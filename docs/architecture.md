@@ -37,7 +37,9 @@ The following components are never demand-paged during an admitted request:
 - every shared expert;
 - scheduler and kernel workspaces.
 
-For DeepSeek, MLA and shared experts are part of this spine. Treating a shared
+For GLM-5.2, low-rank attention, DSA/IndexShare, and the shared expert are part
+of this spine. For DeepSeek-V4, hybrid-attention compression state, sparse
+indexers, mHC parameters, and the shared expert are resident. Treating a shared
 expert as cacheable routed data is an architectural error because it executes on
 every token.
 
@@ -128,8 +130,11 @@ cannot batch unknown future tokens without speculation because autoregressive
 dependency is real.
 
 Temporal batching therefore uses canonical speculative verification only. Draft
-weights must also be int4 or higher. Verification depth is controlled by accepted
-tokens per storage byte and expert-union growth, not merely draft acceptance.
+weights must also be four bits or higher. GLM MTP and DeepSeek DSpark rows enter
+the same provisional expert-ticket wavefront, but each architecture retains its
+exact verification and KV commit rules. Verification depth is controlled by
+accepted tokens per target forward, expert row, and storage byte—not merely
+draft acceptance.
 
 ## Architecture adapters
 
@@ -145,23 +150,35 @@ The manifest declares softmax/sigmoid scoring, normalization, capacity behavior,
 top-k, and optional shared experts. Expert gate/up/down tensors form one placement
 unit unless an explicitly validated sharding plan says otherwise.
 
-### DeepSeek
+### GLM-5.2
 
-DeepSeek is a native adapter, not a collection of special cases. It validates and
-executes:
+The `glm_moe_dsa` adapter validates and executes low-rank query/KV projections,
+DSA top-2048 selection, IndexShare ownership, the three-layer dense prefix,
+fine-grained top-8 MoE, the always-resident shared expert, sigmoid/`noaux_tc`
+routing, routed scaling, and MTP. DSA indexers and MTP are graph components, not
+optional approximations hidden behind a generic attention interface.
 
-- MLA compressed KV;
-- the dense-prefix boundary;
-- fine-grained routed experts;
-- always-resident shared experts;
-- group-limited routing where configured;
-- `noaux_tc` correction-bias selection semantics;
-- raw router weights versus selection scores;
-- top-k normalization and routed scaling.
+For the pinned QuantTrio checkpoint, the adapter also binds every linear role to
+its declared `compressed-tensors` encoding: INT4 group-128 for routed experts,
+INT8 group-128 for ordinary linears, channelwise INT8 for MTP, and BF16/FP32 for
+sensitive tensors. Packed I32 storage never overrides those logical semantics.
 
-The shared expert overlaps remote/local routed execution. Group selection provides
-a lower-entropy signal for conservative prefetch, but only the exact final router
-may select computation.
+### DeepSeek-V4
+
+The `deepseek_v4` adapter validates and executes:
+
+- compressed sparse and heavily compressed hybrid attention;
+- per-layer compression ratios, sparse indexing, and YaRN scaling;
+- manifold-constrained hyper-connections and Sinkhorn normalization;
+- native FP4 E2M1 routed experts and the always-resident shared expert;
+- `sqrtsoftplus` scoring, `noaux_tc` selection, top-6 normalization, routed
+  scaling, and clipped SwiGLU semantics;
+- three DSpark stages, Markov-logit correction, confidence scheduling, and exact
+  speculative verification.
+
+The shared expert overlaps routed execution. DSpark's five provisional rows are
+exposed to the ticket scheduler so resident experts can be reused, but only the
+target model may commit tokens or KV state.
 
 ## Backend boundary
 

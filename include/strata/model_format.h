@@ -14,6 +14,15 @@ enum strata_architecture_id {
     STRATA_ARCH_DENSE = 1,
     STRATA_ARCH_STANDARD_MOE = 2,
     STRATA_ARCH_DEEPSEEK = 3,
+    STRATA_ARCH_GLM_MOE_DSA = 4,
+};
+
+enum strata_tensor_encoding_id {
+    STRATA_ENCODING_BF16 = 1,
+    STRATA_ENCODING_F32 = 2,
+    STRATA_ENCODING_CT_INT4_SYM_G128 = 3,
+    STRATA_ENCODING_CT_INT8_SYM_G128 = 4,
+    STRATA_ENCODING_CT_INT8_SYM_CHANNEL = 5,
 };
 
 /* All offsets are absolute and little-endian. Payloads are immutable. */
@@ -22,7 +31,7 @@ struct strata_model_header {
     char magic[8];
     uint32_t format_version;
     uint32_t architecture;
-    uint32_t quant_bits;
+    uint32_t quant_bits; /* Minimum logical weight precision in the pack. */
     uint32_t flags;
     uint64_t tensor_count;
     uint64_t directory_offset;

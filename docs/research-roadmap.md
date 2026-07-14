@@ -1,72 +1,128 @@
 # Research roadmap
 
-Each phase is gated by measurements. A failed mechanism is recorded and removed
-from runtime code.
+GLM-5.2 is the primary target from the first implementation branch.
+DeepSeek-V4-Flash-DSpark is the native mixed-FP4/FP8 resident proof of concept.
+Every phase answers one bounded question against one of those real checkpoints.
 
-## Phase 0 — foundation (current)
+## Phase 0 — foundation (complete)
 
 - C/C++ build with no third-party runtime.
-- Precision-floor and DeepSeek semantic validation.
-- Exact int4 reference kernel.
-- Sequential trace parser, online predictor, residency simulator, and cold-read
-  contract.
+- Precision-floor and MoE semantic validation.
+- Signed-int4 reference matvec.
+- Sequential trace parser, past-only predictor, residency simulator, and
+  bounded-cold-read contract.
 
 Gate: sanitizer tests and deterministic simulator output.
 
-## Phase 1 — real route evidence
+## Phase 1 — GLM-5.2 source lock and one-module vertical slice (next)
 
-- Capture sequential GLM-5.2 and DeepSeek traces with request, token, layer,
-  top-k IDs, and coefficients.
-- Add offline LRU/LFU/lease and affinity-hypergraph analysis.
-- Measure working-set size, transition stability, useful prediction bytes, and
-  peer fan-out at several memory budgets.
+- Pin `QuantTrio/GLM-5.2-Int4-Int8Mix` configuration, index, license, hashes,
+  and byte totals.
+- Parse and classify all 177,569 tensors across 128 shards.
+- Range-read one real expert's packed I32 values, BF16 group scales, and I64
+  logical shape.
+- Decode the native signed INT4 group-128 representation with bounded memory.
+- Hash, reconstruct, and compare its W4A16 output to a frozen target oracle.
 
-Gate: a novel policy must reduce NVMe bytes by at least 2x versus the best
-conventional policy at equal capacity before runtime implementation.
+Gate: complete deterministic manifest, bounded RSS, deterministic output, and
+recorded reconstruction metrics on an actual GLM-5.2 quantized module.
 
-## Phase 2 — model pack and CPU oracle
+## Phase 2 — zero-rewrite GLM-5.2 import
 
-- Implement incremental Safetensors ingestion and the v1 immutable pack.
-- Implement RMSNorm, RoPE, dense matmul, router variants, SwiGLU, conventional
-  attention, and MLA reference operations.
-- Validate a tiny dense model, tiny conventional MoE, and tiny DeepSeek model.
+- Build a content-addressed sidecar over the 124 main and four MTP shards.
+- Validate every packed value/scale/shape triplet against the pinned
+  `compressed-tensors` policy.
+- Preserve INT4 experts, INT8 linears and MTP, and BF16/FP32 tensors exactly.
+- Open source shards read-only and keep runtime state outside the model files.
+- Resume downloads without creating a second converted weight copy.
 
-Gate: teacher forcing and greedy generation match architecture references.
+Gate: interruption tests pass; final role/byte/hash reconciliation passes;
+missing, changed, overlapping, or writable source extents are rejected.
 
-## Phase 3 — persistent CPU execution
+## Phase 3 — exact GLM-5.2 graph
 
-- NUMA-local expert arenas and persistent worker queues.
-- Expert-major low-row int4 kernels for AVX2 and AVX-512.
-- Shared-expert/routed overlap.
-- Bounded wavefront and multi-request scheduling.
+- Dense spine, low-rank attention, compressed KV, RoPE, and residual graph.
+- DSA top-2048 selection and IndexShare ownership.
+- Exact sigmoid/`noaux_tc` top-8 routing, shared expert, and routed experts.
+- MTP, tokenizer, sampling, and generation.
+- Operation, layer, multi-layer, and complete-model reference artifacts.
 
-Gate: measurable throughput gain over row-synchronous reference execution with
-identical work and memory.
+Gate: layerwise router/attention checks, teacher forcing, greedy generation, and
+MTP acceptance pass declared numerical contracts on the real checkpoint.
 
-## Phase 4 — optional CUDA backend
+## Phase 4 — GLM-5.2 resident execution
 
-- Dense layer residency and device-resident activations.
-- Persistent low-row int4 expert queues.
-- Separate compute, demand H2D, and speculative-prefetch streams.
-- Topology-aware activation movement without a mandatory NCCL dependency.
+- NUMA-aware RAM expert arenas.
+- VRAM-resident dense spine and explicit expert placement.
+- Persistent native INT4 group-128 and INT8 CPU/CUDA kernels.
+- Expert-ticket wavefront and continuous multi-request batching.
+- Separate compute, demand H2D, and budgeted-prefetch queues.
 
-Gate: no silent CPU fallback; per-device tests; fixed replay; equal VRAM budget.
+Gate: fixed replay performs identical work without silent fallback; memory,
+cache, transfer, and physical-I/O counters reconcile.
 
-## Phase 5 — Expert Compute Fabric
+## Phase 5 — GLM-5.2 performance challenge
 
-- Binary peer protocol and content-addressed model identity.
-- Route-affinity partitioner minimizing peer fan-out.
-- Replication, deadlines, health, and exact local failover.
-- Aggregate throughput and per-request latency measurement on 1/10/25 GbE.
+- Reproduce the known baseline contract on the exact target hardware.
+- Run interleaved A/B measurements at equal model, precision, route sequence,
+  RAM, VRAM, and warm/cold state.
+- Compare row-synchronous, ticket-wavefront, and residency policies.
+- Measure prefill, decode, MTP, H2D, NVMe, RSS, VRAM, and synchronization.
+
+Gate: Strata exceeds median baseline decode tok/s outside run variance without a
+quality, workload, memory, or I/O mismatch.
+
+## Phase 6 — native DeepSeek-V4-Flash import
+
+- Pin the official 48-shard DSpark checkpoint.
+- Build a zero-rewrite sidecar manifest over native Safetensors extents.
+- Implement FP4 E2M1 K32 and FP8 E4M3 block-scaled reference paths.
+- Stage the model into the combined RAM+VRAM resident budget.
+
+Gate: all source bytes map to validated roles and steady-state admitted decode
+performs zero physical NVMe reads.
+
+## Phase 7 — exact DeepSeek-V4 graph
+
+- Hybrid compressed sparse/heavily compressed attention.
+- Manifold-constrained hyper-connections and Sinkhorn invariants.
+- Exact sqrtsoftplus/`noaux_tc` top-6 routing and shared/routed execution.
+- YaRN, tokenizer/response encoding, and complete-model generation.
+
+Gate: layerwise routing, attention, mHC, teacher forcing, and generation pass the
+frozen full-model oracle.
+
+## Phase 8 — DSpark wavefront
+
+- Three-stage, five-token semi-autoregressive draft execution.
+- Markov-logit correction and confidence-scheduled verification.
+- Expert-union batching across provisional rows.
+- Exact provisional KV commit/rollback.
+- Adaptive block depth from accepted tokens per target-forward and expert row.
+
+Gate: reproducible end-to-end throughput win; acceptance rate alone is not a
+success metric.
+
+## Phase 9 — evidence-driven residency
+
+- Capture sequential GLM-5.2 and DeepSeek-V4 routes.
+- Compare LRU, LFU, leases, route-affinity cohorts, and uncertainty-budgeted
+  prefetch at equal memory.
+- Measure useful/wasted read bytes, H2D amplification, and expert-union growth.
+- Define admission from measured working sets.
+
+Gate: a new policy materially reduces physical NVMe bytes versus the best
+conventional policy without increasing total transfer cost or changing work.
+
+## Phase 10 — Expert Compute Fabric
+
+- Content-addressed peer ownership and binary protocol.
+- Activation shipping to resident expert owners.
+- Route-affinity partitioning, replication, deadlines, and exact failover.
+- Aggregate throughput and per-request latency on 1/10/25 GbE.
 
 Gate: peer execution beats local cold reads without changing output or exceeding
 network and memory ceilings.
 
-## Phase 6 — read-aware speculation
-
-- Int4-or-higher draft adapter.
-- Verification-depth controller using accepted tokens per NVMe/H2D byte.
-- Expert-union and false-prefetch feedback.
-
-Gate: repeatable single-request latency or aggregate-throughput win. Acceptance
-rate alone is not a success metric.
+Exact source revisions and detailed gates are documented in
+[`model-bringup.md`](model-bringup.md).

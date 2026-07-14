@@ -19,7 +19,7 @@ enum strata_quant_format {
 /* Strata forbids every weight format below four bits. */
 int strata_quant_format_valid(int format);
 
-/* Signed symmetric q4: two two's-complement nibbles per byte. */
+/* Signed q4: two two's-complement nibbles per byte. */
 int8_t strata_q4_unpack(const uint8_t *packed, size_t element);
 void strata_q4_pack(uint8_t *packed, size_t element, int8_t value);
 

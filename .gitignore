@@ -1,4 +1,6 @@
 /build/
+/models/
+/results/
 /build-*/
 /.cache/
 /compile_commands.json
@@ -7,3 +9,4 @@
 *.stats.local
 *.safetensors
 *.strata-model
+plan.md

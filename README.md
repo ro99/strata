@@ -37,25 +37,27 @@ not become an unbounded per-token dependency.
 
 ### GLM-5.2 — the primary target
 
-[`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8) is the
-model Strata is built to beat on equal hardware and memory budgets. It is the
-right first target because it combines every tier we need to engineer: a
+[`QuantTrio/GLM-5.2-Int4-Int8Mix`](https://huggingface.co/QuantTrio/GLM-5.2-Int4-Int8Mix)
+is the exact model Strata targets. It combines every tier we need to engineer: a
 resident dense spine, 256 routed experts, a shared expert, top-8 routing,
 DSA/IndexShare sparse attention, MTP, VRAM placement, a large RAM working set,
 and read-only NVMe capacity.
 
 At the pinned source revision documented in
-[`docs/model-bringup.md`](docs/model-bringup.md), the official repository has
-141 Safetensors weight shards and 755,617,140,416 bytes of tensor payload. Strata
-will consume the official FP8 source incrementally and produce its own immutable
-mixed-precision pack. Routed expert matrices are the first Q4_K64 candidates;
-routers, the dense spine, DSA indexers, and MTP remain at their source or higher
-precision until measurements justify changing them.
+[`docs/model-bringup.md`](docs/model-bringup.md), the repository has 177,569
+indexed tensors in 128 Safetensors shards and 405,459,090,304 bytes of tensor
+payload. The checkpoint already has the required mixed precision: layer 0 is
+BF16; routed expert matrices in layers 3–77 are symmetric W4A16 group-128;
+quantized ordinary linears in layers 1–77 are symmetric W8A16 group-128; the
+MTP layer is channelwise W8A16; and sensitive tensors remain BF16/FP32. Strata
+preserves those native extents behind a verified sidecar manifest instead of
+requantizing or creating a second 405 GB copy.
 
-We have a known external throughput baseline for this model. Every comparison
-must use the same checkpoint semantics, prompt or replay, decode length,
-RAM/VRAM budgets, warm state, GPU topology, and quality mode. The primary metric
-is median decode tok/s; NVMe bytes per emitted token is a co-primary constraint.
+The first external baseline is the model card's verified vLLM 0.23.0
+`compressed-tensors` configuration. Every performance comparison must use this
+exact revision, prompt or replay, decode length, RAM/VRAM budgets, warm state,
+GPU topology, MTP configuration, and reasoning effort. The primary metric is
+median decode tok/s; NVMe bytes per emitted token is a co-primary constraint.
 
 ### DeepSeek-V4-Flash-DSpark — the resident proof of concept
 
@@ -82,30 +84,30 @@ not assume that speculation is automatically faster.
 The next branch is:
 
 ```text
-feat/glm52-stream-pack
+feat/glm52-compressed-import
 ```
 
 It starts with GLM-5.2—not a smaller substitute—and delivers one bounded vertical
 slice:
 
-1. Pin and parse the official `config.json` and Safetensors index.
-2. Validate all 118,629 tensor mappings, 141 shards, architecture fields, and
+1. Pin and parse the target `config.json` and Safetensors index.
+2. Validate all 177,569 tensor mappings, 128 shards, architecture fields, and
    source byte totals without downloading weight payloads.
-3. Read a real GLM-5.2 FP8 expert tensor and its 128×128 block scales.
-4. Convert that tensor to Q4_K64 with the C++ reference codec.
-5. Write, hash, reopen, dequantize, and numerically verify the Strata extent.
-6. Generalize the same path into a resumable one-shard-at-a-time conversion.
+3. Range-read one real expert's `weight_packed`, `weight_scale`, and
+   `weight_shape` extents.
+4. Decode the native signed INT4 group-128 representation in C++.
+5. Verify reconstruction and W4A16 output against a frozen target-format oracle.
+6. Generalize the same validation into a content-addressed sidecar over all
+   original shards.
 
-Only when step 5 passes do we begin the full weight transfer. The complete
-source is downloaded over time, but it never has to coexist on disk: a source
-shard may be released only after every derived extent is durable and
-hash-verified. Expect roughly 400 GB for the resulting pack plus one source
-shard, conversion workspace, and a safety margin—not 761 GB of source plus a
-second complete model.
+Only when step 5 passes do we begin the full weight transfer. The final disk
+budget is the 405,481,014,016 bytes of source shard files plus the small sidecar,
+download state, and safety margin. There is no converted second model copy.
 
-After the GLM pack and graph are running, the DeepSeek-V4-Flash-DSpark adapter is
-the second vertical target. It exercises native FP4/FP8 loading and fully
-resident execution without adding a quantization experiment.
+After the GLM native manifest and graph are running, the
+DeepSeek-V4-Flash-DSpark adapter is the second vertical target. It exercises
+native FP4/FP8 loading and fully resident execution without adding a
+quantization experiment.
 
 The detailed implementation gates and pinned checkpoint facts are in
 [`docs/model-bringup.md`](docs/model-bringup.md). The gated research sequence is
@@ -116,33 +118,47 @@ in [`docs/research-roadmap.md`](docs/research-roadmap.md).
 No Strata model representation may use less than four bits per weight. Four bits
 is a floor, not an instruction to force every tensor to the minimum.
 
-- **GLM-5.2:** Q4_K64 begins with routed expert matrices. The dense spine,
-  routers, DSA indexers, and MTP stay FP8/BF16/FP32 until role-by-role quality and
-  performance evidence supports another representation.
+- **GLM-5.2:** preserve the checkpoint's INT4 group-128 experts, INT8 group-128
+  linears, INT8 channelwise MTP, and BF16/FP32 sensitive tensors exactly. No
+  silent conversion to a different four-bit layout is permitted.
 - **DeepSeek-V4-Flash-DSpark:** preserve the official FP4 E2M1 expert layout and
   FP8/BF16/FP32 supporting tensors exactly. Do not requantize it.
 - **Drafts and predictors:** never below four bits. Placement predictors do not
   enter the numerical graph.
 
-No conversion is accepted merely because it creates a smaller file. GLM-5.2
-requires tensor reconstruction checks, layerwise router checks, fixed-logit
-comparisons, teacher forcing, greedy generation, and measured MTP acceptance.
+Native import still requires tensor reconstruction checks, layerwise router
+checks, fixed-logit comparisons, teacher forcing, greedy generation, and
+measured MTP acceptance.
 
 ## Current status
 
-Strata is an early performance-research engine, not yet a language-model
-inference binary. The repository currently contains:
+Strata now has a first bounded GLM-5.2 inference path intended to establish the
+unoptimized machine baseline. The repository currently contains:
 
-- model and DeepSeek semantic validation;
+- model, GLM-5.2 target-contract, and DeepSeek semantic validation;
+- bounded JSON, Safetensors, and zero-rewrite checkpoint readers;
+- native offset-packed INT4/INT8 groupwise CUDA matvecs for compute 8.6 and
+  12.0, plus FP32 correctness oracles;
+- exact GLM RMSNorm, interleaved RoPE, softmax, sigmoid/`noaux_tc` routing,
+  dense/SwiGLU, shared-expert, and routed-expert operations;
+- a 78-layer main-model graph with causal MLA state and multi-GPU expert
+  dispatch;
+- the pinned byte-level BPE tokenizer and chat rendering;
+- `strata-run`, which reports prompt-processing and decode throughput
+  separately, together with checkpoint, H2D/D2H, and VRAM-cache counters;
 - a fixed model-pack header with a four-bit precision floor;
-- a signed-int4 CPU matvec correctness oracle;
 - a sequential route-trace parser and past-only transition predictor;
 - a VRAM/RAM/peer/NVMe residency simulator;
 - LRU, LFU, and lease-aware policy experiments with explicit byte accounting;
 - dependency-free tests.
 
-The current CPU matvec is an arithmetic oracle. It is not yet the production
-Q4_K64 storage layout or an optimized kernel.
+The first runtime is deliberately bounded to at most 2,048 tokens, where GLM's
+DSA selection covers the entire causal history and therefore has exactly the
+same result as dense causal attention. MTP proposal acceleration is explicitly
+disabled for the first base-model benchmark; it does not change the greedy main
+model result. The absorbed MLA decode kernel, active DSA beyond 2,048 tokens,
+MTP verification, and optimized resident scheduling remain subsequent measured
+hypotheses.
 
 ## Build the current foundation
 
@@ -185,6 +201,36 @@ cmake --build build --parallel
 Peer execution can be modeled with `--peer-resident-pct` and
 `--peer-activation-bytes`. Use `--cold-read-budget` with `--strict` to test an
 admission contract.
+
+## Run the GLM-5.2 baseline
+
+After all 124 main and four MTP shards have finished downloading into
+`models/glm52`, run one exact greedy generation directly from the original
+Safetensors extents:
+
+```bash
+./build/strata-run \
+  --model models/glm52 \
+  --devices 0,1,2 \
+  --prompt 'What is the closer start to sun, and how distant it is from it?' \
+  --max-new 128 \
+  --json
+```
+
+The reproducible benchmark script validates the checkpoint and prompt, records
+system/GPU telemetry, and performs three repetitions by default. Because this
+is a long load and generation, launch it in a named tmux session:
+
+```bash
+tmux new-session -d -s strata-glm52-baseline \
+  'cd /home/rodrigo/Developer/strata && scripts/run_glm52_baseline.sh'
+tmux attach -t strata-glm52-baseline
+```
+
+Ignored outputs are written under `results/glm52-baseline/`. Each run records
+`prompt_processing_tok_s`, `generation_tok_s`, requested checkpoint bytes,
+block-device physical reads/writes, weight and activation transfers, CUDA
+calls, and per-device cache occupancy.
 
 ## The execution loop
 

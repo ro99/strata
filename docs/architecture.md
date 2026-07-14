@@ -158,6 +158,11 @@ fine-grained top-8 MoE, the always-resident shared expert, sigmoid/`noaux_tc`
 routing, routed scaling, and MTP. DSA indexers and MTP are graph components, not
 optional approximations hidden behind a generic attention interface.
 
+For the pinned QuantTrio checkpoint, the adapter also binds every linear role to
+its declared `compressed-tensors` encoding: INT4 group-128 for routed experts,
+INT8 group-128 for ordinary linears, channelwise INT8 for MTP, and BF16/FP32 for
+sensitive tensors. Packed I32 storage never overrides those logical semantics.
+
 ### DeepSeek-V4
 
 The `deepseek_v4` adapter validates and executes:

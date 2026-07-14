@@ -10,7 +10,7 @@ does not depend on framework-specific metadata or tensor-name guessing.
 - eight-byte `STRATA01` magic;
 - format version;
 - architecture ID;
-- weight precision;
+- minimum logical weight precision;
 - tensor count;
 - directory offset and length;
 - manifest hash.
@@ -32,26 +32,29 @@ The model packer will emit fixed-size records containing:
 One routed expert's gate, up, down, and scales share an atomic placement group.
 Shared experts are marked resident-spine data.
 
-## Q4_K64 design target
+## QuantTrio compressed-tensors layouts
 
-The first production four-bit layout will be `Q4_K64`:
+The GLM-5.2 target is already quantized. Strata preserves three native
+`compressed-tensors` encodings rather than requantizing them:
 
-- groups run along the input dimension and never cross an output row;
-- each full group contains 64 signed two's-complement values in `[-8, 7]`;
-- each group has one FP16 scale and no zero point;
-- low and high nibble ordering is fixed by the format, not the host ABI;
-- incomplete tail groups are zero-padded and carry their logical length through
-  the tensor shape;
-- the reference operation is W4A16 with FP32 accumulation.
+- `CT_INT4_SYM_G128`: offset-packed signed four-bit routed-expert weights,
+  symmetric BF16
+  scale per 128 logical input elements, W4A16 with FP32 accumulation;
+- `CT_INT8_SYM_G128`: signed eight-bit ordinary linear weights, symmetric BF16
+  scale per 128 logical input elements, W8A16 with FP32 accumulation;
+- `CT_INT8_SYM_CHANNEL`: signed eight-bit MTP weights with one symmetric BF16
+  scale per output channel, W8A16 with FP32 accumulation.
 
-This is a design target for the next implementation phase. The current per-row
-int4 CPU matvec is an arithmetic oracle and does not yet implement this storage
-layout.
+Each quantized module has an I32 `weight_packed` tensor, a BF16 `weight_scale`
+tensor, and an I64 two-element `weight_shape` tensor. INT4 packs eight logical
+values per I32; INT8 packs four. Stored integer lanes are offset binary: decode
+as `raw - 2^(bits-1)`, with the first logical value in the least-significant
+bits. This is distinct from Strata's standalone two's-complement Q4 oracle.
 
 Tensor precision is declared per directory record. Routers, normalization,
 embeddings, output heads, attention weights, or measured outlier tensors may be
 BF16/FP16. Four bits is the minimum permitted precision, not a requirement that
-every tensor use Q4_K64.
+every tensor use INT4.
 
 ## Native source formats
 
@@ -59,15 +62,16 @@ The model format and kernel ABI must distinguish integer Q4 from floating-point
 FP4. They are both four-bit representations but have different value tables,
 scales, and kernels.
 
-The first required source layouts are:
+The required source layouts are:
 
-- `FP8_E4M3_B128X128`: GLM-5.2 and DeepSeek supporting matrices with declared
-  128×128 block scales;
+- `CT_INT4_SYM_G128`, `CT_INT8_SYM_G128`, and `CT_INT8_SYM_CHANNEL` for the
+  pinned QuantTrio GLM-5.2 checkpoint;
+- `FP8_E4M3_B128X128`: DeepSeek supporting matrices with declared 128×128 block
+  scales;
 - `FP4_E2M1_K32`: DeepSeek-V4 expert values packed two per byte, using the
   E2M1 finite value table and one UE8M0 scale per 32 logical K elements;
 - BF16 and FP32 tensors for normalization, routers, compression, confidence,
-  and other declared sensitive roles;
-- Q4_K64 output extents for GLM-5.2 routed experts.
+  and other declared sensitive roles.
 
 Importers preserve source precision metadata exactly. A source tensor is never
 treated as Q4 merely because its physical storage uses nibbles or `int8` bytes.
@@ -85,8 +89,8 @@ extents inside Safetensors shards when:
 - runtime opens all source files read-only;
 - kernels implement the declared native format without conversion.
 
-DeepSeek-V4-Flash-DSpark uses this path so Strata does not create a redundant
-167 GB rewritten copy.
+QuantTrio/GLM-5.2-Int4-Int8Mix and DeepSeek-V4-Flash-DSpark use this path so
+Strata does not create redundant 405 GB or 167 GB rewritten copies.
 
 ## Packs
 
@@ -98,7 +102,7 @@ read-amplifying false prefetches.
 All runtime files are read-only. Route history, cache state, and machine-specific
 placement do not modify the model pack.
 
-## Conversion
+## Import and optional conversion
 
 The offline C++ `strata-pack` tool will ingest Safetensors incrementally, validate
 architecture semantics, preserve validated four-bit-or-higher source layouts
@@ -110,8 +114,9 @@ reuses only complete verified extents; it never exposes a partially converted
 pack under its final name. Quantization quality is evaluated separately from
 container integrity against immutable source-precision references.
 
-For GLM-5.2, the conversion planner covers the complete pinned source index
-before bulk transfer. Routed expert FP8 extents are decoded and requantized in
-bounded tiles; DSA, router, dense-spine, and MTP tensors remain at their declared
-precision initially. A verified source shard may be released only through an
-explicit operator policy after all derived extents are durable.
+For the pinned GLM-5.2 target, the importer covers the complete source index
+before bulk transfer and emits only a verified sidecar. It retains routed expert
+INT4, ordinary-linear INT8, channelwise MTP INT8, and sensitive BF16/FP32 extents
+in the original read-only shards. Conversion to another four-bit layout is not
+part of target bring-up because it would change declared precision semantics and
+require a separate quality experiment.

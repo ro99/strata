@@ -14,28 +14,30 @@ Every phase answers one bounded question against one of those real checkpoints.
 
 Gate: sanitizer tests and deterministic simulator output.
 
-## Phase 1 — GLM-5.2 source lock and one-tensor vertical slice (next)
+## Phase 1 — GLM-5.2 source lock and one-module vertical slice (next)
 
-- Pin `zai-org/GLM-5.2-FP8` configuration, index, license, hashes, and byte
-  totals.
-- Parse and classify all 118,629 tensors across 141 shards.
-- Read one real FP8 expert tensor and its 128×128 block scales.
-- Convert it to Q4_K64 with bounded memory.
-- Reopen, hash, dequantize, and compare it numerically to the source.
+- Pin `QuantTrio/GLM-5.2-Int4-Int8Mix` configuration, index, license, hashes,
+  and byte totals.
+- Parse and classify all 177,569 tensors across 128 shards.
+- Range-read one real expert's packed I32 values, BF16 group scales, and I64
+  logical shape.
+- Decode the native signed INT4 group-128 representation with bounded memory.
+- Hash, reconstruct, and compare its W4A16 output to a frozen target oracle.
 
 Gate: complete deterministic manifest, bounded RSS, deterministic output, and
-recorded reconstruction metrics on an actual GLM-5.2 tensor.
+recorded reconstruction metrics on an actual GLM-5.2 quantized module.
 
-## Phase 2 — resumable GLM-5.2 pack
+## Phase 2 — zero-rewrite GLM-5.2 import
 
-- Convert one official shard at a time into immutable target extents.
-- Quantize routed expert matrices first; preserve sensitive and MTP tensors.
-- Journal and hash progress at extent granularity.
-- Resume without rewriting completed output.
-- Optionally release source shards only after durable verification.
+- Build a content-addressed sidecar over the 124 main and four MTP shards.
+- Validate every packed value/scale/shape triplet against the pinned
+  `compressed-tensors` policy.
+- Preserve INT4 experts, INT8 linears and MTP, and BF16/FP32 tensors exactly.
+- Open source shards read-only and keep runtime state outside the model files.
+- Resume downloads without creating a second converted weight copy.
 
-Gate: interruption tests pass; final role/byte/hash reconciliation passes; the
-planner's disk and memory ceilings are respected.
+Gate: interruption tests pass; final role/byte/hash reconciliation passes;
+missing, changed, overlapping, or writable source extents are rejected.
 
 ## Phase 3 — exact GLM-5.2 graph
 
@@ -52,7 +54,7 @@ MTP acceptance pass declared numerical contracts on the real checkpoint.
 
 - NUMA-aware RAM expert arenas.
 - VRAM-resident dense spine and explicit expert placement.
-- Persistent Q4_K64 CPU/CUDA expert kernels.
+- Persistent native INT4 group-128 and INT8 CPU/CUDA kernels.
 - Expert-ticket wavefront and continuous multi-request batching.
 - Separate compute, demand H2D, and budgeted-prefetch queues.
 

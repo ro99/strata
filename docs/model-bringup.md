@@ -11,16 +11,18 @@ repository heads.
 
 | Property | GLM-5.2 | DeepSeek-V4-Flash-DSpark |
 |---|---:|---:|
-| Repository | `zai-org/GLM-5.2-FP8` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` |
-| Revision inspected | `ba978f7d347eaf65d22f1a86833408afdb953541` | `62af8fffb2f7030cac4de2f0169f5b8d1101b646` |
-| Weight shards | 141 | 48 |
-| Indexed tensor payload | 755,617,140,416 bytes | 166,878,536,440 bytes |
-| Repository storage | 761,025,363,709 bytes | 166,886,535,336 bytes |
+| Repository | `QuantTrio/GLM-5.2-Int4-Int8Mix` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` |
+| Revision inspected | `1d3bcfe5ec549ecd000fd80b37f191183842e983` | `62af8fffb2f7030cac4de2f0169f5b8d1101b646` |
+| Index SHA-256 | `43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b` | — |
+| Indexed tensors | 177,569 | 72,317 |
+| Weight shards | 128 (124 main + 4 MTP) | 48 |
+| Indexed tensor payload | 405,459,090,304 bytes | 166,878,536,440 bytes |
+| Weight shard files | 405,481,014,016 bytes | 166,886,535,336 bytes repository storage |
 | License reported by repository | MIT | MIT |
-| Source precision | FP8 E4M3 blocks plus BF16/F32 | FP4 experts, FP8 spine, BF16/F32 sensitive tensors |
-| Strata handling | Stream-convert routed experts to Q4_K64 | Preserve native extents; no additional quantization |
+| Source precision | INT4/INT8 packed weights plus BF16/F32 | FP4 experts, FP8 spine, BF16/F32 sensitive tensors |
+| Strata handling | Preserve native extents; no additional quantization | Preserve native extents; no additional quantization |
 
-These values were read from the official repositories on 2026-07-14. The
+These values were read from the pinned target repositories on 2026-07-14. The
 downloader must verify the pinned revision, per-file size/hash, index totals, and
 license files again before transferring weights.
 
@@ -36,79 +38,102 @@ GLM-5.2 defines Strata's primary architecture and performance contract:
 - MLA-style low-rank query/KV projections;
 - DSA top-2048 sparse attention with IndexShare reuse every four layers;
 - a one-million-token maximum context;
-- an official FP8 source layout using 128×128 block scales.
+- symmetric INT4 group-128 routed experts, symmetric INT8 group-128 ordinary
+  linears, channelwise INT8 MTP, and BF16/FP32 sensitive tensors.
+
+The source uses the `compressed-tensors` `pack-quantized` convention. Quantized
+modules are represented by an I32 `weight_packed` tensor, a BF16 `weight_scale`
+tensor, and an I64 two-element `weight_shape` tensor. Logical precision and
+granularity come from the pinned `quantization_config`; physical I32 storage is
+not itself a precision declaration.
+
+| Layer scope | Declared weight representation |
+|---|---|
+| Layer 0 | BF16 |
+| Layers 1–2 | ordinary linears: symmetric INT8 group-128 |
+| Layers 3–77 | routed experts: symmetric INT4 group-128; ordinary linears: symmetric INT8 group-128 |
+| Layer 78 MTP | channelwise symmetric INT8 |
+| Routers, indexers, norms, embeddings, special heads | pinned BF16 or FP32 source dtype |
 
 ### Stage A0 — metadata-only target lock
 
-Create `feat/glm52-stream-pack`. Fetch only the pinned configuration, generation
-configuration, tokenizer assets, license, Safetensors index, and file metadata.
-Do not begin the bulk transfer yet.
+Create `feat/glm52-compressed-import`. Fetch only the pinned configuration,
+generation configuration, tokenizer assets, license, Safetensors index, and
+file metadata. Do not begin the bulk transfer yet.
 
 Implement a C++ inspector that:
 
-1. parses the 118,629-entry tensor index with bounded memory;
-2. recognizes all 141 expected shards and the 755,617,140,416-byte total;
+1. parses the 177,569-entry tensor index with bounded memory;
+2. recognizes all 124 main shards, four MTP shards, and the
+   405,459,090,304-byte indexed payload total;
 3. assigns every tensor an explicit role—dense spine, router, shared expert,
    routed expert, DSA/IndexShare, MTP, embedding, head, norm, or metadata;
-4. derives shape, source precision, target precision, placement group, and
-   expected target extent;
+4. joins every quantized module's packed values, scales, and logical shape and
+   derives its exact precision, granularity, placement group, and source extent;
 5. rejects unknown, duplicate, missing, overlapping, or semantically invalid
    tensors;
-6. emits a deterministic conversion plan without touching weight payloads.
+6. emits a deterministic zero-rewrite sidecar plan without touching weight
+   payloads.
 
 Gate: the manifest covers every indexed tensor and byte. Tensor-name guessing is
 allowed in the offline architecture importer only; runtime code consumes stable
 roles and IDs.
 
-### Stage A1 — one real GLM tensor
+### Stage A1 — one real GLM quantized module
 
-Select one routed expert matrix and its FP8 inverse-scale tensor from the pinned
-index. Download only the containing source shard, with HTTP resume and source
-hash verification.
+Select one routed expert module's `weight_packed`, `weight_scale`, and
+`weight_shape` tensors from the pinned index. Range-read only those extents from
+the containing source shard after verifying the shard size and SHA-256.
 
 Implement the reference path:
 
-1. bounded Safetensors range reader;
-2. FP8 E4M3 plus 128×128 block-scale decode to FP32 tiles;
-3. deterministic Q4_K64 encoding, one output-row group at a time;
-4. Strata extent header, payload, scales, and content hash;
-5. reopen and dequantize the written extent;
-6. absolute, relative, and output-vector error comparison against the FP8
-   source tensor.
+1. bounded Safetensors range reader and header validation;
+2. little-endian I32 unpack into signed INT4 values in the exact
+   `compressed-tensors` order;
+3. BF16 scale decode with one symmetric scale per 128 logical input elements;
+4. logical-shape and byte-count reconciliation for gate, up, and down matrices;
+5. deterministic W4A16 reference matvec with FP32 accumulation;
+6. reconstructed-weight and output-vector comparison against a frozen oracle
+   produced by the pinned checkpoint and compatible `compressed-tensors`
+   implementation.
 
-Gate: peak RSS is bounded by the tile budget, output is deterministic, the
-extent survives reopen/hash verification, and reconstruction metrics are
-recorded. This uses a real GLM-5.2 tensor, not a substitute checkpoint.
+Gate: peak RSS is bounded by the tile budget, output is deterministic, native
+extents survive hash verification, and reconstruction/output metrics are
+recorded. This uses a real target-format GLM-5.2 tensor, not a substitute.
 
-### Stage A2 — resumable shard-streaming conversion
+### Stage A2 — zero-rewrite native import
 
-Generalize A1 across the full checkpoint. The conversion plan is fixed before
+Generalize A1 across the full checkpoint. The sidecar plan is fixed before
 weight transfer begins.
 
-- Process one source shard at a time and each source extent sequentially.
-- Write each target extent exactly once whenever possible.
-- Preserve routers, normalization, embeddings, output head, DSA indexers, dense
-  spine, and MTP at FP8/BF16/F32 initially.
-- Convert routed expert matrices to Q4_K64 first.
-- Do not quantize MTP to int4 until draft acceptance has an FP8 baseline.
-- Record source hash, target hash, quantization metrics, bytes read/written, and
-  completion state per extent.
-- `fsync` data and journal state before marking an extent complete.
-- On restart, reread metadata but never rewrite a verified target extent.
-- Releasing a verified source shard is an explicit operator option, never an
-  implicit cleanup side effect.
+- Reference each official Safetensors extent by pinned shard hash, offset,
+  length, dtype, shape, role, and placement group.
+- Validate that INT4 group-128 tensors pack eight logical weights per I32 and
+  have one BF16 scale per output-row/group pair.
+- Validate that INT8 group-128 tensors pack four logical weights per I32 and
+  have one BF16 scale per output-row/group pair.
+- Validate that MTP INT8 tensors pack four logical weights per I32 and have one
+  BF16 scale per output channel.
+- Preserve BF16 embeddings, norms, indexers, special heads, and FP32 router
+  tensors without conversion.
+- Open model shards read-only at runtime; placement state and route history
+  never modify them.
+- Record full source hashes and manifest completion, but do not write duplicate
+  weight payloads.
 
-The operational disk budget is approximately 400 GB for the target pack plus
-the largest source shard, conversion workspace, journal, and safety margin. The
-exact planner output—not this estimate—authorizes conversion.
+The base disk budget is 405,481,014,016 bytes for the source shard files plus
+metadata, resumable download state, the small sidecar, and a safety margin. The
+exact planner output—not the model card's rounded 378 GiB figure—authorizes the
+download. A second converted pack is outside the plan.
 
-Gate: a forced interruption at every state boundary resumes correctly; a final
-scan verifies all expected tensor roles and hashes; no partial pack is published
-under its final name.
+Gate: a final scan verifies all expected tensor roles, native quantization
+triplets, extents, and hashes; runtime rejects a missing, changed, overlapping,
+or writable source shard.
 
 ### Stage A3 — GLM graph from actual weights
 
-Implement the graph in dependency order using tensors from the real pack:
+Implement the graph in dependency order using tensors from the verified native
+manifest:
 
 1. embedding, RMSNorm, RoPE, and dense linear primitives;
 2. low-rank attention projections and compressed KV state;
@@ -133,7 +158,7 @@ skipped.
 
 Bring up execution tiers in this order:
 
-1. memory-mapped immutable pack and CPU reference execution;
+1. memory-mapped immutable source shards and CPU reference execution;
 2. RAM-resident expert arenas with NUMA placement;
 3. VRAM-resident dense spine and explicit expert cache;
 4. persistent expert-ticket wavefront across requests;
@@ -141,10 +166,11 @@ Bring up execution tiers in this order:
 6. bounded-cold admission contracts;
 7. optional peer execution beside remote resident experts.
 
-The first performance comparison uses the known GLM-5.2 baseline contract on
-the same hardware. Record every run and report median prefill time, decode
-tok/s, physical NVMe bytes per emitted token, H2D bytes, RSS, per-device VRAM,
-expert rows, cache events, and MTP acceptance.
+The first performance comparison reproduces the pinned model card's vLLM 0.23.0
+`compressed-tensors` execution contract on the same hardware before comparing
+Strata. Record every run and report median prefill time, decode tok/s, physical
+NVMe bytes per emitted token, H2D bytes, RSS, per-device VRAM, expert rows,
+cache events, and MTP acceptance.
 
 Gate: correctness passes, median tok/s exceeds the baseline outside run
 variance, and no hidden quality, routing, precision, memory, or I/O difference

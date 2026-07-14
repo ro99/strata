@@ -139,7 +139,7 @@ tmux session:
 
 ```bash
 tmux new-session -d -s strata-glm52-baseline \
-  'cd /home/rodrigo/Developer/strata && scripts/run_glm52_baseline.sh'
+  './scripts/run_glm52_baseline.sh'
 ```
 
 The script defaults to three repetitions and writes ignored artifacts under
@@ -150,7 +150,7 @@ To check greedy determinism without collecting block-device telemetry:
 
 ```bash
 tmux new-session -d -s strata-glm52-determinism \
-  'cd /home/rodrigo/Developer/strata && scripts/check_glm52_determinism.sh'
+  './scripts/check_glm52_determinism.sh'
 ```
 
 The script reports the first divergent token. For opt-in layer and expert state

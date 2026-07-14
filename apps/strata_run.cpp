@@ -22,13 +22,15 @@ struct Options {
     double vram_fraction{0.85};
     bool json{};
     bool quiet{};
+    bool diagnostic_trace{};
 };
 
 void usage() {
     std::cerr
         << "usage: strata-run --model DIR [--prompt TEXT] [--max-new N]\n"
         << "                  [--devices 0,1,2] [--max-context N]\n"
-        << "                  [--vram-fraction F] [--json] [--quiet]\n";
+        << "                  [--vram-fraction F] [--json] [--quiet]\n"
+        << "                  [--diagnostic-trace]\n";
 }
 
 bool parse_u32(std::string_view text, std::uint32_t& value) {
@@ -94,6 +96,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.json = true;
         } else if (argument == "--quiet") {
             options.quiet = true;
+        } else if (argument == "--diagnostic-trace") {
+            options.diagnostic_trace = true;
         } else if (argument == "--help" || argument == "-h") {
             usage();
             std::exit(0);
@@ -154,6 +158,7 @@ int main(int argc, char** argv) {
     config.vram_cache_fraction = options.vram_fraction;
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.verbose = !options.quiet;
+    config.diagnostic_trace = options.diagnostic_trace;
 
     if (!options.quiet) {
         std::cerr << "[contract] exact main-model greedy decode; INT4/INT8 checkpoint unchanged\n"

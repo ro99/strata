@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <future>
@@ -37,6 +38,17 @@ constexpr std::uint32_t kTopK = 8U;
 constexpr std::uint32_t kVocabulary = 154880U;
 constexpr std::uint32_t kDsaThreshold = 2048U;
 constexpr float kAttentionScale = 1.0F / 16.0F;
+
+std::uint64_t state_hash(std::span<const float> values) noexcept {
+    constexpr std::uint64_t offset = 1469598103934665603ULL;
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    std::uint64_t hash = offset;
+    for (const float value : values) {
+        hash ^= std::bit_cast<std::uint32_t>(value);
+        hash *= prime;
+    }
+    return hash;
+}
 
 std::string layer_prefix(std::uint32_t layer) {
     return "model.layers." + std::to_string(layer) + ".";
@@ -741,6 +753,13 @@ struct Glm52Runtime::Impl {
                 result.errors.insert(result.errors.end(), job.errors.begin(), job.errors.end());
                 return result;
             }
+            if (config.diagnostic_trace) {
+                std::cerr << "[expert-state] layer=" << layer
+                          << " expert=" << job.expert
+                          << " device_slot=" << job.device_slot
+                          << " rows=" << job.rows.size()
+                          << " hash=" << std::hex << state_hash(job.output) << std::dec << '\n';
+            }
             for (std::size_t local_row = 0; local_row < job.rows.size(); ++local_row) {
                 auto destination = output.subspan(
                     static_cast<std::size_t>(job.rows[local_row]) * kHidden, kHidden);
@@ -772,6 +791,12 @@ struct Glm52Runtime::Impl {
             result = attention(layer, normalized, rows, position_base, branch);
             if (!result.ok()) return result;
             for (std::size_t index = 0; index < hidden.size(); ++index) hidden[index] += branch[index];
+            if (config.diagnostic_trace) {
+                std::cerr << "[state] phase=" << (rows > 1U ? "prefill" : "decode")
+                          << " position=" << position_base << " rows=" << rows
+                          << " layer=" << layer << " stage=attention hash=" << std::hex
+                          << state_hash(hidden) << std::dec << '\n';
+            }
             result = norm_rows(normalized, hidden, rows,
                                prefix + "post_attention_layernorm.weight");
             if (!result.ok()) return result;
@@ -783,6 +808,12 @@ struct Glm52Runtime::Impl {
             }
             if (!result.ok()) return result;
             for (std::size_t index = 0; index < hidden.size(); ++index) hidden[index] += branch[index];
+            if (config.diagnostic_trace) {
+                std::cerr << "[state] phase=" << (rows > 1U ? "prefill" : "decode")
+                          << " position=" << position_base << " rows=" << rows
+                          << " layer=" << layer << " stage=mlp hash=" << std::hex
+                          << state_hash(hidden) << std::dec << '\n';
+            }
             if (config.verbose) {
                 const auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - layer_started).count();

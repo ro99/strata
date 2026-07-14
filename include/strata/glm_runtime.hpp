@@ -15,6 +15,7 @@ struct Glm52RuntimeConfig {
     double vram_cache_fraction{0.85};
     std::uint32_t maximum_context_tokens{256};
     bool verbose{true};
+    bool diagnostic_trace{};
 };
 
 struct Glm52CacheStats {

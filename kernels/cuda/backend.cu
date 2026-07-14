@@ -277,8 +277,13 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         status != cudaSuccess) {
         return cuda_error(status, "allocate CUDA weights");
     }
-    if (auto status = cudaMemcpy(target->weights, weights.data(), weights.size(),
-                                 cudaMemcpyHostToDevice); status != cudaSuccess) {
+    auto& state = found->second;
+    // This stream is nonblocking with respect to the legacy default stream.
+    // Keep uploads on the execution stream and finish them before the caller's
+    // host payload is released or the cache publishes the weight.
+    if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
+                                      cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
         return cuda_error(status, "upload CUDA weights");
     }
     if (expected_scales != 0U) {
@@ -286,10 +291,14 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             status != cudaSuccess) {
             return cuda_error(status, "allocate CUDA scales");
         }
-        if (auto status = cudaMemcpy(target->scales, scales.data(), scales.size(),
-                                     cudaMemcpyHostToDevice); status != cudaSuccess) {
+        if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
+                                          cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
             return cuda_error(status, "upload CUDA scales");
         }
+    }
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize CUDA weight upload");
     }
     {
         std::scoped_lock lock(impl_->mutex);

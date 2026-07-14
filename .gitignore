@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.cache/
+/compile_commands.json
+*.log
+*.trace.local
+*.stats.local
+*.safetensors
+*.strata-model

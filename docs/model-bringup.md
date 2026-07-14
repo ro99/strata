@@ -1,193 +1,227 @@
-# Model bring-up plan
+# GLM-5.2 and DeepSeek-V4 bring-up plan
 
-This document answers two questions: what should be built next, and when should
-a large checkpoint be downloaded? The short answer is **format first, smallest
-useful architecture second, frontier-scale models last**.
+Strata starts with frontier-scale MoE models. GLM-5.2 is the primary target from
+the first branch; DeepSeek-V4-Flash-DSpark is the first fully resident proof of
+concept. There is no smaller pretrained model in the critical path.
 
-## Decision
+## Pinned source facts
 
-Do not begin with GLM-5.2 or a DeepSeek-V4-class model. Do not write a one-off
-converter for either model. Build one streaming model-pack pipeline and prove it
-on generated tensors and successively richer reference architectures.
+The first implementation must pin revisions rather than follow moving model
+repository heads.
 
-A giant checkpoint makes a poor development fixture:
+| Property | GLM-5.2 | DeepSeek-V4-Flash-DSpark |
+|---|---:|---:|
+| Repository | `zai-org/GLM-5.2-FP8` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` |
+| Revision inspected | `ba978f7d347eaf65d22f1a86833408afdb953541` | `62af8fffb2f7030cac4de2f0169f5b8d1101b646` |
+| Weight shards | 141 | 48 |
+| Indexed tensor payload | 755,617,140,416 bytes | 166,878,536,440 bytes |
+| Repository storage | 761,025,363,709 bytes | 166,886,535,336 bytes |
+| License reported by repository | MIT | MIT |
+| Source precision | FP8 E4M3 blocks plus BF16/F32 | FP4 experts, FP8 spine, BF16/F32 sensitive tensors |
+| Strata handling | Stream-convert routed experts to Q4_K64 | Preserve native extents; no additional quantization |
 
-- source download, conversion, and load cycles are too slow;
-- source and converted weights may temporarily require hundreds of gigabytes;
-- a wrong logit does not identify whether packing, quantization, graph mapping,
-  routing, kernels, or scheduling failed;
-- conversion experiments create large disposable files and unnecessary storage
-  writes;
-- full-scale debugging encourages accidental dependence on model-specific
-  layouts.
+These values were read from the official repositories on 2026-07-14. The
+downloader must verify the pinned revision, per-file size/hash, index totals, and
+license files again before transferring weights.
 
-Large checkpoints become valuable only after the same path has already produced
-correct output on smaller models.
+## Target A — GLM-5.2
 
-## Stage 0 — model pack and Q4_K64
+GLM-5.2 defines Strata's primary architecture and performance contract:
 
-Create `feat/modelpack-q4k64`. Do not download a model for this stage.
+- 78 main layers plus one MTP layer;
+- three dense-prefix layers followed by sparse MoE layers;
+- 256 routed experts, top-8 selection, and one shared expert;
+- sigmoid scores, `noaux_tc` selection, normalized top-k probabilities, and a
+  routed scaling factor of 2.5;
+- MLA-style low-rank query/KV projections;
+- DSA top-2048 sparse attention with IndexShare reuse every four layers;
+- a one-million-token maximum context;
+- an official FP8 source layout using 128×128 block scales.
 
-Implement in this order:
+### Stage A0 — metadata-only target lock
 
-1. A bounded-memory Safetensors header and tensor-directory reader.
-2. A Strata manifest carrying architecture, tensor roles, exact shapes,
-   quantization layout, tokenizer identity, source identity, and content hashes.
-3. The `Q4_K64` reference codec: groups of 64 weights along the input dimension,
-   signed two's-complement values in `[-8, 7]` and one FP16 scale per group.
-4. `strata-pack inspect`, `convert`, and `verify` commands.
-5. Temporary output, per-shard checkpoints, `fsync`, hash verification, and
-   atomic final rename. A restart must reuse already verified extents.
-6. Tiny deterministic fixtures covering odd shapes, partial groups, saturation,
-   zero groups, corrupt headers, corrupt payloads, and interrupted conversion.
+Create `feat/glm52-stream-pack`. Fetch only the pinned configuration, generation
+configuration, tokenizer assets, license, Safetensors index, and file metadata.
+Do not begin the bulk transfer yet.
 
-The initial quantizer should use deterministic round-to-nearest. More advanced
-calibration may be added only after the simple reference path is measurable;
-container correctness and quantizer research are separate hypotheses.
+Implement a C++ inspector that:
 
-### Stage 0 gate
+1. parses the 118,629-entry tensor index with bounded memory;
+2. recognizes all 141 expected shards and the 755,617,140,416-byte total;
+3. assigns every tensor an explicit role—dense spine, router, shared expert,
+   routed expert, DSA/IndexShare, MTP, embedding, head, norm, or metadata;
+4. derives shape, source precision, target precision, placement group, and
+   expected target extent;
+5. rejects unknown, duplicate, missing, overlapping, or semantically invalid
+   tensors;
+6. emits a deterministic conversion plan without touching weight payloads.
 
-- byte-exact pack/unpack layout tests;
-- deterministic output across runs;
-- bounded reconstruction error for each fixture;
-- rejected precision values below four bits;
-- source tensor and output extent hashes verified;
-- peak RSS independent of total checkpoint size;
-- interrupted conversion resumes without rewriting verified extents;
-- no published pack appears before complete verification.
+Gate: the manifest covers every indexed tensor and byte. Tensor-name guessing is
+allowed in the offline architecture importer only; runtime code consumes stable
+roles and IDs.
 
-The existing per-row int4 matvec remains a numerical oracle. It is not the
-Q4_K64 storage specification and should not silently define it.
+### Stage A1 — one real GLM tensor
 
-## Stage 1 — small dense reference
+Select one routed expert matrix and its FP8 inverse-scale tensor from the pinned
+index. Download only the containing source shard, with HTTP resume and source
+hash verification.
 
-Use `TinyLlama/TinyLlama-1.1B-Chat-v1.0` as the first real download. Its
-Llama-compatible graph is small enough for rapid CPU debugging while exercising
-real tokenizer, RoPE, GQA, SwiGLU, RMSNorm, embedding, and output-head behavior.
+Implement the reference path:
 
-Implement the dense CPU graph before an optimized CUDA path. Preserve sensitive
-tensors in BF16/FP16 initially. Quantize one tensor role at a time and compare
-against a source-precision oracle so quality loss has an owner.
+1. bounded Safetensors range reader;
+2. FP8 E4M3 plus 128×128 block-scale decode to FP32 tiles;
+3. deterministic Q4_K64 encoding, one output-row group at a time;
+4. Strata extent header, payload, scales, and content hash;
+5. reopen and dequantize the written extent;
+6. absolute, relative, and output-vector error comparison against the FP8
+   source tensor.
 
-### Stage 1 gate
+Gate: peak RSS is bounded by the tile budget, output is deterministic, the
+extent survives reopen/hash verification, and reconstruction metrics are
+recorded. This uses a real GLM-5.2 tensor, not a substitute checkpoint.
 
-- manifest and tensor mapping are complete—no name-based runtime guessing;
-- selected tensor dequantization matches the reference codec;
-- fixed-prompt source-precision logits are recorded immutably;
-- teacher forcing and greedy generation pass declared tolerances;
-- Q4_K64 quality is evaluated against the same source checkpoint;
-- peak RSS and model-pack bytes are recorded.
+### Stage A2 — resumable shard-streaming conversion
 
-Tokenizer work is part of the architecture adapter. For bring-up, a small
-offline tokenizer utility or pre-tokenized fixtures are acceptable; the final
-runtime must not require a framework or Python process.
+Generalize A1 across the full checkpoint. The conversion plan is fixed before
+weight transfer begins.
 
-## Stage 2 — conventional MoE
+- Process one source shard at a time and each source extent sequentially.
+- Write each target extent exactly once whenever possible.
+- Preserve routers, normalization, embeddings, output head, DSA indexers, dense
+  spine, and MTP at FP8/BF16/F32 initially.
+- Convert routed expert matrices to Q4_K64 first.
+- Do not quantize MTP to int4 until draft acceptance has an FP8 baseline.
+- Record source hash, target hash, quantization metrics, bytes read/written, and
+  completion state per extent.
+- `fsync` data and journal state before marking an extent complete.
+- On restart, reread metadata but never rewrite a verified target extent.
+- Releasing a verified source shard is an explicit operator option, never an
+  implicit cleanup side effect.
 
-Use `allenai/OLMoE-1B-7B-0125`. It is large enough to expose real routing and
-expert reuse but small enough to iterate on a workstation.
+The operational disk budget is approximately 400 GB for the target pack plus
+the largest source shard, conversion workspace, journal, and safety margin. The
+exact planner output—not this estimate—authorizes conversion.
 
-This stage adds exact top-k routing, expert gate/up/down placement groups,
-expert-major ticket batching, route trace capture, and comparison of
-row-synchronous versus wavefront execution. First run everything through the CPU
-reference graph; storage policy results are invalid until routing is correct.
+Gate: a forced interruption at every state boundary resumes correctly; a final
+scan verifies all expected tensor roles and hashes; no partial pack is published
+under its final name.
 
-### Stage 2 gate
+### Stage A3 — GLM graph from actual weights
 
-- exact router IDs, weights, normalization, and aggregation match the oracle;
-- dense-only and MoE-layer logits pass declared tolerances;
-- sequential traces contain no future-derived information;
-- the wavefront performs identical mathematical work;
-- cache and NVMe counters reconcile at byte granularity.
+Implement the graph in dependency order using tensors from the real pack:
 
-## Stage 3 — native DeepSeek
+1. embedding, RMSNorm, RoPE, and dense linear primitives;
+2. low-rank attention projections and compressed KV state;
+3. DSA indexer and IndexShare ownership;
+4. exact sigmoid/`noaux_tc` router selection and combination weights;
+5. shared expert and routed expert SwiGLU;
+6. residual path and layer advancement;
+7. MTP head and verification;
+8. tokenizer and generation boundary.
 
-Use `deepseek-ai/DeepSeek-V2-Lite`. This is the first model that jointly proves
-MLA and DeepSeekMoE behavior without frontier-scale iteration costs.
+Correctness progresses through actual target slices: individual target tensors,
+one dense layer, the first MoE layer, DSA selected positions, a multi-layer
+replay, and finally the complete model. Shape-reduced generated fixtures may
+exercise error paths, but they are not a model milestone.
 
-The adapter must explicitly validate:
+Gate: layerwise logits, router IDs/coefficients, attention selections, teacher
+forcing, greedy generation, and MTP acceptance match frozen reference artifacts
+within declared numerical contracts. No operation may silently fall back or be
+skipped.
 
-- MLA compressed KV and decoupled RoPE paths;
-- dense-prefix and MoE-layer boundaries;
-- fine-grained expert dimensions and top-k;
-- always-resident shared experts;
-- group-limited routing where configured;
-- selection bias/correction semantics separately from combination weights;
-- routed scaling and normalization.
+### Stage A4 — memory hierarchy and performance
 
-Shared experts belong to the resident spine and should overlap routed work.
-Group selection may inform conservative prefetch, but only the final exact router
-can choose executed experts.
+Bring up execution tiers in this order:
 
-### Stage 3 gate
+1. memory-mapped immutable pack and CPU reference execution;
+2. RAM-resident expert arenas with NUMA placement;
+3. VRAM-resident dense spine and explicit expert cache;
+4. persistent expert-ticket wavefront across requests;
+5. overlapped demand H2D and strictly budgeted prefetch;
+6. bounded-cold admission contracts;
+7. optional peer execution beside remote resident experts.
 
-- architecture oracle passes teacher forcing and greedy generation;
-- exact selected experts and coefficients are validated layer by layer;
-- shared experts never enter the demand-paged cache;
-- MLA KV memory matches the manifest-derived bound;
-- generated route traces drive a reproducible residency-policy comparison.
+The first performance comparison uses the known GLM-5.2 baseline contract on
+the same hardware. Record every run and report median prefill time, decode
+tok/s, physical NVMe bytes per emitted token, H2D bytes, RSS, per-device VRAM,
+expert rows, cache events, and MTP acceptance.
 
-## Stage 4 — optimized execution
+Gate: correctness passes, median tok/s exceeds the baseline outside run
+variance, and no hidden quality, routing, precision, memory, or I/O difference
+explains the result.
 
-Only now add persistent CPU kernels, CUDA residency, H2D overlap, multi-request
-batching, admission contracts, and peer execution. Optimization starts from
-fixed replays generated by Stages 2 and 3, so every candidate performs equal
-work.
+## Target B — DeepSeek-V4-Flash-DSpark
 
-A storage policy is useful only when it reduces physical bytes read at equal
-capacity without causing larger H2D traffic, destructive prefetch, or hidden
-latency. Page-cache hits are not zero I/O unless the measurement proves that the
-bytes were resident.
+This target is not a generic older-DeepSeek stand-in. It introduces architecture
+and storage formats that Strata must support natively:
 
-## Stage 5 — frontier-scale acceptance
+- 43 main layers and three DSpark stages;
+- 256 routed experts, top-6 activation, and one shared expert;
+- `sqrtsoftplus` routing, `noaux_tc` selection, routed scale 1.5, and clipped
+  SwiGLU behavior;
+- hybrid compressed sparse attention and heavily compressed attention with
+  per-layer compression ratios;
+- manifold-constrained hyper-connections using Sinkhorn normalization;
+- one-million-token context with YaRN scaling;
+- native FP4 E2M1 expert values with UE8M0 per-32-weight scales;
+- FP8 E4M3 supporting matrices with 128×128 scales;
+- a five-token DSpark block driven from hidden states at layers 40, 41, and 42,
+  plus rank-256 Markov and confidence heads.
 
-GLM-5.2 and the selected DeepSeek-V4-class checkpoint enter here. They validate
-scale; they do not define the basic engine.
+### Stage B0 — zero-rewrite native import
 
-Before downloading either one, record:
+Do not convert or repack 167 GB of already-valid weights. Build a small,
+content-addressed sidecar manifest that references extents in the 48 official
+Safetensors shards. The original files remain immutable and are opened read-only.
+The pinned index contains 72,317 tensors totaling 166,878,536,440 bytes.
 
-- exact checkpoint revision and license;
-- source precision and sharding layout;
-- expected source, temporary, final-pack, and safety-margin bytes;
-- storage filesystem and device endurance/health baseline;
-- RAM, VRAM, NUMA, PCIe/NVLink, and peer topology;
-- the already-passing smaller architecture oracle;
-- conversion and load commands plus restart behavior.
+Implement native reference codecs for:
 
-Conversion is always shard-streaming. The whole source model must never be
-resident in RAM. Source shards are read sequentially, output extents are written
-once, and verified progress is reused after interruption. Deleting source shards
-is a separate, explicit operator decision after the final pack is complete and
-verified.
+- FP4 E2M1 packed nibbles with per-32-element UE8M0 scales;
+- FP8 E4M3 matrices with their declared block scales;
+- BF16, FP32, I64, and scale-only tensor roles.
 
-## How other models are added
+Gate: every byte and tensor is covered, native extents reconstruct correctly,
+and startup can stage the entire checkpoint into the declared RAM+VRAM budget
+without runtime model writes.
 
-Support is split into reusable operator families and exact architecture
-manifests:
+### Stage B1 — exact DeepSeek-V4 graph
 
-| Family | Reused machinery | Model-specific proof |
-|---|---|---|
-| Llama-like dense | RMSNorm, RoPE, GQA/MHA, SwiGLU | tensor mapping, RoPE variant, tokenizer, logits |
-| Conventional MoE | exact router, top-k aggregation, expert tickets | scoring, normalization, capacity, expert layout |
-| DeepSeek | MLA, shared/routed overlap, fine-grained experts | config-era routing semantics, dense prefix, tensor mapping |
-| New family | existing kernels where mathematically identical | missing ops, manifest schema, tiny oracle, generation gate |
+Implement and verify hybrid attention compression, sparse indexing, mHC,
+sqrtsoftplus routing, shared/routed experts, and tokenizer/response encoding.
+Base-model decode must pass before speculative decoding is enabled.
 
-Recognizing a model name is not support. Strata adds an architecture only when
-unsupported semantics fail loudly and the supported path has a reproducible
-oracle.
+Gate: full-model teacher forcing and greedy/sampled generation match frozen
+reference artifacts; routing and mHC invariants pass layerwise; steady-state
+decode performs zero physical NVMe reads after resident admission.
 
-## Precision and quality policy
+### Stage B2 — DSpark as a scheduler primitive
 
-Four bits is the absolute floor, not the universal target. The starting policy
-is:
+DSpark is a confidence-scheduled semi-autoregressive draft, not merely an MTP
+toggle. Strata should expose its five provisional rows directly to the
+expert-centric scheduler:
 
-- routed expert matrices: evaluate Q4_K64 first;
-- dense FFN and attention matrices: Q4_K64 only after per-role quality gates;
-- routers, norms, embeddings, output heads, small tensors, and measured
-  outliers: BF16/FP16 by default;
-- activations and KV: declared per architecture and never silently changed;
-- drafts, predictors, caches, and fallbacks: never below four bits.
+1. capture target hidden states from layers 40–42;
+2. execute the three attached DSpark stages;
+3. combine block logits with the Markov head;
+4. use the confidence head to schedule a verification depth;
+5. form an expert union across provisional rows;
+6. batch resident expert work without allowing drafts to alter exact target
+   verification;
+7. commit only accepted tokens and roll back provisional KV state exactly.
 
-Every mixed-precision choice is stored in the manifest. Runtime code executes
-the declared representation or fails; it does not silently choose a cheaper
-one.
+Measure accepted tokens per target forward, draft time, verification time,
+expert-union size, expert rows, cache pressure, and physical I/O. If speculation
+raises expert work more than it saves target forwards, disable or shorten it;
+acceptance rate alone is not a win.
+
+Gate: output distribution/greedy correctness satisfies the declared speculative
+contract and median end-to-end throughput improves outside variance.
+
+## Other models
+
+No third checkpoint is on the critical path. Reusable dense, MoE, attention,
+quantization, and scheduler operations should remain architecture-neutral, but
+new model adapters wait until GLM-5.2 and DeepSeek-V4-Flash-DSpark are working.
+The project is judged by these two targets, not by the length of a compatibility
+list.

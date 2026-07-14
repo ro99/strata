@@ -1,43 +1,134 @@
 # Strata
 
-**Run models larger than VRAM—without turning the SSD into the decode loop.**
+**Run frontier-scale MoE models across VRAM, RAM, and read-only NVMe—without
+making storage the token loop.**
 
-Strata is a ground-up C/C++ inference engine for dense and mixture-of-experts
-models on memory-constrained workstations and small local clusters. It is built
-for machines with useful CPU RAM, limited GPU memory, and models whose weights
-do not fit in either one alone.
+Strata is a ground-up C/C++ inference engine for enormous sparse models on
+consumer workstations and small local clusters. It is designed around the two
+models that expose the real problem immediately:
 
-The central idea is simple: **move small activation batches to resident weights,
-not giant weight matrices to one token.** Strata keeps a model's dense spine and
-shared experts resident, converts exact router decisions into expert work
-tickets, and combines tickets across requests into an expert-centric execution
-wavefront. NVMe is immutable cold storage and recovery—not a normal per-token
-memory tier.
+- **GLM-5.2** is the primary engineering and performance target.
+- **DeepSeek-V4-Flash-DSpark** is the native four-bit, resident proof of concept.
 
-## Why Strata exists
+The central idea is to move small activation batches to resident weights, not
+giant expert matrices to one token. Exact router decisions become expert work
+tickets; the scheduler groups tickets across requests and speculative rows;
+execution happens where the weights already live. NVMe is immutable model
+backing and cold-start storage. It is never a place for runtime writes and must
+not become an unbounded per-token dependency.
 
-Most offload designs optimize how quickly a cache miss can be served. Strata
-tries to make the miss disappear from steady-state decode:
+## Why Strata is different
 
-- **Resident Execution Contracts** admit a request only with an explicit local,
-  peer-backed, or bounded-cold-read plan.
-- **Expert-centric wavefronts** expose reuse across requests instead of forcing
-  every row through a synchronous load-compute-evict cycle.
-- **DeepSeek is a native architecture**, including MLA, dense prefixes,
-  fine-grained routed experts, shared experts, group-limited routing, and exact
-  selection semantics.
-- **Expert Compute Fabric** sends compact activation rows to LAN peers that own
-  the weights. It does not pretend remote RAM is a fast disk.
-- **Prediction is advisory only.** It can place and prefetch exact weights but
-  can never alter routing or model output.
-- **No framework runtime.** The engine is C++20 with stable C kernel ABIs; CUDA
-  is an optional backend.
+- **Expert-centric execution.** Rows wait briefly for compatible expert work
+  instead of forcing a load-compute-evict cycle at every layer.
+- **Resident Execution Contracts.** A request is admitted with an explicit
+  local, peer-backed, or bounded-cold-read plan.
+- **Architecture-native kernels.** GLM-5.2's DSA/IndexShare and MTP, and
+  DeepSeek-V4's hybrid attention, mHC, routing, native FP4 experts, and DSpark
+  are model graph operations—not opaque framework calls.
+- **Expert Compute Fabric.** LAN peers execute beside their resident weights;
+  only compact activations and partial results cross the network.
+- **Advisory prediction.** Prediction may prefetch or place exact weights. It
+  cannot choose experts, change coefficients, or alter the model output.
+- **No framework runtime.** The engine is C++20 with stable C kernel ABIs and an
+  optional CUDA backend.
 
-For dense models, Strata is deliberately honest: when every weight is used on
-every token and the model exceeds aggregate resident memory, storage bandwidth
-remains a hard limit. The largest gains are expected for sparse MoE models.
+## The two starting models
 
-## Status
+### GLM-5.2 — the primary target
+
+[`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8) is the
+model Strata is built to beat on equal hardware and memory budgets. It is the
+right first target because it combines every tier we need to engineer: a
+resident dense spine, 256 routed experts, a shared expert, top-8 routing,
+DSA/IndexShare sparse attention, MTP, VRAM placement, a large RAM working set,
+and read-only NVMe capacity.
+
+At the pinned source revision documented in
+[`docs/model-bringup.md`](docs/model-bringup.md), the official repository has
+141 Safetensors weight shards and 755,617,140,416 bytes of tensor payload. Strata
+will consume the official FP8 source incrementally and produce its own immutable
+mixed-precision pack. Routed expert matrices are the first Q4_K64 candidates;
+routers, the dense spine, DSA indexers, and MTP remain at their source or higher
+precision until measurements justify changing them.
+
+We have a known external throughput baseline for this model. Every comparison
+must use the same checkpoint semantics, prompt or replay, decode length,
+RAM/VRAM budgets, warm state, GPU topology, and quality mode. The primary metric
+is median decode tok/s; NVMe bytes per emitted token is a co-primary constraint.
+
+### DeepSeek-V4-Flash-DSpark — the resident proof of concept
+
+[`deepseek-ai/DeepSeek-V4-Flash-DSpark`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark)
+is a 284B-total/13B-active MoE checkpoint whose official repository occupies
+166,886,535,336 bytes. It has 256 routed experts, top-6 activation, one shared
+expert, hybrid compressed attention, manifold-constrained hyper-connections,
+and a three-stage DSpark speculative module.
+
+No additional quantization is planned. The checkpoint already uses native FP4
+E2M1 expert weights with per-32-weight scales, FP8 supporting matrices, and
+BF16/FP32 sensitive tensors. Four bits is the allowed floor. Strata will build a
+small verified sidecar manifest over the 48 original Safetensors shards and use
+their extents read-only instead of rewriting another 167 GB copy.
+
+DSpark is particularly valuable to Strata: it proposes a five-token block from
+hidden states captured at target layers 40–42, a Markov head, and a confidence
+head. Those provisional rows create expert batches naturally. We will measure
+accepted tokens per target forward and the growth of the routed-expert union,
+not assume that speculation is automatically faster.
+
+## Start here
+
+The next branch is:
+
+```text
+feat/glm52-stream-pack
+```
+
+It starts with GLM-5.2—not a smaller substitute—and delivers one bounded vertical
+slice:
+
+1. Pin and parse the official `config.json` and Safetensors index.
+2. Validate all 118,629 tensor mappings, 141 shards, architecture fields, and
+   source byte totals without downloading weight payloads.
+3. Read a real GLM-5.2 FP8 expert tensor and its 128×128 block scales.
+4. Convert that tensor to Q4_K64 with the C++ reference codec.
+5. Write, hash, reopen, dequantize, and numerically verify the Strata extent.
+6. Generalize the same path into a resumable one-shard-at-a-time conversion.
+
+Only when step 5 passes do we begin the full weight transfer. The complete
+source is downloaded over time, but it never has to coexist on disk: a source
+shard may be released only after every derived extent is durable and
+hash-verified. Expect roughly 400 GB for the resulting pack plus one source
+shard, conversion workspace, and a safety margin—not 761 GB of source plus a
+second complete model.
+
+After the GLM pack and graph are running, the DeepSeek-V4-Flash-DSpark adapter is
+the second vertical target. It exercises native FP4/FP8 loading and fully
+resident execution without adding a quantization experiment.
+
+The detailed implementation gates and pinned checkpoint facts are in
+[`docs/model-bringup.md`](docs/model-bringup.md). The gated research sequence is
+in [`docs/research-roadmap.md`](docs/research-roadmap.md).
+
+## Precision contract
+
+No Strata model representation may use less than four bits per weight. Four bits
+is a floor, not an instruction to force every tensor to the minimum.
+
+- **GLM-5.2:** Q4_K64 begins with routed expert matrices. The dense spine,
+  routers, DSA indexers, and MTP stay FP8/BF16/FP32 until role-by-role quality and
+  performance evidence supports another representation.
+- **DeepSeek-V4-Flash-DSpark:** preserve the official FP4 E2M1 expert layout and
+  FP8/BF16/FP32 supporting tensors exactly. Do not requantize it.
+- **Drafts and predictors:** never below four bits. Placement predictors do not
+  enter the numerical graph.
+
+No conversion is accepted merely because it creates a smaller file. GLM-5.2
+requires tensor reconstruction checks, layerwise router checks, fixed-logit
+comparisons, teacher forcing, greedy generation, and measured MTP acceptance.
+
+## Current status
 
 Strata is an early performance-research engine, not yet a language-model
 inference binary. The repository currently contains:
@@ -50,68 +141,8 @@ inference binary. The repository currently contains:
 - LRU, LFU, and lease-aware policy experiments with explicit byte accounting;
 - dependency-free tests.
 
-The CPU oracle validates packing and arithmetic. It is not the final production
-quantization layout or optimized kernel.
-
-## Start here
-
-**Do not download GLM-5.2 or a full DeepSeek-V4-class checkpoint yet.** Those
-models are expensive acceptance tests, not productive bring-up targets. Starting
-there would mix format, quantization, architecture, kernel, scheduler, and
-storage bugs into one multi-hour feedback loop.
-
-The next development branch is:
-
-```text
-feat/modelpack-q4k64
-```
-
-Its only job is to implement a resumable, shard-streaming `strata-pack` tool and
-the first production weight layout:
-
-```text
-Q4_K64: signed two's-complement int4 groups of 64 weights + one FP16 scale per group
-execution: W4A16, with FP32 accumulation in the reference path
-```
-
-The first fixtures are generated tensors measured in kilobytes—not a downloaded
-model. The branch is complete when `inspect`, pack, unpack, hashing, atomic
-rename, interruption recovery, and numerical-error tests pass. It must never
-load an entire checkpoint into RAM.
-
-Then bring up models in this order:
-
-| Stage | Reference target | What it proves | Download now? |
-|---|---|---|---|
-| 0 | Deterministic generated tensors | Container, Q4_K64 codec, hashes, resumability | **No model download** |
-| 1 | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Llama-style dense graph, tokenizer boundary, logits, generation | After Stage 0 |
-| 2 | `allenai/OLMoE-1B-7B-0125` | Conventional top-k MoE and expert batching | After dense oracle passes |
-| 3 | `deepseek-ai/DeepSeek-V2-Lite` | MLA plus fine-grained and shared-expert execution | After standard MoE passes |
-| 4 | GLM-5.2 and the selected DeepSeek-V4-class target | Scale, placement, CUDA, and NVMe-wear acceptance | Only after the smaller gates pass |
-
-This is architecture-first support, not a hard-coded model whitelist. A new
-checkpoint is supported when its operator graph, tensor mapping, routing
-semantics, tokenizer boundary, and reference tests are covered. A familiar
-`config.json` alone is not enough.
-
-The detailed sequence, quality gates, and disk-space rules are in
-[`docs/model-bringup.md`](docs/model-bringup.md).
-
-## Quantization contract
-
-Strata never emits or consumes weights, predictors, drafts, shadow models, or
-fallback representations below four-bit precision.
-
-Q4_K64 is the first general-purpose candidate, not a requirement that every
-tensor become int4. The packer may preserve routers, normalization parameters,
-embeddings, output heads, attention projections, and measured outliers in
-BF16/FP16 when a quality gate justifies it. Native int4 checkpoints should be
-preserved when their layout and semantics are validated; BF16/FP16 source
-checkpoints are quantized offline, shard by shard.
-
-No large conversion is accepted without comparison to the source model using
-fixed logits, teacher forcing, greedy generation, and a declared evaluation
-set. Smaller files are not evidence of a usable model.
+The current CPU matvec is an arithmetic oracle. It is not yet the production
+Q4_K64 storage layout or an optimized kernel.
 
 ## Build the current foundation
 
@@ -163,15 +194,14 @@ admission contract.
    resident model spine.
 3. Exact router results produce expert tickets; they do not immediately trigger
    disk reads.
-4. The scheduler groups compatible tickets across ready rows until a bounded
-   latency deadline.
+4. The scheduler groups compatible tickets across ready requests and verified
+   speculative blocks until a bounded latency deadline.
 5. Work executes where the canonical expert already lives: VRAM, local RAM, or
    a peer worker. Only a declared bounded-cold contract may reach NVMe.
 6. Weighted results return to the original row, which advances through the
    exact model graph.
 
-Read [`docs/architecture.md`](docs/architecture.md) for the full design and
-[`docs/research-roadmap.md`](docs/research-roadmap.md) for the gated build plan.
+Read [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ## Repository layout
 
@@ -190,8 +220,7 @@ docs/             architecture, formats, roadmap, and experiment records
 
 - Exact model semantics by default: no expert dropping, reduced top-k, hidden
   CPU fallback, or approximate router substitution.
-- Model files are immutable at runtime. Cache metadata and routing history live
-  elsewhere.
+- Model weights are immutable and read-only during inference.
 - Every performance claim needs reproducible A/B measurements and correctness
   gates.
 - Complexity earns its place only through evidence.

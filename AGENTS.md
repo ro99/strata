@@ -55,11 +55,15 @@ rollback condition. Preserve unrelated changes.
 
 Run `make check` before every result commit. Kernel optimizations must match the
 int4 reference oracle within the declared numerical contract. Architecture
-adapters require tiny-model teacher-forcing and greedy-generation oracles.
+adapters require operation- and layer-level fixtures built from the actual
+target format, followed by full-model teacher-forcing and generation oracles.
+Shape-reduced generated fixtures may test error paths, but smaller pretrained
+models are not target substitutes.
 
-DeepSeek support must preserve MLA layout, shared-expert execution, group-limited
-selection, scoring function, correction bias semantics, top-k normalization, and
-routed scaling exactly as declared by the model manifest.
+DeepSeek support must preserve the declared attention/compression layout,
+shared-expert execution, mHC state, selection and scoring functions, top-k
+normalization, routed scaling, and DSpark verification exactly as declared by
+the model manifest.
 
 ## Long jobs
 

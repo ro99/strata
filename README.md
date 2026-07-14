@@ -73,11 +73,6 @@ The earlier instrumented three-GPU baseline measured a median of 163.1 GB of
 physical NVMe reads; rerun the physical-I/O benchmark after any storage or
 residency change before comparing that metric.
 
-The baseline artifacts are retained under
-[`results/glm52-fix-full`](results/glm52-fix-full/), with the aggregate result
-in [`summary.json`](results/glm52-fix-full/summary.json). The source of the
-numbers above is the three JSON run files in that directory.
-
 ### Baseline contract
 
 Future performance results must keep these variables equal unless the result is

@@ -1,7 +1,9 @@
 #include "strata/glm_runtime.hpp"
 
 #include "strata/glm_ops.hpp"
+#include "strata/glm_int4.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>
@@ -268,6 +270,16 @@ public:
                              input_columns, true, entry);
     }
 
+    bool expert_resident(std::size_t device_slot, std::string_view prefix) const {
+        if (device_slot >= states_.size()) return false;
+        const auto& state = *states_[device_slot];
+        std::scoped_lock lock(state.mutex);
+        const std::string base(prefix);
+        return state.entries.contains(base + "gate_proj") &&
+               state.entries.contains(base + "up_proj") &&
+               state.entries.contains(base + "down_proj");
+    }
+
     [[nodiscard]] Glm52CacheStats stats() const {
         Glm52CacheStats result;
         result.hits = hits_.load(std::memory_order_relaxed);
@@ -465,6 +477,16 @@ Glm52CacheStats cache_delta(const Glm52CacheStats& after,
     return result;
 }
 
+Glm52HostExpertStats host_expert_delta(const Glm52HostExpertStats& after,
+                                       const Glm52HostExpertStats& before) {
+    return {after.experts - before.experts,
+            after.matvec_calls - before.matvec_calls,
+            after.weight_bytes - before.weight_bytes,
+            after.service_nanoseconds - before.service_nanoseconds,
+            after.mapping_sweeps - before.mapping_sweeps,
+            after.mapping_sweep_nanoseconds - before.mapping_sweep_nanoseconds};
+}
+
 struct LayerKv {
     std::vector<float> keys;
     std::vector<float> values;
@@ -488,6 +510,7 @@ struct Glm52Runtime::Impl {
     GlmTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<WeightCache> weights;
+    std::unique_ptr<HostWorkerPool> host_workers;
     std::vector<int> devices;
     std::vector<std::uint64_t> capacities;
     std::vector<std::size_t> device_schedule;
@@ -501,6 +524,21 @@ struct Glm52Runtime::Impl {
     std::uint64_t host_aggregation_nanoseconds{};
     std::uint64_t active_request_id{};
     std::uint64_t generated_requests{};
+    std::atomic<std::uint64_t> host_expert_count{};
+    std::atomic<std::uint64_t> host_expert_matvec_calls{};
+    std::atomic<std::uint64_t> host_expert_weight_bytes{};
+    std::atomic<std::uint64_t> host_expert_service_nanoseconds{};
+    std::atomic<std::uint64_t> host_mapping_sweeps{};
+    std::atomic<std::uint64_t> host_mapping_sweep_nanoseconds{};
+
+    Glm52HostExpertStats host_stats() const noexcept {
+        return {host_expert_count.load(std::memory_order_relaxed),
+                host_expert_matvec_calls.load(std::memory_order_relaxed),
+                host_expert_weight_bytes.load(std::memory_order_relaxed),
+                host_expert_service_nanoseconds.load(std::memory_order_relaxed),
+                host_mapping_sweeps.load(std::memory_order_relaxed),
+                host_mapping_sweep_nanoseconds.load(std::memory_order_relaxed)};
+    }
 
     std::size_t layer_device(std::uint32_t layer) const {
         return device_schedule[layer % device_schedule.size()];
@@ -815,6 +853,280 @@ struct Glm52Runtime::Impl {
                       intermediate, gate, rows, output);
     }
 
+    struct HostMatrix {
+        GlmInt4MatrixView view;
+    };
+
+    ParseResult<HostMatrix> host_matrix(std::string_view base,
+                                        std::uint64_t rows,
+                                        std::uint64_t columns) {
+        ParseResult<HostMatrix> result;
+        const std::string packed_name = std::string(base) + ".weight_packed";
+        const std::string scale_name = std::string(base) + ".weight_scale";
+        const auto* packed = checkpoint->find(packed_name);
+        const auto* scales = checkpoint->find(scale_name);
+        const auto packed_columns = (columns + 7U) / 8U;
+        const auto scale_columns = (columns + 127U) / 128U;
+        if (packed == nullptr || scales == nullptr ||
+            packed->encoding != GlmTensorEncoding::Int4Group128 ||
+            scales->encoding != GlmTensorEncoding::Int4Group128 ||
+            packed->source_shape !=
+                std::vector<std::uint64_t>{rows, packed_columns} ||
+            scales->source_shape !=
+                std::vector<std::uint64_t>{rows, scale_columns}) {
+            result.errors.emplace_back(
+                "host expert matrix is not target INT4 group-128: " +
+                std::string(base));
+            return result;
+        }
+        auto packed_view = checkpoint->view(packed_name);
+        auto scale_view = checkpoint->view(scale_name);
+        if (!packed_view.ok()) {
+            result.errors = std::move(packed_view.errors);
+            return result;
+        }
+        if (!scale_view.ok()) {
+            checkpoint->release_view(packed_view.value);
+            result.errors = std::move(scale_view.errors);
+            return result;
+        }
+        result.value.view = {packed_view.value, scale_view.value, rows, columns,
+                             packed_columns, scale_columns, 128U};
+        return result;
+    }
+
+    void release_host_matrix(const HostMatrix& matrix) const noexcept {
+        // The mapped host tier retains its file-backed working set across
+        // layers and tokens. Immediate MADV_DONTNEED here forces thousands of
+        // avoidable minor faults and discards route locality. The mapping is
+        // still file-backed and remains reclaimable by the kernel.
+        static_cast<void>(matrix);
+    }
+
+    ValidationResult host_matvec(const HostMatrix& matrix,
+                                 std::span<const float> input,
+                                 std::span<float> output) {
+        ValidationResult result;
+        if (host_workers == nullptr) {
+            result.errors.emplace_back("host expert worker pool is unavailable");
+            return result;
+        }
+        constexpr std::uint64_t rows_per_task = 128U;
+        const auto tasks = static_cast<std::size_t>(
+            (matrix.view.rows + rows_per_task - 1U) / rows_per_task);
+        std::mutex error_mutex;
+        auto dispatched = host_workers->parallel_for(tasks, [&](std::size_t task) {
+            const auto begin = static_cast<std::uint64_t>(task) * rows_per_task;
+            const auto end = std::min(matrix.view.rows, begin + rows_per_task);
+            auto status = glm_int4_group128_matvec_rows(
+                matrix.view, input, output, begin, end);
+            if (!status.ok()) {
+                std::scoped_lock lock(error_mutex);
+                if (result.errors.empty()) result.errors = std::move(status.errors);
+            }
+        });
+        if (!dispatched.ok() && result.errors.empty()) {
+            result.errors = std::move(dispatched.errors);
+        }
+        return result;
+    }
+
+    void run_host_expert_job(std::uint32_t layer, ExpertJob& job,
+                             std::span<const float> input) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto prefix = layer_prefix(layer) + "mlp.experts." +
+                            std::to_string(job.expert) + ".";
+        auto gate = host_matrix(prefix + "gate_proj", kExpertIntermediate, kHidden);
+        auto up = host_matrix(prefix + "up_proj", kExpertIntermediate, kHidden);
+        auto down = host_matrix(prefix + "down_proj", kHidden, kExpertIntermediate);
+        const auto release = [&] {
+            if (gate.ok()) release_host_matrix(gate.value);
+            if (up.ok()) release_host_matrix(up.value);
+            if (down.ok()) release_host_matrix(down.value);
+        };
+        for (auto* loaded : {&gate, &up, &down}) {
+            if (!loaded->ok()) {
+                move_parse_errors(job.errors, *loaded);
+                release();
+                return;
+            }
+        }
+        std::vector<float> gate_output(kExpertIntermediate);
+        std::vector<float> up_output(kExpertIntermediate);
+        job.output.resize(kHidden);
+        auto status = host_matvec(gate.value, input, gate_output);
+        if (status.ok()) status = host_matvec(up.value, input, up_output);
+        if (status.ok()) {
+            for (std::size_t index = 0; index < gate_output.size(); ++index) {
+                gate_output[index] =
+                    glm_silu_f32(gate_output[index]) * up_output[index];
+            }
+            status = host_matvec(down.value, gate_output, job.output);
+        }
+        const auto weight_bytes =
+            gate.value.view.packed.size() + gate.value.view.scales.size() +
+            up.value.view.packed.size() + up.value.view.scales.size() +
+            down.value.view.packed.size() + down.value.view.scales.size();
+        release();
+        if (!status.ok()) {
+            move_errors(job.errors, std::move(status));
+            return;
+        }
+        host_expert_count.fetch_add(1U, std::memory_order_relaxed);
+        host_expert_matvec_calls.fetch_add(3U, std::memory_order_relaxed);
+        host_expert_weight_bytes.fetch_add(weight_bytes, std::memory_order_relaxed);
+        host_expert_service_nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count()),
+            std::memory_order_relaxed);
+    }
+
+    struct HostMatvecRequest {
+        const HostMatrix* matrix{};
+        std::span<const float> input;
+        std::span<float> output;
+    };
+
+    ValidationResult host_matvec_wavefront(
+        std::span<const HostMatvecRequest> requests) {
+        ValidationResult result;
+        if (requests.empty()) return result;
+        if (host_workers == nullptr) {
+            result.errors.emplace_back("host expert worker pool is unavailable");
+            return result;
+        }
+        struct Task {
+            const HostMatvecRequest* request{};
+            std::uint64_t begin{};
+            std::uint64_t end{};
+        };
+        constexpr std::uint64_t rows_per_task = 64U;
+        std::vector<Task> tasks;
+        for (const auto& request : requests) {
+            for (std::uint64_t begin = 0U;
+                 begin < request.matrix->view.rows; begin += rows_per_task) {
+                tasks.push_back(
+                    {&request, begin,
+                     std::min(request.matrix->view.rows, begin + rows_per_task)});
+            }
+        }
+        std::mutex error_mutex;
+        auto dispatched = host_workers->parallel_for(
+            tasks.size(), [&](std::size_t index) {
+                const auto& task = tasks[index];
+                auto status = glm_int4_group128_matvec_rows(
+                    task.request->matrix->view, task.request->input,
+                    task.request->output, task.begin, task.end);
+                if (!status.ok()) {
+                    std::scoped_lock lock(error_mutex);
+                    if (result.errors.empty()) {
+                        result.errors = std::move(status.errors);
+                    }
+                }
+            });
+        if (!dispatched.ok() && result.errors.empty()) {
+            result.errors = std::move(dispatched.errors);
+        }
+        return result;
+    }
+
+    void run_host_expert_wavefront(std::uint32_t layer,
+                                   std::span<ExpertJob*> jobs,
+                                   std::span<const float> input) {
+        if (jobs.empty()) return;
+        const auto started = std::chrono::steady_clock::now();
+        struct Work {
+            ExpertJob* job{};
+            HostMatrix gate;
+            HostMatrix up;
+            HostMatrix down;
+            std::vector<float> gate_output =
+                std::vector<float>(kExpertIntermediate);
+            std::vector<float> up_output =
+                std::vector<float>(kExpertIntermediate);
+        };
+        std::vector<Work> work;
+        work.reserve(jobs.size());
+        const auto release_all = [&] {
+            for (const auto& item : work) {
+                if (!item.gate.view.packed.empty()) release_host_matrix(item.gate);
+                if (!item.up.view.packed.empty()) release_host_matrix(item.up);
+                if (!item.down.view.packed.empty()) release_host_matrix(item.down);
+            }
+        };
+        std::uint64_t weight_bytes = 0U;
+        for (auto* job : jobs) {
+            work.emplace_back();
+            auto& item = work.back();
+            item.job = job;
+            const auto prefix = layer_prefix(layer) + "mlp.experts." +
+                                std::to_string(job->expert) + ".";
+            auto gate = host_matrix(
+                prefix + "gate_proj", kExpertIntermediate, kHidden);
+            auto up = host_matrix(
+                prefix + "up_proj", kExpertIntermediate, kHidden);
+            auto down = host_matrix(
+                prefix + "down_proj", kHidden, kExpertIntermediate);
+            for (auto* loaded : {&gate, &up, &down}) {
+                if (!loaded->ok()) {
+                    move_parse_errors(job->errors, *loaded);
+                    if (gate.ok()) release_host_matrix(gate.value);
+                    if (up.ok()) release_host_matrix(up.value);
+                    if (down.ok()) release_host_matrix(down.value);
+                    release_all();
+                    return;
+                }
+            }
+            item.gate = gate.value;
+            item.up = up.value;
+            item.down = down.value;
+            item.job->output.resize(kHidden);
+            weight_bytes +=
+                item.gate.view.packed.size() + item.gate.view.scales.size() +
+                item.up.view.packed.size() + item.up.view.scales.size() +
+                item.down.view.packed.size() + item.down.view.scales.size();
+        }
+
+        std::vector<HostMatvecRequest> gate_up;
+        gate_up.reserve(work.size() * 2U);
+        for (auto& item : work) {
+            gate_up.push_back({&item.gate, input, item.gate_output});
+            gate_up.push_back({&item.up, input, item.up_output});
+        }
+        auto status = host_matvec_wavefront(gate_up);
+        if (status.ok()) {
+            for (auto& item : work) {
+                for (std::size_t index = 0; index < item.gate_output.size(); ++index) {
+                    item.gate_output[index] =
+                        glm_silu_f32(item.gate_output[index]) *
+                        item.up_output[index];
+                }
+            }
+            std::vector<HostMatvecRequest> down;
+            down.reserve(work.size());
+            for (auto& item : work) {
+                down.push_back(
+                    {&item.down, item.gate_output, item.job->output});
+            }
+            status = host_matvec_wavefront(down);
+        }
+        release_all();
+        if (!status.ok()) {
+            move_errors(jobs.front()->errors, std::move(status));
+            return;
+        }
+        host_expert_count.fetch_add(jobs.size(), std::memory_order_relaxed);
+        host_expert_matvec_calls.fetch_add(
+            jobs.size() * 3U, std::memory_order_relaxed);
+        host_expert_weight_bytes.fetch_add(weight_bytes, std::memory_order_relaxed);
+        host_expert_service_nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started).count()),
+            std::memory_order_relaxed);
+    }
+
     void run_expert_job(std::uint32_t layer, ExpertJob& job,
                         std::span<const float> input) {
         std::vector<float> gathered(job.rows.size() * kHidden);
@@ -886,11 +1198,37 @@ struct Glm52Runtime::Impl {
             }
         }
 
+        std::vector<std::uint8_t> host_jobs(jobs.size(), 0U);
+        if (config.host_cold_experts && rows == 1U) {
+            for (std::size_t index = 0; index < jobs.size(); ++index) {
+                const auto expert_prefix = layer_prefix(layer) + "mlp.experts." +
+                                           std::to_string(jobs[index].expert) + ".";
+                if (!weights->expert_resident(jobs[index].device_slot,
+                                              expert_prefix)) {
+                    host_jobs[index] = 1U;
+                }
+            }
+        }
+
         std::vector<std::future<void>> workers;
+        if (std::find(host_jobs.begin(), host_jobs.end(), 1U) != host_jobs.end()) {
+            workers.push_back(std::async(std::launch::async, [&] {
+                std::vector<ExpertJob*> wavefront;
+                for (std::size_t index = 0; index < jobs.size(); ++index) {
+                    if (host_jobs[index] != 0U) {
+                        wavefront.push_back(&jobs[index]);
+                    }
+                }
+                run_host_expert_wavefront(layer, wavefront, input);
+            }));
+        }
         for (std::size_t device = 0; device < devices.size(); ++device) {
             workers.push_back(std::async(std::launch::async, [&, device] {
-                for (auto& job : jobs) {
-                    if (job.device_slot == device) run_expert_job(layer, job, input);
+                for (std::size_t index = 0; index < jobs.size(); ++index) {
+                    if (host_jobs[index] == 0U &&
+                        jobs[index].device_slot == device) {
+                        run_expert_job(layer, jobs[index], input);
+                    }
                 }
             }));
         }
@@ -1069,6 +1407,11 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
             "baseline exact runtime context must be within the 2,048-token full-attention region");
         return result;
     }
+    if (config.host_cold_experts &&
+        (config.host_worker_threads == 0U || config.host_worker_threads > 256U)) {
+        result.errors.emplace_back("host expert worker count must be in [1, 256]");
+        return result;
+    }
     auto checkpoint = GlmCheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
         result.errors = std::move(checkpoint.errors);
@@ -1130,6 +1473,10 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     impl_->device_schedule = std::move(schedule);
     impl_->weights = std::make_unique<WeightCache>(*impl_->checkpoint, impl_->cuda,
                                                    impl_->devices, capacities);
+    if (config.host_cold_experts) {
+        impl_->host_workers =
+            std::make_unique<HostWorkerPool>(config.host_worker_threads);
+    }
     if (config.verbose) {
         for (std::size_t slot = 0; slot < impl_->devices.size(); ++slot) {
             std::cerr << "[hardware] cuda=" << impl_->devices[slot]
@@ -1169,6 +1516,7 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
+    const auto host_before = impl_->host_stats();
     const auto aggregation_before = impl_->host_aggregation_nanoseconds;
     const auto prefill_start = std::chrono::steady_clock::now();
     auto next = impl_->forward(result.prompt_token_ids, 0U, true);
@@ -1182,6 +1530,7 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
     const auto reads_after_prefill = impl_->checkpoint->stats();
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
+    const auto host_after_prefill = impl_->host_stats();
     const auto aggregation_after_prefill = impl_->host_aggregation_nanoseconds;
     if (impl_->config.verbose) {
         std::cerr << "[token] position=" << result.prompt_token_ids.size()
@@ -1204,6 +1553,17 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
             return result;
         }
         ++result.metrics.decode_tokens;
+        if (impl_->config.host_cold_experts &&
+            result.metrics.decode_tokens % 32U == 0U) {
+            const auto sweep_started = std::chrono::steady_clock::now();
+            impl_->checkpoint->release_mapped_views();
+            impl_->host_mapping_sweeps.fetch_add(1U, std::memory_order_relaxed);
+            impl_->host_mapping_sweep_nanoseconds.fetch_add(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - sweep_started).count()),
+                std::memory_order_relaxed);
+        }
         if (impl_->config.verbose) {
             std::cerr << "[token] position=" << position << " id=" << next.value
                       << " second=" << impl_->last_second_token
@@ -1222,21 +1582,27 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
     const auto reads_after_decode = impl_->checkpoint->stats();
     const auto cuda_after_decode = impl_->cuda.stats();
     const auto cache_after_decode = impl_->weights->stats();
+    const auto host_after_decode = impl_->host_stats();
     const auto aggregation_after_decode = impl_->host_aggregation_nanoseconds;
     result.metrics.prefill.checkpoint_reads = checkpoint_delta(reads_after_prefill, reads_before);
     result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
     result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
+    result.metrics.prefill.host_experts = host_expert_delta(
+        host_after_prefill, host_before);
     result.metrics.prefill.host_aggregation_nanoseconds =
         aggregation_after_prefill - aggregation_before;
     result.metrics.decode.checkpoint_reads = checkpoint_delta(
         reads_after_decode, reads_after_prefill);
     result.metrics.decode.cuda = cuda_delta(cuda_after_decode, cuda_after_prefill);
     result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
+    result.metrics.decode.host_experts = host_expert_delta(
+        host_after_decode, host_after_prefill);
     result.metrics.decode.host_aggregation_nanoseconds =
         aggregation_after_decode - aggregation_after_prefill;
     result.metrics.checkpoint_reads = checkpoint_delta(reads_after_decode, reads_before);
     result.metrics.cuda = cuda_delta(cuda_after_decode, cuda_before);
     result.metrics.cache = cache_delta(cache_after_decode, cache_before);
+    result.metrics.host_experts = host_expert_delta(host_after_decode, host_before);
     result.metrics.detailed_timing = impl_->config.detailed_timing;
     if (impl_->route_trace.is_open()) {
         impl_->route_trace.flush();

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <limits>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -62,6 +63,13 @@ void append_errors(ValidationResult& output, std::vector<std::string> errors) {
 }  // namespace
 
 GlmCheckpointReader::~GlmCheckpointReader() {
+    for (const auto& [name, mapping] : mappings_) {
+        static_cast<void>(name);
+        if (mapping.address != nullptr) {
+            static_cast<void>(munmap(mapping.address,
+                                     static_cast<std::size_t>(mapping.bytes)));
+        }
+    }
     for (const auto& [name, descriptor] : shard_fds_) {
         static_cast<void>(name);
         if (descriptor >= 0) static_cast<void>(close(descriptor));
@@ -216,6 +224,82 @@ ParseResult<std::vector<std::byte>> GlmCheckpointReader::read_slice(
         return result;
     }
     return pread_tensor(*tensor, relative_offset, bytes);
+}
+
+ParseResult<std::span<const std::byte>> GlmCheckpointReader::view(
+    std::string_view name) const {
+    ParseResult<std::span<const std::byte>> result;
+    const auto* tensor = find(name);
+    if (tensor == nullptr) {
+        result.errors.emplace_back("checkpoint tensor does not exist: " +
+                                   std::string(name));
+        return result;
+    }
+    std::scoped_lock lock(mapping_mutex_);
+    auto mapping = mappings_.find(tensor->shard);
+    if (mapping == mappings_.end()) {
+        const auto descriptor = shard_fds_.find(tensor->shard);
+        if (descriptor == shard_fds_.end()) {
+            result.errors.emplace_back("checkpoint shard is not open for " +
+                                       tensor->name);
+            return result;
+        }
+        struct stat status {};
+        if (fstat(descriptor->second, &status) != 0 || status.st_size <= 0) {
+            result.errors.emplace_back("cannot size checkpoint shard " +
+                                       tensor->shard + ": " + std::strerror(errno));
+            return result;
+        }
+        const auto bytes = static_cast<std::uint64_t>(status.st_size);
+        void* address = mmap(nullptr, static_cast<std::size_t>(bytes), PROT_READ,
+                             MAP_SHARED, descriptor->second, 0);
+        if (address == MAP_FAILED) {
+            result.errors.emplace_back("cannot map checkpoint shard " +
+                                       tensor->shard + ": " + std::strerror(errno));
+            return result;
+        }
+        mapping = mappings_.emplace(
+            tensor->shard,
+            ShardMapping{static_cast<std::byte*>(address), bytes}).first;
+    }
+    if (tensor->source_offset > mapping->second.bytes ||
+        tensor->source_bytes > mapping->second.bytes - tensor->source_offset) {
+        result.errors.emplace_back("mapped tensor exceeds its checkpoint shard: " +
+                                   tensor->name);
+        return result;
+    }
+    result.value = std::span<const std::byte>(
+        mapping->second.address + tensor->source_offset,
+        static_cast<std::size_t>(tensor->source_bytes));
+    read_calls_.fetch_add(1U, std::memory_order_relaxed);
+    read_bytes_.fetch_add(tensor->source_bytes, std::memory_order_relaxed);
+    return result;
+}
+
+void GlmCheckpointReader::release_view(
+    std::span<const std::byte> bytes) const noexcept {
+    if (bytes.empty()) return;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return;
+    const auto page = static_cast<std::uintptr_t>(page_size);
+    const auto begin = reinterpret_cast<std::uintptr_t>(bytes.data());
+    const auto end = begin + bytes.size();
+    const auto aligned_begin = begin & ~(page - 1U);
+    const auto aligned_end = (end + page - 1U) & ~(page - 1U);
+    static_cast<void>(madvise(reinterpret_cast<void*>(aligned_begin),
+                             aligned_end - aligned_begin, MADV_DONTNEED));
+}
+
+void GlmCheckpointReader::release_mapped_views() const noexcept {
+    std::scoped_lock lock(mapping_mutex_);
+    for (const auto& [name, mapping] : mappings_) {
+        static_cast<void>(name);
+        if (mapping.address != nullptr && mapping.bytes != 0U) {
+            static_cast<void>(madvise(
+                mapping.address, static_cast<std::size_t>(mapping.bytes),
+                MADV_DONTNEED));
+        }
+    }
 }
 
 ParseResult<std::vector<float>> GlmCheckpointReader::read_f32(

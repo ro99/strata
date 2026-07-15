@@ -50,6 +50,14 @@ public:
     [[nodiscard]] ParseResult<std::vector<std::byte>> read_slice(
         std::string_view name, std::uint64_t relative_offset,
         std::uint64_t bytes) const;
+    // Returns a stable read-only view into a lazily mapped checkpoint shard.
+    // The reader owns the mapping. release_view drops this process's mapped
+    // pages after consumers finish while leaving the kernel page cache free to
+    // retain them for subsequent requests.
+    [[nodiscard]] ParseResult<std::span<const std::byte>> view(
+        std::string_view name) const;
+    void release_view(std::span<const std::byte> bytes) const noexcept;
+    void release_mapped_views() const noexcept;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32(
         std::string_view name, std::uint64_t maximum_elements) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32_row(
@@ -76,6 +84,12 @@ private:
     mutable std::uint64_t active_reads_{};
     mutable std::chrono::steady_clock::time_point read_interval_started_;
     mutable std::uint64_t read_wall_nanoseconds_{};
+    struct ShardMapping {
+        std::byte* address{};
+        std::uint64_t bytes{};
+    };
+    mutable std::mutex mapping_mutex_;
+    mutable std::unordered_map<std::string, ShardMapping> mappings_;
 };
 
 // Loads one checkpoint linear directly into a selected GPU. `base_name` omits

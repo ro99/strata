@@ -24,6 +24,8 @@ struct Options {
     bool quiet{};
     bool diagnostic_trace{};
     bool detailed_timing{};
+    bool host_cold_experts{};
+    std::uint32_t host_worker_threads{36U};
     std::string route_trace;
 };
 
@@ -33,6 +35,7 @@ void usage() {
         << "                  [--devices 0,1,2] [--max-context N]\n"
         << "                  [--vram-fraction F] [--json] [--quiet]\n"
         << "                  [--diagnostic-trace] [--detailed-timing]\n"
+        << "                  [--host-cold-experts] [--host-workers N]\n"
         << "                  [--route-trace PATH]\n";
 }
 
@@ -103,6 +106,11 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.diagnostic_trace = true;
         } else if (argument == "--detailed-timing") {
             options.detailed_timing = true;
+        } else if (argument == "--host-cold-experts") {
+            options.host_cold_experts = true;
+        } else if (argument == "--host-workers") {
+            const auto* next = value(argument);
+            if (next == nullptr || !parse_u32(next, options.host_worker_threads)) return false;
         } else if (argument == "--route-trace") {
             const auto* next = value(argument);
             if (next == nullptr) return false;
@@ -229,6 +237,14 @@ void print_phase(std::ostream& output, const strata::Glm52PhaseMetrics& phase) {
            << static_cast<double>(phase.checkpoint_reads.wall_nanoseconds) / 1.0e9
            << ",\"host_aggregation_seconds\":"
            << static_cast<double>(phase.host_aggregation_nanoseconds) / 1.0e9
+           << ",\"host_experts\":" << phase.host_experts.experts
+           << ",\"host_expert_matvec_calls\":" << phase.host_experts.matvec_calls
+           << ",\"host_expert_weight_bytes\":" << phase.host_experts.weight_bytes
+           << ",\"host_expert_service_seconds\":"
+           << static_cast<double>(phase.host_experts.service_nanoseconds) / 1.0e9
+           << ",\"host_mapping_sweeps\":" << phase.host_experts.mapping_sweeps
+           << ",\"host_mapping_sweep_seconds\":"
+           << static_cast<double>(phase.host_experts.mapping_sweep_nanoseconds) / 1.0e9
            << ",\"cuda\":";
     print_cuda_stats(output, phase.cuda);
     output << ",\"cache\":";
@@ -254,6 +270,8 @@ int main(int argc, char** argv) {
     config.verbose = !options.quiet;
     config.diagnostic_trace = options.diagnostic_trace;
     config.detailed_timing = options.detailed_timing;
+    config.host_cold_experts = options.host_cold_experts;
+    config.host_worker_threads = options.host_worker_threads;
     config.route_trace_path = options.route_trace;
 
     if (!options.quiet) {

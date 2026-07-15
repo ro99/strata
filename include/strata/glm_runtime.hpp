@@ -17,6 +17,8 @@ struct Glm52RuntimeConfig {
     bool verbose{true};
     bool diagnostic_trace{};
     bool detailed_timing{};
+    bool host_cold_experts{};
+    std::uint32_t host_worker_threads{36};
     std::string route_trace_path;
     std::uint64_t request_id{};
 };
@@ -35,10 +37,20 @@ struct Glm52CacheStats {
     std::vector<std::uint64_t> device_evictions;
 };
 
+struct Glm52HostExpertStats {
+    std::uint64_t experts{};
+    std::uint64_t matvec_calls{};
+    std::uint64_t weight_bytes{};
+    std::uint64_t service_nanoseconds{};
+    std::uint64_t mapping_sweeps{};
+    std::uint64_t mapping_sweep_nanoseconds{};
+};
+
 struct Glm52PhaseMetrics {
     CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Glm52CacheStats cache;
+    Glm52HostExpertStats host_experts;
     std::uint64_t host_aggregation_nanoseconds{};
 };
 
@@ -50,6 +62,7 @@ struct Glm52RunMetrics {
     CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Glm52CacheStats cache;
+    Glm52HostExpertStats host_experts;
     Glm52PhaseMetrics prefill;
     Glm52PhaseMetrics decode;
     bool detailed_timing{};

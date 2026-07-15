@@ -36,11 +36,13 @@ add_library(strata_core STATIC
     src/model.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
+    src/worker_pool.cpp
     src/trace.cpp
     src/route_predictor.cpp
     src/residency.cpp
     src/simulator.cpp
     kernels/cpu/q4_reference.cpp
+    kernels/cpu/glm_int4.cpp
 )
 
 target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -79,6 +81,9 @@ target_link_libraries(strata-tokenize PRIVATE strata_core)
 add_executable(strata-run apps/strata_run.cpp)
 target_link_libraries(strata-run PRIVATE strata_core)
 
+add_executable(strata-host-expert-probe apps/strata_host_expert_probe.cpp)
+target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
+
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
     add_executable(strata-topology-probe apps/strata_topology_probe.cu)
@@ -98,6 +103,7 @@ if(BUILD_TESTING)
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
         tests/test_glm_ops.cpp
+        tests/test_glm_int4.cpp
         tests/test_model.cpp
         tests/test_q4.cpp
         tests/test_trace.cpp
@@ -125,7 +131,8 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS strata-sim strata-inspect strata-tokenize strata-run RUNTIME DESTINATION bin)
+install(TARGETS strata-sim strata-inspect strata-tokenize strata-run
+        strata-host-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)
 endif()

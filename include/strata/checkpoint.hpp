@@ -4,9 +4,11 @@
 #include "strata/glm_manifest.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -19,6 +21,7 @@ struct CheckpointReadStats {
     std::uint64_t calls{};
     std::uint64_t bytes{};
     std::uint64_t nanoseconds{};
+    std::uint64_t wall_nanoseconds{};
 };
 
 class GlmCheckpointReader;
@@ -69,6 +72,10 @@ private:
     mutable std::atomic<std::uint64_t> read_calls_{};
     mutable std::atomic<std::uint64_t> read_bytes_{};
     mutable std::atomic<std::uint64_t> read_nanoseconds_{};
+    mutable std::mutex read_interval_mutex_;
+    mutable std::uint64_t active_reads_{};
+    mutable std::chrono::steady_clock::time_point read_interval_started_;
+    mutable std::uint64_t read_wall_nanoseconds_{};
 };
 
 // Loads one checkpoint linear directly into a selected GPU. `base_name` omits

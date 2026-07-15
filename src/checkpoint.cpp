@@ -145,6 +145,18 @@ ParseResult<std::vector<std::byte>> GlmCheckpointReader::pread_tensor(
         return result;
     }
     result.value.resize(static_cast<std::size_t>(bytes));
+    {
+        std::scoped_lock lock(read_interval_mutex_);
+        if (active_reads_++ == 0U) read_interval_started_ = std::chrono::steady_clock::now();
+    }
+    const auto finish_interval = [this] {
+        std::scoped_lock lock(read_interval_mutex_);
+        if (--active_reads_ == 0U) {
+            read_wall_nanoseconds_ += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - read_interval_started_).count());
+        }
+    };
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t completed = 0U;
     while (completed < bytes) {
@@ -158,11 +170,13 @@ ParseResult<std::vector<std::byte>> GlmCheckpointReader::pread_tensor(
             result.errors.emplace_back("cannot read tensor " + tensor.name + ": " +
                                        std::strerror(errno));
             result.value.clear();
+            finish_interval();
             return result;
         }
         if (count == 0) {
             result.errors.emplace_back("unexpected end of shard while reading " + tensor.name);
             result.value.clear();
+            finish_interval();
             return result;
         }
         completed += static_cast<std::uint64_t>(count);
@@ -173,6 +187,7 @@ ParseResult<std::vector<std::byte>> GlmCheckpointReader::pread_tensor(
     read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     read_nanoseconds_.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
                                 std::memory_order_relaxed);
+    finish_interval();
     return result;
 }
 
@@ -270,9 +285,11 @@ ParseResult<std::vector<float>> GlmCheckpointReader::read_f32_row(
 }
 
 CheckpointReadStats GlmCheckpointReader::stats() const noexcept {
+    std::scoped_lock lock(read_interval_mutex_);
     return {read_calls_.load(std::memory_order_relaxed),
             read_bytes_.load(std::memory_order_relaxed),
-            read_nanoseconds_.load(std::memory_order_relaxed)};
+            read_nanoseconds_.load(std::memory_order_relaxed),
+            read_wall_nanoseconds_};
 }
 
 ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,

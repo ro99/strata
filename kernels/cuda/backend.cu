@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -130,6 +132,10 @@ struct CudaWeight::Impl {
 struct CudaBackend::Impl {
     struct DeviceState {
         cudaStream_t stream{};
+        cudaEvent_t activation_start{};
+        cudaEvent_t activation_uploaded{};
+        cudaEvent_t kernel_finished{};
+        cudaEvent_t activation_downloaded{};
         float* input{};
         float* output{};
         std::uint64_t input_bytes{};
@@ -138,6 +144,7 @@ struct CudaBackend::Impl {
 
     std::unordered_map<int, DeviceState> devices;
     CudaBackendStats stats;
+    bool detailed_timing{};
     mutable std::mutex mutex;
 
     ~Impl() {
@@ -145,6 +152,12 @@ struct CudaBackend::Impl {
             static_cast<void>(cudaSetDevice(device));
             if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
             if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
+            if (state.activation_start != nullptr) {
+                static_cast<void>(cudaEventDestroy(state.activation_start));
+                static_cast<void>(cudaEventDestroy(state.activation_uploaded));
+                static_cast<void>(cudaEventDestroy(state.kernel_finished));
+                static_cast<void>(cudaEventDestroy(state.activation_downloaded));
+            }
             if (state.stream != nullptr) static_cast<void>(cudaStreamDestroy(state.stream));
         }
     }
@@ -191,7 +204,8 @@ ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int device) {
     return result;
 }
 
-ValidationResult CudaBackend::initialize(std::span<const int> devices) {
+ValidationResult CudaBackend::initialize(std::span<const int> devices,
+                                         bool detailed_timing) {
     ValidationResult result;
     if (devices.empty()) {
         result.errors.emplace_back("CUDA backend requires at least one device");
@@ -201,6 +215,7 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices) {
     if (const auto status = cudaGetDeviceCount(&count); status != cudaSuccess) {
         return cuda_error(status, "enumerate CUDA devices");
     }
+    impl_->detailed_timing = detailed_timing;
     for (const int device : devices) {
         if (device < 0 || device >= count || impl_->devices.contains(device)) {
             result.errors.emplace_back("CUDA device list contains an invalid or duplicate device");
@@ -214,7 +229,18 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices) {
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
         }
+        if (detailed_timing) {
+            for (auto* event : {&state.activation_start, &state.activation_uploaded,
+                                &state.kernel_finished, &state.activation_downloaded}) {
+                if (auto status = cudaEventCreate(event); status != cudaSuccess) {
+                    return cuda_error(status, "create CUDA timing event");
+                }
+            }
+        }
         impl_->devices.emplace(device, state);
+        CudaBackendStats::Device device_stats;
+        device_stats.device = device;
+        impl_->stats.devices.push_back(device_stats);
     }
     return result;
 }
@@ -297,12 +323,24 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             return cuda_error(status, "upload CUDA scales");
         }
     }
+    const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA weight upload");
     }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
     {
         std::scoped_lock lock(impl_->mutex);
-        impl_->stats.weight_upload_bytes += target->bytes;
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        device_stats.weight_upload_bytes += target->bytes;
+        device_stats.weight_allocation_calls += expected_scales == 0U ? 1U : 2U;
+        device_stats.weight_allocation_bytes += target->bytes;
+        ++device_stats.synchronization_calls;
+        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        device_stats.upload_wait_nanoseconds += wait_nanoseconds;
     }
     output.impl_ = std::move(target);
     return result;
@@ -329,6 +367,8 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
     }
     const auto input_bytes = static_cast<std::uint64_t>(input.size_bytes());
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    std::uint64_t workspace_allocation_calls = 0U;
+    std::uint64_t workspace_allocation_bytes = 0U;
     if (input_bytes > state.input_bytes) {
         if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
         if (auto status = cudaMalloc(&state.input, static_cast<std::size_t>(input_bytes));
@@ -336,6 +376,8 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
             return cuda_error(status, "allocate CUDA input workspace");
         }
         state.input_bytes = input_bytes;
+        ++workspace_allocation_calls;
+        workspace_allocation_bytes += input_bytes;
     }
     if (output_bytes > state.output_bytes) {
         if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
@@ -344,11 +386,25 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
             return cuda_error(status, "allocate CUDA output workspace");
         }
         state.output_bytes = output_bytes;
+        ++workspace_allocation_calls;
+        workspace_allocation_bytes += output_bytes;
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record activation upload start");
+        }
     }
     if (auto status = cudaMemcpyAsync(state.input, input.data(), input.size_bytes(),
                                       cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "upload CUDA activation");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record activation upload completion");
+        }
     }
     const dim3 grid(static_cast<unsigned int>(descriptor.rows), rows, 1U);
     constexpr unsigned int threads = 256U;
@@ -368,19 +424,74 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch CUDA matmul");
     }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record CUDA kernel completion");
+        }
+    }
     if (auto status = cudaMemcpyAsync(output.data(), state.output, output.size_bytes(),
                                       cudaMemcpyDeviceToHost, state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "download CUDA activation");
     }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record activation download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA matmul");
     }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    std::uint64_t activation_h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t activation_d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_milliseconds = 0.0F;
+        float kernel_milliseconds = 0.0F;
+        float d2h_milliseconds = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_milliseconds, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure activation upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_milliseconds, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure CUDA kernel");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_milliseconds, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure activation download");
+        }
+        activation_h2d_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(h2d_milliseconds) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(kernel_milliseconds) * 1.0e6));
+        activation_d2h_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(d2h_milliseconds) * 1.0e6));
+    }
     {
         std::scoped_lock lock(impl_->mutex);
-        impl_->stats.activation_h2d_bytes += input_bytes;
-        impl_->stats.activation_d2h_bytes += output_bytes;
-        ++impl_->stats.matmul_calls;
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [&weight](const auto& value) { return value.device == weight.impl_->device; });
+        device_stats.activation_h2d_bytes += input_bytes;
+        device_stats.activation_d2h_bytes += output_bytes;
+        ++device_stats.matmul_calls;
+        device_stats.workspace_allocation_calls += workspace_allocation_calls;
+        device_stats.workspace_allocation_bytes += workspace_allocation_bytes;
+        ++device_stats.synchronization_calls;
+        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        device_stats.activation_h2d_nanoseconds += activation_h2d_nanoseconds;
+        device_stats.kernel_nanoseconds += kernel_nanoseconds;
+        device_stats.activation_d2h_nanoseconds += activation_d2h_nanoseconds;
     }
     return result;
 }
@@ -391,12 +502,47 @@ ValidationResult CudaBackend::synchronize(int device) {
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for synchronization");
     }
-    return cuda_error(cudaStreamSynchronize(found->second.stream), "synchronize CUDA device");
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = cudaStreamSynchronize(found->second.stream);
+    const auto elapsed = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+    if (status == cudaSuccess) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++device_stats.synchronization_calls;
+        device_stats.synchronization_nanoseconds += elapsed;
+    }
+    return cuda_error(status, "synchronize CUDA device");
 }
 
 CudaBackendStats CudaBackend::stats() const noexcept {
     std::scoped_lock lock(impl_->mutex);
-    return impl_->stats;
+    auto result = impl_->stats;
+    for (const auto& device : result.devices) {
+        result.weight_upload_bytes += device.weight_upload_bytes;
+        result.activation_h2d_bytes += device.activation_h2d_bytes;
+        result.activation_d2h_bytes += device.activation_d2h_bytes;
+        result.matmul_calls += device.matmul_calls;
+        result.weight_allocation_calls += device.weight_allocation_calls;
+        result.weight_allocation_bytes += device.weight_allocation_bytes;
+        result.workspace_allocation_calls += device.workspace_allocation_calls;
+        result.workspace_allocation_bytes += device.workspace_allocation_bytes;
+        result.synchronization_calls += device.synchronization_calls;
+        result.synchronization_nanoseconds = std::max(
+            result.synchronization_nanoseconds, device.synchronization_nanoseconds);
+        result.upload_wait_nanoseconds = std::max(
+            result.upload_wait_nanoseconds, device.upload_wait_nanoseconds);
+        result.activation_h2d_nanoseconds = std::max(
+            result.activation_h2d_nanoseconds, device.activation_h2d_nanoseconds);
+        result.kernel_nanoseconds = std::max(
+            result.kernel_nanoseconds, device.kernel_nanoseconds);
+        result.activation_d2h_nanoseconds = std::max(
+            result.activation_d2h_nanoseconds, device.activation_d2h_nanoseconds);
+    }
+    return result;
 }
 
 }  // namespace strata

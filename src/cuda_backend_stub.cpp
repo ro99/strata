@@ -23,7 +23,7 @@ ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int) {
     return {{}, {"CUDA support was not compiled into this build"}};
 }
 
-ValidationResult CudaBackend::initialize(std::span<const int>) {
+ValidationResult CudaBackend::initialize(std::span<const int>, bool) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

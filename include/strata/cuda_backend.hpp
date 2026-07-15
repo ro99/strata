@@ -29,10 +29,41 @@ struct CudaWeightDescriptor {
 };
 
 struct CudaBackendStats {
+    // Byte and event totals sum devices. Aggregate durations are the maximum
+    // per-device service duration so concurrent device work is not double-counted.
+    struct Device {
+        int device{-1};
+        std::uint64_t weight_upload_bytes{};
+        std::uint64_t activation_h2d_bytes{};
+        std::uint64_t activation_d2h_bytes{};
+        std::uint64_t matmul_calls{};
+        std::uint64_t weight_allocation_calls{};
+        std::uint64_t weight_allocation_bytes{};
+        std::uint64_t workspace_allocation_calls{};
+        std::uint64_t workspace_allocation_bytes{};
+        std::uint64_t synchronization_calls{};
+        std::uint64_t synchronization_nanoseconds{};
+        std::uint64_t upload_wait_nanoseconds{};
+        std::uint64_t activation_h2d_nanoseconds{};
+        std::uint64_t kernel_nanoseconds{};
+        std::uint64_t activation_d2h_nanoseconds{};
+    };
+
     std::uint64_t weight_upload_bytes{};
     std::uint64_t activation_h2d_bytes{};
     std::uint64_t activation_d2h_bytes{};
     std::uint64_t matmul_calls{};
+    std::uint64_t weight_allocation_calls{};
+    std::uint64_t weight_allocation_bytes{};
+    std::uint64_t workspace_allocation_calls{};
+    std::uint64_t workspace_allocation_bytes{};
+    std::uint64_t synchronization_calls{};
+    std::uint64_t synchronization_nanoseconds{};
+    std::uint64_t upload_wait_nanoseconds{};
+    std::uint64_t activation_h2d_nanoseconds{};
+    std::uint64_t kernel_nanoseconds{};
+    std::uint64_t activation_d2h_nanoseconds{};
+    std::vector<Device> devices;
 };
 
 struct CudaDeviceMemory {
@@ -72,7 +103,8 @@ public:
     [[nodiscard]] static std::vector<int> available_devices();
     [[nodiscard]] static ParseResult<CudaDeviceMemory> device_memory(int device);
 
-    [[nodiscard]] ValidationResult initialize(std::span<const int> devices);
+    [[nodiscard]] ValidationResult initialize(std::span<const int> devices,
+                                              bool detailed_timing = false);
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,

@@ -16,6 +16,9 @@ struct Glm52RuntimeConfig {
     std::uint32_t maximum_context_tokens{256};
     bool verbose{true};
     bool diagnostic_trace{};
+    bool detailed_timing{};
+    std::string route_trace_path;
+    std::uint64_t request_id{};
 };
 
 struct Glm52CacheStats {
@@ -25,6 +28,18 @@ struct Glm52CacheStats {
     std::vector<std::uint64_t> used_bytes;
     std::vector<std::uint64_t> peak_bytes;
     std::vector<std::uint64_t> capacity_bytes;
+    std::vector<std::uint64_t> pinned_resident_bytes;
+    std::vector<std::uint64_t> evictable_expert_bytes;
+    std::vector<std::uint64_t> device_hits;
+    std::vector<std::uint64_t> device_misses;
+    std::vector<std::uint64_t> device_evictions;
+};
+
+struct Glm52PhaseMetrics {
+    CheckpointReadStats checkpoint_reads;
+    CudaBackendStats cuda;
+    Glm52CacheStats cache;
+    std::uint64_t host_aggregation_nanoseconds{};
 };
 
 struct Glm52RunMetrics {
@@ -35,6 +50,9 @@ struct Glm52RunMetrics {
     CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Glm52CacheStats cache;
+    Glm52PhaseMetrics prefill;
+    Glm52PhaseMetrics decode;
+    bool detailed_timing{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {
         return prefill_seconds > 0.0 ? static_cast<double>(prompt_tokens) / prefill_seconds : 0.0;

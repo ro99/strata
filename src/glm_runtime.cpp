@@ -11,6 +11,8 @@
 #include <cmath>
 #include <future>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <iostream>
 #include <mutex>
@@ -213,7 +215,11 @@ class WeightCache {
         std::uint64_t capacity{};
         std::uint64_t used{};
         std::uint64_t peak{};
+        std::uint64_t pinned_used{};
         std::uint64_t clock{};
+        std::uint64_t hits{};
+        std::uint64_t misses{};
+        std::uint64_t evictions{};
     };
 
 public:
@@ -273,6 +279,11 @@ public:
             result.used_bytes.push_back(state.used);
             result.peak_bytes.push_back(state.peak);
             result.capacity_bytes.push_back(state.capacity);
+            result.pinned_resident_bytes.push_back(state.pinned_used);
+            result.evictable_expert_bytes.push_back(state.used - state.pinned_used);
+            result.device_hits.push_back(state.hits);
+            result.device_misses.push_back(state.misses);
+            result.device_evictions.push_back(state.evictions);
         }
         return result;
     }
@@ -289,7 +300,11 @@ private:
         auto found = state.entries.find(key);
         if (found != state.entries.end()) {
             found->second.last_use = state.clock;
-            found->second.pinned = found->second.pinned || pin;
+            if (pin && !found->second.pinned) {
+                found->second.pinned = true;
+                state.pinned_used += found->second.weight.device_bytes();
+            }
+            ++state.hits;
             hits_.fetch_add(1U, std::memory_order_relaxed);
             output = &found->second;
             return result;
@@ -321,6 +336,7 @@ private:
             }
             state.used -= victim->second.weight.device_bytes();
             state.entries.erase(victim);
+            ++state.evictions;
             evictions_.fetch_add(1U, std::memory_order_relaxed);
         }
         Entry entry;
@@ -331,9 +347,11 @@ private:
         entry.last_use = state.clock;
         entry.pinned = pin;
         state.used += entry.weight.device_bytes();
+        if (pin) state.pinned_used += entry.weight.device_bytes();
         state.peak = std::max(state.peak, state.used);
         found = state.entries.emplace(key, std::move(entry)).first;
         misses_.fetch_add(1U, std::memory_order_relaxed);
+        ++state.misses;
         output = &found->second;
         return result;
     }
@@ -346,6 +364,106 @@ private:
     std::atomic<std::uint64_t> misses_{};
     std::atomic<std::uint64_t> evictions_{};
 };
+
+CheckpointReadStats checkpoint_delta(const CheckpointReadStats& after,
+                                     const CheckpointReadStats& before) {
+    return {after.calls - before.calls, after.bytes - before.bytes,
+            after.nanoseconds - before.nanoseconds,
+            after.wall_nanoseconds - before.wall_nanoseconds};
+}
+
+CudaBackendStats::Device cuda_device_delta(const CudaBackendStats::Device& after,
+                                           const CudaBackendStats::Device& before) {
+    CudaBackendStats::Device result;
+    result.device = after.device;
+#define STRATA_CUDA_DEVICE_DELTA(field) result.field = after.field - before.field
+    STRATA_CUDA_DEVICE_DELTA(weight_upload_bytes);
+    STRATA_CUDA_DEVICE_DELTA(activation_h2d_bytes);
+    STRATA_CUDA_DEVICE_DELTA(activation_d2h_bytes);
+    STRATA_CUDA_DEVICE_DELTA(matmul_calls);
+    STRATA_CUDA_DEVICE_DELTA(weight_allocation_calls);
+    STRATA_CUDA_DEVICE_DELTA(weight_allocation_bytes);
+    STRATA_CUDA_DEVICE_DELTA(workspace_allocation_calls);
+    STRATA_CUDA_DEVICE_DELTA(workspace_allocation_bytes);
+    STRATA_CUDA_DEVICE_DELTA(synchronization_calls);
+    STRATA_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
+#undef STRATA_CUDA_DEVICE_DELTA
+    return result;
+}
+
+CudaBackendStats cuda_delta(const CudaBackendStats& after,
+                            const CudaBackendStats& before) {
+    CudaBackendStats result;
+#define STRATA_CUDA_DELTA(field) result.field = after.field - before.field
+    STRATA_CUDA_DELTA(weight_upload_bytes);
+    STRATA_CUDA_DELTA(activation_h2d_bytes);
+    STRATA_CUDA_DELTA(activation_d2h_bytes);
+    STRATA_CUDA_DELTA(matmul_calls);
+    STRATA_CUDA_DELTA(weight_allocation_calls);
+    STRATA_CUDA_DELTA(weight_allocation_bytes);
+    STRATA_CUDA_DELTA(workspace_allocation_calls);
+    STRATA_CUDA_DELTA(workspace_allocation_bytes);
+    STRATA_CUDA_DELTA(synchronization_calls);
+    STRATA_CUDA_DELTA(synchronization_nanoseconds);
+    STRATA_CUDA_DELTA(upload_wait_nanoseconds);
+    STRATA_CUDA_DELTA(activation_h2d_nanoseconds);
+    STRATA_CUDA_DELTA(kernel_nanoseconds);
+    STRATA_CUDA_DELTA(activation_d2h_nanoseconds);
+#undef STRATA_CUDA_DELTA
+    result.synchronization_nanoseconds = 0U;
+    result.upload_wait_nanoseconds = 0U;
+    result.activation_h2d_nanoseconds = 0U;
+    result.kernel_nanoseconds = 0U;
+    result.activation_d2h_nanoseconds = 0U;
+    for (const auto& device_after : after.devices) {
+        const auto found = std::find_if(
+            before.devices.begin(), before.devices.end(),
+            [&device_after](const auto& value) { return value.device == device_after.device; });
+        if (found == before.devices.end()) {
+            result.devices.push_back(device_after);
+        } else {
+            result.devices.push_back(cuda_device_delta(device_after, *found));
+        }
+        const auto& delta = result.devices.back();
+        result.synchronization_nanoseconds = std::max(
+            result.synchronization_nanoseconds, delta.synchronization_nanoseconds);
+        result.upload_wait_nanoseconds = std::max(
+            result.upload_wait_nanoseconds, delta.upload_wait_nanoseconds);
+        result.activation_h2d_nanoseconds = std::max(
+            result.activation_h2d_nanoseconds, delta.activation_h2d_nanoseconds);
+        result.kernel_nanoseconds = std::max(
+            result.kernel_nanoseconds, delta.kernel_nanoseconds);
+        result.activation_d2h_nanoseconds = std::max(
+            result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
+    }
+    return result;
+}
+
+std::vector<std::uint64_t> counter_delta(const std::vector<std::uint64_t>& after,
+                                         const std::vector<std::uint64_t>& before) {
+    std::vector<std::uint64_t> result;
+    result.reserve(after.size());
+    for (std::size_t index = 0; index < after.size(); ++index) {
+        result.push_back(after[index] - (index < before.size() ? before[index] : 0U));
+    }
+    return result;
+}
+
+Glm52CacheStats cache_delta(const Glm52CacheStats& after,
+                            const Glm52CacheStats& before) {
+    Glm52CacheStats result = after;
+    result.hits -= before.hits;
+    result.misses -= before.misses;
+    result.evictions -= before.evictions;
+    result.device_hits = counter_delta(after.device_hits, before.device_hits);
+    result.device_misses = counter_delta(after.device_misses, before.device_misses);
+    result.device_evictions = counter_delta(after.device_evictions, before.device_evictions);
+    return result;
+}
 
 struct LayerKv {
     std::vector<float> keys;
@@ -376,9 +494,13 @@ struct Glm52Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::uint32_t, std::vector<float>> embedding_rows;
     std::vector<LayerKv> kv{kLayers};
+    std::ofstream route_trace;
     bool initialized{};
     std::uint32_t last_second_token{};
     float last_logit_margin{};
+    std::uint64_t host_aggregation_nanoseconds{};
+    std::uint64_t active_request_id{};
+    std::uint64_t generated_requests{};
 
     std::size_t layer_device(std::uint32_t layer) const {
         return device_schedule[layer % device_schedule.size()];
@@ -386,6 +508,27 @@ struct Glm52Runtime::Impl {
 
     std::size_t expert_device(std::uint32_t expert) const {
         return device_schedule[expert % device_schedule.size()];
+    }
+
+    bool write_route(std::uint32_t position, std::uint32_t layer,
+                     const GlmRoute& route, bool prefill) {
+        if (!route_trace.is_open()) return true;
+        route_trace << "{\"request\":" << active_request_id
+                    << ",\"phase\":\"" << (prefill ? "prefill" : "decode")
+                    << "\",\"token_position\":" << position
+                    << ",\"layer\":" << layer << ",\"experts\":[";
+        for (std::size_t rank = 0; rank < route.experts.size(); ++rank) {
+            if (rank != 0U) route_trace << ',';
+            route_trace << route.experts[rank];
+        }
+        route_trace << "],\"coefficients\":[" << std::setprecision(
+            std::numeric_limits<float>::max_digits10);
+        for (std::size_t rank = 0; rank < route.weights.size(); ++rank) {
+            if (rank != 0U) route_trace << ',';
+            route_trace << route.weights[rank];
+        }
+        route_trace << "]}\n";
+        return route_trace.good();
     }
 
     ParseResult<const std::vector<float>*> host_tensor(std::string name,
@@ -691,7 +834,8 @@ struct Glm52Runtime::Impl {
     }
 
     ValidationResult sparse_mlp(std::uint32_t layer, std::span<const float> input,
-                                std::uint32_t rows, std::span<float> output) {
+                                std::uint32_t rows, std::uint32_t position_base,
+                                bool prefill, std::span<float> output) {
         ValidationResult result;
         const auto prefix = layer_prefix(layer) + "mlp.";
         std::vector<float> logits(static_cast<std::size_t>(rows) * kExperts);
@@ -715,6 +859,10 @@ struct Glm52Runtime::Impl {
                 return result;
             }
             routes[row] = std::move(routed.value);
+            if (!write_route(position_base + row, layer, routes[row], prefill)) {
+                result.errors.emplace_back("cannot write GLM route trace");
+                return result;
+            }
         }
 
         std::array<std::int32_t, kExperts> job_by_expert{};
@@ -747,6 +895,7 @@ struct Glm52Runtime::Impl {
             }));
         }
         for (auto& worker : workers) worker.get();
+        const auto aggregation_started = std::chrono::steady_clock::now();
         std::fill(output.begin(), output.end(), 0.0F);
         for (const auto& job : jobs) {
             if (!job.errors.empty()) {
@@ -769,17 +918,24 @@ struct Glm52Runtime::Impl {
                 }
             }
         }
+        host_aggregation_nanoseconds += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - aggregation_started).count());
 
         std::vector<float> shared(output.size());
         result = mlp_triplet(layer_device(layer), prefix + "shared_experts.",
                              kExpertIntermediate, input, rows, shared);
         if (!result.ok()) return result;
+        const auto shared_aggregation_started = std::chrono::steady_clock::now();
         for (std::size_t index = 0; index < output.size(); ++index) output[index] += shared[index];
+        host_aggregation_nanoseconds += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - shared_aggregation_started).count());
         return result;
     }
 
     ValidationResult forward_layers(std::span<float> hidden, std::uint32_t rows,
-                                    std::uint32_t position_base) {
+                                    std::uint32_t position_base, bool prefill) {
         ValidationResult result;
         std::vector<float> normalized(hidden.size());
         std::vector<float> branch(hidden.size());
@@ -804,7 +960,7 @@ struct Glm52Runtime::Impl {
                 result = mlp_triplet(layer_device(layer), prefix + "mlp.",
                                      kDenseIntermediate, normalized, rows, branch);
             } else {
-                result = sparse_mlp(layer, normalized, rows, branch);
+                result = sparse_mlp(layer, normalized, rows, position_base, prefill, branch);
             }
             if (!result.ok()) return result;
             for (std::size_t index = 0; index < hidden.size(); ++index) hidden[index] += branch[index];
@@ -826,7 +982,7 @@ struct Glm52Runtime::Impl {
     }
 
     ParseResult<std::uint32_t> forward(std::span<const std::uint32_t> token_ids,
-                                       std::uint32_t position_base) {
+                                       std::uint32_t position_base, bool prefill) {
         ParseResult<std::uint32_t> result;
         const auto rows = static_cast<std::uint32_t>(token_ids.size());
         if (rows == 0U || position_base + rows > config.maximum_context_tokens) {
@@ -839,7 +995,7 @@ struct Glm52Runtime::Impl {
             result.errors = std::move(status.errors);
             return result;
         }
-        status = forward_layers(hidden, rows, position_base);
+        status = forward_layers(hidden, rows, position_base, prefill);
         if (!status.ok()) {
             result.errors = std::move(status.errors);
             return result;
@@ -881,6 +1037,7 @@ struct Glm52Runtime::Impl {
     }
 
     void reset_sequence() {
+        host_aggregation_nanoseconds = 0U;
         for (auto& layer : kv) {
             layer.keys.clear();
             layer.values.clear();
@@ -925,8 +1082,20 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         result.errors = std::move(tokenizer.errors);
         return result;
     }
-    result = impl_->cuda.initialize(config.devices);
+    result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
+    if (!config.route_trace_path.empty()) {
+        impl_->route_trace.open(config.route_trace_path, std::ios::out | std::ios::trunc);
+        if (!impl_->route_trace.is_open()) {
+            result.errors.emplace_back("cannot open GLM route trace: " +
+                                       config.route_trace_path);
+            return result;
+        }
+        impl_->route_trace
+            << "{\"schema\":\"strata.glm52.route_trace\",\"version\":1,"
+               "\"position_base\":0,\"layer_base\":0,\"router_order\":true,"
+               "\"coefficient_encoding\":\"float32-roundtrip-decimal\"}\n";
+    }
 
     std::vector<std::uint64_t> capacities;
     std::vector<std::uint64_t> totals;
@@ -995,12 +1164,14 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
         return result;
     }
     result.prompt_token_ids = encoded.value;
+    impl_->active_request_id = impl_->config.request_id + impl_->generated_requests++;
     impl_->reset_sequence();
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
+    const auto aggregation_before = impl_->host_aggregation_nanoseconds;
     const auto prefill_start = std::chrono::steady_clock::now();
-    auto next = impl_->forward(result.prompt_token_ids, 0U);
+    auto next = impl_->forward(result.prompt_token_ids, 0U, true);
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_start).count();
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
@@ -1008,6 +1179,10 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
         result.errors = std::move(next.errors);
         return result;
     }
+    const auto reads_after_prefill = impl_->checkpoint->stats();
+    const auto cuda_after_prefill = impl_->cuda.stats();
+    const auto cache_after_prefill = impl_->weights->stats();
+    const auto aggregation_after_prefill = impl_->host_aggregation_nanoseconds;
     if (impl_->config.verbose) {
         std::cerr << "[token] position=" << result.prompt_token_ids.size()
                   << " id=" << next.value << " second=" << impl_->last_second_token
@@ -1023,7 +1198,7 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
     const auto decode_start = std::chrono::steady_clock::now();
     while (!is_stop(next.value) && result.generated_token_ids.size() < maximum_new_tokens) {
         const std::array<std::uint32_t, 1> input{next.value};
-        next = impl_->forward(input, position++);
+        next = impl_->forward(input, position++, false);
         if (!next.ok()) {
             result.errors = std::move(next.errors);
             return result;
@@ -1044,19 +1219,31 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
         return result;
     }
     result.text = std::move(decoded.value);
-    result.metrics.checkpoint_reads = impl_->checkpoint->stats();
-    result.metrics.checkpoint_reads.calls -= reads_before.calls;
-    result.metrics.checkpoint_reads.bytes -= reads_before.bytes;
-    result.metrics.checkpoint_reads.nanoseconds -= reads_before.nanoseconds;
-    result.metrics.cuda = impl_->cuda.stats();
-    result.metrics.cuda.weight_upload_bytes -= cuda_before.weight_upload_bytes;
-    result.metrics.cuda.activation_h2d_bytes -= cuda_before.activation_h2d_bytes;
-    result.metrics.cuda.activation_d2h_bytes -= cuda_before.activation_d2h_bytes;
-    result.metrics.cuda.matmul_calls -= cuda_before.matmul_calls;
-    result.metrics.cache = impl_->weights->stats();
-    result.metrics.cache.hits -= cache_before.hits;
-    result.metrics.cache.misses -= cache_before.misses;
-    result.metrics.cache.evictions -= cache_before.evictions;
+    const auto reads_after_decode = impl_->checkpoint->stats();
+    const auto cuda_after_decode = impl_->cuda.stats();
+    const auto cache_after_decode = impl_->weights->stats();
+    const auto aggregation_after_decode = impl_->host_aggregation_nanoseconds;
+    result.metrics.prefill.checkpoint_reads = checkpoint_delta(reads_after_prefill, reads_before);
+    result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
+    result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
+    result.metrics.prefill.host_aggregation_nanoseconds =
+        aggregation_after_prefill - aggregation_before;
+    result.metrics.decode.checkpoint_reads = checkpoint_delta(
+        reads_after_decode, reads_after_prefill);
+    result.metrics.decode.cuda = cuda_delta(cuda_after_decode, cuda_after_prefill);
+    result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
+    result.metrics.decode.host_aggregation_nanoseconds =
+        aggregation_after_decode - aggregation_after_prefill;
+    result.metrics.checkpoint_reads = checkpoint_delta(reads_after_decode, reads_before);
+    result.metrics.cuda = cuda_delta(cuda_after_decode, cuda_before);
+    result.metrics.cache = cache_delta(cache_after_decode, cache_before);
+    result.metrics.detailed_timing = impl_->config.detailed_timing;
+    if (impl_->route_trace.is_open()) {
+        impl_->route_trace.flush();
+        if (!impl_->route_trace.good()) {
+            result.errors.emplace_back("cannot flush GLM route trace");
+        }
+    }
     return result;
 }
 

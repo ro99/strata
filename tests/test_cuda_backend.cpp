@@ -30,7 +30,7 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
 
     strata::CudaBackend backend;
     const std::array<int, 1> selected{devices.front()};
-    REQUIRE(backend.initialize(selected).ok());
+    REQUIRE(backend.initialize(selected, true).ok());
 
     // Row 0 = [-8, -7, -6, -5], row 1 = [4, 3, 2, 1].
     std::array<std::byte, 8> packed{};
@@ -58,7 +58,17 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
     REQUIRE(backend.matmul(weight, input, 1U, output).ok());
     REQUIRE(output[0] == -60.0F);
     REQUIRE(output[1] == 10.0F);
-    REQUIRE(backend.stats().matmul_calls == 1U);
+    const auto first_stats = backend.stats();
+    REQUIRE(first_stats.matmul_calls == 1U);
+    REQUIRE(first_stats.weight_upload_bytes == 12U);
+    REQUIRE(first_stats.activation_h2d_bytes == 16U);
+    REQUIRE(first_stats.activation_d2h_bytes == 8U);
+    REQUIRE(first_stats.weight_allocation_calls == 2U);
+    REQUIRE(first_stats.workspace_allocation_calls == 2U);
+    REQUIRE(first_stats.synchronization_calls == 2U);
+    REQUIRE(first_stats.devices.size() == 1U);
+    REQUIRE(first_stats.devices[0].device == devices.front());
+    REQUIRE(first_stats.devices[0].kernel_nanoseconds > 0U);
 
     std::array<std::byte, 8> plain{};
     const std::array<float, 4> plain_values{1.0F, 2.0F, 3.0F, 4.0F};

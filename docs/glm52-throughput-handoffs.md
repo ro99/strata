@@ -19,12 +19,54 @@ previous stage's committed evidence.
 Later stages are conditional. A listed implementation is not authorization to
 perform it when an earlier measurement or simulation gate fails.
 
+## Branch lineage and stage promotion
+
+The accepted stage is the source of truth for the next stage. Agents must never
+start a later stage from an old `main`, an unrelated branch, or an uncommitted
+worktree when the prerequisite stage has accepted commits.
+
+Every stage handoff must name both the stage branch and the exact base revision
+used to create it. The next agent must verify that revision before editing:
+
+```bash
+git status --short --branch
+git rev-parse HEAD
+git merge-base --is-ancestor <base-revision> HEAD
+```
+
+When a stage passes its gate, its accepted implementation and evidence commits
+must be merged into `main` before the next stage branch is created. Keep the
+stage branch for auditability, and create the next branch from the updated
+`main`:
+
+```bash
+git switch main
+git merge --ff-only <accepted-stage-branch>
+git switch -c <next-stage-branch> main
+```
+
+If the merge cannot be performed immediately, the next-stage branch may be
+created directly at the accepted stage's commit, but the handoff must record
+that commit and the merge must happen before the next stage is treated as a
+new baseline. Do not silently rebase, squash, or substitute another revision.
+
+When a stage is rejected, do not merge its experimental runtime behavior into
+`main`. Leave the branch and experiment record reachable for reproducibility.
+Generic tests or tooling may be extracted in a separate reviewed commit only
+when they do not carry the rejected policy. A blocked stage is not merged.
+
+An accepted stage becomes part of the validated baseline; a rejected or blocked
+stage remains an isolated experiment. This is what keeps a later LLM session
+from running against code that differs from the previous accepted stage.
+
 Use this minimal prompt when assigning work in a fresh chat:
 
 ```text
-Execute only stage T<n> from docs/glm52-throughput-handoffs.md. Read AGENTS.md
-and all prerequisites first. Stop after its gate and handoff record; do not
-start or implement any later stage in this chat.
+Execute only stage T<n> from docs/glm52-throughput-handoffs.md. The accepted
+prerequisite base revision is <base-revision>; verify HEAD contains it before
+editing and create the assigned branch from that baseline. Read AGENTS.md and
+all prerequisites first. Stop after its gate and handoff record; do not start
+or implement any later stage in this chat.
 ```
 
 ## Shared experiment contract
@@ -87,9 +129,12 @@ Before editing:
 3. Preserve unrelated changes. Do not work on `main`; create the stage branch
    named below, or a single-purpose branch with the same prefix when that name
    already exists.
-4. State the stage hypothesis, primary metric, correctness gate, memory
+4. Verify the prerequisite's recorded base revision and create the assigned
+   branch from the accepted prerequisite baseline. Record the parent revision
+   before editing.
+5. State the stage hypothesis, primary metric, correctness gate, memory
    ceiling, and rollback condition before changing files.
-5. Do not import runtime code, quantization, or model artifacts from Pulsar or
+6. Do not import runtime code, quantization, or model artifacts from Pulsar or
    Colibri. Implement Strata-native C/C++ interfaces and preserve the existing
    checkpoint.
 
@@ -111,6 +156,7 @@ this template:
 ```text
 Stage:
 Status: complete | rejected | blocked
+Base revision:
 Branch and commit:
 Hypothesis:
 Files changed:

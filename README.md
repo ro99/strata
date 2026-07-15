@@ -205,7 +205,9 @@ VRAM, peer, and NVMe budgets:
 See [`docs/model-bringup.md`](docs/model-bringup.md),
 [`docs/architecture.md`](docs/architecture.md), and
 [`docs/research-roadmap.md`](docs/research-roadmap.md) for detailed contracts
-and future experiments.
+and future experiments. The staged, one-agent-at-a-time GLM throughput work is
+defined in
+[`docs/glm52-throughput-handoffs.md`](docs/glm52-throughput-handoffs.md).
 
 ## Engineering rules
 

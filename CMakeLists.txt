@@ -79,6 +79,18 @@ target_link_libraries(strata-tokenize PRIVATE strata_core)
 add_executable(strata-run apps/strata_run.cpp)
 target_link_libraries(strata-run PRIVATE strata_core)
 
+if(STRATA_HAS_CUDA)
+    find_library(NUMA_LIBRARY numa REQUIRED)
+    add_executable(strata-topology-probe apps/strata_topology_probe.cu)
+    target_link_libraries(strata-topology-probe PRIVATE strata_core ${NUMA_LIBRARY})
+    set_property(TARGET strata-topology-probe PROPERTY CUDA_ARCHITECTURES 86 120)
+    set_property(TARGET strata-topology-probe PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata-topology-probe PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-topology-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-Wall,-Wextra>
+    )
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(strata-tests
@@ -114,3 +126,6 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS strata-sim strata-inspect strata-tokenize strata-run RUNTIME DESTINATION bin)
+if(STRATA_HAS_CUDA)
+    install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)
+endif()

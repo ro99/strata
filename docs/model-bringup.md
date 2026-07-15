@@ -13,7 +13,7 @@ repository heads.
 |---|---:|---:|
 | Repository | `QuantTrio/GLM-5.2-Int4-Int8Mix` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` |
 | Revision inspected | `1d3bcfe5ec549ecd000fd80b37f191183842e983` | `62af8fffb2f7030cac4de2f0169f5b8d1101b646` |
-| Index SHA-256 | `43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b` | — |
+| Index SHA-256 | `43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b` | `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b` |
 | Indexed tensors | 177,569 | 72,317 |
 | Weight shards | 128 (124 main + 4 MTP) | 48 |
 | Indexed tensor payload | 405,459,090,304 bytes | 166,878,536,440 bytes |
@@ -196,6 +196,10 @@ and storage formats that Strata must support natively:
 
 ### Stage B0 — zero-rewrite native import
 
+Status: implemented for the pinned local checkpoint. Header/layout validation,
+native FP4/FP8 CUDA encodings, real target-byte fixtures, and resident-topology
+admission are automated.
+
 Do not convert or repack 167 GB of already-valid weights. Build a small,
 content-addressed sidecar manifest that references extents in the 48 official
 Safetensors shards. The original files remain immutable and are opened read-only.
@@ -213,6 +217,10 @@ without runtime model writes.
 
 ### Stage B1 — exact DeepSeek-V4 graph
 
+Status: base-model executor implemented with an exact 2,048-token admission
+ceiling; frozen layer, teacher-forcing, and full-generation oracle promotion is
+still pending. See `docs/deepseek-v4-runtime.md`.
+
 Implement and verify hybrid attention compression, sparse indexing, mHC,
 sqrtsoftplus routing, shared/routed experts, and tokenizer/response encoding.
 Base-model decode must pass before speculative decoding is enabled.
@@ -222,6 +230,9 @@ reference artifacts; routing and mHC invariants pass layerwise; steady-state
 decode performs zero physical NVMe reads after resident admission.
 
 ### Stage B2 — DSpark as a scheduler primitive
+
+Status: manifest semantics and all tensors are validated; execution remains
+disabled pending exact verification and provisional-state rollback fixtures.
 
 DSpark is a confidence-scheduled semi-autoregressive draft, not merely an MTP
 toggle. Strata should expose its five provisional rows directly to the

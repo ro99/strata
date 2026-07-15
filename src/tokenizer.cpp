@@ -146,11 +146,24 @@ void parse_merges(JsonCursor& cursor,
     cursor.expect('[');
     if (cursor.consume(']')) return;
     for (;;) {
-        cursor.expect('[');
-        auto left = cursor.parse_string();
-        cursor.expect(',');
-        auto right = cursor.parse_string();
-        cursor.expect(']');
+        std::string left;
+        std::string right;
+        if (cursor.peek() == '[') {
+            cursor.expect('[');
+            left = cursor.parse_string();
+            cursor.expect(',');
+            right = cursor.parse_string();
+            cursor.expect(']');
+        } else {
+            auto pair = cursor.parse_string();
+            const auto divider = pair.find(' ');
+            if (divider == std::string::npos || divider == 0U ||
+                divider + 1U >= pair.size()) {
+                throw std::runtime_error("string tokenizer merge is not a token pair");
+            }
+            left = pair.substr(0U, divider);
+            right = pair.substr(divider + 1U);
+        }
         if (!merge_ranks.emplace(merge_key(left, right), rank).second) {
             throw std::runtime_error("duplicate tokenizer merge");
         }
@@ -236,11 +249,19 @@ ParseResult<GlmTokenizer> GlmTokenizer::load(const std::string& path) {
             }
         }
         if (!cursor.finished()) throw detail::JsonError(cursor.offset(), "trailing content");
-        if (!saw_added || !saw_model || result.value.vocabulary_.size() != 154820U ||
-            result.value.merge_ranks_.size() != 321649U ||
-            added_tokens.size() != 36U || !result.value.ignore_merges_) {
-            throw std::runtime_error("tokenizer does not match the pinned GLM-5.2 contract");
+        const bool glm52 = saw_added && saw_model &&
+            result.value.vocabulary_.size() == 154820U &&
+            result.value.merge_ranks_.size() == 321649U &&
+            added_tokens.size() == 36U && result.value.ignore_merges_;
+        const bool deepseek_v4 = saw_added && saw_model &&
+            result.value.vocabulary_.size() == 128000U &&
+            result.value.merge_ranks_.size() == 127741U &&
+            added_tokens.size() == 1283U && !result.value.ignore_merges_;
+        if (!glm52 && !deepseek_v4) {
+            throw std::runtime_error(
+                "tokenizer does not match a pinned GLM-5.2 or DeepSeek-V4 contract");
         }
+        result.value.contract_ = deepseek_v4 ? Contract::DeepSeekV4 : Contract::Glm52;
         result.value.added_tokens_.reserve(added_tokens.size());
         for (auto& [content, id] : added_tokens) {
             result.value.added_tokens_.push_back({std::move(content), id});
@@ -252,8 +273,10 @@ ParseResult<GlmTokenizer> GlmTokenizer::load(const std::string& path) {
         }
         result.value.added_id_.resize(result.value.id_to_piece_.size(), false);
         for (const auto& token : result.value.added_tokens_) {
-            if (!result.value.id_to_piece_[token.id].empty()) {
-                throw std::runtime_error("added token collides with the base vocabulary");
+            if (!result.value.id_to_piece_[token.id].empty() &&
+                result.value.id_to_piece_[token.id] != token.content) {
+                throw std::runtime_error(
+                    "added token collides with a different base vocabulary piece");
             }
             result.value.id_to_piece_[token.id] = token.content;
             result.value.added_id_[token.id] = true;
@@ -533,6 +556,15 @@ std::string render_glm52_user_prompt(std::string_view user_text,
     output.append(user_text);
     output += "<|assistant|>";
     output += enable_thinking ? "<think>" : "<think></think>";
+    return output;
+}
+
+std::string render_deepseek_v4_user_prompt(std::string_view user_text,
+                                           bool enable_thinking) {
+    std::string output = "<｜begin▁of▁sentence｜><｜User｜>";
+    output.append(user_text);
+    output += "<｜Assistant｜>";
+    output += enable_thinking ? "<think>" : "</think>";
     return output;
 }
 

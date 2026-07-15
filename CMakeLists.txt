@@ -32,6 +32,11 @@ add_library(strata_core STATIC
     src/glm_ops.cpp
     src/glm_runtime.cpp
     src/glm_manifest.cpp
+    src/deepseek_manifest.cpp
+    src/deepseek_ops.cpp
+    src/deepseek_checkpoint.cpp
+    src/deepseek_admission.cpp
+    src/deepseek_runtime.cpp
     src/json_cursor.cpp
     src/model.cpp
     src/safetensors.cpp
@@ -81,6 +86,9 @@ target_link_libraries(strata-tokenize PRIVATE strata_core)
 add_executable(strata-run apps/strata_run.cpp)
 target_link_libraries(strata-run PRIVATE strata_core)
 
+add_executable(strata-deepseek-run apps/strata_deepseek_run.cpp)
+target_link_libraries(strata-deepseek-run PRIVATE strata_core)
+
 add_executable(strata-host-expert-probe apps/strata_host_expert_probe.cpp)
 target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 
@@ -104,6 +112,9 @@ if(BUILD_TESTING)
         tests/test_cuda_backend.cpp
         tests/test_glm_ops.cpp
         tests/test_glm_int4.cpp
+        tests/test_deepseek_manifest.cpp
+        tests/test_deepseek_ops.cpp
+        tests/test_deepseek_runtime.cpp
         tests/test_model.cpp
         tests/test_q4.cpp
         tests/test_trace.cpp
@@ -131,7 +142,7 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS strata-sim strata-inspect strata-tokenize strata-run
+install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run
         strata-host-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)

@@ -18,6 +18,11 @@ std::filesystem::path tokenizer_fixture() {
     return path;
 }
 
+std::filesystem::path deepseek_tokenizer_fixture() {
+    return std::filesystem::path(STRATA_SOURCE_DIR) /
+           "models/DeepSeek-V4-Flash-DSpark/tokenizer.json";
+}
+
 }  // namespace
 
 TEST_CASE("GLM single-user chat rendering matches the pinned template") {
@@ -54,4 +59,22 @@ TEST_CASE("GLM tokenizer rejects unsupported Unicode input explicitly") {
     const auto tokenizer = strata::GlmTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     REQUIRE(!tokenizer.value.encode("olá").ok());
+}
+
+TEST_CASE("real DeepSeek V4 tokenizer and single-user chat rendering are supported") {
+    const auto path = deepseek_tokenizer_fixture();
+    if (!std::filesystem::exists(path)) return;
+    const auto tokenizer = strata::GlmTokenizer::load(path.string());
+    REQUIRE(tokenizer.ok());
+    const auto rendered = strata::render_deepseek_v4_user_prompt("hello");
+    REQUIRE(rendered ==
+            "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>");
+    const auto encoded = tokenizer.value.encode(rendered);
+    REQUIRE(encoded.ok());
+    constexpr std::array<std::uint32_t, 5> expected{
+        0U, 128803U, 33310U, 128804U, 128822U};
+    REQUIRE(encoded.value.size() == expected.size());
+    for (std::size_t index = 0U; index < expected.size(); ++index) {
+        REQUIRE(encoded.value[index] == expected[index]);
+    }
 }

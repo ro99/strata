@@ -51,22 +51,99 @@ __device__ float plain_value(const void* weights, int dtype, std::uint64_t index
     return static_cast<const float*>(weights)[index];
 }
 
+__device__ float fp8_e8m0_scale(unsigned char encoded) {
+    return encoded == 0xFFU ? nanf("") : ldexpf(1.0F, static_cast<int>(encoded) - 127);
+}
+
+__device__ float fp8_e4m3_value(unsigned char encoded) {
+    const bool negative = (encoded & 0x80U) != 0U;
+    const unsigned int exponent = (encoded >> 3U) & 0x0FU;
+    const unsigned int mantissa = encoded & 0x07U;
+    float value = 0.0F;
+    if (exponent == 0U) {
+        value = ldexpf(static_cast<float>(mantissa) / 8.0F, -6);
+    } else if (exponent == 0x0FU && mantissa == 0x07U) {
+        return nanf("");
+    } else {
+        value = ldexpf(1.0F + static_cast<float>(mantissa) / 8.0F,
+                       static_cast<int>(exponent) - 7);
+    }
+    return negative ? -value : value;
+}
+
+__device__ float fp4_e2m1_value(unsigned int encoded) {
+    constexpr float table[16]{
+        0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+        0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+    return table[encoded & 0x0FU];
+}
+
+__device__ float quantize_e4m3_value(float value) {
+    const float magnitude = fminf(fabsf(value), 448.0F);
+    float quantized = 0.0F;
+    if (magnitude < 0.015625F) {
+        quantized = rintf(ldexpf(magnitude, 9)) * ldexpf(1.0F, -9);
+    } else {
+        int exponent = 0;
+        static_cast<void>(frexpf(magnitude, &exponent));
+        exponent = max(-6, min(8, exponent - 1));
+        const float step = ldexpf(1.0F, exponent - 3);
+        quantized = fminf(rintf(magnitude / step) * step, 448.0F);
+    }
+    return copysignf(quantized, value);
+}
+
+__global__ void quantize_activation_e4m3_kernel(float* values,
+                                                std::uint64_t columns,
+                                                std::uint32_t rows) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint64_t group_begin = static_cast<std::uint64_t>(blockIdx.x) * 128U;
+    if (row >= rows || group_begin >= columns) return;
+    const std::uint64_t index = group_begin + threadIdx.x;
+    const float magnitude = index < columns
+                                ? fabsf(values[static_cast<std::uint64_t>(row) * columns + index])
+                                : 0.0F;
+    __shared__ float maximum[128];
+    maximum[threadIdx.x] = magnitude;
+    __syncthreads();
+    for (unsigned int stride = 64U; stride != 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) {
+            maximum[threadIdx.x] = fmaxf(maximum[threadIdx.x],
+                                         maximum[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (index >= columns) return;
+    float scale = 1.0F;
+    if (maximum[0] > 0.0F) scale = exp2f(ceilf(log2f(maximum[0] / 448.0F)));
+    auto& value = values[static_cast<std::uint64_t>(row) * columns + index];
+    value = quantize_e4m3_value(value / scale) * scale;
+}
+
 __global__ void plain_matmul_kernel(float* output, const float* input,
                                     const void* weights, int dtype,
                                     std::uint32_t batch, std::uint64_t columns,
-                                    std::uint64_t rows) {
+                                    std::uint64_t rows, std::uint32_t groups,
+                                    std::uint64_t rows_per_group) {
     const std::uint64_t output_row = blockIdx.x;
     const std::uint32_t batch_row = blockIdx.y;
     if (output_row >= rows || batch_row >= batch) return;
     float sum = 0.0F;
     const std::uint64_t weight_base = output_row * columns;
-    const std::uint64_t input_base = static_cast<std::uint64_t>(batch_row) * columns;
+    const std::uint64_t input_row = groups == 0U
+                                        ? batch_row
+                                        : output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
     for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
         sum += plain_value(weights, dtype, weight_base + column) * input[input_base + column];
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0) {
-        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] = sum;
+        const std::uint64_t output_index = groups == 0U
+                                               ? static_cast<std::uint64_t>(batch_row) * rows +
+                                                     output_row
+                                               : output_row;
+        output[output_index] = sum;
     }
 }
 
@@ -77,7 +154,8 @@ __global__ void packed_matmul_kernel(float* output, const float* input,
                                      std::uint64_t packed_columns,
                                      std::uint64_t scale_columns,
                                      std::uint32_t batch, std::uint64_t columns,
-                                     std::uint64_t rows) {
+                                     std::uint64_t rows, std::uint32_t groups,
+                                     std::uint64_t rows_per_group) {
     const std::uint64_t output_row = blockIdx.x;
     const std::uint32_t batch_row = blockIdx.y;
     if (output_row >= rows || batch_row >= batch) return;
@@ -87,7 +165,10 @@ __global__ void packed_matmul_kernel(float* output, const float* input,
     float sum = 0.0F;
     const std::uint64_t packed_base = output_row * packed_columns;
     const std::uint64_t scale_base = output_row * scale_columns;
-    const std::uint64_t input_base = static_cast<std::uint64_t>(batch_row) * columns;
+    const std::uint64_t input_row = groups == 0U
+                                        ? batch_row
+                                        : output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
     for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
         const std::uint32_t word = packed[packed_base + column / lanes];
         const std::uint32_t raw = (word >> ((column % lanes) * bits)) & mask;
@@ -98,7 +179,73 @@ __global__ void packed_matmul_kernel(float* output, const float* input,
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0) {
-        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] = sum;
+        const std::uint64_t output_index = groups == 0U
+                                               ? static_cast<std::uint64_t>(batch_row) * rows +
+                                                     output_row
+                                               : output_row;
+        output[output_index] = sum;
+    }
+}
+
+__global__ void native_fp8_matmul_kernel(
+    float* output, const float* input, const unsigned char* weights,
+    const unsigned char* scales, std::uint64_t scale_columns,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    if (output_row >= rows || batch_row >= batch) return;
+    const std::uint64_t input_row = groups == 0U
+                                        ? batch_row
+                                        : output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
+    const std::uint64_t weight_base = output_row * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        const float weight = fp8_e4m3_value(weights[weight_base + column]);
+        const float scale = fp8_e8m0_scale(
+            scales[(output_row / 128U) * scale_columns + column / 128U]);
+        sum += input[input_base + column] * weight * scale;
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0) {
+        const std::uint64_t output_index = groups == 0U
+                                               ? static_cast<std::uint64_t>(batch_row) * rows +
+                                                     output_row
+                                               : output_row;
+        output[output_index] = sum;
+    }
+}
+
+__global__ void native_fp4_matmul_kernel(
+    float* output, const float* input, const unsigned char* weights,
+    const unsigned char* scales, std::uint64_t packed_columns,
+    std::uint64_t scale_columns, std::uint32_t batch,
+    std::uint64_t columns, std::uint64_t rows, std::uint32_t groups,
+    std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    if (output_row >= rows || batch_row >= batch) return;
+    const std::uint64_t input_row = groups == 0U
+                                        ? batch_row
+                                        : output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
+    const std::uint64_t weight_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned char packed = weights[weight_base + column / 2U];
+        const unsigned int encoded = column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        const float scale = fp8_e8m0_scale(scales[scale_base + column / 32U]);
+        sum += input[input_base + column] * fp4_e2m1_value(encoded) * scale;
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0) {
+        const std::uint64_t output_index = groups == 0U
+                                               ? static_cast<std::uint64_t>(batch_row) * rows +
+                                                     output_row
+                                               : output_row;
+        output[output_index] = sum;
     }
 }
 
@@ -271,7 +418,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid plain CUDA weight descriptor or payload");
             return result;
         }
-    } else {
+    } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
+               descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
         const std::uint32_t bits = descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4
                                        ? 4U
                                        : 8U;
@@ -287,6 +435,37 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid packed CUDA weight descriptor");
             return result;
         }
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+        const auto expected_packed_columns = (descriptor.columns + 1U) / 2U;
+        const auto expected_scale_columns = (descriptor.columns + 31U) / 32U;
+        if (descriptor.dtype != SafetensorsDtype::I8 ||
+            descriptor.packed_columns != expected_packed_columns ||
+            descriptor.scale_columns != expected_scale_columns ||
+            descriptor.group_size != 32U ||
+            !checked_bytes(descriptor.rows, descriptor.packed_columns, 1U,
+                           expected_weights) ||
+            !checked_bytes(descriptor.rows, descriptor.scale_columns, 1U,
+                           expected_scales)) {
+            result.errors.emplace_back("invalid native FP4 CUDA weight descriptor");
+            return result;
+        }
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        const auto expected_scale_columns = (descriptor.columns + 127U) / 128U;
+        const auto expected_scale_rows = (descriptor.rows + 127U) / 128U;
+        if (descriptor.dtype != SafetensorsDtype::F8E4M3 ||
+            descriptor.packed_columns != descriptor.columns ||
+            descriptor.scale_columns != expected_scale_columns ||
+            descriptor.group_size != 128U ||
+            !checked_bytes(descriptor.rows, descriptor.columns, 1U,
+                           expected_weights) ||
+            !checked_bytes(expected_scale_rows, descriptor.scale_columns, 1U,
+                           expected_scales)) {
+            result.errors.emplace_back("invalid native FP8 CUDA weight descriptor");
+            return result;
+        }
+    } else {
+        result.errors.emplace_back("unsupported CUDA weight encoding");
+        return result;
     }
     if (weights.size() != expected_weights || scales.size() != expected_scales) {
         result.errors.emplace_back("CUDA weight payload byte count is invalid");
@@ -350,14 +529,33 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::span<const float> input,
                                      std::uint32_t rows,
                                      std::span<float> output) {
+    return matmul_impl(weight, input, rows, 0U, 0U, output);
+}
+
+ValidationResult CudaBackend::matmul_grouped(
+    const CudaWeight& weight, std::span<const float> input,
+    std::uint32_t groups, std::uint64_t rows_per_group,
+    std::span<float> output) {
+    return matmul_impl(weight, input, groups, groups, rows_per_group, output);
+}
+
+ValidationResult CudaBackend::matmul_impl(
+    const CudaWeight& weight, std::span<const float> input,
+    std::uint32_t rows, std::uint32_t groups,
+    std::uint64_t rows_per_group, std::span<float> output) {
     ValidationResult result;
     if (!weight.valid()) {
         result.errors.emplace_back("CUDA matmul received an invalid weight");
         return result;
     }
     const auto& descriptor = weight.impl_->descriptor;
-    if (rows == 0U || input.size() != descriptor.columns * rows ||
-        output.size() != descriptor.rows * rows) {
+    const bool regular_shape = groups == 0U &&
+        input.size() == descriptor.columns * rows &&
+        output.size() == descriptor.rows * rows;
+    const bool grouped_shape = groups != 0U && rows == groups && rows_per_group != 0U &&
+        descriptor.rows == static_cast<std::uint64_t>(groups) * rows_per_group &&
+        input.size() == descriptor.columns * groups && output.size() == descriptor.rows;
+    if (rows == 0U || (!regular_shape && !grouped_shape)) {
         result.errors.emplace_back("CUDA matmul activation shapes are incompatible");
         return result;
     }
@@ -406,20 +604,45 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
             return cuda_error(status, "record activation upload completion");
         }
     }
-    const dim3 grid(static_cast<unsigned int>(descriptor.rows), rows, 1U);
+    const bool native = descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+                        descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
+    if (native) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((descriptor.columns + 127U) / 128U), rows, 1U);
+        quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U, state.stream>>>(
+            state.input, descriptor.columns, rows);
+    }
+    const auto output_batches = groups == 0U ? rows : 1U;
+    const dim3 grid(static_cast<unsigned int>(descriptor.rows), output_batches, 1U);
     constexpr unsigned int threads = 256U;
     if (descriptor.encoding == CudaWeightEncoding::Plain) {
         plain_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input, weight.impl_->weights,
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
-            descriptor.rows);
-    } else {
+            descriptor.rows, groups, rows_per_group);
+    } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
+               descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
         const auto bits = descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ? 4U : 8U;
         packed_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input, static_cast<const std::uint32_t*>(weight.impl_->weights),
             static_cast<const __nv_bfloat16*>(weight.impl_->scales), bits,
             descriptor.group_size, descriptor.packed_columns,
-            descriptor.scale_columns, rows, descriptor.columns, descriptor.rows);
+            descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
+            groups, rows_per_group);
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+            state.output, state.input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
+            groups, rows_per_group);
+    } else {
+        native_fp4_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+            state.output, state.input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.packed_columns, descriptor.scale_columns, rows,
+            descriptor.columns, descriptor.rows, groups, rows_per_group);
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch CUDA matmul");

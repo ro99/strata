@@ -29,6 +29,7 @@ public:
     [[nodiscard]] std::int32_t token_id(std::string_view piece) const noexcept;
 
 private:
+    enum class Contract : std::uint8_t { Glm52, DeepSeekV4 };
     struct AddedToken {
         std::string content;
         std::uint32_t id{};
@@ -47,10 +48,13 @@ private:
     std::array<std::string, 256> byte_to_piece_;
     std::array<std::int16_t, 1024> codepoint_to_byte_{};
     bool ignore_merges_{};
+    Contract contract_{Contract::Glm52};
 };
 
 [[nodiscard]] std::string render_glm52_user_prompt(
     std::string_view user_text, std::string_view reasoning_effort = "medium-high",
     bool enable_thinking = true);
+[[nodiscard]] std::string render_deepseek_v4_user_prompt(
+    std::string_view user_text, bool enable_thinking = false);
 
 }  // namespace strata

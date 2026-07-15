@@ -5,10 +5,9 @@ mixture-of-experts models whose weights exceed local VRAM. It keeps the model
 semantics exact while distributing work across GPU VRAM, host RAM, and
 read-only NVMe-backed weight storage.
 
-GLM-5.2 is the current runtime and performance target. The repository also
-contains the model-format, routing, residency, and simulation foundations for
-future architectures; those paths are not part of the current GLM throughput
-baseline.
+GLM-5.2 remains the current performance target. A separate executable adapter
+now brings up the pinned `DeepSeek-V4-Flash-DSpark` base model without changing
+the GLM execution path.
 
 ## Current status
 
@@ -30,6 +29,15 @@ The current runtime is intentionally bounded to a maximum context of 2,048
 tokens. MTP proposal acceleration is disabled in the current baseline, and
 active DSA beyond that context, MTP verification, and optimized residency
 scheduling remain future measured work.
+
+The DeepSeek adapter validates all 48 native shards and executes the 43-layer
+base graph with native FP4/FP8 weights, hybrid compressed attention, mHC,
+hash/sqrt-softplus top-6 routing, and the target tokenizer. Its admission plan
+stages the main-model routed experts and embedding into read-only RAM, keeps the
+spine and an expert cache in VRAM, and enforces zero checkpoint reads during
+decode. Its current exact context ceiling is also 2,048 tokens. DSpark tensors
+are validated but speculative execution is rejected until target verification
+and provisional-state rollback have frozen oracles.
 
 The latest correctness and determinism gates pass:
 
@@ -154,6 +162,30 @@ hashes during diagnosis:
 ```bash
 DIAGNOSTIC_TRACE=1 scripts/check_glm52_determinism.sh
 ```
+
+## Run DeepSeek-V4-Flash-DSpark
+
+The exact resident topology can be checked without staging the model:
+
+```bash
+./build/strata-deepseek-run \
+  --model models/DeepSeek-V4-Flash-DSpark \
+  --devices 0,1,2 --host-memory 216G --max-context 2048 \
+  --admission-only --json
+```
+
+To execute the base model:
+
+```bash
+./build/strata-deepseek-run \
+  --model models/DeepSeek-V4-Flash-DSpark \
+  --devices 0,1,2 --host-memory 216G --max-context 2048 \
+  --prompt 'Hello' --max-new 16 --json
+```
+
+See [`docs/deepseek-v4-runtime.md`](docs/deepseek-v4-runtime.md) for the pinned
+checkpoint contract, measured admission plan, design boundary, and remaining
+oracle gates.
 
 ## Model and precision contract
 

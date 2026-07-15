@@ -165,7 +165,7 @@ sensitive tensors. Packed I32 storage never overrides those logical semantics.
 
 ### DeepSeek-V4
 
-The `deepseek_v4` adapter validates and executes:
+The `deepseek_v4` adapter validates and, for the base model, executes:
 
 - compressed sparse and heavily compressed hybrid attention;
 - per-layer compression ratios, sparse indexing, and YaRN scaling;
@@ -173,12 +173,13 @@ The `deepseek_v4` adapter validates and executes:
 - native FP4 E2M1 routed experts and the always-resident shared expert;
 - `sqrtsoftplus` scoring, `noaux_tc` selection, top-6 normalization, routed
   scaling, and clipped SwiGLU semantics;
-- three DSpark stages, Markov-logit correction, confidence scheduling, and exact
-  speculative verification.
+- the declared three DSpark stages, Markov head, and confidence metadata.
 
-The shared expert overlaps routed execution. DSpark's five provisional rows are
-exposed to the ticket scheduler so resident experts can be reused, but only the
-target model may commit tokens or KV state.
+The current exact admission ceiling is 2,048 tokens, where all compressed index
+positions fit the declared top-512 set. DSpark execution is a gated next stage:
+its five provisional rows will be exposed to the ticket scheduler only after
+exact target verification and KV rollback fixtures exist. The runtime currently
+rejects enabling DSpark rather than silently approximating it.
 
 ## Backend boundary
 

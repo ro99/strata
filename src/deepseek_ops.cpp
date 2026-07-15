@@ -1,0 +1,409 @@
+#include "strata/deepseek_ops.hpp"
+
+#include "strata/glm_ops.hpp"
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <limits>
+
+namespace strata {
+
+namespace {
+
+[[nodiscard]] bool valid_router_spec(const RouterSpec& spec) noexcept {
+    return spec.selection == RouterSelectionKind::NoAuxTc &&
+           spec.scoring == RouterScoreKind::SqrtSoftplus &&
+           spec.routed_experts > 0U && spec.experts_per_token > 0U &&
+           spec.experts_per_token <= spec.routed_experts &&
+           spec.groups == 1U && spec.selected_groups == 1U &&
+           spec.normalize_topk && spec.selection_bias &&
+           std::isfinite(spec.routed_scale) && spec.routed_scale > 0.0F;
+}
+
+[[nodiscard]] Dsv4RouteResult gather_route(
+    std::span<const float> logits, std::span<const std::uint32_t> experts,
+    const RouterSpec& spec) {
+    Dsv4RouteResult result;
+    result.value.experts.assign(experts.begin(), experts.end());
+    result.value.weights.reserve(experts.size());
+    float sum = 0.0F;
+    for (const auto expert : experts) {
+        if (expert >= logits.size()) {
+            result.errors.emplace_back("DeepSeek route contains an out-of-range expert");
+            result.value = {};
+            return result;
+        }
+        const float score = std::sqrt(dsv4_softplus_f32(logits[expert]));
+        if (!std::isfinite(score)) {
+            result.errors.emplace_back("DeepSeek router score is not finite");
+            result.value = {};
+            return result;
+        }
+        result.value.weights.push_back(score);
+        sum += score;
+    }
+    if (!std::isfinite(sum) || sum <= 0.0F) {
+        result.errors.emplace_back("DeepSeek selected router scores do not normalize");
+        result.value = {};
+        return result;
+    }
+    for (auto& weight : result.value.weights) {
+        weight = weight / sum * spec.routed_scale;
+    }
+    return result;
+}
+
+}  // namespace
+
+float dsv4_softplus_f32(float value) noexcept {
+    if (value > 20.0F) return value;
+    if (value < -20.0F) return std::exp(value);
+    return std::log1p(std::exp(value));
+}
+
+float dsv4_fp4_e2m1_f32(std::uint8_t nibble) noexcept {
+    constexpr float values[16]{
+        0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+        0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+    return values[nibble & 0x0FU];
+}
+
+float dsv4_fp8_e4m3_f32(std::uint8_t encoded) noexcept {
+    const bool negative = (encoded & 0x80U) != 0U;
+    const std::uint32_t exponent = (encoded >> 3U) & 0x0FU;
+    const std::uint32_t mantissa = encoded & 0x07U;
+    float value = 0.0F;
+    if (exponent == 0U) {
+        value = std::ldexp(static_cast<float>(mantissa) / 8.0F, -6);
+    } else if (exponent == 0x0FU && mantissa == 0x07U) {
+        return std::numeric_limits<float>::quiet_NaN();
+    } else {
+        value = std::ldexp(1.0F + static_cast<float>(mantissa) / 8.0F,
+                           static_cast<int>(exponent) - 7);
+    }
+    return negative ? -value : value;
+}
+
+float dsv4_fp8_e8m0_scale_f32(std::uint8_t encoded) noexcept {
+    if (encoded == 0xFFU) return std::numeric_limits<float>::quiet_NaN();
+    return std::ldexp(1.0F, static_cast<int>(encoded) - 127);
+}
+
+Dsv4RouteResult dsv4_route_sqrtsoftplus_f32(
+    std::span<const float> logits, std::span<const float> selection_bias,
+    const RouterSpec& spec) {
+    Dsv4RouteResult result;
+    if (!valid_router_spec(spec)) {
+        result.errors.emplace_back(
+            "router specification is not the DeepSeek V4 sqrtsoftplus/noaux_tc contract");
+        return result;
+    }
+    if (logits.size() != spec.routed_experts || selection_bias.size() != logits.size()) {
+        result.errors.emplace_back("DeepSeek router tensor shapes disagree with its contract");
+        return result;
+    }
+    std::vector<float> choices(logits.size());
+    for (std::size_t expert = 0U; expert < logits.size(); ++expert) {
+        if (!std::isfinite(logits[expert]) || !std::isfinite(selection_bias[expert])) {
+            result.errors.emplace_back("DeepSeek router tensors contain a non-finite value");
+            return result;
+        }
+        choices[expert] = std::sqrt(dsv4_softplus_f32(logits[expert])) +
+                          selection_bias[expert];
+    }
+    std::vector<std::uint32_t> selected;
+    selected.reserve(spec.experts_per_token);
+    for (std::uint32_t rank = 0U; rank < spec.experts_per_token; ++rank) {
+        bool found = false;
+        std::uint32_t best = 0U;
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t expert = 0U; expert < spec.routed_experts; ++expert) {
+            if (std::find(selected.begin(), selected.end(), expert) != selected.end()) continue;
+            if (!found || choices[expert] > best_score) {
+                found = true;
+                best = expert;
+                best_score = choices[expert];
+            }
+        }
+        selected.push_back(best);
+    }
+    return gather_route(logits, selected, spec);
+}
+
+Dsv4RouteResult dsv4_route_hash_sqrtsoftplus_f32(
+    std::span<const float> logits, std::span<const std::uint32_t> token_experts,
+    const RouterSpec& spec) {
+    Dsv4RouteResult result;
+    if (!valid_router_spec(spec)) {
+        result.errors.emplace_back(
+            "router specification is not the DeepSeek V4 hash-routing contract");
+        return result;
+    }
+    if (logits.size() != spec.routed_experts ||
+        token_experts.size() != spec.experts_per_token) {
+        result.errors.emplace_back("DeepSeek hash router tensor shapes disagree with its contract");
+        return result;
+    }
+    for (const float logit : logits) {
+        if (!std::isfinite(logit)) {
+            result.errors.emplace_back("DeepSeek hash router logits contain a non-finite value");
+            return result;
+        }
+    }
+    return gather_route(logits, token_experts, spec);
+}
+
+ValidationResult dsv4_swiglu_f32(std::span<float> output,
+                                 std::span<const float> gate,
+                                 std::span<const float> up,
+                                 float limit) {
+    ValidationResult result;
+    if (output.empty() || output.size() != gate.size() || gate.size() != up.size()) {
+        result.errors.emplace_back("DeepSeek SwiGLU spans have incompatible sizes");
+        return result;
+    }
+    if (!std::isfinite(limit) || limit <= 0.0F) {
+        result.errors.emplace_back("DeepSeek SwiGLU limit must be finite and positive");
+        return result;
+    }
+    for (std::size_t index = 0U; index < output.size(); ++index) {
+        if (!std::isfinite(gate[index]) || !std::isfinite(up[index])) {
+            result.errors.emplace_back("DeepSeek SwiGLU input contains a non-finite value");
+            return result;
+        }
+        const float limited_gate = std::min(gate[index], limit);
+        const float limited_up = std::clamp(up[index], -limit, limit);
+        output[index] = glm_silu_f32(limited_gate) * limited_up;
+    }
+    return result;
+}
+
+ValidationResult dsv4_fp4_e2m1_matvec_f32(
+    std::span<float> output, std::span<const float> input,
+    std::span<const std::byte> packed_weights,
+    std::span<const std::byte> e8m0_scales,
+    std::uint64_t rows, std::uint64_t columns) {
+    ValidationResult result;
+    if (rows == 0U || columns == 0U || columns % 32U != 0U ||
+        output.size() != rows || input.size() != columns ||
+        packed_weights.size() != rows * columns / 2U ||
+        e8m0_scales.size() != rows * columns / 32U) {
+        result.errors.emplace_back("DeepSeek FP4 matvec layout is incompatible");
+        return result;
+    }
+    for (std::uint64_t row = 0U; row < rows; ++row) {
+        double sum = 0.0;
+        for (std::uint64_t column = 0U; column < columns; ++column) {
+            const auto packed = std::to_integer<std::uint8_t>(
+                packed_weights[row * (columns / 2U) + column / 2U]);
+            const auto nibble = static_cast<std::uint8_t>(
+                column % 2U == 0U ? packed & 0x0FU : packed >> 4U);
+            const auto scale = dsv4_fp8_e8m0_scale_f32(std::to_integer<std::uint8_t>(
+                e8m0_scales[row * (columns / 32U) + column / 32U]));
+            if (!std::isfinite(input[column]) || !std::isfinite(scale)) {
+                result.errors.emplace_back("DeepSeek FP4 matvec contains a non-finite value");
+                return result;
+            }
+            sum += static_cast<double>(input[column]) *
+                   static_cast<double>(dsv4_fp4_e2m1_f32(nibble)) *
+                   static_cast<double>(scale);
+        }
+        output[row] = static_cast<float>(sum);
+    }
+    return result;
+}
+
+ValidationResult dsv4_fp8_e4m3_matvec_f32(
+    std::span<float> output, std::span<const float> input,
+    std::span<const std::byte> weights,
+    std::span<const std::byte> e8m0_scales,
+    std::uint64_t rows, std::uint64_t columns) {
+    ValidationResult result;
+    const auto scale_rows = (rows + 127U) / 128U;
+    const auto scale_columns = (columns + 127U) / 128U;
+    if (rows == 0U || columns == 0U || output.size() != rows ||
+        input.size() != columns || weights.size() != rows * columns ||
+        e8m0_scales.size() != scale_rows * scale_columns) {
+        result.errors.emplace_back("DeepSeek FP8 matvec layout is incompatible");
+        return result;
+    }
+    for (std::uint64_t row = 0U; row < rows; ++row) {
+        double sum = 0.0;
+        for (std::uint64_t column = 0U; column < columns; ++column) {
+            const auto weight = dsv4_fp8_e4m3_f32(std::to_integer<std::uint8_t>(
+                weights[row * columns + column]));
+            const auto scale = dsv4_fp8_e8m0_scale_f32(std::to_integer<std::uint8_t>(
+                e8m0_scales[(row / 128U) * scale_columns + column / 128U]));
+            if (!std::isfinite(input[column]) || !std::isfinite(weight) ||
+                !std::isfinite(scale)) {
+                result.errors.emplace_back("DeepSeek FP8 matvec contains a non-finite value");
+                return result;
+            }
+            sum += static_cast<double>(input[column]) * static_cast<double>(weight) *
+                   static_cast<double>(scale);
+        }
+        output[row] = static_cast<float>(sum);
+    }
+    return result;
+}
+
+Dsv4MhcMixResult dsv4_mhc_split_sinkhorn_f32(
+    std::span<const float> mixes, std::span<const float> scale,
+    std::span<const float> base, std::uint32_t multiplier,
+    std::uint32_t iterations, float epsilon) {
+    Dsv4MhcMixResult result;
+    const auto mix_size = static_cast<std::size_t>(multiplier) * (2U + multiplier);
+    if (multiplier == 0U || iterations == 0U || mixes.size() != mix_size ||
+        base.size() != mix_size || scale.size() != 3U ||
+        !std::isfinite(epsilon) || epsilon <= 0.0F) {
+        result.errors.emplace_back("DeepSeek mHC Sinkhorn shapes or parameters are invalid");
+        return result;
+    }
+    for (const auto values : {mixes, scale, base}) {
+        if (!std::all_of(values.begin(), values.end(), [](float value) {
+                return std::isfinite(value);
+            })) {
+            result.errors.emplace_back("DeepSeek mHC Sinkhorn input is not finite");
+            return result;
+        }
+    }
+    result.value.pre.resize(multiplier);
+    result.value.post.resize(multiplier);
+    result.value.combination.resize(static_cast<std::size_t>(multiplier) * multiplier);
+    for (std::uint32_t index = 0U; index < multiplier; ++index) {
+        result.value.pre[index] =
+            glm_sigmoid_f32(mixes[index] * scale[0] + base[index]) + epsilon;
+        result.value.post[index] = 2.0F * glm_sigmoid_f32(
+            mixes[multiplier + index] * scale[1] + base[multiplier + index]);
+    }
+    const auto offset = static_cast<std::size_t>(2U * multiplier);
+    for (std::uint32_t row = 0U; row < multiplier; ++row) {
+        float maximum = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t column = 0U; column < multiplier; ++column) {
+            const auto index = static_cast<std::size_t>(row) * multiplier + column;
+            auto& value = result.value.combination[index];
+            value = mixes[offset + index] * scale[2] + base[offset + index];
+            maximum = std::max(maximum, value);
+        }
+        float sum = 0.0F;
+        for (std::uint32_t column = 0U; column < multiplier; ++column) {
+            auto& value = result.value.combination[
+                static_cast<std::size_t>(row) * multiplier + column];
+            value = std::exp(value - maximum);
+            sum += value;
+        }
+        for (std::uint32_t column = 0U; column < multiplier; ++column) {
+            auto& value = result.value.combination[
+                static_cast<std::size_t>(row) * multiplier + column];
+            value = value / sum + epsilon;
+        }
+    }
+    for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration) {
+        if (iteration != 0U) {
+            for (std::uint32_t row = 0U; row < multiplier; ++row) {
+                float sum = 0.0F;
+                for (std::uint32_t column = 0U; column < multiplier; ++column) {
+                    sum += result.value.combination[
+                        static_cast<std::size_t>(row) * multiplier + column];
+                }
+                for (std::uint32_t column = 0U; column < multiplier; ++column) {
+                    result.value.combination[
+                        static_cast<std::size_t>(row) * multiplier + column] /= sum + epsilon;
+                }
+            }
+        }
+        for (std::uint32_t column = 0U; column < multiplier; ++column) {
+            float sum = 0.0F;
+            for (std::uint32_t row = 0U; row < multiplier; ++row) {
+                sum += result.value.combination[
+                    static_cast<std::size_t>(row) * multiplier + column];
+            }
+            for (std::uint32_t row = 0U; row < multiplier; ++row) {
+                result.value.combination[
+                    static_cast<std::size_t>(row) * multiplier + column] /= sum + epsilon;
+            }
+        }
+    }
+    return result;
+}
+
+ValidationResult dsv4_mhc_pre_f32(
+    std::span<float> reduced, Dsv4MhcMix& mix,
+    std::span<const float> hidden_copies, std::span<const float> projection,
+    std::span<const float> scale, std::span<const float> base,
+    std::uint32_t multiplier, std::uint32_t iterations, float epsilon) {
+    ValidationResult result;
+    if (multiplier == 0U || hidden_copies.empty() ||
+        hidden_copies.size() % multiplier != 0U ||
+        reduced.size() != hidden_copies.size() / multiplier ||
+        projection.size() != base.size() * hidden_copies.size()) {
+        result.errors.emplace_back("DeepSeek mHC pre-projection shapes are incompatible");
+        return result;
+    }
+    double square_sum = 0.0;
+    for (const float value : hidden_copies) {
+        if (!std::isfinite(value)) {
+            result.errors.emplace_back("DeepSeek mHC hidden state is not finite");
+            return result;
+        }
+        square_sum += static_cast<double>(value) * value;
+    }
+    const float reciprocal = 1.0F / std::sqrt(
+        static_cast<float>(square_sum / static_cast<double>(hidden_copies.size())) + epsilon);
+    std::vector<float> projected(base.size(), 0.0F);
+    for (std::size_t row = 0U; row < projected.size(); ++row) {
+        double sum = 0.0;
+        for (std::size_t column = 0U; column < hidden_copies.size(); ++column) {
+            sum += static_cast<double>(projection[row * hidden_copies.size() + column]) *
+                   hidden_copies[column];
+        }
+        projected[row] = static_cast<float>(sum) * reciprocal;
+    }
+    auto split = dsv4_mhc_split_sinkhorn_f32(
+        projected, scale, base, multiplier, iterations, epsilon);
+    if (!split.ok()) {
+        result.errors = std::move(split.errors);
+        return result;
+    }
+    mix = std::move(split.value);
+    std::fill(reduced.begin(), reduced.end(), 0.0F);
+    for (std::uint32_t copy = 0U; copy < multiplier; ++copy) {
+        for (std::size_t column = 0U; column < reduced.size(); ++column) {
+            reduced[column] += mix.pre[copy] *
+                hidden_copies[static_cast<std::size_t>(copy) * reduced.size() + column];
+        }
+    }
+    return result;
+}
+
+ValidationResult dsv4_mhc_post_f32(
+    std::span<float> output_copies, std::span<const float> branch,
+    std::span<const float> residual_copies, const Dsv4MhcMix& mix,
+    std::uint32_t multiplier) {
+    ValidationResult result;
+    if (multiplier == 0U || branch.empty() ||
+        output_copies.size() != branch.size() * multiplier ||
+        residual_copies.size() != output_copies.size() ||
+        mix.post.size() != multiplier ||
+        mix.combination.size() != static_cast<std::size_t>(multiplier) * multiplier) {
+        result.errors.emplace_back("DeepSeek mHC post-projection shapes are incompatible");
+        return result;
+    }
+    for (std::uint32_t destination = 0U; destination < multiplier; ++destination) {
+        for (std::size_t column = 0U; column < branch.size(); ++column) {
+            float value = mix.post[destination] * branch[column];
+            for (std::uint32_t source = 0U; source < multiplier; ++source) {
+                value += mix.combination[
+                             static_cast<std::size_t>(destination) * multiplier + source] *
+                         residual_copies[
+                             static_cast<std::size_t>(source) * branch.size() + column];
+            }
+            output_copies[static_cast<std::size_t>(destination) * branch.size() + column] =
+                value;
+        }
+    }
+    return result;
+}
+
+}  // namespace strata

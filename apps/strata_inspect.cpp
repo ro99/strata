@@ -1,6 +1,7 @@
 #include "strata/glm_manifest.hpp"
 #include "strata/compressed_tensors.hpp"
 #include "strata/cuda_backend.hpp"
+#include "strata/deepseek_manifest.hpp"
 #include "strata/safetensors.hpp"
 
 #include <array>
@@ -314,6 +315,86 @@ int main(int argc, char** argv) {
     if (!parsed.ok()) {
         for (const auto& error : parsed.errors) std::cerr << "error: " << error << '\n';
         return 1;
+    }
+    const bool has_deepseek_embedding = std::any_of(
+        parsed.value.entries.begin(), parsed.value.entries.end(), [](const auto& entry) {
+            return entry.name == "embed.weight";
+        });
+    const bool has_deepseek_mhc = std::any_of(
+        parsed.value.entries.begin(), parsed.value.entries.end(), [](const auto& entry) {
+            return entry.name == "layers.0.hc_attn_base";
+        });
+    const bool deepseek_v4 = has_deepseek_embedding && has_deepseek_mhc;
+    if (deepseek_v4) {
+        auto result = strata::build_deepseek_v4_flash_dspark_index_manifest(
+            std::move(parsed.value));
+        if (!result.ok()) {
+            for (const auto& error : result.errors) std::cerr << "error: " << error << '\n';
+            return 1;
+        }
+        if (headers) {
+            if (model_directory.empty()) {
+                std::cerr << "error: --headers requires --model DIR\n";
+                return 2;
+            }
+            strata::Dsv4CheckpointOptions options;
+            options.require_all_shards = !allow_incomplete;
+            options.require_read_only = require_read_only;
+            result = strata::validate_deepseek_v4_flash_dspark_checkpoint(
+                model_directory, std::move(result.manifest), options);
+            if (!result.ok()) {
+                for (const auto& error : result.errors) {
+                    std::cerr << "error: " << error << '\n';
+                }
+                return 1;
+            }
+        }
+        const auto& manifest = result.manifest;
+        if (json) {
+            std::cout << "{\n"
+                      << "  \"status\": \"ok\",\n"
+                      << "  \"architecture\": \"deepseek_v4_flash_dspark\",\n"
+                      << "  \"tensor_count\": " << manifest.tensors.size() << ",\n"
+                      << "  \"indexed_tensor_bytes\": "
+                      << manifest.indexed_tensor_bytes << ",\n"
+                      << "  \"shards\": " << manifest.shards.size() << ",\n"
+                      << "  \"quantized_modules\": " << manifest.quantized_modules
+                      << ",\n"
+                      << "  \"fp4_e2m1_group32_modules\": " << manifest.fp4_modules
+                      << ",\n"
+                      << "  \"fp8_e4m3_block128_modules\": " << manifest.fp8_modules
+                      << ",\n"
+                      << "  \"scanned_shards\": " << manifest.scanned_shards << ",\n"
+                      << "  \"resolved_tensors\": " << manifest.resolved_tensors
+                      << ",\n"
+                      << "  \"validated_layouts\": " << manifest.validated_layouts
+                      << ",\n"
+                      << "  \"shard_file_bytes\": " << manifest.shard_file_bytes
+                      << ",\n"
+                      << "  \"tensor_payload_bytes\": "
+                      << manifest.tensor_payload_bytes << "\n"
+                      << "}\n";
+        } else {
+            std::cout << "status=ok\n"
+                      << "architecture=deepseek_v4_flash_dspark\n"
+                      << "tensor_count=" << manifest.tensors.size() << '\n'
+                      << "indexed_tensor_bytes=" << manifest.indexed_tensor_bytes << '\n'
+                      << "shards=" << manifest.shards.size() << '\n'
+                      << "quantized_modules=" << manifest.quantized_modules << '\n'
+                      << "fp4_e2m1_group32_modules=" << manifest.fp4_modules << '\n'
+                      << "fp8_e4m3_block128_modules=" << manifest.fp8_modules << '\n'
+                      << "scanned_shards=" << manifest.scanned_shards << '\n'
+                      << "resolved_tensors=" << manifest.resolved_tensors << '\n'
+                      << "validated_layouts=" << manifest.validated_layouts << '\n'
+                      << "shard_file_bytes=" << manifest.shard_file_bytes << '\n'
+                      << "tensor_payload_bytes=" << manifest.tensor_payload_bytes << '\n';
+            for (std::size_t role = 0U; role < manifest.role_counts.size(); ++role) {
+                std::cout << "role."
+                          << strata::to_string(static_cast<strata::Dsv4TensorRole>(role))
+                          << '=' << manifest.role_counts[role] << '\n';
+            }
+        }
+        return 0;
     }
     auto result = strata::build_quanttrio_glm52_index_manifest(std::move(parsed.value));
     if (!result.ok()) {

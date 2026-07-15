@@ -16,6 +16,8 @@ enum class CudaWeightEncoding : std::uint8_t {
     Plain,
     OffsetPackedInt4,
     OffsetPackedInt8,
+    Fp8E4m3Block128,
+    Fp4E2m1Group32,
 };
 
 struct CudaWeightDescriptor {
@@ -112,11 +114,19 @@ public:
     [[nodiscard]] ValidationResult matmul(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::span<float> output);
+    [[nodiscard]] ValidationResult matmul_grouped(
+        const CudaWeight& weight, std::span<const float> input,
+        std::uint32_t groups, std::uint64_t rows_per_group,
+        std::span<float> output);
     [[nodiscard]] ValidationResult synchronize(int device);
 
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
 private:
+    [[nodiscard]] ValidationResult matmul_impl(
+        const CudaWeight& weight, std::span<const float> input,
+        std::uint32_t rows, std::uint32_t groups,
+        std::uint64_t rows_per_group, std::span<float> output);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -1397,8 +1397,8 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         return result;
     }
     if (!std::isfinite(config.vram_cache_fraction) ||
-        config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.90) {
-        result.errors.emplace_back("VRAM cache fraction must be in (0, 0.90]");
+        config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
+        result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
         return result;
     }
     if (config.maximum_context_tokens == 0U ||

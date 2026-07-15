@@ -1,6 +1,6 @@
 # GLM-5.2 throughput — progressive agent handoffs
 
-Status: **T0 complete; later performance stages have not started**.
+Status: **T0 and T1 complete; later performance stages have not started**.
 
 This document turns the topology, residency, and transfer proposal into a
 sequence of bounded assignments. It is written for agents that may not share a
@@ -179,7 +179,7 @@ stage in progress.
 | Stage | Branch | Assignment | Status |
 |---|---|---|---|
 | T0 | `infra/glm52-observability` | Separate and complete runtime evidence | complete |
-| T1 | `infra/glm52-topology-probe` | Measure the real hardware paths | pending |
+| T1 | `infra/glm52-topology-probe` | Measure the real hardware paths | complete |
 | T2 | `exp/glm52-placement-sim` | Replay real routes against topology-aware policies | pending |
 | T3 | `exp/glm52-expert-bundles` | Test atomic expert-triple caching | pending |
 | T4 | `exp/glm52-static-owners` | Test stable hot-expert ownership | pending |

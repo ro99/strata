@@ -33,7 +33,7 @@ struct Options {
     bool device_moe{};
     bool logit_trace{};
     bool layer_hash_trace{};
-    bool overlap_resident_warmup{};
+    bool overlap_resident_warmup{true};
     std::string route_trace;
 };
 

@@ -116,6 +116,16 @@ demonstrate a material, properly replicated improvement against it. The frozen
 target-layer, teacher-forcing, greedy-generation, and independent physical-I/O
 promotion gates remain open.
 
+The default DeepSeek loader now stages tensors directly into the resident arena
+with eight shard readers, uses block-wise FP8 lookup conversion, warms the GPU
+spine with up to three device workers, and overlaps that warm-up with resident
+staging. On the same 216 GiB topology, the cumulative single-pair loading
+screens reduced initialization from approximately 191 seconds to 22.177 seconds.
+Use `--serial-resident-warmup` only to diagnose or compare the non-overlapped
+path. See
+[`docs/experiments/0008-dsv4-fast-loading-promotion-2026-07-16.md`](docs/experiments/0008-dsv4-fast-loading-promotion-2026-07-16.md)
+for the experiment lineage and matched accounting gates.
+
 ## Build and test
 
 Requirements are a C++20 compiler, CMake, Make, and optionally CUDA 12.8 or a

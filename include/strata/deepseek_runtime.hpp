@@ -28,7 +28,7 @@ struct Dsv4RuntimeConfig {
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};
-    bool overlap_resident_warmup{};
+    bool overlap_resident_warmup{true};
     bool verbose{};
     std::string route_trace_path;
 };

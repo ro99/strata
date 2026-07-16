@@ -14,7 +14,7 @@ TEST_CASE("DeepSeek correctness diagnostics are opt-in") {
     REQUIRE(config.host_attention_threads == 0U);
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
-    REQUIRE(!config.overlap_resident_warmup);
+    REQUIRE(config.overlap_resident_warmup);
 }
 
 TEST_CASE("DeepSeek runtime rejects excessive resident read workers") {

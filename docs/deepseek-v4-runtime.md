@@ -143,6 +143,13 @@ Run the exact base graph:
   --prompt 'Hello' --max-new 16 --json
 ```
 
+Resident loading uses eight shard readers by default. Spine warm-up uses up to
+three device workers and overlaps resident staging, so the usual command takes
+the validated fast-loading path without additional flags. For controlled
+comparisons, `--serial-resident-warmup` restores sequential staging and warm-up;
+`--resident-read-workers` and `--spine-warmup-workers` expose the bounded worker
+counts.
+
 The reusable long smoke command is:
 
 ```bash

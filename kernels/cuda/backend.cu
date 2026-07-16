@@ -5,8 +5,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -249,6 +251,230 @@ __global__ void native_fp4_matmul_kernel(
     }
 }
 
+constexpr std::uint32_t kMaxDeepSeekRoutedExperts = 6U;
+
+struct DeepSeekFp4Batch {
+    const unsigned char* w1_weights[kMaxDeepSeekRoutedExperts]{};
+    const unsigned char* w1_scales[kMaxDeepSeekRoutedExperts]{};
+    const unsigned char* w3_weights[kMaxDeepSeekRoutedExperts]{};
+    const unsigned char* w3_scales[kMaxDeepSeekRoutedExperts]{};
+    const unsigned char* w2_weights[kMaxDeepSeekRoutedExperts]{};
+    const unsigned char* w2_scales[kMaxDeepSeekRoutedExperts]{};
+    float coefficients[kMaxDeepSeekRoutedExperts]{};
+    std::uint32_t count{};
+};
+
+__device__ float fp8_e8m0_scale_bits(unsigned char encoded) {
+    // E8M0 is exactly a float exponent field, except that 0xff is NaN and
+    // exponent zero denotes 2^-127 rather than float zero.
+    if (encoded == 0xFFU) return __uint_as_float(0x7FC0'0000U);
+    if (encoded == 0U) return __uint_as_float(0x0040'0000U);
+    return __uint_as_float(static_cast<unsigned int>(encoded) << 23U);
+}
+
+__device__ float bf16_round(float value) {
+    return __bfloat162float(__float2bfloat16_rn(value));
+}
+
+__device__ float stable_silu(float value) {
+    float sigmoid = 0.0F;
+    if (value >= 0.0F) {
+        sigmoid = 1.0F / (1.0F + expf(-value));
+    } else {
+        const float exponential = expf(value);
+        sigmoid = exponential / (1.0F + exponential);
+    }
+    return value * sigmoid;
+}
+
+__global__ void deepseek_fp4_gate_up_kernel(
+    float* activations, const float* hidden, DeepSeekFp4Batch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    float swiglu_limit, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t expert = blockIdx.y;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto* w1 = batch.w1_weights[expert];
+    const auto* w1_scales = batch.w1_scales[expert];
+    const auto* w3 = batch.w3_weights[expert];
+    const auto* w3_scales = batch.w3_scales[expert];
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    float gate = 0.0F;
+    float up = 0.0F;
+
+    // One warp owns each 32-weight group. Its lane-zero scale decode is shared
+    // by shuffle, and each hidden value feeds both W1 and W3 accumulators.
+    for (std::uint64_t group = warp; group < scale_columns; group += 8U) {
+        float gate_scale = lane == 0U
+                               ? fp8_e8m0_scale_bits(w1_scales[scale_base + group])
+                               : 0.0F;
+        float up_scale = lane == 0U
+                             ? fp8_e8m0_scale_bits(w3_scales[scale_base + group])
+                             : 0.0F;
+        gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
+        up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
+        const std::uint64_t column = group * 32U + lane;
+        if (column < columns) {
+            const float input = hidden[column];
+            const unsigned char gate_packed = w1[packed_base + column / 2U];
+            const unsigned char up_packed = w3[packed_base + column / 2U];
+            const unsigned int gate_encoded = column % 2U == 0U
+                                                  ? gate_packed & 0x0FU
+                                                  : gate_packed >> 4U;
+            const unsigned int up_encoded = column % 2U == 0U
+                                                ? up_packed & 0x0FU
+                                                : up_packed >> 4U;
+            gate += input * fp4_e2m1_value(gate_encoded) * gate_scale;
+            up += input * fp4_e2m1_value(up_encoded) * up_scale;
+        }
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        const float rounded_gate = bf16_round(gate);
+        const float rounded_up = bf16_round(up);
+        if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+            atomicExch(error_flag, 1U);
+            activations[static_cast<std::uint64_t>(expert) * intermediate +
+                        output_row] = __uint_as_float(0x7FC0'0000U);
+            return;
+        }
+        const float limited_gate = fminf(rounded_gate, swiglu_limit);
+        const float limited_up = fmaxf(-swiglu_limit,
+                                       fminf(rounded_up, swiglu_limit));
+        float activated = stable_silu(limited_gate) * limited_up;
+        activated *= batch.coefficients[expert];
+        activated *= batch.coefficients[expert];
+        activations[static_cast<std::uint64_t>(expert) * intermediate + output_row] =
+            bf16_round(activated);
+    }
+}
+
+__global__ void deepseek_fp4_down_kernel(
+    float* output, const float* activations, DeepSeekFp4Batch batch,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t packed_columns, std::uint64_t scale_columns) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t expert = blockIdx.y;
+    if (output_row >= rows || expert >= batch.count) return;
+    const auto* weights = batch.w2_weights[expert];
+    const auto* scales = batch.w2_scales[expert];
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    const std::uint64_t input_base = static_cast<std::uint64_t>(expert) * columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    float sum = 0.0F;
+    for (std::uint64_t group = warp; group < scale_columns; group += 8U) {
+        float scale = lane == 0U
+                          ? fp8_e8m0_scale_bits(scales[scale_base + group])
+                          : 0.0F;
+        scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
+        const std::uint64_t column = group * 32U + lane;
+        if (column < columns) {
+            const unsigned char packed = weights[packed_base + column / 2U];
+            const unsigned int encoded = column % 2U == 0U
+                                             ? packed & 0x0FU
+                                             : packed >> 4U;
+            sum += activations[input_base + column] *
+                   fp4_e2m1_value(encoded) * scale;
+        }
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(expert) * rows + output_row] =
+            bf16_round(sum);
+    }
+}
+
+__global__ void deepseek_fp8_gate_up_kernel(
+    float* activation, const float* hidden,
+    const unsigned char* w1, const unsigned char* w1_scales,
+    const unsigned char* w3, const unsigned char* w3_scales,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t scale_columns, float swiglu_limit,
+    unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    if (output_row >= intermediate) return;
+    const std::uint64_t weight_base = output_row * columns;
+    const std::uint64_t scale_row = (output_row / 128U) * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint64_t groups = (columns + 31U) / 32U;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t group = warp; group < groups; group += 8U) {
+        const std::uint64_t column = group * 32U + lane;
+        float gate_scale = lane == 0U
+                               ? fp8_e8m0_scale_bits(
+                                     w1_scales[scale_row + (group * 32U) / 128U])
+                               : 0.0F;
+        float up_scale = lane == 0U
+                             ? fp8_e8m0_scale_bits(
+                                   w3_scales[scale_row + (group * 32U) / 128U])
+                             : 0.0F;
+        gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
+        up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
+        if (column < columns) {
+            const float input = hidden[column];
+            gate += input * fp8_e4m3_value(w1[weight_base + column]) * gate_scale;
+            up += input * fp8_e4m3_value(w3[weight_base + column]) * up_scale;
+        }
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        const float rounded_gate = bf16_round(gate);
+        const float rounded_up = bf16_round(up);
+        if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+            atomicExch(error_flag, 1U);
+            activation[output_row] = __uint_as_float(0x7FC0'0000U);
+            return;
+        }
+        const float limited_gate = fminf(rounded_gate, swiglu_limit);
+        const float limited_up = fmaxf(-swiglu_limit,
+                                       fminf(rounded_up, swiglu_limit));
+        activation[output_row] = bf16_round(
+            stable_silu(limited_gate) * limited_up);
+    }
+}
+
+__global__ void deepseek_fp8_down_kernel(
+    float* output, const float* activation,
+    const unsigned char* weights, const unsigned char* scales,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t scale_columns) {
+    const std::uint64_t output_row = blockIdx.x;
+    if (output_row >= rows) return;
+    const std::uint64_t weight_base = output_row * columns;
+    const std::uint64_t scale_row = (output_row / 128U) * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint64_t groups = (columns + 31U) / 32U;
+    float sum = 0.0F;
+    for (std::uint64_t group = warp; group < groups; group += 8U) {
+        const std::uint64_t column = group * 32U + lane;
+        float scale = lane == 0U
+                          ? fp8_e8m0_scale_bits(
+                                scales[scale_row + (group * 32U) / 128U])
+                          : 0.0F;
+        scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
+        if (column < columns) {
+            sum += activation[column] *
+                   fp8_e4m3_value(weights[weight_base + column]) * scale;
+        }
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) output[output_row] = bf16_round(sum);
+}
+
 bool checked_bytes(std::uint64_t left, std::uint64_t right, std::uint64_t element_bytes,
                    std::uint64_t& result) {
     if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
@@ -283,10 +509,32 @@ struct CudaBackend::Impl {
         cudaEvent_t activation_uploaded{};
         cudaEvent_t kernel_finished{};
         cudaEvent_t activation_downloaded{};
+        cudaEvent_t moe_start{};
+        cudaEvent_t moe_hidden_uploaded{};
+        cudaEvent_t moe_kernel_finished{};
+        cudaEvent_t moe_download_started{};
+        cudaEvent_t moe_completed{};
         float* input{};
         float* output{};
         std::uint64_t input_bytes{};
         std::uint64_t output_bytes{};
+        float* moe_hidden{};
+        float* moe_activations{};
+        float* moe_output{};
+        unsigned int* moe_error{};
+        void* moe_host_staging{};
+        std::uint64_t moe_hidden_bytes{};
+        std::uint64_t moe_activation_bytes{};
+        std::uint64_t moe_output_bytes{};
+        std::uint64_t moe_host_staging_bytes{};
+        std::uint64_t moe_hidden_columns{};
+        std::uint64_t moe_intermediate_columns{};
+        std::uint32_t moe_routed_count{};
+        std::uint64_t moe_kernel_launches{};
+        std::vector<std::shared_ptr<CudaWeight::Impl>> moe_weights;
+        bool moe_has_shared{};
+        bool moe_in_flight{};
+        bool moe_poisoned{};
     };
 
     std::unordered_map<int, DeviceState> devices;
@@ -299,11 +547,27 @@ struct CudaBackend::Impl {
             static_cast<void>(cudaSetDevice(device));
             if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
             if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
+            if (state.moe_hidden != nullptr) static_cast<void>(cudaFree(state.moe_hidden));
+            if (state.moe_activations != nullptr) {
+                static_cast<void>(cudaFree(state.moe_activations));
+            }
+            if (state.moe_output != nullptr) static_cast<void>(cudaFree(state.moe_output));
+            if (state.moe_error != nullptr) static_cast<void>(cudaFree(state.moe_error));
+            if (state.moe_host_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.moe_host_staging));
+            }
             if (state.activation_start != nullptr) {
                 static_cast<void>(cudaEventDestroy(state.activation_start));
                 static_cast<void>(cudaEventDestroy(state.activation_uploaded));
                 static_cast<void>(cudaEventDestroy(state.kernel_finished));
                 static_cast<void>(cudaEventDestroy(state.activation_downloaded));
+            }
+            if (state.moe_start != nullptr) {
+                static_cast<void>(cudaEventDestroy(state.moe_start));
+                static_cast<void>(cudaEventDestroy(state.moe_hidden_uploaded));
+                static_cast<void>(cudaEventDestroy(state.moe_kernel_finished));
+                static_cast<void>(cudaEventDestroy(state.moe_download_started));
+                static_cast<void>(cudaEventDestroy(state.moe_completed));
             }
             if (state.stream != nullptr) static_cast<void>(cudaStreamDestroy(state.stream));
         }
@@ -384,6 +648,13 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
                 }
             }
         }
+        for (auto* event : {&state.moe_start, &state.moe_hidden_uploaded,
+                            &state.moe_kernel_finished, &state.moe_download_started,
+                            &state.moe_completed}) {
+            if (auto status = cudaEventCreate(event); status != cudaSuccess) {
+                return cuda_error(status, "create DeepSeek MoE event");
+            }
+        }
         impl_->devices.emplace(device, state);
         CudaBackendStats::Device device_stats;
         device_stats.device = device;
@@ -400,6 +671,11 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
         result.errors.emplace_back("weight upload targets an uninitialized CUDA device");
+        return result;
+    }
+    if (found->second.moe_in_flight) {
+        result.errors.emplace_back(
+            "weight upload cannot overlap an in-flight DeepSeek MoE command");
         return result;
     }
     if (descriptor.rows == 0U || descriptor.columns == 0U) {
@@ -474,7 +750,7 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for upload");
     }
-    auto target = std::make_unique<CudaWeight::Impl>();
+    auto target = std::make_shared<CudaWeight::Impl>();
     target->descriptor = descriptor;
     target->device = device;
     target->bytes = expected_weights + expected_scales;
@@ -560,6 +836,11 @@ ValidationResult CudaBackend::matmul_impl(
         return result;
     }
     auto& state = impl_->devices.at(weight.impl_->device);
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "CUDA matmul cannot overlap an in-flight DeepSeek MoE command");
+        return result;
+    }
     if (auto status = cudaSetDevice(weight.impl_->device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for matmul");
     }
@@ -719,9 +1000,601 @@ ValidationResult CudaBackend::matmul_impl(
     return result;
 }
 
+ValidationResult CudaBackend::enqueue_deepseek_moe(
+    int device, std::span<const float> hidden,
+    std::span<const CudaDeepSeekMoeExpert> routed,
+    const CudaDeepSeekMoeExpert* shared, float swiglu_limit) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE command targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "DeepSeek MoE workspace already has an in-flight command");
+        return result;
+    }
+    if (routed.size() > kMaxDeepSeekRoutedExperts ||
+        (routed.empty() && shared == nullptr)) {
+        result.errors.emplace_back(
+            "DeepSeek MoE command requires one to six routed experts or a shared expert");
+        return result;
+    }
+    if (!std::isfinite(swiglu_limit) || swiglu_limit <= 0.0F) {
+        result.errors.emplace_back(
+            "DeepSeek MoE SwiGLU limit must be finite and positive");
+        return result;
+    }
+
+    std::uint64_t hidden_columns = 0U;
+    std::uint64_t intermediate_columns = 0U;
+    auto validate_expert = [&](const CudaDeepSeekMoeExpert& expert,
+                               CudaWeightEncoding encoding,
+                               bool shared_expert) {
+        const std::array<const CudaWeight*, 3> weights{
+            expert.w1, expert.w3, expert.w2};
+        for (const auto* weight : weights) {
+            if (weight == nullptr || !weight->valid()) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE command contains an invalid CUDA weight");
+                return false;
+            }
+            if (weight->impl_->device != device) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE weights do not belong to the command device");
+                return false;
+            }
+            if (weight->impl_->descriptor.encoding != encoding) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE weight encoding is incompatible with the expert kind");
+                return false;
+            }
+        }
+        const auto& w1 = expert.w1->impl_->descriptor;
+        const auto& w3 = expert.w3->impl_->descriptor;
+        const auto& w2 = expert.w2->impl_->descriptor;
+        const auto expected_dtype = encoding == CudaWeightEncoding::Fp4E2m1Group32
+                                        ? SafetensorsDtype::I8
+                                        : SafetensorsDtype::F8E4M3;
+        const auto expected_group = encoding == CudaWeightEncoding::Fp4E2m1Group32
+                                        ? 32U
+                                        : 128U;
+        if (w1.dtype != expected_dtype || w3.dtype != expected_dtype ||
+            w2.dtype != expected_dtype || w1.group_size != expected_group ||
+            w3.group_size != expected_group || w2.group_size != expected_group ||
+            w1.rows == 0U || w1.columns == 0U ||
+            w3.rows != w1.rows || w3.columns != w1.columns ||
+            w2.rows != w1.columns || w2.columns != w1.rows) {
+            result.errors.emplace_back(
+                "DeepSeek MoE W1/W3/W2 shapes or native encoding metadata are invalid");
+            return false;
+        }
+        if (!std::isfinite(expert.coefficient) ||
+            (shared_expert && expert.coefficient != 1.0F)) {
+            result.errors.emplace_back(
+                "DeepSeek MoE expert coefficient is invalid");
+            return false;
+        }
+        if (hidden_columns == 0U) {
+            hidden_columns = w1.columns;
+            intermediate_columns = w1.rows;
+        } else if (hidden_columns != w1.columns ||
+                   intermediate_columns != w1.rows) {
+            result.errors.emplace_back(
+                "DeepSeek MoE experts do not share one exact activation shape");
+            return false;
+        }
+        return true;
+    };
+    for (const auto& expert : routed) {
+        if (!validate_expert(expert, CudaWeightEncoding::Fp4E2m1Group32,
+                             false)) {
+            return result;
+        }
+    }
+    if (shared != nullptr &&
+        !validate_expert(*shared, CudaWeightEncoding::Fp8E4m3Block128, true)) {
+        return result;
+    }
+    if (hidden.empty() || hidden.size() != hidden_columns ||
+        hidden_columns > std::numeric_limits<unsigned int>::max() ||
+        intermediate_columns > std::numeric_limits<unsigned int>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE hidden row or expert dimensions are incompatible");
+        return result;
+    }
+    if (!std::all_of(hidden.begin(), hidden.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek MoE hidden row contains a non-finite value");
+        return result;
+    }
+
+    const std::uint64_t expert_count =
+        static_cast<std::uint64_t>(routed.size()) + (shared == nullptr ? 0U : 1U);
+    std::uint64_t hidden_bytes = 0U;
+    std::uint64_t activation_bytes = 0U;
+    std::uint64_t output_bytes = 0U;
+    std::uint64_t host_staging_bytes = 0U;
+    if (!checked_bytes(1U, hidden_columns, sizeof(float), hidden_bytes) ||
+        !checked_bytes(expert_count, intermediate_columns, sizeof(float),
+                       activation_bytes) ||
+        !checked_bytes(expert_count, hidden_columns, sizeof(float), output_bytes) ||
+        hidden_bytes > std::numeric_limits<std::size_t>::max() ||
+        activation_bytes > std::numeric_limits<std::size_t>::max() ||
+        output_bytes > std::numeric_limits<std::size_t>::max() ||
+        output_bytes > std::numeric_limits<std::uint64_t>::max() -
+                           sizeof(unsigned int)) {
+        result.errors.emplace_back("DeepSeek MoE workspace size overflows");
+        return result;
+    }
+    host_staging_bytes = output_bytes + sizeof(unsigned int);
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for DeepSeek MoE");
+    }
+
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    auto ensure_workspace = [&](float*& pointer, std::uint64_t& capacity,
+                                std::uint64_t required, const char* operation) {
+        if (required <= capacity) return true;
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = nullptr;
+        capacity = 0U;
+        if (const auto status =
+                cudaMalloc(&pointer, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return true;
+    };
+    if (!ensure_workspace(state.moe_hidden, state.moe_hidden_bytes, hidden_bytes,
+                          "allocate DeepSeek MoE hidden workspace") ||
+        !ensure_workspace(state.moe_activations, state.moe_activation_bytes,
+                          activation_bytes,
+                          "allocate DeepSeek MoE activation workspace") ||
+        !ensure_workspace(state.moe_output, state.moe_output_bytes, output_bytes,
+                          "allocate DeepSeek MoE output workspace")) {
+        return result;
+    }
+    if (state.moe_error == nullptr) {
+        if (const auto status = cudaMalloc(&state.moe_error, sizeof(unsigned int));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek MoE error flag");
+        }
+        ++allocation_calls;
+        allocation_bytes += sizeof(unsigned int);
+    }
+    if (host_staging_bytes > state.moe_host_staging_bytes) {
+        if (state.moe_host_staging != nullptr) {
+            static_cast<void>(cudaFreeHost(state.moe_host_staging));
+        }
+        state.moe_host_staging = nullptr;
+        state.moe_host_staging_bytes = 0U;
+        if (const auto status = cudaMallocHost(
+                &state.moe_host_staging,
+                static_cast<std::size_t>(host_staging_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek MoE host staging");
+        }
+        state.moe_host_staging_bytes = host_staging_bytes;
+        ++allocation_calls;
+        allocation_bytes += host_staging_bytes;
+    }
+
+    DeepSeekFp4Batch routed_batch;
+    for (std::size_t index = 0U; index < routed.size(); ++index) {
+        const auto& expert = routed[index];
+        routed_batch.w1_weights[index] =
+            static_cast<const unsigned char*>(expert.w1->impl_->weights);
+        routed_batch.w1_scales[index] =
+            static_cast<const unsigned char*>(expert.w1->impl_->scales);
+        routed_batch.w3_weights[index] =
+            static_cast<const unsigned char*>(expert.w3->impl_->weights);
+        routed_batch.w3_scales[index] =
+            static_cast<const unsigned char*>(expert.w3->impl_->scales);
+        routed_batch.w2_weights[index] =
+            static_cast<const unsigned char*>(expert.w2->impl_->weights);
+        routed_batch.w2_scales[index] =
+            static_cast<const unsigned char*>(expert.w2->impl_->scales);
+        routed_batch.coefficients[index] = expert.coefficient;
+    }
+    routed_batch.count = static_cast<std::uint32_t>(routed.size());
+
+    state.moe_weights.clear();
+    state.moe_weights.reserve(static_cast<std::size_t>(expert_count * 3U));
+    for (const auto& expert : routed) {
+        state.moe_weights.push_back(expert.w1->impl_);
+        state.moe_weights.push_back(expert.w3->impl_);
+        state.moe_weights.push_back(expert.w2->impl_);
+    }
+    if (shared != nullptr) {
+        state.moe_weights.push_back(shared->w1->impl_);
+        state.moe_weights.push_back(shared->w3->impl_);
+        state.moe_weights.push_back(shared->w2->impl_);
+    }
+
+    state.moe_hidden_columns = hidden_columns;
+    state.moe_intermediate_columns = intermediate_columns;
+    state.moe_routed_count = routed_batch.count;
+    state.moe_has_shared = shared != nullptr;
+    state.moe_kernel_launches = 0U;
+    state.moe_in_flight = true;
+    state.moe_poisoned = false;
+    auto abort_enqueue = [&](cudaError_t status, const char* operation) {
+        result = cuda_error(status, operation);
+        const auto drain_status = cudaStreamSynchronize(state.stream);
+        if (drain_status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("drain failed DeepSeek MoE enqueue: ") +
+                cudaGetErrorString(drain_status));
+            state.moe_poisoned = true;
+        } else {
+            state.moe_in_flight = false;
+            state.moe_weights.clear();
+        }
+    };
+
+    if (auto status = cudaEventRecord(state.moe_start, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek MoE start");
+        return result;
+    }
+    if (auto status = cudaMemsetAsync(
+            state.moe_error, 0, sizeof(unsigned int), state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "reset DeepSeek MoE error flag");
+        return result;
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.moe_hidden, hidden.data(), static_cast<std::size_t>(hidden_bytes),
+            cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "upload DeepSeek MoE hidden row");
+        return result;
+    }
+    if (auto status = cudaEventRecord(state.moe_hidden_uploaded, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek MoE hidden upload");
+        return result;
+    }
+
+    constexpr unsigned int threads = 256U;
+    const dim3 hidden_quantize_grid(
+        static_cast<unsigned int>((hidden_columns + 127U) / 128U), 1U, 1U);
+    quantize_activation_e4m3_kernel<<<hidden_quantize_grid, 128U, 0U,
+                                      state.stream>>>(
+        state.moe_hidden, hidden_columns, 1U);
+    ++state.moe_kernel_launches;
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        abort_enqueue(status, "launch DeepSeek MoE hidden quantization");
+        return result;
+    }
+
+    if (!routed.empty()) {
+        const auto& w1 = routed.front().w1->impl_->descriptor;
+        const auto& w2 = routed.front().w2->impl_->descriptor;
+        const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
+                             routed_batch.count, 1U);
+        deepseek_fp4_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, routed_batch,
+            hidden_columns, intermediate_columns, w1.packed_columns,
+            w1.scale_columns, swiglu_limit, state.moe_error);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek FP4 W1/W3 SwiGLU");
+            return result;
+        }
+        const dim3 activation_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            routed_batch.count, 1U);
+        quantize_activation_e4m3_kernel<<<activation_grid, 128U, 0U,
+                                          state.stream>>>(
+            state.moe_activations, intermediate_columns, routed_batch.count);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek routed activation quantization");
+            return result;
+        }
+        const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
+                             routed_batch.count, 1U);
+        deepseek_fp4_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, routed_batch,
+            intermediate_columns, hidden_columns, w2.packed_columns,
+            w2.scale_columns);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek FP4 W2");
+            return result;
+        }
+    }
+
+    if (shared != nullptr) {
+        const auto& w1 = shared->w1->impl_->descriptor;
+        const auto& w2 = shared->w2->impl_->descriptor;
+        float* shared_activation = state.moe_activations +
+            static_cast<std::uint64_t>(routed_batch.count) * intermediate_columns;
+        float* shared_output = state.moe_output +
+            static_cast<std::uint64_t>(routed_batch.count) * hidden_columns;
+        deepseek_fp8_gate_up_kernel<<<
+            static_cast<unsigned int>(intermediate_columns), threads, 0U,
+            state.stream>>>(
+            shared_activation, state.moe_hidden,
+            static_cast<const unsigned char*>(shared->w1->impl_->weights),
+            static_cast<const unsigned char*>(shared->w1->impl_->scales),
+            static_cast<const unsigned char*>(shared->w3->impl_->weights),
+            static_cast<const unsigned char*>(shared->w3->impl_->scales),
+            hidden_columns, intermediate_columns, w1.scale_columns,
+            swiglu_limit, state.moe_error);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek shared FP8 W1/W3 SwiGLU");
+            return result;
+        }
+        const dim3 shared_activation_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            1U, 1U);
+        quantize_activation_e4m3_kernel<<<shared_activation_grid, 128U, 0U,
+                                          state.stream>>>(
+            shared_activation, intermediate_columns, 1U);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek shared activation quantization");
+            return result;
+        }
+        deepseek_fp8_down_kernel<<<
+            static_cast<unsigned int>(hidden_columns), threads, 0U,
+            state.stream>>>(
+            shared_output, shared_activation,
+            static_cast<const unsigned char*>(shared->w2->impl_->weights),
+            static_cast<const unsigned char*>(shared->w2->impl_->scales),
+            intermediate_columns, hidden_columns, w2.scale_columns);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek shared FP8 W2");
+            return result;
+        }
+    }
+    if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek MoE kernel completion");
+        return result;
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        device_stats.activation_h2d_bytes += hidden_bytes;
+        device_stats.matmul_calls += 3U * expert_count;
+        device_stats.workspace_allocation_calls += allocation_calls;
+        device_stats.workspace_allocation_bytes += allocation_bytes;
+        ++device_stats.deepseek_moe_calls;
+        device_stats.deepseek_moe_kernel_launches += state.moe_kernel_launches;
+        ++device_stats.deepseek_moe_h2d_transfers;
+        device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::collect_deepseek_moe(
+    int device, std::span<float> routed_output,
+    std::span<float> shared_output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE collect targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.moe_in_flight) {
+        result.errors.emplace_back(
+            "DeepSeek MoE collect has no matching in-flight command");
+        return result;
+    }
+    if (state.moe_poisoned) {
+        result.errors.emplace_back(
+            "DeepSeek MoE workspace is poisoned by an unconfirmed CUDA drain");
+        if (const auto select_status = cudaSetDevice(device);
+            select_status == cudaSuccess) {
+            if (const auto drain_status = cudaDeviceSynchronize();
+                drain_status == cudaSuccess) {
+                state.moe_in_flight = false;
+                state.moe_poisoned = false;
+                state.moe_weights.clear();
+            } else {
+                result.errors.emplace_back(
+                    std::string("retry poisoned DeepSeek MoE drain: ") +
+                    cudaGetErrorString(drain_status));
+            }
+        } else {
+            result.errors.emplace_back(
+                std::string("select poisoned DeepSeek MoE device: ") +
+                cudaGetErrorString(select_status));
+        }
+        return result;
+    }
+    auto drain_without_output = [&]() {
+        if (const auto status = cudaSetDevice(device); status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("select CUDA device while draining DeepSeek MoE: ") +
+                cudaGetErrorString(status));
+        }
+        const auto drain_status = cudaEventSynchronize(state.moe_kernel_finished);
+        if (drain_status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("drain DeepSeek MoE kernels: ") +
+                cudaGetErrorString(drain_status));
+            state.moe_poisoned = true;
+        } else {
+            state.moe_in_flight = false;
+            state.moe_weights.clear();
+        }
+    };
+    std::uint64_t routed_elements = 0U;
+    if (!checked_bytes(state.moe_routed_count, state.moe_hidden_columns, 1U,
+                       routed_elements) ||
+        routed_output.size() != routed_elements ||
+        (state.moe_has_shared
+             ? shared_output.size() != state.moe_hidden_columns
+             : !shared_output.empty())) {
+        result.errors.emplace_back(
+            "DeepSeek MoE collect output spans do not match the enqueued command");
+        drain_without_output();
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        result = cuda_error(status, "select CUDA device for DeepSeek MoE collect");
+        drain_without_output();
+        return result;
+    }
+    auto abort_collect = [&](cudaError_t status, const char* operation) {
+        result = cuda_error(status, operation);
+        const auto drain_status = cudaStreamSynchronize(state.stream);
+        if (drain_status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("drain failed DeepSeek MoE collect: ") +
+                cudaGetErrorString(drain_status));
+            state.moe_poisoned = true;
+        } else {
+            state.moe_in_flight = false;
+            state.moe_weights.clear();
+        }
+    };
+    if (auto status = cudaEventRecord(state.moe_download_started, state.stream);
+        status != cudaSuccess) {
+        abort_collect(status, "record DeepSeek MoE download start");
+        return result;
+    }
+    const auto routed_bytes =
+        static_cast<std::uint64_t>(routed_output.size_bytes());
+    const auto shared_bytes =
+        static_cast<std::uint64_t>(shared_output.size_bytes());
+    const auto downloaded_bytes = routed_bytes + shared_bytes;
+    auto* host_bytes = static_cast<std::byte*>(state.moe_host_staging);
+    auto* host_error = reinterpret_cast<unsigned int*>(
+        host_bytes + static_cast<std::ptrdiff_t>(downloaded_bytes));
+    if (auto status = cudaMemcpyAsync(
+            host_bytes, state.moe_output,
+            static_cast<std::size_t>(downloaded_bytes),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        abort_collect(status, "stage DeepSeek MoE expert outputs");
+        return result;
+    }
+    if (auto status = cudaMemcpyAsync(
+            host_error, state.moe_error, sizeof(unsigned int),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        abort_collect(status, "stage DeepSeek MoE error flag");
+        return result;
+    }
+    if (auto status = cudaEventRecord(state.moe_completed, state.stream);
+        status != cudaSuccess) {
+        abort_collect(status, "record DeepSeek MoE completion");
+        return result;
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    const auto wait_status = cudaEventSynchronize(state.moe_completed);
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    if (wait_status != cudaSuccess) {
+        result = cuda_error(wait_status, "synchronize DeepSeek MoE completion");
+        const auto drain_status = cudaStreamSynchronize(state.stream);
+        if (drain_status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("drain failed DeepSeek MoE execution: ") +
+                cudaGetErrorString(drain_status));
+            state.moe_poisoned = true;
+        } else {
+            state.moe_in_flight = false;
+            state.moe_weights.clear();
+        }
+        return result;
+    }
+    state.moe_in_flight = false;
+    state.moe_weights.clear();
+
+    float h2d_milliseconds = 0.0F;
+    float kernel_milliseconds = 0.0F;
+    float d2h_milliseconds = 0.0F;
+    if (auto status = cudaEventElapsedTime(
+            &h2d_milliseconds, state.moe_start, state.moe_hidden_uploaded);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure DeepSeek MoE hidden upload");
+    }
+    if (auto status = cudaEventElapsedTime(
+            &kernel_milliseconds, state.moe_hidden_uploaded,
+            state.moe_kernel_finished);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure DeepSeek MoE kernels");
+    }
+    if (auto status = cudaEventElapsedTime(
+            &d2h_milliseconds, state.moe_download_started,
+            state.moe_completed);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure DeepSeek MoE output download");
+    }
+    const auto to_nanoseconds = [](float milliseconds) {
+        return static_cast<std::uint64_t>(std::llround(
+            static_cast<double>(milliseconds) * 1.0e6));
+    };
+    const auto h2d_nanoseconds = to_nanoseconds(h2d_milliseconds);
+    const auto kernel_nanoseconds = to_nanoseconds(kernel_milliseconds);
+    const auto d2h_nanoseconds = to_nanoseconds(d2h_milliseconds);
+    const auto total_nanoseconds =
+        h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        device_stats.activation_d2h_bytes += downloaded_bytes;
+        ++device_stats.synchronization_calls;
+        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        device_stats.activation_h2d_nanoseconds += h2d_nanoseconds;
+        device_stats.kernel_nanoseconds += kernel_nanoseconds;
+        device_stats.activation_d2h_nanoseconds += d2h_nanoseconds;
+        device_stats.deepseek_moe_d2h_transfers += 2U;
+        device_stats.deepseek_moe_d2h_bytes +=
+            downloaded_bytes + sizeof(unsigned int);
+        device_stats.deepseek_moe_h2d_nanoseconds += h2d_nanoseconds;
+        device_stats.deepseek_moe_kernel_nanoseconds += kernel_nanoseconds;
+        device_stats.deepseek_moe_d2h_nanoseconds += d2h_nanoseconds;
+        device_stats.deepseek_moe_nanoseconds += total_nanoseconds;
+    }
+    if (*host_error != 0U) {
+        result.errors.emplace_back(
+            "DeepSeek MoE W1/W3 produced a non-finite BF16 activation");
+        return result;
+    }
+    if (!routed_output.empty()) {
+        std::memcpy(routed_output.data(), host_bytes,
+                    static_cast<std::size_t>(routed_bytes));
+    }
+    if (!shared_output.empty()) {
+        std::memcpy(shared_output.data(),
+                    host_bytes + static_cast<std::ptrdiff_t>(routed_bytes),
+                    static_cast<std::size_t>(shared_bytes));
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::synchronize(int device) {
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) return {{"cannot synchronize an uninitialized CUDA device"}};
+    if (found->second.moe_in_flight) {
+        return {{"use collect_deepseek_moe for an in-flight DeepSeek MoE command"}};
+    }
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for synchronization");
     }
@@ -764,6 +1637,23 @@ CudaBackendStats CudaBackend::stats() const noexcept {
             result.kernel_nanoseconds, device.kernel_nanoseconds);
         result.activation_d2h_nanoseconds = std::max(
             result.activation_d2h_nanoseconds, device.activation_d2h_nanoseconds);
+        result.deepseek_moe_calls += device.deepseek_moe_calls;
+        result.deepseek_moe_kernel_launches += device.deepseek_moe_kernel_launches;
+        result.deepseek_moe_h2d_transfers += device.deepseek_moe_h2d_transfers;
+        result.deepseek_moe_d2h_transfers += device.deepseek_moe_d2h_transfers;
+        result.deepseek_moe_h2d_bytes += device.deepseek_moe_h2d_bytes;
+        result.deepseek_moe_d2h_bytes += device.deepseek_moe_d2h_bytes;
+        result.deepseek_moe_h2d_nanoseconds = std::max(
+            result.deepseek_moe_h2d_nanoseconds,
+            device.deepseek_moe_h2d_nanoseconds);
+        result.deepseek_moe_kernel_nanoseconds = std::max(
+            result.deepseek_moe_kernel_nanoseconds,
+            device.deepseek_moe_kernel_nanoseconds);
+        result.deepseek_moe_d2h_nanoseconds = std::max(
+            result.deepseek_moe_d2h_nanoseconds,
+            device.deepseek_moe_d2h_nanoseconds);
+        result.deepseek_moe_nanoseconds = std::max(
+            result.deepseek_moe_nanoseconds, device.deepseek_moe_nanoseconds);
     }
     return result;
 }

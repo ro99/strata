@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
+#include "strata/deepseek_diagnostics.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -17,8 +18,12 @@ struct Dsv4RuntimeConfig {
     double vram_cache_fraction{0.85};
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
     std::uint32_t maximum_context_tokens{2048U};
+    std::uint32_t logit_trace_top_k{20U};
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
+    bool enable_device_moe{};
+    bool enable_logit_trace{};
+    bool enable_layer_hash_trace{};
     bool detailed_timing{};
     bool verbose{};
     std::string route_trace_path;
@@ -28,15 +33,28 @@ struct Dsv4CacheStats {
     std::uint64_t hits{};
     std::uint64_t misses{};
     std::uint64_t evictions{};
+    std::uint64_t lease_acquires{};
+    std::uint64_t lease_releases{};
     std::vector<std::uint64_t> used_bytes;
     std::vector<std::uint64_t> capacity_bytes;
     std::vector<std::uint64_t> pinned_bytes;
+    std::vector<std::uint64_t> leased_bytes;
+    std::vector<std::uint64_t> active_leases;
+};
+
+struct Dsv4DeviceMoeStats {
+    std::uint64_t batches{};
+    std::uint64_t device_commands{};
+    std::uint64_t routed_experts{};
+    std::uint64_t shared_experts{};
+    std::uint64_t nanoseconds{};
 };
 
 struct Dsv4PhaseMetrics {
     Dsv4CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
+    Dsv4DeviceMoeStats device_moe;
 };
 
 struct Dsv4GenerationMetrics {
@@ -53,10 +71,12 @@ struct Dsv4GenerationMetrics {
     Dsv4CheckpointReadStats decode_checkpoint_reads;
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
+    Dsv4DeviceMoeStats device_moe;
     Dsv4PhaseMetrics prefill;
     Dsv4PhaseMetrics decode;
     bool detailed_timing{};
     bool dspark_enabled{};
+    bool device_moe_enabled{};
 };
 
 struct Dsv4GenerationResult {
@@ -64,6 +84,7 @@ struct Dsv4GenerationResult {
     std::vector<std::uint32_t> prompt_token_ids;
     std::vector<std::uint32_t> generated_token_ids;
     Dsv4GenerationMetrics metrics;
+    Dsv4DiagnosticTrace diagnostics;
     std::vector<std::string> errors;
 
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }

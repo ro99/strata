@@ -34,6 +34,7 @@ add_library(strata_core STATIC
     src/glm_manifest.cpp
     src/deepseek_manifest.cpp
     src/deepseek_ops.cpp
+    src/deepseek_diagnostics.cpp
     src/deepseek_checkpoint.cpp
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp
@@ -114,6 +115,7 @@ if(BUILD_TESTING)
         tests/test_glm_int4.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_ops.cpp
+        tests/test_deepseek_diagnostics.cpp
         tests/test_deepseek_runtime.cpp
         tests/test_model.cpp
         tests/test_q4.cpp

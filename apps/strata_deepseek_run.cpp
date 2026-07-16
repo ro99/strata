@@ -20,12 +20,16 @@ struct Options {
     std::vector<int> devices{0, 1, 2};
     std::uint32_t maximum_new_tokens{16U};
     std::uint32_t maximum_context_tokens{2048U};
+    std::uint32_t logit_trace_top_k{20U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
     double vram_fraction{0.85};
     bool admission_only{};
     bool json{};
     bool quiet{};
     bool detailed_timing{};
+    bool device_moe{};
+    bool logit_trace{};
+    bool layer_hash_trace{};
     std::string route_trace;
 };
 
@@ -34,6 +38,8 @@ void usage() {
         << "usage: strata-deepseek-run --model DIR [--prompt TEXT] [--max-new N]\n"
         << "       [--devices 0,1,2] [--max-context N] [--host-memory 216G]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
+        << "       [--device-moe]\n"
+        << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
         << "       [--detailed-timing] [--json] [--quiet]\n";
 }
 
@@ -125,6 +131,17 @@ bool parse_options(int argc, char** argv, Options& options) {
             const auto* value = next(argument);
             if (value == nullptr) return false;
             options.route_trace = value;
+        } else if (argument == "--device-moe") {
+            options.device_moe = true;
+        } else if (argument == "--logit-trace") {
+            options.logit_trace = true;
+        } else if (argument == "--logit-trace-top-k") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_u32(value, options.logit_trace_top_k) ||
+                options.logit_trace_top_k == 0U) return false;
+            options.logit_trace = true;
+        } else if (argument == "--layer-hash-trace") {
+            options.layer_hash_trace = true;
         } else if (argument == "--admission-only") {
             options.admission_only = true;
         } else if (argument == "--detailed-timing") {
@@ -189,6 +206,23 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.kernel_nanoseconds) / 1.0e9
            << ",\"critical_path_activation_d2h_seconds\":"
            << static_cast<double>(stats.activation_d2h_nanoseconds) / 1.0e9
+           << ",\"deepseek_moe_calls\":" << stats.deepseek_moe_calls
+           << ",\"deepseek_moe_kernel_launches\":"
+           << stats.deepseek_moe_kernel_launches
+           << ",\"deepseek_moe_h2d_transfers\":"
+           << stats.deepseek_moe_h2d_transfers
+           << ",\"deepseek_moe_d2h_transfers\":"
+           << stats.deepseek_moe_d2h_transfers
+           << ",\"deepseek_moe_h2d_bytes\":" << stats.deepseek_moe_h2d_bytes
+           << ",\"deepseek_moe_d2h_bytes\":" << stats.deepseek_moe_d2h_bytes
+           << ",\"maximum_device_deepseek_moe_h2d_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_deepseek_moe_kernel_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_deepseek_moe_d2h_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_deepseek_moe_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_nanoseconds) / 1.0e9
            << ",\"devices\":[";
     for (std::size_t index = 0U; index < stats.devices.size(); ++index) {
         const auto& device = stats.devices[index];
@@ -208,20 +242,58 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"kernel_seconds\":"
                << static_cast<double>(device.kernel_nanoseconds) / 1.0e9
                << ",\"activation_d2h_seconds\":"
-               << static_cast<double>(device.activation_d2h_nanoseconds) / 1.0e9 << '}';
+               << static_cast<double>(device.activation_d2h_nanoseconds) / 1.0e9
+               << ",\"deepseek_moe_calls\":" << device.deepseek_moe_calls
+               << ",\"deepseek_moe_kernel_launches\":"
+               << device.deepseek_moe_kernel_launches
+               << ",\"deepseek_moe_h2d_transfers\":"
+               << device.deepseek_moe_h2d_transfers
+               << ",\"deepseek_moe_d2h_transfers\":"
+               << device.deepseek_moe_d2h_transfers
+               << ",\"deepseek_moe_h2d_bytes\":"
+               << device.deepseek_moe_h2d_bytes
+               << ",\"deepseek_moe_d2h_bytes\":"
+               << device.deepseek_moe_d2h_bytes
+               << ",\"deepseek_moe_h2d_seconds\":"
+               << static_cast<double>(device.deepseek_moe_h2d_nanoseconds) / 1.0e9
+               << ",\"deepseek_moe_kernel_seconds\":"
+               << static_cast<double>(device.deepseek_moe_kernel_nanoseconds) / 1.0e9
+               << ",\"deepseek_moe_d2h_seconds\":"
+               << static_cast<double>(device.deepseek_moe_d2h_nanoseconds) / 1.0e9
+               << ",\"deepseek_moe_seconds\":"
+               << static_cast<double>(device.deepseek_moe_nanoseconds) / 1.0e9
+               << '}';
     }
     output << "]}";
 }
 
 void print_cache_stats(std::ostream& output, const strata::Dsv4CacheStats& stats) {
     output << "{\"hits\":" << stats.hits << ",\"misses\":" << stats.misses
-           << ",\"evictions\":" << stats.evictions << ",\"used_bytes\":";
+           << ",\"evictions\":" << stats.evictions
+           << ",\"lease_acquires\":" << stats.lease_acquires
+           << ",\"lease_releases\":" << stats.lease_releases
+           << ",\"used_bytes\":";
     print_array(output, stats.used_bytes);
     output << ",\"capacity_bytes\":";
     print_array(output, stats.capacity_bytes);
     output << ",\"pinned_bytes\":";
     print_array(output, stats.pinned_bytes);
+    output << ",\"leased_bytes\":";
+    print_array(output, stats.leased_bytes);
+    output << ",\"active_leases\":";
+    print_array(output, stats.active_leases);
     output << '}';
+}
+
+void print_device_moe_stats(
+    std::ostream& output, const strata::Dsv4DeviceMoeStats& stats) {
+    output << "{\"batches\":" << stats.batches
+           << ",\"device_commands\":" << stats.device_commands
+           << ",\"routed_experts\":" << stats.routed_experts
+           << ",\"shared_experts\":" << stats.shared_experts
+           << ",\"execution_seconds\":"
+           << static_cast<double>(stats.nanoseconds) / 1.0e9
+           << '}';
 }
 
 void print_phase(std::ostream& output, const strata::Dsv4PhaseMetrics& phase) {
@@ -233,6 +305,8 @@ void print_phase(std::ostream& output, const strata::Dsv4PhaseMetrics& phase) {
     print_cuda_stats(output, phase.cuda);
     output << ",\"cache\":";
     print_cache_stats(output, phase.cache);
+    output << ",\"device_moe_runtime\":";
+    print_device_moe_stats(output, phase.device_moe);
     output << '}';
 }
 
@@ -252,6 +326,111 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << ",\"zero_nvme_decode\":" << (plan.zero_nvme_decode ? "true" : "false")
            << ",\"dspark_enabled\":" << (plan.dspark_enabled ? "true" : "false")
            << '}';
+}
+
+std::string hex_u64(std::uint64_t value) {
+    std::ostringstream output;
+    output << std::hex << std::setfill('0') << std::setw(16) << value;
+    return output.str();
+}
+
+template <typename T>
+void print_json_number(std::ostream& output, T value) {
+    if (std::isfinite(value)) output << value;
+    else output << "null";
+}
+
+void print_logit_summary(std::ostream& output,
+                         const strata::Dsv4LogitSummary& summary) {
+    output << "{\"value_count\":" << summary.value_count
+           << ",\"finite_count\":" << summary.finite_count
+           << ",\"non_finite_count\":" << summary.non_finite_count
+           << ",\"sum\":";
+    print_json_number(output, summary.sum);
+    output << ",\"absolute_sum\":";
+    print_json_number(output, summary.absolute_sum);
+    output << ",\"square_sum\":";
+    print_json_number(output, summary.square_sum);
+    output << ",\"minimum\":";
+    if (summary.has_finite) print_json_number(output, summary.minimum);
+    else output << "null";
+    output << ",\"maximum\":";
+    if (summary.has_finite) print_json_number(output, summary.maximum);
+    else output << "null";
+    output << ",\"raw_f32_hash\":\"" << hex_u64(summary.raw_f32_hash)
+           << "\"}";
+}
+
+void print_diagnostics(std::ostream& output,
+                       const strata::Dsv4DiagnosticTrace& diagnostics) {
+    const auto previous_precision = output.precision();
+    output << std::setprecision(std::numeric_limits<double>::max_digits10)
+           << "{\"hash_algorithm\":\"fnv1a64-little-endian\""
+           << ",\"logits\":{\"enabled\":"
+           << (diagnostics.logit_trace_enabled ? "true" : "false")
+           << ",\"top_k\":" << diagnostics.logit_top_k;
+    if (diagnostics.logit_trace_enabled) {
+        const auto& aggregate = diagnostics.logit_aggregate;
+        output << ",\"aggregate\":{\"forward_count\":"
+               << aggregate.forward_count
+               << ",\"value_count\":" << aggregate.value_count
+               << ",\"finite_count\":" << aggregate.finite_count
+               << ",\"non_finite_count\":" << aggregate.non_finite_count
+               << ",\"sum\":";
+        print_json_number(output, aggregate.sum);
+        output << ",\"absolute_sum\":";
+        print_json_number(output, aggregate.absolute_sum);
+        output << ",\"square_sum\":";
+        print_json_number(output, aggregate.square_sum);
+        output << ",\"minimum\":";
+        if (aggregate.has_finite) print_json_number(output, aggregate.minimum);
+        else output << "null";
+        output << ",\"maximum\":";
+        if (aggregate.has_finite) print_json_number(output, aggregate.maximum);
+        else output << "null";
+        output << ",\"trace_hash\":\"" << hex_u64(aggregate.trace_hash)
+               << "\"},\"forwards\":[";
+        for (std::size_t index = 0U; index < diagnostics.logits.size(); ++index) {
+            const auto& record = diagnostics.logits[index];
+            if (index != 0U) output << ',';
+            output << "{\"position\":" << record.position
+                   << ",\"input_token\":" << record.input_token
+                   << ",\"selected_token\":" << record.selected_token
+                   << ",\"summary\":";
+            print_logit_summary(output, record.summary);
+            output << ",\"top\":[";
+            for (std::size_t rank = 0U; rank < record.top.size(); ++rank) {
+                if (rank != 0U) output << ',';
+                output << "{\"token_id\":" << record.top[rank].token_id
+                       << ",\"raw_logit\":";
+                print_json_number(output, record.top[rank].raw_logit);
+                output << '}';
+            }
+            output << "]}";
+        }
+        output << ']';
+    }
+    output << "},\"layer_hidden_hashes\":{\"enabled\":"
+           << (diagnostics.layer_hash_trace_enabled ? "true" : "false");
+    if (diagnostics.layer_hash_trace_enabled) {
+        output << ",\"aggregate\":{\"entry_count\":"
+               << diagnostics.layer_hashes.size()
+               << ",\"trace_hash\":\""
+               << hex_u64(diagnostics.layer_hash_trace_hash)
+               << "\"},\"entries\":[";
+        for (std::size_t index = 0U; index < diagnostics.layer_hashes.size(); ++index) {
+            const auto& record = diagnostics.layer_hashes[index];
+            if (index != 0U) output << ',';
+            output << "{\"position\":" << record.position
+                   << ",\"input_token\":" << record.input_token
+                   << ",\"layer\":" << record.layer
+                   << ",\"bf16_hash\":\"" << hex_u64(record.bf16_hash)
+                   << "\"}";
+        }
+        output << ']';
+    }
+    output << "}}";
+    output.precision(previous_precision);
 }
 
 bool device_budgets(const Options& options, std::vector<std::uint64_t>& budgets,
@@ -293,6 +472,13 @@ int main(int argc, char** argv) {
     }
 
     if (options.admission_only) {
+        if (options.device_moe) {
+            std::cerr
+                << "error: --device-moe requires full initialization to prove "
+                   "per-device top-k lease capacity; admission-only cannot "
+                   "make that promise\n";
+            return 1;
+        }
         auto checkpoint = strata::Dsv4CheckpointReader::open(options.model);
         if (!checkpoint.ok()) {
             for (const auto& error : checkpoint.errors) std::cerr << "error: " << error << '\n';
@@ -332,8 +518,12 @@ int main(int argc, char** argv) {
     config.vram_cache_fraction = options.vram_fraction;
     config.host_memory_limit_bytes = options.host_memory_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
+    config.logit_trace_top_k = options.logit_trace_top_k;
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
+    config.enable_device_moe = options.device_moe;
+    config.enable_logit_trace = options.logit_trace;
+    config.enable_layer_hash_trace = options.layer_hash_trace;
     config.detailed_timing = options.detailed_timing;
     config.verbose = !options.quiet;
     config.route_trace_path = options.route_trace;
@@ -354,6 +544,8 @@ int main(int argc, char** argv) {
                   << "{\"answer\":\"" << json_escape(generated.text)
                   << "\",\"execution\":\"exact_base_autoregressive\""
                   << ",\"dspark\":\"disabled\""
+                  << ",\"device_moe\":"
+                  << (metrics.device_moe_enabled ? "true" : "false")
                   << ",\"detailed_timing\":"
                   << (metrics.detailed_timing ? "true" : "false")
                   << ",\"initialization_seconds\":" << metrics.initialization_seconds
@@ -378,12 +570,20 @@ int main(int argc, char** argv) {
         std::cout << ",\"decode\":";
         print_phase(std::cout, metrics.decode);
         std::cout << '}'
+                  << ",\"device_moe_runtime\":";
+        print_device_moe_stats(std::cout, metrics.device_moe);
+        std::cout
                   << ",\"memory_plan\":";
         print_plan(std::cout, metrics.memory);
         std::cout << ",\"prompt_token_ids\":";
         print_array(std::cout, generated.prompt_token_ids);
         std::cout << ",\"generated_token_ids\":";
         print_array(std::cout, generated.generated_token_ids);
+        if (generated.diagnostics.logit_trace_enabled ||
+            generated.diagnostics.layer_hash_trace_enabled) {
+            std::cout << ",\"diagnostics\":";
+            print_diagnostics(std::cout, generated.diagnostics);
+        }
         std::cout << "}\n";
     } else {
         std::cout << generated.text << "\n\n"

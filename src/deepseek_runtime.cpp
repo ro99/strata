@@ -39,8 +39,11 @@ constexpr std::uint32_t kExpertIntermediate = 2048U;
 constexpr std::uint32_t kVocabulary = 129280U;
 constexpr std::uint32_t kMhc = 4U;
 constexpr std::uint32_t kMix = 24U;
+constexpr std::uint64_t kDeviceWorkspaceReserve = 256ULL << 20U;
 constexpr float kRmsEpsilon = 1.0e-6F;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
+constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
 
 [[nodiscard]] std::string layer_prefix(std::uint32_t layer) {
     return "layers." + std::to_string(layer) + ".";
@@ -52,6 +55,29 @@ void append_errors(ValidationResult& result, std::vector<std::string> errors,
         if (!context.empty()) error = std::string(context) + ": " + error;
         result.errors.push_back(std::move(error));
     }
+}
+
+[[nodiscard]] std::uint64_t diagnostic_hash_byte(
+    std::uint64_t hash, std::uint8_t value) noexcept {
+    return (hash ^ value) * kDiagnosticFnvPrime;
+}
+
+[[nodiscard]] std::uint64_t diagnostic_hash_u32(
+    std::uint64_t hash, std::uint32_t value) noexcept {
+    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
+        hash = diagnostic_hash_byte(
+            hash, static_cast<std::uint8_t>(value >> shift));
+    }
+    return hash;
+}
+
+[[nodiscard]] std::uint64_t diagnostic_hash_u64(
+    std::uint64_t hash, std::uint64_t value) noexcept {
+    for (std::uint32_t shift = 0U; shift < 64U; shift += 8U) {
+        hash = diagnostic_hash_byte(
+            hash, static_cast<std::uint8_t>(value >> shift));
+    }
+    return hash;
 }
 
 [[nodiscard]] float round_bf16(float value) noexcept {
@@ -168,6 +194,16 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     STRATA_DSV4_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
     STRATA_DSV4_CUDA_DEVICE_DELTA(kernel_nanoseconds);
     STRATA_DSV4_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_calls);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_kernel_launches);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_h2d_transfers);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_transfers);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_h2d_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_h2d_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_kernel_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_nanoseconds);
 #undef STRATA_DSV4_CUDA_DEVICE_DELTA
     return result;
 }
@@ -190,12 +226,26 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     STRATA_DSV4_CUDA_DELTA(activation_h2d_nanoseconds);
     STRATA_DSV4_CUDA_DELTA(kernel_nanoseconds);
     STRATA_DSV4_CUDA_DELTA(activation_d2h_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_calls);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_kernel_launches);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_h2d_transfers);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_transfers);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_h2d_bytes);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_bytes);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_h2d_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_kernel_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(deepseek_moe_nanoseconds);
 #undef STRATA_DSV4_CUDA_DELTA
     result.synchronization_nanoseconds = 0U;
     result.upload_wait_nanoseconds = 0U;
     result.activation_h2d_nanoseconds = 0U;
     result.kernel_nanoseconds = 0U;
     result.activation_d2h_nanoseconds = 0U;
+    result.deepseek_moe_h2d_nanoseconds = 0U;
+    result.deepseek_moe_kernel_nanoseconds = 0U;
+    result.deepseek_moe_d2h_nanoseconds = 0U;
+    result.deepseek_moe_nanoseconds = 0U;
     for (const auto& device_after : after.devices) {
         const auto found = std::find_if(
             before.devices.begin(), before.devices.end(),
@@ -216,6 +266,17 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             result.kernel_nanoseconds, delta.kernel_nanoseconds);
         result.activation_d2h_nanoseconds = std::max(
             result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
+        result.deepseek_moe_h2d_nanoseconds = std::max(
+            result.deepseek_moe_h2d_nanoseconds,
+            delta.deepseek_moe_h2d_nanoseconds);
+        result.deepseek_moe_kernel_nanoseconds = std::max(
+            result.deepseek_moe_kernel_nanoseconds,
+            delta.deepseek_moe_kernel_nanoseconds);
+        result.deepseek_moe_d2h_nanoseconds = std::max(
+            result.deepseek_moe_d2h_nanoseconds,
+            delta.deepseek_moe_d2h_nanoseconds);
+        result.deepseek_moe_nanoseconds = std::max(
+            result.deepseek_moe_nanoseconds, delta.deepseek_moe_nanoseconds);
     }
     return result;
 }
@@ -226,7 +287,19 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     result.hits -= before.hits;
     result.misses -= before.misses;
     result.evictions -= before.evictions;
+    result.lease_acquires -= before.lease_acquires;
+    result.lease_releases -= before.lease_releases;
     return result;
+}
+
+[[nodiscard]] Dsv4DeviceMoeStats device_moe_delta(
+    const Dsv4DeviceMoeStats& after,
+    const Dsv4DeviceMoeStats& before) noexcept {
+    return {after.batches - before.batches,
+            after.device_commands - before.device_commands,
+            after.routed_experts - before.routed_experts,
+            after.shared_experts - before.shared_experts,
+            after.nanoseconds - before.nanoseconds};
 }
 
 [[nodiscard]] std::uint64_t linear_bytes(const Dsv4CheckpointReader& checkpoint,
@@ -250,6 +323,7 @@ class Dsv4WeightCache {
     struct Entry {
         CudaWeight weight;
         std::uint64_t last_use{};
+        std::uint32_t leases{};
         bool pinned{};
     };
     struct State {
@@ -261,6 +335,49 @@ class Dsv4WeightCache {
     };
 
 public:
+    class Lease {
+    public:
+        Lease() = default;
+        ~Lease() { reset(); }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+
+        Lease(Lease&& other) noexcept
+            : owner_(other.owner_), entry_(other.entry_) {
+            other.owner_ = nullptr;
+            other.entry_ = nullptr;
+        }
+
+        Lease& operator=(Lease&& other) noexcept {
+            if (this == &other) return *this;
+            reset();
+            owner_ = other.owner_;
+            entry_ = other.entry_;
+            other.owner_ = nullptr;
+            other.entry_ = nullptr;
+            return *this;
+        }
+
+        [[nodiscard]] const CudaWeight& weight() const noexcept {
+            return entry_->weight;
+        }
+
+    private:
+        friend class Dsv4WeightCache;
+
+        Lease(Dsv4WeightCache* owner, Entry* entry) noexcept
+            : owner_(owner), entry_(entry) {}
+
+        void reset() noexcept {
+            if (owner_ != nullptr && entry_ != nullptr) owner_->release(entry_);
+            owner_ = nullptr;
+            entry_ = nullptr;
+        }
+
+        Dsv4WeightCache* owner_{};
+        Entry* entry_{};
+    };
+
     Dsv4WeightCache(Dsv4CheckpointReader& checkpoint,
                     Dsv4ResidentWeightStore& resident, CudaBackend& backend,
                     std::vector<int> devices, std::vector<std::uint64_t> capacities)
@@ -273,6 +390,36 @@ public:
                              std::uint64_t rows, std::uint64_t columns) {
         Entry* entry = nullptr;
         return ensure(slot, base, rows, columns, true, entry);
+    }
+
+    ValidationResult acquire(std::size_t slot, std::string_view base,
+                             std::uint64_t rows, std::uint64_t columns,
+                             Lease& output) {
+        output.reset();
+        Entry* entry = nullptr;
+        auto result = ensure(slot, base, rows, columns, false, entry);
+        if (!result.ok()) return result;
+        ++entry->leases;
+        ++lease_acquires_;
+        output = Lease(this, entry);
+        return result;
+    }
+
+    ValidationResult validate_atomic_expert_capacity(
+        std::uint64_t required_bytes) const {
+        ValidationResult result;
+        for (std::size_t slot = 0U; slot < states_.size(); ++slot) {
+            const auto& state = states_[slot];
+            const auto available = state.capacity >= state.pinned
+                                       ? state.capacity - state.pinned
+                                       : 0U;
+            if (required_bytes > available) {
+                result.errors.emplace_back(
+                    "DeepSeek device " + std::to_string(devices_[slot]) +
+                    " cannot lease the worst-case exact top-k expert set");
+            }
+        }
+        return result;
     }
 
     ValidationResult matmul(std::size_t slot, std::string_view base,
@@ -309,10 +456,22 @@ public:
         result.hits = hits_;
         result.misses = misses_;
         result.evictions = evictions_;
+        result.lease_acquires = lease_acquires_;
+        result.lease_releases = lease_releases_;
         for (const auto& state : states_) {
             result.used_bytes.push_back(state.used);
             result.capacity_bytes.push_back(state.capacity);
             result.pinned_bytes.push_back(state.pinned);
+            std::uint64_t leased_bytes = 0U;
+            std::uint64_t active_leases = 0U;
+            for (const auto& [name, entry] : state.entries) {
+                static_cast<void>(name);
+                if (entry.leases == 0U) continue;
+                leased_bytes += entry.weight.device_bytes();
+                active_leases += entry.leases;
+            }
+            result.leased_bytes.push_back(leased_bytes);
+            result.active_leases.push_back(active_leases);
         }
         return result;
     }
@@ -350,15 +509,21 @@ private:
             auto victim = state.entries.end();
             for (auto candidate = state.entries.begin(); candidate != state.entries.end();
                  ++candidate) {
-                if (candidate->second.pinned) continue;
+                if (candidate->second.pinned || candidate->second.leases != 0U) continue;
                 if (victim == state.entries.end() ||
                     candidate->second.last_use < victim->second.last_use) {
                     victim = candidate;
                 }
             }
             if (victim == state.entries.end()) {
-                result.errors.emplace_back(
-                    "DeepSeek pinned resident spine exceeds a device VRAM budget");
+                const bool in_flight = std::any_of(
+                    state.entries.begin(), state.entries.end(),
+                    [](const auto& candidate) {
+                        return candidate.second.leases != 0U;
+                    });
+                result.errors.emplace_back(in_flight
+                    ? "DeepSeek atomic in-flight expert set exceeds a device VRAM budget"
+                    : "DeepSeek pinned resident spine exceeds a device VRAM budget");
                 return result;
             }
             state.used -= victim->second.weight.device_bytes();
@@ -379,6 +544,13 @@ private:
         return result;
     }
 
+    void release(Entry* entry) noexcept {
+        if (entry != nullptr && entry->leases != 0U) {
+            --entry->leases;
+            ++lease_releases_;
+        }
+    }
+
     Dsv4CheckpointReader& checkpoint_;
     Dsv4ResidentWeightStore& resident_;
     CudaBackend& backend_;
@@ -387,6 +559,8 @@ private:
     std::uint64_t hits_{};
     std::uint64_t misses_{};
     std::uint64_t evictions_{};
+    std::uint64_t lease_acquires_{};
+    std::uint64_t lease_releases_{};
 };
 
 struct CompressorState {
@@ -414,6 +588,8 @@ struct DeepSeekV4Runtime::Impl {
     GlmTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
+    Dsv4DiagnosticTrace diagnostics;
+    Dsv4DeviceMoeStats device_moe_stats;
     std::vector<int> devices;
     std::vector<std::uint64_t> capacities;
     std::vector<std::size_t> schedule;
@@ -491,6 +667,11 @@ struct DeepSeekV4Runtime::Impl {
 
     ValidationResult warmup();
     ValidationResult reset_sequence();
+    void reset_diagnostics();
+    void record_layer_hash(std::uint32_t position, std::uint32_t token,
+                           std::uint32_t layer, std::span<const float> hidden);
+    void record_logits(std::uint32_t position, std::uint32_t token,
+                       std::uint32_t selected, std::span<const float> logits);
     ValidationResult embed(std::uint32_t token, std::span<float> output);
     ValidationResult compressor(std::uint32_t layer, std::span<const float> input,
                                 std::uint32_t position);
@@ -499,6 +680,10 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult expert(std::uint32_t layer, std::uint32_t expert_id,
                             float routed_coefficient,
                             std::span<const float> input, std::span<float> output);
+    ValidationResult device_moe(std::uint32_t layer,
+                                const Dsv4Route& route,
+                                std::span<const float> input,
+                                std::span<float> output);
     ValidationResult moe(std::uint32_t layer, std::uint32_t token,
                          std::span<const float> input, std::span<float> output,
                          std::uint32_t position);
@@ -508,6 +693,68 @@ struct DeepSeekV4Runtime::Impl {
                                              std::uint32_t position,
                                              bool logits);
 };
+
+void DeepSeekV4Runtime::Impl::reset_diagnostics() {
+    diagnostics = {};
+    diagnostics.logit_trace_enabled = config.enable_logit_trace;
+    diagnostics.layer_hash_trace_enabled = config.enable_layer_hash_trace;
+    diagnostics.logit_top_k = config.logit_trace_top_k;
+    if (config.enable_logit_trace) {
+        diagnostics.logit_aggregate.trace_hash = diagnostic_hash_u32(
+            kDiagnosticFnvOffset, config.logit_trace_top_k);
+        diagnostics.logits.reserve(config.maximum_context_tokens);
+    }
+    if (config.enable_layer_hash_trace) {
+        diagnostics.layer_hash_trace_hash = diagnostic_hash_u32(
+            kDiagnosticFnvOffset, kLayers);
+        diagnostics.layer_hashes.reserve(
+            static_cast<std::size_t>(config.maximum_context_tokens) * kLayers);
+    }
+}
+
+void DeepSeekV4Runtime::Impl::record_layer_hash(
+    std::uint32_t position, std::uint32_t token, std::uint32_t layer,
+    std::span<const float> hidden) {
+    const auto hash = dsv4_stable_bf16_hash(hidden);
+    diagnostics.layer_hashes.push_back({position, token, layer, hash});
+    auto aggregate = diagnostics.layer_hash_trace_hash;
+    aggregate = diagnostic_hash_u32(aggregate, position);
+    aggregate = diagnostic_hash_u32(aggregate, token);
+    aggregate = diagnostic_hash_u32(aggregate, layer);
+    diagnostics.layer_hash_trace_hash = diagnostic_hash_u64(aggregate, hash);
+}
+
+void DeepSeekV4Runtime::Impl::record_logits(
+    std::uint32_t position, std::uint32_t token, std::uint32_t selected,
+    std::span<const float> logits) {
+    auto analysis = analyze_dsv4_logits(logits, config.logit_trace_top_k);
+    const auto& summary = analysis.summary;
+    auto& aggregate = diagnostics.logit_aggregate;
+    ++aggregate.forward_count;
+    aggregate.value_count += summary.value_count;
+    aggregate.finite_count += summary.finite_count;
+    aggregate.non_finite_count += summary.non_finite_count;
+    aggregate.sum += summary.sum;
+    aggregate.absolute_sum += summary.absolute_sum;
+    aggregate.square_sum += summary.square_sum;
+    if (summary.has_finite) {
+        if (!aggregate.has_finite) {
+            aggregate.minimum = summary.minimum;
+            aggregate.maximum = summary.maximum;
+            aggregate.has_finite = true;
+        } else {
+            aggregate.minimum = std::min(aggregate.minimum, summary.minimum);
+            aggregate.maximum = std::max(aggregate.maximum, summary.maximum);
+        }
+    }
+    auto hash = aggregate.trace_hash;
+    hash = diagnostic_hash_u32(hash, position);
+    hash = diagnostic_hash_u32(hash, token);
+    hash = diagnostic_hash_u32(hash, selected);
+    aggregate.trace_hash = diagnostic_hash_u64(hash, summary.raw_f32_hash);
+    diagnostics.logits.push_back(
+        {position, token, selected, summary, std::move(analysis.top)});
+}
 
 ValidationResult DeepSeekV4Runtime::Impl::warmup() {
     ValidationResult result;
@@ -906,6 +1153,161 @@ ValidationResult DeepSeekV4Runtime::Impl::expert(
                   activated, output);
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::device_moe(
+    std::uint32_t layer, const Dsv4Route& route,
+    std::span<const float> input, std::span<float> output) {
+    ValidationResult result;
+    if (layer >= kLayers || input.size() != kHidden || output.size() != kHidden ||
+        route.experts.size() != kTopK || route.weights.size() != kTopK) {
+        result.errors.emplace_back("DeepSeek device MoE input or route shape is invalid");
+        return result;
+    }
+
+    struct RoutePlacement {
+        std::size_t slot{};
+        std::size_t local_rank{};
+    };
+    struct PendingDevice {
+        std::vector<Dsv4WeightCache::Lease> leases;
+        std::vector<CudaDeepSeekMoeExpert> routed;
+        CudaDeepSeekMoeExpert shared;
+        std::vector<float> routed_output;
+        std::vector<float> shared_output;
+        bool has_shared{};
+        bool enqueued{};
+    };
+
+    std::vector<PendingDevice> pending(devices.size());
+    for (auto& device : pending) {
+        device.leases.reserve((kTopK + 1U) * 3U);
+        device.routed.reserve(kTopK);
+    }
+    std::array<RoutePlacement, kTopK> placements{};
+
+    const auto acquire_triplet = [this, &result](
+        std::size_t slot, std::string_view prefix, float coefficient,
+        PendingDevice& pending_device, CudaDeepSeekMoeExpert& descriptor) {
+        descriptor.coefficient = coefficient;
+        const auto acquire = [this, &result, slot, &pending_device](
+            std::string name, std::uint64_t rows, std::uint64_t columns,
+            const CudaWeight*& weight) {
+            pending_device.leases.emplace_back();
+            auto loaded = weights->acquire(slot, name, rows, columns,
+                                           pending_device.leases.back());
+            if (!loaded.ok()) {
+                append_errors(result, std::move(loaded.errors), name);
+                pending_device.leases.pop_back();
+                return false;
+            }
+            weight = &pending_device.leases.back().weight();
+            return true;
+        };
+        return acquire(std::string(prefix) + "w1", kExpertIntermediate,
+                       kHidden, descriptor.w1) &&
+               acquire(std::string(prefix) + "w3", kExpertIntermediate,
+                       kHidden, descriptor.w3) &&
+               acquire(std::string(prefix) + "w2", kHidden,
+                       kExpertIntermediate, descriptor.w2);
+    };
+
+    const auto routed_prefix = layer_prefix(layer) + "ffn.experts.";
+    for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+        const auto expert_id = route.experts[rank];
+        if (expert_id >= kExperts || !std::isfinite(route.weights[rank])) {
+            result.errors.emplace_back(
+                "DeepSeek device MoE expert id or coefficient is invalid");
+            return result;
+        }
+        const auto slot = expert_device(expert_id);
+        auto& pending_device = pending[slot];
+        placements[rank] = {slot, pending_device.routed.size()};
+        CudaDeepSeekMoeExpert descriptor;
+        const auto prefix = routed_prefix + std::to_string(expert_id) + ".";
+        if (!acquire_triplet(slot, prefix, route.weights[rank],
+                             pending_device, descriptor)) {
+            return result;
+        }
+        pending_device.routed.push_back(descriptor);
+    }
+
+    const auto shared_slot = layer_device(layer);
+    auto& shared_device = pending[shared_slot];
+    const auto shared_prefix = layer_prefix(layer) + "ffn.shared_experts.";
+    if (!acquire_triplet(shared_slot, shared_prefix, 1.0F,
+                         shared_device, shared_device.shared)) {
+        return result;
+    }
+    shared_device.has_shared = true;
+
+    const auto execution_started = std::chrono::steady_clock::now();
+    const auto device_commands = static_cast<std::uint64_t>(std::count_if(
+        pending.begin(), pending.end(), [](const auto& pending_device) {
+            return !pending_device.routed.empty() || pending_device.has_shared;
+        }));
+
+    for (std::size_t slot = 0U; slot < pending.size(); ++slot) {
+        auto& pending_device = pending[slot];
+        if (pending_device.routed.empty() && !pending_device.has_shared) continue;
+        pending_device.routed_output.resize(
+            pending_device.routed.size() * kHidden);
+        if (pending_device.has_shared) {
+            pending_device.shared_output.resize(kHidden);
+        }
+        auto enqueued = cuda.enqueue_deepseek_moe(
+            devices[slot], input, pending_device.routed,
+            pending_device.has_shared ? &pending_device.shared : nullptr, 10.0F);
+        if (!enqueued.ok()) {
+            append_errors(result, std::move(enqueued.errors),
+                          "DeepSeek device MoE enqueue");
+            break;
+        }
+        pending_device.enqueued = true;
+    }
+
+    // Every accepted command must be observed before its cache leases leave
+    // scope, including commands submitted before a later-device enqueue error.
+    for (std::size_t slot = 0U; slot < pending.size(); ++slot) {
+        auto& pending_device = pending[slot];
+        if (!pending_device.enqueued) continue;
+        auto collected = cuda.collect_deepseek_moe(
+            devices[slot], pending_device.routed_output,
+            pending_device.shared_output);
+        pending_device.enqueued = false;
+        if (!collected.ok()) {
+            append_errors(result, std::move(collected.errors),
+                          "DeepSeek device MoE collect");
+        }
+    }
+    if (!result.ok()) return result;
+
+    for (auto& pending_device : pending) {
+        round_bf16(pending_device.routed_output);
+        round_bf16(pending_device.shared_output);
+    }
+    std::fill(output.begin(), output.end(), 0.0F);
+    for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+        const auto placement = placements[rank];
+        const auto routed = std::span<const float>(
+            pending[placement.slot].routed_output)
+            .subspan(placement.local_rank * kHidden, kHidden);
+        for (std::uint32_t column = 0U; column < kHidden; ++column) {
+            output[column] += routed[column];
+        }
+    }
+    for (std::uint32_t column = 0U; column < kHidden; ++column) {
+        output[column] = round_bf16(
+            output[column] + shared_device.shared_output[column]);
+    }
+    ++device_moe_stats.batches;
+    device_moe_stats.device_commands += device_commands;
+    device_moe_stats.routed_experts += kTopK;
+    ++device_moe_stats.shared_experts;
+    device_moe_stats.nanoseconds += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - execution_started).count());
+    return result;
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::moe(
     std::uint32_t layer, std::uint32_t token, std::span<const float> input,
     std::span<float> output, std::uint32_t position) {
@@ -969,6 +1371,10 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
             route_trace << route.value.weights[index];
         }
         route_trace << "]}\n";
+    }
+
+    if (config.enable_device_moe) {
+        return device_moe(layer, route.value, input, output);
     }
 
     std::fill(output.begin(), output.end(), 0.0F);
@@ -1062,6 +1468,9 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
             result.errors = std::move(validation.errors);
             return result;
         }
+        if (config.enable_layer_hash_trace) {
+            record_layer_hash(position, token, layer, hidden);
+        }
     }
     if (!logits_required) {
         result.value = token;
@@ -1114,6 +1523,9 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     }
     result.value = static_cast<std::uint32_t>(
         std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
+    if (config.enable_logit_trace) {
+        record_logits(position, token, result.value, logits);
+    }
     return result;
 }
 
@@ -1141,6 +1553,13 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "current exact DeepSeek runtime context must be within [1, 2048] tokens");
         return result;
     }
+    if (config.enable_logit_trace &&
+        (config.logit_trace_top_k == 0U ||
+         config.logit_trace_top_k > kVocabulary)) {
+        result.errors.emplace_back(
+            "DeepSeek logit trace top-K must be within [1, 129280]");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
@@ -1162,6 +1581,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (!result.ok()) return result;
 
     std::vector<std::uint64_t> capacities;
+    std::vector<std::uint64_t> weight_capacities;
     std::vector<std::uint64_t> totals;
     for (const auto device : config.devices) {
         auto memory = CudaBackend::device_memory(device);
@@ -1177,6 +1597,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
             return result;
         }
         capacities.push_back(capacity);
+        weight_capacities.push_back(capacity - kDeviceWorkspaceReserve);
         totals.push_back(memory.value.total_bytes);
     }
     const auto admission_started = std::chrono::steady_clock::now();
@@ -1209,7 +1630,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
-    impl_->capacities = capacities;
+    impl_->capacities = weight_capacities;
     impl_->schedule = std::move(schedule);
     if (!config.route_trace_path.empty()) {
         impl_->route_trace.open(config.route_trace_path,
@@ -1227,7 +1648,10 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (config.verbose) {
         for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
             std::cerr << "[hardware] cuda=" << impl_->devices[slot]
-                      << " vram_cache_bytes=" << capacities[slot] << '\n';
+                      << " vram_budget_bytes=" << capacities[slot]
+                      << " weight_cache_bytes=" << weight_capacities[slot]
+                      << " workspace_reserve_bytes=" << kDeviceWorkspaceReserve
+                      << '\n';
         }
     }
     const auto staging_started = std::chrono::steady_clock::now();
@@ -1239,9 +1663,20 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (!result.ok()) return result;
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
-        impl_->devices, capacities);
+        impl_->devices, weight_capacities);
     result = impl_->warmup();
     if (!result.ok()) return result;
+    if (config.enable_device_moe) {
+        if (impl_->memory.maximum_expert_bytes >
+            std::numeric_limits<std::uint64_t>::max() / kTopK) {
+            result.errors.emplace_back(
+                "DeepSeek exact top-k expert lease size overflows");
+            return result;
+        }
+        result = impl_->weights->validate_atomic_expert_capacity(
+            impl_->memory.maximum_expert_bytes * kTopK);
+        if (!result.ok()) return result;
+    }
     result = impl_->reset_sequence();
     if (!result.ok()) return result;
     impl_->initialized = true;
@@ -1256,6 +1691,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.cache = impl_->weights->stats();
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
+    impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
     return result;
 }
 
@@ -1283,6 +1719,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
         return result;
     }
     result.prompt_token_ids = encoded.value;
+    impl_->reset_diagnostics();
     auto reset = impl_->reset_sequence();
     if (!reset.ok()) {
         result.errors = std::move(reset.errors);
@@ -1291,6 +1728,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
+    const auto device_moe_before = impl_->device_moe_stats;
     const auto prefill_started = std::chrono::steady_clock::now();
     ParseResult<std::uint32_t> next;
     for (std::size_t position = 0U; position < result.prompt_token_ids.size(); ++position) {
@@ -1308,6 +1746,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto reads_after_prefill = impl_->checkpoint->stats();
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
+    const auto device_moe_after_prefill = impl_->device_moe_stats;
     constexpr std::uint32_t stop_token = 1U;
     if (next.value != stop_token) result.generated_token_ids.push_back(next.value);
     std::uint32_t position = static_cast<std::uint32_t>(
@@ -1336,6 +1775,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto reads_after_decode = impl_->checkpoint->stats();
     const auto cuda_after_decode = impl_->cuda.stats();
     const auto cache_after_decode = impl_->weights->stats();
+    const auto device_moe_after_decode = impl_->device_moe_stats;
     const double prefill_seconds = result.metrics.prefill_seconds;
     const double decode_seconds = result.metrics.decode_seconds;
     result.metrics = impl_->initialization_metrics;
@@ -1349,14 +1789,29 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
                                                          reads_after_prefill);
     result.metrics.cuda = impl_->cuda.stats();
     result.metrics.cache = impl_->weights->stats();
+    result.metrics.device_moe = device_moe_delta(
+        device_moe_after_decode, device_moe_before);
     result.metrics.prefill.checkpoint_reads = read_delta(reads_after_prefill,
                                                          reads_before);
     result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
     result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
+    result.metrics.prefill.device_moe = device_moe_delta(
+        device_moe_after_prefill, device_moe_before);
     result.metrics.decode.checkpoint_reads = read_delta(reads_after_decode,
                                                         reads_after_prefill);
     result.metrics.decode.cuda = cuda_delta(cuda_after_decode, cuda_after_prefill);
     result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
+    result.metrics.decode.device_moe = device_moe_delta(
+        device_moe_after_decode, device_moe_after_prefill);
+    result.diagnostics = std::move(impl_->diagnostics);
+    if (result.metrics.cache.lease_acquires !=
+            result.metrics.cache.lease_releases ||
+        std::any_of(result.metrics.cache.active_leases.begin(),
+                    result.metrics.cache.active_leases.end(),
+                    [](std::uint64_t count) { return count != 0U; })) {
+        result.errors.emplace_back(
+            "DeepSeek generation completed with outstanding CUDA weight leases");
+    }
     if (impl_->config.require_zero_nvme_decode &&
         (result.metrics.decode_checkpoint_reads.calls != 0U ||
          result.metrics.decode_checkpoint_reads.bytes != 0U)) {

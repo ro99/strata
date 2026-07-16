@@ -1,12 +1,16 @@
 #include "test.hpp"
 
 #include "strata/cuda_backend.hpp"
+#include "strata/deepseek_ops.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -19,6 +23,124 @@ std::array<std::byte, 2> bf16(float value) {
     const auto high = static_cast<std::uint16_t>(bits >> 16U);
     std::array<std::byte, 2> output{};
     std::memcpy(output.data(), &high, sizeof(high));
+    return output;
+}
+
+float round_bf16(float value) {
+    auto bits = std::bit_cast<std::uint32_t>(value);
+    if ((bits & 0x7F80'0000U) == 0x7F80'0000U) return value;
+    bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    return std::bit_cast<float>(bits & 0xFFFF'0000U);
+}
+
+strata::CudaWeight upload_fp4(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns, std::uint8_t seed) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Fp4E2m1Group32;
+    descriptor.dtype = strata::SafetensorsDtype::I8;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = (columns + 1U) / 2U;
+    descriptor.scale_columns = (columns + 31U) / 32U;
+    descriptor.group_size = 32U;
+    std::vector<std::byte> weights(
+        static_cast<std::size_t>(rows * descriptor.packed_columns));
+    for (std::uint64_t row = 0U; row < rows; ++row) {
+        for (std::uint64_t packed = 0U; packed < descriptor.packed_columns;
+             ++packed) {
+            const auto low = static_cast<std::uint8_t>(
+                (seed + row * 3U + packed * 5U) & 0x0FU);
+            const auto high = static_cast<std::uint8_t>(
+                (seed + row * 7U + packed * 11U + 1U) & 0x0FU);
+            weights[static_cast<std::size_t>(
+                row * descriptor.packed_columns + packed)] =
+                static_cast<std::byte>(low | static_cast<std::uint8_t>(high << 4U));
+        }
+    }
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(rows * descriptor.scale_columns));
+    for (std::size_t index = 0U; index < scales.size(); ++index) {
+        scales[index] = static_cast<std::byte>(
+            0x78U + static_cast<std::uint8_t>((index + seed) % 3U));
+    }
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
+    return result;
+}
+
+strata::CudaWeight upload_fp8(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns, std::uint8_t seed) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Fp8E4m3Block128;
+    descriptor.dtype = strata::SafetensorsDtype::F8E4M3;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = columns;
+    descriptor.scale_columns = (columns + 127U) / 128U;
+    descriptor.group_size = 128U;
+    constexpr std::array<std::uint8_t, 8> encodings{
+        0x00U, 0x30U, 0xB0U, 0x38U, 0xB8U, 0x40U, 0xC0U, 0x28U};
+    std::vector<std::byte> weights(static_cast<std::size_t>(rows * columns));
+    for (std::size_t index = 0U; index < weights.size(); ++index) {
+        weights[index] = static_cast<std::byte>(
+            encodings[(index + seed) % encodings.size()]);
+    }
+    const auto scale_rows = (rows + 127U) / 128U;
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(scale_rows * descriptor.scale_columns),
+        std::byte{0x78U});
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
+    return result;
+}
+
+strata::CudaWeight upload_fp4_nan_scale(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Fp4E2m1Group32;
+    descriptor.dtype = strata::SafetensorsDtype::I8;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = (columns + 1U) / 2U;
+    descriptor.scale_columns = (columns + 31U) / 32U;
+    descriptor.group_size = 32U;
+    std::vector<std::byte> weights(
+        static_cast<std::size_t>(rows * descriptor.packed_columns),
+        std::byte{0x11U});
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(rows * descriptor.scale_columns),
+        std::byte{0xFFU});
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
+    return result;
+}
+
+std::vector<float> reference_expert(
+    strata::CudaBackend& backend, const strata::CudaWeight& w1,
+    const strata::CudaWeight& w3, const strata::CudaWeight& w2,
+    std::span<const float> hidden, std::uint64_t intermediate,
+    float coefficient, bool routed) {
+    std::vector<float> gate(static_cast<std::size_t>(intermediate));
+    std::vector<float> up(static_cast<std::size_t>(intermediate));
+    std::vector<float> activated(static_cast<std::size_t>(intermediate));
+    REQUIRE(backend.matmul(w1, hidden, 1U, gate).ok());
+    REQUIRE(backend.matmul(w3, hidden, 1U, up).ok());
+    for (auto& value : gate) value = round_bf16(value);
+    for (auto& value : up) value = round_bf16(value);
+    REQUIRE(strata::dsv4_swiglu_f32(activated, gate, up, 10.0F).ok());
+    for (auto& value : activated) {
+        if (routed) {
+            value *= coefficient;
+            value *= coefficient;
+        }
+        value = round_bf16(value);
+    }
+    std::vector<float> output(hidden.size());
+    REQUIRE(backend.matmul(w2, activated, 1U, output).ok());
+    for (auto& value : output) value = round_bf16(value);
     return output;
 }
 
@@ -185,4 +307,152 @@ TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections
                                    grouped_output).ok());
     REQUIRE(grouped_output[0] == 17.0F);
     REQUIRE(grouped_output[1] == 53.0F);
+}
+
+TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when available") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint64_t hidden_columns = 32U;
+    constexpr std::uint64_t intermediate_columns = 32U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto routed0_w1 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 1U);
+    auto routed0_w3 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 6U);
+    auto routed0_w2 = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    auto routed1_w1 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto routed1_w3 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 9U);
+    auto routed1_w2 = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 14U);
+    auto shared_w1 = upload_fp8(
+        backend, device, intermediate_columns, hidden_columns, 1U);
+    auto shared_w3 = upload_fp8(
+        backend, device, intermediate_columns, hidden_columns, 4U);
+    auto shared_w2 = upload_fp8(
+        backend, device, hidden_columns, intermediate_columns, 7U);
+
+    std::array<float, hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 9U) - 4) *
+                        0.125F;
+    }
+    constexpr float coefficient0 = 0.75F;
+    constexpr float coefficient1 = 0.3125F;
+    const auto reference0 = reference_expert(
+        backend, routed0_w1, routed0_w3, routed0_w2, hidden,
+        intermediate_columns, coefficient0, true);
+    const auto reference1 = reference_expert(
+        backend, routed1_w1, routed1_w3, routed1_w2, hidden,
+        intermediate_columns, coefficient1, true);
+    const auto reference_shared = reference_expert(
+        backend, shared_w1, shared_w3, shared_w2, hidden,
+        intermediate_columns, 1.0F, false);
+
+    const std::array<strata::CudaDeepSeekMoeExpert, 2> routed{{
+        {&routed0_w1, &routed0_w3, &routed0_w2, coefficient0},
+        {&routed1_w1, &routed1_w3, &routed1_w2, coefficient1},
+    }};
+    const strata::CudaDeepSeekMoeExpert shared{
+        &shared_w1, &shared_w3, &shared_w2, 1.0F};
+    const auto before = backend.stats();
+    REQUIRE(backend.enqueue_deepseek_moe(
+        device, hidden, routed, &shared, 10.0F).ok());
+    REQUIRE(!backend.enqueue_deepseek_moe(
+        device, hidden, routed, &shared, 10.0F).ok());
+    REQUIRE(!backend.synchronize(device).ok());
+
+    std::array<float, 2U * hidden_columns> routed_output{};
+    std::array<float, hidden_columns> shared_output{};
+    REQUIRE(backend.collect_deepseek_moe(
+        device, routed_output, shared_output).ok());
+    float maximum_difference = 0.0F;
+    for (std::size_t column = 0U; column < hidden_columns; ++column) {
+        const float difference0 = std::abs(routed_output[column] - reference0[column]);
+        const float difference1 = std::abs(
+            routed_output[hidden_columns + column] - reference1[column]);
+        const float shared_difference =
+            std::abs(shared_output[column] - reference_shared[column]);
+        maximum_difference = std::max(
+            maximum_difference,
+            std::max(difference0, std::max(difference1, shared_difference)));
+        REQUIRE(std::bit_cast<std::uint32_t>(routed_output[column]) ==
+                std::bit_cast<std::uint32_t>(reference0[column]));
+        REQUIRE(std::bit_cast<std::uint32_t>(
+                    routed_output[hidden_columns + column]) ==
+                std::bit_cast<std::uint32_t>(reference1[column]));
+        REQUIRE(std::bit_cast<std::uint32_t>(shared_output[column]) ==
+                std::bit_cast<std::uint32_t>(reference_shared[column]));
+        REQUIRE((std::bit_cast<std::uint32_t>(routed_output[column]) & 0xFFFFU) == 0U);
+        REQUIRE((std::bit_cast<std::uint32_t>(
+                     routed_output[hidden_columns + column]) & 0xFFFFU) == 0U);
+        REQUIRE((std::bit_cast<std::uint32_t>(shared_output[column]) & 0xFFFFU) == 0U);
+    }
+    REQUIRE(maximum_difference == 0.0F);
+
+    const auto after = backend.stats();
+    REQUIRE(after.deepseek_moe_calls - before.deepseek_moe_calls == 1U);
+    REQUIRE(after.deepseek_moe_kernel_launches -
+                before.deepseek_moe_kernel_launches == 7U);
+    REQUIRE(after.deepseek_moe_h2d_transfers -
+                before.deepseek_moe_h2d_transfers == 1U);
+    REQUIRE(after.deepseek_moe_d2h_transfers -
+                before.deepseek_moe_d2h_transfers == 2U);
+    REQUIRE(after.deepseek_moe_h2d_bytes - before.deepseek_moe_h2d_bytes ==
+            hidden_columns * sizeof(float));
+    REQUIRE(after.deepseek_moe_d2h_bytes - before.deepseek_moe_d2h_bytes ==
+            3U * hidden_columns * sizeof(float) + sizeof(unsigned int));
+    REQUIRE(after.matmul_calls - before.matmul_calls == 9U);
+    REQUIRE(after.activation_h2d_bytes - before.activation_h2d_bytes ==
+            hidden_columns * sizeof(float));
+    REQUIRE(after.activation_d2h_bytes - before.activation_d2h_bytes ==
+            3U * hidden_columns * sizeof(float));
+    REQUIRE(after.workspace_allocation_calls -
+                before.workspace_allocation_calls == 5U);
+    REQUIRE(after.synchronization_calls - before.synchronization_calls == 1U);
+    REQUIRE(after.deepseek_moe_h2d_nanoseconds >
+            before.deepseek_moe_h2d_nanoseconds);
+    REQUIRE(after.deepseek_moe_kernel_nanoseconds >
+            before.deepseek_moe_kernel_nanoseconds);
+    REQUIRE(after.deepseek_moe_d2h_nanoseconds >
+            before.deepseek_moe_d2h_nanoseconds);
+    REQUIRE(after.deepseek_moe_nanoseconds - before.deepseek_moe_nanoseconds ==
+            (after.deepseek_moe_h2d_nanoseconds -
+             before.deepseek_moe_h2d_nanoseconds) +
+            (after.deepseek_moe_kernel_nanoseconds -
+             before.deepseek_moe_kernel_nanoseconds) +
+            (after.deepseek_moe_d2h_nanoseconds -
+             before.deepseek_moe_d2h_nanoseconds));
+
+    // Non-finite W1/W3 output is an explicit failure and never reaches the
+    // caller through the backend-owned staging buffer.
+    auto invalid_w1 = upload_fp4_nan_scale(
+        backend, device, intermediate_columns, hidden_columns);
+    const std::array<strata::CudaDeepSeekMoeExpert, 1> invalid_routed{{
+        {&invalid_w1, &routed0_w3, &routed0_w2, coefficient0},
+    }};
+    std::array<float, hidden_columns> invalid_output{};
+    invalid_output.fill(123.0F);
+    REQUIRE(backend.enqueue_deepseek_moe(
+        device, hidden, invalid_routed, nullptr, 10.0F).ok());
+    REQUIRE(!backend.collect_deepseek_moe(
+        device, invalid_output, {}).ok());
+    REQUIRE(std::all_of(invalid_output.begin(), invalid_output.end(),
+                        [](float value) { return value == 123.0F; }));
+
+    // A failed collect must drain the command before returning so weight
+    // leases and the persistent workspace can be reused safely.
+    REQUIRE(backend.enqueue_deepseek_moe(
+        device, hidden, routed, &shared, 10.0F).ok());
+    REQUIRE(!backend.collect_deepseek_moe(device, {}, {}).ok());
+    REQUIRE(backend.enqueue_deepseek_moe(
+        device, hidden, routed, &shared, 10.0F).ok());
+    REQUIRE(backend.collect_deepseek_moe(
+        device, routed_output, shared_output).ok());
 }

@@ -5,6 +5,14 @@
 #include <algorithm>
 #include <string>
 
+TEST_CASE("DeepSeek correctness diagnostics are opt-in") {
+    const strata::Dsv4RuntimeConfig config;
+    REQUIRE(!config.enable_device_moe);
+    REQUIRE(!config.enable_logit_trace);
+    REQUIRE(!config.enable_layer_hash_trace);
+    REQUIRE(config.logit_trace_top_k == 20U);
+}
+
 TEST_CASE("DeepSeek runtime rejects unverified DSpark execution explicitly") {
     strata::DeepSeekV4Runtime runtime;
     strata::Dsv4RuntimeConfig config;

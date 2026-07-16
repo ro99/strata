@@ -23,6 +23,7 @@ struct Options {
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{};
     std::uint32_t resident_read_workers{8U};
+    std::uint32_t spine_warmup_workers{3U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
     double vram_fraction{0.85};
     bool admission_only{};
@@ -41,6 +42,7 @@ void usage() {
         << "       [--devices 0,1,2] [--max-context N] [--host-memory 216G]\n"
         << "       [--host-attention-threads N]\n"
         << "       [--resident-read-workers N]\n"
+        << "       [--spine-warmup-workers N]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -132,6 +134,11 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (value == nullptr || !parse_u32(value, options.resident_read_workers) ||
                 options.resident_read_workers == 0U ||
                 options.resident_read_workers > 64U) return false;
+        } else if (argument == "--spine-warmup-workers") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_u32(value, options.spine_warmup_workers) ||
+                options.spine_warmup_workers == 0U ||
+                options.spine_warmup_workers > 64U) return false;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
@@ -535,6 +542,7 @@ int main(int argc, char** argv) {
     config.logit_trace_top_k = options.logit_trace_top_k;
     config.host_attention_threads = options.host_attention_threads;
     config.resident_read_workers = options.resident_read_workers;
+    config.spine_warmup_workers = options.spine_warmup_workers;
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
@@ -566,10 +574,13 @@ int main(int argc, char** argv) {
                   << metrics.host_attention_threads
                   << ",\"resident_read_workers\":"
                   << metrics.resident_read_workers
+                  << ",\"spine_warmup_workers\":"
+                  << metrics.spine_warmup_workers
                   << ",\"detailed_timing\":"
                   << (metrics.detailed_timing ? "true" : "false")
                   << ",\"initialization_seconds\":" << metrics.initialization_seconds
                   << ",\"resident_staging_seconds\":" << metrics.resident_staging_seconds
+                  << ",\"resident_warmup_seconds\":" << metrics.resident_warmup_seconds
                   << ",\"prompt_tokens\":" << metrics.prompt_tokens
                   << ",\"generated_tokens\":" << generated.generated_token_ids.size()
                   << ",\"decode_steps\":" << metrics.decode_tokens

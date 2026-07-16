@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -19,6 +20,7 @@
 #include <memory>
 #include <numbers>
 #include <span>
+#include <thread>
 #include <unordered_map>
 
 namespace strata {
@@ -454,11 +456,11 @@ public:
 
     [[nodiscard]] Dsv4CacheStats stats() const {
         Dsv4CacheStats result;
-        result.hits = hits_;
-        result.misses = misses_;
-        result.evictions = evictions_;
-        result.lease_acquires = lease_acquires_;
-        result.lease_releases = lease_releases_;
+        result.hits = hits_.load(std::memory_order_relaxed);
+        result.misses = misses_.load(std::memory_order_relaxed);
+        result.evictions = evictions_.load(std::memory_order_relaxed);
+        result.lease_acquires = lease_acquires_.load(std::memory_order_relaxed);
+        result.lease_releases = lease_releases_.load(std::memory_order_relaxed);
         for (const auto& state : states_) {
             result.used_bytes.push_back(state.used);
             result.capacity_bytes.push_back(state.capacity);
@@ -557,11 +559,11 @@ private:
     CudaBackend& backend_;
     std::vector<int> devices_;
     std::vector<State> states_;
-    std::uint64_t hits_{};
-    std::uint64_t misses_{};
-    std::uint64_t evictions_{};
-    std::uint64_t lease_acquires_{};
-    std::uint64_t lease_releases_{};
+    std::atomic<std::uint64_t> hits_{};
+    std::atomic<std::uint64_t> misses_{};
+    std::atomic<std::uint64_t> evictions_{};
+    std::atomic<std::uint64_t> lease_acquires_{};
+    std::atomic<std::uint64_t> lease_releases_{};
 };
 
 struct CompressorState {
@@ -760,88 +762,156 @@ void DeepSeekV4Runtime::Impl::record_logits(
 
 ValidationResult DeepSeekV4Runtime::Impl::warmup() {
     ValidationResult result;
-    const auto preload = [this, &result](std::size_t slot, const std::string& base,
-                                         std::uint64_t rows, std::uint64_t columns) {
-        if (result.ok()) result = weights->preload(slot, base, rows, columns);
+    const auto preload = [this](ValidationResult& target, std::size_t slot,
+                                const std::string& base, std::uint64_t rows,
+                                std::uint64_t columns) {
+        if (target.ok()) target = weights->preload(slot, base, rows, columns);
     };
-    const auto load_host = [this, &result](const std::string& name,
-                                           std::uint64_t ceiling) {
-        if (!result.ok()) return;
+    const auto load_host = [this](ValidationResult& target, const std::string& name,
+                                  std::uint64_t ceiling) {
+        if (!target.ok()) return;
         auto loaded = host_tensor(name, ceiling);
-        if (!loaded.ok()) append_errors(result, std::move(loaded.errors));
+        if (!loaded.ok()) append_errors(target, std::move(loaded.errors));
     };
-    const auto load_raw = [this, &result](const std::string& name,
-                                          std::uint64_t ceiling) {
-        if (!result.ok()) return;
+    const auto load_raw = [this](ValidationResult& target, const std::string& name,
+                                 std::uint64_t ceiling) {
+        if (!target.ok()) return;
         auto loaded = raw_tensor(name, ceiling);
-        if (!loaded.ok()) append_errors(result, std::move(loaded.errors));
+        if (!loaded.ok()) append_errors(target, std::move(loaded.errors));
     };
 
     const auto ratios = deepseek_v4_flash_dspark_spec().deepseek_v4.compression_ratios;
-    for (std::uint32_t layer = 0U; layer < kLayers && result.ok(); ++layer) {
+    const auto preload_layer = [this, &preload, &ratios](
+        ValidationResult& target, std::uint32_t layer) {
         const auto slot = layer_device(layer);
         const auto prefix = layer_prefix(layer);
         const auto attention = prefix + "attn.";
-        preload(slot, attention + "wq_a", kQueryRank, kHidden);
-        preload(slot, attention + "wq_b", kHeads * kHeadDim, kQueryRank);
-        preload(slot, attention + "wkv", kHeadDim, kHidden);
-        preload(slot, attention + "wo_a", kOutputGroups * kOutputRank,
+        preload(target, slot, attention + "wq_a", kQueryRank, kHidden);
+        preload(target, slot, attention + "wq_b", kHeads * kHeadDim, kQueryRank);
+        preload(target, slot, attention + "wkv", kHeadDim, kHidden);
+        preload(target, slot, attention + "wo_a", kOutputGroups * kOutputRank,
                 kHeads * kHeadDim / kOutputGroups);
-        preload(slot, attention + "wo_b", kHidden, kOutputGroups * kOutputRank);
-        preload(slot, prefix + "ffn.gate", kExperts, kHidden);
+        preload(target, slot, attention + "wo_b", kHidden,
+                kOutputGroups * kOutputRank);
+        preload(target, slot, prefix + "ffn.gate", kExperts, kHidden);
         for (const auto* operation : {"w1", "w3"}) {
-            preload(slot, prefix + "ffn.shared_experts." + operation,
+            preload(target, slot, prefix + "ffn.shared_experts." + operation,
                     kExpertIntermediate, kHidden);
         }
-        preload(slot, prefix + "ffn.shared_experts.w2", kHidden,
+        preload(target, slot, prefix + "ffn.shared_experts.w2", kHidden,
                 kExpertIntermediate);
-        load_host(attention + "q_norm.weight", kQueryRank);
-        load_host(attention + "kv_norm.weight", kHeadDim);
-        load_host(attention + "attn_sink", kHeads);
-        load_host(prefix + "attn_norm.weight", kHidden);
-        load_host(prefix + "ffn_norm.weight", kHidden);
+        const auto ratio = ratios[layer];
+        if (ratio != 0U) {
+            const auto coefficient = ratio == 4U ? 2U : 1U;
+            const auto dimensions = coefficient * kHeadDim;
+            preload(target, slot, attention + "compressor.wkv", dimensions, kHidden);
+            preload(target, slot, attention + "compressor.wgate", dimensions, kHidden);
+            if (ratio == 4U) {
+                preload(target, slot, attention + "indexer.wq_b", 64U * 128U,
+                        kQueryRank);
+                preload(target, slot, attention + "indexer.weights_proj", 64U, kHidden);
+                preload(target, slot, attention + "indexer.compressor.wkv", 2U * 128U,
+                        kHidden);
+                preload(target, slot, attention + "indexer.compressor.wgate", 2U * 128U,
+                        kHidden);
+            }
+        }
+    };
+    const auto load_host_layer = [this, &load_host, &load_raw, &ratios](
+        ValidationResult& target, std::uint32_t layer) {
+        const auto prefix = layer_prefix(layer);
+        const auto attention = prefix + "attn.";
+        load_host(target, attention + "q_norm.weight", kQueryRank);
+        load_host(target, attention + "kv_norm.weight", kHeadDim);
+        load_host(target, attention + "attn_sink", kHeads);
+        load_host(target, prefix + "attn_norm.weight", kHidden);
+        load_host(target, prefix + "ffn_norm.weight", kHidden);
         for (const auto* branch : {"attn", "ffn"}) {
-            load_host(prefix + "hc_" + branch + "_fn", kMix * kMhc * kHidden);
-            load_host(prefix + "hc_" + branch + "_scale", 3U);
-            load_host(prefix + "hc_" + branch + "_base", kMix);
+            load_host(target, prefix + "hc_" + branch + "_fn",
+                      kMix * kMhc * kHidden);
+            load_host(target, prefix + "hc_" + branch + "_scale", 3U);
+            load_host(target, prefix + "hc_" + branch + "_base", kMix);
         }
         if (layer < 3U) {
-            load_raw(prefix + "ffn.gate.tid2eid", 8ULL * kVocabulary * kTopK);
+            load_raw(target, prefix + "ffn.gate.tid2eid",
+                     8ULL * kVocabulary * kTopK);
         } else {
-            load_host(prefix + "ffn.gate.bias", kExperts);
+            load_host(target, prefix + "ffn.gate.bias", kExperts);
         }
         const auto ratio = ratios[layer];
         if (ratio != 0U) {
             const auto coefficient = ratio == 4U ? 2U : 1U;
             const auto dimensions = coefficient * kHeadDim;
-            preload(slot, attention + "compressor.wkv", dimensions, kHidden);
-            preload(slot, attention + "compressor.wgate", dimensions, kHidden);
-            load_host(attention + "compressor.ape",
+            load_host(target, attention + "compressor.ape",
                       static_cast<std::uint64_t>(ratio) * dimensions);
-            load_host(attention + "compressor.norm.weight", kHeadDim);
+            load_host(target, attention + "compressor.norm.weight", kHeadDim);
             if (ratio == 4U) {
-                preload(slot, attention + "indexer.wq_b", 64U * 128U, kQueryRank);
-                preload(slot, attention + "indexer.weights_proj", 64U, kHidden);
-                preload(slot, attention + "indexer.compressor.wkv", 2U * 128U,
-                        kHidden);
-                preload(slot, attention + "indexer.compressor.wgate", 2U * 128U,
-                        kHidden);
-                load_host(attention + "indexer.compressor.ape", 4U * 2U * 128U);
-                load_host(attention + "indexer.compressor.norm.weight", 128U);
+                load_host(target, attention + "indexer.compressor.ape",
+                          4U * 2U * 128U);
+                load_host(target, attention + "indexer.compressor.norm.weight", 128U);
             }
         }
+    };
+    const auto preload_head = [this, &preload](ValidationResult& target) {
+        preload(target, layer_device(kLayers - 1U), "head", kVocabulary, kHidden);
+    };
+    const auto load_host_head = [this, &load_host](ValidationResult& target) {
+        load_host(target, "norm.weight", kHidden);
+        load_host(target, "hc_head_fn", kMhc * kMhc * kHidden);
+        load_host(target, "hc_head_scale", 1U);
+        load_host(target, "hc_head_base", kMhc);
+    };
+
+    if (config.spine_warmup_workers == 1U) {
+        for (std::uint32_t layer = 0U; layer < kLayers && result.ok(); ++layer) {
+            preload_layer(result, layer);
+            load_host_layer(result, layer);
+            if (config.verbose) {
+                std::cerr << "[deepseek-load] resident spine layer " << layer + 1U
+                          << '/' << kLayers << '\n';
+            }
+        }
+        if (result.ok()) {
+            preload_head(result);
+            load_host_head(result);
+        }
+        return result;
+    }
+
+    std::vector<ValidationResult> device_results(devices.size());
+    std::atomic<std::size_t> next_slot{};
+    const auto worker = [&] {
+        for (;;) {
+            const auto slot = next_slot.fetch_add(1U, std::memory_order_relaxed);
+            if (slot >= devices.size()) return;
+            auto& target = device_results[slot];
+            for (std::uint32_t layer = 0U; layer < kLayers && target.ok(); ++layer) {
+                if (layer_device(layer) == slot) preload_layer(target, layer);
+            }
+            if (target.ok() && layer_device(kLayers - 1U) == slot) {
+                preload_head(target);
+            }
+        }
+    };
+    const auto active_workers = std::min<std::size_t>(
+        config.spine_warmup_workers, devices.size());
+    std::vector<std::thread> workers;
+    workers.reserve(active_workers);
+    for (std::size_t index = 0U; index < active_workers; ++index) {
+        workers.emplace_back(worker);
+    }
+    for (auto& thread : workers) thread.join();
+    for (auto& device_result : device_results) {
+        if (!device_result.ok()) append_errors(result, std::move(device_result.errors));
+    }
+    for (std::uint32_t layer = 0U; layer < kLayers && result.ok(); ++layer) {
+        load_host_layer(result, layer);
         if (config.verbose) {
             std::cerr << "[deepseek-load] resident spine layer " << layer + 1U
                       << '/' << kLayers << '\n';
         }
     }
-    if (result.ok()) {
-        preload(layer_device(kLayers - 1U), "head", kVocabulary, kHidden);
-        load_host("norm.weight", kHidden);
-        load_host("hc_head_fn", kMhc * kMhc * kHidden);
-        load_host("hc_head_scale", 1U);
-        load_host("hc_head_base", kMhc);
-    }
+    if (result.ok()) load_host_head(result);
     return result;
 }
 
@@ -1602,6 +1672,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "DeepSeek resident read worker count must be within [1, 64]");
         return result;
     }
+    if (config.spine_warmup_workers == 0U ||
+        config.spine_warmup_workers > 64U) {
+        result.errors.emplace_back(
+            "DeepSeek spine warmup worker count must be within [1, 64]");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
@@ -1713,7 +1789,10 @@ ValidationResult DeepSeekV4Runtime::initialize(
     } else {
         impl_->attention_workers.reset();
     }
+    const auto warmup_started = std::chrono::steady_clock::now();
     result = impl_->warmup();
+    const double warmup_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - warmup_started).count();
     if (!result.ok()) return result;
     if (config.enable_device_moe) {
         if (impl_->memory.maximum_expert_bytes >
@@ -1734,6 +1813,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
                                       initialization_started).count();
     impl_->initialization_metrics.admission_seconds = admission_seconds;
     impl_->initialization_metrics.resident_staging_seconds = staging_seconds;
+    impl_->initialization_metrics.resident_warmup_seconds = warmup_seconds;
     impl_->initialization_metrics.memory = impl_->memory;
     impl_->initialization_metrics.resident_stage = impl_->resident.stats();
     impl_->initialization_metrics.cuda = impl_->cuda.stats();
@@ -1745,6 +1825,9 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.host_attention_threads;
     impl_->initialization_metrics.resident_read_workers =
         impl_->resident.stats().workers;
+    impl_->initialization_metrics.spine_warmup_workers =
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            config.spine_warmup_workers, impl_->devices.size()));
     return result;
 }
 

@@ -13,6 +13,7 @@ TEST_CASE("DeepSeek correctness diagnostics are opt-in") {
     REQUIRE(config.logit_trace_top_k == 20U);
     REQUIRE(config.host_attention_threads == 0U);
     REQUIRE(config.resident_read_workers == 8U);
+    REQUIRE(config.spine_warmup_workers == 3U);
 }
 
 TEST_CASE("DeepSeek runtime rejects excessive resident read workers") {
@@ -24,6 +25,19 @@ TEST_CASE("DeepSeek runtime rejects excessive resident read workers") {
     REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
                         [](const std::string& error) {
                             return error.find("resident read worker") !=
+                                   std::string::npos;
+                        }));
+}
+
+TEST_CASE("DeepSeek runtime rejects excessive spine warmup workers") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.spine_warmup_workers = 65U;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("spine warmup worker") !=
                                    std::string::npos;
                         }));
 }

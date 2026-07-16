@@ -21,6 +21,7 @@ struct Dsv4RuntimeConfig {
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{};
     std::uint32_t resident_read_workers{8U};
+    std::uint32_t spine_warmup_workers{3U};
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
     bool enable_device_moe{};
@@ -63,6 +64,7 @@ struct Dsv4GenerationMetrics {
     double initialization_seconds{};
     double admission_seconds{};
     double resident_staging_seconds{};
+    double resident_warmup_seconds{};
     double prefill_seconds{};
     double decode_seconds{};
     std::uint64_t prompt_tokens{};
@@ -81,6 +83,7 @@ struct Dsv4GenerationMetrics {
     bool device_moe_enabled{};
     std::uint32_t host_attention_threads{};
     std::uint32_t resident_read_workers{};
+    std::uint32_t spine_warmup_workers{};
 };
 
 struct Dsv4GenerationResult {

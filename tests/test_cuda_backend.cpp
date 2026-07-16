@@ -146,6 +146,48 @@ std::vector<float> reference_expert(
 
 }  // namespace
 
+TEST_CASE("native CUDA backend reuses a strict bounded weight arena when available") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+    REQUIRE(backend.reserve_weight_arena(device, 768U).ok());
+    REQUIRE(!backend.reserve_weight_arena(device, 768U).ok());
+
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Plain;
+    descriptor.dtype = strata::SafetensorsDtype::Bf16;
+    descriptor.rows = 4U;
+    descriptor.columns = 8U;
+    std::array<std::byte, 64> payload{};
+
+    strata::CudaWeight first;
+    strata::CudaWeight second;
+    strata::CudaWeight third;
+    strata::CudaWeight coalesced;
+    REQUIRE(backend.upload(device, descriptor, payload, {}, first).ok());
+    REQUIRE(backend.upload(device, descriptor, payload, {}, second).ok());
+    REQUIRE(backend.upload(device, descriptor, payload, {}, third).ok());
+    REQUIRE(!backend.upload(device, descriptor, payload, {}, coalesced).ok());
+    first = {};
+    second = {};
+    descriptor.rows = 32U;
+    std::array<std::byte, 512> large_payload{};
+    REQUIRE(backend.upload(device, descriptor, large_payload, {}, coalesced).ok());
+
+    REQUIRE(first.device_bytes() == 0U);
+    REQUIRE(second.device_bytes() == 0U);
+    REQUIRE(third.device_bytes() == 256U);
+    REQUIRE(coalesced.device_bytes() == 512U);
+    const auto stats = backend.stats();
+    REQUIRE(stats.weight_allocation_calls == 1U);
+    REQUIRE(stats.weight_allocation_bytes == 768U);
+    REQUIRE(stats.weight_upload_bytes == 704U);
+}
+
 TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when available") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

@@ -11,8 +11,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 
 namespace strata {
@@ -496,6 +498,103 @@ bool checked_bytes(std::uint64_t left, std::uint64_t right, std::uint64_t elemen
     return true;
 }
 
+constexpr std::uint64_t kWeightPointerAlignment = 16U;
+constexpr std::uint64_t kWeightArenaAlignment = 256U;
+
+bool align_up(std::uint64_t value, std::uint64_t alignment,
+              std::uint64_t& result) {
+    const auto remainder = value % alignment;
+    const auto padding = remainder == 0U ? 0U : alignment - remainder;
+    if (value > std::numeric_limits<std::uint64_t>::max() - padding) return false;
+    result = value + padding;
+    return true;
+}
+
+class WeightArena {
+public:
+    struct Allocation {
+        std::uint64_t offset{};
+        std::uint64_t bytes{};
+        void* address{};
+    };
+
+    WeightArena(int device, void* base, std::uint64_t capacity)
+        : device_(device), base_(static_cast<std::byte*>(base)) {
+        free_.reserve(16'384U);
+        free_.push_back({0U, capacity});
+    }
+
+    ~WeightArena() {
+        if (device_ >= 0) static_cast<void>(cudaSetDevice(device_));
+        if (base_ != nullptr) static_cast<void>(cudaFree(base_));
+    }
+
+    WeightArena(const WeightArena&) = delete;
+    WeightArena& operator=(const WeightArena&) = delete;
+
+    [[nodiscard]] bool allocate(std::uint64_t bytes, Allocation& output) {
+        std::scoped_lock lock(mutex_);
+        if (metadata_failed_) return false;
+        const auto found = std::find_if(
+            free_.begin(), free_.end(),
+            [bytes](const Block& block) { return block.bytes >= bytes; });
+        if (found == free_.end()) return false;
+        output.offset = found->offset;
+        output.bytes = bytes;
+        output.address = base_ + found->offset;
+        found->offset += bytes;
+        found->bytes -= bytes;
+        if (found->bytes == 0U) free_.erase(found);
+        return true;
+    }
+
+    void release(std::uint64_t offset, std::uint64_t bytes) noexcept {
+        if (bytes == 0U) return;
+        std::scoped_lock lock(mutex_);
+        auto next = std::lower_bound(
+            free_.begin(), free_.end(), offset,
+            [](const Block& block, std::uint64_t value) {
+                return block.offset < value;
+            });
+        if (next != free_.begin()) {
+            auto previous = std::prev(next);
+            if (previous->offset + previous->bytes == offset) {
+                previous->bytes += bytes;
+                if (next != free_.end() &&
+                    previous->offset + previous->bytes == next->offset) {
+                    previous->bytes += next->bytes;
+                    free_.erase(next);
+                }
+                return;
+            }
+        }
+        if (next != free_.end() && offset + bytes == next->offset) {
+            next->offset = offset;
+            next->bytes += bytes;
+            return;
+        }
+        try {
+            free_.insert(next, Block{offset, bytes});
+        } catch (const std::bad_alloc&) {
+            // Destructors cannot surface allocation failure. Quarantine the
+            // untracked span and make future allocation fail explicitly.
+            metadata_failed_ = true;
+        }
+    }
+
+private:
+    struct Block {
+        std::uint64_t offset{};
+        std::uint64_t bytes{};
+    };
+
+    int device_{-1};
+    std::byte* base_{};
+    std::vector<Block> free_;
+    std::mutex mutex_;
+    bool metadata_failed_{};
+};
+
 }  // namespace
 
 struct CudaWeight::Impl {
@@ -504,8 +603,14 @@ struct CudaWeight::Impl {
     CudaWeightDescriptor descriptor;
     std::uint64_t bytes{};
     int device{-1};
+    std::shared_ptr<WeightArena> arena;
+    std::uint64_t arena_offset{};
 
     ~Impl() {
+        if (arena != nullptr) {
+            arena->release(arena_offset, bytes);
+            return;
+        }
         if (device >= 0) static_cast<void>(cudaSetDevice(device));
         if (weights != nullptr) static_cast<void>(cudaFree(weights));
         if (scales != nullptr) static_cast<void>(cudaFree(scales));
@@ -543,6 +648,8 @@ struct CudaBackend::Impl {
         std::uint32_t moe_routed_count{};
         std::uint64_t moe_kernel_launches{};
         std::vector<std::shared_ptr<CudaWeight::Impl>> moe_weights;
+        std::vector<std::shared_ptr<CudaWeight::Impl>> quarantined_weights;
+        std::shared_ptr<WeightArena> weight_arena;
         bool moe_has_shared{};
         bool moe_in_flight{};
         bool moe_poisoned{};
@@ -629,6 +736,19 @@ ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int device) {
     return result;
 }
 
+std::uint64_t CudaBackend::weight_storage_bytes(
+    std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept {
+    if (weight_bytes == 0U) return 0U;
+    std::uint64_t scale_offset = 0U;
+    if (!align_up(weight_bytes, kWeightPointerAlignment, scale_offset) ||
+        scale_bytes > std::numeric_limits<std::uint64_t>::max() - scale_offset) {
+        return 0U;
+    }
+    std::uint64_t result = 0U;
+    if (!align_up(scale_offset + scale_bytes, kWeightArenaAlignment, result)) return 0U;
+    return result;
+}
+
 ValidationResult CudaBackend::initialize(std::span<const int> devices,
                                          bool detailed_timing) {
     ValidationResult result;
@@ -673,6 +793,56 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         CudaBackendStats::Device device_stats;
         device_stats.device = device;
         impl_->stats.devices.push_back(device_stats);
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::reserve_weight_arena(int device,
+                                                   std::uint64_t bytes) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "weight arena targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.weight_arena != nullptr) {
+        result.errors.emplace_back("CUDA weight arena is already reserved");
+        return result;
+    }
+    const auto stats = std::find_if(
+        impl_->stats.devices.begin(), impl_->stats.devices.end(),
+        [device](const auto& value) { return value.device == device; });
+    if (stats->weight_upload_bytes != 0U) {
+        result.errors.emplace_back(
+            "CUDA weight arena must be reserved before the first weight upload");
+        return result;
+    }
+    bytes -= bytes % kWeightArenaAlignment;
+    if (bytes == 0U || bytes > std::numeric_limits<std::size_t>::max()) {
+        result.errors.emplace_back("CUDA weight arena capacity is invalid");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for weight arena");
+    }
+    void* base = nullptr;
+    if (auto status = cudaMalloc(&base, static_cast<std::size_t>(bytes));
+        status != cudaSuccess) {
+        return cuda_error(status, "reserve CUDA weight arena");
+    }
+    try {
+        state.weight_arena = std::make_shared<WeightArena>(device, base, bytes);
+    } catch (const std::bad_alloc&) {
+        static_cast<void>(cudaFree(base));
+        result.errors.emplace_back("allocate CUDA weight arena metadata");
+        return result;
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        ++stats->weight_allocation_calls;
+        stats->weight_allocation_bytes += bytes;
     }
     return result;
 }
@@ -767,33 +937,69 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     auto target = std::make_shared<CudaWeight::Impl>();
     target->descriptor = descriptor;
     target->device = device;
-    target->bytes = expected_weights + expected_scales;
-    if (auto status = cudaMalloc(&target->weights, static_cast<std::size_t>(expected_weights));
-        status != cudaSuccess) {
-        return cuda_error(status, "allocate CUDA weights");
-    }
+    const auto payload_bytes = expected_weights + expected_scales;
     auto& state = found->second;
+    std::uint64_t allocation_calls = 0U;
+    if (state.weight_arena != nullptr) {
+        target->bytes = weight_storage_bytes(expected_weights, expected_scales);
+        WeightArena::Allocation allocation;
+        if (target->bytes == 0U ||
+            !state.weight_arena->allocate(target->bytes, allocation)) {
+            result.errors.emplace_back(
+                "CUDA weight arena is exhausted; refusing per-weight allocation fallback");
+            return result;
+        }
+        target->arena = state.weight_arena;
+        target->arena_offset = allocation.offset;
+        target->weights = allocation.address;
+        if (expected_scales != 0U) {
+            std::uint64_t scale_offset = 0U;
+            static_cast<void>(align_up(expected_weights, kWeightPointerAlignment,
+                                       scale_offset));
+            target->scales = static_cast<std::byte*>(allocation.address) + scale_offset;
+        }
+    } else {
+        target->bytes = payload_bytes;
+        if (auto status = cudaMalloc(
+                &target->weights, static_cast<std::size_t>(expected_weights));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate CUDA weights");
+        }
+        ++allocation_calls;
+    }
     // This stream is nonblocking with respect to the legacy default stream.
     // Keep uploads on the execution stream and finish them before the caller's
     // host payload is released or the cache publishes the weight.
+    const auto upload_error = [&state, &target](cudaError_t status,
+                                                const char* operation) {
+        if (cudaStreamSynchronize(state.stream) != cudaSuccess) {
+            state.quarantined_weights.push_back(std::move(target));
+        }
+        return cuda_error(status, operation);
+    };
     if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
                                       cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
-        return cuda_error(status, "upload CUDA weights");
+        return upload_error(status, "upload CUDA weights");
     }
     if (expected_scales != 0U) {
-        if (auto status = cudaMalloc(&target->scales, static_cast<std::size_t>(expected_scales));
-            status != cudaSuccess) {
-            return cuda_error(status, "allocate CUDA scales");
+        if (state.weight_arena == nullptr) {
+            if (auto status = cudaMalloc(
+                    &target->scales, static_cast<std::size_t>(expected_scales));
+                status != cudaSuccess) {
+                return cuda_error(status, "allocate CUDA scales");
+            }
+            ++allocation_calls;
         }
         if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
                                           cudaMemcpyHostToDevice, state.stream);
             status != cudaSuccess) {
-            return cuda_error(status, "upload CUDA scales");
+            return upload_error(status, "upload CUDA scales");
         }
     }
     const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        state.quarantined_weights.push_back(std::move(target));
         return cuda_error(status, "synchronize CUDA weight upload");
     }
     const auto wait_nanoseconds = static_cast<std::uint64_t>(
@@ -804,9 +1010,11 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        device_stats.weight_upload_bytes += target->bytes;
-        device_stats.weight_allocation_calls += expected_scales == 0U ? 1U : 2U;
-        device_stats.weight_allocation_bytes += target->bytes;
+        device_stats.weight_upload_bytes += payload_bytes;
+        device_stats.weight_allocation_calls += allocation_calls;
+        if (allocation_calls != 0U) {
+            device_stats.weight_allocation_bytes += payload_bytes;
+        }
         ++device_stats.synchronization_calls;
         device_stats.synchronization_nanoseconds += wait_nanoseconds;
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;

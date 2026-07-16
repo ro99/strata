@@ -134,9 +134,16 @@ public:
     [[nodiscard]] static bool compiled() noexcept;
     [[nodiscard]] static std::vector<int> available_devices();
     [[nodiscard]] static ParseResult<CudaDeviceMemory> device_memory(int device);
+    [[nodiscard]] static std::uint64_t weight_storage_bytes(
+        std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept;
 
     [[nodiscard]] ValidationResult initialize(std::span<const int> devices,
                                               bool detailed_timing = false);
+    // Reserve one capacity-bounded allocation per device. Subsequent uploads
+    // suballocate from it and fail explicitly when it is exhausted; there is
+    // no per-weight cudaMalloc fallback once the arena is enabled.
+    [[nodiscard]] ValidationResult reserve_weight_arena(int device,
+                                                        std::uint64_t bytes);
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,

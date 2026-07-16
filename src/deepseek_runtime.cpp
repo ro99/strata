@@ -338,15 +338,17 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     if (weight == nullptr) return 0U;
     if (base.ends_with(".attn.wo_a") &&
         weight->encoding == Dsv4TensorEncoding::Fp8E4m3Block128) {
-        return weight->source_bytes * 2U;
+        if (weight->source_bytes >
+            std::numeric_limits<std::uint64_t>::max() / 2U) return 0U;
+        return CudaBackend::weight_storage_bytes(weight->source_bytes * 2U, 0U);
     }
-    std::uint64_t result = weight->source_bytes;
+    std::uint64_t scale_bytes = 0U;
     if (weight->encoding != Dsv4TensorEncoding::Plain) {
         const auto* scale = checkpoint.find(std::string(base) + ".scale");
         if (scale == nullptr) return 0U;
-        result += scale->source_bytes;
+        scale_bytes = scale->source_bytes;
     }
-    return result;
+    return CudaBackend::weight_storage_bytes(weight->source_bytes, scale_bytes);
 }
 
 class Dsv4WeightCache {
@@ -1833,6 +1835,11 @@ ValidationResult DeepSeekV4Runtime::initialize(
                       << '\n';
         }
     }
+    for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+        result = impl_->cuda.reserve_weight_arena(
+            impl_->devices[slot], weight_capacities[slot]);
+        if (!result.ok()) return result;
+    }
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
         impl_->devices, weight_capacities);
@@ -1878,14 +1885,22 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     if (!result.ok()) return result;
     if (config.enable_device_moe) {
+        // Each exact expert is three projections. Account conservatively for
+        // the arena's per-projection pointer and block alignment padding.
+        constexpr std::uint64_t kMaximumExpertArenaPadding =
+            3U * (15U + 255U);
         if (impl_->memory.maximum_expert_bytes >
-            std::numeric_limits<std::uint64_t>::max() / kTopK) {
+            std::numeric_limits<std::uint64_t>::max() -
+                kMaximumExpertArenaPadding ||
+            impl_->memory.maximum_expert_bytes + kMaximumExpertArenaPadding >
+                std::numeric_limits<std::uint64_t>::max() / kTopK) {
             result.errors.emplace_back(
                 "DeepSeek exact top-k expert lease size overflows");
             return result;
         }
         result = impl_->weights->validate_atomic_expert_capacity(
-            impl_->memory.maximum_expert_bytes * kTopK);
+            (impl_->memory.maximum_expert_bytes + kMaximumExpertArenaPadding) *
+            kTopK);
         if (!result.ok()) return result;
     }
     result = impl_->reset_sequence();

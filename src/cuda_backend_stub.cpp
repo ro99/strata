@@ -1,5 +1,7 @@
 #include "strata/cuda_backend.hpp"
 
+#include <limits>
+
 namespace strata {
 
 struct CudaWeight::Impl {};
@@ -23,7 +25,22 @@ ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int) {
     return {{}, {"CUDA support was not compiled into this build"}};
 }
 
+std::uint64_t CudaBackend::weight_storage_bytes(
+    std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept {
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (weight_bytes == 0U || weight_bytes > maximum - 15U) return 0U;
+    const auto scale_offset = (weight_bytes + 15U) & ~std::uint64_t{15U};
+    if (scale_bytes > maximum - scale_offset) return 0U;
+    const auto total = scale_offset + scale_bytes;
+    if (total > maximum - 255U) return 0U;
+    return (total + 255U) & ~std::uint64_t{255U};
+}
+
 ValidationResult CudaBackend::initialize(std::span<const int>, bool) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::reserve_weight_arena(int, std::uint64_t) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

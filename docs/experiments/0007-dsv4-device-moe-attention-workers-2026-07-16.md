@@ -1,6 +1,6 @@
 # Experiment 0007 — device MoE with exact host-attention workers
 
-Status: **screened; promoted as the next working baseline**.
+Status: **screened experimental baseline; not yet eligible for `main`**.
 
 ## Hypothesis and contract
 
@@ -100,6 +100,33 @@ stayed within the memory ceiling. The only failed acceptance gate was the
 
 This is a material single-run result and raises the working screen baseline
 from 2.9757502295 to 4.3789600899 steps/s. It is not yet a three-repetition
-validated median. The remaining gap is 3.6023 seconds per 127-step decode; the
-next bounded experiment will parallelize the independent exact mHC projection
-rows and residual destinations using the same otherwise-idle host pool.
+validated median.
+
+The follow-up exact mHC-worker screen on branch
+`exp/dsv4-device-moe-mhc-workers` (negative-result revision `1166175`) reached
+4.3299886195 steps/s versus its matched 4.3326939996 reference, a
+`0.9993755894x` ratio. That path was rejected without thread-count tuning or a
+three-run matrix. The attention-worker revision `c1dada2` therefore remains the
+best working screen baseline, and host micro-experiments stop here.
+
+## Main-branch promotion status
+
+The implementation is suitable for continued experimental use but is not yet
+mature enough for the repository's validated `main` branch. The exact
+serial/parallel comparison proves that this optimization preserves the current
+Strata executor; it does not prove that the executor matches the supplied
+target implementation. The outstanding promotion gates already declared in
+`docs/deepseek-v4-runtime.md` and `docs/model-bringup.md` are:
+
+- frozen target-executor outputs at operation and layer boundaries;
+- full-model teacher-forcing agreement;
+- greedy full-generation agreement;
+- independent physical-I/O confirmation of the zero-NVMe claim; and
+- a median of at least three interleaved 128-token repetitions before treating
+  4.3789600899 steps/s as a validated throughput result.
+
+Until those gates pass, this branch should remain an experimental checkpoint
+and its performance number should be described as a screen, not a validated
+research win. The next performance change, after correctness promotion, should
+be structural: reduce host/device boundaries with a larger device-resident
+attention/mHC block rather than resume small host-loop experiments.

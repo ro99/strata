@@ -5,10 +5,23 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+namespace {
+
+std::uint16_t reference_bf16(float value) {
+    auto bits = std::bit_cast<std::uint32_t>(value);
+    if ((bits & 0x7F80'0000U) != 0x7F80'0000U) {
+        bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    }
+    return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+}  // namespace
 
 TEST_CASE("DeepSeek native FP4 fixture matches target checkpoint bytes") {
     // First 16 packed bytes and the first E8M0 scale from
@@ -48,6 +61,45 @@ TEST_CASE("DeepSeek native FP8 fixture matches target checkpoint bytes") {
     REQUIRE_NEAR(output[0], 0.00738525390625F, 1.0e-9F);
     REQUIRE_NEAR(strata::dsv4_fp8_e4m3_f32(0x7eU), 448.0F, 0.0F);
     REQUIRE(std::isnan(strata::dsv4_fp8_e4m3_f32(0x7fU)));
+}
+
+TEST_CASE("DeepSeek block FP8-to-BF16 conversion matches the scalar oracle") {
+    constexpr std::uint64_t rows = 130U;
+    constexpr std::uint64_t columns = 259U;
+    std::vector<std::byte> weights(static_cast<std::size_t>(rows * columns));
+    for (std::size_t index = 0U; index < weights.size(); ++index) {
+        auto encoded = static_cast<std::uint8_t>((index * 37U + 13U) & 0xFFU);
+        if ((encoded & 0x7FU) == 0x7FU) encoded = 0x7EU;
+        weights[index] = static_cast<std::byte>(encoded);
+    }
+    constexpr std::array<std::uint8_t, 6> encoded_scales{
+        0x73U, 0x78U, 0x7fU, 0x82U, 0x69U, 0x80U};
+    std::array<std::byte, encoded_scales.size()> scales{};
+    for (std::size_t index = 0U; index < scales.size(); ++index) {
+        scales[index] = static_cast<std::byte>(encoded_scales[index]);
+    }
+    std::vector<std::uint16_t> converted(static_cast<std::size_t>(rows * columns));
+    const auto result = strata::dsv4_fp8_e4m3_block128_to_bf16(
+        converted, weights, scales, rows, columns);
+    REQUIRE(result.ok());
+
+    constexpr std::uint64_t scale_columns = (columns + 127U) / 128U;
+    for (std::uint64_t row = 0U; row < rows; ++row) {
+        for (std::uint64_t column = 0U; column < columns; ++column) {
+            const auto index = static_cast<std::size_t>(row * columns + column);
+            const auto encoded = std::to_integer<std::uint8_t>(weights[index]);
+            const auto scale_encoded = std::to_integer<std::uint8_t>(
+                scales[static_cast<std::size_t>(
+                    (row / 128U) * scale_columns + column / 128U)]);
+            const auto expected = reference_bf16(
+                strata::dsv4_fp8_e4m3_f32(encoded) *
+                strata::dsv4_fp8_e8m0_scale_f32(scale_encoded));
+            REQUIRE(converted[index] == expected);
+        }
+    }
+    converted.pop_back();
+    REQUIRE(!strata::dsv4_fp8_e4m3_block128_to_bf16(
+                 converted, weights, scales, rows, columns).ok());
 }
 
 TEST_CASE("DeepSeek sqrtsoftplus routing keeps selection bias out of weights") {

@@ -44,6 +44,15 @@ struct Dsv4MhcMixResult {
 [[nodiscard]] float dsv4_fp8_e4m3_f32(std::uint8_t encoded) noexcept;
 [[nodiscard]] float dsv4_fp8_e8m0_scale_f32(std::uint8_t encoded) noexcept;
 
+// Dequantizes native FP8 block-128 weights into the exact BF16 representation
+// used by the target wo_a projection. Each E8M0 scale covers one 128 x 128
+// output/input block.
+[[nodiscard]] ValidationResult dsv4_fp8_e4m3_block128_to_bf16(
+    std::span<std::uint16_t> output,
+    std::span<const std::byte> weights,
+    std::span<const std::byte> e8m0_scales,
+    std::uint64_t rows, std::uint64_t columns);
+
 // The selection bias changes only top-k membership. Returned coefficients are
 // gathered from unbiased sqrt(softplus(logit)), normalized, then scaled.
 [[nodiscard]] Dsv4RouteResult dsv4_route_sqrtsoftplus_f32(

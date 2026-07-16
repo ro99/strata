@@ -55,14 +55,6 @@ constexpr std::uint64_t kMaximumIndexBytes = 16ULL << 20U;
     return value;
 }
 
-[[nodiscard]] std::uint16_t encode_bf16(float value) noexcept {
-    auto bits = std::bit_cast<std::uint32_t>(value);
-    if ((bits & 0x7F80'0000U) != 0x7F80'0000U) {
-        bits += 0x7FFFU + ((bits >> 16U) & 1U);
-    }
-    return static_cast<std::uint16_t>(bits >> 16U);
-}
-
 [[nodiscard]] bool checked_product(std::uint64_t left, std::uint64_t right,
                                    std::uint64_t& output) noexcept {
     if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
@@ -562,28 +554,18 @@ ValidationResult load_dsv4_cuda_linear(
                         "DeepSeek wo_a FP8 source layout is incompatible");
                     return result;
                 }
-                std::vector<std::byte> bf16(
-                    static_cast<std::size_t>(expected_rows * expected_columns * 2U));
-                for (std::uint64_t row = 0U; row < expected_rows; ++row) {
-                    for (std::uint64_t column = 0U; column < expected_columns;
-                         ++column) {
-                        const auto encoded = std::to_integer<std::uint8_t>(
-                            weight_data[static_cast<std::size_t>(
-                                row * expected_columns + column)]);
-                        const auto scale_encoded = std::to_integer<std::uint8_t>(
-                            scale_data[static_cast<std::size_t>(
-                                (row / 128U) * scale_columns + column / 128U)]);
-                        const auto converted = encode_bf16(
-                            dsv4_fp8_e4m3_f32(encoded) *
-                            dsv4_fp8_e8m0_scale_f32(scale_encoded));
-                        std::memcpy(bf16.data() + static_cast<std::size_t>(
-                                        (row * expected_columns + column) * 2U),
-                                    &converted, sizeof(converted));
-                    }
+                std::vector<std::uint16_t> bf16(
+                    static_cast<std::size_t>(expected_rows * expected_columns));
+                auto converted = dsv4_fp8_e4m3_block128_to_bf16(
+                    bf16, weight_data, scale_data, expected_rows, expected_columns);
+                if (!converted.ok()) {
+                    move_errors(result, std::move(converted.errors));
+                    return result;
                 }
                 descriptor.encoding = CudaWeightEncoding::Plain;
                 descriptor.dtype = SafetensorsDtype::Bf16;
-                return backend.upload(device, descriptor, bf16, {}, output);
+                return backend.upload(device, descriptor, std::as_bytes(std::span(bf16)),
+                                      {}, output);
             }
             descriptor.encoding = CudaWeightEncoding::Fp8E4m3Block128;
             descriptor.packed_columns = expected_columns;

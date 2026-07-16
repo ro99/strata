@@ -3,6 +3,7 @@
 #include "strata/glm_ops.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -10,6 +11,14 @@
 namespace strata {
 
 namespace {
+
+[[nodiscard]] std::uint16_t encode_bf16(float value) noexcept {
+    auto bits = std::bit_cast<std::uint32_t>(value);
+    if ((bits & 0x7F80'0000U) != 0x7F80'0000U) {
+        bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    }
+    return static_cast<std::uint16_t>(bits >> 16U);
+}
 
 [[nodiscard]] bool valid_router_spec(const RouterSpec& spec) noexcept {
     return spec.selection == RouterSelectionKind::NoAuxTc &&
@@ -88,6 +97,64 @@ float dsv4_fp8_e4m3_f32(std::uint8_t encoded) noexcept {
 float dsv4_fp8_e8m0_scale_f32(std::uint8_t encoded) noexcept {
     if (encoded == 0xFFU) return std::numeric_limits<float>::quiet_NaN();
     return std::ldexp(1.0F, static_cast<int>(encoded) - 127);
+}
+
+ValidationResult dsv4_fp8_e4m3_block128_to_bf16(
+    std::span<std::uint16_t> output,
+    std::span<const std::byte> weights,
+    std::span<const std::byte> e8m0_scales,
+    std::uint64_t rows, std::uint64_t columns) {
+    ValidationResult result;
+    constexpr std::uint64_t block = 128U;
+    if (rows == 0U || columns == 0U ||
+        rows > std::numeric_limits<std::uint64_t>::max() - (block - 1U) ||
+        columns > std::numeric_limits<std::uint64_t>::max() - (block - 1U) ||
+        rows > std::numeric_limits<std::uint64_t>::max() / columns) {
+        result.errors.emplace_back("DeepSeek FP8-to-BF16 shape is invalid");
+        return result;
+    }
+    const auto elements = rows * columns;
+    const auto scale_rows = (rows + block - 1U) / block;
+    const auto scale_columns = (columns + block - 1U) / block;
+    if (scale_rows > std::numeric_limits<std::uint64_t>::max() / scale_columns ||
+        output.size() != elements || weights.size() != elements ||
+        e8m0_scales.size() != scale_rows * scale_columns) {
+        result.errors.emplace_back("DeepSeek FP8-to-BF16 extents are incompatible");
+        return result;
+    }
+
+    static const auto fp8_values = [] {
+        std::array<float, 256> values{};
+        for (std::size_t encoded = 0U; encoded < values.size(); ++encoded) {
+            values[encoded] = dsv4_fp8_e4m3_f32(
+                static_cast<std::uint8_t>(encoded));
+        }
+        return values;
+    }();
+
+    for (std::uint64_t block_row = 0U; block_row < rows; block_row += block) {
+        const auto row_end = std::min(block_row + block, rows);
+        for (std::uint64_t block_column = 0U; block_column < columns;
+             block_column += block) {
+            const auto column_end = std::min(block_column + block, columns);
+            const auto scale_encoded = std::to_integer<std::uint8_t>(
+                e8m0_scales[(block_row / block) * scale_columns +
+                            block_column / block]);
+            const float scale = dsv4_fp8_e8m0_scale_f32(scale_encoded);
+            for (std::uint64_t row = block_row; row < row_end; ++row) {
+                const auto row_offset = row * columns;
+                for (std::uint64_t column = block_column;
+                     column < column_end; ++column) {
+                    const auto index = row_offset + column;
+                    const auto encoded = std::to_integer<std::uint8_t>(
+                        weights[static_cast<std::size_t>(index)]);
+                    output[static_cast<std::size_t>(index)] = encode_bf16(
+                        fp8_values[encoded] * scale);
+                }
+            }
+        }
+    }
+    return result;
 }
 
 Dsv4RouteResult dsv4_route_sqrtsoftplus_f32(

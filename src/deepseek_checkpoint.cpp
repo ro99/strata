@@ -142,6 +142,20 @@ ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::pread_tensor(
     const Dsv4ManifestTensor& tensor, std::uint64_t relative_offset,
     std::uint64_t bytes) const {
     ParseResult<std::vector<std::byte>> result;
+    result.value.resize(static_cast<std::size_t>(bytes));
+    auto read = pread_tensor_into(tensor, relative_offset, result.value);
+    if (!read.ok()) {
+        result.errors = std::move(read.errors);
+        result.value.clear();
+    }
+    return result;
+}
+
+ValidationResult Dsv4CheckpointReader::pread_tensor_into(
+    const Dsv4ManifestTensor& tensor, std::uint64_t relative_offset,
+    std::span<std::byte> destination) const {
+    ValidationResult result;
+    const auto bytes = static_cast<std::uint64_t>(destination.size());
     if (relative_offset > tensor.source_bytes || bytes > tensor.source_bytes - relative_offset) {
         result.errors.emplace_back("tensor slice exceeds " + tensor.name);
         return result;
@@ -151,26 +165,23 @@ ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::pread_tensor(
         result.errors.emplace_back("DeepSeek checkpoint shard is not open for " + tensor.name);
         return result;
     }
-    result.value.resize(static_cast<std::size_t>(bytes));
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t completed = 0U;
     while (completed < bytes) {
         const auto request = static_cast<std::size_t>(std::min<std::uint64_t>(
             bytes - completed, static_cast<std::uint64_t>(std::numeric_limits<ssize_t>::max())));
-        const auto count = pread(found->second, result.value.data() + completed, request,
+        const auto count = pread(found->second, destination.data() + completed, request,
                                  static_cast<off_t>(tensor.source_offset + relative_offset +
                                                     completed));
         if (count < 0) {
             if (errno == EINTR) continue;
             result.errors.emplace_back("cannot read DeepSeek tensor " + tensor.name + ": " +
                                        std::strerror(errno));
-            result.value.clear();
             return result;
         }
         if (count == 0) {
             result.errors.emplace_back("unexpected end of DeepSeek shard reading " +
                                        tensor.name);
-            result.value.clear();
             return result;
         }
         completed += static_cast<std::uint64_t>(count);
@@ -199,6 +210,23 @@ ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::read(
         return result;
     }
     return pread_tensor(*tensor, 0U, tensor->source_bytes);
+}
+
+ValidationResult Dsv4CheckpointReader::read_into(
+    std::string_view name, std::span<std::byte> destination) const {
+    ValidationResult result;
+    const auto* tensor = find(name);
+    if (tensor == nullptr) {
+        result.errors.emplace_back("DeepSeek checkpoint tensor does not exist: " +
+                                   std::string(name));
+        return result;
+    }
+    if (destination.size() != tensor->source_bytes) {
+        result.errors.emplace_back("DeepSeek tensor destination has the wrong byte size: " +
+                                   tensor->name);
+        return result;
+    }
+    return pread_tensor_into(*tensor, 0U, destination);
 }
 
 ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::read_slice(
@@ -374,12 +402,13 @@ ValidationResult Dsv4ResidentWeightStore::stage(
     std::uint64_t cursor = 0U;
     for (const auto* tensor : tensors) {
         const auto before = checkpoint.stats();
-        auto payload = checkpoint.read(tensor->name, tensor->source_bytes);
-        if (!payload.ok()) {
-            move_errors(result, std::move(payload.errors));
+        auto loaded = checkpoint.read_into(
+            tensor->name,
+            {arena_ + cursor, static_cast<std::size_t>(tensor->source_bytes)});
+        if (!loaded.ok()) {
+            move_errors(result, std::move(loaded.errors));
             return result;
         }
-        std::memcpy(arena_ + cursor, payload.value.data(), payload.value.size());
         const auto after = checkpoint.stats();
         if (after.bytes - before.bytes != tensor->source_bytes) {
             result.errors.emplace_back("resident staging read accounting mismatch for " +

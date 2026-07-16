@@ -45,6 +45,8 @@ public:
     [[nodiscard]] const Dsv4ManifestTensor* find(std::string_view name) const noexcept;
     [[nodiscard]] ParseResult<std::vector<std::byte>> read(
         std::string_view name, std::uint64_t maximum_bytes) const;
+    [[nodiscard]] ValidationResult read_into(
+        std::string_view name, std::span<std::byte> destination) const;
     [[nodiscard]] ParseResult<std::vector<std::byte>> read_slice(
         std::string_view name, std::uint64_t relative_offset,
         std::uint64_t bytes) const;
@@ -66,6 +68,9 @@ private:
     [[nodiscard]] ParseResult<std::vector<std::byte>> pread_tensor(
         const Dsv4ManifestTensor& tensor, std::uint64_t relative_offset,
         std::uint64_t bytes) const;
+    [[nodiscard]] ValidationResult pread_tensor_into(
+        const Dsv4ManifestTensor& tensor, std::uint64_t relative_offset,
+        std::span<std::byte> destination) const;
 
     std::string model_directory_;
     Dsv4IndexManifest manifest_;

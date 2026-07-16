@@ -5,13 +5,13 @@
 #include <algorithm>
 #include <string>
 
-TEST_CASE("DeepSeek correctness diagnostics are opt-in") {
+TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     const strata::Dsv4RuntimeConfig config;
-    REQUIRE(!config.enable_device_moe);
+    REQUIRE(config.enable_device_moe);
     REQUIRE(!config.enable_logit_trace);
     REQUIRE(!config.enable_layer_hash_trace);
     REQUIRE(config.logit_trace_top_k == 20U);
-    REQUIRE(config.host_attention_threads == 0U);
+    REQUIRE(config.host_attention_threads == 28U);
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
     REQUIRE(config.overlap_resident_warmup);

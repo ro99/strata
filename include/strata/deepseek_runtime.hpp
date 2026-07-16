@@ -19,12 +19,12 @@ struct Dsv4RuntimeConfig {
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t logit_trace_top_k{20U};
-    std::uint32_t host_attention_threads{};
+    std::uint32_t host_attention_threads{28U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
-    bool enable_device_moe{};
+    bool enable_device_moe{true};
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};

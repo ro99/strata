@@ -21,7 +21,7 @@ struct Options {
     std::uint32_t maximum_new_tokens{16U};
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t logit_trace_top_k{20U};
-    std::uint32_t host_attention_threads{};
+    std::uint32_t host_attention_threads{28U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
@@ -30,7 +30,7 @@ struct Options {
     bool json{};
     bool quiet{};
     bool detailed_timing{};
-    bool device_moe{};
+    bool device_moe{true};
     bool logit_trace{};
     bool layer_hash_trace{};
     bool overlap_resident_warmup{true};
@@ -41,12 +41,12 @@ void usage() {
     std::cerr
         << "usage: strata-deepseek-run --model DIR [--prompt TEXT] [--max-new N]\n"
         << "       [--devices 0,1,2] [--max-context N] [--host-memory 216G]\n"
-        << "       [--host-attention-threads N]\n"
+        << "       [--host-attention-threads N|--serial-host-attention]\n"
         << "       [--resident-read-workers N]\n"
         << "       [--spine-warmup-workers N]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
-        << "       [--device-moe]\n"
+        << "       [--device-moe|--serial-device-moe]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
         << "       [--detailed-timing] [--json] [--quiet]\n";
 }
@@ -129,8 +129,9 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--host-attention-threads") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_u32(value, options.host_attention_threads) ||
-                options.host_attention_threads == 0U ||
                 options.host_attention_threads > 64U) return false;
+        } else if (argument == "--serial-host-attention") {
+            options.host_attention_threads = 0U;
         } else if (argument == "--resident-read-workers") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_u32(value, options.resident_read_workers) ||
@@ -156,6 +157,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.route_trace = value;
         } else if (argument == "--device-moe") {
             options.device_moe = true;
+        } else if (argument == "--serial-device-moe") {
+            options.device_moe = false;
         } else if (argument == "--logit-trace") {
             options.logit_trace = true;
         } else if (argument == "--logit-trace-top-k") {
@@ -499,13 +502,6 @@ int main(int argc, char** argv) {
     }
 
     if (options.admission_only) {
-        if (options.device_moe) {
-            std::cerr
-                << "error: --device-moe requires full initialization to prove "
-                   "per-device top-k lease capacity; admission-only cannot "
-                   "make that promise\n";
-            return 1;
-        }
         auto checkpoint = strata::Dsv4CheckpointReader::open(options.model);
         if (!checkpoint.ok()) {
             for (const auto& error : checkpoint.errors) std::cerr << "error: " << error << '\n';

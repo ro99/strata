@@ -6,7 +6,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # Reproducible DeepSeek-V4 reference/device-MoE comparison.
 #
 # Default performance matrix: three repetitions per variant in ABBAAB order,
-# where A is the reference path and B adds --device-moe. Performance runs leave
+# where A is the serial reference path and B enables device MoE. Performance runs leave
 # diagnostic tracing disabled. Use CORRECTNESS_RUN=1 for a separate one-pair
 # trace gate with --logit-trace and --layer-hash-trace.
 #
@@ -479,10 +479,10 @@ run_one() {
     args+=("${common_extra_args[@]}")
     if [[ "${expected_device_moe}" == 1 ]]; then
         args+=(--device-moe)
+    else
+        args+=(--serial-device-moe)
     fi
-    if ((expected_host_attention_threads != 0)); then
-        args+=(--host-attention-threads "${expected_host_attention_threads}")
-    fi
+    args+=(--host-attention-threads "${expected_host_attention_threads}")
     if [[ "${variant}" == candidate ]]; then
         args+=("${candidate_extra_args[@]}")
     else

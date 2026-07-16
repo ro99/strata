@@ -1596,6 +1596,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "DeepSeek host attention worker count must not exceed 64");
         return result;
     }
+    if (config.resident_read_workers == 0U ||
+        config.resident_read_workers > 64U) {
+        result.errors.emplace_back(
+            "DeepSeek resident read worker count must be within [1, 64]");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
@@ -1693,6 +1699,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     const auto staging_started = std::chrono::steady_clock::now();
     result = impl_->resident.stage(*impl_->checkpoint,
                                    config.host_memory_limit_bytes,
+                                   config.resident_read_workers,
                                    config.enable_dspark);
     const double staging_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - staging_started).count();
@@ -1736,6 +1743,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
     impl_->initialization_metrics.host_attention_threads =
         config.host_attention_threads;
+    impl_->initialization_metrics.resident_read_workers =
+        impl_->resident.stats().workers;
     return result;
 }
 

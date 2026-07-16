@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <limits>
+#include <thread>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -356,10 +357,16 @@ Dsv4ResidentWeightStore::~Dsv4ResidentWeightStore() {
 
 ValidationResult Dsv4ResidentWeightStore::stage(
     const Dsv4CheckpointReader& checkpoint,
-    std::uint64_t host_memory_ceiling_bytes, bool include_dspark) {
+    std::uint64_t host_memory_ceiling_bytes, std::uint32_t read_workers,
+    bool include_dspark) {
     ValidationResult result;
     if (complete_ || arena_ != nullptr) {
         result.errors.emplace_back("DeepSeek resident expert store is already staged");
+        return result;
+    }
+    if (read_workers == 0U || read_workers > 64U) {
+        result.errors.emplace_back(
+            "DeepSeek resident read worker count must be within [1, 64]");
         return result;
     }
     std::vector<const Dsv4ManifestTensor*> tensors;
@@ -398,29 +405,75 @@ ValidationResult Dsv4ResidentWeightStore::stage(
     }
     arena_ = static_cast<std::byte*>(allocation);
     extents_.reserve(tensors.size());
-    const auto started = std::chrono::steady_clock::now();
+
+    struct ReadTask {
+        const Dsv4ManifestTensor* tensor{};
+        std::uint64_t destination_offset{};
+    };
+    std::vector<std::vector<ReadTask>> shard_tasks;
     std::uint64_t cursor = 0U;
     for (const auto* tensor : tensors) {
-        const auto before = checkpoint.stats();
-        auto loaded = checkpoint.read_into(
-            tensor->name,
-            {arena_ + cursor, static_cast<std::size_t>(tensor->source_bytes)});
-        if (!loaded.ok()) {
-            move_errors(result, std::move(loaded.errors));
-            return result;
+        if (shard_tasks.empty() ||
+            shard_tasks.back().back().tensor->shard != tensor->shard) {
+            shard_tasks.emplace_back();
         }
-        const auto after = checkpoint.stats();
-        if (after.bytes - before.bytes != tensor->source_bytes) {
-            result.errors.emplace_back("resident staging read accounting mismatch for " +
-                                       tensor->name);
-            return result;
-        }
-        extents_.emplace(tensor->name, Extent{cursor, tensor->source_bytes});
+        shard_tasks.back().push_back({tensor, cursor});
         cursor += tensor->source_bytes;
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto before = checkpoint.stats();
+    std::vector<ValidationResult> shard_results(shard_tasks.size());
+    std::atomic<std::size_t> next_shard{};
+    const auto worker = [&] {
+        while (true) {
+            const auto shard = next_shard.fetch_add(1U, std::memory_order_relaxed);
+            if (shard >= shard_tasks.size()) return;
+            auto& shard_result = shard_results[shard];
+            for (const auto& task : shard_tasks[shard]) {
+                auto loaded = checkpoint.read_into(
+                    task.tensor->name,
+                    {arena_ + task.destination_offset,
+                     static_cast<std::size_t>(task.tensor->source_bytes)});
+                if (!loaded.ok()) {
+                    move_errors(shard_result, std::move(loaded.errors));
+                    break;
+                }
+            }
+        }
+    };
+    const auto active_workers = std::min<std::size_t>(read_workers, shard_tasks.size());
+    if (active_workers == 1U) {
+        worker();
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(active_workers);
+        for (std::size_t index = 0U; index < active_workers; ++index) {
+            workers.emplace_back(worker);
+        }
+        for (auto& thread : workers) thread.join();
+    }
+    for (auto& shard_result : shard_results) {
+        if (!shard_result.ok()) move_errors(result, std::move(shard_result.errors));
+    }
+    if (!result.ok()) return result;
+
+    const auto after = checkpoint.stats();
+    if (after.bytes - before.bytes != arena_bytes_ ||
+        after.calls - before.calls != tensors.size()) {
+        result.errors.emplace_back("resident staging read accounting mismatch");
+        return result;
+    }
+    for (const auto& tasks : shard_tasks) {
+        for (const auto& task : tasks) {
+            extents_.emplace(task.tensor->name,
+                             Extent{task.destination_offset, task.tensor->source_bytes});
+        }
     }
     static_cast<void>(mprotect(arena_, static_cast<std::size_t>(arena_bytes_), PROT_READ));
     stats_.tensors = tensors.size();
     stats_.bytes = arena_bytes_;
+    stats_.workers = static_cast<std::uint32_t>(active_workers);
     stats_.seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     complete_ = true;

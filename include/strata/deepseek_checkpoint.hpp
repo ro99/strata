@@ -84,6 +84,7 @@ private:
 struct Dsv4ResidentStageStats {
     std::uint64_t tensors{};
     std::uint64_t bytes{};
+    std::uint32_t workers{};
     double seconds{};
 };
 
@@ -102,6 +103,7 @@ public:
     [[nodiscard]] ValidationResult stage(
         const Dsv4CheckpointReader& checkpoint,
         std::uint64_t host_memory_ceiling_bytes,
+        std::uint32_t read_workers = 1U,
         bool include_dspark = false);
     [[nodiscard]] std::span<const std::byte> find(std::string_view name) const noexcept;
     [[nodiscard]] bool complete() const noexcept { return complete_; }

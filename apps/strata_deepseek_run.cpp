@@ -169,6 +169,73 @@ void print_array(std::ostream& output, const std::vector<T>& values) {
     output << ']';
 }
 
+void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stats) {
+    output << "{\"weight_h2d_bytes\":" << stats.weight_upload_bytes
+           << ",\"activation_h2d_bytes\":" << stats.activation_h2d_bytes
+           << ",\"activation_d2h_bytes\":" << stats.activation_d2h_bytes
+           << ",\"matmul_calls\":" << stats.matmul_calls
+           << ",\"weight_allocation_calls\":" << stats.weight_allocation_calls
+           << ",\"weight_allocation_bytes\":" << stats.weight_allocation_bytes
+           << ",\"workspace_allocation_calls\":" << stats.workspace_allocation_calls
+           << ",\"workspace_allocation_bytes\":" << stats.workspace_allocation_bytes
+           << ",\"synchronization_calls\":" << stats.synchronization_calls
+           << ",\"critical_path_synchronization_seconds\":"
+           << static_cast<double>(stats.synchronization_nanoseconds) / 1.0e9
+           << ",\"critical_path_upload_wait_seconds\":"
+           << static_cast<double>(stats.upload_wait_nanoseconds) / 1.0e9
+           << ",\"critical_path_activation_h2d_seconds\":"
+           << static_cast<double>(stats.activation_h2d_nanoseconds) / 1.0e9
+           << ",\"critical_path_kernel_seconds\":"
+           << static_cast<double>(stats.kernel_nanoseconds) / 1.0e9
+           << ",\"critical_path_activation_d2h_seconds\":"
+           << static_cast<double>(stats.activation_d2h_nanoseconds) / 1.0e9
+           << ",\"devices\":[";
+    for (std::size_t index = 0U; index < stats.devices.size(); ++index) {
+        const auto& device = stats.devices[index];
+        if (index != 0U) output << ',';
+        output << "{\"device\":" << device.device
+               << ",\"weight_h2d_bytes\":" << device.weight_upload_bytes
+               << ",\"activation_h2d_bytes\":" << device.activation_h2d_bytes
+               << ",\"activation_d2h_bytes\":" << device.activation_d2h_bytes
+               << ",\"matmul_calls\":" << device.matmul_calls
+               << ",\"synchronization_calls\":" << device.synchronization_calls
+               << ",\"synchronization_seconds\":"
+               << static_cast<double>(device.synchronization_nanoseconds) / 1.0e9
+               << ",\"upload_wait_seconds\":"
+               << static_cast<double>(device.upload_wait_nanoseconds) / 1.0e9
+               << ",\"activation_h2d_seconds\":"
+               << static_cast<double>(device.activation_h2d_nanoseconds) / 1.0e9
+               << ",\"kernel_seconds\":"
+               << static_cast<double>(device.kernel_nanoseconds) / 1.0e9
+               << ",\"activation_d2h_seconds\":"
+               << static_cast<double>(device.activation_d2h_nanoseconds) / 1.0e9 << '}';
+    }
+    output << "]}";
+}
+
+void print_cache_stats(std::ostream& output, const strata::Dsv4CacheStats& stats) {
+    output << "{\"hits\":" << stats.hits << ",\"misses\":" << stats.misses
+           << ",\"evictions\":" << stats.evictions << ",\"used_bytes\":";
+    print_array(output, stats.used_bytes);
+    output << ",\"capacity_bytes\":";
+    print_array(output, stats.capacity_bytes);
+    output << ",\"pinned_bytes\":";
+    print_array(output, stats.pinned_bytes);
+    output << '}';
+}
+
+void print_phase(std::ostream& output, const strata::Dsv4PhaseMetrics& phase) {
+    output << "{\"checkpoint_read_calls\":" << phase.checkpoint_reads.calls
+           << ",\"checkpoint_read_bytes\":" << phase.checkpoint_reads.bytes
+           << ",\"checkpoint_read_seconds\":"
+           << static_cast<double>(phase.checkpoint_reads.nanoseconds) / 1.0e9
+           << ",\"cuda\":";
+    print_cuda_stats(output, phase.cuda);
+    output << ",\"cache\":";
+    print_cache_stats(output, phase.cache);
+    output << '}';
+}
+
 void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
     output << "{\"required_host_bytes\":" << plan.required_host_bytes
            << ",\"routed_expert_host_bytes\":" << plan.routed_expert_host_bytes
@@ -287,6 +354,8 @@ int main(int argc, char** argv) {
                   << "{\"answer\":\"" << json_escape(generated.text)
                   << "\",\"execution\":\"exact_base_autoregressive\""
                   << ",\"dspark\":\"disabled\""
+                  << ",\"detailed_timing\":"
+                  << (metrics.detailed_timing ? "true" : "false")
                   << ",\"initialization_seconds\":" << metrics.initialization_seconds
                   << ",\"resident_staging_seconds\":" << metrics.resident_staging_seconds
                   << ",\"prompt_tokens\":" << metrics.prompt_tokens
@@ -302,6 +371,13 @@ int main(int argc, char** argv) {
                   << ",\"vram_cache_hits\":" << metrics.cache.hits
                   << ",\"vram_cache_misses\":" << metrics.cache.misses
                   << ",\"vram_cache_evictions\":" << metrics.cache.evictions
+                  << ",\"cuda\":";
+        print_cuda_stats(std::cout, metrics.cuda);
+        std::cout << ",\"phases\":{\"prefill\":";
+        print_phase(std::cout, metrics.prefill);
+        std::cout << ",\"decode\":";
+        print_phase(std::cout, metrics.decode);
+        std::cout << '}'
                   << ",\"memory_plan\":";
         print_plan(std::cout, metrics.memory);
         std::cout << ",\"prompt_token_ids\":";

@@ -148,6 +148,87 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             after.nanoseconds - before.nanoseconds};
 }
 
+[[nodiscard]] CudaBackendStats::Device cuda_device_delta(
+    const CudaBackendStats::Device& after,
+    const CudaBackendStats::Device& before) {
+    CudaBackendStats::Device result;
+    result.device = after.device;
+#define STRATA_DSV4_CUDA_DEVICE_DELTA(field) result.field = after.field - before.field
+    STRATA_DSV4_CUDA_DEVICE_DELTA(weight_upload_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_h2d_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_d2h_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(matmul_calls);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(weight_allocation_calls);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(weight_allocation_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(workspace_allocation_calls);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(workspace_allocation_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(synchronization_calls);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(kernel_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
+#undef STRATA_DSV4_CUDA_DEVICE_DELTA
+    return result;
+}
+
+[[nodiscard]] CudaBackendStats cuda_delta(const CudaBackendStats& after,
+                                           const CudaBackendStats& before) {
+    CudaBackendStats result;
+#define STRATA_DSV4_CUDA_DELTA(field) result.field = after.field - before.field
+    STRATA_DSV4_CUDA_DELTA(weight_upload_bytes);
+    STRATA_DSV4_CUDA_DELTA(activation_h2d_bytes);
+    STRATA_DSV4_CUDA_DELTA(activation_d2h_bytes);
+    STRATA_DSV4_CUDA_DELTA(matmul_calls);
+    STRATA_DSV4_CUDA_DELTA(weight_allocation_calls);
+    STRATA_DSV4_CUDA_DELTA(weight_allocation_bytes);
+    STRATA_DSV4_CUDA_DELTA(workspace_allocation_calls);
+    STRATA_DSV4_CUDA_DELTA(workspace_allocation_bytes);
+    STRATA_DSV4_CUDA_DELTA(synchronization_calls);
+    STRATA_DSV4_CUDA_DELTA(synchronization_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(upload_wait_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(activation_h2d_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(kernel_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(activation_d2h_nanoseconds);
+#undef STRATA_DSV4_CUDA_DELTA
+    result.synchronization_nanoseconds = 0U;
+    result.upload_wait_nanoseconds = 0U;
+    result.activation_h2d_nanoseconds = 0U;
+    result.kernel_nanoseconds = 0U;
+    result.activation_d2h_nanoseconds = 0U;
+    for (const auto& device_after : after.devices) {
+        const auto found = std::find_if(
+            before.devices.begin(), before.devices.end(),
+            [&device_after](const auto& value) {
+                return value.device == device_after.device;
+            });
+        result.devices.push_back(found == before.devices.end()
+                                     ? device_after
+                                     : cuda_device_delta(device_after, *found));
+        const auto& delta = result.devices.back();
+        result.synchronization_nanoseconds = std::max(
+            result.synchronization_nanoseconds, delta.synchronization_nanoseconds);
+        result.upload_wait_nanoseconds = std::max(
+            result.upload_wait_nanoseconds, delta.upload_wait_nanoseconds);
+        result.activation_h2d_nanoseconds = std::max(
+            result.activation_h2d_nanoseconds, delta.activation_h2d_nanoseconds);
+        result.kernel_nanoseconds = std::max(
+            result.kernel_nanoseconds, delta.kernel_nanoseconds);
+        result.activation_d2h_nanoseconds = std::max(
+            result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
+    }
+    return result;
+}
+
+[[nodiscard]] Dsv4CacheStats cache_delta(const Dsv4CacheStats& after,
+                                         const Dsv4CacheStats& before) {
+    Dsv4CacheStats result = after;
+    result.hits -= before.hits;
+    result.misses -= before.misses;
+    result.evictions -= before.evictions;
+    return result;
+}
+
 [[nodiscard]] std::uint64_t linear_bytes(const Dsv4CheckpointReader& checkpoint,
                                          std::string_view base) {
     const auto* weight = checkpoint.find(std::string(base) + ".weight");
@@ -1173,6 +1254,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.resident_stage = impl_->resident.stats();
     impl_->initialization_metrics.cuda = impl_->cuda.stats();
     impl_->initialization_metrics.cache = impl_->weights->stats();
+    impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
     return result;
 }
@@ -1207,6 +1289,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
         return result;
     }
     const auto reads_before = impl_->checkpoint->stats();
+    const auto cuda_before = impl_->cuda.stats();
+    const auto cache_before = impl_->weights->stats();
     const auto prefill_started = std::chrono::steady_clock::now();
     ParseResult<std::uint32_t> next;
     for (std::size_t position = 0U; position < result.prompt_token_ids.size(); ++position) {
@@ -1222,6 +1306,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
         std::chrono::steady_clock::now() - prefill_started).count();
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
     const auto reads_after_prefill = impl_->checkpoint->stats();
+    const auto cuda_after_prefill = impl_->cuda.stats();
+    const auto cache_after_prefill = impl_->weights->stats();
     constexpr std::uint32_t stop_token = 1U;
     if (next.value != stop_token) result.generated_token_ids.push_back(next.value);
     std::uint32_t position = static_cast<std::uint32_t>(
@@ -1248,6 +1334,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     }
     result.text = std::move(decoded.value);
     const auto reads_after_decode = impl_->checkpoint->stats();
+    const auto cuda_after_decode = impl_->cuda.stats();
+    const auto cache_after_decode = impl_->weights->stats();
     const double prefill_seconds = result.metrics.prefill_seconds;
     const double decode_seconds = result.metrics.decode_seconds;
     result.metrics = impl_->initialization_metrics;
@@ -1261,6 +1349,14 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
                                                          reads_after_prefill);
     result.metrics.cuda = impl_->cuda.stats();
     result.metrics.cache = impl_->weights->stats();
+    result.metrics.prefill.checkpoint_reads = read_delta(reads_after_prefill,
+                                                         reads_before);
+    result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
+    result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
+    result.metrics.decode.checkpoint_reads = read_delta(reads_after_decode,
+                                                        reads_after_prefill);
+    result.metrics.decode.cuda = cuda_delta(cuda_after_decode, cuda_after_prefill);
+    result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
     if (impl_->config.require_zero_nvme_decode &&
         (result.metrics.decode_checkpoint_reads.calls != 0U ||
          result.metrics.decode_checkpoint_reads.bytes != 0U)) {

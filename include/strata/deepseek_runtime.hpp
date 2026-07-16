@@ -33,6 +33,12 @@ struct Dsv4CacheStats {
     std::vector<std::uint64_t> pinned_bytes;
 };
 
+struct Dsv4PhaseMetrics {
+    Dsv4CheckpointReadStats checkpoint_reads;
+    CudaBackendStats cuda;
+    Dsv4CacheStats cache;
+};
+
 struct Dsv4GenerationMetrics {
     double initialization_seconds{};
     double admission_seconds{};
@@ -47,6 +53,9 @@ struct Dsv4GenerationMetrics {
     Dsv4CheckpointReadStats decode_checkpoint_reads;
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
+    Dsv4PhaseMetrics prefill;
+    Dsv4PhaseMetrics decode;
+    bool detailed_timing{};
     bool dspark_enabled{};
 };
 

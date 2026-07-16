@@ -54,11 +54,29 @@ struct Dsv4DeviceMoeStats {
     std::uint64_t nanoseconds{};
 };
 
+struct Dsv4GraphStats {
+    std::uint64_t forward_tokens{};
+    std::uint64_t embedding_nanoseconds{};
+    std::uint64_t mhc_pre_nanoseconds{};
+    std::uint64_t branch_norm_nanoseconds{};
+    std::uint64_t attention_nanoseconds{};
+    std::uint64_t attention_query_nanoseconds{};
+    std::uint64_t attention_kv_nanoseconds{};
+    std::uint64_t attention_score_nanoseconds{};
+    std::uint64_t attention_output_nanoseconds{};
+    std::uint64_t moe_nanoseconds{};
+    std::uint64_t moe_router_nanoseconds{};
+    std::uint64_t moe_prepare_nanoseconds{};
+    std::uint64_t mhc_post_nanoseconds{};
+    std::uint64_t output_head_nanoseconds{};
+};
+
 struct Dsv4PhaseMetrics {
     Dsv4CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
     Dsv4DeviceMoeStats device_moe;
+    Dsv4GraphStats graph;
 };
 
 struct Dsv4GenerationMetrics {
@@ -77,6 +95,7 @@ struct Dsv4GenerationMetrics {
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
     Dsv4DeviceMoeStats device_moe;
+    Dsv4GraphStats graph;
     Dsv4PhaseMetrics prefill;
     Dsv4PhaseMetrics decode;
     bool detailed_timing{};

@@ -305,6 +305,33 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             after.nanoseconds - before.nanoseconds};
 }
 
+[[nodiscard]] Dsv4GraphStats graph_delta(
+    const Dsv4GraphStats& after, const Dsv4GraphStats& before) noexcept {
+    return {
+        after.forward_tokens - before.forward_tokens,
+        after.embedding_nanoseconds - before.embedding_nanoseconds,
+        after.mhc_pre_nanoseconds - before.mhc_pre_nanoseconds,
+        after.branch_norm_nanoseconds - before.branch_norm_nanoseconds,
+        after.attention_nanoseconds - before.attention_nanoseconds,
+        after.attention_query_nanoseconds - before.attention_query_nanoseconds,
+        after.attention_kv_nanoseconds - before.attention_kv_nanoseconds,
+        after.attention_score_nanoseconds - before.attention_score_nanoseconds,
+        after.attention_output_nanoseconds - before.attention_output_nanoseconds,
+        after.moe_nanoseconds - before.moe_nanoseconds,
+        after.moe_router_nanoseconds - before.moe_router_nanoseconds,
+        after.moe_prepare_nanoseconds - before.moe_prepare_nanoseconds,
+        after.mhc_post_nanoseconds - before.mhc_post_nanoseconds,
+        after.output_head_nanoseconds - before.output_head_nanoseconds,
+    };
+}
+
+[[nodiscard]] std::uint64_t elapsed_nanoseconds(
+    std::chrono::steady_clock::time_point started) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
 [[nodiscard]] std::uint64_t linear_bytes(const Dsv4CheckpointReader& checkpoint,
                                          std::string_view base) {
     const auto* weight = checkpoint.find(std::string(base) + ".weight");
@@ -598,6 +625,7 @@ struct DeepSeekV4Runtime::Impl {
     std::unique_ptr<HostWorkerPool> attention_workers;
     Dsv4DiagnosticTrace diagnostics;
     Dsv4DeviceMoeStats device_moe_stats;
+    Dsv4GraphStats graph_stats;
     std::vector<int> devices;
     std::vector<std::uint64_t> capacities;
     std::vector<std::size_t> schedule;
@@ -1072,6 +1100,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     }
     const auto slot = layer_device(layer);
     const auto prefix = layer_prefix(layer) + "attn.";
+    auto subphase_started = std::chrono::steady_clock::now();
     std::vector<float> query_rank(kQueryRank);
     result = linear(slot, prefix + "wq_a", kQueryRank, kHidden, input, query_rank);
     if (!result.ok()) return result;
@@ -1106,7 +1135,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
             normalize_query(head);
         }
     }
+    graph_stats.attention_query_nanoseconds += elapsed_nanoseconds(subphase_started);
 
+    subphase_started = std::chrono::steady_clock::now();
     std::vector<float> kv(kHeadDim);
     result = linear(slot, prefix + "wkv", kHeadDim, kHidden, input, kv);
     if (!result.ok()) return result;
@@ -1123,6 +1154,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                   static_cast<std::size_t>(position % kWindow) * kHeadDim);
     result = compressor(layer, input, position);
     if (!result.ok()) return result;
+    graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
 
     auto sink = host_tensor(prefix + "attn_sink", kHeads);
     if (!sink.ok()) {
@@ -1200,6 +1232,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                    layer_state.frequencies, true);
         round_bf16(destination.last(kRopeDim));
     };
+    subphase_started = std::chrono::steady_clock::now();
     if (attention_workers != nullptr) {
         std::vector<float> parallel_scores(
             static_cast<std::size_t>(kHeads) * score_stride);
@@ -1217,15 +1250,19 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
             attend_head(head, scores);
         }
     }
+    graph_stats.attention_score_nanoseconds += elapsed_nanoseconds(subphase_started);
 
+    subphase_started = std::chrono::steady_clock::now();
     std::vector<float> output_rank(static_cast<std::size_t>(kOutputGroups) *
                                    kOutputRank);
     result = weights->grouped(slot, prefix + "wo_a", kOutputGroups * kOutputRank,
                               kHeads * kHeadDim / kOutputGroups, attended,
                               kOutputGroups, kOutputRank, output_rank);
     if (!result.ok()) return result;
-    return linear(slot, prefix + "wo_b", kHidden,
-                  kOutputGroups * kOutputRank, output_rank, output);
+    result = linear(slot, prefix + "wo_b", kHidden,
+                    kOutputGroups * kOutputRank, output_rank, output);
+    graph_stats.attention_output_nanoseconds += elapsed_nanoseconds(subphase_started);
+    return result;
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::expert(
@@ -1268,6 +1305,7 @@ ValidationResult DeepSeekV4Runtime::Impl::device_moe(
         return result;
     }
 
+    const auto prepare_started = std::chrono::steady_clock::now();
     struct RoutePlacement {
         std::size_t slot{};
         std::size_t local_rank{};
@@ -1344,6 +1382,7 @@ ValidationResult DeepSeekV4Runtime::Impl::device_moe(
     }
     shared_device.has_shared = true;
 
+    graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
     const auto execution_started = std::chrono::steady_clock::now();
     const auto device_commands = static_cast<std::uint64_t>(std::count_if(
         pending.begin(), pending.end(), [](const auto& pending_device) {
@@ -1418,6 +1457,7 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
     std::span<float> output, std::uint32_t position) {
     ValidationResult result;
     const auto prefix = layer_prefix(layer) + "ffn.";
+    const auto router_started = std::chrono::steady_clock::now();
     std::vector<float> logits(kExperts);
     result = linear(layer_device(layer), prefix + "gate", kExperts, kHidden,
                     input, logits, false);
@@ -1462,6 +1502,7 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
         append_errors(result, std::move(route.errors));
         return result;
     }
+    graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
     if (route_trace.is_open()) {
         route_trace << "{\"position\":" << position << ",\"layer\":" << layer
                     << ",\"token\":" << token << ",\"experts\":[";
@@ -1538,20 +1579,29 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
         const std::vector<float> residual(hidden.begin(), hidden.end());
         std::vector<float> reduced(kHidden);
         Dsv4MhcMix mix;
+        auto phase_started = std::chrono::steady_clock::now();
         result = dsv4_mhc_pre_f32(reduced, mix, residual, *projection.value,
                                   *scale.value, *base.value);
+        graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         round_bf16(reduced);
+        phase_started = std::chrono::steady_clock::now();
         result = norm(reduced, reduced, prefix + branch + "_norm.weight");
+        graph_stats.branch_norm_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         std::vector<float> branch_output(kHidden);
+        phase_started = std::chrono::steady_clock::now();
         if (branch == "attn") {
             result = attention(layer, reduced, position, branch_output);
+            graph_stats.attention_nanoseconds += elapsed_nanoseconds(phase_started);
         } else {
             result = moe(layer, token, reduced, branch_output, position);
+            graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
         }
         if (!result.ok()) return result;
+        phase_started = std::chrono::steady_clock::now();
         result = dsv4_mhc_post_f32(hidden, branch_output, residual, mix);
+        graph_stats.mhc_post_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         round_bf16(hidden);
     }
@@ -1562,7 +1612,9 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     std::uint32_t token, std::uint32_t position, bool logits_required) {
     ParseResult<std::uint32_t> result;
     std::vector<float> hidden(static_cast<std::size_t>(kMhc) * kHidden);
+    const auto embedding_started = std::chrono::steady_clock::now();
     auto validation = embed(token, hidden);
+    graph_stats.embedding_nanoseconds += elapsed_nanoseconds(embedding_started);
     if (!validation.ok()) {
         result.errors = std::move(validation.errors);
         return result;
@@ -1578,9 +1630,12 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
         }
     }
     if (!logits_required) {
+        ++graph_stats.forward_tokens;
         result.value = token;
         return result;
     }
+
+    const auto head_started = std::chrono::steady_clock::now();
 
     auto head_projection = host_tensor("hc_head_fn", kMhc * kMhc * kHidden);
     auto head_scale = host_tensor("hc_head_scale", 1U);
@@ -1631,6 +1686,8 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     if (config.enable_logit_trace) {
         record_logits(position, token, result.value, logits);
     }
+    graph_stats.output_head_nanoseconds += elapsed_nanoseconds(head_started);
+    ++graph_stats.forward_tokens;
     return result;
 }
 
@@ -1893,6 +1950,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
     const auto device_moe_before = impl_->device_moe_stats;
+    const auto graph_before = impl_->graph_stats;
     const auto prefill_started = std::chrono::steady_clock::now();
     ParseResult<std::uint32_t> next;
     for (std::size_t position = 0U; position < result.prompt_token_ids.size(); ++position) {
@@ -1911,6 +1969,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
     const auto device_moe_after_prefill = impl_->device_moe_stats;
+    const auto graph_after_prefill = impl_->graph_stats;
     constexpr std::uint32_t stop_token = 1U;
     if (next.value != stop_token) result.generated_token_ids.push_back(next.value);
     std::uint32_t position = static_cast<std::uint32_t>(
@@ -1940,6 +1999,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto cuda_after_decode = impl_->cuda.stats();
     const auto cache_after_decode = impl_->weights->stats();
     const auto device_moe_after_decode = impl_->device_moe_stats;
+    const auto graph_after_decode = impl_->graph_stats;
     const double prefill_seconds = result.metrics.prefill_seconds;
     const double decode_seconds = result.metrics.decode_seconds;
     result.metrics = impl_->initialization_metrics;
@@ -1955,18 +2015,22 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     result.metrics.cache = impl_->weights->stats();
     result.metrics.device_moe = device_moe_delta(
         device_moe_after_decode, device_moe_before);
+    result.metrics.graph = graph_delta(graph_after_decode, graph_before);
     result.metrics.prefill.checkpoint_reads = read_delta(reads_after_prefill,
                                                          reads_before);
     result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
     result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
     result.metrics.prefill.device_moe = device_moe_delta(
         device_moe_after_prefill, device_moe_before);
+    result.metrics.prefill.graph = graph_delta(graph_after_prefill, graph_before);
     result.metrics.decode.checkpoint_reads = read_delta(reads_after_decode,
                                                         reads_after_prefill);
     result.metrics.decode.cuda = cuda_delta(cuda_after_decode, cuda_after_prefill);
     result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
     result.metrics.decode.device_moe = device_moe_delta(
         device_moe_after_decode, device_moe_after_prefill);
+    result.metrics.decode.graph = graph_delta(
+        graph_after_decode, graph_after_prefill);
     result.diagnostics = std::move(impl_->diagnostics);
     if (result.metrics.cache.lease_acquires !=
             result.metrics.cache.lease_releases ||

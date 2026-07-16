@@ -326,6 +326,35 @@ void print_device_moe_stats(
            << '}';
 }
 
+void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats) {
+    const auto seconds = [](std::uint64_t nanoseconds) {
+        return static_cast<double>(nanoseconds) / 1.0e9;
+    };
+    output << "{\"forward_tokens\":" << stats.forward_tokens
+           << ",\"embedding_seconds\":" << seconds(stats.embedding_nanoseconds)
+           << ",\"mhc_pre_seconds\":" << seconds(stats.mhc_pre_nanoseconds)
+           << ",\"branch_norm_seconds\":"
+           << seconds(stats.branch_norm_nanoseconds)
+           << ",\"attention_seconds\":" << seconds(stats.attention_nanoseconds)
+           << ",\"attention_query_seconds\":"
+           << seconds(stats.attention_query_nanoseconds)
+           << ",\"attention_kv_seconds\":"
+           << seconds(stats.attention_kv_nanoseconds)
+           << ",\"attention_score_seconds\":"
+           << seconds(stats.attention_score_nanoseconds)
+           << ",\"attention_output_seconds\":"
+           << seconds(stats.attention_output_nanoseconds)
+           << ",\"moe_seconds\":" << seconds(stats.moe_nanoseconds)
+           << ",\"moe_router_seconds\":"
+           << seconds(stats.moe_router_nanoseconds)
+           << ",\"moe_prepare_seconds\":"
+           << seconds(stats.moe_prepare_nanoseconds)
+           << ",\"mhc_post_seconds\":" << seconds(stats.mhc_post_nanoseconds)
+           << ",\"output_head_seconds\":"
+           << seconds(stats.output_head_nanoseconds)
+           << '}';
+}
+
 void print_phase(std::ostream& output, const strata::Dsv4PhaseMetrics& phase) {
     output << "{\"checkpoint_read_calls\":" << phase.checkpoint_reads.calls
            << ",\"checkpoint_read_bytes\":" << phase.checkpoint_reads.bytes
@@ -337,6 +366,8 @@ void print_phase(std::ostream& output, const strata::Dsv4PhaseMetrics& phase) {
     print_cache_stats(output, phase.cache);
     output << ",\"device_moe_runtime\":";
     print_device_moe_stats(output, phase.device_moe);
+    output << ",\"graph\":";
+    print_graph_stats(output, phase.graph);
     output << '}';
 }
 

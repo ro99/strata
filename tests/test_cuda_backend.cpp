@@ -263,6 +263,33 @@ TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections
     REQUIRE(backend.matmul(fp4_weight, fp4_input, 1U, fp4_output).ok());
     REQUIRE_NEAR(fp4_output[0], 0.046875F, 1.0e-6F);
 
+    constexpr std::array<float, 16> fp4_expected{
+        0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+        0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+    std::array<std::byte, 16U * 16U> exhaustive_fp4{};
+    for (std::size_t row = 0U; row < fp4_expected.size(); ++row) {
+        const auto nibble = static_cast<std::uint8_t>(row);
+        const auto packed = static_cast<std::byte>(nibble | (nibble << 4U));
+        std::fill_n(exhaustive_fp4.begin() +
+                        static_cast<std::ptrdiff_t>(row * 16U),
+                    16U, packed);
+    }
+    std::array<std::byte, 16> exhaustive_scales{};
+    exhaustive_scales.fill(std::byte{0x7FU});
+    descriptor.rows = fp4_expected.size();
+    strata::CudaWeight exhaustive_fp4_weight;
+    REQUIRE(backend.upload(devices.front(), descriptor, exhaustive_fp4,
+                           exhaustive_scales, exhaustive_fp4_weight).ok());
+    std::array<float, 32> exhaustive_input{};
+    exhaustive_input.front() = 1.0F;
+    std::array<float, 16> exhaustive_output{};
+    REQUIRE(backend.matmul(exhaustive_fp4_weight, exhaustive_input, 1U,
+                           exhaustive_output).ok());
+    for (std::size_t code = 0U; code < fp4_expected.size(); ++code) {
+        REQUIRE(std::bit_cast<std::uint32_t>(exhaustive_output[code]) ==
+                std::bit_cast<std::uint32_t>(fp4_expected[code]));
+    }
+
     constexpr std::array<std::uint8_t, 8> fp8_source{
         0xe0U, 0xf0U, 0x6dU, 0x6cU, 0x68U, 0x41U, 0x63U, 0xefU};
     std::array<std::byte, 128> fp8{};

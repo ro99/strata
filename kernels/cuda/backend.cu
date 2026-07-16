@@ -76,10 +76,25 @@ __device__ float fp8_e4m3_value(unsigned char encoded) {
 }
 
 __device__ float fp4_e2m1_value(unsigned int encoded) {
-    constexpr float table[16]{
-        0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
-        0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
-    return table[encoded & 0x0FU];
+    switch (encoded & 0x0FU) {
+        case 0x0U: return 0.0F;
+        case 0x1U: return 0.5F;
+        case 0x2U: return 1.0F;
+        case 0x3U: return 1.5F;
+        case 0x4U: return 2.0F;
+        case 0x5U: return 3.0F;
+        case 0x6U: return 4.0F;
+        case 0x7U: return 6.0F;
+        case 0x8U: return 0.0F;
+        case 0x9U: return -0.5F;
+        case 0xAU: return -1.0F;
+        case 0xBU: return -1.5F;
+        case 0xCU: return -2.0F;
+        case 0xDU: return -3.0F;
+        case 0xEU: return -4.0F;
+        case 0xFU: return -6.0F;
+        default: return 0.0F;
+    }
 }
 
 __device__ float quantize_e4m3_value(float value) {

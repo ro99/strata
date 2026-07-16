@@ -21,6 +21,8 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 #   VRAM_FRACTION=0.85 MAX_CONTEXT_TOKENS=2048 PROMPT=Hello
 #   REFERENCE_ARGS='...'
 #   CANDIDATE_ARGS='...'
+#   REFERENCE_DEVICE_MOE=0 CANDIDATE_DEVICE_MOE=1
+#   REFERENCE_HOST_ATTENTION_THREADS=0 CANDIDATE_HOST_ATTENTION_THREADS=0
 #
 # Suggested launch:
 #   tmux new-session -d -s dsv4-device-moe-ab \
@@ -42,6 +44,10 @@ maximum_context_tokens=${MAX_CONTEXT_TOKENS:-2048}
 prompt=${PROMPT:-Hello}
 minimum_decode_steps_per_second=${MIN_DECODE_STEPS_PER_SECOND:-5.0}
 enforce_acceptance=${ENFORCE_ACCEPTANCE:-0}
+reference_device_moe=${REFERENCE_DEVICE_MOE:-0}
+candidate_device_moe=${CANDIDATE_DEVICE_MOE:-1}
+reference_host_attention_threads=${REFERENCE_HOST_ATTENTION_THREADS:-0}
+candidate_host_attention_threads=${CANDIDATE_HOST_ATTENTION_THREADS:-0}
 expected_index_sha256=98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b
 
 case "${smoke}" in
@@ -56,6 +62,24 @@ case "${enforce_acceptance}" in
     0|1) ;;
     *) echo "error: ENFORCE_ACCEPTANCE must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${reference_device_moe}" in
+    0|1) ;;
+    *) echo "error: REFERENCE_DEVICE_MOE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${candidate_device_moe}" in
+    0|1) ;;
+    *) echo "error: CANDIDATE_DEVICE_MOE must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ ! "${reference_host_attention_threads}" =~ ^[0-9]+$ ]] ||
+   ((reference_host_attention_threads > 64)); then
+    echo "error: REFERENCE_HOST_ATTENTION_THREADS must be within [0, 64]" >&2
+    exit 2
+fi
+if [[ ! "${candidate_host_attention_threads}" =~ ^[0-9]+$ ]] ||
+   ((candidate_host_attention_threads > 64)); then
+    echo "error: CANDIDATE_HOST_ATTENTION_THREADS must be within [0, 64]" >&2
+    exit 2
+fi
 
 if [[ -n ${REPETITIONS+x} ]]; then
     repetitions=${REPETITIONS}
@@ -298,6 +322,7 @@ write_run_summary() {
                 execution:(.execution // null),
                 dspark:(.dspark // null),
                 device_moe:(.device_moe // null),
+                host_attention_threads:(.host_attention_threads // null),
                 detailed_timing:(.detailed_timing // null),
                 initialization_seconds:(.initialization_seconds // null),
                 resident_staging_seconds:(.resident_staging_seconds // null),
@@ -417,6 +442,7 @@ run_one() {
     local repetition=$2
     local order=$3
     local suffix run_dir binary runner_exit_code valid=1
+    local expected_device_moe expected_host_attention_threads
     local initial_read_sectors initial_write_sectors
     local final_read_sectors final_write_sectors
     local physical_read_bytes physical_write_bytes
@@ -431,8 +457,12 @@ run_one() {
 
     if [[ "${variant}" == reference ]]; then
         binary=${reference_binary}
+        expected_device_moe=${reference_device_moe}
+        expected_host_attention_threads=${reference_host_attention_threads}
     else
         binary=${candidate_binary}
+        expected_device_moe=${candidate_device_moe}
+        expected_host_attention_threads=${candidate_host_attention_threads}
     fi
     args=(
         --model "${model_dir}"
@@ -447,8 +477,13 @@ run_one() {
         --json
     )
     args+=("${common_extra_args[@]}")
-    if [[ "${variant}" == candidate ]]; then
+    if [[ "${expected_device_moe}" == 1 ]]; then
         args+=(--device-moe)
+    fi
+    if ((expected_host_attention_threads != 0)); then
+        args+=(--host-attention-threads "${expected_host_attention_threads}")
+    fi
+    if [[ "${variant}" == candidate ]]; then
         args+=("${candidate_extra_args[@]}")
     else
         args+=("${reference_extra_args[@]}")
@@ -498,11 +533,15 @@ run_one() {
 
     if ((runner_exit_code != 0)); then
         valid=0
-    elif ! jq -e --arg variant "${variant}" '
+    elif ! jq -e \
+        --argjson expected_device_moe "${expected_device_moe}" \
+        --argjson expected_host_attention_threads \
+            "${expected_host_attention_threads}" '
         type == "object" and
         .execution == "exact_base_autoregressive" and
         .dspark == "disabled" and
-        (.device_moe == ($variant == "candidate")) and
+        (.device_moe == ($expected_device_moe == 1)) and
+        (.host_attention_threads == $expected_host_attention_threads) and
         .detailed_timing == true and
         ((.decode_seconds // 0) > 0) and
         ((.decode_steps // 0) > 0) and
@@ -514,7 +553,7 @@ run_one() {
           .phases.decode.cache.active_leases[]] | all(. == 0)) and
         ([.phases.prefill.cache.leased_bytes[],
           .phases.decode.cache.leased_bytes[]] | all(. == 0)) and
-        (if $variant == "candidate" then
+        (if $expected_device_moe == 1 then
              .phases.decode.cache.lease_acquires > 0 and
              .phases.decode.device_moe_runtime.batches ==
                  (.decode_steps * 43) and
@@ -798,6 +837,12 @@ sha256sum "${candidate_binary}" >"${result_dir}/candidate-binary.sha256"
     printf 'logit_trace_top_k=%q\n' "${logit_trace_top_k}"
     printf 'minimum_decode_steps_per_second=%q\n' \
         "${minimum_decode_steps_per_second}"
+    printf 'reference_device_moe=%q\n' "${reference_device_moe}"
+    printf 'candidate_device_moe=%q\n' "${candidate_device_moe}"
+    printf 'reference_host_attention_threads=%q\n' \
+        "${reference_host_attention_threads}"
+    printf 'candidate_host_attention_threads=%q\n' \
+        "${candidate_host_attention_threads}"
     printf 'tmux_session=%q\n' "${TMUX:-not-running-under-tmux}"
 } >"${result_dir}/config.txt"
 nvidia-smi -q >"${result_dir}/nvidia-smi-q-before.txt"

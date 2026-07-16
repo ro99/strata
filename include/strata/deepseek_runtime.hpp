@@ -19,6 +19,7 @@ struct Dsv4RuntimeConfig {
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t logit_trace_top_k{20U};
+    std::uint32_t host_attention_threads{};
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
     bool enable_device_moe{};
@@ -77,6 +78,7 @@ struct Dsv4GenerationMetrics {
     bool detailed_timing{};
     bool dspark_enabled{};
     bool device_moe_enabled{};
+    std::uint32_t host_attention_threads{};
 };
 
 struct Dsv4GenerationResult {

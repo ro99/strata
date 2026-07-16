@@ -21,6 +21,7 @@ struct Options {
     std::uint32_t maximum_new_tokens{16U};
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t logit_trace_top_k{20U};
+    std::uint32_t host_attention_threads{};
     std::uint64_t host_memory_bytes{216ULL << 30U};
     double vram_fraction{0.85};
     bool admission_only{};
@@ -37,6 +38,7 @@ void usage() {
     std::cerr
         << "usage: strata-deepseek-run --model DIR [--prompt TEXT] [--max-new N]\n"
         << "       [--devices 0,1,2] [--max-context N] [--host-memory 216G]\n"
+        << "       [--host-attention-threads N]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -118,6 +120,11 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--max-context") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_u32(value, options.maximum_context_tokens)) return false;
+        } else if (argument == "--host-attention-threads") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_u32(value, options.host_attention_threads) ||
+                options.host_attention_threads == 0U ||
+                options.host_attention_threads > 64U) return false;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
@@ -519,6 +526,7 @@ int main(int argc, char** argv) {
     config.host_memory_limit_bytes = options.host_memory_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
+    config.host_attention_threads = options.host_attention_threads;
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
@@ -546,6 +554,8 @@ int main(int argc, char** argv) {
                   << ",\"dspark\":\"disabled\""
                   << ",\"device_moe\":"
                   << (metrics.device_moe_enabled ? "true" : "false")
+                  << ",\"host_attention_threads\":"
+                  << metrics.host_attention_threads
                   << ",\"detailed_timing\":"
                   << (metrics.detailed_timing ? "true" : "false")
                   << ",\"initialization_seconds\":" << metrics.initialization_seconds

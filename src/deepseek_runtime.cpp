@@ -3,6 +3,7 @@
 #include "strata/deepseek_ops.hpp"
 #include "strata/glm_ops.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>
@@ -588,6 +589,7 @@ struct DeepSeekV4Runtime::Impl {
     GlmTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
+    std::unique_ptr<HostWorkerPool> attention_workers;
     Dsv4DiagnosticTrace diagnostics;
     Dsv4DeviceMoeStats device_moe_stats;
     std::vector<int> devices;
@@ -1005,7 +1007,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     result = linear(slot, prefix + "wq_b", kHeads * kHeadDim, kQueryRank,
                     query_rank, queries);
     if (!result.ok()) return result;
-    for (std::uint32_t head = 0U; head < kHeads; ++head) {
+    const auto normalize_query = [&](std::uint32_t head) {
         auto query = std::span<float>(queries).subspan(
             static_cast<std::size_t>(head) * kHeadDim, kHeadDim);
         double square_sum = 0.0;
@@ -1018,6 +1020,17 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
         apply_rope(query.last(kRopeDim), position,
                    attention_state[layer].frequencies);
         round_bf16(query.last(kRopeDim));
+    };
+    if (attention_workers != nullptr) {
+        result = attention_workers->parallel_for(
+            kHeads, [&](std::size_t head) {
+                normalize_query(static_cast<std::uint32_t>(head));
+            });
+        if (!result.ok()) return result;
+    } else {
+        for (std::uint32_t head = 0U; head < kHeads; ++head) {
+            normalize_query(head);
+        }
     }
 
     std::vector<float> kv(kHeadDim);
@@ -1046,12 +1059,13 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     const auto window_count = std::min<std::uint32_t>(position + 1U, kWindow);
     const auto ratio = layer_state.compressor.ratio;
     const auto compressed_count = ratio == 0U ? 0U : (position + 1U) / ratio;
-    std::vector<float> scores;
-    scores.reserve(static_cast<std::size_t>(window_count) + compressed_count);
-    for (std::uint32_t head = 0U; head < kHeads; ++head) {
+    const auto score_stride = static_cast<std::size_t>(window_count) +
+                              compressed_count;
+    const auto attend_head = [&](std::uint32_t head,
+                                 std::span<float> scores) {
         const auto query = std::span<const float>(queries).subspan(
             static_cast<std::size_t>(head) * kHeadDim, kHeadDim);
-        scores.clear();
+        std::size_t next_score = 0U;
         float maximum = (*sink.value)[head];
         for (std::uint32_t item = 0U; item < window_count; ++item) {
             const auto absolute = position + 1U - window_count + item;
@@ -1062,7 +1076,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                 dot += static_cast<double>(query[dimension]) * key[dimension];
             }
             const float score = static_cast<float>(dot) * kAttentionScale;
-            scores.push_back(score);
+            scores[next_score++] = score;
             maximum = std::max(maximum, score);
         }
         for (std::uint32_t item = 0U; item < compressed_count; ++item) {
@@ -1074,7 +1088,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                 dot += static_cast<double>(query[dimension]) * key[dimension];
             }
             const float score = static_cast<float>(dot) * kAttentionScale;
-            scores.push_back(score);
+            scores[next_score++] = score;
             maximum = std::max(maximum, score);
         }
         double denominator = std::exp(
@@ -1111,6 +1125,23 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
         apply_rope(destination.last(kRopeDim), position,
                    layer_state.frequencies, true);
         round_bf16(destination.last(kRopeDim));
+    };
+    if (attention_workers != nullptr) {
+        std::vector<float> parallel_scores(
+            static_cast<std::size_t>(kHeads) * score_stride);
+        result = attention_workers->parallel_for(
+            kHeads, [&](std::size_t head) {
+                attend_head(
+                    static_cast<std::uint32_t>(head),
+                    std::span<float>(parallel_scores).subspan(
+                        head * score_stride, score_stride));
+            });
+        if (!result.ok()) return result;
+    } else {
+        std::vector<float> scores(score_stride);
+        for (std::uint32_t head = 0U; head < kHeads; ++head) {
+            attend_head(head, scores);
+        }
     }
 
     std::vector<float> output_rank(static_cast<std::size_t>(kOutputGroups) *
@@ -1560,6 +1591,11 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "DeepSeek logit trace top-K must be within [1, 129280]");
         return result;
     }
+    if (config.host_attention_threads > kHeads) {
+        result.errors.emplace_back(
+            "DeepSeek host attention worker count must not exceed 64");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
@@ -1664,6 +1700,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
         impl_->devices, weight_capacities);
+    if (config.host_attention_threads != 0U) {
+        impl_->attention_workers = std::make_unique<HostWorkerPool>(
+            config.host_attention_threads);
+    } else {
+        impl_->attention_workers.reset();
+    }
     result = impl_->warmup();
     if (!result.ok()) return result;
     if (config.enable_device_moe) {
@@ -1692,6 +1734,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
     impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
+    impl_->initialization_metrics.host_attention_threads =
+        config.host_attention_threads;
     return result;
 }
 

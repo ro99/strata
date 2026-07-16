@@ -11,6 +11,20 @@ TEST_CASE("DeepSeek correctness diagnostics are opt-in") {
     REQUIRE(!config.enable_logit_trace);
     REQUIRE(!config.enable_layer_hash_trace);
     REQUIRE(config.logit_trace_top_k == 20U);
+    REQUIRE(config.host_attention_threads == 0U);
+}
+
+TEST_CASE("DeepSeek runtime rejects excessive host attention workers") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.host_attention_threads = 65U;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("attention worker") !=
+                                   std::string::npos;
+                        }));
 }
 
 TEST_CASE("DeepSeek runtime rejects unverified DSpark execution explicitly") {

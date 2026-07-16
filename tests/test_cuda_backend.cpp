@@ -414,7 +414,7 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
     REQUIRE(after.activation_d2h_bytes - before.activation_d2h_bytes ==
             3U * hidden_columns * sizeof(float));
     REQUIRE(after.workspace_allocation_calls -
-                before.workspace_allocation_calls == 5U);
+                before.workspace_allocation_calls == 6U);
     REQUIRE(after.synchronization_calls - before.synchronization_calls == 1U);
     REQUIRE(after.deepseek_moe_h2d_nanoseconds >
             before.deepseek_moe_h2d_nanoseconds);

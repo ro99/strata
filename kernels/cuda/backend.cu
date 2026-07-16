@@ -1,4 +1,5 @@
 #include "strata/cuda_backend.hpp"
+#include "strata/glm_ops.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -276,22 +278,11 @@ __device__ float bf16_round(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
-__device__ float stable_silu(float value) {
-    float sigmoid = 0.0F;
-    if (value >= 0.0F) {
-        sigmoid = 1.0F / (1.0F + expf(-value));
-    } else {
-        const float exponential = expf(value);
-        sigmoid = exponential / (1.0F + exponential);
-    }
-    return value * sigmoid;
-}
-
 __global__ void deepseek_fp4_gate_up_kernel(
     float* activations, const float* hidden, DeepSeekFp4Batch batch,
     std::uint64_t columns, std::uint64_t intermediate,
     std::uint64_t packed_columns, std::uint64_t scale_columns,
-    float swiglu_limit, unsigned int* error_flag) {
+    float swiglu_limit, const float* bf16_silu, unsigned int* error_flag) {
     const std::uint64_t output_row = blockIdx.x;
     const std::uint32_t expert = blockIdx.y;
     if (output_row >= intermediate || expert >= batch.count) return;
@@ -348,7 +339,9 @@ __global__ void deepseek_fp4_gate_up_kernel(
         const float limited_gate = fminf(rounded_gate, swiglu_limit);
         const float limited_up = fmaxf(-swiglu_limit,
                                        fminf(rounded_up, swiglu_limit));
-        float activated = stable_silu(limited_gate) * limited_up;
+        const auto gate_bits = static_cast<std::uint16_t>(
+            __float_as_uint(limited_gate) >> 16U);
+        float activated = bf16_silu[gate_bits] * limited_up;
         activated *= batch.coefficients[expert];
         activated *= batch.coefficients[expert];
         activations[static_cast<std::uint64_t>(expert) * intermediate + output_row] =
@@ -399,7 +392,7 @@ __global__ void deepseek_fp8_gate_up_kernel(
     const unsigned char* w3, const unsigned char* w3_scales,
     std::uint64_t columns, std::uint64_t intermediate,
     std::uint64_t scale_columns, float swiglu_limit,
-    unsigned int* error_flag) {
+    const float* bf16_silu, unsigned int* error_flag) {
     const std::uint64_t output_row = blockIdx.x;
     if (output_row >= intermediate) return;
     const std::uint64_t weight_base = output_row * columns;
@@ -441,8 +434,10 @@ __global__ void deepseek_fp8_gate_up_kernel(
         const float limited_gate = fminf(rounded_gate, swiglu_limit);
         const float limited_up = fmaxf(-swiglu_limit,
                                        fminf(rounded_up, swiglu_limit));
+        const auto gate_bits = static_cast<std::uint16_t>(
+            __float_as_uint(limited_gate) >> 16U);
         activation[output_row] = bf16_round(
-            stable_silu(limited_gate) * limited_up);
+            bf16_silu[gate_bits] * limited_up);
     }
 }
 
@@ -521,6 +516,7 @@ struct CudaBackend::Impl {
         float* moe_hidden{};
         float* moe_activations{};
         float* moe_output{};
+        float* moe_bf16_silu{};
         unsigned int* moe_error{};
         void* moe_host_staging{};
         std::uint64_t moe_hidden_bytes{};
@@ -552,6 +548,9 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaFree(state.moe_activations));
             }
             if (state.moe_output != nullptr) static_cast<void>(cudaFree(state.moe_output));
+            if (state.moe_bf16_silu != nullptr) {
+                static_cast<void>(cudaFree(state.moe_bf16_silu));
+            }
             if (state.moe_error != nullptr) static_cast<void>(cudaFree(state.moe_error));
             if (state.moe_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.moe_host_staging));
@@ -1164,6 +1163,33 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
                           "allocate DeepSeek MoE output workspace")) {
         return result;
     }
+    if (state.moe_bf16_silu == nullptr) {
+        constexpr std::size_t entries = 1U << 16U;
+        constexpr std::size_t bytes = entries * sizeof(float);
+        static const std::array<float, entries> table = [] {
+            std::array<float, entries> values{};
+            for (std::size_t index = 0U; index < entries; ++index) {
+                const auto bits = static_cast<std::uint32_t>(index) << 16U;
+                const float value = std::bit_cast<float>(bits);
+                values[index] = std::isfinite(value) ? glm_silu_f32(value) : value;
+            }
+            return values;
+        }();
+        if (const auto status = cudaMalloc(&state.moe_bf16_silu, bytes);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek BF16 SiLU table");
+        }
+        if (const auto status = cudaMemcpyAsync(
+                state.moe_bf16_silu, table.data(), bytes,
+                cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
+            static_cast<void>(cudaFree(state.moe_bf16_silu));
+            state.moe_bf16_silu = nullptr;
+            return cuda_error(status, "upload DeepSeek BF16 SiLU table");
+        }
+        ++allocation_calls;
+        allocation_bytes += bytes;
+    }
     if (state.moe_error == nullptr) {
         if (const auto status = cudaMalloc(&state.moe_error, sizeof(unsigned int));
             status != cudaSuccess) {
@@ -1286,7 +1312,8 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         deepseek_fp4_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, routed_batch,
             hidden_columns, intermediate_columns, w1.packed_columns,
-            w1.scale_columns, swiglu_limit, state.moe_error);
+            w1.scale_columns, swiglu_limit, state.moe_bf16_silu,
+            state.moe_error);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek FP4 W1/W3 SwiGLU");
@@ -1332,7 +1359,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             static_cast<const unsigned char*>(shared->w3->impl_->weights),
             static_cast<const unsigned char*>(shared->w3->impl_->scales),
             hidden_columns, intermediate_columns, w1.scale_columns,
-            swiglu_limit, state.moe_error);
+            swiglu_limit, state.moe_bf16_silu, state.moe_error);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared FP8 W1/W3 SwiGLU");

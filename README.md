@@ -98,6 +98,24 @@ RSS, and per-GPU VRAM with every performance result. Report at least three
 interleaved repetitions and do not call a result a win when it is within the
 observed run variance.
 
+## DeepSeek-V4 screened baseline
+
+The DeepSeek-V4 base executor is the `main` baseline for subsequent DeepSeek
+experiments. On the admitted three-GPU topology (216 GiB host-memory ceiling,
+0.85 VRAM fraction, exact device MoE, FP4 switch, and 28 exact host-attention
+workers), one matched 128-token `Hello` screen completed 127 decode steps in
+29.00231959 seconds, or **4.3789600899 decode steps/s**. Its matched serial
+attention reference reached 3.0227143404 steps/s, a 1.4486847240x speedup.
+
+Tokens, sequential routes, logits, and every recorded layer BF16 hash matched;
+decode checkpoint reads were zero, cache leases were balanced, and the measured
+RSS/VRAM stayed within admission. This is the working comparison baseline, not
+a three-repetition median or an external target-model validation claim. Future
+DeepSeek experiments may land only when they preserve this exact contract and
+demonstrate a material, properly replicated improvement against it. The frozen
+target-layer, teacher-forcing, greedy-generation, and independent physical-I/O
+promotion gates remain open.
+
 ## Build and test
 
 Requirements are a C++20 compiler, CMake, Make, and optionally CUDA 12.8 or a

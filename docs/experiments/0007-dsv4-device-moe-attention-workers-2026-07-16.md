@@ -1,6 +1,7 @@
 # Experiment 0007 — device MoE with exact host-attention workers
 
-Status: **screened experimental baseline; not yet eligible for `main`**.
+Status: **screened DeepSeek baseline integrated into `main`; target-oracle
+promotion gates remain open**.
 
 ## Hypothesis and contract
 
@@ -109,14 +110,13 @@ The follow-up exact mHC-worker screen on branch
 three-run matrix. The attention-worker revision `c1dada2` therefore remains the
 best working screen baseline, and host micro-experiments stop here.
 
-## Main-branch promotion status
+## Main-baseline status
 
-The implementation is suitable for continued experimental use but is not yet
-mature enough for the repository's validated `main` branch. The exact
-serial/parallel comparison proves that this optimization preserves the current
-Strata executor; it does not prove that the executor matches the supplied
-target implementation. The outstanding promotion gates already declared in
-`docs/deepseek-v4-runtime.md` and `docs/model-bringup.md` are:
+This revision is integrated as the DeepSeek comparison baseline on `main`.
+The exact serial/parallel comparison proves that this optimization preserves the
+current Strata executor; it does not prove that the executor matches the
+supplied target implementation. The outstanding target-validation gates already
+declared in `docs/deepseek-v4-runtime.md` and `docs/model-bringup.md` are:
 
 - frozen target-executor outputs at operation and layer boundaries;
 - full-model teacher-forcing agreement;
@@ -125,8 +125,9 @@ target implementation. The outstanding promotion gates already declared in
 - a median of at least three interleaved 128-token repetitions before treating
   4.3789600899 steps/s as a validated throughput result.
 
-Until those gates pass, this branch should remain an experimental checkpoint
-and its performance number should be described as a screen, not a validated
-research win. The next performance change, after correctness promotion, should
+Until those gates pass, the performance number must be described as a screen,
+not a validated research win. Future DeepSeek experiment branches compare
+against this exact `main` baseline and merge only after a material, replicated
+improvement. The next performance change, after correctness promotion, should
 be structural: reduce host/device boundaries with a larger device-resident
 attention/mHC block rather than resume small host-loop experiments.

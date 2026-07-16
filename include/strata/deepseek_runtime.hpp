@@ -28,6 +28,7 @@ struct Dsv4RuntimeConfig {
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};
+    bool overlap_resident_warmup{};
     bool verbose{};
     std::string route_trace_path;
 };
@@ -81,6 +82,7 @@ struct Dsv4GenerationMetrics {
     bool detailed_timing{};
     bool dspark_enabled{};
     bool device_moe_enabled{};
+    bool resident_warmup_overlapped{};
     std::uint32_t host_attention_threads{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};

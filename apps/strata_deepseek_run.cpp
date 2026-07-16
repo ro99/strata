@@ -33,6 +33,7 @@ struct Options {
     bool device_moe{};
     bool logit_trace{};
     bool layer_hash_trace{};
+    bool overlap_resident_warmup{};
     std::string route_trace;
 };
 
@@ -43,6 +44,7 @@ void usage() {
         << "       [--host-attention-threads N]\n"
         << "       [--resident-read-workers N]\n"
         << "       [--spine-warmup-workers N]\n"
+        << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -163,6 +165,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.logit_trace = true;
         } else if (argument == "--layer-hash-trace") {
             options.layer_hash_trace = true;
+        } else if (argument == "--overlap-resident-warmup") {
+            options.overlap_resident_warmup = true;
+        } else if (argument == "--serial-resident-warmup") {
+            options.overlap_resident_warmup = false;
         } else if (argument == "--admission-only") {
             options.admission_only = true;
         } else if (argument == "--detailed-timing") {
@@ -548,6 +554,7 @@ int main(int argc, char** argv) {
     config.enable_device_moe = options.device_moe;
     config.enable_logit_trace = options.logit_trace;
     config.enable_layer_hash_trace = options.layer_hash_trace;
+    config.overlap_resident_warmup = options.overlap_resident_warmup;
     config.detailed_timing = options.detailed_timing;
     config.verbose = !options.quiet;
     config.route_trace_path = options.route_trace;
@@ -576,6 +583,8 @@ int main(int argc, char** argv) {
                   << metrics.resident_read_workers
                   << ",\"spine_warmup_workers\":"
                   << metrics.spine_warmup_workers
+                  << ",\"resident_warmup_overlapped\":"
+                  << (metrics.resident_warmup_overlapped ? "true" : "false")
                   << ",\"detailed_timing\":"
                   << (metrics.detailed_timing ? "true" : "false")
                   << ",\"initialization_seconds\":" << metrics.initialization_seconds

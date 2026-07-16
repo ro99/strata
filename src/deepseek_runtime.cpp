@@ -392,7 +392,7 @@ public:
     ValidationResult preload(std::size_t slot, std::string_view base,
                              std::uint64_t rows, std::uint64_t columns) {
         Entry* entry = nullptr;
-        return ensure(slot, base, rows, columns, true, entry);
+        return ensure(slot, base, rows, columns, true, false, entry);
     }
 
     ValidationResult acquire(std::size_t slot, std::string_view base,
@@ -400,7 +400,7 @@ public:
                              Lease& output) {
         output.reset();
         Entry* entry = nullptr;
-        auto result = ensure(slot, base, rows, columns, false, entry);
+        auto result = ensure(slot, base, rows, columns, false, true, entry);
         if (!result.ok()) return result;
         ++entry->leases;
         ++lease_acquires_;
@@ -431,7 +431,8 @@ public:
                             std::span<const float> input, std::uint32_t rows,
                             std::span<float> output, bool bf16_output = true) {
         Entry* entry = nullptr;
-        auto result = ensure(slot, base, output_columns, input_columns, false, entry);
+        auto result = ensure(slot, base, output_columns, input_columns,
+                             false, true, entry);
         if (!result.ok()) return result;
         result = backend_.matmul(entry->weight, input, rows, output);
         if (result.ok() && bf16_output) round_bf16(output);
@@ -446,7 +447,8 @@ public:
                              std::uint64_t rows_per_group,
                              std::span<float> output) {
         Entry* entry = nullptr;
-        auto result = ensure(slot, base, output_columns, input_columns, false, entry);
+        auto result = ensure(slot, base, output_columns, input_columns,
+                             false, true, entry);
         if (!result.ok()) return result;
         result = backend_.matmul_grouped(entry->weight, input, groups,
                                          rows_per_group, output);
@@ -482,7 +484,7 @@ public:
 private:
     ValidationResult ensure(std::size_t slot, std::string_view base,
                             std::uint64_t rows, std::uint64_t columns,
-                            bool pin, Entry*& output) {
+                            bool pin, bool use_resident, Entry*& output) {
         ValidationResult result;
         if (slot >= states_.size()) {
             result.errors.emplace_back("DeepSeek linear targets an invalid CUDA slot");
@@ -534,7 +536,9 @@ private:
             ++evictions_;
         }
         Entry entry;
-        result = load_dsv4_cuda_linear(checkpoint_, &resident_, base, rows, columns,
+        result = load_dsv4_cuda_linear(checkpoint_,
+                                        use_resident ? &resident_ : nullptr,
+                                        base, rows, columns,
                                         devices_[slot], backend_, entry.weight);
         if (!result.ok()) return result;
         entry.last_use = state.clock;
@@ -1772,14 +1776,6 @@ ValidationResult DeepSeekV4Runtime::initialize(
                       << '\n';
         }
     }
-    const auto staging_started = std::chrono::steady_clock::now();
-    result = impl_->resident.stage(*impl_->checkpoint,
-                                   config.host_memory_limit_bytes,
-                                   config.resident_read_workers,
-                                   config.enable_dspark);
-    const double staging_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - staging_started).count();
-    if (!result.ok()) return result;
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
         impl_->devices, weight_capacities);
@@ -1789,10 +1785,40 @@ ValidationResult DeepSeekV4Runtime::initialize(
     } else {
         impl_->attention_workers.reset();
     }
-    const auto warmup_started = std::chrono::steady_clock::now();
-    result = impl_->warmup();
-    const double warmup_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - warmup_started).count();
+
+    ValidationResult staging_result;
+    ValidationResult warmup_result;
+    double staging_seconds = 0.0;
+    double warmup_seconds = 0.0;
+    const auto stage_resident = [&] {
+        const auto started = std::chrono::steady_clock::now();
+        staging_result = impl_->resident.stage(*impl_->checkpoint,
+                                               config.host_memory_limit_bytes,
+                                               config.resident_read_workers,
+                                               config.enable_dspark);
+        staging_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    };
+    const auto warm_spine = [&] {
+        const auto started = std::chrono::steady_clock::now();
+        warmup_result = impl_->warmup();
+        warmup_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    };
+    if (config.overlap_resident_warmup) {
+        std::thread staging_thread(stage_resident);
+        warm_spine();
+        staging_thread.join();
+    } else {
+        stage_resident();
+        if (staging_result.ok()) warm_spine();
+    }
+    if (!staging_result.ok()) {
+        append_errors(result, std::move(staging_result.errors));
+    }
+    if (!warmup_result.ok()) {
+        append_errors(result, std::move(warmup_result.errors));
+    }
     if (!result.ok()) return result;
     if (config.enable_device_moe) {
         if (impl_->memory.maximum_expert_bytes >
@@ -1821,6 +1847,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
     impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
+    impl_->initialization_metrics.resident_warmup_overlapped =
+        config.overlap_resident_warmup;
     impl_->initialization_metrics.host_attention_threads =
         config.host_attention_threads;
     impl_->initialization_metrics.resident_read_workers =

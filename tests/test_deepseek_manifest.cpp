@@ -149,11 +149,15 @@ TEST_CASE("real DeepSeek V4 DSpark checkpoint opens without format conversion wh
     }
     std::vector<std::byte> direct(static_cast<std::size_t>(tensor->source_bytes));
     const auto before_direct = checkpoint.value->stats();
-    const auto direct_read = checkpoint.value->read_into(tensor->name, direct);
+    strata::Dsv4CheckpointReadStats local_direct;
+    const auto direct_read = checkpoint.value->read_into(
+        tensor->name, direct, &local_direct);
     const auto after_direct = checkpoint.value->stats();
     REQUIRE(direct_read.ok());
     REQUIRE(after_direct.calls == before_direct.calls + 1U);
     REQUIRE(after_direct.bytes == before_direct.bytes + tensor->source_bytes);
+    REQUIRE(local_direct.calls == 1U);
+    REQUIRE(local_direct.bytes == tensor->source_bytes);
     for (std::size_t index = 0U; index < expected.size(); ++index) {
         REQUIRE(std::to_integer<std::uint8_t>(direct[index]) == expected[index]);
     }

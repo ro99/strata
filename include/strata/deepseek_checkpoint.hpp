@@ -46,7 +46,8 @@ public:
     [[nodiscard]] ParseResult<std::vector<std::byte>> read(
         std::string_view name, std::uint64_t maximum_bytes) const;
     [[nodiscard]] ValidationResult read_into(
-        std::string_view name, std::span<std::byte> destination) const;
+        std::string_view name, std::span<std::byte> destination,
+        Dsv4CheckpointReadStats* local_stats = nullptr) const;
     [[nodiscard]] ParseResult<std::vector<std::byte>> read_slice(
         std::string_view name, std::uint64_t relative_offset,
         std::uint64_t bytes) const;
@@ -70,7 +71,8 @@ private:
         std::uint64_t bytes) const;
     [[nodiscard]] ValidationResult pread_tensor_into(
         const Dsv4ManifestTensor& tensor, std::uint64_t relative_offset,
-        std::span<std::byte> destination) const;
+        std::span<std::byte> destination,
+        Dsv4CheckpointReadStats* local_stats = nullptr) const;
 
     std::string model_directory_;
     Dsv4IndexManifest manifest_;

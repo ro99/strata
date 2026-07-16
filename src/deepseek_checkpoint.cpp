@@ -146,7 +146,8 @@ ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::pread_tensor(
 
 ValidationResult Dsv4CheckpointReader::pread_tensor_into(
     const Dsv4ManifestTensor& tensor, std::uint64_t relative_offset,
-    std::span<std::byte> destination) const {
+    std::span<std::byte> destination,
+    Dsv4CheckpointReadStats* local_stats) const {
     ValidationResult result;
     const auto bytes = static_cast<std::uint64_t>(destination.size());
     if (relative_offset > tensor.source_bytes || bytes > tensor.source_bytes - relative_offset) {
@@ -185,6 +186,11 @@ ValidationResult Dsv4CheckpointReader::pread_tensor_into(
     read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     read_nanoseconds_.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
                                 std::memory_order_relaxed);
+    if (local_stats != nullptr) {
+        ++local_stats->calls;
+        local_stats->bytes += bytes;
+        local_stats->nanoseconds += static_cast<std::uint64_t>(elapsed.count());
+    }
     return result;
 }
 
@@ -206,7 +212,8 @@ ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::read(
 }
 
 ValidationResult Dsv4CheckpointReader::read_into(
-    std::string_view name, std::span<std::byte> destination) const {
+    std::string_view name, std::span<std::byte> destination,
+    Dsv4CheckpointReadStats* local_stats) const {
     ValidationResult result;
     const auto* tensor = find(name);
     if (tensor == nullptr) {
@@ -219,7 +226,7 @@ ValidationResult Dsv4CheckpointReader::read_into(
                                    tensor->name);
         return result;
     }
-    return pread_tensor_into(*tensor, 0U, destination);
+    return pread_tensor_into(*tensor, 0U, destination, local_stats);
 }
 
 ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::read_slice(
@@ -414,8 +421,8 @@ ValidationResult Dsv4ResidentWeightStore::stage(
     }
 
     const auto started = std::chrono::steady_clock::now();
-    const auto before = checkpoint.stats();
     std::vector<ValidationResult> shard_results(shard_tasks.size());
+    std::vector<Dsv4CheckpointReadStats> shard_stats(shard_tasks.size());
     std::atomic<std::size_t> next_shard{};
     const auto worker = [&] {
         while (true) {
@@ -426,7 +433,8 @@ ValidationResult Dsv4ResidentWeightStore::stage(
                 auto loaded = checkpoint.read_into(
                     task.tensor->name,
                     {arena_ + task.destination_offset,
-                     static_cast<std::size_t>(task.tensor->source_bytes)});
+                     static_cast<std::size_t>(task.tensor->source_bytes)},
+                    &shard_stats[shard]);
                 if (!loaded.ok()) {
                     move_errors(shard_result, std::move(loaded.errors));
                     break;
@@ -450,9 +458,13 @@ ValidationResult Dsv4ResidentWeightStore::stage(
     }
     if (!result.ok()) return result;
 
-    const auto after = checkpoint.stats();
-    if (after.bytes - before.bytes != arena_bytes_ ||
-        after.calls - before.calls != tensors.size()) {
+    Dsv4CheckpointReadStats stage_reads;
+    for (const auto& shard : shard_stats) {
+        stage_reads.calls += shard.calls;
+        stage_reads.bytes += shard.bytes;
+        stage_reads.nanoseconds += shard.nanoseconds;
+    }
+    if (stage_reads.bytes != arena_bytes_ || stage_reads.calls != tensors.size()) {
         result.errors.emplace_back("resident staging read accounting mismatch");
         return result;
     }

@@ -64,5 +64,6 @@ variance. Artifacts are under
 The exact first-boundary correctness gate passes, and short-request behavior is
 token-identical in the single pair. This does not establish a throughput win or
 validate practical 32k/200k/1m ingestion. Production-scale batched prefill and
-a three-repetition performance matrix remain follow-up work documented in
+a three-repetition performance matrix remain follow-up work tracked in
+[issue #2](https://github.com/ro99/strata/issues/2) and documented in
 [`issues/production-scale-batched-prefill.md`](../issues/production-scale-batched-prefill.md).

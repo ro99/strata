@@ -1,7 +1,6 @@
 # Issue draft: production-scale batched prefill for DeepSeek
 
-GitHub issue creation is pending repository authentication in the development
-environment (`gh` is not installed and no GitHub write credential is available).
+Tracked upstream as [issue #2](https://github.com/ro99/strata/issues/2).
 
 ## Title
 

@@ -2,6 +2,7 @@
 
 #include "strata/deepseek_ops.hpp"
 #include "strata/glm_ops.hpp"
+#include "strata/sampling.hpp"
 #include "strata/tokenizer.hpp"
 #include "strata/worker_pool.hpp"
 
@@ -22,6 +23,7 @@
 #include <numbers>
 #include <numeric>
 #include <span>
+#include <random>
 #include <thread>
 #include <unordered_map>
 
@@ -696,6 +698,7 @@ struct DeepSeekV4Runtime::Impl {
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
     std::ofstream route_trace;
+    std::mt19937_64 sampler;
     bool initialized{};
 
     [[nodiscard]] std::size_t layer_device(std::uint32_t layer) const {
@@ -1520,7 +1523,6 @@ ValidationResult DeepSeekV4Runtime::Impl::expert(
     if (!result.ok()) return result;
     for (auto& value : activated) {
         value *= routed_coefficient;
-        value *= routed_coefficient;
     }
     round_bf16(activated);
     return linear(slot, prefix + "w2", kHidden, kExpertIntermediate,
@@ -1913,8 +1915,8 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
         result.errors = std::move(validation.errors);
         return result;
     }
-    result.value = static_cast<std::uint32_t>(
-        std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
+    result.value = sample_logits_gumbel(
+        logits, config.sampling_temperature, sampler);
     if (config.enable_logit_trace) {
         record_logits(position, token, result.value, logits);
     }
@@ -1939,6 +1941,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (!std::isfinite(config.vram_cache_fraction) ||
         config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
         result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
+        return result;
+    }
+    if (!std::isfinite(config.sampling_temperature) ||
+        config.sampling_temperature < 0.0 || config.sampling_temperature > 10.0) {
+        result.errors.emplace_back(
+            "DeepSeek sampling temperature must be within [0, 10]");
         return result;
     }
     const auto model_context =
@@ -2040,6 +2048,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
         }
     }
     impl_->config = config;
+    impl_->sampler.seed(config.sampling_seed);
     impl_->memory = admission.plan;
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->tokenizer = std::move(tokenizer.value);
@@ -2164,8 +2173,9 @@ ValidationResult DeepSeekV4Runtime::initialize(
     return result;
 }
 
-Dsv4GenerationResult DeepSeekV4Runtime::generate(
-    std::string_view prompt, std::uint32_t maximum_new_tokens) {
+Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
+    std::string_view prompt, std::uint32_t maximum_new_tokens,
+    const TokenStreamCallback& on_token) {
     Dsv4GenerationResult result;
     if (!impl_->initialized) {
         result.errors.emplace_back("DeepSeek runtime is not initialized");
@@ -2221,7 +2231,15 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     const auto device_moe_after_prefill = impl_->device_moe_stats;
     const auto graph_after_prefill = impl_->graph_stats;
     constexpr std::uint32_t stop_token = 1U;
-    if (next.value != stop_token) result.generated_token_ids.push_back(next.value);
+    if (next.value != stop_token) {
+        result.generated_token_ids.push_back(next.value);
+        const auto piece = impl_->tokenizer.decode_token(next.value);
+        if (!piece.ok()) {
+            result.errors = std::move(piece.errors);
+            return result;
+        }
+        if (on_token) on_token(next.value, piece.value);
+    }
     std::uint32_t position = static_cast<std::uint32_t>(
         result.prompt_token_ids.size());
     std::uint64_t decode_steps = 0U;
@@ -2234,7 +2252,15 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
             return result;
         }
         ++decode_steps;
-        if (next.value != stop_token) result.generated_token_ids.push_back(next.value);
+        if (next.value != stop_token) {
+            result.generated_token_ids.push_back(next.value);
+            const auto piece = impl_->tokenizer.decode_token(next.value);
+            if (!piece.ok()) {
+                result.errors = std::move(piece.errors);
+                return result;
+            }
+            if (on_token) on_token(next.value, piece.value);
+        }
     }
     result.metrics.decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - decode_started).count();
@@ -2303,6 +2329,11 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
         }
     }
     return result;
+}
+
+Dsv4GenerationResult DeepSeekV4Runtime::generate(
+    std::string_view prompt, std::uint32_t maximum_new_tokens) {
+    return generate_stream(prompt, maximum_new_tokens, {});
 }
 
 const Dsv4MemoryPlan& DeepSeekV4Runtime::memory_plan() const noexcept {

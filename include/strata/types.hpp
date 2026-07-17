@@ -7,6 +7,8 @@
 
 namespace strata {
 
+using TokenStreamCallback = std::function<void(std::uint32_t, std::string_view)>;
+
 inline constexpr std::uint32_t kMinimumQuantBits = 4;
 
 enum class Tier : std::uint8_t {

@@ -113,8 +113,8 @@ private:
 };
 
 // One exact DeepSeek expert projection triplet. The weight objects must remain
-// alive until the matching collect call completes. Routed coefficients are
-// applied twice; the optional shared expert must use coefficient 1.0.
+// alive until the matching collect call completes. Each routed coefficient is
+// applied once before w2; the optional shared expert must use coefficient 1.0.
 struct CudaDeepSeekMoeExpert {
     const CudaWeight* w1{};
     const CudaWeight* w3{};

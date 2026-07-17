@@ -4,8 +4,10 @@
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/deepseek_diagnostics.hpp"
+#include "strata/types.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,6 +24,8 @@ struct Dsv4RuntimeConfig {
     std::uint32_t host_attention_threads{28U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
+    double sampling_temperature{};
+    std::uint64_t sampling_seed{33'377'335U};
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
     bool enable_device_moe{true};
@@ -135,6 +139,9 @@ public:
         const std::string& model_directory, const Dsv4RuntimeConfig& config);
     [[nodiscard]] Dsv4GenerationResult generate(
         std::string_view prompt, std::uint32_t maximum_new_tokens);
+    [[nodiscard]] Dsv4GenerationResult generate_stream(
+        std::string_view prompt, std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token);
     [[nodiscard]] const Dsv4MemoryPlan& memory_plan() const noexcept;
 
 private:

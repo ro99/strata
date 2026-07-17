@@ -108,6 +108,16 @@ caches are host-resident and lazily committed.
 
 ## Resident smoke evidence
 
+The initial executor incorrectly applied each routed expert coefficient twice
+before the down projection. The target inference code applies it once. This
+distorted every routed MoE layer and caused repetitive multilingual output even
+though the tokenizer and cache paths were correct. The host executor, CUDA MoE
+kernel, and CUDA reference fixture now all apply the coefficient once.
+
+Interactive chat also follows the checkpoint generation configuration with
+seeded Gumbel-max sampling at temperature 1.0. Exact runtime benchmarks remain
+greedy unless sampling is explicitly configured.
+
 The reusable smoke completed in tmux session `strata-deepseek-v4-smoke` on
 2026-07-15 with prompt `Hi`, five prompt tokens, two emitted tokens, and one
 decode forward. It produced `You are` and a complete 258-row route trace (six

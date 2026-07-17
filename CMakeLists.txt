@@ -46,6 +46,7 @@ add_library(strata_core STATIC
     src/trace.cpp
     src/route_predictor.cpp
     src/residency.cpp
+    src/sampling.cpp
     src/simulator.cpp
     kernels/cpu/q4_reference.cpp
     kernels/cpu/glm_int4.cpp
@@ -90,6 +91,9 @@ target_link_libraries(strata-run PRIVATE strata_core)
 add_executable(strata-deepseek-run apps/strata_deepseek_run.cpp)
 target_link_libraries(strata-deepseek-run PRIVATE strata_core)
 
+add_executable(strata-chat apps/strata_chat.cpp)
+target_link_libraries(strata-chat PRIVATE strata_core)
+
 add_executable(strata-host-expert-probe apps/strata_host_expert_probe.cpp)
 target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 
@@ -122,6 +126,7 @@ if(BUILD_TESTING)
         tests/test_trace.cpp
         tests/test_predictor.cpp
         tests/test_residency.cpp
+        tests/test_sampling.cpp
         tests/test_safetensors.cpp
         tests/test_tokenizer.cpp
     )
@@ -144,7 +149,7 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run
+install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat
         strata-host-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)

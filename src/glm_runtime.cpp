@@ -2,6 +2,7 @@
 
 #include "strata/glm_ops.hpp"
 #include "strata/glm_int4.hpp"
+#include "strata/sampling.hpp"
 #include "strata/tokenizer.hpp"
 #include "strata/worker_pool.hpp"
 
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <unordered_map>
 
 namespace strata {
@@ -518,6 +520,7 @@ struct Glm52Runtime::Impl {
     std::unordered_map<std::uint32_t, std::vector<float>> embedding_rows;
     std::vector<LayerKv> kv{kLayers};
     std::ofstream route_trace;
+    std::mt19937_64 sampler;
     bool initialized{};
     std::uint32_t last_second_token{};
     float last_logit_margin{};
@@ -638,7 +641,7 @@ struct Glm52Runtime::Impl {
                 auto bias = host_tensor(mlp + "gate.e_score_correction_bias", kExperts);
                 if (!bias.ok() && result.ok()) result.errors = std::move(bias.errors);
             }
-            if (config.verbose && result.ok()) {
+            if ((config.verbose || config.load_progress) && result.ok()) {
                 std::cerr << "[load] resident spine layer " << (layer + 1U) << '/'
                           << kLayers << '\n';
             }
@@ -1368,7 +1371,8 @@ struct Glm52Runtime::Impl {
                 second = token;
             }
         }
-        result.value = best;
+        result.value = sample_logits_gumbel(
+            logits, config.sampling_temperature, sampler);
         last_second_token = second;
         last_logit_margin = logits[best] - logits[second];
         return result;
@@ -1399,6 +1403,11 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     if (!std::isfinite(config.vram_cache_fraction) ||
         config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
         result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
+        return result;
+    }
+    if (!std::isfinite(config.sampling_temperature) ||
+        config.sampling_temperature < 0.0 || config.sampling_temperature > 10.0) {
+        result.errors.emplace_back("GLM sampling temperature must be within [0, 10]");
         return result;
     }
     if (config.maximum_context_tokens == 0U ||
@@ -1466,6 +1475,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     }
 
     impl_->config = config;
+    impl_->sampler.seed(config.sampling_seed);
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
@@ -1477,7 +1487,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         impl_->host_workers =
             std::make_unique<HostWorkerPool>(config.host_worker_threads);
     }
-    if (config.verbose) {
+    if (config.verbose || config.load_progress) {
         for (std::size_t slot = 0; slot < impl_->devices.size(); ++slot) {
             std::cerr << "[hardware] cuda=" << impl_->devices[slot]
                       << " vram_cache_bytes=" << capacities[slot] << '\n';
@@ -1489,8 +1499,9 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     return result;
 }
 
-Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
-                                             std::uint32_t maximum_new_tokens) {
+Glm52GenerationResult Glm52Runtime::generate_stream(
+    std::string_view prompt, std::uint32_t maximum_new_tokens,
+    const TokenStreamCallback& on_token) {
     Glm52GenerationResult result;
     if (!impl_->initialized) {
         result.errors.emplace_back("GLM runtime is not initialized");
@@ -1543,7 +1554,15 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
     auto is_stop = [&stop_ids](std::uint32_t token) {
         return std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end();
     };
-    if (!is_stop(next.value)) result.generated_token_ids.push_back(next.value);
+    if (!is_stop(next.value)) {
+        result.generated_token_ids.push_back(next.value);
+        const auto piece = impl_->tokenizer.decode_token(next.value);
+        if (!piece.ok()) {
+            result.errors = std::move(piece.errors);
+            return result;
+        }
+        if (on_token) on_token(next.value, piece.value);
+    }
     const auto decode_start = std::chrono::steady_clock::now();
     while (!is_stop(next.value) && result.generated_token_ids.size() < maximum_new_tokens) {
         const std::array<std::uint32_t, 1> input{next.value};
@@ -1569,7 +1588,15 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
                       << " second=" << impl_->last_second_token
                       << " margin=" << impl_->last_logit_margin << '\n';
         }
-        if (!is_stop(next.value)) result.generated_token_ids.push_back(next.value);
+        if (!is_stop(next.value)) {
+            result.generated_token_ids.push_back(next.value);
+            const auto piece = impl_->tokenizer.decode_token(next.value);
+            if (!piece.ok()) {
+                result.errors = std::move(piece.errors);
+                return result;
+            }
+            if (on_token) on_token(next.value, piece.value);
+        }
     }
     result.metrics.decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - decode_start).count();
@@ -1611,6 +1638,11 @@ Glm52GenerationResult Glm52Runtime::generate(std::string_view prompt,
         }
     }
     return result;
+}
+
+Glm52GenerationResult Glm52Runtime::generate(
+    std::string_view prompt, std::uint32_t maximum_new_tokens) {
+    return generate_stream(prompt, maximum_new_tokens, {});
 }
 
 }  // namespace strata

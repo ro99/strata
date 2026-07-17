@@ -360,7 +360,6 @@ __global__ void deepseek_fp4_gate_up_kernel(
             __float_as_uint(limited_gate) >> 16U);
         float activated = bf16_silu[gate_bits] * limited_up;
         activated *= batch.coefficients[expert];
-        activated *= batch.coefficients[expert];
         activations[static_cast<std::uint64_t>(expert) * intermediate + output_row] =
             bf16_round(activated);
     }

@@ -134,7 +134,6 @@ std::vector<float> reference_expert(
     for (auto& value : activated) {
         if (routed) {
             value *= coefficient;
-            value *= coefficient;
         }
         value = round_bf16(value);
     }

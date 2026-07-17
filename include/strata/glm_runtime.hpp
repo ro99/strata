@@ -1,8 +1,10 @@
 #pragma once
 
 #include "strata/checkpoint.hpp"
+#include "strata/types.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -15,10 +17,13 @@ struct Glm52RuntimeConfig {
     double vram_cache_fraction{0.85};
     std::uint32_t maximum_context_tokens{256};
     bool verbose{true};
+    bool load_progress{};
     bool diagnostic_trace{};
     bool detailed_timing{};
     bool host_cold_experts{};
     std::uint32_t host_worker_threads{36};
+    double sampling_temperature{};
+    std::uint64_t sampling_seed{33'377'335U};
     std::string route_trace_path;
     std::uint64_t request_id{};
 };
@@ -98,6 +103,9 @@ public:
         const std::string& model_directory, const Glm52RuntimeConfig& config = {});
     [[nodiscard]] Glm52GenerationResult generate(
         std::string_view prompt, std::uint32_t maximum_new_tokens);
+    [[nodiscard]] Glm52GenerationResult generate_stream(
+        std::string_view prompt, std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token);
 
 private:
     struct Impl;

@@ -6,6 +6,7 @@ model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-observability"}
 capture_telemetry=${CAPTURE_TELEMETRY:-1}
 runner=${RUNNER:-"${repo_root}/build/strata-deepseek-run"}
+maximum_context_tokens=${MAX_CONTEXT_TOKENS:-2048}
 mkdir -p "${result_dir}"
 
 telemetry_pid=
@@ -39,7 +40,7 @@ git -C "${repo_root}" diff --binary >"${result_dir}/candidate.diff"
     --devices 0,1,2 \
     --host-memory 216G \
     --vram-fraction 0.85 \
-    --max-context 2048 \
+    --max-context "${maximum_context_tokens}" \
     --max-new 128 \
     --prompt Hello \
     --detailed-timing \

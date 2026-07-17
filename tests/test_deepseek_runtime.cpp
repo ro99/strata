@@ -56,6 +56,26 @@ TEST_CASE("DeepSeek runtime rejects excessive host attention workers") {
                         }));
 }
 
+TEST_CASE("DeepSeek runtime accepts user context ceilings through the model limit") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.maximum_context_tokens = 1'048'576U;
+    const auto accepted = runtime.initialize("not-used", config);
+    REQUIRE(!accepted.ok());
+    REQUIRE(std::none_of(accepted.errors.begin(), accepted.errors.end(),
+                         [](const std::string& error) {
+                             return error.find("context") != std::string::npos;
+                         }));
+
+    config.maximum_context_tokens = 1'048'577U;
+    const auto rejected = runtime.initialize("not-used", config);
+    REQUIRE(!rejected.ok());
+    REQUIRE(std::any_of(rejected.errors.begin(), rejected.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("model limit") != std::string::npos;
+                        }));
+}
+
 TEST_CASE("DeepSeek runtime rejects unverified DSpark execution explicitly") {
     strata::DeepSeekV4Runtime runtime;
     strata::Dsv4RuntimeConfig config;

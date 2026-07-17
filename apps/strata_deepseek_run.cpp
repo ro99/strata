@@ -340,6 +340,14 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.attention_query_nanoseconds)
            << ",\"attention_kv_seconds\":"
            << seconds(stats.attention_kv_nanoseconds)
+           << ",\"attention_index_seconds\":"
+           << seconds(stats.attention_index_nanoseconds)
+           << ",\"attention_index_queries\":"
+           << stats.attention_index_queries
+           << ",\"attention_index_candidates\":"
+           << stats.attention_index_candidates
+           << ",\"attention_index_selected\":"
+           << stats.attention_index_selected
            << ",\"attention_score_seconds\":"
            << seconds(stats.attention_score_nanoseconds)
            << ",\"attention_output_seconds\":"
@@ -376,6 +384,7 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << ",\"routed_expert_host_bytes\":" << plan.routed_expert_host_bytes
            << ",\"host_parameter_bytes\":" << plan.host_parameter_bytes
            << ",\"kv_state_bytes\":" << plan.kv_state_bytes
+           << ",\"index_state_bytes\":" << plan.index_state_bytes
            << ",\"host_workspace_bytes\":" << plan.host_workspace_bytes
            << ",\"total_vram_budget_bytes\":" << plan.total_vram_budget_bytes
            << ",\"resident_spine_vram_bytes\":" << plan.resident_spine_vram_bytes
@@ -527,7 +536,8 @@ int main(int argc, char** argv) {
     if (!options.quiet) {
         std::cerr
             << "[contract] exact DeepSeek-V4-Flash base-model greedy decode\n"
-            << "[contract] FP4/FP8 checkpoint semantics unchanged; context <=2048\n"
+            << "[contract] FP4/FP8 checkpoint semantics unchanged; "
+               "user-sized context <=1048576\n"
             << "[contract] experts and embedding resident in RAM; decode NVMe bytes = 0\n"
             << "[contract] optional DSpark proposals disabled, never approximated\n";
     }

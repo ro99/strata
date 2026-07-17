@@ -21,6 +21,11 @@ std::uint16_t reference_bf16(float value) {
     return static_cast<std::uint16_t>(bits >> 16U);
 }
 
+float bf16_value(float value) {
+    return std::bit_cast<float>(
+        static_cast<std::uint32_t>(reference_bf16(value)) << 16U);
+}
+
 }  // namespace
 
 TEST_CASE("DeepSeek native FP4 fixture matches target checkpoint bytes") {
@@ -41,6 +46,98 @@ TEST_CASE("DeepSeek native FP4 fixture matches target checkpoint bytes") {
         output, input, weights, scales, 1U, 32U);
     REQUIRE(result.ok());
     REQUIRE_NEAR(output[0], 0.046875F, 1.0e-7F);
+}
+
+TEST_CASE("DeepSeek indexer Hadamard and FP4 activation path matches target semantics") {
+    std::array<float, 128> rotated{};
+    rotated[0] = 1.0F;
+    const auto rotation = strata::dsv4_hadamard_rotate_f32(rotated);
+    REQUIRE(rotation.ok());
+    const float expected_rotation = bf16_value(1.0F / std::sqrt(128.0F));
+    for (const float value : rotated) {
+        REQUIRE_NEAR(value, expected_rotation, 0.0F);
+    }
+
+    std::array<float, 32> quantized{};
+    quantized[0] = 0.6F;
+    quantized[1] = -1.4F;
+    quantized[2] = 2.1F;
+    quantized[3] = 6.0F;
+    quantized[4] = 0.75F;
+    quantized[5] = 1.75F;
+    quantized[6] = 3.5F;
+    const auto simulation = strata::dsv4_fp4_e2m1_simulate_f32(quantized);
+    REQUIRE(simulation.ok());
+    REQUIRE_NEAR(quantized[0], 0.5F, 0.0F);
+    REQUIRE_NEAR(quantized[1], -1.5F, 0.0F);
+    REQUIRE_NEAR(quantized[2], 2.0F, 0.0F);
+    REQUIRE_NEAR(quantized[3], 6.0F, 0.0F);
+    REQUIRE_NEAR(quantized[4], 1.0F, 0.0F);
+    REQUIRE_NEAR(quantized[5], 2.0F, 0.0F);
+    REQUIRE_NEAR(quantized[6], 4.0F, 0.0F);
+
+    REQUIRE(!strata::dsv4_hadamard_rotate_f32(
+                 std::span<float>(rotated).first(127U)).ok());
+    REQUIRE(!strata::dsv4_fp4_e2m1_simulate_f32(
+                 std::span<float>(quantized).first(31U)).ok());
+}
+
+TEST_CASE("DeepSeek learned index selects the scalar-oracle top 512 at the boundary") {
+    constexpr std::uint32_t heads = 3U;
+    constexpr std::uint32_t head_dim = 4U;
+    constexpr std::uint32_t positions = 513U;
+    constexpr std::uint32_t top_k = 512U;
+    const std::array<float, heads * head_dim> queries{
+        1.0F, -0.5F, 0.25F, 2.0F,
+        -1.0F, 0.75F, 0.5F, -0.25F,
+        0.5F, 1.0F, -1.5F, 0.25F};
+    const std::array<float, heads> weights{0.5F, -0.25F, 1.5F};
+    std::vector<float> keys(static_cast<std::size_t>(positions) * head_dim);
+    for (std::uint32_t row = 0U; row < positions; ++row) {
+        for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+            keys[static_cast<std::size_t>(row) * head_dim + dimension] =
+                bf16_value(static_cast<float>(
+                    static_cast<int>((row * 17U + dimension * 11U) % 31U) - 15) /
+                    8.0F);
+        }
+    }
+    std::vector<float> expected(positions);
+    for (std::uint32_t row = 0U; row < positions; ++row) {
+        float score = 0.0F;
+        for (std::uint32_t head = 0U; head < heads; ++head) {
+            float dot = 0.0F;
+            for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+                dot += queries[head * head_dim + dimension] *
+                       keys[row * head_dim + dimension];
+            }
+            score += bf16_value(weights[head] *
+                                std::max(0.0F, bf16_value(dot)));
+        }
+        expected[row] = bf16_value(score);
+    }
+    std::vector<float> actual(positions);
+    REQUIRE(strata::dsv4_index_scores_f32(
+                actual, queries, keys, weights, heads, head_dim).ok());
+    REQUIRE(actual == expected);
+
+    std::vector<std::uint32_t> reference(positions);
+    for (std::uint32_t index = 0U; index < positions; ++index) {
+        reference[index] = index;
+    }
+    std::partial_sort(reference.begin(), reference.begin() + top_k,
+                      reference.end(), [&expected](auto first, auto second) {
+                          if (expected[first] != expected[second]) {
+                              return expected[first] > expected[second];
+                          }
+                          return first < second;
+                      });
+    reference.resize(top_k);
+    const auto selected = strata::dsv4_index_topk_f32(actual, top_k);
+    REQUIRE(selected.ok());
+    REQUIRE(selected.positions == reference);
+    REQUIRE(std::find(selected.positions.begin(), selected.positions.end(),
+                      reference.back()) != selected.positions.end());
+    REQUIRE(!strata::dsv4_index_topk_f32(actual, positions + 1U).ok());
 }
 
 TEST_CASE("DeepSeek native FP8 fixture matches target checkpoint bytes") {

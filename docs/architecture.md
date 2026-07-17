@@ -175,11 +175,16 @@ The `deepseek_v4` adapter validates and, for the base model, executes:
   scaling, and clipped SwiGLU semantics;
 - the declared three DSpark stages, Markov head, and confidence metadata.
 
-The current exact admission ceiling is 2,048 tokens, where all compressed index
-positions fit the declared top-512 set. DSpark execution is a gated next stage:
-its five provisional rows will be exposed to the ticket scheduler only after
-exact target verification and KV rollback fixtures exist. The runtime currently
-rejects enabling DSpark rather than silently approximating it.
+DeepSeek context admission accepts any positive logical ceiling through the
+model's declared 1,048,576-token limit. Compressed KV and sparse-index caches
+use lazy host pages, while ratio-4 layers maintain the learned index state and
+select the declared top 512 compressed positions once the history exceeds that
+set. The implementation and boundary fixtures do not imply practical or
+full-model validation at 32k/200k/1m prompt lengths; batched prefill remains a
+separate gate. DSpark execution is a gated next stage: its five provisional
+rows will be exposed to the ticket scheduler only after exact target
+verification and KV rollback fixtures exist. The runtime currently rejects
+enabling DSpark rather than silently approximating it.
 
 ## Backend boundary
 

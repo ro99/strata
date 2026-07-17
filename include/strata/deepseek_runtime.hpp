@@ -62,6 +62,10 @@ struct Dsv4GraphStats {
     std::uint64_t attention_nanoseconds{};
     std::uint64_t attention_query_nanoseconds{};
     std::uint64_t attention_kv_nanoseconds{};
+    std::uint64_t attention_index_nanoseconds{};
+    std::uint64_t attention_index_queries{};
+    std::uint64_t attention_index_candidates{};
+    std::uint64_t attention_index_selected{};
     std::uint64_t attention_score_nanoseconds{};
     std::uint64_t attention_output_nanoseconds{};
     std::uint64_t moe_nanoseconds{};

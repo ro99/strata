@@ -39,10 +39,38 @@ struct Dsv4MhcMixResult {
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
+struct Dsv4IndexSelectionResult {
+    std::vector<std::uint32_t> positions;
+    std::vector<std::string> errors;
+
+    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
+};
+
 [[nodiscard]] float dsv4_softplus_f32(float value) noexcept;
 [[nodiscard]] float dsv4_fp4_e2m1_f32(std::uint8_t nibble) noexcept;
 [[nodiscard]] float dsv4_fp8_e4m3_f32(std::uint8_t encoded) noexcept;
 [[nodiscard]] float dsv4_fp8_e8m0_scale_f32(std::uint8_t encoded) noexcept;
+
+// Target indexer activation path: normalized Hadamard rotation followed by
+// in-place FP4 E2M1/per-32 E8M0 quantize-dequantize simulation in BF16.
+[[nodiscard]] ValidationResult dsv4_hadamard_rotate_f32(
+    std::span<float> values);
+[[nodiscard]] ValidationResult dsv4_fp4_e2m1_simulate_f32(
+    std::span<float> values, std::uint32_t group_size = 32U);
+
+// Target learned-index scoring after Q/K FP4 simulation. Queries are laid out
+// [heads, head_dim], keys [positions, head_dim], and weights [heads]. The
+// BF16 boundaries mirror the bundled target implementation's einsum,
+// weighted-ReLU reduction, and final score tensor.
+[[nodiscard]] ValidationResult dsv4_index_scores_f32(
+    std::span<float> scores, std::span<const float> queries,
+    std::span<const float> keys, std::span<const float> weights,
+    std::uint32_t heads, std::uint32_t head_dim);
+
+// Descending target top-k membership with a deterministic lower-position tie
+// break for reproducible exact-mode diagnostics.
+[[nodiscard]] Dsv4IndexSelectionResult dsv4_index_topk_f32(
+    std::span<const float> scores, std::uint32_t top_k);
 
 // Dequantizes native FP8 block-128 weights into the exact BF16 representation
 // used by the target wo_a projection. Each E8M0 scale covers one 128 x 128

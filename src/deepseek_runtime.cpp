@@ -18,7 +18,9 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <numbers>
+#include <numeric>
 #include <span>
 #include <thread>
 #include <unordered_map>
@@ -36,6 +38,9 @@ constexpr std::uint32_t kQueryRank = 1024U;
 constexpr std::uint32_t kOutputRank = 1024U;
 constexpr std::uint32_t kOutputGroups = 8U;
 constexpr std::uint32_t kWindow = 128U;
+constexpr std::uint32_t kIndexHeads = 64U;
+constexpr std::uint32_t kIndexHeadDim = 128U;
+constexpr std::uint32_t kIndexTopK = 512U;
 constexpr std::uint32_t kExperts = 256U;
 constexpr std::uint32_t kTopK = 6U;
 constexpr std::uint32_t kExpertIntermediate = 2048U;
@@ -315,6 +320,10 @@ void apply_rope(std::span<float> values, std::uint64_t position,
         after.attention_nanoseconds - before.attention_nanoseconds,
         after.attention_query_nanoseconds - before.attention_query_nanoseconds,
         after.attention_kv_nanoseconds - before.attention_kv_nanoseconds,
+        after.attention_index_nanoseconds - before.attention_index_nanoseconds,
+        after.attention_index_queries - before.attention_index_queries,
+        after.attention_index_candidates - before.attention_index_candidates,
+        after.attention_index_selected - before.attention_index_selected,
         after.attention_score_nanoseconds - before.attention_score_nanoseconds,
         after.attention_output_nanoseconds - before.attention_output_nanoseconds,
         after.moe_nanoseconds - before.moe_nanoseconds,
@@ -599,17 +608,69 @@ private:
     std::atomic<std::uint64_t> lease_releases_{};
 };
 
+class PagedFloatRows {
+public:
+    [[nodiscard]] bool configure(std::size_t rows, std::size_t columns) {
+        rows_ = rows;
+        columns_ = columns;
+        constexpr std::size_t target_page_bytes = 256U << 10U;
+        page_rows_ = std::max<std::size_t>(
+            1U, target_page_bytes / std::max<std::size_t>(sizeof(float),
+                                                          columns_ * sizeof(float)));
+        try {
+            pages_.clear();
+            pages_.resize((rows_ + page_rows_ - 1U) / page_rows_);
+        } catch (const std::bad_alloc&) {
+            pages_.clear();
+            rows_ = 0U;
+            columns_ = 0U;
+            page_rows_ = 0U;
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::span<float> writable_row(std::size_t row) {
+        if (row >= rows_ || columns_ == 0U || page_rows_ == 0U) return {};
+        const auto page = row / page_rows_;
+        if (pages_[page] == nullptr) {
+            const auto rows_in_page = std::min(
+                page_rows_, rows_ - page * page_rows_);
+            pages_[page].reset(
+                new (std::nothrow) float[rows_in_page * columns_]);
+            if (pages_[page] == nullptr) return {};
+        }
+        return {pages_[page].get() + (row % page_rows_) * columns_, columns_};
+    }
+
+    [[nodiscard]] std::span<const float> row(std::size_t row) const noexcept {
+        if (row >= rows_ || columns_ == 0U || page_rows_ == 0U) return {};
+        const auto page = row / page_rows_;
+        if (pages_[page] == nullptr) return {};
+        return {pages_[page].get() + (row % page_rows_) * columns_, columns_};
+    }
+
+private:
+    std::size_t rows_{};
+    std::size_t columns_{};
+    std::size_t page_rows_{};
+    std::vector<std::unique_ptr<float[]>> pages_;
+};
+
 struct CompressorState {
     std::uint32_t ratio{};
     std::uint32_t coefficient{};
+    std::uint32_t head_dim{};
+    bool rotate_fp4{};
     std::vector<float> values;
     std::vector<float> scores;
-    std::vector<float> compressed;
+    PagedFloatRows compressed;
 };
 
 struct AttentionState {
     std::vector<float> sliding;
     CompressorState compressor;
+    CompressorState indexer_compressor;
     std::vector<float> frequencies;
 };
 
@@ -704,7 +765,7 @@ struct DeepSeekV4Runtime::Impl {
     }
 
     ValidationResult warmup();
-    ValidationResult reset_sequence();
+    ValidationResult reset_sequence(std::uint32_t active_context_tokens);
     void reset_diagnostics();
     void record_layer_hash(std::uint32_t position, std::uint32_t token,
                            std::uint32_t layer, std::span<const float> hidden);
@@ -713,6 +774,17 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult embed(std::uint32_t token, std::span<float> output);
     ValidationResult compressor(std::uint32_t layer, std::span<const float> input,
                                 std::uint32_t position);
+    ValidationResult compress_state(std::uint32_t layer,
+                                    CompressorState& state,
+                                    const std::string& prefix,
+                                    std::span<const float> input,
+                                    std::uint32_t position,
+                                    std::span<const float> frequencies);
+    ValidationResult index_positions(std::uint32_t layer,
+                                     std::span<const float> input,
+                                     std::span<const float> query_rank,
+                                     std::uint32_t position,
+                                     std::vector<std::uint32_t>& selected);
     ValidationResult attention(std::uint32_t layer, std::span<const float> input,
                                std::uint32_t position, std::span<float> output);
     ValidationResult expert(std::uint32_t layer, std::uint32_t expert_id,
@@ -949,7 +1021,8 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
     return result;
 }
 
-ValidationResult DeepSeekV4Runtime::Impl::reset_sequence() {
+ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
+    std::uint32_t active_context_tokens) {
     ValidationResult result;
     const auto ratios = deepseek_v4_flash_dspark_spec().deepseek_v4.compression_ratios;
     for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
@@ -961,17 +1034,46 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence() {
         compressor_state.ratio = ratios[layer];
         if (compressor_state.ratio == 0U) continue;
         compressor_state.coefficient = compressor_state.ratio == 4U ? 2U : 1U;
+        compressor_state.head_dim = kHeadDim;
         const auto rows = static_cast<std::size_t>(compressor_state.coefficient) *
                           compressor_state.ratio;
         const auto dimensions = static_cast<std::size_t>(
-            compressor_state.coefficient) * kHeadDim;
+            compressor_state.coefficient) * compressor_state.head_dim;
         compressor_state.values.assign(rows * dimensions, 0.0F);
         compressor_state.scores.assign(
             rows * dimensions, -std::numeric_limits<float>::infinity());
         const auto compressed_rows =
             (static_cast<std::size_t>(config.maximum_context_tokens) +
              compressor_state.ratio - 1U) / compressor_state.ratio;
-        compressor_state.compressed.assign(compressed_rows * kHeadDim, 0.0F);
+        if (!compressor_state.compressed.configure(compressed_rows,
+                                                   compressor_state.head_dim)) {
+            result.errors.emplace_back(
+                "cannot reserve paged DeepSeek compressed KV metadata");
+            return result;
+        }
+        state.indexer_compressor = {};
+        if (compressor_state.ratio == 4U &&
+            active_context_tokens > kIndexTopK * compressor_state.ratio) {
+            auto& indexer = state.indexer_compressor;
+            indexer.ratio = compressor_state.ratio;
+            indexer.coefficient = 2U;
+            indexer.head_dim = kIndexHeadDim;
+            indexer.rotate_fp4 = true;
+            const auto indexer_rows = static_cast<std::size_t>(indexer.coefficient) *
+                                      indexer.ratio;
+            const auto indexer_dimensions =
+                static_cast<std::size_t>(indexer.coefficient) * indexer.head_dim;
+            indexer.values.assign(indexer_rows * indexer_dimensions, 0.0F);
+            indexer.scores.assign(
+                indexer_rows * indexer_dimensions,
+                -std::numeric_limits<float>::infinity());
+            if (!indexer.compressed.configure(compressed_rows,
+                                              indexer.head_dim)) {
+                result.errors.emplace_back(
+                    "cannot reserve paged DeepSeek sparse-index metadata");
+                return result;
+            }
+        }
     }
     return result;
 }
@@ -1005,11 +1107,19 @@ ValidationResult DeepSeekV4Runtime::Impl::embed(std::uint32_t token,
 
 ValidationResult DeepSeekV4Runtime::Impl::compressor(
     std::uint32_t layer, std::span<const float> input, std::uint32_t position) {
+    return compress_state(layer, attention_state[layer].compressor,
+                          layer_prefix(layer) + "attn.compressor.", input,
+                          position, attention_state[layer].frequencies);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::compress_state(
+    std::uint32_t layer, CompressorState& state, const std::string& prefix,
+    std::span<const float> input, std::uint32_t position,
+    std::span<const float> frequencies) {
     ValidationResult result;
-    auto& state = attention_state[layer].compressor;
     if (state.ratio == 0U) return result;
-    const auto prefix = layer_prefix(layer) + "attn.compressor.";
-    const auto dimensions = static_cast<std::size_t>(state.coefficient) * kHeadDim;
+    const auto dimensions = static_cast<std::size_t>(state.coefficient) *
+                            state.head_dim;
     std::vector<float> values(dimensions);
     std::vector<float> scores(dimensions);
     const auto slot = layer_device(layer);
@@ -1034,8 +1144,8 @@ ValidationResult DeepSeekV4Runtime::Impl::compressor(
     }
     if ((position + 1U) % state.ratio != 0U) return result;
 
-    std::vector<float> pooled(kHeadDim, 0.0F);
-    for (std::uint32_t dimension = 0U; dimension < kHeadDim; ++dimension) {
+    std::vector<float> pooled(state.head_dim, 0.0F);
+    for (std::uint32_t dimension = 0U; dimension < state.head_dim; ++dimension) {
         float maximum = -std::numeric_limits<float>::infinity();
         for (std::uint32_t candidate = 0U;
              candidate < state.coefficient * state.ratio; ++candidate) {
@@ -1043,7 +1153,7 @@ ValidationResult DeepSeekV4Runtime::Impl::compressor(
             if (state.coefficient == 2U) {
                 const auto source_row = candidate < state.ratio ? candidate : candidate;
                 const auto source_dimension = candidate < state.ratio ? dimension :
-                    static_cast<std::uint32_t>(kHeadDim + dimension);
+                    static_cast<std::uint32_t>(state.head_dim + dimension);
                 index = static_cast<std::size_t>(source_row) * dimensions +
                         source_dimension;
             } else {
@@ -1058,7 +1168,7 @@ ValidationResult DeepSeekV4Runtime::Impl::compressor(
             std::size_t index = 0U;
             if (state.coefficient == 2U) {
                 const auto source_dimension = candidate < state.ratio ? dimension :
-                    static_cast<std::uint32_t>(kHeadDim + dimension);
+                    static_cast<std::uint32_t>(state.head_dim + dimension);
                 index = static_cast<std::size_t>(candidate) * dimensions +
                         source_dimension;
             } else {
@@ -1081,14 +1191,117 @@ ValidationResult DeepSeekV4Runtime::Impl::compressor(
     result = norm(pooled, pooled, prefix + "norm.weight");
     if (!result.ok()) return result;
     apply_rope(std::span<float>(pooled).last(kRopeDim),
-               position + 1U - state.ratio, attention_state[layer].frequencies);
+               position + 1U - state.ratio, frequencies);
     round_bf16(pooled);
-    quantize_activation_in_place(std::span<float>(pooled).first(kHeadDim - kRopeDim),
-                                 64U);
+    if (state.rotate_fp4) {
+        result = dsv4_hadamard_rotate_f32(pooled);
+        if (!result.ok()) return result;
+        result = dsv4_fp4_e2m1_simulate_f32(pooled, 32U);
+        if (!result.ok()) return result;
+    } else {
+        quantize_activation_in_place(
+            std::span<float>(pooled).first(state.head_dim - kRopeDim), 64U);
+    }
     const auto compressed_row = position / state.ratio;
-    std::copy(pooled.begin(), pooled.end(),
-              state.compressed.begin() +
-                  static_cast<std::size_t>(compressed_row) * kHeadDim);
+    auto destination = state.compressed.writable_row(compressed_row);
+    if (destination.size() != pooled.size()) {
+        result.errors.emplace_back("DeepSeek compressed cache allocation failed");
+        return result;
+    }
+    std::copy(pooled.begin(), pooled.end(), destination.begin());
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::index_positions(
+    std::uint32_t layer, std::span<const float> input,
+    std::span<const float> query_rank, std::uint32_t position,
+    std::vector<std::uint32_t>& selected) {
+    ValidationResult result;
+    selected.clear();
+    auto& state = attention_state[layer].indexer_compressor;
+    if (state.ratio == 0U) {
+        result.errors.emplace_back(
+            "DeepSeek sparse indexer was not admitted for a long context");
+        return result;
+    }
+    const auto prefix = layer_prefix(layer) + "attn.indexer.";
+    result = compress_state(layer, state, prefix + "compressor.", input,
+                            position, attention_state[layer].frequencies);
+    if (!result.ok()) return result;
+
+    const auto compressed_count = (position + 1U) / state.ratio;
+    if (compressed_count <= kIndexTopK) {
+        selected.resize(compressed_count);
+        std::iota(selected.begin(), selected.end(), 0U);
+        return result;
+    }
+    ++graph_stats.attention_index_queries;
+    graph_stats.attention_index_candidates += compressed_count;
+    graph_stats.attention_index_selected += kIndexTopK;
+
+    const auto slot = layer_device(layer);
+    std::vector<float> queries(
+        static_cast<std::size_t>(kIndexHeads) * kIndexHeadDim);
+    result = linear(slot, prefix + "wq_b", kIndexHeads * kIndexHeadDim,
+                    kQueryRank, query_rank, queries);
+    if (!result.ok()) return result;
+    for (std::uint32_t head = 0U; head < kIndexHeads; ++head) {
+        auto query = std::span<float>(queries).subspan(
+            static_cast<std::size_t>(head) * kIndexHeadDim, kIndexHeadDim);
+        apply_rope(query.last(kRopeDim), position,
+                   attention_state[layer].frequencies);
+        round_bf16(query.last(kRopeDim));
+        result = dsv4_hadamard_rotate_f32(query);
+        if (!result.ok()) return result;
+        result = dsv4_fp4_e2m1_simulate_f32(query, 32U);
+        if (!result.ok()) return result;
+    }
+
+    std::vector<float> index_weights(kIndexHeads);
+    result = linear(slot, prefix + "weights_proj", kIndexHeads, kHidden,
+                    input, index_weights);
+    if (!result.ok()) return result;
+    constexpr float index_scale =
+        1.0F / std::sqrt(static_cast<float>(kIndexHeadDim * kIndexHeads));
+    for (auto& weight : index_weights) weight = round_bf16(weight * index_scale);
+
+    std::vector<float> scores(compressed_count);
+    const auto score_row = [&](std::size_t row) {
+        const auto key = state.compressed.row(row);
+        if (key.size() != kIndexHeadDim) {
+            scores[row] = -std::numeric_limits<float>::infinity();
+            return;
+        }
+        auto destination = std::span<float>(scores).subspan(row, 1U);
+        const auto scored = dsv4_index_scores_f32(
+            destination, queries, key, index_weights, kIndexHeads,
+            kIndexHeadDim);
+        if (!scored.ok()) scores[row] = -std::numeric_limits<float>::infinity();
+    };
+    if (attention_workers != nullptr && attention_workers->size() > 1U) {
+        const auto workers = std::min<std::size_t>(
+            attention_workers->size(), compressed_count);
+        result = attention_workers->parallel_for(
+            workers, [&](std::size_t worker) {
+                const auto begin = compressed_count * worker / workers;
+                const auto end = compressed_count * (worker + 1U) / workers;
+                for (std::size_t row = begin; row < end; ++row) {
+                    score_row(row);
+                }
+            });
+        if (!result.ok()) return result;
+    } else {
+        for (std::size_t row = 0U; row < compressed_count; ++row) {
+            score_row(row);
+        }
+    }
+
+    auto topk = dsv4_index_topk_f32(scores, kIndexTopK);
+    if (!topk.ok()) {
+        append_errors(result, std::move(topk.errors));
+        return result;
+    }
+    selected = std::move(topk.positions);
     return result;
 }
 
@@ -1157,6 +1370,18 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     result = compressor(layer, input, position);
     if (!result.ok()) return result;
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
+    std::vector<std::uint32_t> indexed_positions;
+    const bool use_sparse_indexer =
+        layer_state.compressor.ratio == 4U &&
+        layer_state.indexer_compressor.ratio == 4U;
+    if (use_sparse_indexer) {
+        subphase_started = std::chrono::steady_clock::now();
+        result = index_positions(layer, input, query_rank, position,
+                                 indexed_positions);
+        if (!result.ok()) return result;
+        graph_stats.attention_index_nanoseconds +=
+            elapsed_nanoseconds(subphase_started);
+    }
 
     auto sink = host_tensor(prefix + "attn_sink", kHeads);
     if (!sink.ok()) {
@@ -1167,8 +1392,11 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     const auto window_count = std::min<std::uint32_t>(position + 1U, kWindow);
     const auto ratio = layer_state.compressor.ratio;
     const auto compressed_count = ratio == 0U ? 0U : (position + 1U) / ratio;
+    const auto attended_compressed_count = use_sparse_indexer
+        ? static_cast<std::uint32_t>(indexed_positions.size())
+        : compressed_count;
     const auto score_stride = static_cast<std::size_t>(window_count) +
-                              compressed_count;
+                              attended_compressed_count;
     const auto attend_head = [&](std::uint32_t head,
                                  std::span<float> scores) {
         const auto query = std::span<const float>(queries).subspan(
@@ -1187,10 +1415,11 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
             scores[next_score++] = score;
             maximum = std::max(maximum, score);
         }
-        for (std::uint32_t item = 0U; item < compressed_count; ++item) {
-            const auto key = std::span<const float>(layer_state.compressor.compressed)
-                                 .subspan(static_cast<std::size_t>(item) * kHeadDim,
-                                          kHeadDim);
+        for (std::uint32_t item = 0U; item < attended_compressed_count; ++item) {
+            const auto cache_row = use_sparse_indexer
+                ? indexed_positions[item]
+                : item;
+            const auto key = layer_state.compressor.compressed.row(cache_row);
             double dot = 0.0;
             for (std::uint32_t dimension = 0U; dimension < kHeadDim; ++dimension) {
                 dot += static_cast<double>(query[dimension]) * key[dimension];
@@ -1218,10 +1447,11 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                 destination[dimension] += probability * value[dimension];
             }
         }
-        for (std::uint32_t item = 0U; item < compressed_count; ++item) {
-            const auto value = std::span<const float>(layer_state.compressor.compressed)
-                                   .subspan(static_cast<std::size_t>(item) * kHeadDim,
-                                            kHeadDim);
+        for (std::uint32_t item = 0U; item < attended_compressed_count; ++item) {
+            const auto cache_row = use_sparse_indexer
+                ? indexed_positions[item]
+                : item;
+            const auto value = layer_state.compressor.compressed.row(cache_row);
             const float probability = static_cast<float>(
                 std::exp(static_cast<double>(scores[score_index++] - maximum)) /
                 denominator);
@@ -1711,10 +1941,13 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
         return result;
     }
+    const auto model_context =
+        deepseek_v4_flash_dspark_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
-        config.maximum_context_tokens > 2048U) {
+        config.maximum_context_tokens > model_context) {
         result.errors.emplace_back(
-            "current exact DeepSeek runtime context must be within [1, 2048] tokens");
+            "DeepSeek runtime context must be within the model limit [1, " +
+            std::to_string(model_context) + "] tokens");
         return result;
     }
     if (config.enable_logit_trace &&
@@ -1903,7 +2136,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
             kTopK);
         if (!result.ok()) return result;
     }
-    result = impl_->reset_sequence();
+    result = impl_->reset_sequence(1U);
     if (!result.ok()) return result;
     impl_->initialized = true;
     impl_->initialization_metrics.initialization_seconds =
@@ -1956,7 +2189,9 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate(
     }
     result.prompt_token_ids = encoded.value;
     impl_->reset_diagnostics();
-    auto reset = impl_->reset_sequence();
+    const auto active_context_tokens = static_cast<std::uint32_t>(
+        encoded.value.size() + maximum_new_tokens);
+    auto reset = impl_->reset_sequence(active_context_tokens);
     if (!reset.ok()) {
         result.errors = std::move(reset.errors);
         return result;

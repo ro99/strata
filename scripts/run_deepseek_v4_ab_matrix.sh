@@ -6,10 +6,16 @@ baseline_runner=${BASELINE_RUNNER:?set BASELINE_RUNNER to the baseline executabl
 candidate_runner=${CANDIDATE_RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 result_root=${RESULT_ROOT:-"${repo_root}/results/deepseek-v4-ab-matrix"}
 repetitions=${REPETITIONS:-3}
+start_repetition=${START_REPETITION:-1}
 
 mkdir -p "${result_root}"
-: >"${result_root}/order.txt"
-for repetition in $(seq 1 "${repetitions}"); do
+if [[ "${start_repetition}" == 1 ]]; then
+    : >"${result_root}/order.txt"
+else
+    touch "${result_root}/order.txt"
+fi
+last_repetition=$((start_repetition + repetitions - 1))
+for repetition in $(seq "${start_repetition}" "${last_repetition}"); do
     for variant in baseline candidate; do
         runner=${baseline_runner}
         if [[ "${variant}" == candidate ]]; then runner=${candidate_runner}; fi

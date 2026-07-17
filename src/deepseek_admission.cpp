@@ -43,9 +43,13 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
                     [](std::uint64_t bytes) { return bytes == 0U; })) {
         result.errors.emplace_back("DeepSeek admission requires positive per-device VRAM budgets");
     }
-    if (config.maximum_context_tokens == 0U || config.maximum_context_tokens > 2048U) {
+    const auto model_context =
+        deepseek_v4_flash_dspark_spec().max_context_tokens;
+    if (config.maximum_context_tokens == 0U ||
+        config.maximum_context_tokens > model_context) {
         result.errors.emplace_back(
-            "current exact DeepSeek indexer admission is limited to [1, 2048] tokens");
+            "DeepSeek context must be within the model limit [1, " +
+            std::to_string(model_context) + "] tokens");
     }
     if (!result.errors.empty()) return result;
 
@@ -129,7 +133,8 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
     constexpr std::uint64_t window = 128U;
     constexpr std::uint64_t fp32 = 4U;
     result.plan.kv_state_bytes = layers * window * head_dim * fp32;
-    const auto& ratios = deepseek_v4_flash_dspark_spec().deepseek_v4.compression_ratios;
+    const auto& deepseek = deepseek_v4_flash_dspark_spec().deepseek_v4;
+    const auto& ratios = deepseek.compression_ratios;
     for (std::uint32_t layer = 0U; layer < 43U; ++layer) {
         const auto ratio = ratios[layer];
         if (ratio == 0U) continue;
@@ -146,6 +151,23 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             result.errors.emplace_back("DeepSeek compressor state byte count overflows");
             return result;
         }
+        if (ratio == 4U &&
+            config.maximum_context_tokens > deepseek.index_topk * ratio) {
+            constexpr std::uint64_t index_head_dim = 128U;
+            const auto index_cache = compressed * index_head_dim * fp32;
+            constexpr std::uint64_t index_compressor_state =
+                2U * 4U * 2U * index_head_dim * fp32 * 2U;
+            if (!add(result.plan.index_state_bytes, index_cache) ||
+                !add(result.plan.index_state_bytes, index_compressor_state)) {
+                result.errors.emplace_back(
+                    "DeepSeek sparse-index state byte count overflows");
+                return result;
+            }
+        }
+    }
+    if (!add(result.plan.kv_state_bytes, result.plan.index_state_bytes)) {
+        result.errors.emplace_back("DeepSeek total KV/index state byte count overflows");
+        return result;
     }
     if (config.enable_dspark) {
         if (!add(result.plan.kv_state_bytes, 3U * window * head_dim * fp32)) {

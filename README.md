@@ -25,9 +25,9 @@ The current GLM-5.2 path provides:
   H2D/D2H counters, and VRAM-cache statistics;
 - a deterministic greedy-decode diagnostic for repeated fixed-input runs.
 
-The current runtime is intentionally bounded to a maximum context of 2,048
-tokens. MTP proposal acceleration is disabled in the current baseline, and
-active DSA beyond that context, MTP verification, and optimized residency
+The current GLM-5.2 runtime is intentionally bounded to a maximum context of
+2,048 tokens. MTP proposal acceleration is disabled in the current baseline,
+and active DSA beyond that context, MTP verification, and optimized residency
 scheduling remain future measured work.
 
 The DeepSeek adapter validates all 48 native shards and executes the 43-layer
@@ -35,9 +35,14 @@ base graph with native FP4/FP8 weights, hybrid compressed attention, mHC,
 hash/sqrt-softplus top-6 routing, and the target tokenizer. Its admission plan
 stages the main-model routed experts and embedding into read-only RAM, keeps the
 spine and an expert cache in VRAM, and enforces zero checkpoint reads during
-decode. Its current exact context ceiling is also 2,048 tokens. DSpark tensors
-are validated but speculative execution is rejected until target verification
-and provisional-state rollback have frozen oracles.
+decode. DeepSeek admission accepts logical context ceilings through the model's
+declared 1,048,576-token limit. Compressed KV and learned-index rows are
+committed in host pages as the sequence grows; ratio-4 layers switch to the
+declared learned top-512 selection beyond 2,048 tokens. Current full-model
+execution evidence covers the first selection boundary, not production-scale
+32k/200k/1m ingestion. DSpark tensors are validated but speculative execution
+is rejected until target verification and provisional-state rollback have
+frozen oracles.
 
 The latest correctness and determinism gates pass:
 
@@ -210,6 +215,13 @@ To execute the base model:
   --devices 0,1,2 --host-memory 216G --max-context 2048 \
   --prompt 'Hello' --max-new 16 --json
 ```
+
+`--max-context` is the per-runtime logical cache ceiling and accepts any value
+from 1 through 1,048,576. This is an admission/storage limit, not a claim that
+token-at-a-time prefill is practical or fully validated at every ceiling. The
+rendered prompt plus `--max-new` must fit that ceiling. Use `--admission-only
+--json` first to inspect `kv_state_bytes`, `index_state_bytes`, and total host
+admission for large contexts such as 32,768 or 200,000 tokens.
 
 Exact device MoE and 28 host-attention workers are the defaults. Use
 `--serial-device-moe` and `--serial-host-attention` only for controlled

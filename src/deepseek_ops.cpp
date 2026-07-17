@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <numeric>
 
 namespace strata {
 
@@ -18,6 +19,11 @@ namespace {
         bits += 0x7FFFU + ((bits >> 16U) & 1U);
     }
     return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+[[nodiscard]] float round_bf16(float value) noexcept {
+    return std::bit_cast<float>(
+        static_cast<std::uint32_t>(encode_bf16(value)) << 16U);
 }
 
 [[nodiscard]] bool valid_router_spec(const RouterSpec& spec) noexcept {
@@ -76,6 +82,133 @@ float dsv4_fp4_e2m1_f32(std::uint8_t nibble) noexcept {
         0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
         0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
     return values[nibble & 0x0FU];
+}
+
+ValidationResult dsv4_hadamard_rotate_f32(std::span<float> values) {
+    ValidationResult result;
+    if (values.empty() || (values.size() & (values.size() - 1U)) != 0U ||
+        std::any_of(values.begin(), values.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek Hadamard rotation requires finite power-of-two input");
+        return result;
+    }
+    for (std::size_t width = 1U; width < values.size(); width *= 2U) {
+        for (std::size_t begin = 0U; begin < values.size(); begin += width * 2U) {
+            for (std::size_t offset = 0U; offset < width; ++offset) {
+                const float first = values[begin + offset];
+                const float second = values[begin + width + offset];
+                values[begin + offset] = first + second;
+                values[begin + width + offset] = first - second;
+            }
+        }
+    }
+    const float scale = 1.0F / std::sqrt(static_cast<float>(values.size()));
+    for (auto& value : values) value = round_bf16(value * scale);
+    return result;
+}
+
+ValidationResult dsv4_fp4_e2m1_simulate_f32(
+    std::span<float> values, std::uint32_t group_size) {
+    ValidationResult result;
+    if (values.empty() || group_size == 0U || values.size() % group_size != 0U ||
+        std::any_of(values.begin(), values.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek FP4 activation simulation has invalid groups or values");
+        return result;
+    }
+    constexpr std::array<float, 8> magnitudes{
+        0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    for (std::size_t begin = 0U; begin < values.size(); begin += group_size) {
+        const auto group = values.subspan(begin, group_size);
+        float maximum = 0.0F;
+        for (const float value : group) {
+            maximum = std::max(maximum, std::abs(value));
+        }
+        const float bounded = std::max(maximum, std::ldexp(6.0F, -126));
+        const float scale = std::exp2(std::ceil(std::log2(bounded / 6.0F)));
+        for (auto& value : group) {
+            const float magnitude = std::min(std::abs(value / scale), 6.0F);
+            std::size_t nearest = 0U;
+            float distance = std::abs(magnitude - magnitudes[nearest]);
+            for (std::size_t candidate = 1U; candidate < magnitudes.size();
+                 ++candidate) {
+                const float candidate_distance =
+                    std::abs(magnitude - magnitudes[candidate]);
+                if (candidate_distance < distance ||
+                    (candidate_distance == distance &&
+                     (candidate & 1U) == 0U && (nearest & 1U) != 0U)) {
+                    nearest = candidate;
+                    distance = candidate_distance;
+                }
+            }
+            value = round_bf16(
+                std::copysign(magnitudes[nearest] * scale, value));
+        }
+    }
+    return result;
+}
+
+ValidationResult dsv4_index_scores_f32(
+    std::span<float> scores, std::span<const float> queries,
+    std::span<const float> keys, std::span<const float> weights,
+    std::uint32_t heads, std::uint32_t head_dim) {
+    ValidationResult result;
+    const auto query_elements = static_cast<std::size_t>(heads) * head_dim;
+    if (heads == 0U || head_dim == 0U || queries.size() != query_elements ||
+        weights.size() != heads || scores.empty() ||
+        keys.size() != scores.size() * static_cast<std::size_t>(head_dim) ||
+        std::any_of(queries.begin(), queries.end(),
+                    [](float value) { return !std::isfinite(value); }) ||
+        std::any_of(keys.begin(), keys.end(),
+                    [](float value) { return !std::isfinite(value); }) ||
+        std::any_of(weights.begin(), weights.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek learned-index score tensors are invalid");
+        return result;
+    }
+    for (std::size_t row = 0U; row < scores.size(); ++row) {
+        const auto key = keys.subspan(row * head_dim, head_dim);
+        float score = 0.0F;
+        for (std::uint32_t head = 0U; head < heads; ++head) {
+            const auto query = queries.subspan(
+                static_cast<std::size_t>(head) * head_dim, head_dim);
+            float dot = 0.0F;
+            for (std::uint32_t dimension = 0U; dimension < head_dim;
+                 ++dimension) {
+                dot += query[dimension] * key[dimension];
+            }
+            dot = round_bf16(dot);
+            score += round_bf16(weights[head] * std::max(0.0F, dot));
+        }
+        scores[row] = round_bf16(score);
+    }
+    return result;
+}
+
+Dsv4IndexSelectionResult dsv4_index_topk_f32(
+    std::span<const float> scores, std::uint32_t top_k) {
+    Dsv4IndexSelectionResult result;
+    if (scores.empty() || top_k == 0U || top_k > scores.size() ||
+        std::any_of(scores.begin(), scores.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek learned-index top-k scores are invalid");
+        return result;
+    }
+    result.positions.resize(scores.size());
+    std::iota(result.positions.begin(), result.positions.end(), 0U);
+    const auto better = [&scores](std::uint32_t first, std::uint32_t second) {
+        if (scores[first] != scores[second]) return scores[first] > scores[second];
+        return first < second;
+    };
+    std::partial_sort(result.positions.begin(),
+                      result.positions.begin() + top_k,
+                      result.positions.end(), better);
+    result.positions.resize(top_k);
+    return result;
 }
 
 float dsv4_fp8_e4m3_f32(std::uint8_t encoded) noexcept {

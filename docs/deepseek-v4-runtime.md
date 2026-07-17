@@ -49,9 +49,13 @@ other declared FP8 linears retain native execution.
 - BF16 embedding and response-head boundary with the target tokenizer/template;
 - low-rank 64-head attention, 128-token sliding state, attention sinks, YaRN,
   and compression ratios 4 and 128;
-- exact compressed-position membership for contexts up to 2,048 tokens. At
-  this ceiling a ratio-4 layer has at most the configured 512 index entries, so
-  learned index ranking cannot remove a position;
+- logical cache admission through the declared 1,048,576-token model limit,
+  with lazily committed host pages for compressed KV and learned-index state;
+- exact compressed-position membership through 2,048 tokens, followed by the
+  target's learned top-512 selection in ratio-4 layers; ratio-128 layers retain
+  their full heavily-compressed history;
+- full-model execution evidence through the first learned-index boundary;
+  production-scale 32k/200k/1m ingestion is not yet claimed;
 - four-lane mHC pre/post mixing with 20 Sinkhorn iterations;
 - hash routes from `tid2eid` in layers 0–2 and bias-selected
   sqrt-softplus/noaux top-6 routes in later layers;
@@ -61,8 +65,11 @@ other declared FP8 linears retain native execution.
 
 Before initialization, admission reserves the non-DSpark routed experts and
 embedding in anonymous RAM, the main-model spine and workspaces in VRAM, and KV
-state in RAM. The staged arena becomes read-only. After warm-up, any checkpoint
-read during decode violates the zero-NVMe contract and fails the request.
+and index state in RAM. Cache capacity is admitted logically, but 256 KiB host
+pages are committed only as rows are produced, so a large configured ceiling
+does not zero or touch the complete cache up front. The staged weight arena
+becomes read-only. After warm-up, any checkpoint read during decode violates
+the zero-NVMe contract and fails the request.
 
 The checkpoint's three DSpark stages, target-layer IDs, block size, noise token,
 Markov head, confidence head, and tensor layouts are validated. Optional DSpark
@@ -92,6 +99,12 @@ ceiling, and context 2,048, the inspected machine admitted this plan on
 
 Admission uses currently free VRAM, so the exact budget changes when other GPU
 processes are present.
+
+On the same topology, admission at the model's 1,048,576-token ceiling requires
+164,965,579,100 host bytes. Of that total, 14,451,884,032 bytes are logical
+KV/index capacity, including 2,818,916,352 bytes for learned-index state. The
+VRAM weight plan and zero-NVMe decode contract are unchanged because these
+caches are host-resident and lazily committed.
 
 ## Resident smoke evidence
 

@@ -19,6 +19,7 @@ struct Dsv4MemoryPlan {
     std::uint64_t routed_expert_host_bytes{};
     std::uint64_t host_parameter_bytes{};
     std::uint64_t kv_state_bytes{};
+    std::uint64_t index_state_bytes{};
     std::uint64_t host_workspace_bytes{};
     std::uint64_t required_host_bytes{};
     std::uint64_t resident_spine_vram_bytes{};

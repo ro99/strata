@@ -126,3 +126,19 @@ network and memory ceilings.
 
 Exact source revisions and detailed gates are documented in
 [`model-bringup.md`](model-bringup.md).
+
+## DeepSeek long-context follow-up
+
+The runtime now admits arbitrary user-selected DeepSeek logical context ceilings
+up to the checkpoint limit (1,048,576 tokens), with lazy host-page commitment
+for the large cache and the declared learned top-512 index selection for ratio-4
+layers beyond the 2,048-token index window. Short decode requests do not pay for
+index maintenance merely because a large logical cache was configured. This is
+storage/admission groundwork; execution evidence currently covers the first
+selection boundary only.
+
+Production-scale ingestion will need a batched prefill path. The current
+token-by-token prefill validates the long-context storage and indexing boundary,
+but makes 32k/200k/1m prompt ingestion impractical. The batched path must retain
+the exact DeepSeek attention, compressed-KV/index state, routing, mHC, causal
+masking, and teacher-forcing behavior while exposing separate prefill metrics.

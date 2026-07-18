@@ -133,7 +133,9 @@ TEST_CASE("pinned DeepSeek V4 manifest rejects a missing FP4 scale") {
 TEST_CASE("real DeepSeek V4 DSpark checkpoint opens without format conversion when available") {
     const auto model = std::filesystem::path(STRATA_SOURCE_DIR) /
                        "models/DeepSeek-V4-Flash-DSpark";
-    if (!std::filesystem::exists(model / "model.safetensors.index.json")) return;
+    if (!std::filesystem::exists(model / "model.safetensors.index.json")) {
+        SKIP("pinned DeepSeek checkpoint fixture is absent");
+    }
     const auto checkpoint = strata::Dsv4CheckpointReader::open(model.string());
     REQUIRE(checkpoint.ok());
     const auto* tensor = checkpoint.value->find("layers.0.ffn.experts.0.w1.weight");

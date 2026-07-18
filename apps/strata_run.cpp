@@ -1,5 +1,7 @@
 #include "strata/glm_runtime.hpp"
 
+#include "cli_common.hpp"
+
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -39,32 +41,6 @@ void usage() {
         << "                  [--route-trace PATH]\n";
 }
 
-bool parse_u32(std::string_view text, std::uint32_t& value) {
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
-}
-
-bool parse_devices(std::string_view text, std::vector<int>& output) {
-    output.clear();
-    std::size_t begin = 0U;
-    while (begin < text.size()) {
-        const auto end = text.find(',', begin);
-        const auto part = text.substr(begin, end == std::string_view::npos
-                                                ? text.size() - begin
-                                                : end - begin);
-        int device = -1;
-        const auto parsed = std::from_chars(part.data(), part.data() + part.size(), device);
-        if (part.empty() || parsed.ec != std::errc{} ||
-            parsed.ptr != part.data() + part.size() || device < 0) {
-            return false;
-        }
-        output.push_back(device);
-        if (end == std::string_view::npos) break;
-        begin = end + 1U;
-    }
-    return !output.empty();
-}
-
 bool parse_options(int argc, char** argv, Options& options) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -85,19 +61,17 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.prompt = next;
         } else if (argument == "--devices") {
             const auto* next = value(argument);
-            if (next == nullptr || !parse_devices(next, options.devices)) return false;
+            if (next == nullptr || !strata::cli::parse_devices(next, options.devices)) return false;
         } else if (argument == "--max-new") {
             const auto* next = value(argument);
-            if (next == nullptr || !parse_u32(next, options.maximum_new_tokens)) return false;
+            if (next == nullptr || !strata::cli::parse_u32(next, options.maximum_new_tokens)) return false;
         } else if (argument == "--max-context") {
             const auto* next = value(argument);
-            if (next == nullptr || !parse_u32(next, options.maximum_context_tokens)) return false;
+            if (next == nullptr || !strata::cli::parse_u32(next, options.maximum_context_tokens)) return false;
         } else if (argument == "--vram-fraction") {
             const auto* next = value(argument);
             if (next == nullptr) return false;
-            char* end = nullptr;
-            options.vram_fraction = std::strtod(next, &end);
-            if (end == next || *end != '\0') return false;
+            if (!strata::cli::parse_double(next, options.vram_fraction, 0.0, 0.95)) return false;
         } else if (argument == "--json") {
             options.json = true;
         } else if (argument == "--quiet") {
@@ -110,7 +84,7 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.host_cold_experts = true;
         } else if (argument == "--host-workers") {
             const auto* next = value(argument);
-            if (next == nullptr || !parse_u32(next, options.host_worker_threads)) return false;
+            if (next == nullptr || !strata::cli::parse_u32(next, options.host_worker_threads)) return false;
         } else if (argument == "--route-trace") {
             const auto* next = value(argument);
             if (next == nullptr) return false;
@@ -124,29 +98,6 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
     }
     return !options.model.empty();
-}
-
-std::string json_escape(std::string_view text) {
-    std::ostringstream output;
-    for (const unsigned char value : text) {
-        switch (value) {
-            case '"': output << "\\\""; break;
-            case '\\': output << "\\\\"; break;
-            case '\b': output << "\\b"; break;
-            case '\f': output << "\\f"; break;
-            case '\n': output << "\\n"; break;
-            case '\r': output << "\\r"; break;
-            case '\t': output << "\\t"; break;
-            default:
-                if (value < 0x20U) {
-                    output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-                           << static_cast<unsigned int>(value) << std::dec;
-                } else {
-                    output << static_cast<char>(value);
-                }
-        }
-    }
-    return output.str();
 }
 
 template <typename T>
@@ -297,12 +248,13 @@ int main(int argc, char** argv) {
     const auto& metrics = generated.metrics;
     if (options.json) {
         std::cout << std::setprecision(10)
-                  << "{\"prompt\":\"" << json_escape(options.prompt)
-                  << "\",\"answer\":\"" << json_escape(generated.text)
+                  << "{\"prompt\":\"" << strata::cli::json_escape(options.prompt)
+                  << "\",\"answer\":\"" << strata::cli::json_escape(generated.text)
                   << "\",\"execution\":\"exact_base_autoregressive\""
                   << ",\"mtp\":\"disabled\""
                   << ",\"detailed_timing\":" << (metrics.detailed_timing ? "true" : "false")
-                  << ",\"route_trace\":\"" << json_escape(options.route_trace) << '"'
+                  << ",\"route_trace\":\""
+                  << strata::cli::json_escape(options.route_trace) << '"'
                   << ",\"initialization_seconds\":" << initialization_seconds
                   << ",\"prompt_tokens\":" << metrics.prompt_tokens
                   << ",\"decode_tokens\":" << metrics.decode_tokens

@@ -1,5 +1,7 @@
 #include "strata/deepseek_runtime.hpp"
 
+#include "cli_common.hpp"
+
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -51,11 +53,6 @@ void usage() {
         << "       [--detailed-timing] [--json] [--quiet]\n";
 }
 
-bool parse_u32(std::string_view text, std::uint32_t& value) {
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
-}
-
 bool parse_bytes(std::string_view text, std::uint64_t& value) {
     if (text.empty()) return false;
     std::uint64_t multiplier = 1U;
@@ -81,24 +78,6 @@ bool parse_bytes(std::string_view text, std::uint64_t& value) {
     return true;
 }
 
-bool parse_devices(std::string_view text, std::vector<int>& output) {
-    output.clear();
-    std::size_t begin = 0U;
-    while (begin < text.size()) {
-        const auto end = text.find(',', begin);
-        const auto item = text.substr(begin, end == std::string_view::npos
-            ? text.size() - begin : end - begin);
-        int device = -1;
-        const auto parsed = std::from_chars(item.data(), item.data() + item.size(), device);
-        if (item.empty() || parsed.ec != std::errc{} ||
-            parsed.ptr != item.data() + item.size() || device < 0) return false;
-        output.push_back(device);
-        if (end == std::string_view::npos) break;
-        begin = end + 1U;
-    }
-    return !output.empty();
-}
-
 bool parse_options(int argc, char** argv, Options& options) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -119,27 +98,27 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.prompt = value;
         } else if (argument == "--devices") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_devices(value, options.devices)) return false;
+            if (value == nullptr || !strata::cli::parse_devices(value, options.devices)) return false;
         } else if (argument == "--max-new") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_u32(value, options.maximum_new_tokens)) return false;
+            if (value == nullptr || !strata::cli::parse_u32(value, options.maximum_new_tokens)) return false;
         } else if (argument == "--max-context") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_u32(value, options.maximum_context_tokens)) return false;
+            if (value == nullptr || !strata::cli::parse_u32(value, options.maximum_context_tokens)) return false;
         } else if (argument == "--host-attention-threads") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_u32(value, options.host_attention_threads) ||
+            if (value == nullptr || !strata::cli::parse_u32(value, options.host_attention_threads) ||
                 options.host_attention_threads > 64U) return false;
         } else if (argument == "--serial-host-attention") {
             options.host_attention_threads = 0U;
         } else if (argument == "--resident-read-workers") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_u32(value, options.resident_read_workers) ||
+            if (value == nullptr || !strata::cli::parse_u32(value, options.resident_read_workers) ||
                 options.resident_read_workers == 0U ||
                 options.resident_read_workers > 64U) return false;
         } else if (argument == "--spine-warmup-workers") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_u32(value, options.spine_warmup_workers) ||
+            if (value == nullptr || !strata::cli::parse_u32(value, options.spine_warmup_workers) ||
                 options.spine_warmup_workers == 0U ||
                 options.spine_warmup_workers > 64U) return false;
         } else if (argument == "--host-memory") {
@@ -148,9 +127,7 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--vram-fraction") {
             const auto* value = next(argument);
             if (value == nullptr) return false;
-            char* end = nullptr;
-            options.vram_fraction = std::strtod(value, &end);
-            if (end == value || *end != '\0') return false;
+            if (!strata::cli::parse_double(value, options.vram_fraction, 0.0, 0.95)) return false;
         } else if (argument == "--route-trace") {
             const auto* value = next(argument);
             if (value == nullptr) return false;
@@ -163,7 +140,7 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.logit_trace = true;
         } else if (argument == "--logit-trace-top-k") {
             const auto* value = next(argument);
-            if (value == nullptr || !parse_u32(value, options.logit_trace_top_k) ||
+            if (value == nullptr || !strata::cli::parse_u32(value, options.logit_trace_top_k) ||
                 options.logit_trace_top_k == 0U) return false;
             options.logit_trace = true;
         } else if (argument == "--layer-hash-trace") {
@@ -189,21 +166,6 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
     }
     return !options.model.empty();
-}
-
-std::string json_escape(std::string_view input) {
-    std::ostringstream output;
-    for (const unsigned char value : input) {
-        switch (value) {
-            case '"': output << "\\\""; break;
-            case '\\': output << "\\\\"; break;
-            case '\n': output << "\\n"; break;
-            case '\r': output << "\\r"; break;
-            case '\t': output << "\\t"; break;
-            default: output << static_cast<char>(value); break;
-        }
-    }
-    return output.str();
 }
 
 template <typename T>
@@ -624,7 +586,7 @@ int main(int argc, char** argv) {
     const auto& metrics = generated.metrics;
     if (options.json) {
         std::cout << std::setprecision(10)
-                  << "{\"answer\":\"" << json_escape(generated.text)
+                  << "{\"answer\":\"" << strata::cli::json_escape(generated.text)
                   << "\",\"execution\":\"exact_base_autoregressive\""
                   << ",\"dspark\":\"disabled\""
                   << ",\"device_moe\":"

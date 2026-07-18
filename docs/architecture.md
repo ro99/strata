@@ -1,6 +1,11 @@
-# Strata architecture
+# Strata target architecture
 
-## Decision
+Status: **target design**. This document describes the intended expert-ticket
+wavefront, not behavior already present in every runtime. See
+[`current-architecture.md`](current-architecture.md) for the implemented design
+and explicit gaps.
+
+## Target decision
 
 Strata is an **expert-centric wavefront runtime**. The engine does not regard
 NVMe, RAM, and VRAM as interchangeable caches with different speeds. It gives

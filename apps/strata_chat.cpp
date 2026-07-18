@@ -1,5 +1,6 @@
-#include "strata/deepseek_runtime.hpp"
-#include "strata/glm_runtime.hpp"
+#include "strata/runtime.hpp"
+
+#include "cli_common.hpp"
 
 #include <charconv>
 #include <chrono>
@@ -41,41 +42,6 @@ void usage() {
         << "Without --prompt, read one question per line until EOF.\n";
 }
 
-bool parse_u32(std::string_view text, std::uint32_t& value) {
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && value > 0U;
-}
-
-bool parse_u64(std::string_view text, std::uint64_t& value) {
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
-}
-
-bool parse_double(std::string_view text, double& value) {
-    const std::string owned(text);
-    char* end = nullptr;
-    value = std::strtod(owned.c_str(), &end);
-    return end != owned.c_str() && *end == '\0' && value >= 0.0 && value <= 10.0;
-}
-
-bool parse_devices(std::string_view text, std::vector<int>& devices) {
-    devices.clear();
-    std::size_t begin = 0U;
-    while (begin < text.size()) {
-        const auto end = text.find(',', begin);
-        const auto part = text.substr(begin, end == std::string_view::npos
-                                                ? text.size() - begin : end - begin);
-        int device = -1;
-        const auto parsed = std::from_chars(part.data(), part.data() + part.size(), device);
-        if (part.empty() || parsed.ec != std::errc{} ||
-            parsed.ptr != part.data() + part.size() || device < 0) return false;
-        devices.push_back(device);
-        if (end == std::string_view::npos) break;
-        begin = end + 1U;
-    }
-    return !devices.empty();
-}
-
 bool parse_options(int argc, char** argv, Options& options) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -89,17 +55,17 @@ bool parse_options(int argc, char** argv, Options& options) {
         else if (argument == "--model-type") options.model_type = std::string(next());
         else if (argument == "--prompt") options.prompt = std::string(next());
         else if (argument == "--context-size" || argument == "--max-context") {
-            if (!parse_u32(next(), options.context_size)) return false;
+            if (!strata::cli::parse_positive_u32(next(), options.context_size)) return false;
         } else if (argument == "--max-new") {
-            if (!parse_u32(next(), options.max_new_tokens)) return false;
+            if (!strata::cli::parse_positive_u32(next(), options.max_new_tokens)) return false;
         } else if (argument == "--temperature") {
-            if (!parse_double(next(), options.temperature)) return false;
+            if (!strata::cli::parse_double(next(), options.temperature, 0.0, 10.0)) return false;
         } else if (argument == "--vram-fraction") {
-            if (!parse_double(next(), options.vram_fraction)) return false;
+            if (!strata::cli::parse_double(next(), options.vram_fraction, 0.0, 0.95)) return false;
         } else if (argument == "--seed") {
-            if (!parse_u64(next(), options.seed)) return false;
+            if (!strata::cli::parse_u64(next(), options.seed)) return false;
         } else if (argument == "--devices") {
-            if (!parse_devices(next(), options.devices)) return false;
+            if (!strata::cli::parse_devices(next(), options.devices)) return false;
             options.devices_explicit = true;
         } else {
             std::cerr << "unknown argument: " << argument << '\n';
@@ -109,15 +75,6 @@ bool parse_options(int argc, char** argv, Options& options) {
     if (!options.devices_explicit) options.devices = {0, 1, 2};
     return !options.model.empty() &&
            (options.model_type == "glm" || options.model_type == "deepseek");
-}
-
-std::string devices_text(const std::vector<int>& devices) {
-    std::ostringstream output;
-    for (std::size_t index = 0U; index < devices.size(); ++index) {
-        if (index != 0U) output << ',';
-        output << devices[index];
-    }
-    return output.str();
 }
 
 class StreamDisplay {
@@ -295,14 +252,15 @@ private:
     std::optional<std::chrono::steady_clock::time_point> decode_started_;
 };
 
-template <typename Runtime, typename Result>
-bool answer(Runtime& runtime, const Options& options, std::string_view prompt) {
+bool answer(strata::RuntimeSession& runtime, const Options& options,
+            std::string_view prompt) {
     std::cerr << "[prefill] processing prompt...\n";
     StreamDisplay display;
     const strata::TokenStreamCallback stream = [&](std::uint32_t, std::string_view piece) {
         display.token(piece);
     };
-    const Result result = runtime.generate_stream(prompt, options.max_new_tokens, stream);
+    const auto result = runtime.generate_stream(
+        prompt, options.max_new_tokens, stream);
     if (!result.ok()) {
         display.abort();
         for (const auto& error : result.errors) std::cerr << "error: " << error << '\n';
@@ -326,10 +284,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    strata::Glm52Runtime glm;
-    strata::DeepSeekV4Runtime deepseek;
+    strata::RuntimeSession runtime;
     std::cerr << "[startup] model_type=" << options.model_type
-              << " devices=" << devices_text(options.devices)
+              << " devices=" << strata::cli::devices_text(options.devices)
               << " context=" << options.context_size
               << " max_new=" << options.max_new_tokens
               << " temperature=" << options.temperature
@@ -340,53 +297,35 @@ int main(int argc, char** argv) {
               << " base-model decode; no hidden fallback\n"
               << "[startup] loading model; this can take several minutes...\n";
     const auto initialization_started = std::chrono::steady_clock::now();
-    if (options.model_type == "glm") {
-        strata::Glm52RuntimeConfig config;
-        config.devices = options.devices;
-        config.maximum_context_tokens = options.context_size;
-        config.vram_cache_fraction = options.vram_fraction;
-        config.verbose = false;
-        config.load_progress = true;
-        config.sampling_temperature = options.temperature;
-        config.sampling_seed = options.seed;
-        const auto initialized = glm.initialize(options.model, config);
-        if (!initialized.ok()) {
-            for (const auto& error : initialized.errors) std::cerr << "error: " << error << '\n';
-            return 1;
+    strata::RuntimeConfig config;
+    config.model = options.model_type == "glm"
+                       ? strata::RuntimeModel::Glm52
+                       : strata::RuntimeModel::DeepSeekV4;
+    config.devices = options.devices;
+    config.maximum_context_tokens = options.context_size;
+    config.vram_cache_fraction = options.vram_fraction;
+    config.verbose = options.model_type == "deepseek";
+    config.load_progress = options.model_type == "glm";
+    config.sampling_temperature = options.temperature;
+    config.sampling_seed = options.seed;
+    const auto initialized = runtime.initialize(options.model, config);
+    if (!initialized.ok()) {
+        for (const auto& error : initialized.errors) {
+            std::cerr << "error: " << error << '\n';
         }
-        std::cerr << "[ready] model loaded in " << std::fixed << std::setprecision(2)
-                  << std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - initialization_started).count()
-                  << " s; enter a prompt\n";
-        if (!options.prompt.empty()) return answer<strata::Glm52Runtime, strata::Glm52GenerationResult>(glm, options, options.prompt) ? 0 : 1;
-        std::string prompt;
-        while (std::cout << "> " && std::getline(std::cin, prompt)) {
-            if (prompt.empty()) continue;
-            if (!answer<strata::Glm52Runtime, strata::Glm52GenerationResult>(glm, options, prompt)) return 1;
-        }
-    } else {
-        strata::Dsv4RuntimeConfig config;
-        config.devices = options.devices;
-        config.maximum_context_tokens = options.context_size;
-        config.vram_cache_fraction = options.vram_fraction;
-        config.verbose = true;
-        config.sampling_temperature = options.temperature;
-        config.sampling_seed = options.seed;
-        const auto initialized = deepseek.initialize(options.model, config);
-        if (!initialized.ok()) {
-            for (const auto& error : initialized.errors) std::cerr << "error: " << error << '\n';
-            return 1;
-        }
-        std::cerr << "[ready] model loaded in " << std::fixed << std::setprecision(2)
-                  << std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() - initialization_started).count()
-                  << " s; enter a prompt\n";
-        if (!options.prompt.empty()) return answer<strata::DeepSeekV4Runtime, strata::Dsv4GenerationResult>(deepseek, options, options.prompt) ? 0 : 1;
-        std::string prompt;
-        while (std::cout << "> " && std::getline(std::cin, prompt)) {
-            if (prompt.empty()) continue;
-            if (!answer<strata::DeepSeekV4Runtime, strata::Dsv4GenerationResult>(deepseek, options, prompt)) return 1;
-        }
+        return 1;
+    }
+    std::cerr << "[ready] model loaded in " << std::fixed << std::setprecision(2)
+              << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - initialization_started).count()
+              << " s; enter a prompt\n";
+    if (!options.prompt.empty()) {
+        return answer(runtime, options, options.prompt) ? 0 : 1;
+    }
+    std::string prompt;
+    while (std::cout << "> " && std::getline(std::cin, prompt)) {
+        if (prompt.empty()) continue;
+        if (!answer(runtime, options, prompt)) return 1;
     }
     return 0;
 }

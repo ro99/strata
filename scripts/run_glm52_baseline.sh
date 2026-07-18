@@ -54,7 +54,8 @@ fi
     --model "${model_dir}" --headers --json \
     >"${result_dir}/checkpoint.json"
 "${repo_root}/build/strata-tokenize" \
-    --tokenizer "${model_dir}/tokenizer.json" --prompt "${prompt}" \
+    --tokenizer "${model_dir}/tokenizer.json" --model-type glm \
+    --prompt "${prompt}" \
     >"${result_dir}/prompt-tokens.txt"
 
 {

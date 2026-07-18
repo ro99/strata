@@ -106,7 +106,12 @@ KV/index capacity, including 2,818,916,352 bytes for learned-index state. The
 VRAM weight plan and zero-NVMe decode contract are unchanged because these
 caches are host-resident and lazily committed.
 
-## Resident smoke evidence
+## Initial resident smoke evidence
+
+This section preserves the first successful resident smoke from 2026-07-15. It
+is historical evidence, not the current performance baseline. See the repository
+`README.md` and later records under `docs/experiments/` for promoted loading,
+execution, and long-context results.
 
 The routed expert coefficient is applied once before the down projection, as in
 the bundled target inference code. The host executor, CUDA MoE kernel, and CUDA

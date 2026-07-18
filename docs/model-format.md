@@ -1,7 +1,12 @@
 # Model format v1
 
-Strata uses an immutable, self-describing model format. Runtime interpretation
-does not depend on framework-specific metadata or tensor-name guessing.
+Status: **format contract with partial tooling**. Strata defines an immutable,
+self-describing native model format, but the current GLM and DeepSeek runtimes
+primarily execute pinned Safetensors through the foreign-extent manifest path
+described below. The standalone `strata-pack` writer remains planned.
+
+Runtime interpretation after import does not depend on ad hoc tensor-name
+guessing in the execution graph.
 
 ## Header
 
@@ -92,7 +97,7 @@ extents inside Safetensors shards when:
 QuantTrio/GLM-5.2-Int4-Int8Mix and DeepSeek-V4-Flash-DSpark use this path so
 Strata does not create redundant 405 GB or 167 GB rewritten copies.
 
-## Packs
+## Planned native packs
 
 Large payload files are organized for parallel direct reads without requiring
 one file per expert. Expert groups derived from routing-affinity traces may occupy
@@ -104,10 +109,10 @@ placement do not modify the model pack.
 
 ## Import and optional conversion
 
-The offline C++ `strata-pack` tool will ingest Safetensors incrementally, validate
-architecture semantics, preserve validated four-bit-or-higher source layouts
-where possible, generate hashes, and write to a temporary path before atomic
-rename. It must never require loading the whole checkpoint into RAM.
+The planned offline C++ `strata-pack` tool will ingest Safetensors incrementally,
+validate architecture semantics, preserve validated four-bit-or-higher source
+layouts where possible, generate hashes, and write to a temporary path before
+atomic rename. It must never require loading the whole checkpoint into RAM.
 
 Conversion progress is extent-addressed and hash-verified. On restart, the tool
 reuses only complete verified extents; it never exposes a partially converted

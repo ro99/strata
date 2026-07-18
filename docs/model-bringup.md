@@ -4,6 +4,12 @@ Strata starts with frontier-scale MoE models. GLM-5.2 is the primary target from
 the first branch; DeepSeek-V4-Flash-DSpark is the first fully resident proof of
 concept. There is no smaller pretrained model in the critical path.
 
+Status: this is the bring-up contract and retains imperative steps even after
+implementation. The status line under each stage distinguishes implemented work
+from open gates. For current runnable behavior, use `README.md` and
+`current-architecture.md`; do not infer implementation merely from a stage being
+listed here.
+
 ## Pinned source facts
 
 The first implementation must pin revisions rather than follow moving model
@@ -57,6 +63,8 @@ not itself a precision declaration.
 
 ### Stage A0 — metadata-only target lock
 
+Status: implemented in the pinned GLM manifest and inspector path.
+
 Create `feat/glm52-compressed-import`. Fetch only the pinned configuration,
 generation configuration, tokenizer assets, license, Safetensors index, and
 file metadata. Do not begin the bulk transfer yet.
@@ -81,6 +89,10 @@ roles and IDs.
 
 ### Stage A1 — one real GLM quantized module
 
+Status: native target-format decoding and scalar/AVX2/CUDA operation fixtures are
+implemented. Comparison with an independently frozen target output remains an
+open promotion gate.
+
 Select one routed expert module's `weight_packed`, `weight_scale`, and
 `weight_shape` tensors from the pinned index. Range-read only those extents from
 the containing source shard after verifying the shard size and SHA-256.
@@ -102,6 +114,9 @@ extents survive hash verification, and reconstruction/output metrics are
 recorded. This uses a real target-format GLM-5.2 tensor, not a substitute.
 
 ### Stage A2 — zero-rewrite native import
+
+Status: implemented for the pinned local checkpoint and its read-only source
+shards.
 
 Generalize A1 across the full checkpoint. The sidecar plan is fixed before
 weight transfer begins.
@@ -132,6 +147,9 @@ or writable source shard.
 
 ### Stage A3 — GLM graph from actual weights
 
+Status: the 78-layer base executor is implemented. External layer,
+teacher-forcing, greedy-generation, and MTP verification gates remain open.
+
 Implement the graph in dependency order using tensors from the verified native
 manifest:
 
@@ -155,6 +173,10 @@ within declared numerical contracts. No operation may silently fall back or be
 skipped.
 
 ### Stage A4 — memory hierarchy and performance
+
+Status: partial. RAM/VRAM arenas, the CUDA weight cache, exact host expert
+execution, admission accounting, and instrumentation exist. The cross-request
+expert-ticket wavefront, runtime prefetch, and peer execution do not.
 
 Bring up execution tiers in this order:
 
@@ -217,9 +239,11 @@ without runtime model writes.
 
 ### Stage B1 — exact DeepSeek-V4 graph
 
-Status: base-model executor implemented with an exact 2,048-token admission
-ceiling; frozen layer, teacher-forcing, and full-generation oracle promotion is
-still pending. See `docs/deepseek-v4-runtime.md`.
+Status: base-model executor implemented. Admission accepts logical ceilings up
+to 1,048,576 tokens with lazy host-page commitment, and execution evidence covers
+the first learned-index boundary. Production-scale ingestion and frozen layer,
+teacher-forcing, and full-generation oracle promotion remain pending. See
+`docs/deepseek-v4-runtime.md`.
 
 Implement and verify hybrid attention compression, sparse indexing, mHC,
 sqrtsoftplus routing, shared/routed experts, and tokenizer/response encoding.

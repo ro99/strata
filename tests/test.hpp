@@ -31,6 +31,15 @@ struct Registrar {
     }
 };
 
+class Skip final : public std::exception {
+public:
+    explicit Skip(std::string reason) : reason_(std::move(reason)) {}
+    [[nodiscard]] const char* what() const noexcept override { return reason_.c_str(); }
+
+private:
+    std::string reason_;
+};
+
 [[noreturn]] inline void fail(std::string_view expression, std::string_view file, int line) {
     std::ostringstream message;
     message << file << ':' << line << ": assertion failed: " << expression;
@@ -60,3 +69,5 @@ struct Registrar {
             ::strata::test::fail(#actual " ~= " #expected, __FILE__, __LINE__);          \
         }                                                                                \
     } while (false)
+
+#define SKIP(reason) throw ::strata::test::Skip(reason)

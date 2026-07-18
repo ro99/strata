@@ -1,9 +1,12 @@
 #include "strata/deepseek_runtime.hpp"
 
 #include "strata/deepseek_ops.hpp"
-#include "strata/glm_ops.hpp"
+#include "strata/model_adapter.hpp"
+#include "strata/numerics.hpp"
 #include "strata/sampling.hpp"
+#include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
@@ -16,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -31,26 +35,27 @@ namespace strata {
 
 namespace {
 
-constexpr std::uint32_t kHidden = 4096U;
-constexpr std::uint32_t kLayers = 43U;
-constexpr std::uint32_t kHeads = 64U;
-constexpr std::uint32_t kHeadDim = 512U;
-constexpr std::uint32_t kRopeDim = 64U;
-constexpr std::uint32_t kQueryRank = 1024U;
-constexpr std::uint32_t kOutputRank = 1024U;
-constexpr std::uint32_t kOutputGroups = 8U;
-constexpr std::uint32_t kWindow = 128U;
-constexpr std::uint32_t kIndexHeads = 64U;
-constexpr std::uint32_t kIndexHeadDim = 128U;
-constexpr std::uint32_t kIndexTopK = 512U;
-constexpr std::uint32_t kExperts = 256U;
-constexpr std::uint32_t kTopK = 6U;
-constexpr std::uint32_t kExpertIntermediate = 2048U;
-constexpr std::uint32_t kVocabulary = 129280U;
-constexpr std::uint32_t kMhc = 4U;
-constexpr std::uint32_t kMix = 24U;
+constexpr std::uint32_t kHidden = kDeepSeekV4ExecutionContract.hidden_size;
+constexpr std::uint32_t kLayers = kDeepSeekV4ExecutionContract.layer_count;
+constexpr std::uint32_t kHeads = kDeepSeekV4ExecutionContract.attention_heads;
+constexpr std::uint32_t kHeadDim = kDeepSeekV4ExecutionContract.head_dim;
+constexpr std::uint32_t kRopeDim = kDeepSeekV4ExecutionContract.rope_head_dim;
+constexpr std::uint32_t kQueryRank = kDeepSeekV4ExecutionContract.query_lora_rank;
+constexpr std::uint32_t kOutputRank = kDeepSeekV4ExecutionContract.output_lora_rank;
+constexpr std::uint32_t kOutputGroups = kDeepSeekV4ExecutionContract.output_groups;
+constexpr std::uint32_t kWindow = kDeepSeekV4ExecutionContract.sliding_window;
+constexpr std::uint32_t kIndexHeads = kDeepSeekV4ExecutionContract.index_heads;
+constexpr std::uint32_t kIndexHeadDim = kDeepSeekV4ExecutionContract.index_head_dim;
+constexpr std::uint32_t kIndexTopK = kDeepSeekV4ExecutionContract.index_topk;
+constexpr std::uint32_t kExperts = kDeepSeekV4ExecutionContract.routed_experts;
+constexpr std::uint32_t kTopK = kDeepSeekV4ExecutionContract.experts_per_token;
+constexpr std::uint32_t kExpertIntermediate =
+    kDeepSeekV4ExecutionContract.expert_intermediate_size;
+constexpr std::uint32_t kVocabulary = kDeepSeekV4ExecutionContract.vocabulary_size;
+constexpr std::uint32_t kMhc = kDeepSeekV4ExecutionContract.mhc_multiplier;
+constexpr std::uint32_t kMix = kDeepSeekV4ExecutionContract.mix_width;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 256ULL << 20U;
-constexpr float kRmsEpsilon = 1.0e-6F;
+constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
 constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
@@ -684,7 +689,7 @@ struct DeepSeekV4Runtime::Impl {
     Dsv4GenerationMetrics initialization_metrics;
     std::unique_ptr<Dsv4CheckpointReader> checkpoint;
     Dsv4ResidentWeightStore resident;
-    GlmTokenizer tokenizer;
+    ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
     std::unique_ptr<HostWorkerPool> attention_workers;
@@ -697,9 +702,12 @@ struct DeepSeekV4Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
-    std::ofstream route_trace;
+    RouteTraceWriter route_trace;
     std::mt19937_64 sampler;
     bool initialized{};
+    std::uint64_t active_request_id{};
+    std::uint64_t generated_requests{};
+    std::uint32_t active_prompt_tokens{};
 
     [[nodiscard]] std::size_t layer_device(std::uint32_t layer) const {
         return schedule[layer % schedule.size()];
@@ -762,7 +770,7 @@ struct DeepSeekV4Runtime::Impl {
             append_errors(result, std::move(weight.errors));
             return result;
         }
-        result = glm_rms_norm_f32(output, input, *weight.value, kRmsEpsilon);
+        result = rms_norm_f32(output, input, *weight.value, kRmsEpsilon);
         if (result.ok()) round_bf16(output);
         return result;
     }
@@ -1753,19 +1761,16 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
         record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
     }
     if (route_trace.is_open()) {
-        route_trace << "{\"position\":" << position << ",\"layer\":" << layer
-                    << ",\"token\":" << token << ",\"experts\":[";
-        for (std::size_t index = 0U; index < route.value.experts.size(); ++index) {
-            if (index != 0U) route_trace << ',';
-            route_trace << route.value.experts[index];
-        }
-        route_trace << "],\"weights\":[" << std::setprecision(
-            std::numeric_limits<float>::max_digits10);
-        for (std::size_t index = 0U; index < route.value.weights.size(); ++index) {
-            if (index != 0U) route_trace << ',';
-            route_trace << route.value.weights[index];
-        }
-        route_trace << "]}\n";
+        RouteEvent event;
+        event.request = active_request_id;
+        event.token_position = position;
+        event.layer = layer;
+        event.experts = route.value.experts;
+        event.coefficients = route.value.weights;
+        event.phase = position < active_prompt_tokens
+                          ? RoutePhase::Prefill : RoutePhase::Decode;
+        auto written = route_trace.write(event);
+        if (!written.ok()) return written;
     }
 
     if (config.enable_device_moe) {
@@ -1921,7 +1926,7 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
             projected += static_cast<double>((*head_projection.value)[row + column]) *
                          hidden[column];
         }
-        const float coefficient = glm_sigmoid_f32(
+        const float coefficient = sigmoid_f32(
             static_cast<float>(projected) * reciprocal * (*head_scale.value)[0] +
             (*head_base.value)[copy]) + kRmsEpsilon;
         for (std::uint32_t column = 0U; column < kHidden; ++column) {
@@ -1961,21 +1966,14 @@ ValidationResult DeepSeekV4Runtime::initialize(
     const std::string& model_directory, const Dsv4RuntimeConfig& config) {
     ValidationResult result;
     const auto initialization_started = std::chrono::steady_clock::now();
-    if (config.devices.empty()) {
-        result.errors.emplace_back("DeepSeek runtime requires at least one CUDA device");
+    if (impl_->initialized) {
+        result.errors.emplace_back("DeepSeek runtime is already initialized");
         return result;
     }
-    if (!std::isfinite(config.vram_cache_fraction) ||
-        config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
-        result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
-        return result;
-    }
-    if (!std::isfinite(config.sampling_temperature) ||
-        config.sampling_temperature < 0.0 || config.sampling_temperature > 10.0) {
-        result.errors.emplace_back(
-            "DeepSeek sampling temperature must be within [0, 10]");
-        return result;
-    }
+    result = validate_common_runtime_config(
+        config.devices, config.vram_cache_fraction,
+        config.sampling_temperature, "DeepSeek");
+    if (!result.ok()) return result;
     const auto model_context =
         deepseek_v4_flash_dspark_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
@@ -2015,12 +2013,13 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "the base-model executor; refusing a silent approximation");
         return result;
     }
+    impl_ = std::make_unique<Impl>();
     auto checkpoint = Dsv4CheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
         result.errors = std::move(checkpoint.errors);
         return result;
     }
-    auto tokenizer = GlmTokenizer::load(
+    auto tokenizer = ModelTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {
         result.errors = std::move(tokenizer.errors);
@@ -2029,26 +2028,15 @@ ValidationResult DeepSeekV4Runtime::initialize(
     result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
 
-    std::vector<std::uint64_t> capacities;
-    std::vector<std::uint64_t> weight_capacities;
-    std::vector<std::uint64_t> totals;
-    for (const auto device : config.devices) {
-        auto memory = CudaBackend::device_memory(device);
-        if (!memory.ok()) {
-            result.errors = std::move(memory.errors);
-            return result;
-        }
-        const auto capacity = static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * config.vram_cache_fraction);
-        if (capacity < (2ULL << 30U)) {
-            result.errors.emplace_back(
-                "CUDA device has less than 2 GiB available for DeepSeek weights");
-            return result;
-        }
-        capacities.push_back(capacity);
-        weight_capacities.push_back(capacity - kDeviceWorkspaceReserve);
-        totals.push_back(memory.value.total_bytes);
+    auto device_plan = plan_runtime_devices(
+        config.devices, config.vram_cache_fraction, kDeviceWorkspaceReserve,
+        2ULL << 30U, "DeepSeek");
+    if (!device_plan.ok()) {
+        result.errors = std::move(device_plan.errors);
+        return result;
     }
+    auto capacities = std::move(device_plan.value.budgets);
+    auto weight_capacities = std::move(device_plan.value.weight_capacities);
     const auto admission_started = std::chrono::steady_clock::now();
     Dsv4AdmissionConfig admission_config;
     admission_config.host_memory_ceiling_bytes = config.host_memory_limit_bytes;
@@ -2065,15 +2053,6 @@ ValidationResult DeepSeekV4Runtime::initialize(
         return result;
     }
 
-    const auto smallest = *std::min_element(totals.begin(), totals.end());
-    std::vector<std::size_t> schedule;
-    for (std::size_t slot = 0U; slot < totals.size(); ++slot) {
-        const auto shares = std::max<std::uint64_t>(
-            1U, (totals[slot] * 2U + smallest / 2U) / smallest);
-        for (std::uint64_t count = 0U; count < shares; ++count) {
-            schedule.push_back(slot);
-        }
-    }
     impl_->config = config;
     impl_->sampler.seed(config.sampling_seed);
     impl_->memory = admission.plan;
@@ -2081,19 +2060,10 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
     impl_->capacities = weight_capacities;
-    impl_->schedule = std::move(schedule);
+    impl_->schedule = std::move(device_plan.value.weighted_schedule);
     if (!config.route_trace_path.empty()) {
-        impl_->route_trace.open(config.route_trace_path,
-                                std::ios::out | std::ios::trunc);
-        if (!impl_->route_trace.is_open()) {
-            result.errors.emplace_back("cannot open DeepSeek route trace: " +
-                                       config.route_trace_path);
-            return result;
-        }
-        impl_->route_trace
-            << "{\"schema\":\"strata.deepseek_v4.route_trace\",\"version\":1,"
-               "\"position_base\":0,\"layer_base\":0,\"router_order\":true,"
-               "\"coefficient_encoding\":\"float32-roundtrip-decimal\"}\n";
+        result = impl_->route_trace.open(config.route_trace_path);
+        if (!result.ok()) return result;
     }
     if (config.verbose) {
         for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
@@ -2225,6 +2195,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
         return result;
     }
     result.prompt_token_ids = encoded.value;
+    impl_->active_request_id = impl_->generated_requests++;
+    impl_->active_prompt_tokens = static_cast<std::uint32_t>(encoded.value.size());
     impl_->reset_diagnostics();
     const auto active_context_tokens = static_cast<std::uint32_t>(
         encoded.value.size() + maximum_new_tokens);
@@ -2350,10 +2322,10 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
             "DeepSeek zero-NVMe decode contract was violated by checkpoint reads");
     }
     if (impl_->route_trace.is_open()) {
-        impl_->route_trace.flush();
-        if (!impl_->route_trace.good()) {
-            result.errors.emplace_back("cannot flush DeepSeek route trace");
-        }
+        auto flushed = impl_->route_trace.flush();
+        result.errors.insert(result.errors.end(),
+                             std::make_move_iterator(flushed.errors.begin()),
+                             std::make_move_iterator(flushed.errors.end()));
     }
     return result;
 }

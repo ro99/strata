@@ -1,5 +1,7 @@
 #include "strata/model.hpp"
 
+#include "strata/model_adapter.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <string_view>
@@ -174,13 +176,13 @@ ModelSpec deepseek_v4_flash_dspark_spec() {
     spec.attention = AttentionKind::HybridCompressedSparse;
     spec.router.selection = RouterSelectionKind::NoAuxTc;
     spec.router.scoring = RouterScoreKind::SqrtSoftplus;
-    spec.router.routed_experts = 256U;
-    spec.router.experts_per_token = 6U;
+    spec.router.routed_experts = kDeepSeekV4ExecutionContract.routed_experts;
+    spec.router.experts_per_token = kDeepSeekV4ExecutionContract.experts_per_token;
     spec.router.groups = 1U;
     spec.router.selected_groups = 1U;
     spec.router.normalize_topk = true;
     spec.router.selection_bias = true;
-    spec.router.routed_scale = 1.5F;
+    spec.router.routed_scale = kDeepSeekV4ExecutionContract.routed_scale;
 
     spec.mixed_quantization.kind = QuantizationKind::NativeFp4Fp8;
     spec.native_fp4_fp8 = {8U, 128U, 8U, 128U, 128U, 4U, 32U, true};
@@ -195,37 +197,37 @@ ModelSpec deepseek_v4_flash_dspark_spec() {
     spec.source.mtp_shards = 0U;
 
     spec.quant_bits = 4U;
-    spec.hidden_size = 4096U;
-    spec.layer_count = 43U;
-    spec.max_context_tokens = 1'048'576U;
+    spec.hidden_size = kDeepSeekV4ExecutionContract.hidden_size;
+    spec.layer_count = kDeepSeekV4ExecutionContract.layer_count;
+    spec.max_context_tokens = kDeepSeekV4ExecutionContract.maximum_context_tokens;
     spec.dense_prefix_layers = 0U;
     spec.shared_experts = 1U;
-    spec.expert_intermediate_size = 2048U;
+    spec.expert_intermediate_size =
+        kDeepSeekV4ExecutionContract.expert_intermediate_size;
 
-    spec.deepseek_v4.attention_heads = 64U;
-    spec.deepseek_v4.key_value_heads = 1U;
-    spec.deepseek_v4.head_dim = 512U;
-    spec.deepseek_v4.rope_head_dim = 64U;
-    spec.deepseek_v4.query_lora_rank = 1024U;
-    spec.deepseek_v4.output_lora_rank = 1024U;
-    spec.deepseek_v4.output_groups = 8U;
-    spec.deepseek_v4.sliding_window = 128U;
-    spec.deepseek_v4.index_heads = 64U;
-    spec.deepseek_v4.index_head_dim = 128U;
-    spec.deepseek_v4.index_topk = 512U;
+    spec.deepseek_v4.attention_heads = kDeepSeekV4ExecutionContract.attention_heads;
+    spec.deepseek_v4.key_value_heads = kDeepSeekV4ExecutionContract.key_value_heads;
+    spec.deepseek_v4.head_dim = kDeepSeekV4ExecutionContract.head_dim;
+    spec.deepseek_v4.rope_head_dim = kDeepSeekV4ExecutionContract.rope_head_dim;
+    spec.deepseek_v4.query_lora_rank = kDeepSeekV4ExecutionContract.query_lora_rank;
+    spec.deepseek_v4.output_lora_rank = kDeepSeekV4ExecutionContract.output_lora_rank;
+    spec.deepseek_v4.output_groups = kDeepSeekV4ExecutionContract.output_groups;
+    spec.deepseek_v4.sliding_window = kDeepSeekV4ExecutionContract.sliding_window;
+    spec.deepseek_v4.index_heads = kDeepSeekV4ExecutionContract.index_heads;
+    spec.deepseek_v4.index_head_dim = kDeepSeekV4ExecutionContract.index_head_dim;
+    spec.deepseek_v4.index_topk = kDeepSeekV4ExecutionContract.index_topk;
     spec.deepseek_v4.hash_layers = 3U;
-    spec.deepseek_v4.mhc_multiplier = 4U;
-    spec.deepseek_v4.mhc_sinkhorn_iterations = 20U;
+    spec.deepseek_v4.mhc_multiplier = kDeepSeekV4ExecutionContract.mhc_multiplier;
+    spec.deepseek_v4.mhc_sinkhorn_iterations =
+        kDeepSeekV4ExecutionContract.mhc_sinkhorn_iterations;
     spec.deepseek_v4.dspark_layers = 3U;
     spec.deepseek_v4.dspark_block_size = 5U;
     spec.deepseek_v4.dspark_noise_token_id = 128'799U;
     spec.deepseek_v4.dspark_markov_rank = 256U;
-    spec.deepseek_v4.swiglu_limit = 10.0F;
-    spec.deepseek_v4.compression_ratios = {
-        0U, 0U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U,
-        4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U,
-        4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U,
-        4U, 128U, 4U, 128U, 4U, 128U, 4U, 0U, 0U, 0U};
+    spec.deepseek_v4.swiglu_limit = kDeepSeekV4ExecutionContract.swiglu_limit;
+    spec.deepseek_v4.compression_ratios.assign(
+        kDeepSeekV4ExecutionContract.compression_ratios.begin(),
+        kDeepSeekV4ExecutionContract.compression_ratios.end());
     spec.deepseek_v4.dspark_target_layers = {40U, 41U, 42U};
     return spec;
 }
@@ -311,13 +313,13 @@ ModelSpec quanttrio_glm52_int4_int8_mix_spec() {
     spec.attention = AttentionKind::Mla;
     spec.router.selection = RouterSelectionKind::NoAuxTc;
     spec.router.scoring = RouterScoreKind::Sigmoid;
-    spec.router.routed_experts = 256;
-    spec.router.experts_per_token = 8;
+    spec.router.routed_experts = kGlm52ExecutionContract.routed_experts;
+    spec.router.experts_per_token = kGlm52ExecutionContract.experts_per_token;
     spec.router.groups = 1;
     spec.router.selected_groups = 1;
     spec.router.normalize_topk = true;
     spec.router.selection_bias = true;
-    spec.router.routed_scale = 2.5F;
+    spec.router.routed_scale = kGlm52ExecutionContract.routed_scale;
 
     spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsInt4Int8Mix;
     spec.mixed_quantization.activation_bits = 16;
@@ -342,13 +344,14 @@ ModelSpec quanttrio_glm52_int4_int8_mix_spec() {
     spec.source.mtp_shards = 4;
 
     spec.quant_bits = 4;
-    spec.hidden_size = 6144;
-    spec.layer_count = 78;
-    spec.max_context_tokens = 1'048'576;
-    spec.dense_prefix_layers = 3;
+    spec.hidden_size = kGlm52ExecutionContract.hidden_size;
+    spec.layer_count = kGlm52ExecutionContract.layer_count;
+    spec.max_context_tokens = kGlm52ExecutionContract.maximum_context_tokens;
+    spec.dense_prefix_layers = kGlm52ExecutionContract.dense_prefix_layers;
     spec.shared_experts = 1;
-    spec.expert_intermediate_size = 2048;
-    spec.glm_moe_dsa.sparse_attention_topk = 2048;
+    spec.expert_intermediate_size = kGlm52ExecutionContract.expert_intermediate_size;
+    spec.glm_moe_dsa.sparse_attention_topk =
+        kGlm52ExecutionContract.sparse_attention_topk;
     spec.glm_moe_dsa.index_share_frequency = 4;
     spec.glm_moe_dsa.mtp_layers = 1;
     spec.glm_moe_dsa.index_share_for_mtp = true;

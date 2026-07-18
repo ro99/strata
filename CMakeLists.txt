@@ -27,6 +27,7 @@ endif()
 
 add_library(strata_core STATIC
     src/checkpoint.cpp
+    src/checkpoint_io.cpp
     src/compressed_tensors.cpp
     ${STRATA_CUDA_SOURCE}
     src/glm_ops.cpp
@@ -40,11 +41,14 @@ add_library(strata_core STATIC
     src/deepseek_runtime.cpp
     src/json_cursor.cpp
     src/model.cpp
+    src/numerics.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
     src/worker_pool.cpp
     src/trace.cpp
     src/route_predictor.cpp
+    src/runtime.cpp
+    src/runtime_support.cpp
     src/residency.cpp
     src/sampling.cpp
     src/simulator.cpp
@@ -126,6 +130,7 @@ if(BUILD_TESTING)
         tests/test_trace.cpp
         tests/test_predictor.cpp
         tests/test_residency.cpp
+        tests/test_runtime.cpp
         tests/test_sampling.cpp
         tests/test_safetensors.cpp
         tests/test_tokenizer.cpp

@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
         status = parallel_matvec(up.value.view, input, up_output);
         if (!status.ok()) return status;
         for (std::size_t index = 0; index < gate_output.size(); ++index) {
-            gate_output[index] = strata::glm_silu_f32(gate_output[index]) * up_output[index];
+            gate_output[index] = strata::silu_f32(gate_output[index]) * up_output[index];
         }
         return parallel_matvec(
             down.value.view, gate_output, output);

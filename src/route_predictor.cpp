@@ -9,8 +9,10 @@ void RoutePredictor::observe(const RouteEvent& event) {
     auto& previous = previous_by_request_[event.request];
     if (previous.valid) {
         const bool ordered_same_token =
-            event.token == previous.event.token && event.layer > previous.event.layer;
-        const bool ordered_next_token = event.token == previous.event.token + 1U;
+            event.token_position == previous.event.token_position &&
+            event.layer > previous.event.layer;
+        const bool ordered_next_token =
+            event.token_position == previous.event.token_position + 1U;
         if (ordered_same_token || ordered_next_token) {
             for (const auto source_expert : previous.event.experts) {
                 const ExpertKey source{previous.event.layer, source_expert};

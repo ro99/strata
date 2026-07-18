@@ -70,10 +70,6 @@ GlmCheckpointReader::~GlmCheckpointReader() {
                                      static_cast<std::size_t>(mapping.bytes)));
         }
     }
-    for (const auto& [name, descriptor] : shard_fds_) {
-        static_cast<void>(name);
-        if (descriptor >= 0) static_cast<void>(close(descriptor));
-    }
 }
 
 GlmCheckpointOpenResult GlmCheckpointReader::open(std::string model_directory,
@@ -115,15 +111,11 @@ GlmCheckpointOpenResult GlmCheckpointReader::open(std::string model_directory,
          ++index_value) {
         reader->tensors_.emplace(reader->manifest_.tensors[index_value].name, index_value);
     }
-    for (const auto& shard : reader->manifest_.shards) {
-        const auto path = (std::filesystem::path(reader->model_directory_) / shard).string();
-        const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (descriptor < 0) {
-            result.errors.emplace_back("cannot open checkpoint shard " + path + ": " +
-                                       std::strerror(errno));
-            return result;
-        }
-        reader->shard_fds_.emplace(shard, descriptor);
+    auto opened = reader->shards_.open(reader->model_directory_,
+                                       reader->manifest_.shards, "GLM");
+    if (!opened.ok()) {
+        result.errors = std::move(opened.errors);
+        return result;
     }
     result.value = std::move(reader);
     return result;
@@ -140,11 +132,6 @@ ParseResult<std::vector<std::byte>> GlmCheckpointReader::pread_tensor(
     ParseResult<std::vector<std::byte>> result;
     if (relative_offset > tensor.source_bytes || bytes > tensor.source_bytes - relative_offset) {
         result.errors.emplace_back("tensor slice exceeds " + tensor.name);
-        return result;
-    }
-    const auto found = shard_fds_.find(tensor.shard);
-    if (found == shard_fds_.end()) {
-        result.errors.emplace_back("checkpoint shard is not open for " + tensor.name);
         return result;
     }
     if (tensor.source_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) -
@@ -166,28 +153,13 @@ ParseResult<std::vector<std::byte>> GlmCheckpointReader::pread_tensor(
         }
     };
     const auto started = std::chrono::steady_clock::now();
-    std::uint64_t completed = 0U;
-    while (completed < bytes) {
-        const auto request = static_cast<std::size_t>(std::min<std::uint64_t>(
-            bytes - completed, static_cast<std::uint64_t>(std::numeric_limits<ssize_t>::max())));
-        const auto count = pread(found->second, result.value.data() + completed, request,
-                                 static_cast<off_t>(tensor.source_offset + relative_offset +
-                                                    completed));
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            result.errors.emplace_back("cannot read tensor " + tensor.name + ": " +
-                                       std::strerror(errno));
-            result.value.clear();
-            finish_interval();
-            return result;
-        }
-        if (count == 0) {
-            result.errors.emplace_back("unexpected end of shard while reading " + tensor.name);
-            result.value.clear();
-            finish_interval();
-            return result;
-        }
-        completed += static_cast<std::uint64_t>(count);
+    auto read = shards_.read(tensor.shard, tensor.source_offset + relative_offset,
+                             result.value, tensor.name);
+    if (!read.ok()) {
+        result.errors = std::move(read.errors);
+        result.value.clear();
+        finish_interval();
+        return result;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started);
@@ -238,21 +210,21 @@ ParseResult<std::span<const std::byte>> GlmCheckpointReader::view(
     std::scoped_lock lock(mapping_mutex_);
     auto mapping = mappings_.find(tensor->shard);
     if (mapping == mappings_.end()) {
-        const auto descriptor = shard_fds_.find(tensor->shard);
-        if (descriptor == shard_fds_.end()) {
+        const int descriptor = shards_.descriptor(tensor->shard);
+        if (descriptor < 0) {
             result.errors.emplace_back("checkpoint shard is not open for " +
                                        tensor->name);
             return result;
         }
         struct stat status {};
-        if (fstat(descriptor->second, &status) != 0 || status.st_size <= 0) {
+        if (fstat(descriptor, &status) != 0 || status.st_size <= 0) {
             result.errors.emplace_back("cannot size checkpoint shard " +
                                        tensor->shard + ": " + std::strerror(errno));
             return result;
         }
         const auto bytes = static_cast<std::uint64_t>(status.st_size);
         void* address = mmap(nullptr, static_cast<std::size_t>(bytes), PROT_READ,
-                             MAP_SHARED, descriptor->second, 0);
+                             MAP_SHARED, descriptor, 0);
         if (address == MAP_FAILED) {
             result.errors.emplace_back("cannot map checkpoint shard " +
                                        tensor->shard + ": " + std::strerror(errno));

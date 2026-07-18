@@ -14,40 +14,6 @@ void append_shape_error(ValidationResult& result, const char* operation) {
 
 }  // namespace
 
-ValidationResult glm_rms_norm_f32(std::span<float> output,
-                                  std::span<const float> input,
-                                  std::span<const float> weight,
-                                  float epsilon) {
-    ValidationResult result;
-    if (output.size() != input.size() || input.size() != weight.size() || input.empty()) {
-        append_shape_error(result, "RMSNorm");
-        return result;
-    }
-    if (!std::isfinite(epsilon) || epsilon <= 0.0F) {
-        result.errors.emplace_back("RMSNorm epsilon must be finite and positive");
-        return result;
-    }
-    double squared_sum = 0.0;
-    for (const float value : input) {
-        if (!std::isfinite(value)) {
-            result.errors.emplace_back("RMSNorm input contains a non-finite value");
-            return result;
-        }
-        squared_sum += static_cast<double>(value) * static_cast<double>(value);
-    }
-    const auto mean_square = static_cast<float>(squared_sum /
-                                                 static_cast<double>(input.size()));
-    const float reciprocal = 1.0F / std::sqrt(mean_square + epsilon);
-    for (std::size_t index = 0; index < input.size(); ++index) {
-        if (!std::isfinite(weight[index])) {
-            result.errors.emplace_back("RMSNorm weight contains a non-finite value");
-            return result;
-        }
-        output[index] = input[index] * reciprocal * weight[index];
-    }
-    return result;
-}
-
 ValidationResult glm_layer_norm_f32(std::span<float> values,
                                     std::span<const float> weight,
                                     std::span<const float> bias,
@@ -147,16 +113,6 @@ ValidationResult glm_rope_interleaved_f32(std::span<float> values,
     return result;
 }
 
-float glm_sigmoid_f32(float value) noexcept {
-    if (value >= 0.0F) return 1.0F / (1.0F + std::exp(-value));
-    const float exponential = std::exp(value);
-    return exponential / (1.0F + exponential);
-}
-
-float glm_silu_f32(float value) noexcept {
-    return value * glm_sigmoid_f32(value);
-}
-
 GlmRouteResult glm_route_logits_noaux_tc(std::span<const float> logits,
                                          std::span<const float> correction_bias,
                                          const RouterSpec& spec) {
@@ -185,7 +141,7 @@ GlmRouteResult glm_route_logits_noaux_tc(std::span<const float> logits,
             result.errors.emplace_back("router tensors contain a non-finite value");
             return result;
         }
-        scores[expert] = glm_sigmoid_f32(logits[expert]);
+        scores[expert] = sigmoid_f32(logits[expert]);
         choices[expert] = scores[expert] + correction_bias[expert];
     }
 

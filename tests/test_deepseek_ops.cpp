@@ -1,7 +1,7 @@
 #include "test.hpp"
 
 #include "strata/deepseek_ops.hpp"
-#include "strata/glm_ops.hpp"
+#include "strata/numerics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -260,6 +260,6 @@ TEST_CASE("DeepSeek SwiGLU applies asymmetric target clamping") {
     std::array<float, 3> output{};
     const auto result = strata::dsv4_swiglu_f32(output, gate, up, 10.0F);
     REQUIRE(result.ok());
-    REQUIRE_NEAR(output[0], strata::glm_silu_f32(-20.0F) * -10.0F, 1.0e-7F);
-    REQUIRE_NEAR(output[1], strata::glm_silu_f32(10.0F) * 10.0F, 1.0e-5F);
+    REQUIRE_NEAR(output[0], strata::silu_f32(-20.0F) * -10.0F, 1.0e-7F);
+    REQUIRE_NEAR(output[1], strata::silu_f32(10.0F) * 10.0F, 1.0e-5F);
 }

@@ -2,8 +2,11 @@
 
 #include "strata/glm_ops.hpp"
 #include "strata/glm_int4.hpp"
+#include "strata/model_adapter.hpp"
 #include "strata/sampling.hpp"
+#include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
@@ -28,22 +31,25 @@ namespace strata {
 
 namespace {
 
-constexpr std::uint32_t kHidden = 6144U;
-constexpr std::uint32_t kLayers = 78U;
-constexpr std::uint32_t kHeads = 64U;
-constexpr std::uint32_t kQueryLora = 2048U;
-constexpr std::uint32_t kKvLora = 512U;
-constexpr std::uint32_t kNope = 192U;
-constexpr std::uint32_t kRope = 64U;
+constexpr std::uint32_t kHidden = kGlm52ExecutionContract.hidden_size;
+constexpr std::uint32_t kLayers = kGlm52ExecutionContract.layer_count;
+constexpr std::uint32_t kHeads = kGlm52ExecutionContract.attention_heads;
+constexpr std::uint32_t kQueryLora = kGlm52ExecutionContract.query_lora_rank;
+constexpr std::uint32_t kKvLora = kGlm52ExecutionContract.kv_lora_rank;
+constexpr std::uint32_t kNope = kGlm52ExecutionContract.nope_head_dim;
+constexpr std::uint32_t kRope = kGlm52ExecutionContract.rope_head_dim;
 constexpr std::uint32_t kQueryHead = kNope + kRope;
-constexpr std::uint32_t kValueHead = 256U;
-constexpr std::uint32_t kDenseIntermediate = 12288U;
-constexpr std::uint32_t kExpertIntermediate = 2048U;
-constexpr std::uint32_t kExperts = 256U;
-constexpr std::uint32_t kTopK = 8U;
-constexpr std::uint32_t kVocabulary = 154880U;
-constexpr std::uint32_t kDsaThreshold = 2048U;
-constexpr float kAttentionScale = 1.0F / 16.0F;
+constexpr std::uint32_t kValueHead = kGlm52ExecutionContract.value_head_dim;
+constexpr std::uint32_t kDenseIntermediate =
+    kGlm52ExecutionContract.dense_intermediate_size;
+constexpr std::uint32_t kExpertIntermediate =
+    kGlm52ExecutionContract.expert_intermediate_size;
+constexpr std::uint32_t kExperts = kGlm52ExecutionContract.routed_experts;
+constexpr std::uint32_t kTopK = kGlm52ExecutionContract.experts_per_token;
+constexpr std::uint32_t kVocabulary = kGlm52ExecutionContract.vocabulary_size;
+constexpr std::uint32_t kDsaThreshold =
+    kGlm52ExecutionContract.sparse_attention_topk;
+constexpr float kAttentionScale = kGlm52ExecutionContract.attention_scale;
 
 std::uint64_t state_hash(std::span<const float> values) noexcept {
     constexpr std::uint64_t offset = 1469598103934665603ULL;
@@ -509,7 +515,7 @@ struct ExpertJob {
 struct Glm52Runtime::Impl {
     Glm52RuntimeConfig config;
     std::unique_ptr<GlmCheckpointReader> checkpoint;
-    GlmTokenizer tokenizer;
+    ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<WeightCache> weights;
     std::unique_ptr<HostWorkerPool> host_workers;
@@ -519,7 +525,7 @@ struct Glm52Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::uint32_t, std::vector<float>> embedding_rows;
     std::vector<LayerKv> kv{kLayers};
-    std::ofstream route_trace;
+    RouteTraceWriter route_trace;
     std::mt19937_64 sampler;
     bool initialized{};
     std::uint32_t last_second_token{};
@@ -554,22 +560,14 @@ struct Glm52Runtime::Impl {
     bool write_route(std::uint32_t position, std::uint32_t layer,
                      const GlmRoute& route, bool prefill) {
         if (!route_trace.is_open()) return true;
-        route_trace << "{\"request\":" << active_request_id
-                    << ",\"phase\":\"" << (prefill ? "prefill" : "decode")
-                    << "\",\"token_position\":" << position
-                    << ",\"layer\":" << layer << ",\"experts\":[";
-        for (std::size_t rank = 0; rank < route.experts.size(); ++rank) {
-            if (rank != 0U) route_trace << ',';
-            route_trace << route.experts[rank];
-        }
-        route_trace << "],\"coefficients\":[" << std::setprecision(
-            std::numeric_limits<float>::max_digits10);
-        for (std::size_t rank = 0; rank < route.weights.size(); ++rank) {
-            if (rank != 0U) route_trace << ',';
-            route_trace << route.weights[rank];
-        }
-        route_trace << "]}\n";
-        return route_trace.good();
+        RouteEvent event;
+        event.request = active_request_id;
+        event.token_position = position;
+        event.layer = layer;
+        event.experts = route.experts;
+        event.coefficients = route.weights;
+        event.phase = prefill ? RoutePhase::Prefill : RoutePhase::Decode;
+        return route_trace.write(event).ok();
     }
 
     ParseResult<const std::vector<float>*> host_tensor(std::string name,
@@ -695,10 +693,10 @@ struct Glm52Runtime::Impl {
             return result;
         }
         for (std::uint32_t row = 0; row < rows; ++row) {
-            auto status = glm_rms_norm_f32(
+            auto status = rms_norm_f32(
                 output.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
                 input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
-                *weight.value);
+                *weight.value, kGlm52RmsNormEpsilon);
             if (!status.ok()) return status;
         }
         return result;
@@ -720,12 +718,12 @@ struct Glm52Runtime::Impl {
             return result;
         }
         for (std::uint32_t row = 0; row < rows; ++row) {
-            auto status = glm_rms_norm_f32(
+            auto status = rms_norm_f32(
                 std::span<float>(query_residual).subspan(
                     static_cast<std::size_t>(row) * kQueryLora, kQueryLora),
                 std::span<const float>(query_residual).subspan(
                     static_cast<std::size_t>(row) * kQueryLora, kQueryLora),
-                *query_norm.value);
+                *query_norm.value, kGlm52RmsNormEpsilon);
             if (!status.ok()) return status;
         }
         std::vector<float> queries(static_cast<std::size_t>(rows) * kHeads * kQueryHead);
@@ -759,8 +757,8 @@ struct Glm52Runtime::Impl {
                 static_cast<std::size_t>(row) * (kKvLora + kRope), kKvLora + kRope);
             auto destination = std::span<float>(latent).subspan(
                 static_cast<std::size_t>(row) * kKvLora, kKvLora);
-            auto status = glm_rms_norm_f32(destination, source.first(kKvLora),
-                                            *kv_norm.value);
+            auto status = rms_norm_f32(destination, source.first(kKvLora),
+                                       *kv_norm.value, kGlm52RmsNormEpsilon);
             if (!status.ok()) return status;
             auto rope_destination = std::span<float>(new_rope).subspan(
                 static_cast<std::size_t>(row) * kRope, kRope);
@@ -850,7 +848,7 @@ struct Glm52Runtime::Impl {
                         kHidden, input, rows, up);
         if (!result.ok()) return result;
         for (std::size_t index = 0; index < gate.size(); ++index) {
-            gate[index] = glm_silu_f32(gate[index]) * up[index];
+            gate[index] = silu_f32(gate[index]) * up[index];
         }
         return linear(device, std::string(prefix) + "down_proj", kHidden,
                       intermediate, gate, rows, output);
@@ -962,7 +960,7 @@ struct Glm52Runtime::Impl {
         if (status.ok()) {
             for (std::size_t index = 0; index < gate_output.size(); ++index) {
                 gate_output[index] =
-                    glm_silu_f32(gate_output[index]) * up_output[index];
+                    silu_f32(gate_output[index]) * up_output[index];
             }
             status = host_matvec(down.value, gate_output, job.output);
         }
@@ -1102,7 +1100,7 @@ struct Glm52Runtime::Impl {
             for (auto& item : work) {
                 for (std::size_t index = 0; index < item.gate_output.size(); ++index) {
                     item.gate_output[index] =
-                        glm_silu_f32(item.gate_output[index]) *
+                        silu_f32(item.gate_output[index]) *
                         item.up_output[index];
                 }
             }
@@ -1348,7 +1346,8 @@ struct Glm52Runtime::Impl {
         }
         std::vector<float> normalized(kHidden);
         const auto last = std::span<const float>(hidden).last(kHidden);
-        status = glm_rms_norm_f32(normalized, last, *final_norm.value);
+        status = rms_norm_f32(normalized, last, *final_norm.value,
+                              kGlm52RmsNormEpsilon);
         if (!status.ok()) {
             result.errors = std::move(status.errors);
             return result;
@@ -1396,20 +1395,14 @@ Glm52Runtime& Glm52Runtime::operator=(Glm52Runtime&&) noexcept = default;
 ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
                                           const Glm52RuntimeConfig& config) {
     ValidationResult result;
-    if (config.devices.empty()) {
-        result.errors.emplace_back("GLM runtime requires at least one CUDA device");
+    if (impl_->initialized) {
+        result.errors.emplace_back("GLM runtime is already initialized");
         return result;
     }
-    if (!std::isfinite(config.vram_cache_fraction) ||
-        config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
-        result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
-        return result;
-    }
-    if (!std::isfinite(config.sampling_temperature) ||
-        config.sampling_temperature < 0.0 || config.sampling_temperature > 10.0) {
-        result.errors.emplace_back("GLM sampling temperature must be within [0, 10]");
-        return result;
-    }
+    result = validate_common_runtime_config(
+        config.devices, config.vram_cache_fraction,
+        config.sampling_temperature, "GLM");
+    if (!result.ok()) return result;
     if (config.maximum_context_tokens == 0U ||
         config.maximum_context_tokens > kDsaThreshold) {
         result.errors.emplace_back(
@@ -1421,6 +1414,10 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         result.errors.emplace_back("host expert worker count must be in [1, 256]");
         return result;
     }
+    // A failed prior attempt may have populated caches or backend state. Build
+    // every new attempt from a fresh implementation; a successful runtime is
+    // explicitly one-shot and rejected above.
+    impl_ = std::make_unique<Impl>();
     auto checkpoint = GlmCheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
         result.errors = std::move(checkpoint.errors);
@@ -1428,7 +1425,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     }
     result = validate_runtime_graph_contract(*checkpoint.value);
     if (!result.ok()) return result;
-    auto tokenizer = GlmTokenizer::load(
+    auto tokenizer = ModelTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {
         result.errors = std::move(tokenizer.errors);
@@ -1437,42 +1434,17 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
     if (!config.route_trace_path.empty()) {
-        impl_->route_trace.open(config.route_trace_path, std::ios::out | std::ios::trunc);
-        if (!impl_->route_trace.is_open()) {
-            result.errors.emplace_back("cannot open GLM route trace: " +
-                                       config.route_trace_path);
-            return result;
-        }
-        impl_->route_trace
-            << "{\"schema\":\"strata.glm52.route_trace\",\"version\":1,"
-               "\"position_base\":0,\"layer_base\":0,\"router_order\":true,"
-               "\"coefficient_encoding\":\"float32-roundtrip-decimal\"}\n";
+        result = impl_->route_trace.open(config.route_trace_path);
+        if (!result.ok()) return result;
     }
 
-    std::vector<std::uint64_t> capacities;
-    std::vector<std::uint64_t> totals;
-    for (const auto device : config.devices) {
-        auto memory = CudaBackend::device_memory(device);
-        if (!memory.ok()) {
-            result.errors = std::move(memory.errors);
-            return result;
-        }
-        const auto capacity = static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * config.vram_cache_fraction);
-        if (capacity < (2ULL << 30U)) {
-            result.errors.emplace_back("CUDA device has less than 2 GiB available for weights");
-            return result;
-        }
-        capacities.push_back(capacity);
-        totals.push_back(memory.value.total_bytes);
+    auto device_plan = plan_runtime_devices(
+        config.devices, config.vram_cache_fraction, 0U, 2ULL << 30U, "GLM");
+    if (!device_plan.ok()) {
+        result.errors = std::move(device_plan.errors);
+        return result;
     }
-    const auto smallest = *std::min_element(totals.begin(), totals.end());
-    std::vector<std::size_t> schedule;
-    for (std::size_t slot = 0; slot < totals.size(); ++slot) {
-        const auto shares = std::max<std::uint64_t>(
-            1U, (totals[slot] * 2U + smallest / 2U) / smallest);
-        for (std::uint64_t count = 0; count < shares; ++count) schedule.push_back(slot);
-    }
+    auto capacities = std::move(device_plan.value.weight_capacities);
 
     impl_->config = config;
     impl_->sampler.seed(config.sampling_seed);
@@ -1480,7 +1452,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
     impl_->capacities = capacities;
-    impl_->device_schedule = std::move(schedule);
+    impl_->device_schedule = std::move(device_plan.value.weighted_schedule);
     impl_->weights = std::make_unique<WeightCache>(*impl_->checkpoint, impl_->cuda,
                                                    impl_->devices, capacities);
     if (config.host_cold_experts) {
@@ -1632,10 +1604,8 @@ Glm52GenerationResult Glm52Runtime::generate_stream(
     result.metrics.host_experts = host_expert_delta(host_after_decode, host_before);
     result.metrics.detailed_timing = impl_->config.detailed_timing;
     if (impl_->route_trace.is_open()) {
-        impl_->route_trace.flush();
-        if (!impl_->route_trace.good()) {
-            result.errors.emplace_back("cannot flush GLM route trace");
-        }
+        auto flushed = impl_->route_trace.flush();
+        move_errors(result.errors, std::move(flushed));
     }
     return result;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/model.hpp"
+#include "strata/numerics.hpp"
 
 #include <cstdint>
 #include <span>
@@ -25,10 +26,6 @@ struct GlmRouteResult {
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
-[[nodiscard]] ValidationResult glm_rms_norm_f32(
-    std::span<float> output, std::span<const float> input,
-    std::span<const float> weight, float epsilon = kGlm52RmsNormEpsilon);
-
 [[nodiscard]] ValidationResult glm_layer_norm_f32(
     std::span<float> values, std::span<const float> weight,
     std::span<const float> bias, float epsilon = kGlm52IndexerNormEpsilon);
@@ -39,9 +36,6 @@ struct GlmRouteResult {
     std::span<float> values, std::uint64_t position,
     std::uint32_t rope_dimensions = kGlm52RopeDimensions,
     float theta = kGlm52RopeTheta);
-
-[[nodiscard]] float glm_sigmoid_f32(float value) noexcept;
-[[nodiscard]] float glm_silu_f32(float value) noexcept;
 
 // Applies the pinned sigmoid/noaux_tc rule to precomputed router logits. The
 // correction bias participates in top-k selection only; returned weights come

@@ -26,6 +26,7 @@ struct Options {
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
     double temperature{};
+    double vram_fraction{0.85};
     std::uint64_t seed{33'377'335U};
     bool devices_explicit{};
 };
@@ -35,7 +36,8 @@ void usage() {
         << "usage: strata-chat --model DIR --model-type deepseek|glm\n"
         << "                    [--context-size N] [--max-new N]\n"
         << "                    [--temperature F] [--seed N]\n"
-        << "                    [--devices 0,1,2] [--prompt TEXT]\n\n"
+        << "                    [--devices 0,1,2] [--vram-fraction F]\n"
+        << "                    [--prompt TEXT]\n\n"
         << "Without --prompt, read one question per line until EOF.\n";
 }
 
@@ -92,6 +94,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (!parse_u32(next(), options.max_new_tokens)) return false;
         } else if (argument == "--temperature") {
             if (!parse_double(next(), options.temperature)) return false;
+        } else if (argument == "--vram-fraction") {
+            if (!parse_double(next(), options.vram_fraction)) return false;
         } else if (argument == "--seed") {
             if (!parse_u64(next(), options.seed)) return false;
         } else if (argument == "--devices") {
@@ -329,6 +333,7 @@ int main(int argc, char** argv) {
               << " context=" << options.context_size
               << " max_new=" << options.max_new_tokens
               << " temperature=" << options.temperature
+              << " vram_fraction=" << options.vram_fraction
               << " seed=" << options.seed << '\n'
               << "[contract] "
               << (options.temperature == 0.0 ? "exact greedy" : "seeded Gumbel-max sampled")
@@ -339,6 +344,7 @@ int main(int argc, char** argv) {
         strata::Glm52RuntimeConfig config;
         config.devices = options.devices;
         config.maximum_context_tokens = options.context_size;
+        config.vram_cache_fraction = options.vram_fraction;
         config.verbose = false;
         config.load_progress = true;
         config.sampling_temperature = options.temperature;
@@ -362,6 +368,7 @@ int main(int argc, char** argv) {
         strata::Dsv4RuntimeConfig config;
         config.devices = options.devices;
         config.maximum_context_tokens = options.context_size;
+        config.vram_cache_fraction = options.vram_fraction;
         config.verbose = true;
         config.sampling_temperature = options.temperature;
         config.sampling_seed = options.seed;

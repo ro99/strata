@@ -162,6 +162,10 @@ load time. Chat defaults to greedy decoding (`--temperature 0`) for deterministi
 output. Pass `--temperature 1` to enable seeded Gumbel-max sampling. Runtime and
 benchmark APIs remain greedy by default, so sampling is never enabled silently.
 
+`--vram-fraction` controls the fraction of each GPU's free memory budgeted for
+weight caching (default 0.85, valid range `(0, 0.95]`). Raise it (e.g., `0.95`)
+to keep more experts resident when free VRAM allows.
+
 For a sanitizer build:
 
 ```bash

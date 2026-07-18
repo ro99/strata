@@ -10,6 +10,7 @@ maximum_context=${MAX_CONTEXT_TOKENS:-8192}
 maximum_new=${MAX_NEW_TOKENS:-16}
 prompt=${PROMPT:-hello}
 temperature=${TEMPERATURE:-0}
+vram_fraction=${VRAM_FRACTION:-}
 seed=${SAMPLING_SEED:-33377335}
 
 mkdir -p "${result_dir}"
@@ -23,6 +24,7 @@ command_line=$(printf '%q ' \
     --max-new "${maximum_new}" \
     --temperature "${temperature}" \
     --seed "${seed}" \
+    ${vram_fraction:+--vram-fraction "${vram_fraction}"} \
     --prompt "${prompt}")
 
 script --quiet --return --command "${command_line}" \

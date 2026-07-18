@@ -34,7 +34,7 @@ TEST_CASE("GLM single-user chat rendering matches the pinned template") {
 
 TEST_CASE("real GLM tokenizer produces the frozen baseline prompt ids when available") {
     const auto path = tokenizer_fixture();
-    if (!std::filesystem::exists(path)) return;
+    if (!std::filesystem::exists(path)) SKIP("pinned GLM tokenizer fixture is absent");
     const auto tokenizer = strata::ModelTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     const auto rendered = strata::render_glm52_user_prompt(kPrompt);
@@ -55,7 +55,7 @@ TEST_CASE("real GLM tokenizer produces the frozen baseline prompt ids when avail
 
 TEST_CASE("GLM tokenizer matches the canonical Unicode byte-level BPE ids") {
     const auto path = tokenizer_fixture();
-    if (!std::filesystem::exists(path)) return;
+    if (!std::filesystem::exists(path)) SKIP("pinned GLM tokenizer fixture is absent");
     const auto tokenizer = strata::ModelTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     const auto encoded = tokenizer.value.encode("olá");
@@ -78,7 +78,7 @@ TEST_CASE("committed tokenizer pretoken boundaries cover both model contracts") 
 
 TEST_CASE("real DeepSeek V4 tokenizer and single-user chat rendering are supported") {
     const auto path = deepseek_tokenizer_fixture();
-    if (!std::filesystem::exists(path)) return;
+    if (!std::filesystem::exists(path)) SKIP("pinned DeepSeek tokenizer fixture is absent");
     const auto tokenizer = strata::ModelTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     const auto rendered = strata::render_deepseek_v4_user_prompt("hello");
@@ -96,7 +96,7 @@ TEST_CASE("real DeepSeek V4 tokenizer and single-user chat rendering are support
 
 TEST_CASE("DeepSeek V4 byte-level decode produces valid UTF-8 across adjacent tokens") {
     const auto path = deepseek_tokenizer_fixture();
-    if (!std::filesystem::exists(path)) return;
+    if (!std::filesystem::exists(path)) SKIP("pinned DeepSeek tokenizer fixture is absent");
     const auto tokenizer = strata::ModelTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
 
@@ -116,7 +116,7 @@ TEST_CASE("DeepSeek V4 byte-level decode produces valid UTF-8 across adjacent to
 
 TEST_CASE("DeepSeek V4 tokenizer matches Unicode and digit-split canonical ids") {
     const auto path = deepseek_tokenizer_fixture();
-    if (!std::filesystem::exists(path)) return;
+    if (!std::filesystem::exists(path)) SKIP("pinned DeepSeek tokenizer fixture is absent");
     const auto tokenizer = strata::ModelTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     const auto encoded = tokenizer.value.encode("é1234");

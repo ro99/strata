@@ -2,8 +2,10 @@
 
 #include "strata/deepseek_ops.hpp"
 #include "strata/glm_ops.hpp"
+#include "strata/numerics.hpp"
 #include "strata/sampling.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -697,9 +700,12 @@ struct DeepSeekV4Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
-    std::ofstream route_trace;
+    RouteTraceWriter route_trace;
     std::mt19937_64 sampler;
     bool initialized{};
+    std::uint64_t active_request_id{};
+    std::uint64_t generated_requests{};
+    std::uint32_t active_prompt_tokens{};
 
     [[nodiscard]] std::size_t layer_device(std::uint32_t layer) const {
         return schedule[layer % schedule.size()];
@@ -762,7 +768,7 @@ struct DeepSeekV4Runtime::Impl {
             append_errors(result, std::move(weight.errors));
             return result;
         }
-        result = glm_rms_norm_f32(output, input, *weight.value, kRmsEpsilon);
+        result = rms_norm_f32(output, input, *weight.value, kRmsEpsilon);
         if (result.ok()) round_bf16(output);
         return result;
     }
@@ -1753,19 +1759,16 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
         record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
     }
     if (route_trace.is_open()) {
-        route_trace << "{\"position\":" << position << ",\"layer\":" << layer
-                    << ",\"token\":" << token << ",\"experts\":[";
-        for (std::size_t index = 0U; index < route.value.experts.size(); ++index) {
-            if (index != 0U) route_trace << ',';
-            route_trace << route.value.experts[index];
-        }
-        route_trace << "],\"weights\":[" << std::setprecision(
-            std::numeric_limits<float>::max_digits10);
-        for (std::size_t index = 0U; index < route.value.weights.size(); ++index) {
-            if (index != 0U) route_trace << ',';
-            route_trace << route.value.weights[index];
-        }
-        route_trace << "]}\n";
+        RouteEvent event;
+        event.request = active_request_id;
+        event.token_position = position;
+        event.layer = layer;
+        event.experts = route.value.experts;
+        event.coefficients = route.value.weights;
+        event.phase = position < active_prompt_tokens
+                          ? RoutePhase::Prefill : RoutePhase::Decode;
+        auto written = route_trace.write(event);
+        if (!written.ok()) return written;
     }
 
     if (config.enable_device_moe) {
@@ -1921,7 +1924,7 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
             projected += static_cast<double>((*head_projection.value)[row + column]) *
                          hidden[column];
         }
-        const float coefficient = glm_sigmoid_f32(
+        const float coefficient = sigmoid_f32(
             static_cast<float>(projected) * reciprocal * (*head_scale.value)[0] +
             (*head_base.value)[copy]) + kRmsEpsilon;
         for (std::uint32_t column = 0U; column < kHidden; ++column) {
@@ -2083,17 +2086,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->capacities = weight_capacities;
     impl_->schedule = std::move(schedule);
     if (!config.route_trace_path.empty()) {
-        impl_->route_trace.open(config.route_trace_path,
-                                std::ios::out | std::ios::trunc);
-        if (!impl_->route_trace.is_open()) {
-            result.errors.emplace_back("cannot open DeepSeek route trace: " +
-                                       config.route_trace_path);
-            return result;
-        }
-        impl_->route_trace
-            << "{\"schema\":\"strata.deepseek_v4.route_trace\",\"version\":1,"
-               "\"position_base\":0,\"layer_base\":0,\"router_order\":true,"
-               "\"coefficient_encoding\":\"float32-roundtrip-decimal\"}\n";
+        result = impl_->route_trace.open(config.route_trace_path);
+        if (!result.ok()) return result;
     }
     if (config.verbose) {
         for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
@@ -2225,6 +2219,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
         return result;
     }
     result.prompt_token_ids = encoded.value;
+    impl_->active_request_id = impl_->generated_requests++;
+    impl_->active_prompt_tokens = static_cast<std::uint32_t>(encoded.value.size());
     impl_->reset_diagnostics();
     const auto active_context_tokens = static_cast<std::uint32_t>(
         encoded.value.size() + maximum_new_tokens);
@@ -2350,10 +2346,10 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
             "DeepSeek zero-NVMe decode contract was violated by checkpoint reads");
     }
     if (impl_->route_trace.is_open()) {
-        impl_->route_trace.flush();
-        if (!impl_->route_trace.good()) {
-            result.errors.emplace_back("cannot flush DeepSeek route trace");
-        }
+        auto flushed = impl_->route_trace.flush();
+        result.errors.insert(result.errors.end(),
+                             std::make_move_iterator(flushed.errors.begin()),
+                             std::make_move_iterator(flushed.errors.end()));
     }
     return result;
 }

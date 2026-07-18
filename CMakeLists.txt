@@ -27,6 +27,7 @@ endif()
 
 add_library(strata_core STATIC
     src/checkpoint.cpp
+    src/checkpoint_io.cpp
     src/compressed_tensors.cpp
     ${STRATA_CUDA_SOURCE}
     src/glm_ops.cpp
@@ -40,6 +41,7 @@ add_library(strata_core STATIC
     src/deepseek_runtime.cpp
     src/json_cursor.cpp
     src/model.cpp
+    src/numerics.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
     src/worker_pool.cpp

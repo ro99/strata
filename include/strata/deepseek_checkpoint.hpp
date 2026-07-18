@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/cuda_backend.hpp"
+#include "strata/checkpoint_io.hpp"
 #include "strata/deepseek_manifest.hpp"
 
 #include <atomic>
@@ -77,7 +78,7 @@ private:
     std::string model_directory_;
     Dsv4IndexManifest manifest_;
     std::unordered_map<std::string_view, std::size_t> tensors_;
-    std::unordered_map<std::string, int> shard_fds_;
+    CheckpointShardSet shards_;
     mutable std::atomic<std::uint64_t> read_calls_{};
     mutable std::atomic<std::uint64_t> read_bytes_{};
     mutable std::atomic<std::uint64_t> read_nanoseconds_{};

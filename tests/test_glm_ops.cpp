@@ -21,7 +21,8 @@ TEST_CASE("GLM RMSNorm uses the pinned affine RMS definition") {
     const std::array<float, 3> input{1.0F, 2.0F, 3.0F};
     const std::array<float, 3> weight{1.0F, 0.5F, 2.0F};
     std::array<float, 3> output{};
-    REQUIRE(strata::glm_rms_norm_f32(output, input, weight).ok());
+    REQUIRE(strata::rms_norm_f32(
+        output, input, weight, strata::kGlm52RmsNormEpsilon).ok());
     const float reciprocal = 1.0F / std::sqrt(14.0F / 3.0F + 1.0e-5F);
     REQUIRE(std::abs(output[0] - reciprocal) < 1.0e-6F);
     REQUIRE(std::abs(output[1] - reciprocal) < 1.0e-6F);
@@ -55,8 +56,8 @@ TEST_CASE("GLM router correction bias changes selection but not coefficient sour
     REQUIRE(result.ok());
     REQUIRE(result.value.experts[0] == 3U);
     REQUIRE(result.value.experts[1] == 0U);
-    const float first = strata::glm_sigmoid_f32(logits[3]);
-    const float second = strata::glm_sigmoid_f32(logits[0]);
+    const float first = strata::sigmoid_f32(logits[3]);
+    const float second = strata::sigmoid_f32(logits[0]);
     REQUIRE(std::abs(result.value.weights[0] - first / (first + second) * 2.5F) < 1.0e-6F);
     REQUIRE(std::abs(result.value.weights[1] - second / (first + second) * 2.5F) < 1.0e-6F);
 }

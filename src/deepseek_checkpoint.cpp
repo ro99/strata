@@ -68,12 +68,7 @@ void move_errors(ValidationResult& result, std::vector<std::string> errors) {
 
 }  // namespace
 
-Dsv4CheckpointReader::~Dsv4CheckpointReader() {
-    for (const auto& [name, descriptor] : shard_fds_) {
-        static_cast<void>(name);
-        if (descriptor >= 0) static_cast<void>(close(descriptor));
-    }
-}
+Dsv4CheckpointReader::~Dsv4CheckpointReader() = default;
 
 Dsv4CheckpointOpenResult Dsv4CheckpointReader::open(std::string model_directory,
                                                     bool require_read_only) {
@@ -112,15 +107,11 @@ Dsv4CheckpointOpenResult Dsv4CheckpointReader::open(std::string model_directory,
          ++index_value) {
         reader->tensors_.emplace(reader->manifest_.tensors[index_value].name, index_value);
     }
-    for (const auto& shard : reader->manifest_.shards) {
-        const auto path = (std::filesystem::path(reader->model_directory_) / shard).string();
-        const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (descriptor < 0) {
-            result.errors.emplace_back("cannot open DeepSeek checkpoint shard " + path +
-                                       ": " + std::strerror(errno));
-            return result;
-        }
-        reader->shard_fds_.emplace(shard, descriptor);
+    auto opened = reader->shards_.open(reader->model_directory_,
+                                       reader->manifest_.shards, "DeepSeek");
+    if (!opened.ok()) {
+        result.errors = std::move(opened.errors);
+        return result;
     }
     result.value = std::move(reader);
     return result;
@@ -154,32 +145,15 @@ ValidationResult Dsv4CheckpointReader::pread_tensor_into(
         result.errors.emplace_back("tensor slice exceeds " + tensor.name);
         return result;
     }
-    const auto found = shard_fds_.find(tensor.shard);
-    if (found == shard_fds_.end()) {
-        result.errors.emplace_back("DeepSeek checkpoint shard is not open for " + tensor.name);
+    if (tensor.source_offset > std::numeric_limits<std::uint64_t>::max() -
+                                   relative_offset) {
+        result.errors.emplace_back("tensor file offset overflows");
         return result;
     }
     const auto started = std::chrono::steady_clock::now();
-    std::uint64_t completed = 0U;
-    while (completed < bytes) {
-        const auto request = static_cast<std::size_t>(std::min<std::uint64_t>(
-            bytes - completed, static_cast<std::uint64_t>(std::numeric_limits<ssize_t>::max())));
-        const auto count = pread(found->second, destination.data() + completed, request,
-                                 static_cast<off_t>(tensor.source_offset + relative_offset +
-                                                    completed));
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            result.errors.emplace_back("cannot read DeepSeek tensor " + tensor.name + ": " +
-                                       std::strerror(errno));
-            return result;
-        }
-        if (count == 0) {
-            result.errors.emplace_back("unexpected end of DeepSeek shard reading " +
-                                       tensor.name);
-            return result;
-        }
-        completed += static_cast<std::uint64_t>(count);
-    }
+    result = shards_.read(tensor.shard, tensor.source_offset + relative_offset,
+                          destination, tensor.name);
+    if (!result.ok()) return result;
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - started);
     read_calls_.fetch_add(1U, std::memory_order_relaxed);

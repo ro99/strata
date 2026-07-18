@@ -1,6 +1,6 @@
 #include "strata/deepseek_ops.hpp"
 
-#include "strata/glm_ops.hpp"
+#include "strata/numerics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -374,7 +374,7 @@ ValidationResult dsv4_swiglu_f32(std::span<float> output,
         }
         const float limited_gate = std::min(gate[index], limit);
         const float limited_up = std::clamp(up[index], -limit, limit);
-        output[index] = glm_silu_f32(limited_gate) * limited_up;
+        output[index] = silu_f32(limited_gate) * limited_up;
     }
     return result;
 }
@@ -473,8 +473,8 @@ Dsv4MhcMixResult dsv4_mhc_split_sinkhorn_f32(
     result.value.combination.resize(static_cast<std::size_t>(multiplier) * multiplier);
     for (std::uint32_t index = 0U; index < multiplier; ++index) {
         result.value.pre[index] =
-            glm_sigmoid_f32(mixes[index] * scale[0] + base[index]) + epsilon;
-        result.value.post[index] = 2.0F * glm_sigmoid_f32(
+            sigmoid_f32(mixes[index] * scale[0] + base[index]) + epsilon;
+        result.value.post[index] = 2.0F * sigmoid_f32(
             mixes[multiplier + index] * scale[1] + base[multiplier + index]);
     }
     const auto offset = static_cast<std::size_t>(2U * multiplier);

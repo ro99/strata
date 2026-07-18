@@ -1,5 +1,5 @@
 #include "strata/cuda_backend.hpp"
-#include "strata/glm_ops.hpp"
+#include "strata/numerics.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -1393,7 +1393,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             for (std::size_t index = 0U; index < entries; ++index) {
                 const auto bits = static_cast<std::uint32_t>(index) << 16U;
                 const float value = std::bit_cast<float>(bits);
-                values[index] = std::isfinite(value) ? glm_silu_f32(value) : value;
+                values[index] = std::isfinite(value) ? silu_f32(value) : value;
             }
             return values;
         }();

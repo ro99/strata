@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strata/result.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -52,14 +54,6 @@ struct SafetensorsShard {
     std::uint64_t header_size{};
     std::uint64_t data_start{};
     std::vector<SafetensorsTensor> tensors;
-};
-
-template <typename T>
-struct ParseResult {
-    T value;
-    std::vector<std::string> errors;
-
-    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
 [[nodiscard]] ParseResult<SafetensorsIndex> parse_safetensors_index(

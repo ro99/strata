@@ -4,6 +4,7 @@
 #include "strata/glm_int4.hpp"
 #include "strata/sampling.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
@@ -519,7 +520,7 @@ struct Glm52Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::uint32_t, std::vector<float>> embedding_rows;
     std::vector<LayerKv> kv{kLayers};
-    std::ofstream route_trace;
+    RouteTraceWriter route_trace;
     std::mt19937_64 sampler;
     bool initialized{};
     std::uint32_t last_second_token{};
@@ -554,22 +555,14 @@ struct Glm52Runtime::Impl {
     bool write_route(std::uint32_t position, std::uint32_t layer,
                      const GlmRoute& route, bool prefill) {
         if (!route_trace.is_open()) return true;
-        route_trace << "{\"request\":" << active_request_id
-                    << ",\"phase\":\"" << (prefill ? "prefill" : "decode")
-                    << "\",\"token_position\":" << position
-                    << ",\"layer\":" << layer << ",\"experts\":[";
-        for (std::size_t rank = 0; rank < route.experts.size(); ++rank) {
-            if (rank != 0U) route_trace << ',';
-            route_trace << route.experts[rank];
-        }
-        route_trace << "],\"coefficients\":[" << std::setprecision(
-            std::numeric_limits<float>::max_digits10);
-        for (std::size_t rank = 0; rank < route.weights.size(); ++rank) {
-            if (rank != 0U) route_trace << ',';
-            route_trace << route.weights[rank];
-        }
-        route_trace << "]}\n";
-        return route_trace.good();
+        RouteEvent event;
+        event.request = active_request_id;
+        event.token_position = position;
+        event.layer = layer;
+        event.experts = route.experts;
+        event.coefficients = route.weights;
+        event.phase = prefill ? RoutePhase::Prefill : RoutePhase::Decode;
+        return route_trace.write(event).ok();
     }
 
     ParseResult<const std::vector<float>*> host_tensor(std::string name,
@@ -695,10 +688,10 @@ struct Glm52Runtime::Impl {
             return result;
         }
         for (std::uint32_t row = 0; row < rows; ++row) {
-            auto status = glm_rms_norm_f32(
+            auto status = rms_norm_f32(
                 output.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
                 input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
-                *weight.value);
+                *weight.value, kGlm52RmsNormEpsilon);
             if (!status.ok()) return status;
         }
         return result;
@@ -720,12 +713,12 @@ struct Glm52Runtime::Impl {
             return result;
         }
         for (std::uint32_t row = 0; row < rows; ++row) {
-            auto status = glm_rms_norm_f32(
+            auto status = rms_norm_f32(
                 std::span<float>(query_residual).subspan(
                     static_cast<std::size_t>(row) * kQueryLora, kQueryLora),
                 std::span<const float>(query_residual).subspan(
                     static_cast<std::size_t>(row) * kQueryLora, kQueryLora),
-                *query_norm.value);
+                *query_norm.value, kGlm52RmsNormEpsilon);
             if (!status.ok()) return status;
         }
         std::vector<float> queries(static_cast<std::size_t>(rows) * kHeads * kQueryHead);
@@ -759,8 +752,8 @@ struct Glm52Runtime::Impl {
                 static_cast<std::size_t>(row) * (kKvLora + kRope), kKvLora + kRope);
             auto destination = std::span<float>(latent).subspan(
                 static_cast<std::size_t>(row) * kKvLora, kKvLora);
-            auto status = glm_rms_norm_f32(destination, source.first(kKvLora),
-                                            *kv_norm.value);
+            auto status = rms_norm_f32(destination, source.first(kKvLora),
+                                       *kv_norm.value, kGlm52RmsNormEpsilon);
             if (!status.ok()) return status;
             auto rope_destination = std::span<float>(new_rope).subspan(
                 static_cast<std::size_t>(row) * kRope, kRope);
@@ -850,7 +843,7 @@ struct Glm52Runtime::Impl {
                         kHidden, input, rows, up);
         if (!result.ok()) return result;
         for (std::size_t index = 0; index < gate.size(); ++index) {
-            gate[index] = glm_silu_f32(gate[index]) * up[index];
+            gate[index] = silu_f32(gate[index]) * up[index];
         }
         return linear(device, std::string(prefix) + "down_proj", kHidden,
                       intermediate, gate, rows, output);
@@ -962,7 +955,7 @@ struct Glm52Runtime::Impl {
         if (status.ok()) {
             for (std::size_t index = 0; index < gate_output.size(); ++index) {
                 gate_output[index] =
-                    glm_silu_f32(gate_output[index]) * up_output[index];
+                    silu_f32(gate_output[index]) * up_output[index];
             }
             status = host_matvec(down.value, gate_output, job.output);
         }
@@ -1102,7 +1095,7 @@ struct Glm52Runtime::Impl {
             for (auto& item : work) {
                 for (std::size_t index = 0; index < item.gate_output.size(); ++index) {
                     item.gate_output[index] =
-                        glm_silu_f32(item.gate_output[index]) *
+                        silu_f32(item.gate_output[index]) *
                         item.up_output[index];
                 }
             }
@@ -1348,7 +1341,8 @@ struct Glm52Runtime::Impl {
         }
         std::vector<float> normalized(kHidden);
         const auto last = std::span<const float>(hidden).last(kHidden);
-        status = glm_rms_norm_f32(normalized, last, *final_norm.value);
+        status = rms_norm_f32(normalized, last, *final_norm.value,
+                              kGlm52RmsNormEpsilon);
         if (!status.ok()) {
             result.errors = std::move(status.errors);
             return result;
@@ -1437,16 +1431,8 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
     if (!config.route_trace_path.empty()) {
-        impl_->route_trace.open(config.route_trace_path, std::ios::out | std::ios::trunc);
-        if (!impl_->route_trace.is_open()) {
-            result.errors.emplace_back("cannot open GLM route trace: " +
-                                       config.route_trace_path);
-            return result;
-        }
-        impl_->route_trace
-            << "{\"schema\":\"strata.glm52.route_trace\",\"version\":1,"
-               "\"position_base\":0,\"layer_base\":0,\"router_order\":true,"
-               "\"coefficient_encoding\":\"float32-roundtrip-decimal\"}\n";
+        result = impl_->route_trace.open(config.route_trace_path);
+        if (!result.ok()) return result;
     }
 
     std::vector<std::uint64_t> capacities;
@@ -1632,10 +1618,8 @@ Glm52GenerationResult Glm52Runtime::generate_stream(
     result.metrics.host_experts = host_expert_delta(host_after_decode, host_before);
     result.metrics.detailed_timing = impl_->config.detailed_timing;
     if (impl_->route_trace.is_open()) {
-        impl_->route_trace.flush();
-        if (!impl_->route_trace.good()) {
-            result.errors.emplace_back("cannot flush GLM route trace");
-        }
+        auto flushed = impl_->route_trace.flush();
+        move_errors(result.errors, std::move(flushed));
     }
     return result;
 }

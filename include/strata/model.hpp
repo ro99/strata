@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/result.hpp"
 #include "strata/types.hpp"
 
 #include <cstdint>
@@ -148,12 +149,6 @@ struct ModelSpec {
     std::uint32_t dense_prefix_layers{};
     std::uint32_t shared_experts{};
     std::uint32_t expert_intermediate_size{};
-};
-
-struct ValidationResult {
-    std::vector<std::string> errors;
-
-    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
 [[nodiscard]] ValidationResult validate_model(const ModelSpec& spec);

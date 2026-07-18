@@ -4,6 +4,7 @@
 #include "strata/glm_int4.hpp"
 #include "strata/model_adapter.hpp"
 #include "strata/sampling.hpp"
+#include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
 #include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
@@ -1394,20 +1395,14 @@ Glm52Runtime& Glm52Runtime::operator=(Glm52Runtime&&) noexcept = default;
 ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
                                           const Glm52RuntimeConfig& config) {
     ValidationResult result;
-    if (config.devices.empty()) {
-        result.errors.emplace_back("GLM runtime requires at least one CUDA device");
+    if (impl_->initialized) {
+        result.errors.emplace_back("GLM runtime is already initialized");
         return result;
     }
-    if (!std::isfinite(config.vram_cache_fraction) ||
-        config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
-        result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
-        return result;
-    }
-    if (!std::isfinite(config.sampling_temperature) ||
-        config.sampling_temperature < 0.0 || config.sampling_temperature > 10.0) {
-        result.errors.emplace_back("GLM sampling temperature must be within [0, 10]");
-        return result;
-    }
+    result = validate_common_runtime_config(
+        config.devices, config.vram_cache_fraction,
+        config.sampling_temperature, "GLM");
+    if (!result.ok()) return result;
     if (config.maximum_context_tokens == 0U ||
         config.maximum_context_tokens > kDsaThreshold) {
         result.errors.emplace_back(
@@ -1419,6 +1414,10 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         result.errors.emplace_back("host expert worker count must be in [1, 256]");
         return result;
     }
+    // A failed prior attempt may have populated caches or backend state. Build
+    // every new attempt from a fresh implementation; a successful runtime is
+    // explicitly one-shot and rejected above.
+    impl_ = std::make_unique<Impl>();
     auto checkpoint = GlmCheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
         result.errors = std::move(checkpoint.errors);
@@ -1439,30 +1438,13 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         if (!result.ok()) return result;
     }
 
-    std::vector<std::uint64_t> capacities;
-    std::vector<std::uint64_t> totals;
-    for (const auto device : config.devices) {
-        auto memory = CudaBackend::device_memory(device);
-        if (!memory.ok()) {
-            result.errors = std::move(memory.errors);
-            return result;
-        }
-        const auto capacity = static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * config.vram_cache_fraction);
-        if (capacity < (2ULL << 30U)) {
-            result.errors.emplace_back("CUDA device has less than 2 GiB available for weights");
-            return result;
-        }
-        capacities.push_back(capacity);
-        totals.push_back(memory.value.total_bytes);
+    auto device_plan = plan_runtime_devices(
+        config.devices, config.vram_cache_fraction, 0U, 2ULL << 30U, "GLM");
+    if (!device_plan.ok()) {
+        result.errors = std::move(device_plan.errors);
+        return result;
     }
-    const auto smallest = *std::min_element(totals.begin(), totals.end());
-    std::vector<std::size_t> schedule;
-    for (std::size_t slot = 0; slot < totals.size(); ++slot) {
-        const auto shares = std::max<std::uint64_t>(
-            1U, (totals[slot] * 2U + smallest / 2U) / smallest);
-        for (std::uint64_t count = 0; count < shares; ++count) schedule.push_back(slot);
-    }
+    auto capacities = std::move(device_plan.value.weight_capacities);
 
     impl_->config = config;
     impl_->sampler.seed(config.sampling_seed);
@@ -1470,7 +1452,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
     impl_->capacities = capacities;
-    impl_->device_schedule = std::move(schedule);
+    impl_->device_schedule = std::move(device_plan.value.weighted_schedule);
     impl_->weights = std::make_unique<WeightCache>(*impl_->checkpoint, impl_->cuda,
                                                    impl_->devices, capacities);
     if (config.host_cold_experts) {

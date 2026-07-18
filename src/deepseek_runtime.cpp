@@ -4,6 +4,7 @@
 #include "strata/model_adapter.hpp"
 #include "strata/numerics.hpp"
 #include "strata/sampling.hpp"
+#include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
 #include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
@@ -1965,21 +1966,14 @@ ValidationResult DeepSeekV4Runtime::initialize(
     const std::string& model_directory, const Dsv4RuntimeConfig& config) {
     ValidationResult result;
     const auto initialization_started = std::chrono::steady_clock::now();
-    if (config.devices.empty()) {
-        result.errors.emplace_back("DeepSeek runtime requires at least one CUDA device");
+    if (impl_->initialized) {
+        result.errors.emplace_back("DeepSeek runtime is already initialized");
         return result;
     }
-    if (!std::isfinite(config.vram_cache_fraction) ||
-        config.vram_cache_fraction <= 0.0 || config.vram_cache_fraction > 0.95) {
-        result.errors.emplace_back("VRAM cache fraction must be in (0, 0.95]");
-        return result;
-    }
-    if (!std::isfinite(config.sampling_temperature) ||
-        config.sampling_temperature < 0.0 || config.sampling_temperature > 10.0) {
-        result.errors.emplace_back(
-            "DeepSeek sampling temperature must be within [0, 10]");
-        return result;
-    }
+    result = validate_common_runtime_config(
+        config.devices, config.vram_cache_fraction,
+        config.sampling_temperature, "DeepSeek");
+    if (!result.ok()) return result;
     const auto model_context =
         deepseek_v4_flash_dspark_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
@@ -2019,6 +2013,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "the base-model executor; refusing a silent approximation");
         return result;
     }
+    impl_ = std::make_unique<Impl>();
     auto checkpoint = Dsv4CheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
         result.errors = std::move(checkpoint.errors);
@@ -2033,26 +2028,15 @@ ValidationResult DeepSeekV4Runtime::initialize(
     result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
 
-    std::vector<std::uint64_t> capacities;
-    std::vector<std::uint64_t> weight_capacities;
-    std::vector<std::uint64_t> totals;
-    for (const auto device : config.devices) {
-        auto memory = CudaBackend::device_memory(device);
-        if (!memory.ok()) {
-            result.errors = std::move(memory.errors);
-            return result;
-        }
-        const auto capacity = static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * config.vram_cache_fraction);
-        if (capacity < (2ULL << 30U)) {
-            result.errors.emplace_back(
-                "CUDA device has less than 2 GiB available for DeepSeek weights");
-            return result;
-        }
-        capacities.push_back(capacity);
-        weight_capacities.push_back(capacity - kDeviceWorkspaceReserve);
-        totals.push_back(memory.value.total_bytes);
+    auto device_plan = plan_runtime_devices(
+        config.devices, config.vram_cache_fraction, kDeviceWorkspaceReserve,
+        2ULL << 30U, "DeepSeek");
+    if (!device_plan.ok()) {
+        result.errors = std::move(device_plan.errors);
+        return result;
     }
+    auto capacities = std::move(device_plan.value.budgets);
+    auto weight_capacities = std::move(device_plan.value.weight_capacities);
     const auto admission_started = std::chrono::steady_clock::now();
     Dsv4AdmissionConfig admission_config;
     admission_config.host_memory_ceiling_bytes = config.host_memory_limit_bytes;
@@ -2069,15 +2053,6 @@ ValidationResult DeepSeekV4Runtime::initialize(
         return result;
     }
 
-    const auto smallest = *std::min_element(totals.begin(), totals.end());
-    std::vector<std::size_t> schedule;
-    for (std::size_t slot = 0U; slot < totals.size(); ++slot) {
-        const auto shares = std::max<std::uint64_t>(
-            1U, (totals[slot] * 2U + smallest / 2U) / smallest);
-        for (std::uint64_t count = 0U; count < shares; ++count) {
-            schedule.push_back(slot);
-        }
-    }
     impl_->config = config;
     impl_->sampler.seed(config.sampling_seed);
     impl_->memory = admission.plan;
@@ -2085,7 +2060,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
     impl_->capacities = weight_capacities;
-    impl_->schedule = std::move(schedule);
+    impl_->schedule = std::move(device_plan.value.weighted_schedule);
     if (!config.route_trace_path.empty()) {
         result = impl_->route_trace.open(config.route_trace_path);
         if (!result.ok()) return result;

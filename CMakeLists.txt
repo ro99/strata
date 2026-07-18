@@ -47,6 +47,8 @@ add_library(strata_core STATIC
     src/worker_pool.cpp
     src/trace.cpp
     src/route_predictor.cpp
+    src/runtime.cpp
+    src/runtime_support.cpp
     src/residency.cpp
     src/sampling.cpp
     src/simulator.cpp
@@ -128,6 +130,7 @@ if(BUILD_TESTING)
         tests/test_trace.cpp
         tests/test_predictor.cpp
         tests/test_residency.cpp
+        tests/test_runtime.cpp
         tests/test_sampling.cpp
         tests/test_safetensors.cpp
         tests/test_tokenizer.cpp

@@ -200,7 +200,7 @@ void parse_model(JsonCursor& cursor, bool& ignore_merges,
 
 }  // namespace
 
-GlmTokenizer::GlmTokenizer() {
+BpeTokenizer::BpeTokenizer() {
     codepoint_to_byte_.fill(-1);
     std::array<bool, 256> direct{};
     for (std::uint32_t value = 33U; value <= 126U; ++value) direct[value] = true;
@@ -214,8 +214,8 @@ GlmTokenizer::GlmTokenizer() {
     }
 }
 
-ParseResult<GlmTokenizer> GlmTokenizer::load(const std::string& path) {
-    ParseResult<GlmTokenizer> result;
+ParseResult<BpeTokenizer> BpeTokenizer::load(const std::string& path) {
+    ParseResult<BpeTokenizer> result;
     const auto text = load_bounded_text_file(path, 128ULL << 20U);
     if (!text.ok()) {
         result.errors = text.errors;
@@ -294,7 +294,7 @@ ParseResult<GlmTokenizer> GlmTokenizer::load(const std::string& path) {
     return result;
 }
 
-std::int32_t GlmTokenizer::token_id(std::string_view piece) const noexcept {
+std::int32_t BpeTokenizer::token_id(std::string_view piece) const noexcept {
     for (const auto& token : added_tokens_) {
         if (token.content == piece) return static_cast<std::int32_t>(token.id);
     }
@@ -302,7 +302,7 @@ std::int32_t GlmTokenizer::token_id(std::string_view piece) const noexcept {
     return found == vocabulary_.end() ? -1 : static_cast<std::int32_t>(found->second);
 }
 
-ParseResult<std::vector<std::uint32_t>> GlmTokenizer::encode_piece(
+ParseResult<std::vector<std::uint32_t>> BpeTokenizer::encode_piece(
     std::string_view bytes) const {
     ParseResult<std::vector<std::uint32_t>> result;
     std::string byte_level;
@@ -343,14 +343,12 @@ ParseResult<std::vector<std::uint32_t>> GlmTokenizer::encode_piece(
     return result;
 }
 
-ParseResult<std::vector<std::uint32_t>> GlmTokenizer::encode_plain_chunk(
+ParseResult<std::vector<std::uint32_t>> BpeTokenizer::encode_plain_chunk(
     std::string_view text) const {
     ParseResult<std::vector<std::uint32_t>> result;
     for (const auto value : text) {
         if (static_cast<unsigned char>(value) >= 0x80U) {
-            result.errors.emplace_back(
-                "non-ASCII encoding is not enabled; refusing to silently change tokenization");
-            return result;
+            return encode_piece(text);
         }
     }
     const auto emit = [&](std::size_t begin, std::size_t end,
@@ -465,7 +463,7 @@ ParseResult<std::vector<std::uint32_t>> GlmTokenizer::encode_plain_chunk(
     return result;
 }
 
-ParseResult<std::vector<std::uint32_t>> GlmTokenizer::encode(std::string_view text) const {
+ParseResult<std::vector<std::uint32_t>> BpeTokenizer::encode(std::string_view text) const {
     ParseResult<std::vector<std::uint32_t>> result;
     std::size_t cursor = 0;
     while (cursor < text.size()) {
@@ -494,7 +492,7 @@ ParseResult<std::vector<std::uint32_t>> GlmTokenizer::encode(std::string_view te
     return result;
 }
 
-ParseResult<std::string> GlmTokenizer::decode_token(std::uint32_t token) const {
+ParseResult<std::string> BpeTokenizer::decode_token(std::uint32_t token) const {
     ParseResult<std::string> result;
     if (token >= id_to_piece_.size() || id_to_piece_[token].empty()) {
         result.errors.emplace_back("token id is outside the pinned vocabulary");
@@ -521,7 +519,7 @@ ParseResult<std::string> GlmTokenizer::decode_token(std::uint32_t token) const {
     return result;
 }
 
-ParseResult<std::string> GlmTokenizer::decode(
+ParseResult<std::string> BpeTokenizer::decode(
     std::span<const std::uint32_t> tokens) const {
     ParseResult<std::string> result;
     for (const auto token : tokens) {

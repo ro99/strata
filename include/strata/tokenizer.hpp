@@ -12,11 +12,11 @@
 
 namespace strata {
 
-class GlmTokenizer {
+class BpeTokenizer {
 public:
-    GlmTokenizer();
+    BpeTokenizer();
 
-    [[nodiscard]] static ParseResult<GlmTokenizer> load(const std::string& path);
+    [[nodiscard]] static ParseResult<BpeTokenizer> load(const std::string& path);
     [[nodiscard]] ParseResult<std::vector<std::uint32_t>> encode(
         std::string_view text) const;
     [[nodiscard]] ParseResult<std::string> decode(

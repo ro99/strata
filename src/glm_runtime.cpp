@@ -509,7 +509,7 @@ struct ExpertJob {
 struct Glm52Runtime::Impl {
     Glm52RuntimeConfig config;
     std::unique_ptr<GlmCheckpointReader> checkpoint;
-    GlmTokenizer tokenizer;
+    BpeTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<WeightCache> weights;
     std::unique_ptr<HostWorkerPool> host_workers;
@@ -1428,7 +1428,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     }
     result = validate_runtime_graph_contract(*checkpoint.value);
     if (!result.ok()) return result;
-    auto tokenizer = GlmTokenizer::load(
+    auto tokenizer = BpeTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {
         result.errors = std::move(tokenizer.errors);

@@ -684,7 +684,7 @@ struct DeepSeekV4Runtime::Impl {
     Dsv4GenerationMetrics initialization_metrics;
     std::unique_ptr<Dsv4CheckpointReader> checkpoint;
     Dsv4ResidentWeightStore resident;
-    GlmTokenizer tokenizer;
+    BpeTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
     std::unique_ptr<HostWorkerPool> attention_workers;
@@ -2020,7 +2020,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result.errors = std::move(checkpoint.errors);
         return result;
     }
-    auto tokenizer = GlmTokenizer::load(
+    auto tokenizer = BpeTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {
         result.errors = std::move(tokenizer.errors);

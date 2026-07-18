@@ -1,6 +1,9 @@
 # Offline tools
 
-Planned dependency-light C++ tools:
+This directory contains small source-level helpers. Runnable applications built
+by CMake live under `apps/`; reproducible probes and benchmarks live under
+`scripts/`. The following dependency-light offline tools remain planned and are
+not current executables:
 
 - `strata-pack`: incremental Safetensors to immutable Strata model packs;
 - `strata-trace`: normalize sequential route captures;

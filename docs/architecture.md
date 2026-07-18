@@ -193,10 +193,13 @@ enabling DSpark rather than silently approximating it.
 
 ## Backend boundary
 
-The scheduler, model graph, and memory ownership are C++20. Kernels use a stable C
-ABI so CPU, CUDA, and future backends do not leak allocator or C++ ABI state across
-the boundary.
+The scheduler, model graph, and memory ownership are C++20. The standalone CPU
+Q4 reference exposes a stable C ABI. The optional CUDA implementation is isolated
+behind the `CudaBackend` ownership/API boundary so CUDA allocator and stream state
+do not leak into model adapters.
 
-The default CPU build has no external runtime dependencies. CUDA will be optional
-and dynamically isolated. Persistent arenas and explicit events replace per-call
-allocation and synchronization.
+The default CPU build has no external runtime dependencies. CUDA is selected at
+configure time when a compiler is available; otherwise an explicit error-returning
+stub is built. The native backend uses persistent arenas, workspaces, streams, and
+events, although individual synchronous API calls still synchronize when their
+host output contract requires it.

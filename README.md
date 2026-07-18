@@ -304,12 +304,14 @@ VRAM, peer, and NVMe budgets:
   --lease 16
 ```
 
-See [`docs/model-bringup.md`](docs/model-bringup.md),
+See the [`docs` index](docs/README.md) for the distinction between current-state,
+target-design, planning, and historical evidence documents. Detailed entry points
+include [`docs/model-bringup.md`](docs/model-bringup.md),
 [`docs/current-architecture.md`](docs/current-architecture.md),
 [`docs/architecture.md`](docs/architecture.md), and
 [`docs/research-roadmap.md`](docs/research-roadmap.md) for detailed contracts
-and future experiments. The staged, one-agent-at-a-time GLM throughput work is
-defined in
+and future experiments. The original staged, one-agent-at-a-time GLM throughput
+plan is preserved in
 [`docs/glm52-throughput-handoffs.md`](docs/glm52-throughput-handoffs.md).
 
 ## Engineering rules

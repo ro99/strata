@@ -1,6 +1,10 @@
 # GLM-5.2 throughput — progressive agent handoffs
 
-Status: **T0 and T1 complete; later performance stages have not started**.
+Status: **historical staged plan**. T0 and T1 were completed under this sequence.
+Subsequent work proceeded through separately bounded experiment branches and must
+be read from `docs/experiments/`, the current `README.md` baseline, and branch
+history. The statement that later performance work had not started is no longer
+current, and this file is not the live runtime status page.
 
 This document turns the topology, residency, and transfer proposal into a
 sequence of bounded assignments. It is written for agents that may not share a

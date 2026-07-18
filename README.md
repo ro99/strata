@@ -147,20 +147,19 @@ decoded tok/s in the terminal title without moving the answer cursor. Select the
 context ceiling at launch; CUDA devices default to `0,1,2`:
 
 ```bash
-./build/strata-chat --model models/GLM-5.2 --model-type glm \
-  --context-size 4096 --max-new 512 --devices 0,1,2
+./build/strata-chat --model models/glm52 --model-type glm \
+  --context-size 2048 --max-new 512 --devices 0,1,2
 
 ./build/strata-chat --model models/DeepSeek-V4-Flash-DSpark \
-  --model-type deepseek --context-size 8192 --max-new 256 --devices 0
+  --model-type deepseek --context-size 8192 --max-new 256 --devices 0,1,2
 ```
 
 The interactive form reads one prompt per line. For a single streamed request,
 add `--prompt 'Explain sparse attention.'`. `--context-size` is enforced by
 the selected runtime; the prompt plus `--max-new` must fit within it. Startup
 prints the selected devices, VRAM budgets, model-loading progress, and elapsed
-load time. Chat follows the checkpoints' intended sampling contract with seeded
-Gumbel-max sampling at temperature `1.0`; use `--temperature 0` for exact greedy
-diagnostics or `--seed N` for a reproducible sampled conversation. Runtime and
+load time. Chat defaults to greedy decoding (`--temperature 0`) for deterministic
+output. Pass `--temperature 1` to enable seeded Gumbel-max sampling. Runtime and
 benchmark APIs remain greedy by default, so sampling is never enabled silently.
 
 For a sanitizer build:

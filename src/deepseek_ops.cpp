@@ -594,8 +594,9 @@ ValidationResult dsv4_mhc_post_f32(
         for (std::size_t column = 0U; column < branch.size(); ++column) {
             float value = mix.post[destination] * branch[column];
             for (std::uint32_t source = 0U; source < multiplier; ++source) {
+                // The target contracts comb as [source, destination].
                 value += mix.combination[
-                             static_cast<std::size_t>(destination) * multiplier + source] *
+                             static_cast<std::size_t>(source) * multiplier + destination] *
                          residual_copies[
                              static_cast<std::size_t>(source) * branch.size() + column];
             }

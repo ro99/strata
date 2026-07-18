@@ -60,7 +60,7 @@ other declared FP8 linears retain native execution.
 - hash routes from `tid2eid` in layers 0–2 and bias-selected
   sqrt-softplus/noaux top-6 routes in later layers;
 - native FP4 routed experts, FP8 shared experts, asymmetric SwiGLU limit 10,
-  routed scale 1.5, and the target's twice-applied routed coefficient;
+  routed scale 1.5, and the target's once-applied routed coefficient;
 - greedy base-model decode with checkpoint-read accounting.
 
 Before initialization, admission reserves the non-DSpark routed experts and
@@ -108,15 +108,21 @@ caches are host-resident and lazily committed.
 
 ## Resident smoke evidence
 
-The initial executor incorrectly applied each routed expert coefficient twice
-before the down projection. The target inference code applies it once. This
-distorted every routed MoE layer and caused repetitive multilingual output even
-though the tokenizer and cache paths were correct. The host executor, CUDA MoE
-kernel, and CUDA reference fixture now all apply the coefficient once.
+The routed expert coefficient is applied once before the down projection, as in
+the bundled target inference code. The host executor, CUDA MoE kernel, and CUDA
+reference fixture use that same contract.
 
-Interactive chat also follows the checkpoint generation configuration with
-seeded Gumbel-max sampling at temperature 1.0. Exact runtime benchmarks remain
-greedy unless sampling is explicitly configured.
+The initial mHC post-mix treated the Sinkhorn combination matrix's rows as
+destinations and columns as sources. The target expression uses source rows and
+destination columns. That transpose affected both residual branches in every
+layer and caused repetitive or truncated multilingual words despite valid
+tokenization and UTF-8 decoding. A non-symmetric operation fixture now pins the
+target orientation.
+
+The interactive chat now defaults to greedy decoding (temperature 0) for
+deterministic output. Pass `--temperature 1` to enable seeded Gumbel-max
+sampling. Exact runtime benchmarks remain greedy unless sampling is
+explicitly configured.
 
 The reusable smoke completed in tmux session `strata-deepseek-v4-smoke` on
 2026-07-15 with prompt `Hi`, five prompt tokens, two emitted tokens, and one

@@ -3,6 +3,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -24,7 +25,7 @@ struct Options {
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
-    double temperature{1.0};
+    double temperature{};
     std::uint64_t seed{33'377'335U};
     bool devices_explicit{};
 };
@@ -126,23 +127,33 @@ public:
     }
 
     void token(std::string_view piece) {
-        std::cout << piece << std::flush;
+        pending_utf8_.append(piece.data(), piece.size());
+        flush_pending_utf8();
         ++emitted_;
         const auto now = std::chrono::steady_clock::now();
         if (!decode_started_) decode_started_ = now;
         if (interactive_) {
-            std::ostringstream title;
-            title << "strata-chat | " << emitted_ << " tokens | "
-                  << std::fixed << std::setprecision(2)
-                  << tokens_per_second(now) << " tok/s";
-            set_title(title.str());
-        } else if (emitted_ % 16U == 0U) {
+            if (pending_utf8_.empty()) {
+                std::ostringstream title;
+                title << "strata-chat | " << emitted_ << " tokens | "
+                      << std::fixed << std::setprecision(2)
+                      << tokens_per_second(now) << " tok/s";
+                set_title(title.str());
+            }
+        } else if (emitted_ % 16U == 0U && pending_utf8_.empty()) {
             std::cerr << "[decode] " << emitted_ << " tokens | "
                       << tokens_per_second(now) << " tok/s\n";
         }
     }
 
     void finish(double runtime_tok_s) {
+        flush_pending_utf8();
+        if (!pending_utf8_.empty()) {
+            const char replacement[] = "\xEF\xBF\xBD";
+            std::cout.write(replacement, 3);
+            pending_utf8_.clear();
+            std::cout << std::flush;
+        }
         if (interactive_) set_title("strata-chat | ready");
         std::cout << '\n';
         std::cerr << std::fixed << std::setprecision(2)
@@ -151,11 +162,118 @@ public:
     }
 
     void abort() {
+        flush_pending_utf8();
+        if (!pending_utf8_.empty()) {
+            const char replacement[] = "\xEF\xBF\xBD";
+            std::cout.write(replacement, 3);
+            pending_utf8_.clear();
+            std::cout << std::flush;
+        }
         if (interactive_) set_title("strata-chat | error");
         std::cout << '\n';
     }
 
 private:
+    // Returns >0 for a complete valid UTF-8 sequence, 0 if incomplete, -1 if invalid.
+    int consume_utf8_at(std::size_t pos) const {
+        const unsigned char lead = static_cast<unsigned char>(pending_utf8_[pos]);
+        const std::size_t remain = pending_utf8_.size() - pos;
+
+        if (lead <= 0x7FU) return 1;
+
+        if (lead >= 0xC2U && lead <= 0xDFU) {
+            if (remain < 2) return 0;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
+            return 2;
+        }
+
+        if (lead == 0xE0U) {
+            if (remain < 3) return 0;
+            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
+            if ((b2 & 0xC0U) != 0x80U || b2 < 0xA0U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            return 3;
+        }
+
+        if (lead >= 0xE1U && lead <= 0xECU) {
+            if (remain < 3) return 0;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            return 3;
+        }
+
+        if (lead == 0xEDU) {
+            if (remain < 3) return 0;
+            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
+            if ((b2 & 0xC0U) != 0x80U || b2 > 0x9FU) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            return 3;
+        }
+
+        if (lead >= 0xEEU && lead <= 0xEFU) {
+            if (remain < 3) return 0;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            return 3;
+        }
+
+        if (lead == 0xF0U) {
+            if (remain < 4) return 0;
+            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
+            if ((b2 & 0xC0U) != 0x80U || b2 < 0x90U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 3U]) & 0xC0U) != 0x80U) return -1;
+            return 4;
+        }
+
+        if (lead >= 0xF1U && lead <= 0xF3U) {
+            if (remain < 4) return 0;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 3U]) & 0xC0U) != 0x80U) return -1;
+            return 4;
+        }
+
+        if (lead == 0xF4U) {
+            if (remain < 4) return 0;
+            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
+            if ((b2 & 0xC0U) != 0x80U || b2 > 0x8FU) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
+            if ((static_cast<unsigned char>(pending_utf8_[pos + 3U]) & 0xC0U) != 0x80U) return -1;
+            return 4;
+        }
+
+        return -1;
+    }
+
+    void flush_pending_utf8() {
+        if (pending_utf8_.empty()) return;
+        std::size_t pos = 0;
+        while (pos < pending_utf8_.size()) {
+            const int result = consume_utf8_at(pos);
+            if (result > 0) {
+                pos += static_cast<std::size_t>(result);
+            } else if (result == 0) {
+                break;
+            } else {
+                if (pos > 0) {
+                    std::cout.write(pending_utf8_.data(), pos);
+                    pending_utf8_.erase(0, pos);
+                    pos = 0;
+                }
+                const char replacement[] = "\xEF\xBF\xBD";
+                std::cout.write(replacement, 3);
+                pending_utf8_.erase(0, 1);
+                std::cout << std::flush;
+            }
+        }
+        if (pos > 0) {
+            std::cout.write(pending_utf8_.data(), pos);
+            pending_utf8_.erase(0, pos);
+            std::cout << std::flush;
+        }
+    }
+
     double tokens_per_second(std::chrono::steady_clock::time_point now) const {
         if (!decode_started_ || emitted_ < 2U) return 0.0;
         const double seconds = std::chrono::duration<double>(
@@ -169,6 +287,7 @@ private:
 
     bool interactive_{};
     std::uint64_t emitted_{};
+    std::string pending_utf8_;
     std::optional<std::chrono::steady_clock::time_point> decode_started_;
 };
 

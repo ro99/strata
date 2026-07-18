@@ -499,7 +499,22 @@ void print_diagnostics(std::ostream& output,
         }
         output << ']';
     }
-    output << "}}";
+    output << '}';
+    if (diagnostics.layer_hash_trace_enabled && !diagnostics.operation_hashes.empty()) {
+        output << ",\"operation_hashes\":[";
+        for (std::size_t index = 0U; index < diagnostics.operation_hashes.size(); ++index) {
+            const auto& record = diagnostics.operation_hashes[index];
+            if (index != 0U) output << ',';
+            output << "{\"position\":" << record.position
+                   << ",\"input_token\":" << record.input_token
+                   << ",\"layer\":" << record.layer
+                   << ",\"operation\":\"" << record.operation << '"'
+                   << ",\"bf16_hash\":\"" << hex_u64(record.bf16_hash)
+                   << "\"}";
+        }
+        output << ']';
+    }
+    output << '}';
     output.precision(previous_precision);
 }
 

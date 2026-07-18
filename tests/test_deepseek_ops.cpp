@@ -234,6 +234,26 @@ TEST_CASE("DeepSeek mHC Sinkhorn preserves four residual lanes") {
     }
 }
 
+TEST_CASE("DeepSeek mHC post mixing uses source rows and destination columns") {
+    constexpr std::uint32_t multiplier = 2U;
+    constexpr std::array<float, 1> branch{3.0F};
+    constexpr std::array<float, 2> residual{10.0F, 20.0F};
+    const strata::Dsv4MhcMix mix{
+        {},
+        {1.0F, 1.0F},
+        {0.1F, 0.9F,
+         0.8F, 0.2F},
+    };
+    std::array<float, 2> output{};
+
+    const auto result = strata::dsv4_mhc_post_f32(
+        output, branch, residual, mix, multiplier);
+
+    REQUIRE(result.ok());
+    REQUIRE_NEAR(output[0], 20.0F, 1.0e-6F);
+    REQUIRE_NEAR(output[1], 16.0F, 1.0e-6F);
+}
+
 TEST_CASE("DeepSeek SwiGLU applies asymmetric target clamping") {
     constexpr std::array<float, 3> gate{-20.0F, 20.0F, 1.0F};
     constexpr std::array<float, 3> up{-20.0F, 20.0F, 2.0F};

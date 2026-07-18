@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace strata {
@@ -68,6 +69,14 @@ struct Dsv4LayerHashTraceRecord {
     std::uint64_t bf16_hash{};
 };
 
+struct Dsv4OperationHashTraceRecord {
+    std::uint32_t position{};
+    std::uint32_t input_token{};
+    std::uint32_t layer{};
+    std::string operation;
+    std::uint64_t bf16_hash{};
+};
+
 struct Dsv4DiagnosticTrace {
     bool logit_trace_enabled{};
     bool layer_hash_trace_enabled{};
@@ -76,6 +85,7 @@ struct Dsv4DiagnosticTrace {
     std::vector<Dsv4LogitTraceRecord> logits;
     std::uint64_t layer_hash_trace_hash{};
     std::vector<Dsv4LayerHashTraceRecord> layer_hashes;
+    std::vector<Dsv4OperationHashTraceRecord> operation_hashes;
 };
 
 }  // namespace strata

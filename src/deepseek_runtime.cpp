@@ -772,6 +772,9 @@ struct DeepSeekV4Runtime::Impl {
     void reset_diagnostics();
     void record_layer_hash(std::uint32_t position, std::uint32_t token,
                            std::uint32_t layer, std::span<const float> hidden);
+    void record_operation_hash(std::uint32_t position, std::uint32_t token,
+                               std::uint32_t layer, std::string_view operation,
+                               std::span<const float> values);
     void record_logits(std::uint32_t position, std::uint32_t token,
                        std::uint32_t selected, std::span<const float> logits);
     ValidationResult embed(std::uint32_t token, std::span<float> output);
@@ -835,6 +838,15 @@ void DeepSeekV4Runtime::Impl::record_layer_hash(
     aggregate = diagnostic_hash_u32(aggregate, token);
     aggregate = diagnostic_hash_u32(aggregate, layer);
     diagnostics.layer_hash_trace_hash = diagnostic_hash_u64(aggregate, hash);
+}
+
+void DeepSeekV4Runtime::Impl::record_operation_hash(
+    std::uint32_t position, std::uint32_t token,
+    std::uint32_t layer, std::string_view operation,
+    std::span<const float> values) {
+    const auto hash = dsv4_stable_bf16_hash(values);
+    diagnostics.operation_hashes.push_back(
+        {position, token, layer, std::string(operation), hash});
 }
 
 void DeepSeekV4Runtime::Impl::record_logits(
@@ -1737,6 +1749,9 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
         return result;
     }
     graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
+    if (config.enable_layer_hash_trace) {
+        record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
+    }
     if (route_trace.is_open()) {
         route_trace << "{\"position\":" << position << ",\"layer\":" << layer
                     << ",\"token\":" << token << ",\"experts\":[";
@@ -1819,10 +1834,16 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
         graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         round_bf16(reduced);
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer, branch + "_mhc_pre", reduced);
+        }
         phase_started = std::chrono::steady_clock::now();
         result = norm(reduced, reduced, prefix + branch + "_norm.weight");
         graph_stats.branch_norm_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer, branch + "_norm", reduced);
+        }
         std::vector<float> branch_output(kHidden);
         phase_started = std::chrono::steady_clock::now();
         if (branch == "attn") {
@@ -1833,11 +1854,17 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
             graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
         }
         if (!result.ok()) return result;
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer, branch + "_output", branch_output);
+        }
         phase_started = std::chrono::steady_clock::now();
         result = dsv4_mhc_post_f32(hidden, branch_output, residual, mix);
         graph_stats.mhc_post_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         round_bf16(hidden);
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer, branch + "_mhc_post", hidden);
+        }
     }
     return result;
 }

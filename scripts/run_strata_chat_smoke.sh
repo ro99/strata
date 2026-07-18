@@ -9,7 +9,7 @@ devices=${CUDA_DEVICES:-0,1,2}
 maximum_context=${MAX_CONTEXT_TOKENS:-8192}
 maximum_new=${MAX_NEW_TOKENS:-16}
 prompt=${PROMPT:-hello}
-temperature=${TEMPERATURE:-1.0}
+temperature=${TEMPERATURE:-0}
 seed=${SAMPLING_SEED:-33377335}
 
 mkdir -p "${result_dir}"

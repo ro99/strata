@@ -78,3 +78,23 @@ TEST_CASE("real DeepSeek V4 tokenizer and single-user chat rendering are support
         REQUIRE(encoded.value[index] == expected[index]);
     }
 }
+
+TEST_CASE("DeepSeek V4 byte-level decode produces valid UTF-8 across adjacent tokens") {
+    const auto path = deepseek_tokenizer_fixture();
+    if (!std::filesystem::exists(path)) return;
+    const auto tokenizer = strata::GlmTokenizer::load(path.string());
+    REQUIRE(tokenizer.ok());
+
+    const auto t130 = tokenizer.value.decode_token(130U);
+    REQUIRE(t130.ok());
+    REQUIRE(t130.value == std::string("\xC3", 1));
+
+    const auto t105 = tokenizer.value.decode_token(105U);
+    REQUIRE(t105.ok());
+    REQUIRE(t105.value == std::string("\xA9", 1));
+
+    const std::array<std::uint32_t, 2> pair{130U, 105U};
+    const auto combined = tokenizer.value.decode(pair);
+    REQUIRE(combined.ok());
+    REQUIRE(combined.value == "\xC3\xA9");
+}

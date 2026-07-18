@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: strata-tokenize --tokenizer FILE --prompt TEXT\n";
         return 2;
     }
-    const auto loaded = strata::GlmTokenizer::load(tokenizer_path);
+    const auto loaded = strata::ModelTokenizer::load(tokenizer_path);
     if (!loaded.ok()) {
         for (const auto& error : loaded.errors) std::cerr << "error: " << error << '\n';
         return 1;

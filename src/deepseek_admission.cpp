@@ -1,5 +1,7 @@
 #include "strata/deepseek_admission.hpp"
 
+#include "strata/model_adapter.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <string_view>
@@ -128,14 +130,15 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             result.plan.maximum_expert_bytes, bytes);
     }
 
-    constexpr std::uint64_t layers = 43U;
-    constexpr std::uint64_t head_dim = 512U;
-    constexpr std::uint64_t window = 128U;
+    constexpr std::uint64_t layers = kDeepSeekV4ExecutionContract.layer_count;
+    constexpr std::uint64_t head_dim = kDeepSeekV4ExecutionContract.head_dim;
+    constexpr std::uint64_t window = kDeepSeekV4ExecutionContract.sliding_window;
     constexpr std::uint64_t fp32 = 4U;
     result.plan.kv_state_bytes = layers * window * head_dim * fp32;
     const auto& deepseek = deepseek_v4_flash_dspark_spec().deepseek_v4;
     const auto& ratios = deepseek.compression_ratios;
-    for (std::uint32_t layer = 0U; layer < 43U; ++layer) {
+    for (std::uint32_t layer = 0U;
+         layer < kDeepSeekV4ExecutionContract.layer_count; ++layer) {
         const auto ratio = ratios[layer];
         if (ratio == 0U) continue;
         const auto compressed =
@@ -153,7 +156,8 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         }
         if (ratio == 4U &&
             config.maximum_context_tokens > deepseek.index_topk * ratio) {
-            constexpr std::uint64_t index_head_dim = 128U;
+            constexpr std::uint64_t index_head_dim =
+                kDeepSeekV4ExecutionContract.index_head_dim;
             const auto index_cache = compressed * index_head_dim * fp32;
             constexpr std::uint64_t index_compressor_state =
                 2U * 4U * 2U * index_head_dim * fp32 * 2U;

@@ -2,6 +2,7 @@
 
 #include "strata/glm_ops.hpp"
 #include "strata/glm_int4.hpp"
+#include "strata/model_adapter.hpp"
 #include "strata/sampling.hpp"
 #include "strata/tokenizer.hpp"
 #include "strata/trace.hpp"
@@ -29,22 +30,25 @@ namespace strata {
 
 namespace {
 
-constexpr std::uint32_t kHidden = 6144U;
-constexpr std::uint32_t kLayers = 78U;
-constexpr std::uint32_t kHeads = 64U;
-constexpr std::uint32_t kQueryLora = 2048U;
-constexpr std::uint32_t kKvLora = 512U;
-constexpr std::uint32_t kNope = 192U;
-constexpr std::uint32_t kRope = 64U;
+constexpr std::uint32_t kHidden = kGlm52ExecutionContract.hidden_size;
+constexpr std::uint32_t kLayers = kGlm52ExecutionContract.layer_count;
+constexpr std::uint32_t kHeads = kGlm52ExecutionContract.attention_heads;
+constexpr std::uint32_t kQueryLora = kGlm52ExecutionContract.query_lora_rank;
+constexpr std::uint32_t kKvLora = kGlm52ExecutionContract.kv_lora_rank;
+constexpr std::uint32_t kNope = kGlm52ExecutionContract.nope_head_dim;
+constexpr std::uint32_t kRope = kGlm52ExecutionContract.rope_head_dim;
 constexpr std::uint32_t kQueryHead = kNope + kRope;
-constexpr std::uint32_t kValueHead = 256U;
-constexpr std::uint32_t kDenseIntermediate = 12288U;
-constexpr std::uint32_t kExpertIntermediate = 2048U;
-constexpr std::uint32_t kExperts = 256U;
-constexpr std::uint32_t kTopK = 8U;
-constexpr std::uint32_t kVocabulary = 154880U;
-constexpr std::uint32_t kDsaThreshold = 2048U;
-constexpr float kAttentionScale = 1.0F / 16.0F;
+constexpr std::uint32_t kValueHead = kGlm52ExecutionContract.value_head_dim;
+constexpr std::uint32_t kDenseIntermediate =
+    kGlm52ExecutionContract.dense_intermediate_size;
+constexpr std::uint32_t kExpertIntermediate =
+    kGlm52ExecutionContract.expert_intermediate_size;
+constexpr std::uint32_t kExperts = kGlm52ExecutionContract.routed_experts;
+constexpr std::uint32_t kTopK = kGlm52ExecutionContract.experts_per_token;
+constexpr std::uint32_t kVocabulary = kGlm52ExecutionContract.vocabulary_size;
+constexpr std::uint32_t kDsaThreshold =
+    kGlm52ExecutionContract.sparse_attention_topk;
+constexpr float kAttentionScale = kGlm52ExecutionContract.attention_scale;
 
 std::uint64_t state_hash(std::span<const float> values) noexcept {
     constexpr std::uint64_t offset = 1469598103934665603ULL;
@@ -510,7 +514,7 @@ struct ExpertJob {
 struct Glm52Runtime::Impl {
     Glm52RuntimeConfig config;
     std::unique_ptr<GlmCheckpointReader> checkpoint;
-    GlmTokenizer tokenizer;
+    ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<WeightCache> weights;
     std::unique_ptr<HostWorkerPool> host_workers;
@@ -1422,7 +1426,7 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     }
     result = validate_runtime_graph_contract(*checkpoint.value);
     if (!result.ok()) return result;
-    auto tokenizer = GlmTokenizer::load(
+    auto tokenizer = ModelTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {
         result.errors = std::move(tokenizer.errors);

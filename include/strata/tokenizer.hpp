@@ -12,11 +12,19 @@
 
 namespace strata {
 
-class GlmTokenizer {
-public:
-    GlmTokenizer();
+enum class TokenizerContract : std::uint8_t {
+    Glm52,
+    DeepSeekV4,
+};
 
-    [[nodiscard]] static ParseResult<GlmTokenizer> load(const std::string& path);
+[[nodiscard]] ParseResult<std::vector<std::string>> pretokenize(
+    TokenizerContract contract, std::string_view text);
+
+class ModelTokenizer {
+public:
+    ModelTokenizer();
+
+    [[nodiscard]] static ParseResult<ModelTokenizer> load(const std::string& path);
     [[nodiscard]] ParseResult<std::vector<std::uint32_t>> encode(
         std::string_view text) const;
     [[nodiscard]] ParseResult<std::string> decode(
@@ -29,7 +37,6 @@ public:
     [[nodiscard]] std::int32_t token_id(std::string_view piece) const noexcept;
 
 private:
-    enum class Contract : std::uint8_t { Glm52, DeepSeekV4 };
     struct AddedToken {
         std::string content;
         std::uint32_t id{};
@@ -48,7 +55,7 @@ private:
     std::array<std::string, 256> byte_to_piece_;
     std::array<std::int16_t, 1024> codepoint_to_byte_{};
     bool ignore_merges_{};
-    Contract contract_{Contract::Glm52};
+    TokenizerContract contract_{TokenizerContract::Glm52};
 };
 
 [[nodiscard]] std::string render_glm52_user_prompt(

@@ -1,7 +1,7 @@
 #include "strata/deepseek_runtime.hpp"
 
 #include "strata/deepseek_ops.hpp"
-#include "strata/glm_ops.hpp"
+#include "strata/model_adapter.hpp"
 #include "strata/numerics.hpp"
 #include "strata/sampling.hpp"
 #include "strata/tokenizer.hpp"
@@ -34,26 +34,27 @@ namespace strata {
 
 namespace {
 
-constexpr std::uint32_t kHidden = 4096U;
-constexpr std::uint32_t kLayers = 43U;
-constexpr std::uint32_t kHeads = 64U;
-constexpr std::uint32_t kHeadDim = 512U;
-constexpr std::uint32_t kRopeDim = 64U;
-constexpr std::uint32_t kQueryRank = 1024U;
-constexpr std::uint32_t kOutputRank = 1024U;
-constexpr std::uint32_t kOutputGroups = 8U;
-constexpr std::uint32_t kWindow = 128U;
-constexpr std::uint32_t kIndexHeads = 64U;
-constexpr std::uint32_t kIndexHeadDim = 128U;
-constexpr std::uint32_t kIndexTopK = 512U;
-constexpr std::uint32_t kExperts = 256U;
-constexpr std::uint32_t kTopK = 6U;
-constexpr std::uint32_t kExpertIntermediate = 2048U;
-constexpr std::uint32_t kVocabulary = 129280U;
-constexpr std::uint32_t kMhc = 4U;
-constexpr std::uint32_t kMix = 24U;
+constexpr std::uint32_t kHidden = kDeepSeekV4ExecutionContract.hidden_size;
+constexpr std::uint32_t kLayers = kDeepSeekV4ExecutionContract.layer_count;
+constexpr std::uint32_t kHeads = kDeepSeekV4ExecutionContract.attention_heads;
+constexpr std::uint32_t kHeadDim = kDeepSeekV4ExecutionContract.head_dim;
+constexpr std::uint32_t kRopeDim = kDeepSeekV4ExecutionContract.rope_head_dim;
+constexpr std::uint32_t kQueryRank = kDeepSeekV4ExecutionContract.query_lora_rank;
+constexpr std::uint32_t kOutputRank = kDeepSeekV4ExecutionContract.output_lora_rank;
+constexpr std::uint32_t kOutputGroups = kDeepSeekV4ExecutionContract.output_groups;
+constexpr std::uint32_t kWindow = kDeepSeekV4ExecutionContract.sliding_window;
+constexpr std::uint32_t kIndexHeads = kDeepSeekV4ExecutionContract.index_heads;
+constexpr std::uint32_t kIndexHeadDim = kDeepSeekV4ExecutionContract.index_head_dim;
+constexpr std::uint32_t kIndexTopK = kDeepSeekV4ExecutionContract.index_topk;
+constexpr std::uint32_t kExperts = kDeepSeekV4ExecutionContract.routed_experts;
+constexpr std::uint32_t kTopK = kDeepSeekV4ExecutionContract.experts_per_token;
+constexpr std::uint32_t kExpertIntermediate =
+    kDeepSeekV4ExecutionContract.expert_intermediate_size;
+constexpr std::uint32_t kVocabulary = kDeepSeekV4ExecutionContract.vocabulary_size;
+constexpr std::uint32_t kMhc = kDeepSeekV4ExecutionContract.mhc_multiplier;
+constexpr std::uint32_t kMix = kDeepSeekV4ExecutionContract.mix_width;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 256ULL << 20U;
-constexpr float kRmsEpsilon = 1.0e-6F;
+constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
 constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
@@ -687,7 +688,7 @@ struct DeepSeekV4Runtime::Impl {
     Dsv4GenerationMetrics initialization_metrics;
     std::unique_ptr<Dsv4CheckpointReader> checkpoint;
     Dsv4ResidentWeightStore resident;
-    GlmTokenizer tokenizer;
+    ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
     std::unique_ptr<HostWorkerPool> attention_workers;
@@ -2023,7 +2024,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result.errors = std::move(checkpoint.errors);
         return result;
     }
-    auto tokenizer = GlmTokenizer::load(
+    auto tokenizer = ModelTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {
         result.errors = std::move(tokenizer.errors);

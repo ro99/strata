@@ -35,7 +35,7 @@ TEST_CASE("GLM single-user chat rendering matches the pinned template") {
 TEST_CASE("real GLM tokenizer produces the frozen baseline prompt ids when available") {
     const auto path = tokenizer_fixture();
     if (!std::filesystem::exists(path)) return;
-    const auto tokenizer = strata::BpeTokenizer::load(path.string());
+    const auto tokenizer = strata::GlmTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     const auto rendered = strata::render_glm52_user_prompt(kPrompt);
     const auto encoded = tokenizer.value.encode(rendered);
@@ -53,20 +53,18 @@ TEST_CASE("real GLM tokenizer produces the frozen baseline prompt ids when avail
     REQUIRE(decoded.value == rendered);
 }
 
-TEST_CASE("GLM tokenizer encodes Unicode input through byte-level BPE") {
+TEST_CASE("GLM tokenizer rejects unsupported Unicode input explicitly") {
     const auto path = tokenizer_fixture();
     if (!std::filesystem::exists(path)) return;
-    const auto tokenizer = strata::BpeTokenizer::load(path.string());
+    const auto tokenizer = strata::GlmTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
-    const auto encoded = tokenizer.value.encode("olá");
-    REQUIRE(encoded.ok());
-    REQUIRE(!encoded.value.empty());
+    REQUIRE(!tokenizer.value.encode("olá").ok());
 }
 
 TEST_CASE("real DeepSeek V4 tokenizer and single-user chat rendering are supported") {
     const auto path = deepseek_tokenizer_fixture();
     if (!std::filesystem::exists(path)) return;
-    const auto tokenizer = strata::BpeTokenizer::load(path.string());
+    const auto tokenizer = strata::GlmTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
     const auto rendered = strata::render_deepseek_v4_user_prompt("hello");
     REQUIRE(rendered ==
@@ -84,7 +82,7 @@ TEST_CASE("real DeepSeek V4 tokenizer and single-user chat rendering are support
 TEST_CASE("DeepSeek V4 byte-level decode produces valid UTF-8 across adjacent tokens") {
     const auto path = deepseek_tokenizer_fixture();
     if (!std::filesystem::exists(path)) return;
-    const auto tokenizer = strata::BpeTokenizer::load(path.string());
+    const auto tokenizer = strata::GlmTokenizer::load(path.string());
     REQUIRE(tokenizer.ok());
 
     const auto t130 = tokenizer.value.decode_token(130U);

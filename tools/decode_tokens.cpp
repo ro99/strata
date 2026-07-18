@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: decode_tokens TOKENIZER_PATH TOKEN_ID [TOKEN_ID ...]\n";
         return 1;
     }
-    const auto loaded = strata::BpeTokenizer::load(argv[1]);
+    const auto loaded = strata::GlmTokenizer::load(argv[1]);
     if (!loaded.ok()) {
         for (const auto& error : loaded.errors) std::cerr << "error: " << error << '\n';
         return 1;

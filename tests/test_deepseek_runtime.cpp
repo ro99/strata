@@ -9,6 +9,7 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     const strata::Dsv4RuntimeConfig config;
     REQUIRE(config.enable_device_moe);
     REQUIRE(!config.enable_flash_attention);
+    REQUIRE(config.flash_attention_minimum_rows == 256U);
     REQUIRE(!config.enable_logit_trace);
     REQUIRE(!config.enable_layer_hash_trace);
     REQUIRE(config.logit_trace_top_k == 20U);

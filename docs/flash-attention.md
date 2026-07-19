@@ -32,7 +32,9 @@ its exact selected rows can use the same indexed-segment contract.
 - Empty value storage aliases keys when `query_key_dim == value_dim`.
 - Empty row indices select every source row in storage order; otherwise indices
   gather exact source rows in descriptor order.
-- Logical segments are concatenated without materializing attention scores.
+- Logical segments are packed without a persistent score tensor or host score
+  transfer. The DeepSeek exact-compatibility specialization uses bounded
+  transient device score/probability scratch for one decode query.
 - `query_heads` must be divisible by `key_value_heads`, covering MHA, GQA, and
   MQA/shared-KV mappings.
 - Optional causal counts select a visible prefix of the concatenated rows for
@@ -45,9 +47,11 @@ its exact selected rows can use the same indexed-segment contract.
   devices fail with an unsupported error when the backend is requested.
 
 The descriptor carries a byte ceiling. Validation accounts queries, gathered
-K/V rows, sinks, causal limits, and outputs before CUDA allocation. Device
-buffers grow only to the validated request and are reused. No score tensor is
-stored persistently or copied to the host.
+K/V rows, sinks, causal limits, outputs, numerical status, and exact-contract
+score scratch before CUDA allocation. Device buffers grow geometrically within
+that ceiling and are reused. Pinned staging combines each request into one H2D
+and one D2H transfer. No score tensor is stored persistently or copied to the
+host.
 
 ## Numerical and failure contract
 
@@ -60,8 +64,9 @@ it implicitly:
   F32.
 - `f64_dot_f32_score_f32_accum` preserves DeepSeek's established scalar order:
   sequential F64 dot, F32 score, global F64 softmax, F32 probability, and F32
-  value accumulation. The fused CUDA compatibility specialization recomputes
-  QK across bounded passes instead of storing a score tensor.
+  value accumulation. One thread computes each row's sequential dot, thread
+  zero preserves the ordered softmax reduction, and value lanes preserve the
+  original row accumulation order using bounded transient scratch.
 - `f32_dot_f32_softmax_f32_accum` similarly preserves GLM's all-F32 dot,
   softmax, probability, and value-accumulation contract. Cross-device
   libm/libdevice exponential differences are accepted up to `4e-6` absolute at
@@ -74,21 +79,29 @@ attention loops.
 
 CUDA reports non-finite scores, invalid denominators, and non-finite output as
 errors. It also rejects incompatible shapes, indices, head mappings, workspace
-ceilings, and devices. Output is copied into the
-caller span only after successful CUDA completion and numerical-status
-validation. There is no silent fallback when FlashAttention is explicitly
-enabled.
+ceilings, and devices. Explicit CUDA enablement validates the device during
+runtime initialization, even when a shape-aware adapter retains its scalar
+kernel below a declared crossover. Output is copied into the caller span only
+after successful CUDA completion and numerical-status validation. There is no
+error-triggered or numerical fallback.
 
 ## Current dispatch
 
 Use `--flash-attention` with `strata-deepseek-run`, `strata-run`, or
 `strata-chat`. Use `--scalar-attention` in the concrete benchmark runners to
-pin the reference path. Operation fixtures and short full-model traces pass,
-but the required three-repetition DeepSeek matrix completed with a median
-candidate/scalar decode-throughput ratio of `0.520x`; the scalar default is
-therefore retained under the rollback condition. The measured result is
-recorded in
-[`docs/experiments/0014-generic-flash-attention-performance-2026-07-19.md`](experiments/0014-generic-flash-attention-performance-2026-07-19.md).
+pin the reference path. DeepSeek's production adapter keeps its 28-worker
+scalar kernel below 256 logical KV rows and dispatches CUDA at or above that
+measured crossover. `--flash-attention-minimum-rows 0` forces CUDA for
+diagnostics. JSON graph metrics report `attention_cuda_dispatches` and
+`attention_scalar_dispatches` independently.
+
+The original unconditional implementation failed promotion at `0.520x`
+median short-context decode throughput. The production decode redesign and its
+replacement gates are recorded in
+[`docs/experiments/0015-production-flash-decode-2026-07-19.md`](experiments/0015-production-flash-decode-2026-07-19.md); the replicated gate shows
+attention/prefill improvement but no end-to-end decode win within observed
+variance, so the scalar backend remains the global default. Use
+`--flash-attention` for the shape-aware hybrid policy.
 
 Detailed CUDA JSON includes FlashAttention calls, launches, H2D/D2H transfers
 and bytes, useful/wasted staging bytes, transfer time, kernel time, total

@@ -371,6 +371,8 @@ void apply_rope(std::span<float> values, std::uint64_t position,
         after.attention_index_queries - before.attention_index_queries,
         after.attention_index_candidates - before.attention_index_candidates,
         after.attention_index_selected - before.attention_index_selected,
+        after.attention_cuda_dispatches - before.attention_cuda_dispatches,
+        after.attention_scalar_dispatches - before.attention_scalar_dispatches,
         after.attention_score_nanoseconds - before.attention_score_nanoseconds,
         after.attention_output_nanoseconds - before.attention_output_nanoseconds,
         after.moe_nanoseconds - before.moe_nanoseconds,
@@ -1460,8 +1462,12 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
         : compressed_count;
     const auto score_stride = static_cast<std::size_t>(window_count) +
                               attended_compressed_count;
+    const bool use_cuda_attention = should_dispatch_flash_attention_cuda(
+        config.enable_flash_attention, score_stride,
+        config.flash_attention_minimum_rows);
     subphase_started = std::chrono::steady_clock::now();
-    if (config.enable_flash_attention) {
+    if (use_cuda_attention) {
+        ++graph_stats.attention_cuda_dispatches;
         std::vector<std::uint32_t> sliding_rows(window_count);
         for (std::uint32_t item = 0U; item < window_count; ++item) {
             const auto absolute = position + 1U - window_count + item;
@@ -1518,6 +1524,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
             }
         }
     } else {
+        ++graph_stats.attention_scalar_dispatches;
     const auto attend_head = [&](std::uint32_t head,
                                  std::span<float> scores) {
         const auto query = std::span<const float>(queries).subspan(
@@ -2125,6 +2132,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
+    if (config.enable_flash_attention) {
+        for (const int device : config.devices) {
+            result = impl_->cuda.validate_flash_attention_device(device);
+            if (!result.ok()) return result;
+        }
+    }
 
     auto device_plan = plan_runtime_devices(
         config.devices, config.vram_cache_fraction, kDeviceWorkspaceReserve,
@@ -2262,6 +2275,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.host_attention_threads;
     impl_->initialization_metrics.flash_attention_enabled =
         config.enable_flash_attention;
+    impl_->initialization_metrics.flash_attention_minimum_rows =
+        config.flash_attention_minimum_rows;
     impl_->initialization_metrics.resident_read_workers =
         impl_->resident.stats().workers;
     impl_->initialization_metrics.spine_warmup_workers =

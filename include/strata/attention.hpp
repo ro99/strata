@@ -27,6 +27,15 @@ enum class FlashAttentionNumerics : std::uint32_t {
     f32_dot_f32_softmax_f32_accum = 2U,
 };
 
+// Production adapters may retain their exact scalar implementation below a
+// measured CUDA crossover. This is a declared dispatch policy, not an error
+// fallback and never changes the request's numerical contract.
+[[nodiscard]] constexpr bool should_dispatch_flash_attention_cuda(
+    bool enabled, std::uint64_t logical_rows,
+    std::uint64_t minimum_cuda_rows) noexcept {
+    return enabled && logical_rows >= minimum_cuda_rows;
+}
+
 // Model-neutral forward attention request. Queries and outputs use
 // [query_rows, query_heads, dimension]. Segment storage uses
 // [source_rows, key_value_heads, dimension]. causal_key_counts, when present,

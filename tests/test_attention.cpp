@@ -119,6 +119,13 @@ TEST_CASE("generic FlashAttention scalar oracle preserves compatibility contract
     }
 }
 
+TEST_CASE("FlashAttention production dispatch observes the measured row boundary") {
+    REQUIRE(!strata::should_dispatch_flash_attention_cuda(false, 256U, 256U));
+    REQUIRE(!strata::should_dispatch_flash_attention_cuda(true, 255U, 256U));
+    REQUIRE(strata::should_dispatch_flash_attention_cuda(true, 256U, 256U));
+    REQUIRE(strata::should_dispatch_flash_attention_cuda(true, 0U, 0U));
+}
+
 TEST_CASE("generic FlashAttention handles sink-only and adversarial logits") {
     const std::array<float, 4> sink_queries{1.0F, 2.0F, 3.0F, 4.0F};
     const std::array<float, 2> sinks{100.0F, -100.0F};

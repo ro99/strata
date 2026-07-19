@@ -1515,6 +1515,12 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     }
     result = impl_->cuda.initialize(config.devices, config.detailed_timing);
     if (!result.ok()) return result;
+    if (config.enable_flash_attention) {
+        for (const int device : config.devices) {
+            result = impl_->cuda.validate_flash_attention_device(device);
+            if (!result.ok()) return result;
+        }
+    }
     if (!config.route_trace_path.empty()) {
         result = impl_->route_trace.open(config.route_trace_path);
         if (!result.ok()) return result;

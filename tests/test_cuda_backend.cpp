@@ -145,6 +145,23 @@ std::vector<float> reference_expert(
 
 }  // namespace
 
+TEST_CASE("native CUDA FlashAttention validates device support before dispatch") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    strata::CudaBackend backend;
+    REQUIRE(!backend.validate_flash_attention_device(devices.front()).ok());
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device).ok());
+    const auto supported =
+        backend.validate_flash_attention_device(devices.front());
+    if (!supported.ok()) {
+        REQUIRE(!supported.errors.empty());
+        REQUIRE(supported.errors.front().find("supports only SM86 and SM120") !=
+                std::string::npos);
+    }
+}
+
 TEST_CASE("native CUDA backend executes generic tiled online FlashAttention when available") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;
@@ -265,6 +282,63 @@ TEST_CASE("native CUDA FlashAttention matches the DeepSeek shared-KV shape on su
         }
     }
     REQUIRE(supported != 0U);
+}
+
+TEST_CASE("native CUDA FlashAttention grows decode scratch geometrically") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    constexpr std::uint32_t heads = 4U;
+    constexpr std::uint32_t dimension = 64U;
+    constexpr std::uint32_t maximum_rows = 17U;
+    std::vector<float> queries(static_cast<std::size_t>(heads) * dimension);
+    std::vector<float> keys(static_cast<std::size_t>(maximum_rows) * dimension);
+    std::vector<float> sinks(heads);
+    for (std::size_t index = 0U; index < queries.size(); ++index) {
+        queries[index] = static_cast<float>(static_cast<int>(index % 19U) - 9) /
+                         32.0F;
+    }
+    for (std::size_t index = 0U; index < keys.size(); ++index) {
+        keys[index] = static_cast<float>(static_cast<int>(index % 23U) - 11) /
+                      32.0F;
+    }
+    for (std::size_t index = 0U; index < sinks.size(); ++index) {
+        sinks[index] = static_cast<float>(index) * 0.0625F;
+    }
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device, true).ok());
+    std::vector<float> expected(static_cast<std::size_t>(heads) * dimension);
+    std::vector<float> actual(expected.size());
+    for (std::uint32_t rows = 1U; rows <= maximum_rows; ++rows) {
+        const std::array<strata::FlashAttentionSegment, 1> segments{{
+            {std::span<const float>(keys).first(
+                 static_cast<std::size_t>(rows) * dimension),
+             {}, {}}}};
+        strata::FlashAttentionRequest request;
+        request.queries = queries;
+        request.segments = segments;
+        request.head_sinks = sinks;
+        request.query_rows = 1U;
+        request.query_heads = heads;
+        request.key_value_heads = 1U;
+        request.query_key_dim = dimension;
+        request.value_dim = dimension;
+        request.scale = 1.0F / std::sqrt(static_cast<float>(dimension));
+        request.numerics =
+            strata::FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
+        REQUIRE(strata::flash_attention_reference_f32(request, expected).ok());
+        REQUIRE(backend.flash_attention(
+            devices.front(), request, actual).ok());
+        for (std::size_t index = 0U; index < actual.size(); ++index) {
+            REQUIRE_NEAR(actual[index], expected[index], 5.0e-4F);
+        }
+    }
+
+    // Three combined initial buffers plus seven power-of-two upload/score
+    // growth boundaries. Exact-sized allocation would grow twice per row.
+    REQUIRE(backend.stats().workspace_allocation_calls == 10U);
 }
 
 TEST_CASE("native CUDA FlashAttention preserves an all-F32 adapter contract") {

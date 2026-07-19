@@ -24,6 +24,7 @@ struct Options {
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
+    std::uint32_t flash_attention_minimum_rows{256U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
@@ -51,6 +52,7 @@ void usage() {
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
+        << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
         << "       [--detailed-timing] [--json] [--quiet]\n";
 }
@@ -142,6 +144,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.flash_attention = true;
         } else if (argument == "--scalar-attention") {
             options.flash_attention = false;
+        } else if (argument == "--flash-attention-minimum-rows") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_u32(
+                    value, options.flash_attention_minimum_rows)) return false;
         } else if (argument == "--logit-trace") {
             options.logit_trace = true;
         } else if (argument == "--logit-trace-top-k") {
@@ -363,6 +369,10 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.attention_index_candidates
            << ",\"attention_index_selected\":"
            << stats.attention_index_selected
+           << ",\"attention_cuda_dispatches\":"
+           << stats.attention_cuda_dispatches
+           << ",\"attention_scalar_dispatches\":"
+           << stats.attention_scalar_dispatches
            << ",\"attention_score_seconds\":"
            << seconds(stats.attention_score_nanoseconds)
            << ",\"attention_output_seconds\":"
@@ -620,6 +630,8 @@ int main(int argc, char** argv) {
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
     config.enable_flash_attention = options.flash_attention;
+    config.flash_attention_minimum_rows =
+        options.flash_attention_minimum_rows;
     config.enable_logit_trace = options.logit_trace;
     config.enable_layer_hash_trace = options.layer_hash_trace;
     config.overlap_resident_warmup = options.overlap_resident_warmup;
@@ -649,6 +661,8 @@ int main(int argc, char** argv) {
                   << metrics.host_attention_threads
                   << ",\"flash_attention\":"
                   << (metrics.flash_attention_enabled ? "true" : "false")
+                  << ",\"flash_attention_minimum_rows\":"
+                  << metrics.flash_attention_minimum_rows
                   << ",\"resident_read_workers\":"
                   << metrics.resident_read_workers
                   << ",\"spine_warmup_workers\":"

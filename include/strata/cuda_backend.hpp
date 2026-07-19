@@ -180,6 +180,11 @@ public:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t groups, std::uint64_t rows_per_group,
         std::span<float> output);
+    // Validate an explicitly requested FlashAttention device before model
+    // admission. Shape-aware dispatch must not hide an unsupported
+    // architecture until a later, longer request reaches the CUDA branch.
+    [[nodiscard]] ValidationResult validate_flash_attention_device(
+        int device) const;
     // Executes the model-neutral forward attention primitive under the
     // request's explicit numerical contract. Host segments are packed into
     // bounded reusable device workspaces; indexed rows are gathered exactly in

@@ -23,6 +23,10 @@ struct Dsv4RuntimeConfig {
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     bool enable_flash_attention{};
+    // CUDA offload has a fixed launch/staging cost. The production default
+    // retains parallel host attention below the measured row crossover; zero
+    // forces every supported shape through CUDA for diagnostics.
+    std::uint32_t flash_attention_minimum_rows{256U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     double sampling_temperature{};
@@ -71,6 +75,8 @@ struct Dsv4GraphStats {
     std::uint64_t attention_index_queries{};
     std::uint64_t attention_index_candidates{};
     std::uint64_t attention_index_selected{};
+    std::uint64_t attention_cuda_dispatches{};
+    std::uint64_t attention_scalar_dispatches{};
     std::uint64_t attention_score_nanoseconds{};
     std::uint64_t attention_output_nanoseconds{};
     std::uint64_t moe_nanoseconds{};
@@ -113,6 +119,7 @@ struct Dsv4GenerationMetrics {
     bool resident_warmup_overlapped{};
     std::uint32_t host_attention_threads{};
     bool flash_attention_enabled{};
+    std::uint32_t flash_attention_minimum_rows{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};
 };

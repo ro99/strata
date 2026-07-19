@@ -19,6 +19,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 #   CORRECTNESS_RUN=1 LOGIT_TRACE_TOP_K=20
 #   MODEL_DIR=... CUDA_DEVICES=0,1,2 HOST_MEMORY=216G
 #   VRAM_FRACTION=0.85 MAX_CONTEXT_TOKENS=2048 PROMPT=Hello
+#   PROMPT_REPETITIONS=2050  # deterministic 2,054-token boundary prompt
 #   REFERENCE_ARGS='...'
 #   CANDIDATE_ARGS='...'
 #   REFERENCE_DEVICE_MOE=0 CANDIDATE_DEVICE_MOE=1
@@ -42,6 +43,7 @@ host_memory_limit_kib=${HOST_MEMORY_LIMIT_KIB:-226492416}
 vram_fraction=${VRAM_FRACTION:-0.85}
 maximum_context_tokens=${MAX_CONTEXT_TOKENS:-2048}
 prompt=${PROMPT:-Hello}
+prompt_repetitions=${PROMPT_REPETITIONS:-0}
 minimum_decode_steps_per_second=${MIN_DECODE_STEPS_PER_SECOND:-5.0}
 enforce_acceptance=${ENFORCE_ACCEPTANCE:-0}
 reference_device_moe=${REFERENCE_DEVICE_MOE:-0}
@@ -108,6 +110,10 @@ if [[ ! "${maximum_context_tokens}" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: MAX_CONTEXT_TOKENS must be a positive integer" >&2
     exit 2
 fi
+if [[ ! "${prompt_repetitions}" =~ ^[0-9]+$ ]]; then
+    echo "error: PROMPT_REPETITIONS must be a non-negative integer" >&2
+    exit 2
+fi
 if [[ ! "${logit_trace_top_k}" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: LOGIT_TRACE_TOP_K must be a positive integer" >&2
     exit 2
@@ -115,6 +121,12 @@ fi
 if [[ ! "${host_memory_limit_kib}" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: HOST_MEMORY_LIMIT_KIB must be a positive integer" >&2
     exit 2
+fi
+if ((prompt_repetitions > 0)); then
+    prompt=
+    for ((index=0; index<prompt_repetitions; ++index)); do
+        prompt+=' x'
+    done
 fi
 
 if [[ "${correctness_run}" == 1 ]]; then
@@ -397,6 +409,8 @@ write_run_summary() {
                         (.phases.decode.cuda.maximum_device_deepseek_moe_seconds // null),
                     devices:(.phases.decode.cuda.devices // [])
                 },
+                prefill_graph:(.phases.prefill.graph // {}),
+                decode_graph:(.phases.decode.graph // {}),
                 decode_cache:(.phases.decode.cache // {}),
                 prefill_cache:(.phases.prefill.cache // {}),
                 decode_device_moe_runtime:
@@ -719,6 +733,18 @@ write_final_summary() {
                     ($selected | map(.decode_cuda.deepseek_moe_d2h_bytes)),
                 decode_deepseek_moe_seconds:
                     ($selected | map(.decode_cuda.deepseek_moe_seconds)),
+                prefill_attention_score_seconds:
+                    ($selected | map(
+                        .prefill_graph.attention_score_seconds // null)),
+                decode_attention_score_seconds:
+                    ($selected | map(
+                        .decode_graph.attention_score_seconds // null)),
+                decode_attention_cuda_dispatches:
+                    ($selected | map(
+                        .decode_graph.attention_cuda_dispatches // null)),
+                decode_attention_scalar_dispatches:
+                    ($selected | map(
+                        .decode_graph.attention_scalar_dispatches // null)),
                 decode_cache:($selected | map(.decode_cache)),
                 prefill_cache:($selected | map(.prefill_cache)),
                 decode_device_moe_runtime:
@@ -830,6 +856,7 @@ sha256sum "${candidate_binary}" >"${result_dir}/candidate-binary.sha256"
     printf 'maximum_new_tokens=%q\n' "${maximum_new_tokens}"
     printf 'maximum_context_tokens=%q\n' "${maximum_context_tokens}"
     printf 'prompt=%q\n' "${prompt}"
+    printf 'prompt_repetitions=%q\n' "${prompt_repetitions}"
     printf 'devices=%q\n' "${devices}"
     printf 'host_memory=%q\n' "${host_memory}"
     printf 'vram_fraction=%q\n' "${vram_fraction}"

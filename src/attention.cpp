@@ -193,9 +193,20 @@ ParseResult<FlashAttentionShape> validate_flash_attention_request(
     std::uint64_t packed_elements = result.value.packed_key_elements;
     const auto packed_values = result.value.values_alias_keys
         ? 0U : result.value.packed_value_elements;
+    std::uint64_t score_elements = 0U;
+    if (request.numerics ==
+            FlashAttentionNumerics::f64_dot_f32_score_f32_accum &&
+        (!multiply(request.query_rows, request.query_heads, score_elements) ||
+         !multiply(score_elements, result.value.logical_rows,
+                   score_elements))) {
+        result.errors.emplace_back(
+            "FlashAttention score scratch size overflows");
+        return result;
+    }
     if (!add(packed_elements, packed_values, packed_elements) ||
         !add(packed_elements, query_elements, packed_elements) ||
         !add(packed_elements, output_elements, packed_elements) ||
+        !add(packed_elements, score_elements, packed_elements) ||
         !add(packed_elements, request.head_sinks.size(), packed_elements) ||
         !add(packed_elements, request.causal_key_counts.size(), packed_elements) ||
         !add(packed_elements, 1U, packed_elements)) {

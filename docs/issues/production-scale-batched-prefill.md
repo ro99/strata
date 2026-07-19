@@ -14,9 +14,12 @@ implements the declared learned top-512 index selection for ratio-4 layers
 after the 2,048-token index window. Full-model execution evidence currently
 covers the first selection boundary.
 
-Production-scale ingestion will need a batched prefill path. The current
-full-model ingestion advances one token at a time, so practical and complete
-32k/200k/1m execution validation remains future work.
+The runtime now has an accepted bounded layer-major prefill path with multi-row
+attention projections and router projections. Page 64 is the measured default;
+page size one remains the independent token-at-a-time oracle. Short and first
+learned-index-boundary full-model correctness pass, but practical 32k/200k/1m
+execution validation remains open. Exact expert execution remains row-at-a-time
+within each bounded page.
 
 The batched path must preserve the existing DeepSeek contract: compressed KV
 and index state, causal masking, routing and top-k normalization, shared expert

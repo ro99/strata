@@ -38,11 +38,12 @@ spine and an expert cache in VRAM, and enforces zero checkpoint reads during
 decode. DeepSeek admission accepts logical context ceilings through the model's
 declared 1,048,576-token limit. Compressed KV and learned-index rows are
 committed in host pages as the sequence grows; ratio-4 layers switch to the
-declared learned top-512 selection beyond 2,048 tokens. Current full-model
-execution evidence covers the first selection boundary, not production-scale
-32k/200k/1m ingestion. DSpark tensors are validated but speculative execution
-is rejected until target verification and provisional-state rollback have
-frozen oracles.
+declared learned top-512 selection beyond 2,048 tokens. Prefill uses bounded
+64-token layer-major pages by default, with page size one retaining the exact
+token-at-a-time oracle. Short full-model page equivalence passes; production-
+scale 32k/200k/1m ingestion is not yet claimed. DSpark tensors are validated but
+speculative execution is rejected until target verification and provisional-
+state rollback have frozen oracles.
 
 The latest correctness and determinism gates pass:
 
@@ -244,10 +245,12 @@ To execute the base model:
 
 `--max-context` is the per-runtime logical cache ceiling and accepts any value
 from 1 through 1,048,576. This is an admission/storage limit, not a claim that
-token-at-a-time prefill is practical or fully validated at every ceiling. The
-rendered prompt plus `--max-new` must fit that ceiling. Use `--admission-only
---json` first to inspect `kv_state_bytes`, `index_state_bytes`, and total host
-admission for large contexts such as 32,768 or 200,000 tokens.
+prefill is practical or fully validated at every ceiling. `--prefill-page-tokens`
+selects a bounded page in `[1,512]` (default 64); one selects the original
+token-at-a-time oracle. The rendered prompt plus `--max-new` must fit that
+ceiling. Use `--admission-only --json` first to inspect `kv_state_bytes`,
+`index_state_bytes`, and total host admission for large contexts such as 32,768
+or 200,000 tokens.
 
 Exact device MoE and 28 host-attention workers are the defaults. Use
 `--serial-device-moe` and `--serial-host-attention` only for controlled

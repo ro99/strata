@@ -28,9 +28,10 @@ runtime result types for ordinary generation.
 ## Current execution model
 
 The current executors are architecture-specific and exact. GLM performs a
-batched prefill followed by token-at-a-time decode. DeepSeek currently advances
-one token through every layer, including during prefill. Each executor performs
-its own exact attention, router, shared-expert, routed-expert, residual, and
+batched prefill followed by token-at-a-time decode. DeepSeek performs bounded
+layer-major prefill pages with a multi-row router projection, exact row-ordered
+causal/cache transitions, and token-at-a-time decode. Each executor performs its
+own exact attention, router, shared-expert, routed-expert, residual, and
 cache-state transitions.
 
 The concrete runtime translation units are model executors, not the future

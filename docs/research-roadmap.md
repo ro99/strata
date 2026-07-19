@@ -143,8 +143,8 @@ index maintenance merely because a large logical cache was configured. This is
 storage/admission groundwork; execution evidence currently covers the first
 selection boundary only.
 
-Production-scale ingestion will need a batched prefill path. The current
-token-by-token prefill validates the long-context storage and indexing boundary,
-but makes 32k/200k/1m prompt ingestion impractical. The batched path must retain
-the exact DeepSeek attention, compressed-KV/index state, routing, mHC, causal
-masking, and teacher-forcing behavior while exposing separate prefill metrics.
+The initial bounded batched-prefill path uses layer-major pages and multi-row
+router projections while retaining exact row-ordered attention, cache, routing,
+mHC, and expert semantics. Short and learned-index-boundary full-model oracle
+equivalence pass. The 32k/200k/1m execution gates and further batched
+attention/expert work remain open, with separate prefill metrics required.

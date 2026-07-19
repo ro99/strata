@@ -22,6 +22,7 @@ struct Options {
     std::vector<int> devices{0, 1, 2};
     std::uint32_t maximum_new_tokens{16U};
     std::uint32_t maximum_context_tokens{2048U};
+    std::uint32_t prefill_page_tokens{64U};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     std::uint32_t flash_attention_minimum_rows{256U};
@@ -45,6 +46,7 @@ void usage() {
     std::cerr
         << "usage: strata-deepseek-run --model DIR [--prompt TEXT] [--max-new N]\n"
         << "       [--devices 0,1,2] [--max-context N] [--host-memory 216G]\n"
+        << "       [--prefill-page-tokens N]\n"
         << "       [--host-attention-threads N|--serial-host-attention]\n"
         << "       [--resident-read-workers N]\n"
         << "       [--spine-warmup-workers N]\n"
@@ -109,6 +111,12 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--max-context") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(value, options.maximum_context_tokens)) return false;
+        } else if (argument == "--prefill-page-tokens") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_u32(
+                    value, options.prefill_page_tokens) ||
+                options.prefill_page_tokens == 0U ||
+                options.prefill_page_tokens > 512U) return false;
         } else if (argument == "--host-attention-threads") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(value, options.host_attention_threads) ||
@@ -352,6 +360,11 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
         return static_cast<double>(nanoseconds) / 1.0e9;
     };
     output << "{\"forward_tokens\":" << stats.forward_tokens
+           << ",\"prefill_pages\":" << stats.prefill_pages
+           << ",\"prefill_max_page_tokens\":"
+           << stats.prefill_max_page_tokens
+           << ",\"prefill_max_workspace_bytes\":"
+           << stats.prefill_max_workspace_bytes
            << ",\"embedding_seconds\":" << seconds(stats.embedding_nanoseconds)
            << ",\"mhc_pre_seconds\":" << seconds(stats.mhc_pre_nanoseconds)
            << ",\"branch_norm_seconds\":"
@@ -361,6 +374,10 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.attention_query_nanoseconds)
            << ",\"attention_kv_seconds\":"
            << seconds(stats.attention_kv_nanoseconds)
+           << ",\"attention_projection_matmul_calls\":"
+           << stats.attention_projection_matmul_calls
+           << ",\"attention_projection_matmul_rows\":"
+           << stats.attention_projection_matmul_rows
            << ",\"attention_index_seconds\":"
            << seconds(stats.attention_index_nanoseconds)
            << ",\"attention_index_queries\":"
@@ -622,6 +639,7 @@ int main(int argc, char** argv) {
     config.vram_cache_fraction = options.vram_fraction;
     config.host_memory_limit_bytes = options.host_memory_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
+    config.prefill_page_tokens = options.prefill_page_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
     config.host_attention_threads = options.host_attention_threads;
     config.resident_read_workers = options.resident_read_workers;
@@ -659,6 +677,8 @@ int main(int argc, char** argv) {
                   << (metrics.device_moe_enabled ? "true" : "false")
                   << ",\"host_attention_threads\":"
                   << metrics.host_attention_threads
+                  << ",\"prefill_page_tokens\":"
+                  << metrics.prefill_page_tokens
                   << ",\"flash_attention\":"
                   << (metrics.flash_attention_enabled ? "true" : "false")
                   << ",\"flash_attention_minimum_rows\":"

@@ -55,6 +55,7 @@ constexpr std::uint32_t kVocabulary = kDeepSeekV4ExecutionContract.vocabulary_si
 constexpr std::uint32_t kMhc = kDeepSeekV4ExecutionContract.mhc_multiplier;
 constexpr std::uint32_t kMix = kDeepSeekV4ExecutionContract.mix_width;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 256ULL << 20U;
+constexpr std::uint32_t kMaximumPrefillPageTokens = 512U;
 constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
@@ -361,12 +362,21 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     const Dsv4GraphStats& after, const Dsv4GraphStats& before) noexcept {
     return {
         after.forward_tokens - before.forward_tokens,
+        after.prefill_pages - before.prefill_pages,
+        after.prefill_pages == before.prefill_pages
+            ? 0U : after.prefill_max_page_tokens,
+        after.prefill_pages == before.prefill_pages
+            ? 0U : after.prefill_max_workspace_bytes,
         after.embedding_nanoseconds - before.embedding_nanoseconds,
         after.mhc_pre_nanoseconds - before.mhc_pre_nanoseconds,
         after.branch_norm_nanoseconds - before.branch_norm_nanoseconds,
         after.attention_nanoseconds - before.attention_nanoseconds,
         after.attention_query_nanoseconds - before.attention_query_nanoseconds,
         after.attention_kv_nanoseconds - before.attention_kv_nanoseconds,
+        after.attention_projection_matmul_calls -
+            before.attention_projection_matmul_calls,
+        after.attention_projection_matmul_rows -
+            before.attention_projection_matmul_rows,
         after.attention_index_nanoseconds - before.attention_index_nanoseconds,
         after.attention_index_queries - before.attention_index_queries,
         after.attention_index_candidates - before.attention_index_candidates,
@@ -745,6 +755,8 @@ struct DeepSeekV4Runtime::Impl {
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
     RouteTraceWriter route_trace;
+    std::vector<RouteEvent> deferred_route_events;
+    bool defer_prefill_observability{};
     std::mt19937_64 sampler;
     bool initialized{};
     std::uint64_t active_request_id{};
@@ -804,6 +816,16 @@ struct DeepSeekV4Runtime::Impl {
                                output, bf16_output);
     }
 
+    ValidationResult linear_rows(std::size_t slot, std::string_view base,
+                                 std::uint64_t outputs, std::uint64_t inputs,
+                                 std::span<const float> input,
+                                 std::uint32_t rows,
+                                 std::span<float> output,
+                                 bool bf16_output = true) {
+        return weights->matmul(slot, base, outputs, inputs, input, rows,
+                               output, bf16_output);
+    }
+
     ValidationResult norm(std::span<float> output, std::span<const float> input,
                           std::string name) {
         ValidationResult result;
@@ -814,6 +836,48 @@ struct DeepSeekV4Runtime::Impl {
         }
         result = rms_norm_f32(output, input, *weight.value, kRmsEpsilon);
         if (result.ok()) round_bf16(output);
+        return result;
+    }
+
+    ValidationResult norm_rows(std::span<float> output,
+                               std::span<const float> input,
+                               std::uint32_t rows,
+                               std::uint32_t columns,
+                               std::string name) {
+        ValidationResult result;
+        if (rows == 0U || columns == 0U ||
+            input.size() != static_cast<std::size_t>(rows) * columns ||
+            output.size() != input.size()) {
+            result.errors.emplace_back(
+                "DeepSeek batched normalization spans have incompatible sizes");
+            return result;
+        }
+        auto weight = host_tensor(std::move(name), columns);
+        if (!weight.ok()) {
+            append_errors(result, std::move(weight.errors));
+            return result;
+        }
+        std::vector<ValidationResult> row_results(rows);
+        const auto normalize_row = [&](std::size_t row) {
+            auto output_row = output.subspan(row * columns, columns);
+            const auto input_row = input.subspan(row * columns, columns);
+            row_results[row] = rms_norm_f32(output_row, input_row,
+                                             *weight.value, kRmsEpsilon);
+            if (row_results[row].ok()) round_bf16(output_row);
+        };
+        if (attention_workers != nullptr && rows > 1U) {
+            result = attention_workers->parallel_for(rows, normalize_row);
+            if (!result.ok()) return result;
+        } else {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                normalize_row(row);
+            }
+        }
+        for (auto& row_result : row_results) {
+            if (!row_result.ok()) {
+                append_errors(result, std::move(row_result.errors));
+            }
+        }
         return result;
     }
 
@@ -843,6 +907,15 @@ struct DeepSeekV4Runtime::Impl {
                                      std::vector<std::uint32_t>& selected);
     ValidationResult attention(std::uint32_t layer, std::span<const float> input,
                                std::uint32_t position, std::span<float> output);
+    ValidationResult attention_prepared(
+        std::uint32_t layer, std::span<const float> input,
+        std::span<const float> query_rank, std::span<const float> queries,
+        std::span<const float> kv, std::uint32_t position,
+        std::span<float> output);
+    ValidationResult attention_page(std::uint32_t layer,
+                                    std::span<const float> input,
+                                    std::uint32_t position_base,
+                                    std::span<float> output);
     ValidationResult expert(std::uint32_t layer, std::uint32_t expert_id,
                             float routed_coefficient,
                             std::span<const float> input, std::span<float> output);
@@ -853,8 +926,30 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult moe(std::uint32_t layer, std::uint32_t token,
                          std::span<const float> input, std::span<float> output,
                          std::uint32_t position);
+    ValidationResult route_moe(std::uint32_t layer, std::uint32_t token,
+                               std::span<const float> logits,
+                               std::uint32_t position, Dsv4Route& route);
+    ValidationResult execute_moe(std::uint32_t layer, const Dsv4Route& route,
+                                 std::span<const float> input,
+                                 std::span<float> output);
+    ValidationResult moe_page(std::uint32_t layer,
+                              std::span<const std::uint32_t> tokens,
+                              std::span<const float> input,
+                              std::span<float> output,
+                              std::uint32_t position_base);
     ValidationResult block(std::uint32_t layer, std::uint32_t token,
                            std::span<float> hidden, std::uint32_t position);
+    ValidationResult block_page(std::uint32_t layer,
+                                std::span<const std::uint32_t> tokens,
+                                std::span<float> hidden,
+                                std::uint32_t position_base);
+    ParseResult<std::uint32_t> sample_hidden(std::uint32_t token,
+                                             std::uint32_t position,
+                                             std::span<const float> hidden);
+    ParseResult<std::uint32_t> forward_prefill(
+        std::span<const std::uint32_t> tokens);
+    ValidationResult flush_deferred_routes();
+    ValidationResult flush_prefill_observability();
     ParseResult<std::uint32_t> forward_token(std::uint32_t token,
                                              std::uint32_t position,
                                              bool logits);
@@ -865,6 +960,11 @@ void DeepSeekV4Runtime::Impl::reset_diagnostics() {
     diagnostics.logit_trace_enabled = config.enable_logit_trace;
     diagnostics.layer_hash_trace_enabled = config.enable_layer_hash_trace;
     diagnostics.logit_top_k = config.logit_trace_top_k;
+    graph_stats.prefill_pages = 0U;
+    graph_stats.prefill_max_page_tokens = 0U;
+    graph_stats.prefill_max_workspace_bytes = 0U;
+    deferred_route_events.clear();
+    defer_prefill_observability = false;
     if (config.enable_logit_trace) {
         diagnostics.logit_aggregate.trace_hash = diagnostic_hash_u32(
             kDiagnosticFnvOffset, config.logit_trace_top_k);
@@ -1382,11 +1482,15 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     const auto prefix = layer_prefix(layer) + "attn.";
     auto subphase_started = std::chrono::steady_clock::now();
     std::vector<float> query_rank(kQueryRank);
+    ++graph_stats.attention_projection_matmul_calls;
+    ++graph_stats.attention_projection_matmul_rows;
     result = linear(slot, prefix + "wq_a", kQueryRank, kHidden, input, query_rank);
     if (!result.ok()) return result;
     result = norm(query_rank, query_rank, prefix + "q_norm.weight");
     if (!result.ok()) return result;
     std::vector<float> queries(static_cast<std::size_t>(kHeads) * kHeadDim);
+    ++graph_stats.attention_projection_matmul_calls;
+    ++graph_stats.attention_projection_matmul_rows;
     result = linear(slot, prefix + "wq_b", kHeads * kHeadDim, kQueryRank,
                     query_rank, queries);
     if (!result.ok()) return result;
@@ -1419,6 +1523,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
 
     subphase_started = std::chrono::steady_clock::now();
     std::vector<float> kv(kHeadDim);
+    ++graph_stats.attention_projection_matmul_calls;
+    ++graph_stats.attention_projection_matmul_rows;
     result = linear(slot, prefix + "wkv", kHeadDim, kHidden, input, kv);
     if (!result.ok()) return result;
     result = norm(kv, kv, prefix + "kv_norm.weight");
@@ -1428,6 +1534,27 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     round_bf16(std::span<float>(kv).last(kRopeDim));
     quantize_activation_in_place(std::span<float>(kv).first(kHeadDim - kRopeDim),
                                  64U);
+    graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
+    return attention_prepared(layer, input, query_rank, queries, kv, position,
+                              output);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
+    std::uint32_t layer, std::span<const float> input,
+    std::span<const float> query_rank, std::span<const float> queries,
+    std::span<const float> kv, std::uint32_t position,
+    std::span<float> output) {
+    ValidationResult result;
+    if (input.size() != kHidden || query_rank.size() != kQueryRank ||
+        queries.size() != static_cast<std::size_t>(kHeads) * kHeadDim ||
+        kv.size() != kHeadDim || output.size() != kHidden) {
+        result.errors.emplace_back(
+            "DeepSeek prepared attention spans have incompatible sizes");
+        return result;
+    }
+    const auto slot = layer_device(layer);
+    const auto prefix = layer_prefix(layer) + "attn.";
+    auto subphase_started = std::chrono::steady_clock::now();
     auto& layer_state = attention_state[layer];
     std::copy(kv.begin(), kv.end(),
               layer_state.sliding.begin() +
@@ -1625,6 +1752,122 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::attention_page(
+    std::uint32_t layer, std::span<const float> input,
+    std::uint32_t position_base, std::span<float> output) {
+    ValidationResult result;
+    if (input.empty() || input.size() % kHidden != 0U ||
+        output.size() != input.size()) {
+        result.errors.emplace_back(
+            "DeepSeek attention page spans have incompatible sizes");
+        return result;
+    }
+    const auto row_count = input.size() / kHidden;
+    if (row_count > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back("DeepSeek attention page row count overflows");
+        return result;
+    }
+    const auto rows = static_cast<std::uint32_t>(row_count);
+    if (rows > config.prefill_page_tokens ||
+        rows > config.maximum_context_tokens ||
+        position_base > config.maximum_context_tokens - rows) {
+        result.errors.emplace_back(
+            "DeepSeek attention page exceeds the admitted context bounds");
+        return result;
+    }
+
+    const auto slot = layer_device(layer);
+    const auto prefix = layer_prefix(layer) + "attn.";
+    auto subphase_started = std::chrono::steady_clock::now();
+    std::vector<float> query_rank(row_count * kQueryRank);
+    ++graph_stats.attention_projection_matmul_calls;
+    graph_stats.attention_projection_matmul_rows += rows;
+    result = linear_rows(slot, prefix + "wq_a", kQueryRank, kHidden, input,
+                         rows, query_rank);
+    if (!result.ok()) return result;
+    result = norm_rows(query_rank, query_rank, rows, kQueryRank,
+                       prefix + "q_norm.weight");
+    if (!result.ok()) return result;
+
+    const auto query_stride = static_cast<std::size_t>(kHeads) * kHeadDim;
+    std::vector<float> queries(row_count * query_stride);
+    ++graph_stats.attention_projection_matmul_calls;
+    graph_stats.attention_projection_matmul_rows += rows;
+    result = linear_rows(slot, prefix + "wq_b", query_stride, kQueryRank,
+                         query_rank, rows, queries);
+    if (!result.ok()) return result;
+    const auto normalize_query = [&](std::size_t task) {
+        const auto row = task / kHeads;
+        const auto head = task % kHeads;
+        auto query = std::span<float>(queries).subspan(
+            row * query_stride + head * kHeadDim, kHeadDim);
+        double square_sum = 0.0;
+        for (const float value : query) {
+            square_sum += static_cast<double>(value) * value;
+        }
+        const float reciprocal = 1.0F / std::sqrt(
+            static_cast<float>(square_sum / kHeadDim) + kRmsEpsilon);
+        for (auto& value : query) value = round_bf16(value * reciprocal);
+        apply_rope(query.last(kRopeDim),
+                   position_base + static_cast<std::uint32_t>(row),
+                   attention_state[layer].frequencies);
+        round_bf16(query.last(kRopeDim));
+    };
+    if (attention_workers != nullptr) {
+        result = attention_workers->parallel_for(
+            row_count * kHeads, normalize_query);
+        if (!result.ok()) return result;
+    } else {
+        for (std::size_t task = 0U; task < row_count * kHeads; ++task) {
+            normalize_query(task);
+        }
+    }
+    graph_stats.attention_query_nanoseconds += elapsed_nanoseconds(subphase_started);
+
+    subphase_started = std::chrono::steady_clock::now();
+    std::vector<float> kv(row_count * kHeadDim);
+    ++graph_stats.attention_projection_matmul_calls;
+    graph_stats.attention_projection_matmul_rows += rows;
+    result = linear_rows(slot, prefix + "wkv", kHeadDim, kHidden, input, rows,
+                         kv);
+    if (!result.ok()) return result;
+    result = norm_rows(kv, kv, rows, kHeadDim, prefix + "kv_norm.weight");
+    if (!result.ok()) return result;
+    const auto finish_kv = [&](std::size_t row) {
+        auto kv_row = std::span<float>(kv).subspan(row * kHeadDim, kHeadDim);
+        apply_rope(kv_row.last(kRopeDim),
+                   position_base + static_cast<std::uint32_t>(row),
+                   attention_state[layer].frequencies);
+        round_bf16(kv_row.last(kRopeDim));
+        quantize_activation_in_place(kv_row.first(kHeadDim - kRopeDim), 64U);
+    };
+    if (attention_workers != nullptr && rows > 1U) {
+        result = attention_workers->parallel_for(rows, finish_kv);
+        if (!result.ok()) return result;
+    } else {
+        for (std::uint32_t row = 0U; row < rows; ++row) finish_kv(row);
+    }
+    graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
+
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        const auto input_row = input.subspan(
+            static_cast<std::size_t>(row) * kHidden, kHidden);
+        const auto query_rank_row = std::span<const float>(query_rank).subspan(
+            static_cast<std::size_t>(row) * kQueryRank, kQueryRank);
+        const auto queries_row = std::span<const float>(queries).subspan(
+            static_cast<std::size_t>(row) * query_stride, query_stride);
+        const auto kv_row = std::span<const float>(kv).subspan(
+            static_cast<std::size_t>(row) * kHeadDim, kHeadDim);
+        auto output_row = output.subspan(
+            static_cast<std::size_t>(row) * kHidden, kHidden);
+        result = attention_prepared(layer, input_row, query_rank_row,
+                                    queries_row, kv_row, position_base + row,
+                                    output_row);
+        if (!result.ok()) return result;
+    }
+    return result;
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::expert(
     std::uint32_t layer, std::uint32_t expert_id,
     float routed_coefficient,
@@ -1811,16 +2054,11 @@ ValidationResult DeepSeekV4Runtime::Impl::device_moe(
     return result;
 }
 
-ValidationResult DeepSeekV4Runtime::Impl::moe(
-    std::uint32_t layer, std::uint32_t token, std::span<const float> input,
-    std::span<float> output, std::uint32_t position) {
+ValidationResult DeepSeekV4Runtime::Impl::route_moe(
+    std::uint32_t layer, std::uint32_t token, std::span<const float> logits,
+    std::uint32_t position, Dsv4Route& output) {
     ValidationResult result;
     const auto prefix = layer_prefix(layer) + "ffn.";
-    const auto router_started = std::chrono::steady_clock::now();
-    std::vector<float> logits(kExperts);
-    result = linear(layer_device(layer), prefix + "gate", kExperts, kHidden,
-                    input, logits, false);
-    if (!result.ok()) return result;
     const auto& router = deepseek_v4_flash_dspark_spec().router;
     Dsv4RouteResult route;
     if (layer < 3U) {
@@ -1861,7 +2099,6 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
         append_errors(result, std::move(route.errors));
         return result;
     }
-    graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
     if (config.enable_layer_hash_trace) {
         record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
     }
@@ -1874,19 +2111,32 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
         event.coefficients = route.value.weights;
         event.phase = position < active_prompt_tokens
                           ? RoutePhase::Prefill : RoutePhase::Decode;
-        auto written = route_trace.write(event);
-        if (!written.ok()) return written;
+        if (defer_prefill_observability && event.phase == RoutePhase::Prefill) {
+            deferred_route_events.push_back(std::move(event));
+        } else {
+            auto written = route_trace.write(event);
+            if (!written.ok()) return written;
+        }
     }
+    output = std::move(route.value);
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::execute_moe(
+    std::uint32_t layer, const Dsv4Route& route,
+    std::span<const float> input, std::span<float> output) {
+    ValidationResult result;
+    const auto prefix = layer_prefix(layer) + "ffn.";
 
     if (config.enable_device_moe) {
-        return device_moe(layer, route.value, input, output);
+        return device_moe(layer, route, input, output);
     }
 
     std::fill(output.begin(), output.end(), 0.0F);
     std::vector<float> routed(kHidden);
-    for (std::size_t rank = 0U; rank < route.value.experts.size(); ++rank) {
-        result = expert(layer, route.value.experts[rank],
-                        route.value.weights[rank], input, routed);
+    for (std::size_t rank = 0U; rank < route.experts.size(); ++rank) {
+        result = expert(layer, route.experts[rank], route.weights[rank], input,
+                        routed);
         if (!result.ok()) return result;
         for (std::uint32_t column = 0U; column < kHidden; ++column) {
             output[column] += routed[column];
@@ -1912,6 +2162,58 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
     if (!result.ok()) return result;
     for (std::uint32_t column = 0U; column < kHidden; ++column) {
         output[column] = round_bf16(output[column] + shared_output[column]);
+    }
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::moe(
+    std::uint32_t layer, std::uint32_t token, std::span<const float> input,
+    std::span<float> output, std::uint32_t position) {
+    ValidationResult result;
+    const auto router_started = std::chrono::steady_clock::now();
+    std::vector<float> logits(kExperts);
+    result = linear(layer_device(layer), layer_prefix(layer) + "ffn.gate",
+                    kExperts, kHidden, input, logits, false);
+    if (!result.ok()) return result;
+    Dsv4Route route;
+    result = route_moe(layer, token, logits, position, route);
+    graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
+    if (!result.ok()) return result;
+    return execute_moe(layer, route, input, output);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::moe_page(
+    std::uint32_t layer, std::span<const std::uint32_t> tokens,
+    std::span<const float> input, std::span<float> output,
+    std::uint32_t position_base) {
+    ValidationResult result;
+    const auto rows = static_cast<std::uint32_t>(tokens.size());
+    if (rows == 0U || input.size() != static_cast<std::size_t>(rows) * kHidden ||
+        output.size() != input.size()) {
+        result.errors.emplace_back("DeepSeek MoE page has incompatible dimensions");
+        return result;
+    }
+    const auto router_started = std::chrono::steady_clock::now();
+    std::vector<float> logits(static_cast<std::size_t>(rows) * kExperts);
+    result = linear_rows(layer_device(layer), layer_prefix(layer) + "ffn.gate",
+                         kExperts, kHidden, input, rows, logits, false);
+    if (!result.ok()) return result;
+    std::vector<Dsv4Route> routes(rows);
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = route_moe(
+            layer, tokens[row],
+            std::span<const float>(logits).subspan(
+                static_cast<std::size_t>(row) * kExperts, kExperts),
+            position_base + row, routes[row]);
+        if (!result.ok()) return result;
+    }
+    graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = execute_moe(
+            layer, routes[row],
+            input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
+            output.subspan(static_cast<std::size_t>(row) * kHidden, kHidden));
+        if (!result.ok()) return result;
     }
     return result;
 }
@@ -1979,9 +2281,117 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::block_page(
+    std::uint32_t layer, std::span<const std::uint32_t> tokens,
+    std::span<float> hidden, std::uint32_t position_base) {
+    ValidationResult result;
+    const auto rows = tokens.size();
+    const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
+    if (rows == 0U || rows > config.maximum_context_tokens ||
+        hidden.size() != rows * hidden_stride ||
+        position_base > config.maximum_context_tokens - rows) {
+        result.errors.emplace_back(
+            "DeepSeek prefill page has incompatible dimensions");
+        return result;
+    }
+    const auto prefix = layer_prefix(layer);
+    for (const auto* branch_name : {"attn", "ffn"}) {
+        const std::string branch(branch_name);
+        auto projection = host_tensor(prefix + "hc_" + branch + "_fn",
+                                      kMix * kMhc * kHidden);
+        auto scale = host_tensor(prefix + "hc_" + branch + "_scale", 3U);
+        auto base = host_tensor(prefix + "hc_" + branch + "_base", kMix);
+        if (!projection.ok()) append_errors(result, std::move(projection.errors));
+        if (!scale.ok()) append_errors(result, std::move(scale.errors));
+        if (!base.ok()) append_errors(result, std::move(base.errors));
+        if (!result.ok()) return result;
+
+        const std::vector<float> residual(hidden.begin(), hidden.end());
+        std::vector<float> reduced(rows * kHidden);
+        std::vector<Dsv4MhcMix> mixes(rows);
+        for (std::size_t row = 0U; row < rows; ++row) {
+            const auto position = position_base + static_cast<std::uint32_t>(row);
+            auto reduced_row = std::span<float>(reduced).subspan(row * kHidden,
+                                                                 kHidden);
+            const auto residual_row = std::span<const float>(residual).subspan(
+                row * hidden_stride, hidden_stride);
+            auto phase_started = std::chrono::steady_clock::now();
+            result = dsv4_mhc_pre_f32(reduced_row, mixes[row], residual_row,
+                                      *projection.value, *scale.value,
+                                      *base.value);
+            graph_stats.mhc_pre_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+            round_bf16(reduced_row);
+            if (config.enable_layer_hash_trace) {
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_mhc_pre", reduced_row);
+            }
+            phase_started = std::chrono::steady_clock::now();
+            result = norm(reduced_row, reduced_row,
+                          prefix + branch + "_norm.weight");
+            graph_stats.branch_norm_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+            if (config.enable_layer_hash_trace) {
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_norm", reduced_row);
+            }
+        }
+
+        std::vector<float> branch_output(rows * kHidden);
+        if (branch == "attn") {
+            const auto phase_started = std::chrono::steady_clock::now();
+            result = attention_page(layer, reduced, position_base,
+                                    branch_output);
+            graph_stats.attention_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+        } else {
+            const auto phase_started = std::chrono::steady_clock::now();
+            result = moe_page(layer, tokens, reduced, branch_output,
+                              position_base);
+            graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+        }
+        if (config.enable_layer_hash_trace) {
+            for (std::size_t row = 0U; row < rows; ++row) {
+                const auto position = position_base +
+                                      static_cast<std::uint32_t>(row);
+                const auto output_row = std::span<const float>(branch_output)
+                    .subspan(row * kHidden, kHidden);
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_output", output_row);
+            }
+        }
+
+        for (std::size_t row = 0U; row < rows; ++row) {
+            const auto position = position_base + static_cast<std::uint32_t>(row);
+            auto hidden_row = hidden.subspan(row * hidden_stride, hidden_stride);
+            const auto output_row = std::span<const float>(branch_output).subspan(
+                row * kHidden, kHidden);
+            const auto residual_row = std::span<const float>(residual).subspan(
+                row * hidden_stride, hidden_stride);
+            const auto phase_started = std::chrono::steady_clock::now();
+            result = dsv4_mhc_post_f32(hidden_row, output_row, residual_row,
+                                       mixes[row]);
+            graph_stats.mhc_post_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+            round_bf16(hidden_row);
+            if (config.enable_layer_hash_trace) {
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_mhc_post", hidden_row);
+            }
+        }
+    }
+    return result;
+}
+
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     std::uint32_t token, std::uint32_t position, bool logits_required) {
     ParseResult<std::uint32_t> result;
+    result.value = token;
     std::vector<float> hidden(static_cast<std::size_t>(kMhc) * kHidden);
     const auto embedding_started = std::chrono::steady_clock::now();
     auto validation = embed(token, hidden);
@@ -2003,6 +2413,20 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     if (!logits_required) {
         ++graph_stats.forward_tokens;
         result.value = token;
+        return result;
+    }
+
+    return sample_hidden(token, position, hidden);
+}
+
+ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
+    std::uint32_t token, std::uint32_t position,
+    std::span<const float> hidden) {
+    ParseResult<std::uint32_t> result;
+    ValidationResult validation;
+    if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
+        result.errors.emplace_back(
+            "DeepSeek output head received an invalid hidden-state shape");
         return result;
     }
 
@@ -2062,6 +2486,151 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::flush_deferred_routes() {
+    ValidationResult result;
+    std::stable_sort(
+        deferred_route_events.begin(), deferred_route_events.end(),
+        [](const RouteEvent& left, const RouteEvent& right) {
+            if (left.token_position != right.token_position) {
+                return left.token_position < right.token_position;
+            }
+            return left.layer < right.layer;
+        });
+    for (const auto& event : deferred_route_events) {
+        auto written = route_trace.write(event);
+        if (!written.ok()) {
+            append_errors(result, std::move(written.errors));
+            break;
+        }
+    }
+    deferred_route_events.clear();
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::flush_prefill_observability() {
+    ValidationResult result;
+    const auto position_layer_less = [](const auto& left, const auto& right) {
+        if (left.position != right.position) return left.position < right.position;
+        return left.layer < right.layer;
+    };
+    if (config.enable_layer_hash_trace) {
+        std::stable_sort(diagnostics.layer_hashes.begin(),
+                         diagnostics.layer_hashes.end(), position_layer_less);
+        diagnostics.layer_hash_trace_hash = diagnostic_hash_u32(
+            kDiagnosticFnvOffset, kLayers);
+        for (const auto& record : diagnostics.layer_hashes) {
+            auto aggregate = diagnostics.layer_hash_trace_hash;
+            aggregate = diagnostic_hash_u32(aggregate, record.position);
+            aggregate = diagnostic_hash_u32(aggregate, record.input_token);
+            aggregate = diagnostic_hash_u32(aggregate, record.layer);
+            diagnostics.layer_hash_trace_hash = diagnostic_hash_u64(
+                aggregate, record.bf16_hash);
+        }
+        std::stable_sort(diagnostics.operation_hashes.begin(),
+                         diagnostics.operation_hashes.end(),
+                         position_layer_less);
+    }
+    return flush_deferred_routes();
+}
+
+ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
+    std::span<const std::uint32_t> tokens) {
+    ParseResult<std::uint32_t> result;
+    if (tokens.empty()) {
+        result.errors.emplace_back("DeepSeek prefill requires at least one token");
+        return result;
+    }
+    const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
+    if (config.prefill_page_tokens == 1U) {
+        for (std::size_t position = 0U; position < tokens.size(); ++position) {
+            ++graph_stats.prefill_pages;
+            graph_stats.prefill_max_page_tokens = 1U;
+            graph_stats.prefill_max_workspace_bytes = std::max<std::uint64_t>(
+                graph_stats.prefill_max_workspace_bytes,
+                static_cast<std::uint64_t>(hidden_stride) * sizeof(float));
+            result = forward_token(
+                tokens[position], static_cast<std::uint32_t>(position),
+                position + 1U == tokens.size());
+            if (!result.ok()) return result;
+        }
+        return result;
+    }
+    defer_prefill_observability = true;
+    for (std::size_t page_begin = 0U; page_begin < tokens.size();
+         page_begin += config.prefill_page_tokens) {
+        const auto page_rows = static_cast<std::uint32_t>(std::min<std::size_t>(
+            config.prefill_page_tokens, tokens.size() - page_begin));
+        std::vector<float> hidden(static_cast<std::size_t>(page_rows) * hidden_stride);
+        ++graph_stats.prefill_pages;
+        graph_stats.prefill_max_page_tokens = std::max<std::uint64_t>(
+            graph_stats.prefill_max_page_tokens, page_rows);
+        graph_stats.prefill_max_workspace_bytes = std::max<std::uint64_t>(
+            graph_stats.prefill_max_workspace_bytes,
+            static_cast<std::uint64_t>(page_rows) *
+                (2U * hidden_stride + 2U * kHidden + kQueryRank +
+                 static_cast<std::size_t>(kHeads) * kHeadDim + kHeadDim) *
+                sizeof(float));
+
+        for (std::uint32_t row = 0U; row < page_rows; ++row) {
+            const auto embedding_started = std::chrono::steady_clock::now();
+            auto status = embed(tokens[page_begin + row],
+                                std::span<float>(hidden).subspan(
+                                    static_cast<std::size_t>(row) * hidden_stride,
+                                    hidden_stride));
+            graph_stats.embedding_nanoseconds +=
+                elapsed_nanoseconds(embedding_started);
+            if (!status.ok()) {
+                defer_prefill_observability = false;
+                result.errors = std::move(status.errors);
+                return result;
+            }
+        }
+
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            auto status = block_page(
+                layer, tokens.subspan(page_begin, page_rows), hidden,
+                static_cast<std::uint32_t>(page_begin));
+            if (!status.ok()) {
+                defer_prefill_observability = false;
+                result.errors = std::move(status.errors);
+                return result;
+            }
+            for (std::uint32_t row = 0U; row < page_rows; ++row) {
+                const auto absolute = static_cast<std::uint32_t>(page_begin) + row;
+                if (config.enable_layer_hash_trace) {
+                    record_layer_hash(
+                        absolute, tokens[absolute], layer,
+                        std::span<const float>(hidden).subspan(
+                            static_cast<std::size_t>(row) * hidden_stride,
+                            hidden_stride));
+                }
+            }
+        }
+        auto routes_flushed = flush_deferred_routes();
+        if (!routes_flushed.ok()) {
+            defer_prefill_observability = false;
+            result.errors = std::move(routes_flushed.errors);
+            return result;
+        }
+        graph_stats.forward_tokens += page_rows;
+        if (page_begin + page_rows == tokens.size()) {
+            --graph_stats.forward_tokens;
+            const auto last_row = std::span<const float>(hidden).last(hidden_stride);
+            result = sample_hidden(tokens.back(),
+                                   static_cast<std::uint32_t>(tokens.size() - 1U),
+                                   last_row);
+            if (!result.ok()) {
+                defer_prefill_observability = false;
+                return result;
+            }
+        }
+    }
+    defer_prefill_observability = false;
+    auto flushed = flush_prefill_observability();
+    if (!flushed.ok()) result.errors = std::move(flushed.errors);
+    return result;
+}
+
 DeepSeekV4Runtime::DeepSeekV4Runtime() : impl_(std::make_unique<Impl>()) {}
 DeepSeekV4Runtime::~DeepSeekV4Runtime() = default;
 DeepSeekV4Runtime::DeepSeekV4Runtime(DeepSeekV4Runtime&&) noexcept = default;
@@ -2086,6 +2655,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result.errors.emplace_back(
             "DeepSeek runtime context must be within the model limit [1, " +
             std::to_string(model_context) + "] tokens");
+        return result;
+    }
+    if (config.prefill_page_tokens == 0U ||
+        config.prefill_page_tokens > kMaximumPrefillPageTokens) {
+        result.errors.emplace_back(
+            "DeepSeek prefill page must be within [1, 512] tokens");
         return result;
     }
     if (config.enable_logit_trace &&
@@ -2273,6 +2848,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.overlap_resident_warmup;
     impl_->initialization_metrics.host_attention_threads =
         config.host_attention_threads;
+    impl_->initialization_metrics.prefill_page_tokens =
+        config.prefill_page_tokens;
     impl_->initialization_metrics.flash_attention_enabled =
         config.enable_flash_attention;
     impl_->initialization_metrics.flash_attention_minimum_rows =
@@ -2326,15 +2903,10 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
     const auto device_moe_before = impl_->device_moe_stats;
     const auto graph_before = impl_->graph_stats;
     const auto prefill_started = std::chrono::steady_clock::now();
-    ParseResult<std::uint32_t> next;
-    for (std::size_t position = 0U; position < result.prompt_token_ids.size(); ++position) {
-        next = impl_->forward_token(
-            result.prompt_token_ids[position], static_cast<std::uint32_t>(position),
-            position + 1U == result.prompt_token_ids.size());
-        if (!next.ok()) {
-            result.errors = std::move(next.errors);
-            return result;
-        }
+    auto next = impl_->forward_prefill(result.prompt_token_ids);
+    if (!next.ok()) {
+        result.errors = std::move(next.errors);
+        return result;
     }
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_started).count();

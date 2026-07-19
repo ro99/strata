@@ -54,6 +54,8 @@ other declared FP8 linears retain native execution.
 - exact compressed-position membership through 2,048 tokens, followed by the
   target's learned top-512 selection in ratio-4 layers; ratio-128 layers retain
   their full heavily-compressed history;
+- bounded layer-major prefill pages with a multi-row router projection and a
+  page-size-one token-at-a-time oracle; short full-model page equivalence passes;
 - full-model execution evidence through the first learned-index boundary;
   production-scale 32k/200k/1m ingestion is not yet claimed;
 - four-lane mHC pre/post mixing with 20 Sinkhorn iterations;

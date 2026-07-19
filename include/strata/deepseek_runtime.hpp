@@ -20,6 +20,9 @@ struct Dsv4RuntimeConfig {
     double vram_cache_fraction{0.85};
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
     std::uint32_t maximum_context_tokens{2048U};
+    // Prefill is executed in bounded layer-major pages. Page 64 is the
+    // accepted measured default; a value of one retains the oracle traversal.
+    std::uint32_t prefill_page_tokens{64U};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     bool enable_flash_attention{};
@@ -65,12 +68,17 @@ struct Dsv4DeviceMoeStats {
 
 struct Dsv4GraphStats {
     std::uint64_t forward_tokens{};
+    std::uint64_t prefill_pages{};
+    std::uint64_t prefill_max_page_tokens{};
+    std::uint64_t prefill_max_workspace_bytes{};
     std::uint64_t embedding_nanoseconds{};
     std::uint64_t mhc_pre_nanoseconds{};
     std::uint64_t branch_norm_nanoseconds{};
     std::uint64_t attention_nanoseconds{};
     std::uint64_t attention_query_nanoseconds{};
     std::uint64_t attention_kv_nanoseconds{};
+    std::uint64_t attention_projection_matmul_calls{};
+    std::uint64_t attention_projection_matmul_rows{};
     std::uint64_t attention_index_nanoseconds{};
     std::uint64_t attention_index_queries{};
     std::uint64_t attention_index_candidates{};
@@ -118,6 +126,7 @@ struct Dsv4GenerationMetrics {
     bool device_moe_enabled{};
     bool resident_warmup_overlapped{};
     std::uint32_t host_attention_threads{};
+    std::uint32_t prefill_page_tokens{};
     bool flash_attention_enabled{};
     std::uint32_t flash_attention_minimum_rows{};
     std::uint32_t resident_read_workers{};

@@ -50,6 +50,7 @@ constexpr std::uint32_t kVocabulary = kGlm52ExecutionContract.vocabulary_size;
 constexpr std::uint32_t kDsaThreshold =
     kGlm52ExecutionContract.sparse_attention_topk;
 constexpr float kAttentionScale = kGlm52ExecutionContract.attention_scale;
+constexpr std::uint64_t kFlashAttentionWorkspaceReserve = 768ULL << 20U;
 
 std::uint64_t state_hash(std::span<const float> values) noexcept {
     constexpr std::uint64_t offset = 1469598103934665603ULL;
@@ -411,6 +412,18 @@ CudaBackendStats::Device cuda_device_delta(const CudaBackendStats::Device& after
     STRATA_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_calls);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_kernel_launches);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_h2d_transfers);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_transfers);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_h2d_bytes);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_bytes);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_useful_staging_bytes);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_wasted_staging_bytes);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_h2d_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(flash_attention_nanoseconds);
 #undef STRATA_CUDA_DEVICE_DELTA
     return result;
 }
@@ -433,12 +446,28 @@ CudaBackendStats cuda_delta(const CudaBackendStats& after,
     STRATA_CUDA_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DELTA(kernel_nanoseconds);
     STRATA_CUDA_DELTA(activation_d2h_nanoseconds);
+    STRATA_CUDA_DELTA(flash_attention_calls);
+    STRATA_CUDA_DELTA(flash_attention_kernel_launches);
+    STRATA_CUDA_DELTA(flash_attention_h2d_transfers);
+    STRATA_CUDA_DELTA(flash_attention_d2h_transfers);
+    STRATA_CUDA_DELTA(flash_attention_h2d_bytes);
+    STRATA_CUDA_DELTA(flash_attention_d2h_bytes);
+    STRATA_CUDA_DELTA(flash_attention_useful_staging_bytes);
+    STRATA_CUDA_DELTA(flash_attention_wasted_staging_bytes);
+    STRATA_CUDA_DELTA(flash_attention_h2d_nanoseconds);
+    STRATA_CUDA_DELTA(flash_attention_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(flash_attention_d2h_nanoseconds);
+    STRATA_CUDA_DELTA(flash_attention_nanoseconds);
 #undef STRATA_CUDA_DELTA
     result.synchronization_nanoseconds = 0U;
     result.upload_wait_nanoseconds = 0U;
     result.activation_h2d_nanoseconds = 0U;
     result.kernel_nanoseconds = 0U;
     result.activation_d2h_nanoseconds = 0U;
+    result.flash_attention_h2d_nanoseconds = 0U;
+    result.flash_attention_kernel_nanoseconds = 0U;
+    result.flash_attention_d2h_nanoseconds = 0U;
+    result.flash_attention_nanoseconds = 0U;
     for (const auto& device_after : after.devices) {
         const auto found = std::find_if(
             before.devices.begin(), before.devices.end(),
@@ -459,6 +488,18 @@ CudaBackendStats cuda_delta(const CudaBackendStats& after,
             result.kernel_nanoseconds, delta.kernel_nanoseconds);
         result.activation_d2h_nanoseconds = std::max(
             result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
+        result.flash_attention_h2d_nanoseconds = std::max(
+            result.flash_attention_h2d_nanoseconds,
+            delta.flash_attention_h2d_nanoseconds);
+        result.flash_attention_kernel_nanoseconds = std::max(
+            result.flash_attention_kernel_nanoseconds,
+            delta.flash_attention_kernel_nanoseconds);
+        result.flash_attention_d2h_nanoseconds = std::max(
+            result.flash_attention_d2h_nanoseconds,
+            delta.flash_attention_d2h_nanoseconds);
+        result.flash_attention_nanoseconds = std::max(
+            result.flash_attention_nanoseconds,
+            delta.flash_attention_nanoseconds);
     }
     return result;
 }
@@ -795,36 +836,77 @@ struct Glm52Runtime::Impl {
         }
 
         std::vector<float> context(static_cast<std::size_t>(rows) * kHeads * kValueHead);
-        for (std::uint32_t row = 0; row < rows; ++row) {
-            const std::uint32_t position = position_base + row;
-            const std::size_t token_count = static_cast<std::size_t>(position) + 1U;
-            std::vector<float> scores(token_count);
-            for (std::uint32_t head = 0; head < kHeads; ++head) {
-                const auto* query = queries.data() +
-                    (static_cast<std::size_t>(row) * kHeads + head) * kQueryHead;
-                for (std::size_t token = 0; token < token_count; ++token) {
-                    const auto* key = cache.keys.data() +
+        if (config.enable_flash_attention) {
+            const auto token_count = cache.rope.size() / kRope;
+            std::vector<float> logical_keys(
+                token_count * kHeads * kQueryHead);
+            for (std::size_t token = 0U; token < token_count; ++token) {
+                const auto* rope_key = cache.rope.data() + token * kRope;
+                for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                    const auto* nope_key = cache.keys.data() +
                         (token * kHeads + head) * kNope;
-                    const auto* rope_key = cache.rope.data() + token * kRope;
-                    float score = 0.0F;
-                    for (std::uint32_t index = 0; index < kNope; ++index) {
-                        score += query[index] * key[index];
-                    }
-                    for (std::uint32_t index = 0; index < kRope; ++index) {
-                        score += query[kNope + index] * rope_key[index];
-                    }
-                    scores[token] = score * kAttentionScale;
+                    auto* destination = logical_keys.data() +
+                        (token * kHeads + head) * kQueryHead;
+                    std::copy(nope_key, nope_key + kNope, destination);
+                    std::copy(rope_key, rope_key + kRope, destination + kNope);
                 }
-                auto status = glm_softmax_f32(scores);
-                if (!status.ok()) return status;
-                auto* destination = context.data() +
-                    (static_cast<std::size_t>(row) * kHeads + head) * kValueHead;
-                std::fill(destination, destination + kValueHead, 0.0F);
-                for (std::size_t token = 0; token < token_count; ++token) {
-                    const auto* value = cache.values.data() +
-                        (token * kHeads + head) * kValueHead;
-                    for (std::uint32_t index = 0; index < kValueHead; ++index) {
-                        destination[index] += scores[token] * value[index];
+            }
+            std::vector<std::uint32_t> causal_limits(rows);
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                causal_limits[row] = position_base + row + 1U;
+            }
+            const std::array<FlashAttentionSegment, 1> segments{{
+                {logical_keys,
+                 std::span<const float>(cache.values).first(
+                     token_count * kHeads * kValueHead),
+                 {}}}};
+            FlashAttentionRequest request;
+            request.queries = queries;
+            request.segments = segments;
+            request.causal_key_counts = causal_limits;
+            request.query_rows = rows;
+            request.query_heads = kHeads;
+            request.key_value_heads = kHeads;
+            request.query_key_dim = kQueryHead;
+            request.value_dim = kValueHead;
+            request.scale = kAttentionScale;
+            request.numerics =
+                FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
+            request.maximum_workspace_bytes = kFlashAttentionWorkspaceReserve;
+            result = cuda.flash_attention(devices[device], request, context);
+            if (!result.ok()) return result;
+        } else {
+            for (std::uint32_t row = 0; row < rows; ++row) {
+                const std::uint32_t position = position_base + row;
+                const std::size_t token_count = static_cast<std::size_t>(position) + 1U;
+                std::vector<float> scores(token_count);
+                for (std::uint32_t head = 0; head < kHeads; ++head) {
+                    const auto* query = queries.data() +
+                        (static_cast<std::size_t>(row) * kHeads + head) * kQueryHead;
+                    for (std::size_t token = 0; token < token_count; ++token) {
+                        const auto* key = cache.keys.data() +
+                            (token * kHeads + head) * kNope;
+                        const auto* rope_key = cache.rope.data() + token * kRope;
+                        float score = 0.0F;
+                        for (std::uint32_t index = 0; index < kNope; ++index) {
+                            score += query[index] * key[index];
+                        }
+                        for (std::uint32_t index = 0; index < kRope; ++index) {
+                            score += query[kNope + index] * rope_key[index];
+                        }
+                        scores[token] = score * kAttentionScale;
+                    }
+                    auto status = glm_softmax_f32(scores);
+                    if (!status.ok()) return status;
+                    auto* destination = context.data() +
+                        (static_cast<std::size_t>(row) * kHeads + head) * kValueHead;
+                    std::fill(destination, destination + kValueHead, 0.0F);
+                    for (std::size_t token = 0; token < token_count; ++token) {
+                        const auto* value = cache.values.data() +
+                            (token * kHeads + head) * kValueHead;
+                        for (std::uint32_t index = 0; index < kValueHead; ++index) {
+                            destination[index] += scores[token] * value[index];
+                        }
                     }
                 }
             }
@@ -1439,7 +1521,9 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     }
 
     auto device_plan = plan_runtime_devices(
-        config.devices, config.vram_cache_fraction, 0U, 2ULL << 30U, "GLM");
+        config.devices, config.vram_cache_fraction,
+        config.enable_flash_attention ? kFlashAttentionWorkspaceReserve : 0U,
+        2ULL << 30U, "GLM");
     if (!device_plan.ok()) {
         result.errors = std::move(device_plan.errors);
         return result;
@@ -1603,6 +1687,8 @@ Glm52GenerationResult Glm52Runtime::generate_stream(
     result.metrics.cache = cache_delta(cache_after_decode, cache_before);
     result.metrics.host_experts = host_expert_delta(host_after_decode, host_before);
     result.metrics.detailed_timing = impl_->config.detailed_timing;
+    result.metrics.flash_attention_enabled =
+        impl_->config.enable_flash_attention;
     if (impl_->route_trace.is_open()) {
         auto flushed = impl_->route_trace.flush();
         move_errors(result.errors, std::move(flushed));

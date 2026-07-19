@@ -26,6 +26,7 @@ struct Options {
     bool quiet{};
     bool diagnostic_trace{};
     bool detailed_timing{};
+    bool flash_attention{};
     bool host_cold_experts{};
     std::uint32_t host_worker_threads{36U};
     std::string route_trace;
@@ -37,6 +38,7 @@ void usage() {
         << "                  [--devices 0,1,2] [--max-context N]\n"
         << "                  [--vram-fraction F] [--json] [--quiet]\n"
         << "                  [--diagnostic-trace] [--detailed-timing]\n"
+        << "                  [--flash-attention|--scalar-attention]\n"
         << "                  [--host-cold-experts] [--host-workers N]\n"
         << "                  [--route-trace PATH]\n";
 }
@@ -80,6 +82,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.diagnostic_trace = true;
         } else if (argument == "--detailed-timing") {
             options.detailed_timing = true;
+        } else if (argument == "--flash-attention") {
+            options.flash_attention = true;
+        } else if (argument == "--scalar-attention") {
+            options.flash_attention = false;
         } else if (argument == "--host-cold-experts") {
             options.host_cold_experts = true;
         } else if (argument == "--host-workers") {
@@ -130,6 +136,29 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.kernel_nanoseconds) / 1.0e9
            << ",\"critical_path_activation_d2h_seconds\":"
            << static_cast<double>(stats.activation_d2h_nanoseconds) / 1.0e9
+           << ",\"flash_attention_calls\":" << stats.flash_attention_calls
+           << ",\"flash_attention_kernel_launches\":"
+           << stats.flash_attention_kernel_launches
+           << ",\"flash_attention_h2d_transfers\":"
+           << stats.flash_attention_h2d_transfers
+           << ",\"flash_attention_d2h_transfers\":"
+           << stats.flash_attention_d2h_transfers
+           << ",\"flash_attention_h2d_bytes\":"
+           << stats.flash_attention_h2d_bytes
+           << ",\"flash_attention_d2h_bytes\":"
+           << stats.flash_attention_d2h_bytes
+           << ",\"flash_attention_useful_staging_bytes\":"
+           << stats.flash_attention_useful_staging_bytes
+           << ",\"flash_attention_wasted_staging_bytes\":"
+           << stats.flash_attention_wasted_staging_bytes
+           << ",\"maximum_device_flash_attention_h2d_seconds\":"
+           << static_cast<double>(stats.flash_attention_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_flash_attention_kernel_seconds\":"
+           << static_cast<double>(stats.flash_attention_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_flash_attention_d2h_seconds\":"
+           << static_cast<double>(stats.flash_attention_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_flash_attention_seconds\":"
+           << static_cast<double>(stats.flash_attention_nanoseconds) / 1.0e9
            << ",\"devices\":[";
     for (std::size_t index = 0; index < stats.devices.size(); ++index) {
         const auto& device = stats.devices[index];
@@ -153,7 +182,32 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"kernel_seconds\":"
                << static_cast<double>(device.kernel_nanoseconds) / 1.0e9
                << ",\"activation_d2h_seconds\":"
-               << static_cast<double>(device.activation_d2h_nanoseconds) / 1.0e9 << '}';
+               << static_cast<double>(device.activation_d2h_nanoseconds) / 1.0e9
+               << ",\"flash_attention_calls\":"
+               << device.flash_attention_calls
+               << ",\"flash_attention_kernel_launches\":"
+               << device.flash_attention_kernel_launches
+               << ",\"flash_attention_h2d_transfers\":"
+               << device.flash_attention_h2d_transfers
+               << ",\"flash_attention_d2h_transfers\":"
+               << device.flash_attention_d2h_transfers
+               << ",\"flash_attention_h2d_bytes\":"
+               << device.flash_attention_h2d_bytes
+               << ",\"flash_attention_d2h_bytes\":"
+               << device.flash_attention_d2h_bytes
+               << ",\"flash_attention_useful_staging_bytes\":"
+               << device.flash_attention_useful_staging_bytes
+               << ",\"flash_attention_wasted_staging_bytes\":"
+               << device.flash_attention_wasted_staging_bytes
+               << ",\"flash_attention_h2d_seconds\":"
+               << static_cast<double>(device.flash_attention_h2d_nanoseconds) / 1.0e9
+               << ",\"flash_attention_kernel_seconds\":"
+               << static_cast<double>(device.flash_attention_kernel_nanoseconds) / 1.0e9
+               << ",\"flash_attention_d2h_seconds\":"
+               << static_cast<double>(device.flash_attention_d2h_nanoseconds) / 1.0e9
+               << ",\"flash_attention_seconds\":"
+               << static_cast<double>(device.flash_attention_nanoseconds) / 1.0e9
+               << '}';
     }
     output << "]}";
 }
@@ -221,6 +275,7 @@ int main(int argc, char** argv) {
     config.verbose = !options.quiet;
     config.diagnostic_trace = options.diagnostic_trace;
     config.detailed_timing = options.detailed_timing;
+    config.enable_flash_attention = options.flash_attention;
     config.host_cold_experts = options.host_cold_experts;
     config.host_worker_threads = options.host_worker_threads;
     config.route_trace_path = options.route_trace;
@@ -253,6 +308,8 @@ int main(int argc, char** argv) {
                   << "\",\"execution\":\"exact_base_autoregressive\""
                   << ",\"mtp\":\"disabled\""
                   << ",\"detailed_timing\":" << (metrics.detailed_timing ? "true" : "false")
+                  << ",\"flash_attention\":"
+                  << (metrics.flash_attention_enabled ? "true" : "false")
                   << ",\"route_trace\":\""
                   << strata::cli::json_escape(options.route_trace) << '"'
                   << ",\"initialization_seconds\":" << initialization_seconds

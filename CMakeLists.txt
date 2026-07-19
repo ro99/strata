@@ -26,6 +26,7 @@ else()
 endif()
 
 add_library(strata_core STATIC
+    src/attention.cpp
     src/checkpoint.cpp
     src/checkpoint_io.cpp
     src/compressed_tensors.cpp
@@ -117,6 +118,7 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(strata-tests
         tests/test_main.cpp
+        tests/test_attention.cpp
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
         tests/test_glm_ops.cpp

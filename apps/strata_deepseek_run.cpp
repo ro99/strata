@@ -33,6 +33,7 @@ struct Options {
     bool quiet{};
     bool detailed_timing{};
     bool device_moe{true};
+    bool flash_attention{};
     bool logit_trace{};
     bool layer_hash_trace{};
     bool overlap_resident_warmup{true};
@@ -49,6 +50,7 @@ void usage() {
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
+        << "       [--flash-attention|--scalar-attention]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
         << "       [--detailed-timing] [--json] [--quiet]\n";
 }
@@ -136,6 +138,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.device_moe = true;
         } else if (argument == "--serial-device-moe") {
             options.device_moe = false;
+        } else if (argument == "--flash-attention") {
+            options.flash_attention = true;
+        } else if (argument == "--scalar-attention") {
+            options.flash_attention = false;
         } else if (argument == "--logit-trace") {
             options.logit_trace = true;
         } else if (argument == "--logit-trace-top-k") {
@@ -215,6 +221,29 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.deepseek_moe_d2h_nanoseconds) / 1.0e9
            << ",\"maximum_device_deepseek_moe_seconds\":"
            << static_cast<double>(stats.deepseek_moe_nanoseconds) / 1.0e9
+           << ",\"flash_attention_calls\":" << stats.flash_attention_calls
+           << ",\"flash_attention_kernel_launches\":"
+           << stats.flash_attention_kernel_launches
+           << ",\"flash_attention_h2d_transfers\":"
+           << stats.flash_attention_h2d_transfers
+           << ",\"flash_attention_d2h_transfers\":"
+           << stats.flash_attention_d2h_transfers
+           << ",\"flash_attention_h2d_bytes\":"
+           << stats.flash_attention_h2d_bytes
+           << ",\"flash_attention_d2h_bytes\":"
+           << stats.flash_attention_d2h_bytes
+           << ",\"flash_attention_useful_staging_bytes\":"
+           << stats.flash_attention_useful_staging_bytes
+           << ",\"flash_attention_wasted_staging_bytes\":"
+           << stats.flash_attention_wasted_staging_bytes
+           << ",\"maximum_device_flash_attention_h2d_seconds\":"
+           << static_cast<double>(stats.flash_attention_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_flash_attention_kernel_seconds\":"
+           << static_cast<double>(stats.flash_attention_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_flash_attention_d2h_seconds\":"
+           << static_cast<double>(stats.flash_attention_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_flash_attention_seconds\":"
+           << static_cast<double>(stats.flash_attention_nanoseconds) / 1.0e9
            << ",\"devices\":[";
     for (std::size_t index = 0U; index < stats.devices.size(); ++index) {
         const auto& device = stats.devices[index];
@@ -254,6 +283,30 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.deepseek_moe_d2h_nanoseconds) / 1.0e9
                << ",\"deepseek_moe_seconds\":"
                << static_cast<double>(device.deepseek_moe_nanoseconds) / 1.0e9
+               << ",\"flash_attention_calls\":"
+               << device.flash_attention_calls
+               << ",\"flash_attention_kernel_launches\":"
+               << device.flash_attention_kernel_launches
+               << ",\"flash_attention_h2d_transfers\":"
+               << device.flash_attention_h2d_transfers
+               << ",\"flash_attention_d2h_transfers\":"
+               << device.flash_attention_d2h_transfers
+               << ",\"flash_attention_h2d_bytes\":"
+               << device.flash_attention_h2d_bytes
+               << ",\"flash_attention_d2h_bytes\":"
+               << device.flash_attention_d2h_bytes
+               << ",\"flash_attention_useful_staging_bytes\":"
+               << device.flash_attention_useful_staging_bytes
+               << ",\"flash_attention_wasted_staging_bytes\":"
+               << device.flash_attention_wasted_staging_bytes
+               << ",\"flash_attention_h2d_seconds\":"
+               << static_cast<double>(device.flash_attention_h2d_nanoseconds) / 1.0e9
+               << ",\"flash_attention_kernel_seconds\":"
+               << static_cast<double>(device.flash_attention_kernel_nanoseconds) / 1.0e9
+               << ",\"flash_attention_d2h_seconds\":"
+               << static_cast<double>(device.flash_attention_d2h_nanoseconds) / 1.0e9
+               << ",\"flash_attention_seconds\":"
+               << static_cast<double>(device.flash_attention_nanoseconds) / 1.0e9
                << '}';
     }
     output << "]}";
@@ -566,6 +619,7 @@ int main(int argc, char** argv) {
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
+    config.enable_flash_attention = options.flash_attention;
     config.enable_logit_trace = options.logit_trace;
     config.enable_layer_hash_trace = options.layer_hash_trace;
     config.overlap_resident_warmup = options.overlap_resident_warmup;
@@ -593,6 +647,8 @@ int main(int argc, char** argv) {
                   << (metrics.device_moe_enabled ? "true" : "false")
                   << ",\"host_attention_threads\":"
                   << metrics.host_attention_threads
+                  << ",\"flash_attention\":"
+                  << (metrics.flash_attention_enabled ? "true" : "false")
                   << ",\"resident_read_workers\":"
                   << metrics.resident_read_workers
                   << ",\"spine_warmup_workers\":"

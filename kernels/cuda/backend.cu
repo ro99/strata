@@ -47,6 +47,24 @@ __device__ float reduce_block(float value) {
     return value;
 }
 
+__device__ double reduce_block_double(double value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xFFFF'FFFFU, value, offset);
+    }
+    __shared__ double warps[8];
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    if (lane == 0) warps[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < 8 ? warps[lane] : 0.0;
+    if (warp == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xFFFF'FFFFU, value, offset);
+        }
+    }
+    return value;
+}
+
 __device__ float plain_value(const void* weights, int dtype, std::uint64_t index) {
     if (dtype == static_cast<int>(SafetensorsDtype::Bf16)) {
         return __bfloat162float(static_cast<const __nv_bfloat16*>(weights)[index]);
@@ -486,6 +504,320 @@ __global__ void deepseek_fp8_down_kernel(
     if (threadIdx.x == 0U) output[output_row] = bf16_round(sum);
 }
 
+// Decode-oriented FlashAttention-2 forward specialization. One CTA owns one
+// query/head row while K/V are streamed in bounded tiles. Scores never leave
+// registers/shared memory; the running maximum, denominator, and output are
+// rescaled at every tile boundary.
+__global__ void flash_attention_forward_kernel(
+    float* output, const float* queries, const float* keys, const float* values,
+    const float* sinks, const std::uint32_t* causal_key_counts,
+    std::uint32_t query_rows, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t query_key_dim,
+    std::uint32_t value_dim, std::uint32_t key_rows, float scale,
+    unsigned int* error_flag) {
+    constexpr std::uint32_t tile_rows = 32U;
+    constexpr std::uint32_t threads = 256U;
+    constexpr std::uint32_t values_per_thread = 4U;
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (head >= query_heads || query_row >= query_rows) return;
+    const auto heads_per_kv = query_heads / key_value_heads;
+    const auto kv_head = head / heads_per_kv;
+    const auto visible_rows = causal_key_counts == nullptr
+        ? key_rows : causal_key_counts[query_row];
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(query_row) * query_heads + head) *
+            query_key_dim;
+    double accumulator[values_per_thread]{0.0, 0.0, 0.0, 0.0};
+    __shared__ double scores[tile_rows];
+    __shared__ double running_maximum;
+    __shared__ double denominator;
+    __shared__ double correction;
+    if (threadIdx.x == 0U) {
+        running_maximum = sinks == nullptr ? -INFINITY : sinks[head];
+        denominator = sinks == nullptr ? 0.0 : 1.0;
+    }
+    __syncthreads();
+
+    for (std::uint32_t tile = 0U; tile < visible_rows; tile += tile_rows) {
+        const auto count = min(tile_rows, visible_rows - tile);
+        for (std::uint32_t item = 0U; item < count; ++item) {
+            const auto row = tile + item;
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            double dot = 0.0;
+            for (std::uint32_t dimension = threadIdx.x;
+                 dimension < query_key_dim; dimension += blockDim.x) {
+                dot += static_cast<double>(query[dimension]) * key[dimension];
+            }
+            dot = reduce_block_double(dot);
+            if (threadIdx.x == 0U) {
+                scores[item] = dot * static_cast<double>(scale);
+                if (!isfinite(scores[item])) atomicExch(error_flag, 1U);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0U) {
+            double tile_maximum = -INFINITY;
+            for (std::uint32_t item = 0U; item < count; ++item) {
+                tile_maximum = fmax(tile_maximum, scores[item]);
+            }
+            const double next_maximum = fmax(running_maximum, tile_maximum);
+            correction = denominator == 0.0
+                ? 0.0 : exp(running_maximum - next_maximum);
+            denominator *= correction;
+            for (std::uint32_t item = 0U; item < count; ++item) {
+                scores[item] = exp(scores[item] - next_maximum);
+                denominator += scores[item];
+            }
+            running_maximum = next_maximum;
+            if (!isfinite(denominator) || denominator <= 0.0F) {
+                atomicExch(error_flag, 2U);
+            }
+        }
+        __syncthreads();
+        for (auto& value : accumulator) value *= correction;
+        for (std::uint32_t item = 0U; item < count; ++item) {
+            const auto row = tile + item;
+            const auto* value = values +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    value_dim;
+#pragma unroll
+            for (std::uint32_t slot = 0U; slot < values_per_thread; ++slot) {
+                const auto dimension = threadIdx.x + slot * threads;
+                if (dimension < value_dim) {
+                    accumulator[slot] += scores[item] * value[dimension];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    auto* destination = output +
+        (static_cast<std::uint64_t>(query_row) * query_heads + head) * value_dim;
+#pragma unroll
+    for (std::uint32_t slot = 0U; slot < values_per_thread; ++slot) {
+        const auto dimension = threadIdx.x + slot * threads;
+        if (dimension < value_dim) {
+            const float value = static_cast<float>(accumulator[slot] / denominator);
+            destination[dimension] = value;
+            if (!isfinite(value)) atomicExch(error_flag, 3U);
+        }
+    }
+}
+
+__device__ double flash_attention_sequential_dot(
+    const float* query, const float* key, std::uint32_t dimensions) {
+    double dot = 0.0;
+    for (std::uint32_t dimension = 0U; dimension < dimensions; ++dimension) {
+        dot = __dadd_rn(dot, __dmul_rn(
+            static_cast<double>(query[dimension]),
+            static_cast<double>(key[dimension])));
+    }
+    return dot;
+}
+
+// Compatibility specialization for model oracles whose public numerical
+// contract predates online softmax: F64 sequential dot, F32 score, global F64
+// softmax, F32 probability, and sequential F32 V accumulation. K/V remain
+// fused and no score tensor is materialized; the compatibility cost is
+// recomputing QK in three passes.
+__global__ void flash_attention_reference_f32_kernel(
+    float* output, const float* queries, const float* keys, const float* values,
+    const float* sinks, const std::uint32_t* causal_key_counts,
+    std::uint32_t query_rows, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t query_key_dim,
+    std::uint32_t value_dim, std::uint32_t key_rows, float scale,
+    unsigned int* error_flag) {
+    constexpr std::uint32_t threads = 256U;
+    constexpr std::uint32_t values_per_thread = 4U;
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (head >= query_heads || query_row >= query_rows) return;
+    const auto heads_per_kv = query_heads / key_value_heads;
+    const auto kv_head = head / heads_per_kv;
+    const auto visible_rows = causal_key_counts == nullptr
+        ? key_rows : causal_key_counts[query_row];
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(query_row) * query_heads + head) *
+            query_key_dim;
+    float accumulator[values_per_thread]{0.0F, 0.0F, 0.0F, 0.0F};
+    __shared__ float maximum;
+    __shared__ double denominator;
+    __shared__ float probability;
+
+    if (threadIdx.x == 0U) {
+        maximum = sinks == nullptr ? -INFINITY : sinks[head];
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            const float score = __fmul_rn(static_cast<float>(
+                flash_attention_sequential_dot(query, key, query_key_dim)), scale);
+            if (!isfinite(score)) atomicExch(error_flag, 1U);
+            maximum = fmaxf(maximum, score);
+        }
+        denominator = sinks == nullptr
+            ? 0.0
+            : exp(static_cast<double>(__fsub_rn(sinks[head], maximum)));
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            const float score = __fmul_rn(static_cast<float>(
+                flash_attention_sequential_dot(query, key, query_key_dim)), scale);
+            denominator = __dadd_rn(denominator, exp(static_cast<double>(
+                __fsub_rn(score, maximum))));
+        }
+        if (!isfinite(denominator) || denominator <= 0.0) {
+            atomicExch(error_flag, 2U);
+        }
+    }
+    __syncthreads();
+
+    for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+        if (threadIdx.x == 0U) {
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            const float score = __fmul_rn(static_cast<float>(
+                flash_attention_sequential_dot(query, key, query_key_dim)), scale);
+            probability = static_cast<float>(exp(static_cast<double>(
+                __fsub_rn(score, maximum))) / denominator);
+        }
+        __syncthreads();
+        const auto* value = values +
+            (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                value_dim;
+#pragma unroll
+        for (std::uint32_t slot = 0U; slot < values_per_thread; ++slot) {
+            const auto dimension = threadIdx.x + slot * threads;
+            if (dimension < value_dim) {
+                accumulator[slot] = __fadd_rn(
+                    accumulator[slot],
+                    __fmul_rn(probability, value[dimension]));
+            }
+        }
+        __syncthreads();
+    }
+
+    auto* destination = output +
+        (static_cast<std::uint64_t>(query_row) * query_heads + head) * value_dim;
+#pragma unroll
+    for (std::uint32_t slot = 0U; slot < values_per_thread; ++slot) {
+        const auto dimension = threadIdx.x + slot * threads;
+        if (dimension < value_dim) {
+            destination[dimension] = accumulator[slot];
+            if (!isfinite(accumulator[slot])) atomicExch(error_flag, 3U);
+        }
+    }
+}
+
+__device__ float flash_attention_sequential_dot_f32(
+    const float* query, const float* key, std::uint32_t dimensions) {
+    float dot = 0.0F;
+    for (std::uint32_t dimension = 0U; dimension < dimensions; ++dimension) {
+        dot = __fadd_rn(dot, __fmul_rn(query[dimension], key[dimension]));
+    }
+    return dot;
+}
+
+// F32 compatibility specialization used by adapters whose scalar oracle has
+// an F32 dot, exp, denominator, probability, and V accumulation contract.
+__global__ void flash_attention_reference_all_f32_kernel(
+    float* output, const float* queries, const float* keys, const float* values,
+    const float* sinks, const std::uint32_t* causal_key_counts,
+    std::uint32_t query_rows, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t query_key_dim,
+    std::uint32_t value_dim, std::uint32_t key_rows, float scale,
+    unsigned int* error_flag) {
+    constexpr std::uint32_t threads = 256U;
+    constexpr std::uint32_t values_per_thread = 4U;
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (head >= query_heads || query_row >= query_rows) return;
+    const auto heads_per_kv = query_heads / key_value_heads;
+    const auto kv_head = head / heads_per_kv;
+    const auto visible_rows = causal_key_counts == nullptr
+        ? key_rows : causal_key_counts[query_row];
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(query_row) * query_heads + head) *
+            query_key_dim;
+    float accumulator[values_per_thread]{0.0F, 0.0F, 0.0F, 0.0F};
+    __shared__ float maximum;
+    __shared__ float denominator;
+    __shared__ float probability;
+
+    if (threadIdx.x == 0U) {
+        maximum = sinks == nullptr ? -INFINITY : sinks[head];
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            const float score = __fmul_rn(
+                flash_attention_sequential_dot_f32(
+                    query, key, query_key_dim), scale);
+            if (!isfinite(score)) atomicExch(error_flag, 1U);
+            maximum = fmaxf(maximum, score);
+        }
+        denominator = sinks == nullptr
+            ? 0.0F : expf(__fsub_rn(sinks[head], maximum));
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            const float score = __fmul_rn(
+                flash_attention_sequential_dot_f32(
+                    query, key, query_key_dim), scale);
+            denominator = __fadd_rn(
+                denominator, expf(__fsub_rn(score, maximum)));
+        }
+        if (!isfinite(denominator) || denominator <= 0.0F) {
+            atomicExch(error_flag, 2U);
+        }
+    }
+    __syncthreads();
+
+    for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+        if (threadIdx.x == 0U) {
+            const auto* key = keys +
+                (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                    query_key_dim;
+            const float score = __fmul_rn(
+                flash_attention_sequential_dot_f32(
+                    query, key, query_key_dim), scale);
+            probability = __fdiv_rn(
+                expf(__fsub_rn(score, maximum)), denominator);
+        }
+        __syncthreads();
+        const auto* value = values +
+            (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
+                value_dim;
+#pragma unroll
+        for (std::uint32_t slot = 0U; slot < values_per_thread; ++slot) {
+            const auto dimension = threadIdx.x + slot * threads;
+            if (dimension < value_dim) {
+                accumulator[slot] = __fadd_rn(
+                    accumulator[slot],
+                    __fmul_rn(probability, value[dimension]));
+            }
+        }
+        __syncthreads();
+    }
+
+    auto* destination = output +
+        (static_cast<std::uint64_t>(query_row) * query_heads + head) * value_dim;
+#pragma unroll
+    for (std::uint32_t slot = 0U; slot < values_per_thread; ++slot) {
+        const auto dimension = threadIdx.x + slot * threads;
+        if (dimension < value_dim) {
+            destination[dimension] = accumulator[slot];
+            if (!isfinite(accumulator[slot])) atomicExch(error_flag, 3U);
+        }
+    }
+}
+
 bool checked_bytes(std::uint64_t left, std::uint64_t right, std::uint64_t element_bytes,
                    std::uint64_t& result) {
     if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
@@ -632,6 +964,19 @@ struct CudaBackend::Impl {
         float* output{};
         std::uint64_t input_bytes{};
         std::uint64_t output_bytes{};
+        float* attention_queries{};
+        float* attention_keys{};
+        float* attention_values{};
+        float* attention_sinks{};
+        std::uint32_t* attention_causal_limits{};
+        float* attention_output{};
+        unsigned int* attention_error{};
+        std::uint64_t attention_query_bytes{};
+        std::uint64_t attention_key_bytes{};
+        std::uint64_t attention_value_bytes{};
+        std::uint64_t attention_sink_bytes{};
+        std::uint64_t attention_causal_limit_bytes{};
+        std::uint64_t attention_output_bytes{};
         float* moe_hidden{};
         float* moe_activations{};
         float* moe_output{};
@@ -664,6 +1009,27 @@ struct CudaBackend::Impl {
             static_cast<void>(cudaSetDevice(device));
             if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
             if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
+            if (state.attention_queries != nullptr) {
+                static_cast<void>(cudaFree(state.attention_queries));
+            }
+            if (state.attention_keys != nullptr) {
+                static_cast<void>(cudaFree(state.attention_keys));
+            }
+            if (state.attention_values != nullptr) {
+                static_cast<void>(cudaFree(state.attention_values));
+            }
+            if (state.attention_sinks != nullptr) {
+                static_cast<void>(cudaFree(state.attention_sinks));
+            }
+            if (state.attention_causal_limits != nullptr) {
+                static_cast<void>(cudaFree(state.attention_causal_limits));
+            }
+            if (state.attention_output != nullptr) {
+                static_cast<void>(cudaFree(state.attention_output));
+            }
+            if (state.attention_error != nullptr) {
+                static_cast<void>(cudaFree(state.attention_error));
+            }
             if (state.moe_hidden != nullptr) static_cast<void>(cudaFree(state.moe_hidden));
             if (state.moe_activations != nullptr) {
                 static_cast<void>(cudaFree(state.moe_activations));
@@ -1034,6 +1400,334 @@ ValidationResult CudaBackend::matmul_grouped(
     std::uint32_t groups, std::uint64_t rows_per_group,
     std::span<float> output) {
     return matmul_impl(weight, input, groups, groups, rows_per_group, output);
+}
+
+ValidationResult CudaBackend::flash_attention(
+    int device, const FlashAttentionRequest& request,
+    std::span<float> output) {
+    ValidationResult result;
+    auto shape = validate_flash_attention_request(request, output);
+    if (!shape.ok()) {
+        result.errors = std::move(shape.errors);
+        return result;
+    }
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "FlashAttention targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "FlashAttention cannot overlap an in-flight DeepSeek MoE command");
+        return result;
+    }
+    if (request.query_rows > 65'535U || request.query_key_dim > 1'024U ||
+        request.value_dim > 1'024U ||
+        shape.value.logical_rows > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "FlashAttention CUDA shape exceeds the supported query, row, or head dimension");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for FlashAttention");
+    }
+    cudaDeviceProp properties{};
+    if (auto status = cudaGetDeviceProperties(&properties, device);
+        status != cudaSuccess) {
+        return cuda_error(status, "query CUDA device for FlashAttention");
+    }
+    const bool supported_architecture =
+        (properties.major == 8 && properties.minor == 6) ||
+        (properties.major == 12 && properties.minor == 0);
+    if (!supported_architecture) {
+        result.errors.emplace_back(
+            "FlashAttention CUDA kernel supports only SM86 and SM120 devices");
+        return result;
+    }
+
+    std::vector<float> packed_keys;
+    std::vector<float> packed_values;
+    std::vector<float> downloaded;
+    try {
+        downloaded.resize(output.size());
+        packed_keys.reserve(static_cast<std::size_t>(
+            shape.value.packed_key_elements));
+        if (!shape.value.values_alias_keys) {
+            packed_values.reserve(static_cast<std::size_t>(
+                shape.value.packed_value_elements));
+        }
+        const auto key_row_elements = static_cast<std::size_t>(
+            request.key_value_heads) * request.query_key_dim;
+        const auto value_row_elements = static_cast<std::size_t>(
+            request.key_value_heads) * request.value_dim;
+        for (const auto& segment : request.segments) {
+            const auto source_rows = segment.keys.size() / key_row_elements;
+            const auto logical_rows = segment.row_indices.empty()
+                ? source_rows : segment.row_indices.size();
+            for (std::size_t row = 0U; row < logical_rows; ++row) {
+                const auto source_row = segment.row_indices.empty()
+                    ? row : segment.row_indices[row];
+                const auto key = segment.keys.subspan(
+                    static_cast<std::size_t>(source_row) * key_row_elements,
+                    key_row_elements);
+                packed_keys.insert(packed_keys.end(), key.begin(), key.end());
+                if (!shape.value.values_alias_keys) {
+                    const auto& values = segment.values.empty()
+                        ? segment.keys : segment.values;
+                    const auto value = values.subspan(
+                        static_cast<std::size_t>(source_row) * value_row_elements,
+                        value_row_elements);
+                    packed_values.insert(packed_values.end(),
+                                         value.begin(), value.end());
+                }
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        result.errors.emplace_back(
+            "FlashAttention host staging allocation failed within its workspace contract");
+        return result;
+    }
+
+    const auto query_bytes = static_cast<std::uint64_t>(request.queries.size_bytes());
+    const auto key_bytes = static_cast<std::uint64_t>(packed_keys.size() * sizeof(float));
+    const auto value_bytes = shape.value.values_alias_keys
+        ? 0U : static_cast<std::uint64_t>(packed_values.size() * sizeof(float));
+    const auto sink_bytes = static_cast<std::uint64_t>(request.head_sinks.size_bytes());
+    const auto limit_bytes = static_cast<std::uint64_t>(
+        request.causal_key_counts.size_bytes());
+    const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    const auto ensure_workspace = [&](auto*& pointer, std::uint64_t& capacity,
+                                      std::uint64_t required,
+                                      const char* operation) -> bool {
+        if (required == 0U || required <= capacity) return true;
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = nullptr;
+        if (cudaMalloc(&pointer, static_cast<std::size_t>(required)) != cudaSuccess) {
+            result.errors.emplace_back(operation);
+            capacity = 0U;
+            return false;
+        }
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return true;
+    };
+    if (!ensure_workspace(state.attention_queries, state.attention_query_bytes,
+                          query_bytes, "allocate FlashAttention query workspace") ||
+        !ensure_workspace(state.attention_keys, state.attention_key_bytes,
+                          key_bytes, "allocate FlashAttention key workspace") ||
+        !ensure_workspace(state.attention_values, state.attention_value_bytes,
+                          value_bytes, "allocate FlashAttention value workspace") ||
+        !ensure_workspace(state.attention_sinks, state.attention_sink_bytes,
+                          sink_bytes, "allocate FlashAttention sink workspace") ||
+        !ensure_workspace(state.attention_causal_limits,
+                          state.attention_causal_limit_bytes, limit_bytes,
+                          "allocate FlashAttention causal-limit workspace") ||
+        !ensure_workspace(state.attention_output, state.attention_output_bytes,
+                          output_bytes, "allocate FlashAttention output workspace")) {
+        return result;
+    }
+    if (state.attention_error == nullptr) {
+        if (auto status = cudaMalloc(&state.attention_error,
+                                     sizeof(*state.attention_error));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate FlashAttention status workspace");
+        }
+        ++allocation_calls;
+        allocation_bytes += sizeof(*state.attention_error);
+    }
+
+    const auto operation_started = std::chrono::steady_clock::now();
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record FlashAttention upload start");
+        }
+    }
+    const auto copy_h2d = [&](void* destination, const void* source,
+                              std::uint64_t bytes,
+                              const char* operation) -> bool {
+        if (bytes == 0U) return true;
+        if (auto status = cudaMemcpyAsync(destination, source,
+                                          static_cast<std::size_t>(bytes),
+                                          cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        return true;
+    };
+    if (!copy_h2d(state.attention_queries, request.queries.data(), query_bytes,
+                  "upload FlashAttention queries") ||
+        !copy_h2d(state.attention_keys, packed_keys.data(), key_bytes,
+                  "upload FlashAttention keys") ||
+        !copy_h2d(state.attention_values, packed_values.data(), value_bytes,
+                  "upload FlashAttention values") ||
+        !copy_h2d(state.attention_sinks, request.head_sinks.data(), sink_bytes,
+                  "upload FlashAttention sinks") ||
+        !copy_h2d(state.attention_causal_limits,
+                  request.causal_key_counts.data(), limit_bytes,
+                  "upload FlashAttention causal limits")) {
+        return result;
+    }
+    if (auto status = cudaMemsetAsync(state.attention_error, 0,
+                                      sizeof(*state.attention_error), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear FlashAttention status");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record FlashAttention upload completion");
+        }
+    }
+    const dim3 grid(request.query_heads, request.query_rows, 1U);
+    constexpr unsigned int threads = 256U;
+    const auto* device_values = shape.value.values_alias_keys
+        ? state.attention_keys : state.attention_values;
+    if (request.numerics ==
+        FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum) {
+        flash_attention_reference_all_f32_kernel<<<grid, threads, 0U, state.stream>>>(
+            state.attention_output, state.attention_queries, state.attention_keys,
+            device_values,
+            request.head_sinks.empty() ? nullptr : state.attention_sinks,
+            request.causal_key_counts.empty()
+                ? nullptr : state.attention_causal_limits,
+            request.query_rows, request.query_heads, request.key_value_heads,
+            request.query_key_dim, request.value_dim,
+            static_cast<std::uint32_t>(shape.value.logical_rows), request.scale,
+            state.attention_error);
+    } else if (request.numerics ==
+        FlashAttentionNumerics::f64_dot_f32_score_f32_accum) {
+        flash_attention_reference_f32_kernel<<<grid, threads, 0U, state.stream>>>(
+            state.attention_output, state.attention_queries, state.attention_keys,
+            device_values,
+            request.head_sinks.empty() ? nullptr : state.attention_sinks,
+            request.causal_key_counts.empty()
+                ? nullptr : state.attention_causal_limits,
+            request.query_rows, request.query_heads, request.key_value_heads,
+            request.query_key_dim, request.value_dim,
+            static_cast<std::uint32_t>(shape.value.logical_rows), request.scale,
+            state.attention_error);
+    } else {
+        flash_attention_forward_kernel<<<grid, threads, 0U, state.stream>>>(
+            state.attention_output, state.attention_queries, state.attention_keys,
+            device_values,
+            request.head_sinks.empty() ? nullptr : state.attention_sinks,
+            request.causal_key_counts.empty()
+                ? nullptr : state.attention_causal_limits,
+            request.query_rows, request.query_heads, request.key_value_heads,
+            request.query_key_dim, request.value_dim,
+            static_cast<std::uint32_t>(shape.value.logical_rows), request.scale,
+            state.attention_error);
+    }
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch FlashAttention forward kernel");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record FlashAttention kernel completion");
+        }
+    }
+    unsigned int numerical_error = 0U;
+    if (auto status = cudaMemcpyAsync(downloaded.data(), state.attention_output,
+                                      output.size_bytes(), cudaMemcpyDeviceToHost,
+                                      state.stream); status != cudaSuccess) {
+        return cuda_error(status, "download FlashAttention output");
+    }
+    if (auto status = cudaMemcpyAsync(&numerical_error, state.attention_error,
+                                      sizeof(numerical_error),
+                                      cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download FlashAttention status");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record FlashAttention download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize FlashAttention forward");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    const auto operation_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - operation_started).count());
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_milliseconds = 0.0F;
+        float kernel_milliseconds = 0.0F;
+        float d2h_milliseconds = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_milliseconds, state.activation_start,
+                state.activation_uploaded); status != cudaSuccess) {
+            return cuda_error(status, "measure FlashAttention upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_milliseconds, state.activation_uploaded,
+                state.kernel_finished); status != cudaSuccess) {
+            return cuda_error(status, "measure FlashAttention kernel");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_milliseconds, state.kernel_finished,
+                state.activation_downloaded); status != cudaSuccess) {
+            return cuda_error(status, "measure FlashAttention download");
+        }
+        h2d_nanoseconds = static_cast<std::uint64_t>(std::llround(
+            static_cast<double>(h2d_milliseconds) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(std::llround(
+            static_cast<double>(kernel_milliseconds) * 1.0e6));
+        d2h_nanoseconds = static_cast<std::uint64_t>(std::llround(
+            static_cast<double>(d2h_milliseconds) * 1.0e6));
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++stats.flash_attention_calls;
+        ++stats.flash_attention_kernel_launches;
+        stats.flash_attention_h2d_transfers +=
+            1U + (key_bytes != 0U ? 1U : 0U) +
+            (value_bytes != 0U ? 1U : 0U) +
+            (sink_bytes != 0U ? 1U : 0U) +
+            (limit_bytes != 0U ? 1U : 0U);
+        stats.flash_attention_d2h_transfers += 2U;
+        stats.flash_attention_h2d_bytes += query_bytes + key_bytes +
+            value_bytes + sink_bytes + limit_bytes;
+        stats.flash_attention_d2h_bytes += output_bytes + sizeof(numerical_error);
+        stats.flash_attention_useful_staging_bytes += key_bytes + value_bytes;
+        stats.flash_attention_h2d_nanoseconds += h2d_nanoseconds;
+        stats.flash_attention_kernel_nanoseconds += kernel_nanoseconds;
+        stats.flash_attention_d2h_nanoseconds += d2h_nanoseconds;
+        stats.flash_attention_nanoseconds += operation_nanoseconds;
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
+    }
+    if (numerical_error != 0U) {
+        result.errors.emplace_back(
+            numerical_error == 1U
+                ? "FlashAttention CUDA score is non-finite"
+                : numerical_error == 2U
+                    ? "FlashAttention CUDA softmax denominator is invalid"
+                    : "FlashAttention CUDA output is non-finite");
+        return result;
+    }
+    std::copy(downloaded.begin(), downloaded.end(), output.begin());
+    return result;
 }
 
 ValidationResult CudaBackend::matmul_impl(
@@ -1903,6 +2597,31 @@ CudaBackendStats CudaBackend::stats() const noexcept {
             device.deepseek_moe_d2h_nanoseconds);
         result.deepseek_moe_nanoseconds = std::max(
             result.deepseek_moe_nanoseconds, device.deepseek_moe_nanoseconds);
+        result.flash_attention_calls += device.flash_attention_calls;
+        result.flash_attention_kernel_launches +=
+            device.flash_attention_kernel_launches;
+        result.flash_attention_h2d_transfers +=
+            device.flash_attention_h2d_transfers;
+        result.flash_attention_d2h_transfers +=
+            device.flash_attention_d2h_transfers;
+        result.flash_attention_h2d_bytes += device.flash_attention_h2d_bytes;
+        result.flash_attention_d2h_bytes += device.flash_attention_d2h_bytes;
+        result.flash_attention_useful_staging_bytes +=
+            device.flash_attention_useful_staging_bytes;
+        result.flash_attention_wasted_staging_bytes +=
+            device.flash_attention_wasted_staging_bytes;
+        result.flash_attention_h2d_nanoseconds = std::max(
+            result.flash_attention_h2d_nanoseconds,
+            device.flash_attention_h2d_nanoseconds);
+        result.flash_attention_kernel_nanoseconds = std::max(
+            result.flash_attention_kernel_nanoseconds,
+            device.flash_attention_kernel_nanoseconds);
+        result.flash_attention_d2h_nanoseconds = std::max(
+            result.flash_attention_d2h_nanoseconds,
+            device.flash_attention_d2h_nanoseconds);
+        result.flash_attention_nanoseconds = std::max(
+            result.flash_attention_nanoseconds,
+            device.flash_attention_nanoseconds);
     }
     return result;
 }

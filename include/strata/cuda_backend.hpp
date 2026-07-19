@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/attention.hpp"
 #include "strata/model.hpp"
 #include "strata/safetensors.hpp"
 
@@ -59,6 +60,18 @@ struct CudaBackendStats {
         std::uint64_t deepseek_moe_kernel_nanoseconds{};
         std::uint64_t deepseek_moe_d2h_nanoseconds{};
         std::uint64_t deepseek_moe_nanoseconds{};
+        std::uint64_t flash_attention_calls{};
+        std::uint64_t flash_attention_kernel_launches{};
+        std::uint64_t flash_attention_h2d_transfers{};
+        std::uint64_t flash_attention_d2h_transfers{};
+        std::uint64_t flash_attention_h2d_bytes{};
+        std::uint64_t flash_attention_d2h_bytes{};
+        std::uint64_t flash_attention_useful_staging_bytes{};
+        std::uint64_t flash_attention_wasted_staging_bytes{};
+        std::uint64_t flash_attention_h2d_nanoseconds{};
+        std::uint64_t flash_attention_kernel_nanoseconds{};
+        std::uint64_t flash_attention_d2h_nanoseconds{};
+        std::uint64_t flash_attention_nanoseconds{};
     };
 
     std::uint64_t weight_upload_bytes{};
@@ -85,6 +98,18 @@ struct CudaBackendStats {
     std::uint64_t deepseek_moe_kernel_nanoseconds{};
     std::uint64_t deepseek_moe_d2h_nanoseconds{};
     std::uint64_t deepseek_moe_nanoseconds{};
+    std::uint64_t flash_attention_calls{};
+    std::uint64_t flash_attention_kernel_launches{};
+    std::uint64_t flash_attention_h2d_transfers{};
+    std::uint64_t flash_attention_d2h_transfers{};
+    std::uint64_t flash_attention_h2d_bytes{};
+    std::uint64_t flash_attention_d2h_bytes{};
+    std::uint64_t flash_attention_useful_staging_bytes{};
+    std::uint64_t flash_attention_wasted_staging_bytes{};
+    std::uint64_t flash_attention_h2d_nanoseconds{};
+    std::uint64_t flash_attention_kernel_nanoseconds{};
+    std::uint64_t flash_attention_d2h_nanoseconds{};
+    std::uint64_t flash_attention_nanoseconds{};
     std::vector<Device> devices;
 };
 
@@ -154,6 +179,14 @@ public:
     [[nodiscard]] ValidationResult matmul_grouped(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t groups, std::uint64_t rows_per_group,
+        std::span<float> output);
+    // Executes the model-neutral forward attention primitive under the
+    // request's explicit numerical contract. Host segments are packed into
+    // bounded reusable device workspaces; indexed rows are gathered exactly in
+    // descriptor order. Unsupported devices or shapes return an error and
+    // never select another numerical path silently.
+    [[nodiscard]] ValidationResult flash_attention(
+        int device, const FlashAttentionRequest& request,
         std::span<float> output);
     // Enqueue first on every active device, then collect each device. Routed
     // results are flattened in the same order as `routed`; shared output is

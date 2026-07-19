@@ -255,9 +255,11 @@ reference or diagnostic runs.
 
 The generic tiled online-softmax CUDA backend is available as an opt-in
 correctness/performance candidate. Add `--flash-attention` to either model
-runner; `--scalar-attention` pins the existing oracle. It remains disabled by
-default until the full-model and replicated benchmark gates in
-[`docs/flash-attention.md`](docs/flash-attention.md) pass.
+runner; `--scalar-attention` pins the existing oracle. The full-model gates
+passed, but the required three-repetition DeepSeek matrix measured a 0.520x
+candidate/scalar median decode-throughput ratio, so the rollback policy keeps
+the scalar path as the default. See [`docs/flash-attention.md`](docs/flash-attention.md)
+and the benchmark record for the complete counters and decision.
 
 See [`docs/deepseek-v4-runtime.md`](docs/deepseek-v4-runtime.md) for the pinned
 checkpoint contract, measured admission plan, design boundary, and remaining

@@ -83,9 +83,12 @@ enabled.
 
 Use `--flash-attention` with `strata-deepseek-run`, `strata-run`, or
 `strata-chat`. Use `--scalar-attention` in the concrete benchmark runners to
-pin the reference path. The default remains scalar until operation fixtures,
-layer/full-model traces, token identity, and three interleaved measurements all
-pass without a memory-ceiling or throughput regression.
+pin the reference path. Operation fixtures and short full-model traces pass,
+but the required three-repetition DeepSeek matrix completed with a median
+candidate/scalar decode-throughput ratio of `0.520x`; the scalar default is
+therefore retained under the rollback condition. The measured result is
+recorded in
+[`docs/experiments/0014-generic-flash-attention-performance-2026-07-19.md`](experiments/0014-generic-flash-attention-performance-2026-07-19.md).
 
 Detailed CUDA JSON includes FlashAttention calls, launches, H2D/D2H transfers
 and bytes, useful/wasted staging bytes, transfer time, kernel time, total

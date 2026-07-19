@@ -34,6 +34,7 @@ ValidationResult RuntimeSession::initialize(
         concrete.sampling_seed = config.sampling_seed;
         concrete.verbose = config.verbose;
         concrete.load_progress = config.load_progress;
+        concrete.enable_flash_attention = config.enable_flash_attention;
         result = runtime.initialize(model_directory, concrete);
         if (result.ok()) impl_->runtime.emplace<Glm52Runtime>(std::move(runtime));
         return result;
@@ -46,6 +47,7 @@ ValidationResult RuntimeSession::initialize(
     concrete.sampling_temperature = config.sampling_temperature;
     concrete.sampling_seed = config.sampling_seed;
     concrete.verbose = config.verbose;
+    concrete.enable_flash_attention = config.enable_flash_attention;
     result = runtime.initialize(model_directory, concrete);
     if (result.ok()) impl_->runtime.emplace<DeepSeekV4Runtime>(std::move(runtime));
     return result;

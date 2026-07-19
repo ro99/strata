@@ -30,6 +30,7 @@ struct Options {
     double vram_fraction{0.85};
     std::uint64_t seed{33'377'335U};
     bool devices_explicit{};
+    bool flash_attention{};
 };
 
 void usage() {
@@ -38,6 +39,7 @@ void usage() {
         << "                    [--context-size N] [--max-new N]\n"
         << "                    [--temperature F] [--seed N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
+        << "                    [--flash-attention]\n"
         << "                    [--prompt TEXT]\n\n"
         << "Without --prompt, read one question per line until EOF.\n";
 }
@@ -48,6 +50,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         if (argument == "--help" || argument == "-h") {
             usage();
             std::exit(0);
+        }
+        if (argument == "--flash-attention") {
+            options.flash_attention = true;
+            continue;
         }
         if (index + 1 >= argc) return false;
         const auto next = [&]() { return std::string_view(argv[++index]); };
@@ -292,6 +298,9 @@ int main(int argc, char** argv) {
               << " temperature=" << options.temperature
               << " vram_fraction=" << options.vram_fraction
               << " seed=" << options.seed << '\n'
+              << "[attention] "
+              << (options.flash_attention ? "CUDA FlashAttention" : "scalar reference")
+              << '\n'
               << "[contract] "
               << (options.temperature == 0.0 ? "exact greedy" : "seeded Gumbel-max sampled")
               << " base-model decode; no hidden fallback\n"
@@ -308,6 +317,7 @@ int main(int argc, char** argv) {
     config.load_progress = options.model_type == "glm";
     config.sampling_temperature = options.temperature;
     config.sampling_seed = options.seed;
+    config.enable_flash_attention = options.flash_attention;
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {

@@ -219,6 +219,18 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_kernel_nanoseconds);
     STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_nanoseconds);
     STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_calls);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_kernel_launches);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_h2d_transfers);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_d2h_transfers);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_h2d_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_d2h_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_useful_staging_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_wasted_staging_bytes);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_h2d_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_kernel_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_d2h_nanoseconds);
+    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_nanoseconds);
 #undef STRATA_DSV4_CUDA_DEVICE_DELTA
     return result;
 }
@@ -251,6 +263,18 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     STRATA_DSV4_CUDA_DELTA(deepseek_moe_kernel_nanoseconds);
     STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_nanoseconds);
     STRATA_DSV4_CUDA_DELTA(deepseek_moe_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_calls);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_kernel_launches);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_h2d_transfers);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_d2h_transfers);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_h2d_bytes);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_d2h_bytes);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_useful_staging_bytes);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_wasted_staging_bytes);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_h2d_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_kernel_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_d2h_nanoseconds);
+    STRATA_DSV4_CUDA_DELTA(flash_attention_nanoseconds);
 #undef STRATA_DSV4_CUDA_DELTA
     result.synchronization_nanoseconds = 0U;
     result.upload_wait_nanoseconds = 0U;
@@ -261,6 +285,10 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     result.deepseek_moe_kernel_nanoseconds = 0U;
     result.deepseek_moe_d2h_nanoseconds = 0U;
     result.deepseek_moe_nanoseconds = 0U;
+    result.flash_attention_h2d_nanoseconds = 0U;
+    result.flash_attention_kernel_nanoseconds = 0U;
+    result.flash_attention_d2h_nanoseconds = 0U;
+    result.flash_attention_nanoseconds = 0U;
     for (const auto& device_after : after.devices) {
         const auto found = std::find_if(
             before.devices.begin(), before.devices.end(),
@@ -292,6 +320,18 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             delta.deepseek_moe_d2h_nanoseconds);
         result.deepseek_moe_nanoseconds = std::max(
             result.deepseek_moe_nanoseconds, delta.deepseek_moe_nanoseconds);
+        result.flash_attention_h2d_nanoseconds = std::max(
+            result.flash_attention_h2d_nanoseconds,
+            delta.flash_attention_h2d_nanoseconds);
+        result.flash_attention_kernel_nanoseconds = std::max(
+            result.flash_attention_kernel_nanoseconds,
+            delta.flash_attention_kernel_nanoseconds);
+        result.flash_attention_d2h_nanoseconds = std::max(
+            result.flash_attention_d2h_nanoseconds,
+            delta.flash_attention_d2h_nanoseconds);
+        result.flash_attention_nanoseconds = std::max(
+            result.flash_attention_nanoseconds,
+            delta.flash_attention_nanoseconds);
     }
     return result;
 }
@@ -1420,6 +1460,64 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
         : compressed_count;
     const auto score_stride = static_cast<std::size_t>(window_count) +
                               attended_compressed_count;
+    subphase_started = std::chrono::steady_clock::now();
+    if (config.enable_flash_attention) {
+        std::vector<std::uint32_t> sliding_rows(window_count);
+        for (std::uint32_t item = 0U; item < window_count; ++item) {
+            const auto absolute = position + 1U - window_count + item;
+            sliding_rows[item] = absolute % kWindow;
+        }
+        std::vector<FlashAttentionSegment> segments;
+        segments.reserve(static_cast<std::size_t>(attended_compressed_count) + 1U);
+        if (window_count != 0U) {
+            segments.push_back({layer_state.sliding, {}, sliding_rows});
+        }
+        for (std::uint32_t item = 0U; item < attended_compressed_count; ++item) {
+            const auto cache_row = use_sparse_indexer
+                ? indexed_positions[item] : item;
+            const auto row = layer_state.compressor.compressed.row(cache_row);
+            if (row.size() != kHeadDim) {
+                result.errors.emplace_back(
+                    "DeepSeek FlashAttention compressed row is unavailable");
+                return result;
+            }
+            segments.push_back({row, {}, {}});
+        }
+        FlashAttentionRequest request;
+        request.queries = queries;
+        request.segments = segments;
+        request.head_sinks = *sink.value;
+        request.query_rows = 1U;
+        request.query_heads = kHeads;
+        request.key_value_heads = 1U;
+        request.query_key_dim = kHeadDim;
+        request.value_dim = kHeadDim;
+        request.scale = kAttentionScale;
+        request.numerics =
+            FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
+        request.maximum_workspace_bytes = kDeviceWorkspaceReserve;
+        result = cuda.flash_attention(devices[slot], request, attended);
+        if (!result.ok()) return result;
+        const auto finish_head = [&](std::uint32_t head) {
+            auto destination = std::span<float>(attended).subspan(
+                static_cast<std::size_t>(head) * kHeadDim, kHeadDim);
+            round_bf16(destination);
+            apply_rope(destination.last(kRopeDim), position,
+                       layer_state.frequencies, true);
+            round_bf16(destination.last(kRopeDim));
+        };
+        if (attention_workers != nullptr) {
+            result = attention_workers->parallel_for(
+                kHeads, [&](std::size_t head) {
+                    finish_head(static_cast<std::uint32_t>(head));
+                });
+            if (!result.ok()) return result;
+        } else {
+            for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                finish_head(head);
+            }
+        }
+    } else {
     const auto attend_head = [&](std::uint32_t head,
                                  std::span<float> scores) {
         const auto query = std::span<const float>(queries).subspan(
@@ -1487,7 +1585,6 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                    layer_state.frequencies, true);
         round_bf16(destination.last(kRopeDim));
     };
-    subphase_started = std::chrono::steady_clock::now();
     if (attention_workers != nullptr) {
         std::vector<float> parallel_scores(
             static_cast<std::size_t>(kHeads) * score_stride);
@@ -1504,6 +1601,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
             attend_head(head, scores);
         }
+    }
     }
     graph_stats.attention_score_nanoseconds += elapsed_nanoseconds(subphase_started);
 
@@ -2162,6 +2260,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.overlap_resident_warmup;
     impl_->initialization_metrics.host_attention_threads =
         config.host_attention_threads;
+    impl_->initialization_metrics.flash_attention_enabled =
+        config.enable_flash_attention;
     impl_->initialization_metrics.resident_read_workers =
         impl_->resident.stats().workers;
     impl_->initialization_metrics.spine_warmup_workers =

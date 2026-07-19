@@ -253,6 +253,12 @@ Exact device MoE and 28 host-attention workers are the defaults. Use
 `--serial-device-moe` and `--serial-host-attention` only for controlled
 reference or diagnostic runs.
 
+The generic tiled online-softmax CUDA backend is available as an opt-in
+correctness/performance candidate. Add `--flash-attention` to either model
+runner; `--scalar-attention` pins the existing oracle. It remains disabled by
+default until the full-model and replicated benchmark gates in
+[`docs/flash-attention.md`](docs/flash-attention.md) pass.
+
 See [`docs/deepseek-v4-runtime.md`](docs/deepseek-v4-runtime.md) for the pinned
 checkpoint contract, measured admission plan, design boundary, and remaining
 oracle gates.

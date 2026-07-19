@@ -61,6 +61,11 @@ ValidationResult CudaBackend::matmul_grouped(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::flash_attention(
+    int, const FlashAttentionRequest&, std::span<float>) {
+    return {{"FlashAttention requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::enqueue_deepseek_moe(
     int, std::span<const float>,
     std::span<const CudaDeepSeekMoeExpert>,

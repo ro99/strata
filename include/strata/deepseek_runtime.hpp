@@ -22,6 +22,7 @@ struct Dsv4RuntimeConfig {
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
+    bool enable_flash_attention{};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     double sampling_temperature{};
@@ -111,6 +112,7 @@ struct Dsv4GenerationMetrics {
     bool device_moe_enabled{};
     bool resident_warmup_overlapped{};
     std::uint32_t host_attention_threads{};
+    bool flash_attention_enabled{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};
 };

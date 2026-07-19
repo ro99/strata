@@ -8,7 +8,8 @@ usage: scripts/run_glm52_baseline.sh
 
 Environment overrides:
   MODEL_DIR, RESULT_DIR, REPETITIONS, MAX_NEW_TOKENS, MAX_CONTEXT_TOKENS,
-  CUDA_DEVICES, VRAM_FRACTION, TRACE_ROUTES (0|1), DETAILED_TIMING (0|1)
+  CUDA_DEVICES, VRAM_FRACTION, TRACE_ROUTES (0|1), DETAILED_TIMING (0|1),
+  FLASH_ATTENTION (0|1)
 EOF
     exit 0
 fi
@@ -23,6 +24,7 @@ devices=${CUDA_DEVICES:-0,1,2}
 vram_fraction=${VRAM_FRACTION:-0.85}
 trace_routes=${TRACE_ROUTES:-1}
 detailed_timing=${DETAILED_TIMING:-0}
+flash_attention=${FLASH_ATTENTION:-0}
 prompt='What is the closer start to sun, and how distant it is from it?'
 expected_index_sha256=43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b
 model_source=$(findmnt -no SOURCE --target "${model_dir}")
@@ -31,6 +33,11 @@ if [[ -z "${block_name}" ]]; then
     block_name=$(basename "${model_source}")
 fi
 block_stat="/sys/class/block/${block_name}/stat"
+
+case "${flash_attention}" in
+    0|1) ;;
+    *) echo "error: FLASH_ATTENTION must be 0 or 1" >&2; exit 2 ;;
+esac
 
 mkdir -p "${result_dir}"
 if ! command -v jq >/dev/null 2>&1; then
@@ -103,6 +110,11 @@ for ((run = 1; run <= repetitions; ++run)); do
     fi
     if [[ "${detailed_timing}" == 1 ]]; then
         run_args+=(--detailed-timing)
+    fi
+    if [[ "${flash_attention}" == 1 ]]; then
+        run_args+=(--flash-attention)
+    else
+        run_args+=(--scalar-attention)
     fi
     read -r _ _ read_sectors _ _ _ write_sectors _ <"${block_stat}"
     /usr/bin/time -v \

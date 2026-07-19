@@ -20,6 +20,7 @@ struct Glm52RuntimeConfig {
     bool load_progress{};
     bool diagnostic_trace{};
     bool detailed_timing{};
+    bool enable_flash_attention{};
     bool host_cold_experts{};
     std::uint32_t host_worker_threads{36};
     double sampling_temperature{};
@@ -71,6 +72,7 @@ struct Glm52RunMetrics {
     Glm52PhaseMetrics prefill;
     Glm52PhaseMetrics decode;
     bool detailed_timing{};
+    bool flash_attention_enabled{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {
         return prefill_seconds > 0.0 ? static_cast<double>(prompt_tokens) / prefill_seconds : 0.0;

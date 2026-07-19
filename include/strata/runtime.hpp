@@ -25,6 +25,7 @@ struct RuntimeConfig {
     std::uint64_t sampling_seed{33'377'335U};
     bool verbose{};
     bool load_progress{};
+    bool enable_flash_attention{};
 };
 
 struct GenerationMetrics {

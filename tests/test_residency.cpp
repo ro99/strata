@@ -60,8 +60,8 @@ TEST_CASE("strict cold-read budget reports refusal") {
 
 TEST_CASE("simulator learns transitions and accounts all routes") {
     const std::vector<strata::RouteEvent> events{
-        {0, 0, 3, {1}}, {0, 0, 4, {2}},
-        {0, 1, 3, {1}}, {0, 1, 4, {2}},
+        {0, 0, 3, {1}, {}}, {0, 0, 4, {2}, {}},
+        {0, 1, 3, {1}, {}}, {0, 1, 4, {2}, {}},
     };
     strata::SimulationConfig config;
     config.residency.expert_bytes = 10;

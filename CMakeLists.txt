@@ -7,6 +7,12 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+add_compile_options(
+    "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>"
+    "$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>"
+)
 
 option(STRATA_ENABLE_SANITIZERS "Enable address and undefined-behavior sanitizers" OFF)
 option(STRATA_ENABLE_CUDA "Build the native CUDA backend when a CUDA compiler is available" ON)
@@ -59,10 +65,6 @@ add_library(strata_core STATIC
 
 target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(strata_core PUBLIC STRATA_VERSION="${PROJECT_VERSION}")
-target_compile_options(strata_core PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>
-    $<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>
-)
 
 if(STRATA_HAS_CUDA)
     set_property(TARGET strata_core PROPERTY CUDA_ARCHITECTURES 86 120)

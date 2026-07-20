@@ -12,6 +12,8 @@ benchmark must not be used as evidence of current behavior.
   including explicit scheduler gaps.
 - `deepseek-v4-runtime.md` — current DeepSeek contract plus clearly labeled
   historical bring-up evidence.
+- `tui.md` — Ratatui build, operator controls, memory bounds, and the versioned
+  `strata-chat` frontend protocol.
 - `../kernels/cuda/README.md` — native CUDA and non-CUDA stub behavior.
 
 These files must be updated when a change alters user-visible behavior or makes a

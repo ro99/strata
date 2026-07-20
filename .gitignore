@@ -2,6 +2,7 @@
 /models/
 /results/
 /build-*/
+/target/
 /.cache/
 /compile_commands.json
 *.log

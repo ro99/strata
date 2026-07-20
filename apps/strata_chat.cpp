@@ -1,3 +1,4 @@
+#include "strata/chat_protocol.hpp"
 #include "strata/runtime.hpp"
 
 #include "cli_common.hpp"
@@ -31,6 +32,7 @@ struct Options {
     std::uint64_t seed{33'377'335U};
     bool devices_explicit{};
     bool flash_attention{};
+    bool jsonl_protocol{};
 };
 
 void usage() {
@@ -40,8 +42,10 @@ void usage() {
         << "                    [--temperature F] [--seed N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention]\n"
+        << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
-        << "Without --prompt, read one question per line until EOF.\n";
+        << "Without --prompt, read one question per line until EOF.\n"
+        << "The jsonl protocol reads {\"command\":\"prompt\",\"text\":\"...\"}.\n";
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -73,6 +77,9 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--devices") {
             if (!strata::cli::parse_devices(next(), options.devices)) return false;
             options.devices_explicit = true;
+        } else if (argument == "--protocol") {
+            if (next() != "jsonl") return false;
+            options.jsonl_protocol = true;
         } else {
             std::cerr << "unknown argument: " << argument << '\n';
             return false;
@@ -83,22 +90,40 @@ bool parse_options(int argc, char** argv, Options& options) {
            (options.model_type == "glm" || options.model_type == "deepseek");
 }
 
+void protocol_event(std::string_view event, std::string_view fields = {}) {
+    std::cout << "{\"protocol\":\"strata-chat\",\"version\":"
+              << strata::chat_protocol_version << ",\"event\":\""
+              << event << '"';
+    if (!fields.empty()) std::cout << ',' << fields;
+    std::cout << "}\n" << std::flush;
+}
+
+void protocol_message(std::string_view event, std::string_view message,
+                      bool fatal = false) {
+    std::ostringstream fields;
+    fields << "\"message\":\"" << strata::cli::json_escape(message) << '"';
+    if (fatal) fields << ",\"fatal\":true";
+    protocol_event(event, fields.str());
+}
+
 class StreamDisplay {
 public:
-    StreamDisplay() : interactive_(isatty(STDOUT_FILENO) != 0) {
+    explicit StreamDisplay(bool protocol)
+        : protocol_(protocol), interactive_(!protocol && isatty(STDOUT_FILENO) != 0) {
         if (interactive_) {
             std::cerr << "[decode] live token speed is shown in the terminal title\n";
             set_title("strata-chat | waiting for first token");
         }
-        std::cout << "assistant> " << std::flush;
+        if (!protocol_) std::cout << "assistant> " << std::flush;
     }
 
-    void token(std::string_view piece) {
-        pending_utf8_.append(piece.data(), piece.size());
-        flush_pending_utf8();
+    void token(std::uint32_t token_id, std::string_view piece) {
+        last_token_id_ = token_id;
         ++emitted_;
         const auto now = std::chrono::steady_clock::now();
         if (!decode_started_) decode_started_ = now;
+        pending_utf8_.append(piece.data(), piece.size());
+        flush_pending_utf8();
         if (interactive_) {
             if (pending_utf8_.empty()) {
                 std::ostringstream title;
@@ -107,7 +132,7 @@ public:
                       << tokens_per_second(now) << " tok/s";
                 set_title(title.str());
             }
-        } else if (emitted_ % 16U == 0U && pending_utf8_.empty()) {
+        } else if (!protocol_ && emitted_ % 16U == 0U && pending_utf8_.empty()) {
             std::cerr << "[decode] " << emitted_ << " tokens | "
                       << tokens_per_second(now) << " tok/s\n";
         }
@@ -117,27 +142,27 @@ public:
         flush_pending_utf8();
         if (!pending_utf8_.empty()) {
             const char replacement[] = "\xEF\xBF\xBD";
-            std::cout.write(replacement, 3);
+            write_text(std::string_view(replacement, 3));
             pending_utf8_.clear();
-            std::cout << std::flush;
         }
         if (interactive_) set_title("strata-chat | ready");
-        std::cout << '\n';
-        std::cerr << std::fixed << std::setprecision(2)
-                  << "[done] " << emitted_ << " tokens | "
-                  << runtime_tok_s << " tok/s\n";
+        if (!protocol_) {
+            std::cout << '\n';
+            std::cerr << std::fixed << std::setprecision(2)
+                      << "[done] " << emitted_ << " tokens | "
+                      << runtime_tok_s << " tok/s\n";
+        }
     }
 
     void abort() {
         flush_pending_utf8();
         if (!pending_utf8_.empty()) {
             const char replacement[] = "\xEF\xBF\xBD";
-            std::cout.write(replacement, 3);
+            write_text(std::string_view(replacement, 3));
             pending_utf8_.clear();
-            std::cout << std::flush;
         }
         if (interactive_) set_title("strata-chat | error");
-        std::cout << '\n';
+        if (!protocol_) std::cout << '\n';
     }
 
 private:
@@ -224,21 +249,35 @@ private:
                 break;
             } else {
                 if (pos > 0) {
-                    std::cout.write(pending_utf8_.data(), pos);
+                    write_text(std::string_view(pending_utf8_.data(), pos));
                     pending_utf8_.erase(0, pos);
                     pos = 0;
                 }
                 const char replacement[] = "\xEF\xBF\xBD";
-                std::cout.write(replacement, 3);
+                write_text(std::string_view(replacement, 3));
                 pending_utf8_.erase(0, 1);
-                std::cout << std::flush;
             }
         }
         if (pos > 0) {
-            std::cout.write(pending_utf8_.data(), pos);
+            write_text(std::string_view(pending_utf8_.data(), pos));
             pending_utf8_.erase(0, pos);
-            std::cout << std::flush;
         }
+    }
+
+    void write_text(std::string_view text) const {
+        if (!protocol_) {
+            std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
+            std::cout << std::flush;
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::ostringstream fields;
+        fields << "\"token_id\":" << last_token_id_
+               << ",\"tokens\":" << emitted_
+               << ",\"tok_s\":" << std::fixed << std::setprecision(4)
+               << tokens_per_second(now)
+               << ",\"text\":\"" << strata::cli::json_escape(text) << '"';
+        protocol_event("token", fields.str());
     }
 
     double tokens_per_second(std::chrono::steady_clock::time_point now) const {
@@ -252,7 +291,9 @@ private:
         std::cerr << "\033]0;" << title << '\a' << std::flush;
     }
 
+    bool protocol_{};
     bool interactive_{};
+    std::uint32_t last_token_id_{};
     std::uint64_t emitted_{};
     std::string pending_utf8_;
     std::optional<std::chrono::steady_clock::time_point> decode_started_;
@@ -261,15 +302,24 @@ private:
 bool answer(strata::RuntimeSession& runtime, const Options& options,
             std::string_view prompt) {
     std::cerr << "[prefill] processing prompt...\n";
-    StreamDisplay display;
-    const strata::TokenStreamCallback stream = [&](std::uint32_t, std::string_view piece) {
-        display.token(piece);
+    if (options.jsonl_protocol) {
+        std::ostringstream fields;
+        fields << "\"prompt_bytes\":" << prompt.size();
+        protocol_event("turn_start", fields.str());
+    }
+    StreamDisplay display(options.jsonl_protocol);
+    const strata::TokenStreamCallback stream = [&](std::uint32_t token,
+                                                    std::string_view piece) {
+        display.token(token, piece);
     };
     const auto result = runtime.generate_stream(
         prompt, options.max_new_tokens, stream);
     if (!result.ok()) {
         display.abort();
-        for (const auto& error : result.errors) std::cerr << "error: " << error << '\n';
+        for (const auto& error : result.errors) {
+            std::cerr << "error: " << error << '\n';
+            if (options.jsonl_protocol) protocol_message("error", error);
+        }
         return false;
     }
     const double runtime_tok_s = result.metrics.decode_seconds > 0.0
@@ -277,7 +327,23 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
               result.metrics.decode_seconds
         : 0.0;
     display.finish(runtime_tok_s);
-    std::cout << '\n';
+    if (options.jsonl_protocol) {
+        const double prefill_tok_s = result.metrics.prefill_seconds > 0.0
+            ? static_cast<double>(result.metrics.prompt_tokens) /
+                  result.metrics.prefill_seconds
+            : 0.0;
+        std::ostringstream fields;
+        fields << std::fixed << std::setprecision(6)
+               << "\"prompt_tokens\":" << result.metrics.prompt_tokens
+               << ",\"decode_tokens\":" << result.metrics.decode_tokens
+               << ",\"prefill_seconds\":" << result.metrics.prefill_seconds
+               << ",\"prefill_tok_s\":" << prefill_tok_s
+               << ",\"decode_seconds\":" << result.metrics.decode_seconds
+               << ",\"decode_tok_s\":" << runtime_tok_s;
+        protocol_event("turn_done", fields.str());
+    } else {
+        std::cout << '\n';
+    }
     return true;
 }
 
@@ -288,6 +354,21 @@ int main(int argc, char** argv) {
     if (!parse_options(argc, argv, options)) {
         usage();
         return 2;
+    }
+
+    if (options.jsonl_protocol) {
+        std::ostringstream fields;
+        fields << "\"model_type\":\"" << options.model_type
+               << "\",\"devices\":\""
+               << strata::cli::devices_text(options.devices)
+               << "\",\"context_size\":" << options.context_size
+               << ",\"max_new_tokens\":" << options.max_new_tokens
+               << ",\"temperature\":" << options.temperature
+               << ",\"exact\":" << (options.temperature == 0.0 ? "true" : "false")
+               << ",\"flash_attention\":"
+               << (options.flash_attention ? "true" : "false");
+        protocol_event("hello", fields.str());
+        protocol_message("status", "Loading model");
     }
 
     strata::RuntimeSession runtime;
@@ -322,20 +403,40 @@ int main(int argc, char** argv) {
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {
             std::cerr << "error: " << error << '\n';
+            if (options.jsonl_protocol) protocol_message("error", error, true);
         }
         return 1;
     }
+    const double load_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - initialization_started).count();
     std::cerr << "[ready] model loaded in " << std::fixed << std::setprecision(2)
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - initialization_started).count()
+              << load_seconds
               << " s; enter a prompt\n";
+    if (options.jsonl_protocol) {
+        std::ostringstream fields;
+        fields << std::fixed << std::setprecision(6)
+               << "\"load_seconds\":" << load_seconds;
+        protocol_event("ready", fields.str());
+    }
     if (!options.prompt.empty()) {
         return answer(runtime, options, options.prompt) ? 0 : 1;
     }
     std::string prompt;
-    while (std::cout << "> " && std::getline(std::cin, prompt)) {
-        if (prompt.empty()) continue;
-        if (!answer(runtime, options, prompt)) return 1;
+    if (options.jsonl_protocol) {
+        while (std::getline(std::cin, prompt)) {
+            strata::ChatRequest request;
+            std::string error;
+            if (!strata::parse_chat_request(prompt, request, error)) {
+                protocol_message("error", error);
+                continue;
+            }
+            if (!answer(runtime, options, request.prompt)) return 1;
+        }
+    } else {
+        while (std::cout << "> " && std::getline(std::cin, prompt)) {
+            if (prompt.empty()) continue;
+            if (!answer(runtime, options, prompt)) return 1;
+        }
     }
     return 0;
 }

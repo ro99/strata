@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["apps/strata-tui"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+

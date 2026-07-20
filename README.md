@@ -143,9 +143,40 @@ make check
 
 ## Interactive terminal chat
 
-`strata-chat` streams each decoded token to stdout and continuously reports
-decoded tok/s in the terminal title without moving the answer cursor. Select the runtime and
-context ceiling at launch; CUDA devices default to `0,1,2`:
+The recommended interactive experience is `strata-tui`, a responsive
+[Ratatui](https://github.com/ratatui/ratatui) cockpit for launching and chatting
+with either runtime. It provides a guided launch form, streamed output,
+prefill/decode telemetry, a live throughput graph, context usage, prompt
+history, runtime diagnostics, and explicit exact-versus-sampled contract
+status.
+
+Build and open the launch form:
+
+```bash
+make tui
+./target/release/strata-tui
+```
+
+Or launch a configured session immediately:
+
+```bash
+./target/release/strata-tui \
+  --model models/DeepSeek-V4-Flash-DSpark \
+  --model-type deepseek --context-size 8192 --max-new 256 \
+  --devices 0,1,2
+```
+
+The TUI keeps one long-lived `strata-chat` process and communicates through a
+versioned JSON-lines protocol. It does not implement model behavior: precision,
+routing, top-k, sampling, admission, and exact-mode failures remain owned by the
+C++ runtime. Press `F1` for the keyboard map, `Ctrl+L` for runtime diagnostics,
+and `Ctrl+Q` to quit. See [the TUI operator guide](docs/tui.md) for the complete
+interface and protocol contract.
+
+`strata-chat` remains available as the minimal streaming terminal interface. It
+continuously reports decoded tok/s in the terminal title without moving the
+answer cursor. Select the runtime and context ceiling at launch; CUDA devices
+default to `0,1,2`:
 
 ```bash
 ./build/strata-chat --model models/glm52 --model-type glm \

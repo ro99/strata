@@ -16,12 +16,7 @@ struct RuntimeDevicePlan {
     std::vector<std::size_t> weighted_schedule;
 };
 
-struct RuntimeDevicePlanResult {
-    RuntimeDevicePlan value;
-    std::vector<std::string> errors;
-
-    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
-};
+using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
 
 [[nodiscard]] ValidationResult validate_common_runtime_config(
     std::span<const int> devices, double vram_fraction,

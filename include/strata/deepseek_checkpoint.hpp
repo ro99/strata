@@ -54,15 +54,8 @@ public:
         std::uint64_t bytes) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32(
         std::string_view name, std::uint64_t maximum_elements) const;
-    [[nodiscard]] ParseResult<std::vector<float>> read_f32_row(
-        std::string_view name, std::uint64_t row) const;
-    [[nodiscard]] ParseResult<std::vector<std::uint32_t>> read_u32_row_from_i64(
-        std::string_view name, std::uint64_t row) const;
 
     [[nodiscard]] const Dsv4IndexManifest& manifest() const noexcept { return manifest_; }
-    [[nodiscard]] const std::string& model_directory() const noexcept {
-        return model_directory_;
-    }
     [[nodiscard]] Dsv4CheckpointReadStats stats() const noexcept;
 
 private:
@@ -109,7 +102,6 @@ public:
         std::uint32_t read_workers = 1U,
         bool include_dspark = false);
     [[nodiscard]] std::span<const std::byte> find(std::string_view name) const noexcept;
-    [[nodiscard]] bool complete() const noexcept { return complete_; }
     [[nodiscard]] Dsv4ResidentStageStats stats() const noexcept { return stats_; }
 
 private:

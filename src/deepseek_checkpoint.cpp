@@ -1,9 +1,10 @@
 #include "strata/deepseek_checkpoint.hpp"
 
+#include "checkpoint_common.hpp"
+
 #include "strata/deepseek_ops.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -20,47 +21,6 @@ namespace strata {
 namespace {
 
 constexpr std::uint64_t kMaximumIndexBytes = 16ULL << 20U;
-
-[[nodiscard]] float decode_plain_scalar(const std::byte* bytes,
-                                        SafetensorsDtype dtype) {
-    if (dtype == SafetensorsDtype::Bf16) {
-        std::uint16_t value = 0U;
-        std::memcpy(&value, bytes, sizeof(value));
-        return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
-    }
-    if (dtype == SafetensorsDtype::F16) {
-        std::uint16_t value = 0U;
-        std::memcpy(&value, bytes, sizeof(value));
-        const std::uint32_t sign = (value & 0x8000U) << 16U;
-        std::uint32_t exponent = (value >> 10U) & 0x1FU;
-        std::uint32_t mantissa = value & 0x3FFU;
-        if (exponent == 0U) {
-            if (mantissa == 0U) return std::bit_cast<float>(sign);
-            std::int32_t shift = 0;
-            while ((mantissa & 0x400U) == 0U) {
-                mantissa <<= 1U;
-                ++shift;
-            }
-            mantissa &= 0x3FFU;
-            exponent = static_cast<std::uint32_t>(127 - 15 - shift);
-        } else if (exponent == 0x1FU) {
-            exponent = 0xFFU;
-        } else {
-            exponent += 127U - 15U;
-        }
-        return std::bit_cast<float>(sign | (exponent << 23U) | (mantissa << 13U));
-    }
-    float value = 0.0F;
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-}
-
-[[nodiscard]] bool checked_product(std::uint64_t left, std::uint64_t right,
-                                   std::uint64_t& output) noexcept {
-    if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
-    output = left * right;
-    return true;
-}
 
 void move_errors(ValidationResult& result, std::vector<std::string> errors) {
     for (auto& error : errors) result.errors.push_back(std::move(error));
@@ -242,76 +202,8 @@ ParseResult<std::vector<float>> Dsv4CheckpointReader::read_f32(
     const auto elements = tensor->source_bytes / element_bytes;
     result.value.resize(static_cast<std::size_t>(elements));
     for (std::uint64_t index = 0U; index < elements; ++index) {
-        result.value[static_cast<std::size_t>(index)] = decode_plain_scalar(
+        result.value[static_cast<std::size_t>(index)] = detail::decode_plain_scalar(
             encoded.value.data() + index * element_bytes, tensor->source_dtype);
-    }
-    return result;
-}
-
-ParseResult<std::vector<float>> Dsv4CheckpointReader::read_f32_row(
-    std::string_view name, std::uint64_t row) const {
-    ParseResult<std::vector<float>> result;
-    const auto* tensor = find(name);
-    if (tensor == nullptr || tensor->source_shape.size() != 2U ||
-        row >= (tensor == nullptr ? 0U : tensor->source_shape[0])) {
-        result.errors.emplace_back("cannot address DeepSeek tensor row: " + std::string(name));
-        return result;
-    }
-    const auto element_bytes = safetensors_dtype_bytes(tensor->source_dtype);
-    if (tensor->source_dtype != SafetensorsDtype::Bf16 &&
-        tensor->source_dtype != SafetensorsDtype::F16 &&
-        tensor->source_dtype != SafetensorsDtype::F32) {
-        result.errors.emplace_back("requested DeepSeek tensor row is not plain floating point");
-        return result;
-    }
-    std::uint64_t row_bytes = 0U;
-    if (!checked_product(tensor->source_shape[1], element_bytes, row_bytes)) {
-        result.errors.emplace_back("DeepSeek tensor row size overflows");
-        return result;
-    }
-    auto encoded = pread_tensor(*tensor, row * row_bytes, row_bytes);
-    if (!encoded.ok()) {
-        result.errors = std::move(encoded.errors);
-        return result;
-    }
-    result.value.resize(static_cast<std::size_t>(tensor->source_shape[1]));
-    for (std::size_t index = 0U; index < result.value.size(); ++index) {
-        result.value[index] = decode_plain_scalar(
-            encoded.value.data() + index * element_bytes, tensor->source_dtype);
-    }
-    return result;
-}
-
-ParseResult<std::vector<std::uint32_t>> Dsv4CheckpointReader::read_u32_row_from_i64(
-    std::string_view name, std::uint64_t row) const {
-    ParseResult<std::vector<std::uint32_t>> result;
-    const auto* tensor = find(name);
-    if (tensor == nullptr || tensor->source_dtype != SafetensorsDtype::I64 ||
-        tensor->source_shape.size() != 2U || row >= tensor->source_shape[0]) {
-        result.errors.emplace_back("cannot address DeepSeek I64 routing row: " +
-                                   std::string(name));
-        return result;
-    }
-    std::uint64_t row_bytes = 0U;
-    if (!checked_product(tensor->source_shape[1], 8U, row_bytes)) {
-        result.errors.emplace_back("DeepSeek I64 routing row size overflows");
-        return result;
-    }
-    auto encoded = pread_tensor(*tensor, row * row_bytes, row_bytes);
-    if (!encoded.ok()) {
-        result.errors = std::move(encoded.errors);
-        return result;
-    }
-    result.value.resize(static_cast<std::size_t>(tensor->source_shape[1]));
-    for (std::size_t index = 0U; index < result.value.size(); ++index) {
-        std::int64_t value = 0;
-        std::memcpy(&value, encoded.value.data() + index * 8U, sizeof(value));
-        if (value < 0 || value > std::numeric_limits<std::uint32_t>::max()) {
-            result.errors.emplace_back("DeepSeek hash routing expert is out of range");
-            result.value.clear();
-            return result;
-        }
-        result.value[index] = static_cast<std::uint32_t>(value);
     }
     return result;
 }

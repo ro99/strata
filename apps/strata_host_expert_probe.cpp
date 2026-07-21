@@ -1,10 +1,11 @@
+#include "cli_common.hpp"
+
 #include "strata/checkpoint.hpp"
 #include "strata/glm_int4.hpp"
 #include "strata/glm_ops.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -58,11 +59,6 @@ strata::ParseResult<OwnedMatrix> load_matrix(
     return result;
 }
 
-bool parse_u32(std::string_view text, std::uint32_t& output) {
-    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), output);
-    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -82,16 +78,18 @@ int main(int argc, char** argv) {
             model = next;
         } else if (argument == "--layer") {
             const auto* next = value();
-            if (next == nullptr || !parse_u32(next, layer)) return 2;
+            if (next == nullptr || !strata::cli::parse_u32(next, layer)) return 2;
         } else if (argument == "--expert") {
             const auto* next = value();
-            if (next == nullptr || !parse_u32(next, expert)) return 2;
+            if (next == nullptr || !strata::cli::parse_u32(next, expert)) return 2;
         } else if (argument == "--iterations") {
             const auto* next = value();
-            if (next == nullptr || !parse_u32(next, iterations) || iterations == 0U) return 2;
+            if (next == nullptr || !strata::cli::parse_u32(next, iterations) ||
+                iterations == 0U) return 2;
         } else if (argument == "--threads") {
             const auto* next = value();
-            if (next == nullptr || !parse_u32(next, threads) || threads == 0U) return 2;
+            if (next == nullptr || !strata::cli::parse_u32(next, threads) ||
+                threads == 0U) return 2;
         } else {
             return 2;
         }

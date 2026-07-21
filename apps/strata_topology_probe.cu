@@ -1,3 +1,5 @@
+#include "cli_common.hpp"
+
 #include "strata/cuda_backend.hpp"
 #include "strata/model.hpp"
 
@@ -77,29 +79,6 @@ void observe_vram(int device) {
     cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "observe CUDA memory use");
     observed_vram_used[device] = std::max(observed_vram_used[device],
                                           static_cast<std::uint64_t>(total_bytes - free_bytes));
-}
-
-std::string json_escape(std::string_view value) {
-    std::ostringstream output;
-    for (const unsigned char byte : value) {
-        switch (byte) {
-            case '\"': output << "\\\""; break;
-            case '\\': output << "\\\\"; break;
-            case '\b': output << "\\b"; break;
-            case '\f': output << "\\f"; break;
-            case '\n': output << "\\n"; break;
-            case '\r': output << "\\r"; break;
-            case '\t': output << "\\t"; break;
-            default:
-                if (byte < 0x20U) {
-                    output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-                           << static_cast<unsigned int>(byte) << std::dec;
-                } else {
-                    output << static_cast<char>(byte);
-                }
-        }
-    }
-    return output.str();
 }
 
 std::string read_text(const std::string& path) {
@@ -954,8 +933,10 @@ int main(int argc, char** argv) {
 
         std::cout << std::setprecision(10);
         std::cout << "{\"schema\":\"strata.topology_probe\",\"version\":1";
-        std::cout << ",\"identity\":{\"hostname\":\"" << json_escape(hostname)
-                  << "\",\"kernel\":\"" << json_escape(system_identity.release)
+        std::cout << ",\"identity\":{\"hostname\":\""
+                  << strata::cli::json_escape(hostname)
+                  << "\",\"kernel\":\""
+                  << strata::cli::json_escape(system_identity.release)
                   << "\",\"cuda_driver_version\":" << driver_version
                   << ",\"cuda_runtime_version\":" << runtime_version << '}';
         std::cout << ",\"configuration\":{\"repetitions\":" << options.repetitions
@@ -964,22 +945,25 @@ int main(int argc, char** argv) {
                   << ",\"io_bytes\":" << options.io_bytes
                   << ",\"io_block_bytes\":" << options.io_block_bytes
                   << ",\"prefill_rows\":" << options.prefill_rows
-                  << ",\"checkpoint_file\":\"" << json_escape(options.checkpoint_file)
+                  << ",\"checkpoint_file\":\""
+                  << strata::cli::json_escape(options.checkpoint_file)
                   << "\"}";
         std::cout << ",\"devices\":[";
         for (std::size_t index = 0; index < identities.size(); ++index) {
             if (index != 0U) std::cout << ',';
             const auto& device = identities[index];
             std::cout << "{\"cuda_index\":" << device.index
-                      << ",\"name\":\"" << json_escape(device.name)
-                      << "\",\"pci_bdf\":\"" << json_escape(device.pci_bdf)
+                      << ",\"name\":\"" << strata::cli::json_escape(device.name)
+                      << "\",\"pci_bdf\":\"" << strata::cli::json_escape(device.pci_bdf)
                       << "\",\"uuid\":\"" << device.uuid
                       << "\",\"compute_capability\":\"" << device.compute_major << '.'
                       << device.compute_minor << "\",\"free_vram_bytes\":" << device.free_bytes
                       << ",\"total_vram_bytes\":" << device.total_bytes
                       << ",\"numa_node\":" << device.numa_node
-                      << ",\"pcie_current_speed\":\"" << json_escape(device.link_speed)
-                      << "\",\"pcie_current_width\":\"" << json_escape(device.link_width)
+                      << ",\"pcie_current_speed\":\""
+                      << strata::cli::json_escape(device.link_speed)
+                      << "\",\"pcie_current_width\":\""
+                      << strata::cli::json_escape(device.link_width)
                       << "\"}";
         }
         std::cout << ']';

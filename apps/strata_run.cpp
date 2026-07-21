@@ -2,7 +2,6 @@
 
 #include "cli_common.hpp"
 
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -17,7 +16,7 @@ namespace {
 
 struct Options {
     std::string model;
-    std::string prompt{"What is the closer start to sun, and how distant it is from it?"};
+    std::string prompt{"What is the closest star to sun and how far is it"};
     std::vector<int> devices{0, 1, 2};
     std::uint32_t maximum_new_tokens{64U};
     std::uint32_t maximum_context_tokens{256U};
@@ -104,16 +103,6 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
     }
     return !options.model.empty();
-}
-
-template <typename T>
-void print_array(std::ostream& output, const std::vector<T>& values) {
-    output << '[';
-    for (std::size_t index = 0; index < values.size(); ++index) {
-        if (index != 0U) output << ',';
-        output << values[index];
-    }
-    output << ']';
 }
 
 void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stats) {
@@ -215,21 +204,21 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
 void print_cache_stats(std::ostream& output, const strata::Glm52CacheStats& stats) {
     output << "{\"hits\":" << stats.hits << ",\"misses\":" << stats.misses
            << ",\"evictions\":" << stats.evictions << ",\"used_bytes\":";
-    print_array(output, stats.used_bytes);
+    strata::cli::print_array(output, stats.used_bytes);
     output << ",\"peak_bytes\":";
-    print_array(output, stats.peak_bytes);
+    strata::cli::print_array(output, stats.peak_bytes);
     output << ",\"capacity_bytes\":";
-    print_array(output, stats.capacity_bytes);
+    strata::cli::print_array(output, stats.capacity_bytes);
     output << ",\"pinned_resident_spine_bytes\":";
-    print_array(output, stats.pinned_resident_bytes);
+    strata::cli::print_array(output, stats.pinned_resident_bytes);
     output << ",\"evictable_expert_bytes\":";
-    print_array(output, stats.evictable_expert_bytes);
+    strata::cli::print_array(output, stats.evictable_expert_bytes);
     output << ",\"device_hits\":";
-    print_array(output, stats.device_hits);
+    strata::cli::print_array(output, stats.device_hits);
     output << ",\"device_misses\":";
-    print_array(output, stats.device_misses);
+    strata::cli::print_array(output, stats.device_misses);
     output << ",\"device_evictions\":";
-    print_array(output, stats.device_evictions);
+    strata::cli::print_array(output, stats.device_evictions);
     output << '}';
 }
 
@@ -339,24 +328,24 @@ int main(int argc, char** argv) {
                   << ",\"vram_cache_misses\":" << metrics.cache.misses
                   << ",\"vram_cache_evictions\":" << metrics.cache.evictions
                   << ",\"vram_cache_used_bytes\":";
-        print_array(std::cout, metrics.cache.used_bytes);
+        strata::cli::print_array(std::cout, metrics.cache.used_bytes);
         std::cout << ",\"vram_cache_peak_bytes\":";
-        print_array(std::cout, metrics.cache.peak_bytes);
+        strata::cli::print_array(std::cout, metrics.cache.peak_bytes);
         std::cout << ",\"vram_cache_capacity_bytes\":";
-        print_array(std::cout, metrics.cache.capacity_bytes);
+        strata::cli::print_array(std::cout, metrics.cache.capacity_bytes);
         std::cout << ",\"pinned_resident_spine_bytes\":";
-        print_array(std::cout, metrics.cache.pinned_resident_bytes);
+        strata::cli::print_array(std::cout, metrics.cache.pinned_resident_bytes);
         std::cout << ",\"evictable_expert_bytes\":";
-        print_array(std::cout, metrics.cache.evictable_expert_bytes);
+        strata::cli::print_array(std::cout, metrics.cache.evictable_expert_bytes);
         std::cout << ",\"phases\":{\"prefill\":";
         print_phase(std::cout, metrics.prefill);
         std::cout << ",\"decode\":";
         print_phase(std::cout, metrics.decode);
         std::cout << '}';
         std::cout << ",\"prompt_token_ids\":";
-        print_array(std::cout, generated.prompt_token_ids);
+        strata::cli::print_array(std::cout, generated.prompt_token_ids);
         std::cout << ",\"generated_token_ids\":";
-        print_array(std::cout, generated.generated_token_ids);
+        strata::cli::print_array(std::cout, generated.generated_token_ids);
         std::cout << "}\n";
     } else {
         std::cout << generated.text << "\n\n"

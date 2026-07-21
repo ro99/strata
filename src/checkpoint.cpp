@@ -1,5 +1,7 @@
 #include "strata/checkpoint.hpp"
 
+#include "checkpoint_common.hpp"
+
 #include <bit>
 #include <cerrno>
 #include <chrono>
@@ -16,45 +18,6 @@ namespace strata {
 namespace {
 
 constexpr std::uint64_t kMaximumIndexBytes = 64ULL << 20U;
-
-float decode_scalar(const std::byte* bytes, SafetensorsDtype dtype) {
-    if (dtype == SafetensorsDtype::Bf16) {
-        std::uint16_t value = 0U;
-        std::memcpy(&value, bytes, sizeof(value));
-        return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
-    }
-    if (dtype == SafetensorsDtype::F16) {
-        std::uint16_t value = 0U;
-        std::memcpy(&value, bytes, sizeof(value));
-        const std::uint32_t sign = (value & 0x8000U) << 16U;
-        std::uint32_t exponent = (value >> 10U) & 0x1FU;
-        std::uint32_t mantissa = value & 0x3FFU;
-        if (exponent == 0U) {
-            if (mantissa == 0U) return std::bit_cast<float>(sign);
-            std::int32_t shift = 0;
-            while ((mantissa & 0x400U) == 0U) {
-                mantissa <<= 1U;
-                ++shift;
-            }
-            mantissa &= 0x3FFU;
-            exponent = static_cast<std::uint32_t>(127 - 15 - shift);
-        } else if (exponent == 0x1FU) {
-            exponent = 0xFFU;
-        } else {
-            exponent += 127U - 15U;
-        }
-        return std::bit_cast<float>(sign | (exponent << 23U) | (mantissa << 13U));
-    }
-    float value = 0.0F;
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-}
-
-bool checked_product(std::uint64_t left, std::uint64_t right, std::uint64_t& output) {
-    if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
-    output = left * right;
-    return true;
-}
 
 void append_errors(ValidationResult& output, std::vector<std::string> errors) {
     for (auto& error : errors) output.errors.push_back(std::move(error));
@@ -301,7 +264,8 @@ ParseResult<std::vector<float>> GlmCheckpointReader::read_f32(
     result.value.resize(static_cast<std::size_t>(elements));
     for (std::uint64_t index = 0U; index < elements; ++index) {
         result.value[static_cast<std::size_t>(index)] =
-            decode_scalar(encoded.value.data() + index * element_bytes, tensor->source_dtype);
+            detail::decode_plain_scalar(encoded.value.data() + index * element_bytes,
+                                        tensor->source_dtype);
     }
     return result;
 }
@@ -323,7 +287,7 @@ ParseResult<std::vector<float>> GlmCheckpointReader::read_f32_row(
         return result;
     }
     std::uint64_t row_bytes = 0U;
-    if (!checked_product(tensor->source_shape[1], element_bytes, row_bytes)) {
+    if (!detail::checked_product(tensor->source_shape[1], element_bytes, row_bytes)) {
         result.errors.emplace_back("tensor row byte count overflows");
         return result;
     }
@@ -334,8 +298,8 @@ ParseResult<std::vector<float>> GlmCheckpointReader::read_f32_row(
     }
     result.value.resize(static_cast<std::size_t>(tensor->source_shape[1]));
     for (std::size_t index = 0U; index < result.value.size(); ++index) {
-        result.value[index] = decode_scalar(encoded.value.data() + index * element_bytes,
-                                            tensor->source_dtype);
+        result.value[index] = detail::decode_plain_scalar(
+            encoded.value.data() + index * element_bytes, tensor->source_dtype);
     }
     return result;
 }

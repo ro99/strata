@@ -1,5 +1,7 @@
 #include "strata/glm_runtime.hpp"
 
+#include "cuda_stats_delta.hpp"
+
 #include "strata/glm_ops.hpp"
 #include "strata/glm_int4.hpp"
 #include "strata/model_adapter.hpp"
@@ -393,115 +395,9 @@ CheckpointReadStats checkpoint_delta(const CheckpointReadStats& after,
             after.wall_nanoseconds - before.wall_nanoseconds};
 }
 
-CudaBackendStats::Device cuda_device_delta(const CudaBackendStats::Device& after,
-                                           const CudaBackendStats::Device& before) {
-    CudaBackendStats::Device result;
-    result.device = after.device;
-#define STRATA_CUDA_DEVICE_DELTA(field) result.field = after.field - before.field
-    STRATA_CUDA_DEVICE_DELTA(weight_upload_bytes);
-    STRATA_CUDA_DEVICE_DELTA(activation_h2d_bytes);
-    STRATA_CUDA_DEVICE_DELTA(activation_d2h_bytes);
-    STRATA_CUDA_DEVICE_DELTA(matmul_calls);
-    STRATA_CUDA_DEVICE_DELTA(weight_allocation_calls);
-    STRATA_CUDA_DEVICE_DELTA(weight_allocation_bytes);
-    STRATA_CUDA_DEVICE_DELTA(workspace_allocation_calls);
-    STRATA_CUDA_DEVICE_DELTA(workspace_allocation_bytes);
-    STRATA_CUDA_DEVICE_DELTA(synchronization_calls);
-    STRATA_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(kernel_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_calls);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_kernel_launches);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_h2d_transfers);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_transfers);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_h2d_bytes);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_bytes);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_useful_staging_bytes);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_wasted_staging_bytes);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_h2d_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_kernel_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_nanoseconds);
-    STRATA_CUDA_DEVICE_DELTA(flash_attention_nanoseconds);
-#undef STRATA_CUDA_DEVICE_DELTA
-    return result;
-}
-
 CudaBackendStats cuda_delta(const CudaBackendStats& after,
                             const CudaBackendStats& before) {
-    CudaBackendStats result;
-#define STRATA_CUDA_DELTA(field) result.field = after.field - before.field
-    STRATA_CUDA_DELTA(weight_upload_bytes);
-    STRATA_CUDA_DELTA(activation_h2d_bytes);
-    STRATA_CUDA_DELTA(activation_d2h_bytes);
-    STRATA_CUDA_DELTA(matmul_calls);
-    STRATA_CUDA_DELTA(weight_allocation_calls);
-    STRATA_CUDA_DELTA(weight_allocation_bytes);
-    STRATA_CUDA_DELTA(workspace_allocation_calls);
-    STRATA_CUDA_DELTA(workspace_allocation_bytes);
-    STRATA_CUDA_DELTA(synchronization_calls);
-    STRATA_CUDA_DELTA(synchronization_nanoseconds);
-    STRATA_CUDA_DELTA(upload_wait_nanoseconds);
-    STRATA_CUDA_DELTA(activation_h2d_nanoseconds);
-    STRATA_CUDA_DELTA(kernel_nanoseconds);
-    STRATA_CUDA_DELTA(activation_d2h_nanoseconds);
-    STRATA_CUDA_DELTA(flash_attention_calls);
-    STRATA_CUDA_DELTA(flash_attention_kernel_launches);
-    STRATA_CUDA_DELTA(flash_attention_h2d_transfers);
-    STRATA_CUDA_DELTA(flash_attention_d2h_transfers);
-    STRATA_CUDA_DELTA(flash_attention_h2d_bytes);
-    STRATA_CUDA_DELTA(flash_attention_d2h_bytes);
-    STRATA_CUDA_DELTA(flash_attention_useful_staging_bytes);
-    STRATA_CUDA_DELTA(flash_attention_wasted_staging_bytes);
-    STRATA_CUDA_DELTA(flash_attention_h2d_nanoseconds);
-    STRATA_CUDA_DELTA(flash_attention_kernel_nanoseconds);
-    STRATA_CUDA_DELTA(flash_attention_d2h_nanoseconds);
-    STRATA_CUDA_DELTA(flash_attention_nanoseconds);
-#undef STRATA_CUDA_DELTA
-    result.synchronization_nanoseconds = 0U;
-    result.upload_wait_nanoseconds = 0U;
-    result.activation_h2d_nanoseconds = 0U;
-    result.kernel_nanoseconds = 0U;
-    result.activation_d2h_nanoseconds = 0U;
-    result.flash_attention_h2d_nanoseconds = 0U;
-    result.flash_attention_kernel_nanoseconds = 0U;
-    result.flash_attention_d2h_nanoseconds = 0U;
-    result.flash_attention_nanoseconds = 0U;
-    for (const auto& device_after : after.devices) {
-        const auto found = std::find_if(
-            before.devices.begin(), before.devices.end(),
-            [&device_after](const auto& value) { return value.device == device_after.device; });
-        if (found == before.devices.end()) {
-            result.devices.push_back(device_after);
-        } else {
-            result.devices.push_back(cuda_device_delta(device_after, *found));
-        }
-        const auto& delta = result.devices.back();
-        result.synchronization_nanoseconds = std::max(
-            result.synchronization_nanoseconds, delta.synchronization_nanoseconds);
-        result.upload_wait_nanoseconds = std::max(
-            result.upload_wait_nanoseconds, delta.upload_wait_nanoseconds);
-        result.activation_h2d_nanoseconds = std::max(
-            result.activation_h2d_nanoseconds, delta.activation_h2d_nanoseconds);
-        result.kernel_nanoseconds = std::max(
-            result.kernel_nanoseconds, delta.kernel_nanoseconds);
-        result.activation_d2h_nanoseconds = std::max(
-            result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
-        result.flash_attention_h2d_nanoseconds = std::max(
-            result.flash_attention_h2d_nanoseconds,
-            delta.flash_attention_h2d_nanoseconds);
-        result.flash_attention_kernel_nanoseconds = std::max(
-            result.flash_attention_kernel_nanoseconds,
-            delta.flash_attention_kernel_nanoseconds);
-        result.flash_attention_d2h_nanoseconds = std::max(
-            result.flash_attention_d2h_nanoseconds,
-            delta.flash_attention_d2h_nanoseconds);
-        result.flash_attention_nanoseconds = std::max(
-            result.flash_attention_nanoseconds,
-            delta.flash_attention_nanoseconds);
-    }
-    return result;
+    return detail::cuda_delta(after, before);
 }
 
 std::vector<std::uint64_t> counter_delta(const std::vector<std::uint64_t>& after,

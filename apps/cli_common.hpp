@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -61,6 +62,16 @@ inline std::string devices_text(const std::vector<int>& devices) {
         output << devices[index];
     }
     return output.str();
+}
+
+template <typename T>
+inline void print_array(std::ostream& output, const std::vector<T>& values) {
+    output << '[';
+    for (std::size_t index = 0U; index < values.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << values[index];
+    }
+    output << ']';
 }
 
 inline std::string json_escape(std::string_view text) {

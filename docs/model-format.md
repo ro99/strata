@@ -10,7 +10,7 @@ guessing in the execution graph.
 
 ## Header
 
-`include/strata/model_format.h` defines the fixed little-endian header:
+The planned native-pack header is fixed-width and little-endian:
 
 - eight-byte `STRATA01` magic;
 - format version;

@@ -188,16 +188,6 @@ bool parse_options(int argc, char** argv, Options& options) {
     return !options.model.empty();
 }
 
-template <typename T>
-void print_array(std::ostream& output, const std::vector<T>& values) {
-    output << '[';
-    for (std::size_t index = 0U; index < values.size(); ++index) {
-        if (index != 0U) output << ',';
-        output << values[index];
-    }
-    output << ']';
-}
-
 void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stats) {
     output << "{\"weight_h2d_bytes\":" << stats.weight_upload_bytes
            << ",\"activation_h2d_bytes\":" << stats.activation_h2d_bytes
@@ -332,15 +322,15 @@ void print_cache_stats(std::ostream& output, const strata::Dsv4CacheStats& stats
            << ",\"lease_acquires\":" << stats.lease_acquires
            << ",\"lease_releases\":" << stats.lease_releases
            << ",\"used_bytes\":";
-    print_array(output, stats.used_bytes);
+    strata::cli::print_array(output, stats.used_bytes);
     output << ",\"capacity_bytes\":";
-    print_array(output, stats.capacity_bytes);
+    strata::cli::print_array(output, stats.capacity_bytes);
     output << ",\"pinned_bytes\":";
-    print_array(output, stats.pinned_bytes);
+    strata::cli::print_array(output, stats.pinned_bytes);
     output << ",\"leased_bytes\":";
-    print_array(output, stats.leased_bytes);
+    strata::cli::print_array(output, stats.leased_bytes);
     output << ",\"active_leases\":";
-    print_array(output, stats.active_leases);
+    strata::cli::print_array(output, stats.active_leases);
     output << '}';
 }
 
@@ -720,9 +710,9 @@ int main(int argc, char** argv) {
                   << ",\"memory_plan\":";
         print_plan(std::cout, metrics.memory);
         std::cout << ",\"prompt_token_ids\":";
-        print_array(std::cout, generated.prompt_token_ids);
+        strata::cli::print_array(std::cout, generated.prompt_token_ids);
         std::cout << ",\"generated_token_ids\":";
-        print_array(std::cout, generated.generated_token_ids);
+        strata::cli::print_array(std::cout, generated.generated_token_ids);
         if (generated.diagnostics.logit_trace_enabled ||
             generated.diagnostics.layer_hash_trace_enabled) {
             std::cout << ",\"diagnostics\":";

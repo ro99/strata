@@ -1,5 +1,7 @@
 #include "strata/compressed_tensors.hpp"
 
+#include "checkpoint_common.hpp"
+
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -34,12 +36,6 @@ float read_le_bf16(const std::byte* bytes) {
         static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(bytes[0])) |
         (static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(bytes[1])) << 8U));
     return std::bit_cast<float>(high << 16U);
-}
-
-bool checked_product(std::uint64_t left, std::uint64_t right, std::uint64_t& output) {
-    if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
-    output = left * right;
-    return true;
 }
 
 }  // namespace
@@ -123,8 +119,8 @@ ValidationResult compressed_tensor_matvec_f32(
     }
     std::uint64_t packed_words = 0;
     std::uint64_t scale_values = 0;
-    if (!checked_product(layout.packed_rows, layout.packed_columns, packed_words) ||
-        !checked_product(layout.scale_rows, layout.scale_columns, scale_values) ||
+    if (!detail::checked_product(layout.packed_rows, layout.packed_columns, packed_words) ||
+        !detail::checked_product(layout.scale_rows, layout.scale_columns, scale_values) ||
         packed_words > std::numeric_limits<std::uint64_t>::max() / 4U ||
         scale_values > std::numeric_limits<std::uint64_t>::max() / 2U ||
         packed.size() != packed_words * 4U || scales.size() != scale_values * 2U) {

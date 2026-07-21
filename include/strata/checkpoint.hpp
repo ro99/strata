@@ -65,7 +65,6 @@ public:
         std::string_view name, std::uint64_t row) const;
 
     [[nodiscard]] const GlmIndexManifest& manifest() const noexcept { return manifest_; }
-    [[nodiscard]] const std::string& model_directory() const noexcept { return model_directory_; }
     [[nodiscard]] CheckpointReadStats stats() const noexcept;
 
 private:

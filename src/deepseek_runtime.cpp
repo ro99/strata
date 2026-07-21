@@ -1,5 +1,7 @@
 #include "strata/deepseek_runtime.hpp"
 
+#include "cuda_stats_delta.hpp"
+
 #include "strata/deepseek_ops.hpp"
 #include "strata/model_adapter.hpp"
 #include "strata/numerics.hpp"
@@ -190,151 +192,9 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             after.nanoseconds - before.nanoseconds};
 }
 
-[[nodiscard]] CudaBackendStats::Device cuda_device_delta(
-    const CudaBackendStats::Device& after,
-    const CudaBackendStats::Device& before) {
-    CudaBackendStats::Device result;
-    result.device = after.device;
-#define STRATA_DSV4_CUDA_DEVICE_DELTA(field) result.field = after.field - before.field
-    STRATA_DSV4_CUDA_DEVICE_DELTA(weight_upload_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_h2d_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_d2h_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(matmul_calls);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(weight_allocation_calls);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(weight_allocation_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(workspace_allocation_calls);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(workspace_allocation_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(synchronization_calls);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(kernel_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_calls);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_kernel_launches);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_h2d_transfers);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_transfers);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_h2d_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_h2d_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_kernel_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_d2h_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(deepseek_moe_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_calls);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_kernel_launches);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_h2d_transfers);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_d2h_transfers);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_h2d_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_d2h_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_useful_staging_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_wasted_staging_bytes);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_h2d_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_kernel_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_d2h_nanoseconds);
-    STRATA_DSV4_CUDA_DEVICE_DELTA(flash_attention_nanoseconds);
-#undef STRATA_DSV4_CUDA_DEVICE_DELTA
-    return result;
-}
-
 [[nodiscard]] CudaBackendStats cuda_delta(const CudaBackendStats& after,
                                            const CudaBackendStats& before) {
-    CudaBackendStats result;
-#define STRATA_DSV4_CUDA_DELTA(field) result.field = after.field - before.field
-    STRATA_DSV4_CUDA_DELTA(weight_upload_bytes);
-    STRATA_DSV4_CUDA_DELTA(activation_h2d_bytes);
-    STRATA_DSV4_CUDA_DELTA(activation_d2h_bytes);
-    STRATA_DSV4_CUDA_DELTA(matmul_calls);
-    STRATA_DSV4_CUDA_DELTA(weight_allocation_calls);
-    STRATA_DSV4_CUDA_DELTA(weight_allocation_bytes);
-    STRATA_DSV4_CUDA_DELTA(workspace_allocation_calls);
-    STRATA_DSV4_CUDA_DELTA(workspace_allocation_bytes);
-    STRATA_DSV4_CUDA_DELTA(synchronization_calls);
-    STRATA_DSV4_CUDA_DELTA(synchronization_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(upload_wait_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(activation_h2d_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(kernel_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(activation_d2h_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_calls);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_kernel_launches);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_h2d_transfers);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_transfers);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_h2d_bytes);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_bytes);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_h2d_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_kernel_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_d2h_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(deepseek_moe_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_calls);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_kernel_launches);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_h2d_transfers);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_d2h_transfers);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_h2d_bytes);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_d2h_bytes);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_useful_staging_bytes);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_wasted_staging_bytes);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_h2d_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_kernel_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_d2h_nanoseconds);
-    STRATA_DSV4_CUDA_DELTA(flash_attention_nanoseconds);
-#undef STRATA_DSV4_CUDA_DELTA
-    result.synchronization_nanoseconds = 0U;
-    result.upload_wait_nanoseconds = 0U;
-    result.activation_h2d_nanoseconds = 0U;
-    result.kernel_nanoseconds = 0U;
-    result.activation_d2h_nanoseconds = 0U;
-    result.deepseek_moe_h2d_nanoseconds = 0U;
-    result.deepseek_moe_kernel_nanoseconds = 0U;
-    result.deepseek_moe_d2h_nanoseconds = 0U;
-    result.deepseek_moe_nanoseconds = 0U;
-    result.flash_attention_h2d_nanoseconds = 0U;
-    result.flash_attention_kernel_nanoseconds = 0U;
-    result.flash_attention_d2h_nanoseconds = 0U;
-    result.flash_attention_nanoseconds = 0U;
-    for (const auto& device_after : after.devices) {
-        const auto found = std::find_if(
-            before.devices.begin(), before.devices.end(),
-            [&device_after](const auto& value) {
-                return value.device == device_after.device;
-            });
-        result.devices.push_back(found == before.devices.end()
-                                     ? device_after
-                                     : cuda_device_delta(device_after, *found));
-        const auto& delta = result.devices.back();
-        result.synchronization_nanoseconds = std::max(
-            result.synchronization_nanoseconds, delta.synchronization_nanoseconds);
-        result.upload_wait_nanoseconds = std::max(
-            result.upload_wait_nanoseconds, delta.upload_wait_nanoseconds);
-        result.activation_h2d_nanoseconds = std::max(
-            result.activation_h2d_nanoseconds, delta.activation_h2d_nanoseconds);
-        result.kernel_nanoseconds = std::max(
-            result.kernel_nanoseconds, delta.kernel_nanoseconds);
-        result.activation_d2h_nanoseconds = std::max(
-            result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
-        result.deepseek_moe_h2d_nanoseconds = std::max(
-            result.deepseek_moe_h2d_nanoseconds,
-            delta.deepseek_moe_h2d_nanoseconds);
-        result.deepseek_moe_kernel_nanoseconds = std::max(
-            result.deepseek_moe_kernel_nanoseconds,
-            delta.deepseek_moe_kernel_nanoseconds);
-        result.deepseek_moe_d2h_nanoseconds = std::max(
-            result.deepseek_moe_d2h_nanoseconds,
-            delta.deepseek_moe_d2h_nanoseconds);
-        result.deepseek_moe_nanoseconds = std::max(
-            result.deepseek_moe_nanoseconds, delta.deepseek_moe_nanoseconds);
-        result.flash_attention_h2d_nanoseconds = std::max(
-            result.flash_attention_h2d_nanoseconds,
-            delta.flash_attention_h2d_nanoseconds);
-        result.flash_attention_kernel_nanoseconds = std::max(
-            result.flash_attention_kernel_nanoseconds,
-            delta.flash_attention_kernel_nanoseconds);
-        result.flash_attention_d2h_nanoseconds = std::max(
-            result.flash_attention_d2h_nanoseconds,
-            delta.flash_attention_d2h_nanoseconds);
-        result.flash_attention_nanoseconds = std::max(
-            result.flash_attention_nanoseconds,
-            delta.flash_attention_nanoseconds);
-    }
-    return result;
+    return detail::cuda_delta(after, before);
 }
 
 [[nodiscard]] Dsv4CacheStats cache_delta(const Dsv4CacheStats& after,

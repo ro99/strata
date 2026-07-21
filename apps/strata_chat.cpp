@@ -3,6 +3,7 @@
 
 #include "cli_common.hpp"
 
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -45,7 +46,7 @@ void usage() {
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
-        << "The jsonl protocol reads {\"command\":\"prompt\",\"text\":\"...\"}.\n";
+        << "The jsonl protocol reads prompt text and an optional messages array.\n";
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -300,7 +301,9 @@ private:
 };
 
 bool answer(strata::RuntimeSession& runtime, const Options& options,
-            std::string_view prompt) {
+            std::span<const strata::ChatMessage> messages,
+            std::string& answer_text) {
+    const auto& prompt = messages.back().content;
     std::cerr << "[prefill] processing prompt...\n";
     if (options.jsonl_protocol) {
         std::ostringstream fields;
@@ -312,8 +315,8 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
                                                     std::string_view piece) {
         display.token(token, piece);
     };
-    const auto result = runtime.generate_stream(
-        prompt, options.max_new_tokens, stream);
+    const auto result = runtime.generate_chat_stream(
+        messages, options.max_new_tokens, stream);
     if (!result.ok()) {
         display.abort();
         for (const auto& error : result.errors) {
@@ -344,6 +347,7 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
     } else {
         std::cout << '\n';
     }
+    answer_text = result.text;
     return true;
 }
 
@@ -419,9 +423,13 @@ int main(int argc, char** argv) {
         protocol_event("ready", fields.str());
     }
     if (!options.prompt.empty()) {
-        return answer(runtime, options, options.prompt) ? 0 : 1;
+        const std::array messages{strata::ChatMessage{
+            strata::ChatRole::User, options.prompt}};
+        std::string answer_text;
+        return answer(runtime, options, messages, answer_text) ? 0 : 1;
     }
     std::string prompt;
+    std::vector<strata::ChatMessage> conversation;
     if (options.jsonl_protocol) {
         while (std::getline(std::cin, prompt)) {
             strata::ChatRequest request;
@@ -430,12 +438,27 @@ int main(int argc, char** argv) {
                 protocol_message("error", error);
                 continue;
             }
-            if (!answer(runtime, options, request.prompt)) return 1;
+            auto messages = request.includes_history
+                ? std::move(request.messages)
+                : conversation;
+            if (!request.includes_history) {
+                messages.push_back({strata::ChatRole::User,
+                                    std::move(request.prompt)});
+            }
+            std::string answer_text;
+            if (!answer(runtime, options, messages, answer_text)) return 1;
+            messages.push_back({strata::ChatRole::Assistant,
+                                std::move(answer_text)});
+            conversation = std::move(messages);
         }
     } else {
         while (std::cout << "> " && std::getline(std::cin, prompt)) {
             if (prompt.empty()) continue;
-            if (!answer(runtime, options, prompt)) return 1;
+            conversation.push_back({strata::ChatRole::User, prompt});
+            std::string answer_text;
+            if (!answer(runtime, options, conversation, answer_text)) return 1;
+            conversation.push_back({strata::ChatRole::Assistant,
+                                    std::move(answer_text)});
         }
     }
     return 0;

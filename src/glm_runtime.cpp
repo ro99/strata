@@ -1460,6 +1460,15 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
 Glm52GenerationResult Glm52Runtime::generate_stream(
     std::string_view prompt, std::uint32_t maximum_new_tokens,
     const TokenStreamCallback& on_token) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(prompt)}};
+    return generate_chat_stream(messages, maximum_new_tokens, on_token);
+}
+
+Glm52GenerationResult Glm52Runtime::generate_chat_stream(
+    std::span<const ChatMessage> messages,
+    std::uint32_t maximum_new_tokens,
+    const TokenStreamCallback& on_token) {
     Glm52GenerationResult result;
     if (!impl_->initialized) {
         result.errors.emplace_back("GLM runtime is not initialized");
@@ -1469,15 +1478,26 @@ Glm52GenerationResult Glm52Runtime::generate_stream(
         result.errors.emplace_back("maximum_new_tokens must be positive");
         return result;
     }
-    const auto rendered = render_glm52_user_prompt(prompt);
-    auto encoded = impl_->tokenizer.encode(rendered);
-    if (!encoded.ok()) {
-        result.errors = std::move(encoded.errors);
+    std::string validation_error;
+    if (!validate_chat_messages(messages, validation_error)) {
+        result.errors.push_back(std::move(validation_error));
         return result;
     }
-    if (encoded.value.size() + maximum_new_tokens > impl_->config.maximum_context_tokens) {
-        result.errors.emplace_back("prompt and requested generation exceed the context ceiling");
-        return result;
+    ParseResult<std::vector<std::uint32_t>> encoded;
+    for (;;) {
+        encoded = impl_->tokenizer.encode(render_glm52_chat_prompt(messages));
+        if (!encoded.ok()) {
+            result.errors = std::move(encoded.errors);
+            return result;
+        }
+        if (encoded.value.size() + maximum_new_tokens <=
+            impl_->config.maximum_context_tokens) break;
+        if (messages.size() <= 1U) {
+            result.errors.emplace_back(
+                "prompt and requested generation exceed the context ceiling");
+            return result;
+        }
+        messages = messages.subspan(2U);
     }
     result.prompt_token_ids = encoded.value;
     impl_->active_request_id = impl_->config.request_id + impl_->generated_requests++;

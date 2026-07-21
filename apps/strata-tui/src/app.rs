@@ -496,11 +496,12 @@ impl App {
             });
             return;
         }
+        let history = completed_history(&self.messages);
         let sent = self
             .process
             .as_mut()
             .ok_or_else(|| "Runtime process is unavailable".to_string())
-            .and_then(|process| process.send_prompt(&prompt));
+            .and_then(|process| process.send_prompt(&history, &prompt));
         if let Err(error) = sent {
             self.phase = RuntimePhase::Error;
             self.notice = Some(error);
@@ -836,6 +837,25 @@ fn safe_prefix(text: &str, maximum: usize) -> usize {
     length
 }
 
+fn completed_history(messages: &VecDeque<ChatMessage>) -> Vec<(&str, &str)> {
+    let mut history = Vec::new();
+    let mut user = None;
+    for message in messages {
+        match message.role {
+            Role::User if message.complete => user = Some(message.text.as_str()),
+            Role::Assistant if message.complete => {
+                if let Some(text) = user.take() {
+                    history.push(("user", text));
+                    history.push(("assistant", message.text.as_str()));
+                }
+            }
+            Role::System => user = None,
+            Role::User | Role::Assistant => {}
+        }
+    }
+    history
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,5 +878,35 @@ mod tests {
         assert_eq!(app.phase, RuntimePhase::Decode);
         assert_eq!(app.messages.back().unwrap().text, "hello");
         assert_eq!(app.metrics.decode_tokens, 3);
+    }
+
+    #[test]
+    fn completed_history_keeps_only_finished_turns() {
+        let messages = VecDeque::from([
+            ChatMessage {
+                role: Role::User,
+                text: "one".into(),
+                complete: true,
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                text: "two".into(),
+                complete: true,
+            },
+            ChatMessage {
+                role: Role::User,
+                text: "failed".into(),
+                complete: true,
+            },
+            ChatMessage {
+                role: Role::Assistant,
+                text: String::new(),
+                complete: false,
+            },
+        ]);
+        assert_eq!(
+            completed_history(&messages),
+            [("user", "one"), ("assistant", "two")]
+        );
     }
 }

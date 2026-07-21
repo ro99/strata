@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/chat_protocol.hpp"
 #include "strata/result.hpp"
 #include "strata/types.hpp"
 
@@ -60,6 +61,10 @@ public:
         const std::string& model_directory, const RuntimeConfig& config);
     [[nodiscard]] GenerationResult generate_stream(
         std::string_view prompt, std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token = {});
+    [[nodiscard]] GenerationResult generate_chat_stream(
+        std::span<const ChatMessage> messages,
+        std::uint32_t maximum_new_tokens,
         const TokenStreamCallback& on_token = {});
 
 private:

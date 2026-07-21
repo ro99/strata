@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/chat_protocol.hpp"
 #include "strata/safetensors.hpp"
 
 #include <array>
@@ -61,7 +62,13 @@ private:
 [[nodiscard]] std::string render_glm52_user_prompt(
     std::string_view user_text, std::string_view reasoning_effort = "medium-high",
     bool enable_thinking = true);
+[[nodiscard]] std::string render_glm52_chat_prompt(
+    std::span<const ChatMessage> messages,
+    std::string_view reasoning_effort = "medium-high",
+    bool enable_thinking = true);
 [[nodiscard]] std::string render_deepseek_v4_user_prompt(
     std::string_view user_text, bool enable_thinking = false);
+[[nodiscard]] std::string render_deepseek_v4_chat_prompt(
+    std::span<const ChatMessage> messages, bool enable_thinking = false);
 
 }  // namespace strata

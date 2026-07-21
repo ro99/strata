@@ -722,6 +722,15 @@ ParseResult<std::string> ModelTokenizer::decode(
 std::string render_glm52_user_prompt(std::string_view user_text,
                                      std::string_view reasoning_effort,
                                      bool enable_thinking) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(user_text)}};
+    return render_glm52_chat_prompt(messages, reasoning_effort,
+                                    enable_thinking);
+}
+
+std::string render_glm52_chat_prompt(std::span<const ChatMessage> messages,
+                                     std::string_view reasoning_effort,
+                                     bool enable_thinking) {
     std::string output = "[gMASK]<sop>\n";
     if (enable_thinking) {
         std::string effort(reasoning_effort);
@@ -735,8 +744,13 @@ std::string render_glm52_user_prompt(std::string_view user_text,
         }
         output += "<|system|>Reasoning Effort: " + effort;
     }
-    output += "<|user|>";
-    output.append(user_text);
+    for (const auto& message : messages) {
+        output += message.role == ChatRole::User ? "<|user|>" : "<|assistant|>";
+        if (message.role == ChatRole::Assistant) {
+            output += enable_thinking ? "<think>" : "<think></think>";
+        }
+        output += message.content;
+    }
     output += "<|assistant|>";
     output += enable_thinking ? "<think>" : "<think></think>";
     return output;
@@ -744,8 +758,21 @@ std::string render_glm52_user_prompt(std::string_view user_text,
 
 std::string render_deepseek_v4_user_prompt(std::string_view user_text,
                                            bool enable_thinking) {
-    std::string output = "<｜begin▁of▁sentence｜><｜User｜>";
-    output.append(user_text);
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(user_text)}};
+    return render_deepseek_v4_chat_prompt(messages, enable_thinking);
+}
+
+std::string render_deepseek_v4_chat_prompt(
+    std::span<const ChatMessage> messages, bool enable_thinking) {
+    std::string output = "<｜begin▁of▁sentence｜>";
+    for (const auto& message : messages) {
+        output += message.role == ChatRole::User ? "<｜User｜>" : "<｜Assistant｜>";
+        if (message.role == ChatRole::Assistant) {
+            output += enable_thinking ? "<think>" : "</think>";
+        }
+        output += message.content;
+    }
     output += "<｜Assistant｜>";
     output += enable_thinking ? "<think>" : "</think>";
     return output;

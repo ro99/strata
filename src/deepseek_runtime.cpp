@@ -2725,6 +2725,15 @@ ValidationResult DeepSeekV4Runtime::initialize(
 Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
     std::string_view prompt, std::uint32_t maximum_new_tokens,
     const TokenStreamCallback& on_token) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(prompt)}};
+    return generate_chat_stream(messages, maximum_new_tokens, on_token);
+}
+
+Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
+    std::span<const ChatMessage> messages,
+    std::uint32_t maximum_new_tokens,
+    const TokenStreamCallback& on_token) {
     Dsv4GenerationResult result;
     if (!impl_->initialized) {
         result.errors.emplace_back("DeepSeek runtime is not initialized");
@@ -2734,17 +2743,27 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_stream(
         result.errors.emplace_back("maximum_new_tokens must be positive");
         return result;
     }
-    auto encoded = impl_->tokenizer.encode(
-        render_deepseek_v4_user_prompt(prompt, false));
-    if (!encoded.ok()) {
-        result.errors = std::move(encoded.errors);
+    std::string validation_error;
+    if (!validate_chat_messages(messages, validation_error)) {
+        result.errors.push_back(std::move(validation_error));
         return result;
     }
-    if (encoded.value.size() + maximum_new_tokens >
-        impl_->config.maximum_context_tokens) {
-        result.errors.emplace_back(
-            "prompt and requested DeepSeek generation exceed the context ceiling");
-        return result;
+    ParseResult<std::vector<std::uint32_t>> encoded;
+    for (;;) {
+        encoded = impl_->tokenizer.encode(
+            render_deepseek_v4_chat_prompt(messages, false));
+        if (!encoded.ok()) {
+            result.errors = std::move(encoded.errors);
+            return result;
+        }
+        if (encoded.value.size() + maximum_new_tokens <=
+            impl_->config.maximum_context_tokens) break;
+        if (messages.size() <= 1U) {
+            result.errors.emplace_back(
+                "prompt and requested DeepSeek generation exceed the context ceiling");
+            return result;
+        }
+        messages = messages.subspan(2U);
     }
     result.prompt_token_ids = encoded.value;
     impl_->active_request_id = impl_->generated_requests++;

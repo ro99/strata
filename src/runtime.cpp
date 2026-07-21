@@ -3,6 +3,7 @@
 #include "strata/deepseek_runtime.hpp"
 #include "strata/glm_runtime.hpp"
 
+#include <array>
 #include <utility>
 #include <variant>
 
@@ -56,9 +57,19 @@ ValidationResult RuntimeSession::initialize(
 GenerationResult RuntimeSession::generate_stream(
     std::string_view prompt, std::uint32_t maximum_new_tokens,
     const TokenStreamCallback& on_token) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(prompt)}};
+    return generate_chat_stream(messages, maximum_new_tokens, on_token);
+}
+
+GenerationResult RuntimeSession::generate_chat_stream(
+    std::span<const ChatMessage> messages,
+    std::uint32_t maximum_new_tokens,
+    const TokenStreamCallback& on_token) {
     GenerationResult result;
     if (auto* runtime = std::get_if<Glm52Runtime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_stream(prompt, maximum_new_tokens, on_token);
+        auto concrete = runtime->generate_chat_stream(
+            messages, maximum_new_tokens, on_token);
         result.text = std::move(concrete.text);
         result.prompt_token_ids = std::move(concrete.prompt_token_ids);
         result.generated_token_ids = std::move(concrete.generated_token_ids);
@@ -70,7 +81,8 @@ GenerationResult RuntimeSession::generate_stream(
         return result;
     }
     if (auto* runtime = std::get_if<DeepSeekV4Runtime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_stream(prompt, maximum_new_tokens, on_token);
+        auto concrete = runtime->generate_chat_stream(
+            messages, maximum_new_tokens, on_token);
         result.text = std::move(concrete.text);
         result.prompt_token_ids = std::move(concrete.prompt_token_ids);
         result.generated_token_ids = std::move(concrete.generated_token_ids);

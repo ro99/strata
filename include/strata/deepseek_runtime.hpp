@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/chat_protocol.hpp"
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
@@ -160,6 +161,10 @@ public:
     [[nodiscard]] Dsv4GenerationResult generate_stream(
         std::string_view prompt, std::uint32_t maximum_new_tokens,
         const TokenStreamCallback& on_token);
+    [[nodiscard]] Dsv4GenerationResult generate_chat_stream(
+        std::span<const ChatMessage> messages,
+        std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token = {});
     [[nodiscard]] const Dsv4MemoryPlan& memory_plan() const noexcept;
 
 private:

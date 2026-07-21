@@ -52,15 +52,9 @@ impl RuntimeProcess {
         })
     }
 
-    pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
-        serde_json::to_writer(
-            &mut self.stdin,
-            &json!({
-                "command": "prompt",
-                "text": prompt,
-            }),
-        )
-        .map_err(|error| format!("Could not encode the prompt: {error}"))?;
+    pub fn send_prompt(&mut self, history: &[(&str, &str)], prompt: &str) -> Result<(), String> {
+        serde_json::to_writer(&mut self.stdin, &prompt_request(history, prompt))
+            .map_err(|error| format!("Could not encode the prompt: {error}"))?;
         self.stdin
             .write_all(b"\n")
             .and_then(|()| self.stdin.flush())
@@ -89,6 +83,19 @@ impl RuntimeProcess {
             }
         }
     }
+}
+
+fn prompt_request(history: &[(&str, &str)], prompt: &str) -> serde_json::Value {
+    let mut messages = history
+        .iter()
+        .map(|(role, content)| json!({"role": role, "content": content}))
+        .collect::<Vec<_>>();
+    messages.push(json!({"role": "user", "content": prompt}));
+    json!({
+        "command": "prompt",
+        "text": prompt,
+        "messages": messages,
+    })
 }
 
 impl Drop for RuntimeProcess {
@@ -141,4 +148,20 @@ fn spawn_log_reader(stderr: impl std::io::Read + Send + 'static, sender: Sender<
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_request_carries_prior_turns_and_current_text() {
+        let request = prompt_request(
+            &[("user", "Capital of France?"), ("assistant", "Paris")],
+            "And its population?",
+        );
+        assert_eq!(request["text"], "And its population?");
+        assert_eq!(request["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(request["messages"][1]["content"], "Paris");
+    }
 }

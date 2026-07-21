@@ -32,6 +32,22 @@ TEST_CASE("GLM single-user chat rendering matches the pinned template") {
             "<|assistant|><think>");
 }
 
+TEST_CASE("chat rendering includes prior user and assistant turns") {
+    const std::array messages{
+        strata::ChatMessage{strata::ChatRole::User, "Capital of France?"},
+        strata::ChatMessage{strata::ChatRole::Assistant, "Paris"},
+        strata::ChatMessage{strata::ChatRole::User, "And its population?"},
+    };
+    REQUIRE(strata::render_glm52_chat_prompt(messages, "medium-high", false) ==
+            "[gMASK]<sop>\n<|user|>Capital of France?"
+            "<|assistant|><think></think>Paris"
+            "<|user|>And its population?<|assistant|><think></think>");
+    REQUIRE(strata::render_deepseek_v4_chat_prompt(messages) ==
+            "<｜begin▁of▁sentence｜><｜User｜>Capital of France?"
+            "<｜Assistant｜></think>Paris<｜User｜>And its population?"
+            "<｜Assistant｜></think>");
+}
+
 TEST_CASE("real GLM tokenizer produces the frozen baseline prompt ids when available") {
     const auto path = tokenizer_fixture();
     if (!std::filesystem::exists(path)) SKIP("pinned GLM tokenizer fixture is absent");

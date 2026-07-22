@@ -49,8 +49,10 @@ other declared FP8 linears retain native execution.
 - BF16 embedding and response-head boundary with the target tokenizer/template;
 - low-rank 64-head attention, 128-token sliding state, attention sinks, YaRN,
   and compression ratios 4 and 128;
-- logical cache admission through the declared 1,048,576-token model limit,
-  with lazily committed host pages for compressed KV and learned-index state;
+- logical cache admission through the declared 1,048,576-token model limit;
+- an opt-in fixed-row block KV manager (`--block-kv-cache`) with distinct
+  sliding, CSA, HCA, and learned-index tables; the scalar row/page path remains
+  selectable as the validation oracle;
 - exact compressed-position membership through 2,048 tokens, followed by the
   target's learned top-512 selection in ratio-4 layers; ratio-128 layers retain
   their full heavily-compressed history;
@@ -67,9 +69,11 @@ other declared FP8 linears retain native execution.
 
 Before initialization, admission reserves the non-DSpark routed experts and
 embedding in anonymous RAM, the main-model spine and workspaces in VRAM, and KV
-and index state in RAM. Cache capacity is admitted logically, but 256 KiB host
-pages are committed only as rows are produced, so a large configured ceiling
-does not zero or touch the complete cache up front. The staged weight arena
+and index state in separately reported host/device budgets. Scalar cache pages
+or typed blocks are committed only as rows are produced, so a large configured
+ceiling does not zero or touch the complete cache up front. Device KV blocks
+use their own bounded allocator and cannot evict an in-flight lease. The staged
+weight arena
 becomes read-only. After warm-up, any checkpoint read during decode violates
 the zero-NVMe contract and fails the request.
 

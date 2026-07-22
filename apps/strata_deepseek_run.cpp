@@ -29,6 +29,8 @@ struct Options {
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
+    std::uint64_t host_kv_cache_bytes{};
+    std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
     bool admission_only{};
     bool json{};
@@ -36,6 +38,7 @@ struct Options {
     bool detailed_timing{};
     bool device_moe{true};
     bool flash_attention{};
+    bool block_kv_cache{};
     bool logit_trace{};
     bool layer_hash_trace{};
     bool overlap_resident_warmup{true};
@@ -54,6 +57,8 @@ void usage() {
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
+        << "       [--block-kv-cache|--scalar-kv-cache]\n"
+        << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
         << "       [--detailed-timing] [--json] [--quiet]\n";
@@ -82,6 +87,21 @@ bool parse_bytes(std::string_view text, std::uint64_t& value) {
     }
     value = base * multiplier;
     return true;
+}
+
+bool parse_byte_list(std::string_view text,
+                     std::vector<std::uint64_t>& values) {
+    values.clear();
+    while (!text.empty()) {
+        const auto separator = text.find(',');
+        const auto item = text.substr(0U, separator);
+        std::uint64_t value = 0U;
+        if (!parse_bytes(item, value)) return false;
+        values.push_back(value);
+        if (separator == std::string_view::npos) return true;
+        text.remove_prefix(separator + 1U);
+    }
+    return false;
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -136,6 +156,14 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
+        } else if (argument == "--kv-host-cache") {
+            const auto* value = next(argument);
+            if (value == nullptr ||
+                !parse_bytes(value, options.host_kv_cache_bytes)) return false;
+        } else if (argument == "--kv-device-cache") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_byte_list(
+                    value, options.device_kv_cache_bytes)) return false;
         } else if (argument == "--vram-fraction") {
             const auto* value = next(argument);
             if (value == nullptr) return false;
@@ -152,6 +180,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.flash_attention = true;
         } else if (argument == "--scalar-attention") {
             options.flash_attention = false;
+        } else if (argument == "--block-kv-cache") {
+            options.block_kv_cache = true;
+        } else if (argument == "--scalar-kv-cache") {
+            options.block_kv_cache = false;
         } else if (argument == "--flash-attention-minimum-rows") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(
@@ -334,6 +366,36 @@ void print_cache_stats(std::ostream& output, const strata::Dsv4CacheStats& stats
     output << '}';
 }
 
+void print_kv_cache_stats(
+    std::ostream& output, const strata::Dsv4KvCacheStats& stats) {
+    output << "{\"host_capacity_bytes\":" << stats.host_capacity_bytes
+           << ",\"host_used_bytes\":" << stats.host_used_bytes
+           << ",\"host_peak_bytes\":" << stats.host_peak_bytes
+           << ",\"device_capacity_bytes\":";
+    strata::cli::print_array(output, stats.device_capacity_bytes);
+    output << ",\"device_used_bytes\":";
+    strata::cli::print_array(output, stats.device_used_bytes);
+    output << ",\"device_peak_bytes\":";
+    strata::cli::print_array(output, stats.device_peak_bytes);
+    output << ",\"allocated_blocks\":" << stats.allocated_blocks
+           << ",\"used_blocks\":" << stats.used_blocks
+           << ",\"allocation_calls\":" << stats.allocation_calls
+           << ",\"allocation_seconds\":"
+           << static_cast<double>(stats.allocation_nanoseconds) / 1.0e9
+           << ",\"hits\":" << stats.hits
+           << ",\"misses\":" << stats.misses
+           << ",\"evictions\":" << stats.evictions
+           << ",\"promotions\":" << stats.promotions
+           << ",\"promotion_seconds\":"
+           << static_cast<double>(stats.promotion_nanoseconds) / 1.0e9
+           << ",\"host_to_device_bytes\":" << stats.host_to_device_bytes
+           << ",\"device_to_host_bytes\":" << stats.device_to_host_bytes
+           << ",\"host_write_bytes\":" << stats.host_write_bytes
+           << ",\"gather_bytes\":" << stats.gather_bytes
+           << ",\"copy_on_write_blocks\":" << stats.copy_on_write_blocks
+           << '}';
+}
+
 void print_device_moe_stats(
     std::ostream& output, const strata::Dsv4DeviceMoeStats& stats) {
     output << "{\"batches\":" << stats.batches
@@ -404,6 +466,8 @@ void print_phase(std::ostream& output, const strata::Dsv4PhaseMetrics& phase) {
     print_cuda_stats(output, phase.cuda);
     output << ",\"cache\":";
     print_cache_stats(output, phase.cache);
+    output << ",\"kv_cache\":";
+    print_kv_cache_stats(output, phase.kv_cache);
     output << ",\"device_moe_runtime\":";
     print_device_moe_stats(output, phase.device_moe);
     output << ",\"graph\":";
@@ -417,6 +481,11 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << ",\"host_parameter_bytes\":" << plan.host_parameter_bytes
            << ",\"kv_state_bytes\":" << plan.kv_state_bytes
            << ",\"index_state_bytes\":" << plan.index_state_bytes
+           << ",\"host_kv_cache_bytes\":" << plan.host_kv_cache_bytes
+           << ",\"device_kv_cache_bytes\":" << plan.device_kv_cache_bytes
+           << ",\"per_device_kv_cache_bytes\":";
+    strata::cli::print_array(output, plan.per_device_kv_cache_bytes);
+    output
            << ",\"host_workspace_bytes\":" << plan.host_workspace_bytes
            << ",\"total_vram_budget_bytes\":" << plan.total_vram_budget_bytes
            << ",\"resident_spine_vram_bytes\":" << plan.resident_spine_vram_bytes
@@ -603,6 +672,8 @@ int main(int argc, char** argv) {
         }
         strata::Dsv4AdmissionConfig config;
         config.host_memory_ceiling_bytes = options.host_memory_bytes;
+        config.host_kv_cache_bytes = options.host_kv_cache_bytes;
+        config.device_kv_cache_bytes = options.device_kv_cache_bytes;
         config.vram_weight_budgets = budgets;
         config.maximum_context_tokens = options.maximum_context_tokens;
         config.require_zero_nvme_decode = true;
@@ -628,6 +699,8 @@ int main(int argc, char** argv) {
     config.devices = options.devices;
     config.vram_cache_fraction = options.vram_fraction;
     config.host_memory_limit_bytes = options.host_memory_bytes;
+    config.host_kv_cache_bytes = options.host_kv_cache_bytes;
+    config.device_kv_cache_bytes = options.device_kv_cache_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.prefill_page_tokens = options.prefill_page_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
@@ -638,6 +711,9 @@ int main(int argc, char** argv) {
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
     config.enable_flash_attention = options.flash_attention;
+    config.kv_cache_mode = options.block_kv_cache
+        ? strata::Dsv4KvCacheMode::Block
+        : strata::Dsv4KvCacheMode::ScalarOracle;
     config.flash_attention_minimum_rows =
         options.flash_attention_minimum_rows;
     config.enable_logit_trace = options.logit_trace;
@@ -671,6 +747,9 @@ int main(int argc, char** argv) {
                   << metrics.prefill_page_tokens
                   << ",\"flash_attention\":"
                   << (metrics.flash_attention_enabled ? "true" : "false")
+                  << ",\"block_kv_cache\":"
+                  << (metrics.block_kv_cache_enabled ? "true" : "false")
+                  << ",\"kv_block_rows\":" << metrics.kv_block_rows
                   << ",\"flash_attention_minimum_rows\":"
                   << metrics.flash_attention_minimum_rows
                   << ",\"resident_read_workers\":"
@@ -687,6 +766,10 @@ int main(int argc, char** argv) {
                   << ",\"prompt_tokens\":" << metrics.prompt_tokens
                   << ",\"generated_tokens\":" << generated.generated_token_ids.size()
                   << ",\"decode_steps\":" << metrics.decode_tokens
+                  << ",\"rss_bytes\":" << metrics.rss_bytes
+                  << ",\"device_vram_used_bytes\":";
+        strata::cli::print_array(std::cout, metrics.device_vram_used_bytes);
+        std::cout
                   << ",\"prefill_seconds\":" << metrics.prefill_seconds
                   << ",\"decode_seconds\":" << metrics.decode_seconds
                   << ",\"decode_checkpoint_read_bytes\":"
@@ -697,6 +780,9 @@ int main(int argc, char** argv) {
                   << ",\"vram_cache_hits\":" << metrics.cache.hits
                   << ",\"vram_cache_misses\":" << metrics.cache.misses
                   << ",\"vram_cache_evictions\":" << metrics.cache.evictions
+                  << ",\"kv_cache\":";
+        print_kv_cache_stats(std::cout, metrics.kv_cache);
+        std::cout
                   << ",\"cuda\":";
         print_cuda_stats(std::cout, metrics.cuda);
         std::cout << ",\"phases\":{\"prefill\":";

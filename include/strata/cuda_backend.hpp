@@ -137,6 +137,25 @@ private:
     friend class CudaBackend;
 };
 
+class CudaBuffer {
+public:
+    CudaBuffer();
+    ~CudaBuffer();
+    CudaBuffer(CudaBuffer&&) noexcept;
+    CudaBuffer& operator=(CudaBuffer&&) noexcept;
+    CudaBuffer(const CudaBuffer&) = delete;
+    CudaBuffer& operator=(const CudaBuffer&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] std::uint64_t device_bytes() const noexcept;
+    [[nodiscard]] int device() const noexcept;
+
+private:
+    struct Impl;
+    std::shared_ptr<Impl> impl_;
+    friend class CudaBackend;
+};
+
 // One exact DeepSeek expert projection triplet. The weight objects must remain
 // alive until the matching collect call completes. Each routed coefficient is
 // applied once before w2; the optional shared expert must use coefficient 1.0.
@@ -173,6 +192,8 @@ public:
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,
         CudaWeight& output);
+    [[nodiscard]] ValidationResult upload_buffer(
+        int device, std::span<const std::byte> bytes, CudaBuffer& output);
     [[nodiscard]] ValidationResult matmul(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::span<float> output);

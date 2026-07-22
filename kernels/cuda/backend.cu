@@ -945,6 +945,17 @@ struct CudaWeight::Impl {
     }
 };
 
+struct CudaBuffer::Impl {
+    void* data{};
+    std::uint64_t bytes{};
+    int device{-1};
+
+    ~Impl() {
+        if (device >= 0) static_cast<void>(cudaSetDevice(device));
+        if (data != nullptr) static_cast<void>(cudaFree(data));
+    }
+};
+
 struct CudaBackend::Impl {
     struct DeviceState {
         cudaStream_t stream{};
@@ -987,6 +998,7 @@ struct CudaBackend::Impl {
         std::uint64_t moe_kernel_launches{};
         std::vector<std::shared_ptr<CudaWeight::Impl>> moe_weights;
         std::vector<std::shared_ptr<CudaWeight::Impl>> quarantined_weights;
+        std::vector<std::shared_ptr<CudaBuffer::Impl>> quarantined_buffers;
         std::shared_ptr<WeightArena> weight_arena;
         bool moe_has_shared{};
         bool moe_in_flight{};
@@ -1056,6 +1068,18 @@ CudaWeight& CudaWeight::operator=(CudaWeight&&) noexcept = default;
 bool CudaWeight::valid() const noexcept { return impl_ != nullptr && impl_->weights != nullptr; }
 std::uint64_t CudaWeight::device_bytes() const noexcept { return impl_ ? impl_->bytes : 0U; }
 int CudaWeight::device() const noexcept { return impl_ ? impl_->device : -1; }
+
+CudaBuffer::CudaBuffer() = default;
+CudaBuffer::~CudaBuffer() = default;
+CudaBuffer::CudaBuffer(CudaBuffer&&) noexcept = default;
+CudaBuffer& CudaBuffer::operator=(CudaBuffer&&) noexcept = default;
+bool CudaBuffer::valid() const noexcept {
+    return impl_ != nullptr && impl_->data != nullptr;
+}
+std::uint64_t CudaBuffer::device_bytes() const noexcept {
+    return impl_ ? impl_->bytes : 0U;
+}
+int CudaBuffer::device() const noexcept { return impl_ ? impl_->device : -1; }
 
 CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {}
 CudaBackend::~CudaBackend() = default;
@@ -1380,6 +1404,64 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         ++device_stats.synchronization_calls;
         device_stats.synchronization_nanoseconds += wait_nanoseconds;
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
+    }
+    output.impl_ = std::move(target);
+    return result;
+}
+
+ValidationResult CudaBackend::upload_buffer(
+    int device, std::span<const std::byte> bytes, CudaBuffer& output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "buffer upload targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "buffer upload cannot overlap an in-flight DeepSeek MoE command");
+        return result;
+    }
+    if (bytes.empty()) {
+        result.errors.emplace_back("CUDA buffer upload payload is empty");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for buffer upload");
+    }
+    auto target = std::make_shared<CudaBuffer::Impl>();
+    target->bytes = bytes.size();
+    target->device = device;
+    if (auto status = cudaMalloc(&target->data, bytes.size());
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate CUDA buffer");
+    }
+    if (auto status = cudaMemcpyAsync(target->data, bytes.data(), bytes.size(),
+                                      cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload CUDA buffer");
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        state.quarantined_buffers.push_back(std::move(target));
+        return cuda_error(status, "synchronize CUDA buffer upload");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += bytes.size();
+        stats.activation_h2d_nanoseconds += wait_nanoseconds;
+        ++stats.workspace_allocation_calls;
+        stats.workspace_allocation_bytes += bytes.size();
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
     }
     output.impl_ = std::move(target);
     return result;

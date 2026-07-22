@@ -74,6 +74,8 @@ paths. Hand back the session, log, expected summary, and current stage.
 ## Git hygiene
 
 - `main` is a validated research baseline, not a scratch branch.
+- Create task branches from `main` unless the user explicitly names another
+  base; never inherit unpromoted branch work implicitly.
 - Use `exp/`, `feat/`, `fix/`, and `infra/` branches.
 - Make reversible, single-purpose commits.
 - Record failed experiments; do not merge failed runtime code.

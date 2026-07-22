@@ -181,8 +181,9 @@ The `deepseek_v4` adapter validates and, for the base model, executes:
 - the declared three DSpark stages, Markov head, and confidence metadata.
 
 DeepSeek context admission accepts any positive logical ceiling through the
-model's declared 1,048,576-token limit. Compressed KV and sparse-index caches
-use lazy host pages, while ratio-4 layers maintain the learned index state and
+model's declared 1,048,576-token limit. The scalar oracle uses lazy host pages;
+the selectable block manager uses separate sliding, CSA, HCA, and learned-index
+tables with bounded host/device residency. Ratio-4 layers maintain the learned index state and
 select the declared top 512 compressed positions once the history exceeds that
 set. The implementation and boundary fixtures do not imply practical or
 full-model validation at 32k/200k/1m prompt lengths; batched prefill remains a

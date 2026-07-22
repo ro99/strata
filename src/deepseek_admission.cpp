@@ -45,6 +45,11 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
                     [](std::uint64_t bytes) { return bytes == 0U; })) {
         result.errors.emplace_back("DeepSeek admission requires positive per-device VRAM budgets");
     }
+    if (!config.device_kv_cache_bytes.empty() &&
+        config.device_kv_cache_bytes.size() != config.vram_weight_budgets.size()) {
+        result.errors.emplace_back(
+            "DeepSeek KV and VRAM device budget counts must match");
+    }
     const auto model_context =
         deepseek_v4_flash_dspark_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
@@ -179,6 +184,29 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             return result;
         }
     }
+    result.plan.host_kv_cache_bytes = config.host_kv_cache_bytes == 0U
+        ? result.plan.kv_state_bytes : config.host_kv_cache_bytes;
+    if (result.plan.host_kv_cache_bytes < result.plan.kv_state_bytes) {
+        result.errors.emplace_back(
+            "DeepSeek exact KV state exceeds the host KV cache budget");
+    }
+    result.plan.per_device_kv_cache_bytes = config.device_kv_cache_bytes;
+    if (result.plan.per_device_kv_cache_bytes.empty()) {
+        result.plan.per_device_kv_cache_bytes.resize(
+            config.vram_weight_budgets.size());
+    }
+    for (std::size_t slot = 0U;
+         slot < result.plan.per_device_kv_cache_bytes.size(); ++slot) {
+        const auto bytes = result.plan.per_device_kv_cache_bytes[slot];
+        constexpr std::uint64_t workspace = 256ULL << 20U;
+        if (config.vram_weight_budgets[slot] <= workspace ||
+            bytes >= config.vram_weight_budgets[slot] - workspace ||
+            !add(result.plan.device_kv_cache_bytes, bytes)) {
+            result.errors.emplace_back(
+                "DeepSeek device KV cache budget exceeds admitted VRAM");
+            return result;
+        }
+    }
     result.plan.host_workspace_bytes = 1ULL << 30U;
     result.plan.vram_workspace_bytes =
         static_cast<std::uint64_t>(config.vram_weight_budgets.size()) * (256ULL << 20U);
@@ -193,8 +221,19 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         result.errors.emplace_back(
             "DeepSeek zero-read resident set exceeds the host-memory ceiling");
     }
+    if (result.plan.resident_spine_vram_bytes >
+            std::numeric_limits<std::uint64_t>::max() -
+                result.plan.vram_workspace_bytes ||
+        result.plan.resident_spine_vram_bytes +
+                result.plan.vram_workspace_bytes >
+            std::numeric_limits<std::uint64_t>::max() -
+                result.plan.device_kv_cache_bytes) {
+        result.errors.emplace_back("DeepSeek required VRAM byte count overflows");
+        return result;
+    }
     const auto required_vram = result.plan.resident_spine_vram_bytes +
-                               result.plan.vram_workspace_bytes;
+                               result.plan.vram_workspace_bytes +
+                               result.plan.device_kv_cache_bytes;
     if (required_vram > result.plan.total_vram_budget_bytes) {
         result.errors.emplace_back(
             "DeepSeek resident spine and workspaces exceed aggregate VRAM budget");

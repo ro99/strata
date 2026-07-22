@@ -5,6 +5,7 @@
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/deepseek_diagnostics.hpp"
+#include "strata/deepseek_kv_cache.hpp"
 #include "strata/types.hpp"
 
 #include <cstdint>
@@ -20,7 +21,11 @@ struct Dsv4RuntimeConfig {
     std::vector<int> devices{0};
     double vram_cache_fraction{0.85};
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
+    std::uint64_t host_kv_cache_bytes{};
+    std::vector<std::uint64_t> device_kv_cache_bytes;
     std::uint32_t maximum_context_tokens{2048U};
+    Dsv4KvCacheMode kv_cache_mode{Dsv4KvCacheMode::ScalarOracle};
+    std::uint32_t kv_block_rows{64U};
     // Prefill is executed in bounded layer-major pages. Page 64 is the
     // accepted measured default; a value of one retains the oracle traversal.
     std::uint32_t prefill_page_tokens{64U};
@@ -99,6 +104,7 @@ struct Dsv4PhaseMetrics {
     Dsv4CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
+    Dsv4KvCacheStats kv_cache;
     Dsv4DeviceMoeStats device_moe;
     Dsv4GraphStats graph;
 };
@@ -112,12 +118,15 @@ struct Dsv4GenerationMetrics {
     double decode_seconds{};
     std::uint64_t prompt_tokens{};
     std::uint64_t decode_tokens{};
+    std::uint64_t rss_bytes{};
+    std::vector<std::uint64_t> device_vram_used_bytes;
     Dsv4MemoryPlan memory;
     Dsv4ResidentStageStats resident_stage;
     Dsv4CheckpointReadStats generation_checkpoint_reads;
     Dsv4CheckpointReadStats decode_checkpoint_reads;
     CudaBackendStats cuda;
     Dsv4CacheStats cache;
+    Dsv4KvCacheStats kv_cache;
     Dsv4DeviceMoeStats device_moe;
     Dsv4GraphStats graph;
     Dsv4PhaseMetrics prefill;
@@ -126,6 +135,8 @@ struct Dsv4GenerationMetrics {
     bool dspark_enabled{};
     bool device_moe_enabled{};
     bool resident_warmup_overlapped{};
+    bool block_kv_cache_enabled{};
+    std::uint32_t kv_block_rows{};
     std::uint32_t host_attention_threads{};
     std::uint32_t prefill_page_tokens{};
     bool flash_attention_enabled{};

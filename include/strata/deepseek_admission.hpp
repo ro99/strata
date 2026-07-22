@@ -10,6 +10,8 @@ namespace strata {
 struct Dsv4AdmissionConfig {
     std::uint64_t host_memory_ceiling_bytes{};
     std::vector<std::uint64_t> vram_weight_budgets;
+    std::uint64_t host_kv_cache_bytes{};
+    std::vector<std::uint64_t> device_kv_cache_bytes;
     std::uint32_t maximum_context_tokens{2048U};
     bool enable_dspark{};
     bool require_zero_nvme_decode{true};
@@ -20,6 +22,9 @@ struct Dsv4MemoryPlan {
     std::uint64_t host_parameter_bytes{};
     std::uint64_t kv_state_bytes{};
     std::uint64_t index_state_bytes{};
+    std::uint64_t host_kv_cache_bytes{};
+    std::uint64_t device_kv_cache_bytes{};
+    std::vector<std::uint64_t> per_device_kv_cache_bytes;
     std::uint64_t host_workspace_bytes{};
     std::uint64_t required_host_bytes{};
     std::uint64_t resident_spine_vram_bytes{};

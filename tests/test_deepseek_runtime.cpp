@@ -18,6 +18,34 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
     REQUIRE(config.overlap_resident_warmup);
+    REQUIRE(config.kv_cache_mode == strata::Dsv4KvCacheMode::ScalarOracle);
+    REQUIRE(config.kv_block_rows == 64U);
+    REQUIRE(config.host_kv_cache_bytes == 0U);
+    REQUIRE(config.device_kv_cache_bytes.empty());
+}
+
+TEST_CASE("DeepSeek runtime validates block KV cache configuration") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.kv_cache_mode = strata::Dsv4KvCacheMode::Block;
+    config.kv_block_rows = 0U;
+    const auto rows = runtime.initialize("not-used", config);
+    REQUIRE(!rows.ok());
+    REQUIRE(std::any_of(rows.errors.begin(), rows.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("KV block row") != std::string::npos;
+                        }));
+
+    strata::DeepSeekV4Runtime second;
+    config.kv_block_rows = 64U;
+    config.device_kv_cache_bytes = {1U, 2U};
+    const auto devices = second.initialize("not-used", config);
+    REQUIRE(!devices.ok());
+    REQUIRE(std::any_of(devices.errors.begin(), devices.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("KV device budget count") !=
+                                   std::string::npos;
+                        }));
 }
 
 TEST_CASE("DeepSeek runtime rejects an unbounded prefill page") {

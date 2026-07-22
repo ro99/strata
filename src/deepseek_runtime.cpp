@@ -33,6 +33,10 @@
 #include <thread>
 #include <unordered_map>
 
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
 namespace strata {
 
 namespace {
@@ -208,6 +212,30 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     return result;
 }
 
+[[nodiscard]] Dsv4KvCacheStats kv_cache_delta(
+    const Dsv4KvCacheStats& after,
+    const Dsv4KvCacheStats& before) {
+    Dsv4KvCacheStats result = after;
+    result.allocated_blocks -= before.allocated_blocks;
+    result.allocation_calls -= before.allocation_calls;
+    result.allocation_nanoseconds -= before.allocation_nanoseconds;
+    result.hits -= before.hits;
+    result.misses -= before.misses;
+    result.evictions -= before.evictions;
+    result.promotions -= before.promotions;
+    result.promotion_nanoseconds -= before.promotion_nanoseconds;
+    result.host_to_device_bytes -= before.host_to_device_bytes;
+    result.device_to_host_bytes -= before.device_to_host_bytes;
+    result.host_write_bytes -= before.host_write_bytes;
+    result.gather_bytes -= before.gather_bytes;
+    result.copy_on_write_blocks -= before.copy_on_write_blocks;
+    result.sequence_creations -= before.sequence_creations;
+    result.sequence_resets -= before.sequence_resets;
+    result.sequence_releases -= before.sequence_releases;
+    result.sequence_truncations -= before.sequence_truncations;
+    return result;
+}
+
 [[nodiscard]] Dsv4DeviceMoeStats device_moe_delta(
     const Dsv4DeviceMoeStats& after,
     const Dsv4DeviceMoeStats& before) noexcept {
@@ -258,6 +286,39 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());
+}
+
+[[nodiscard]] std::uint64_t resident_set_bytes() noexcept {
+#if defined(__linux__)
+    std::ifstream input("/proc/self/statm");
+    std::uint64_t virtual_pages = 0U;
+    std::uint64_t resident_pages = 0U;
+    input >> virtual_pages >> resident_pages;
+    static_cast<void>(virtual_pages);
+    const long page_bytes = sysconf(_SC_PAGESIZE);
+    if (!input || page_bytes <= 0 ||
+        resident_pages > std::numeric_limits<std::uint64_t>::max() /
+                             static_cast<std::uint64_t>(page_bytes)) {
+        return 0U;
+    }
+    return resident_pages * static_cast<std::uint64_t>(page_bytes);
+#else
+    return 0U;
+#endif
+}
+
+[[nodiscard]] std::vector<std::uint64_t> device_vram_used_bytes(
+    std::span<const int> devices) {
+    std::vector<std::uint64_t> result;
+    result.reserve(devices.size());
+    for (const int device : devices) {
+        const auto memory = CudaBackend::device_memory(device);
+        result.push_back(memory.ok() && memory.value.total_bytes >=
+                                           memory.value.free_bytes
+                             ? memory.value.total_bytes - memory.value.free_bytes
+                             : 0U);
+    }
+    return result;
 }
 
 [[nodiscard]] std::uint64_t linear_bytes(const Dsv4CheckpointReader& checkpoint,
@@ -581,6 +642,7 @@ struct CompressorState {
     std::uint32_t coefficient{};
     std::uint32_t head_dim{};
     bool rotate_fp4{};
+    Dsv4KvBlockKind kind{Dsv4KvBlockKind::Csa};
     std::vector<float> values;
     std::vector<float> scores;
     PagedFloatRows compressed;
@@ -604,6 +666,8 @@ struct DeepSeekV4Runtime::Impl {
     ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
+    std::unique_ptr<Dsv4KvCache> kv_cache;
+    Dsv4SequenceHandle active_sequence{};
     std::unique_ptr<HostWorkerPool> attention_workers;
     Dsv4DiagnosticTrace diagnostics;
     Dsv4DeviceMoeStats device_moe_stats;
@@ -743,6 +807,9 @@ struct DeepSeekV4Runtime::Impl {
 
     ValidationResult warmup();
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
+    ParseResult<std::span<const float>> kv_row(
+        std::uint32_t layer, Dsv4KvBlockKind kind,
+        std::uint64_t logical_row);
     void reset_diagnostics();
     void record_layer_hash(std::uint32_t position, std::uint32_t token,
                            std::uint32_t layer, std::span<const float> hidden);
@@ -1049,15 +1116,26 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
 ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     std::uint32_t active_context_tokens) {
     ValidationResult result;
+    if (kv_cache != nullptr) {
+        result = kv_cache->reset_sequence(active_sequence);
+        if (!result.ok()) return result;
+    }
     const auto ratios = deepseek_v4_flash_dspark_spec().deepseek_v4.compression_ratios;
     for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
         auto& state = attention_state[layer];
-        state.sliding.assign(static_cast<std::size_t>(kWindow) * kHeadDim, 0.0F);
+        if (kv_cache == nullptr) {
+            state.sliding.assign(static_cast<std::size_t>(kWindow) * kHeadDim,
+                                 0.0F);
+        } else {
+            state.sliding.clear();
+        }
         state.frequencies = rope_frequencies(ratios[layer]);
         auto& compressor_state = state.compressor;
         compressor_state = {};
         compressor_state.ratio = ratios[layer];
         if (compressor_state.ratio == 0U) continue;
+        compressor_state.kind = compressor_state.ratio == 4U
+            ? Dsv4KvBlockKind::Csa : Dsv4KvBlockKind::Hca;
         compressor_state.coefficient = compressor_state.ratio == 4U ? 2U : 1U;
         compressor_state.head_dim = kHeadDim;
         const auto rows = static_cast<std::size_t>(compressor_state.coefficient) *
@@ -1070,7 +1148,8 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
         const auto compressed_rows =
             (static_cast<std::size_t>(config.maximum_context_tokens) +
              compressor_state.ratio - 1U) / compressor_state.ratio;
-        if (!compressor_state.compressed.configure(compressed_rows,
+        if (kv_cache == nullptr &&
+            !compressor_state.compressed.configure(compressed_rows,
                                                    compressor_state.head_dim)) {
             result.errors.emplace_back(
                 "cannot reserve paged DeepSeek compressed KV metadata");
@@ -1081,6 +1160,7 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
             active_context_tokens > kIndexTopK * compressor_state.ratio) {
             auto& indexer = state.indexer_compressor;
             indexer.ratio = compressor_state.ratio;
+            indexer.kind = Dsv4KvBlockKind::LearnedIndex;
             indexer.coefficient = 2U;
             indexer.head_dim = kIndexHeadDim;
             indexer.rotate_fp4 = true;
@@ -1092,13 +1172,37 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
             indexer.scores.assign(
                 indexer_rows * indexer_dimensions,
                 -std::numeric_limits<float>::infinity());
-            if (!indexer.compressed.configure(compressed_rows,
+            if (kv_cache == nullptr &&
+                !indexer.compressed.configure(compressed_rows,
                                               indexer.head_dim)) {
                 result.errors.emplace_back(
                     "cannot reserve paged DeepSeek sparse-index metadata");
                 return result;
             }
         }
+    }
+    return result;
+}
+
+ParseResult<std::span<const float>> DeepSeekV4Runtime::Impl::kv_row(
+    std::uint32_t layer, Dsv4KvBlockKind kind,
+    std::uint64_t logical_row) {
+    if (kv_cache != nullptr) {
+        return kv_cache->row(active_sequence, kind, layer, logical_row);
+    }
+    ParseResult<std::span<const float>> result;
+    const auto& state = attention_state[layer];
+    if (kind == Dsv4KvBlockKind::Sliding) {
+        result.value = std::span<const float>(state.sliding).subspan(
+            static_cast<std::size_t>(logical_row % kWindow) * kHeadDim,
+            kHeadDim);
+        return result;
+    }
+    const auto& compressed = kind == Dsv4KvBlockKind::LearnedIndex
+        ? state.indexer_compressor.compressed : state.compressor.compressed;
+    result.value = compressed.row(logical_row);
+    if (result.value.empty()) {
+        result.errors.emplace_back("DeepSeek scalar KV row is unavailable");
     }
     return result;
 }
@@ -1228,12 +1332,18 @@ ValidationResult DeepSeekV4Runtime::Impl::compress_state(
             std::span<float>(pooled).first(state.head_dim - kRopeDim), 64U);
     }
     const auto compressed_row = position / state.ratio;
-    auto destination = state.compressed.writable_row(compressed_row);
-    if (destination.size() != pooled.size()) {
-        result.errors.emplace_back("DeepSeek compressed cache allocation failed");
-        return result;
+    if (kv_cache != nullptr) {
+        result = kv_cache->append(active_sequence, state.kind, layer,
+                                  state.ratio, compressed_row, pooled);
+        if (!result.ok()) return result;
+    } else {
+        auto destination = state.compressed.writable_row(compressed_row);
+        if (destination.size() != pooled.size()) {
+            result.errors.emplace_back("DeepSeek compressed cache allocation failed");
+            return result;
+        }
+        std::copy(pooled.begin(), pooled.end(), destination.begin());
     }
-    std::copy(pooled.begin(), pooled.end(), destination.begin());
     return result;
 }
 
@@ -1291,8 +1401,21 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     for (auto& weight : index_weights) weight = round_bf16(weight * index_scale);
 
     std::vector<float> scores(compressed_count);
+    std::vector<std::span<const float>> block_keys;
+    if (kv_cache != nullptr) {
+        block_keys.reserve(compressed_count);
+        for (std::uint32_t row = 0U; row < compressed_count; ++row) {
+            auto key = kv_row(layer, Dsv4KvBlockKind::LearnedIndex, row);
+            if (!key.ok()) {
+                append_errors(result, std::move(key.errors));
+                return result;
+            }
+            block_keys.push_back(key.value);
+        }
+    }
     const auto score_row = [&](std::size_t row) {
-        const auto key = state.compressed.row(row);
+        const auto key = kv_cache == nullptr
+            ? state.compressed.row(row) : block_keys[row];
         if (key.size() != kIndexHeadDim) {
             scores[row] = -std::numeric_limits<float>::infinity();
             return;
@@ -1416,9 +1539,16 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     const auto prefix = layer_prefix(layer) + "attn.";
     auto subphase_started = std::chrono::steady_clock::now();
     auto& layer_state = attention_state[layer];
-    std::copy(kv.begin(), kv.end(),
-              layer_state.sliding.begin() +
-                  static_cast<std::size_t>(position % kWindow) * kHeadDim);
+    if (kv_cache != nullptr) {
+        result = kv_cache->append(active_sequence,
+                                  Dsv4KvBlockKind::Sliding, layer,
+                                  1U, position, kv);
+        if (!result.ok()) return result;
+    } else {
+        std::copy(kv.begin(), kv.end(),
+                  layer_state.sliding.begin() +
+                      static_cast<std::size_t>(position % kWindow) * kHeadDim);
+    }
     result = compressor(layer, input, position);
     if (!result.ok()) return result;
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
@@ -1449,6 +1579,29 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         : compressed_count;
     const auto score_stride = static_cast<std::size_t>(window_count) +
                               attended_compressed_count;
+    std::vector<std::span<const float>> block_rows;
+    if (kv_cache != nullptr) {
+        block_rows.reserve(score_stride);
+        for (std::uint32_t item = 0U; item < window_count; ++item) {
+            const auto absolute = position + 1U - window_count + item;
+            auto row = kv_row(layer, Dsv4KvBlockKind::Sliding, absolute);
+            if (!row.ok()) {
+                append_errors(result, std::move(row.errors));
+                return result;
+            }
+            block_rows.push_back(row.value);
+        }
+        for (std::uint32_t item = 0U; item < attended_compressed_count; ++item) {
+            const auto cache_row = use_sparse_indexer
+                ? indexed_positions[item] : item;
+            auto row = kv_row(layer, layer_state.compressor.kind, cache_row);
+            if (!row.ok()) {
+                append_errors(result, std::move(row.errors));
+                return result;
+            }
+            block_rows.push_back(row.value);
+        }
+    }
     const bool use_cuda_attention = should_dispatch_flash_attention_cuda(
         config.enable_flash_attention, score_stride,
         config.flash_attention_minimum_rows);
@@ -1461,20 +1614,29 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
             sliding_rows[item] = absolute % kWindow;
         }
         std::vector<FlashAttentionSegment> segments;
-        segments.reserve(static_cast<std::size_t>(attended_compressed_count) + 1U);
-        if (window_count != 0U) {
-            segments.push_back({layer_state.sliding, {}, sliding_rows});
-        }
-        for (std::uint32_t item = 0U; item < attended_compressed_count; ++item) {
-            const auto cache_row = use_sparse_indexer
-                ? indexed_positions[item] : item;
-            const auto row = layer_state.compressor.compressed.row(cache_row);
-            if (row.size() != kHeadDim) {
-                result.errors.emplace_back(
-                    "DeepSeek FlashAttention compressed row is unavailable");
-                return result;
+        if (kv_cache != nullptr) {
+            segments.reserve(block_rows.size());
+            for (const auto row : block_rows) {
+                segments.push_back({row, {}, {}});
             }
-            segments.push_back({row, {}, {}});
+        } else {
+            segments.reserve(
+                static_cast<std::size_t>(attended_compressed_count) + 1U);
+            if (window_count != 0U) {
+                segments.push_back({layer_state.sliding, {}, sliding_rows});
+            }
+            for (std::uint32_t item = 0U;
+                 item < attended_compressed_count; ++item) {
+                const auto cache_row = use_sparse_indexer
+                    ? indexed_positions[item] : item;
+                const auto row = layer_state.compressor.compressed.row(cache_row);
+                if (row.size() != kHeadDim) {
+                    result.errors.emplace_back(
+                        "DeepSeek FlashAttention compressed row is unavailable");
+                    return result;
+                }
+                segments.push_back({row, {}, {}});
+            }
         }
         FlashAttentionRequest request;
         request.queries = queries;
@@ -1520,8 +1682,11 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         float maximum = (*sink.value)[head];
         for (std::uint32_t item = 0U; item < window_count; ++item) {
             const auto absolute = position + 1U - window_count + item;
-            const auto key = std::span<const float>(layer_state.sliding).subspan(
-                static_cast<std::size_t>(absolute % kWindow) * kHeadDim, kHeadDim);
+            const auto key = kv_cache == nullptr
+                ? std::span<const float>(layer_state.sliding).subspan(
+                      static_cast<std::size_t>(absolute % kWindow) * kHeadDim,
+                      kHeadDim)
+                : block_rows[item];
             double dot = 0.0;
             for (std::uint32_t dimension = 0U; dimension < kHeadDim; ++dimension) {
                 dot += static_cast<double>(query[dimension]) * key[dimension];
@@ -1534,7 +1699,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
             const auto cache_row = use_sparse_indexer
                 ? indexed_positions[item]
                 : item;
-            const auto key = layer_state.compressor.compressed.row(cache_row);
+            const auto key = kv_cache == nullptr
+                ? layer_state.compressor.compressed.row(cache_row)
+                : block_rows[static_cast<std::size_t>(window_count) + item];
             double dot = 0.0;
             for (std::uint32_t dimension = 0U; dimension < kHeadDim; ++dimension) {
                 dot += static_cast<double>(query[dimension]) * key[dimension];
@@ -1553,8 +1720,11 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         std::size_t score_index = 0U;
         for (std::uint32_t item = 0U; item < window_count; ++item) {
             const auto absolute = position + 1U - window_count + item;
-            const auto value = std::span<const float>(layer_state.sliding).subspan(
-                static_cast<std::size_t>(absolute % kWindow) * kHeadDim, kHeadDim);
+            const auto value = kv_cache == nullptr
+                ? std::span<const float>(layer_state.sliding).subspan(
+                      static_cast<std::size_t>(absolute % kWindow) * kHeadDim,
+                      kHeadDim)
+                : block_rows[item];
             const float probability = static_cast<float>(
                 std::exp(static_cast<double>(scores[score_index++] - maximum)) /
                 denominator);
@@ -1566,7 +1736,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
             const auto cache_row = use_sparse_indexer
                 ? indexed_positions[item]
                 : item;
-            const auto value = layer_state.compressor.compressed.row(cache_row);
+            const auto value = kv_cache == nullptr
+                ? layer_state.compressor.compressed.row(cache_row)
+                : block_rows[static_cast<std::size_t>(window_count) + item];
             const float probability = static_cast<float>(
                 std::exp(static_cast<double>(scores[score_index++] - maximum)) /
                 denominator);
@@ -2517,6 +2689,18 @@ ValidationResult DeepSeekV4Runtime::initialize(
             std::to_string(model_context) + "] tokens");
         return result;
     }
+    if (config.kv_cache_mode == Dsv4KvCacheMode::Block &&
+        config.kv_block_rows == 0U) {
+        result.errors.emplace_back(
+            "DeepSeek KV block row count must be positive");
+        return result;
+    }
+    if (!config.device_kv_cache_bytes.empty() &&
+        config.device_kv_cache_bytes.size() != config.devices.size()) {
+        result.errors.emplace_back(
+            "DeepSeek KV device budget count must match the device count");
+        return result;
+    }
     if (config.prefill_page_tokens == 0U ||
         config.prefill_page_tokens > kMaximumPrefillPageTokens) {
         result.errors.emplace_back(
@@ -2583,10 +2767,24 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     auto capacities = std::move(device_plan.value.budgets);
     auto weight_capacities = std::move(device_plan.value.weight_capacities);
+    auto kv_device_capacities = config.device_kv_cache_bytes;
+    if (kv_device_capacities.empty()) {
+        kv_device_capacities.resize(config.devices.size());
+    }
+    for (std::size_t slot = 0U; slot < weight_capacities.size(); ++slot) {
+        if (kv_device_capacities[slot] >= weight_capacities[slot]) {
+            result.errors.emplace_back(
+                "DeepSeek KV device budget leaves no weight-cache capacity");
+            return result;
+        }
+        weight_capacities[slot] -= kv_device_capacities[slot];
+    }
     const auto admission_started = std::chrono::steady_clock::now();
     Dsv4AdmissionConfig admission_config;
     admission_config.host_memory_ceiling_bytes = config.host_memory_limit_bytes;
     admission_config.vram_weight_budgets = capacities;
+    admission_config.host_kv_cache_bytes = config.host_kv_cache_bytes;
+    admission_config.device_kv_cache_bytes = kv_device_capacities;
     admission_config.maximum_context_tokens = config.maximum_context_tokens;
     admission_config.enable_dspark = config.enable_dspark;
     admission_config.require_zero_nvme_decode = config.require_zero_nvme_decode;
@@ -2616,6 +2814,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
             std::cerr << "[hardware] cuda=" << impl_->devices[slot]
                       << " vram_budget_bytes=" << capacities[slot]
                       << " weight_cache_bytes=" << weight_capacities[slot]
+                      << " kv_cache_bytes=" << kv_device_capacities[slot]
                       << " workspace_reserve_bytes=" << kDeviceWorkspaceReserve
                       << '\n';
         }
@@ -2628,6 +2827,24 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
         impl_->devices, weight_capacities);
+    if (config.kv_cache_mode == Dsv4KvCacheMode::Block) {
+        Dsv4KvCacheConfig kv_config;
+        kv_config.block_rows = config.kv_block_rows;
+        kv_config.sliding_window_rows = kWindow;
+        kv_config.host_capacity_bytes = impl_->memory.host_kv_cache_bytes;
+        kv_config.devices = config.devices;
+        kv_config.device_capacity_bytes = kv_device_capacities;
+        impl_->kv_cache = std::make_unique<Dsv4KvCache>(
+            std::move(kv_config), &impl_->cuda);
+        result = impl_->kv_cache->validate();
+        if (!result.ok()) return result;
+        auto sequence = impl_->kv_cache->create_sequence();
+        if (!sequence.ok()) {
+            result.errors = std::move(sequence.errors);
+            return result;
+        }
+        impl_->active_sequence = sequence.value;
+    }
     if (config.host_attention_threads != 0U) {
         impl_->attention_workers = std::make_unique<HostWorkerPool>(
             config.host_attention_threads);
@@ -2701,11 +2918,20 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.resident_stage = impl_->resident.stats();
     impl_->initialization_metrics.cuda = impl_->cuda.stats();
     impl_->initialization_metrics.cache = impl_->weights->stats();
+    if (impl_->kv_cache != nullptr) {
+        impl_->initialization_metrics.kv_cache = impl_->kv_cache->stats();
+    }
+    impl_->initialization_metrics.rss_bytes = resident_set_bytes();
+    impl_->initialization_metrics.device_vram_used_bytes =
+        device_vram_used_bytes(impl_->devices);
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
     impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
     impl_->initialization_metrics.resident_warmup_overlapped =
         config.overlap_resident_warmup;
+    impl_->initialization_metrics.block_kv_cache_enabled =
+        config.kv_cache_mode == Dsv4KvCacheMode::Block;
+    impl_->initialization_metrics.kv_block_rows = config.kv_block_rows;
     impl_->initialization_metrics.host_attention_threads =
         config.host_attention_threads;
     impl_->initialization_metrics.prefill_page_tokens =
@@ -2779,6 +3005,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
+    const auto kv_cache_before = impl_->kv_cache == nullptr
+        ? Dsv4KvCacheStats{} : impl_->kv_cache->stats();
     const auto device_moe_before = impl_->device_moe_stats;
     const auto graph_before = impl_->graph_stats;
     const auto prefill_started = std::chrono::steady_clock::now();
@@ -2793,6 +3021,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto reads_after_prefill = impl_->checkpoint->stats();
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
+    const auto kv_cache_after_prefill = impl_->kv_cache == nullptr
+        ? Dsv4KvCacheStats{} : impl_->kv_cache->stats();
     const auto device_moe_after_prefill = impl_->device_moe_stats;
     const auto graph_after_prefill = impl_->graph_stats;
     constexpr std::uint32_t stop_token = 1U;
@@ -2839,6 +3069,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto reads_after_decode = impl_->checkpoint->stats();
     const auto cuda_after_decode = impl_->cuda.stats();
     const auto cache_after_decode = impl_->weights->stats();
+    const auto kv_cache_after_decode = impl_->kv_cache == nullptr
+        ? Dsv4KvCacheStats{} : impl_->kv_cache->stats();
     const auto device_moe_after_decode = impl_->device_moe_stats;
     const auto graph_after_decode = impl_->graph_stats;
     const double prefill_seconds = result.metrics.prefill_seconds;
@@ -2848,12 +3080,16 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     result.metrics.decode_seconds = decode_seconds;
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
     result.metrics.decode_tokens = decode_steps;
+    result.metrics.rss_bytes = resident_set_bytes();
+    result.metrics.device_vram_used_bytes =
+        device_vram_used_bytes(impl_->devices);
     result.metrics.generation_checkpoint_reads = read_delta(reads_after_decode,
                                                              reads_before);
     result.metrics.decode_checkpoint_reads = read_delta(reads_after_decode,
                                                          reads_after_prefill);
     result.metrics.cuda = impl_->cuda.stats();
     result.metrics.cache = impl_->weights->stats();
+    result.metrics.kv_cache = kv_cache_after_decode;
     result.metrics.device_moe = device_moe_delta(
         device_moe_after_decode, device_moe_before);
     result.metrics.graph = graph_delta(graph_after_decode, graph_before);
@@ -2861,6 +3097,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
                                                          reads_before);
     result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
     result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
+    result.metrics.prefill.kv_cache = kv_cache_delta(
+        kv_cache_after_prefill, kv_cache_before);
     result.metrics.prefill.device_moe = device_moe_delta(
         device_moe_after_prefill, device_moe_before);
     result.metrics.prefill.graph = graph_delta(graph_after_prefill, graph_before);
@@ -2868,6 +3106,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
                                                         reads_after_prefill);
     result.metrics.decode.cuda = cuda_delta(cuda_after_decode, cuda_after_prefill);
     result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
+    result.metrics.decode.kv_cache = kv_cache_delta(
+        kv_cache_after_decode, kv_cache_after_prefill);
     result.metrics.decode.device_moe = device_moe_delta(
         device_moe_after_decode, device_moe_after_prefill);
     result.metrics.decode.graph = graph_delta(

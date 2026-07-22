@@ -14,6 +14,7 @@ struct Dsv4AdmissionConfig {
     std::vector<std::uint64_t> device_kv_cache_bytes;
     std::uint32_t maximum_context_tokens{2048U};
     bool enable_dspark{};
+    bool compact_kv_cache{};
     bool require_zero_nvme_decode{true};
 };
 
@@ -22,6 +23,9 @@ struct Dsv4MemoryPlan {
     std::uint64_t host_parameter_bytes{};
     std::uint64_t kv_state_bytes{};
     std::uint64_t index_state_bytes{};
+    std::uint64_t kv_cache_payload_bytes{};
+    std::uint64_t kv_cache_metadata_bytes{};
+    std::uint64_t kv_cache_alignment_bytes{};
     std::uint64_t host_kv_cache_bytes{};
     std::uint64_t device_kv_cache_bytes{};
     std::vector<std::uint64_t> per_device_kv_cache_bytes;

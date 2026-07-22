@@ -1,9 +1,14 @@
 #include "strata/deepseek_kv_cache.hpp"
 
+#include "strata/deepseek_ops.hpp"
 #include "strata/model_adapter.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <unordered_map>
@@ -13,6 +18,29 @@
 namespace strata {
 
 namespace {
+
+constexpr std::uint32_t kBlockMagic = 0x344B'5653U;
+constexpr std::uint16_t kBlockHeaderBytes = kDsv4KvBlockHeaderBytes;
+constexpr std::uint64_t kBlockAlignment = 64U;
+
+struct BlockHeader {
+    std::uint32_t magic{};
+    std::uint16_t version{};
+    std::uint16_t header_bytes{};
+    std::uint8_t format{};
+    std::uint8_t kind{};
+    std::uint16_t reserved0{};
+    std::uint32_t row_width{};
+    std::uint32_t capacity_rows{};
+    std::uint32_t layer{};
+    std::uint32_t compression_ratio{};
+    std::uint32_t reserved1{};
+    std::uint64_t payload_bytes{};
+    std::uint64_t physical_bytes{};
+    std::array<std::byte, 16> reserved2{};
+};
+
+static_assert(sizeof(BlockHeader) == kBlockHeaderBytes);
 
 struct TableKey {
     Dsv4KvBlockKind kind{Dsv4KvBlockKind::Sliding};
@@ -44,7 +72,281 @@ struct TableKeyHash {
         : kDeepSeekV4ExecutionContract.head_dim;
 }
 
+[[nodiscard]] std::uint16_t encode_bf16(float value) noexcept {
+    auto bits = std::bit_cast<std::uint32_t>(value);
+    if ((bits & 0x7F80'0000U) != 0x7F80'0000U) {
+        bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    }
+    return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+[[nodiscard]] float decode_bf16(std::uint16_t value) noexcept {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
+}
+
+[[nodiscard]] bool scale_code(float maximum, float format_max,
+                              int minimum_exponent,
+                              std::uint8_t& encoded) noexcept {
+    const float bounded = maximum == 0.0F
+        ? std::ldexp(format_max, minimum_exponent) : maximum;
+    const int exponent = static_cast<int>(
+        std::ceil(std::log2(bounded / format_max)));
+    if (exponent < -127 || exponent > 127) return false;
+    encoded = static_cast<std::uint8_t>(exponent + 127);
+    return encoded != 0xFFU;
+}
+
+[[nodiscard]] bool encode_fp8_exact(float value,
+                                    std::uint8_t& encoded) noexcept {
+    static const auto magnitudes = [] {
+        std::array<float, 127> values{};
+        for (std::size_t code = 0U; code < values.size(); ++code) {
+            values[code] = dsv4_fp8_e4m3_f32(
+                static_cast<std::uint8_t>(code));
+        }
+        return values;
+    }();
+    const float magnitude = std::abs(value);
+    const auto found = std::lower_bound(
+        magnitudes.begin(), magnitudes.end(), magnitude);
+    if (found == magnitudes.end() || *found != magnitude) return false;
+    encoded = static_cast<std::uint8_t>(found - magnitudes.begin());
+    if (std::signbit(value)) encoded |= 0x80U;
+    return true;
+}
+
+[[nodiscard]] bool encode_fp4_exact(float value,
+                                    std::uint8_t& encoded) noexcept {
+    constexpr std::array<float, 8> magnitudes{
+        0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    const auto found = std::lower_bound(
+        magnitudes.begin(), magnitudes.end(), std::abs(value));
+    if (found == magnitudes.end() || *found != std::abs(value)) return false;
+    encoded = static_cast<std::uint8_t>(found - magnitudes.begin());
+    if (std::signbit(value)) encoded |= 0x08U;
+    return true;
+}
+
+[[nodiscard]] std::uint64_t align_block(std::uint64_t bytes) noexcept {
+    if (bytes > std::numeric_limits<std::uint64_t>::max() -
+                    (kBlockAlignment - 1U)) {
+        return 0U;
+    }
+    return (bytes + kBlockAlignment - 1U) & ~(kBlockAlignment - 1U);
+}
+
 }  // namespace
+
+Dsv4KvFormat dsv4_kv_format(Dsv4KvBlockKind kind,
+                            bool f32_oracle) noexcept {
+    if (f32_oracle) return Dsv4KvFormat::F32;
+    return kind == Dsv4KvBlockKind::LearnedIndex
+        ? Dsv4KvFormat::Fp4E2m1Group32
+        : Dsv4KvFormat::Fp8E4m3Group64Bf16Rope;
+}
+
+std::uint64_t dsv4_kv_row_bytes(Dsv4KvBlockKind kind,
+                                Dsv4KvFormat format) noexcept {
+    const auto width = static_cast<std::uint64_t>(required_width(kind));
+    if (format == Dsv4KvFormat::F32) return width * sizeof(float);
+    if (format == Dsv4KvFormat::Fp8E4m3Group64Bf16Rope &&
+        kind != Dsv4KvBlockKind::LearnedIndex) {
+        constexpr std::uint64_t rope =
+            kDeepSeekV4ExecutionContract.rope_head_dim;
+        const auto nope = width - rope;
+        return nope + nope / 64U + rope * sizeof(std::uint16_t);
+    }
+    if (format == Dsv4KvFormat::Fp4E2m1Group32 &&
+        kind == Dsv4KvBlockKind::LearnedIndex) {
+        return width / 2U + width / 32U;
+    }
+    return 0U;
+}
+
+std::uint64_t dsv4_kv_block_bytes(Dsv4KvBlockKind kind,
+                                  Dsv4KvFormat format,
+                                  std::uint32_t capacity_rows) noexcept {
+    const auto row_bytes = dsv4_kv_row_bytes(kind, format);
+    if (row_bytes == 0U || capacity_rows == 0U ||
+        row_bytes > (std::numeric_limits<std::uint64_t>::max() -
+                     kBlockHeaderBytes) / capacity_rows) {
+        return 0U;
+    }
+    return align_block(kBlockHeaderBytes +
+                       row_bytes * static_cast<std::uint64_t>(capacity_rows));
+}
+
+ValidationResult dsv4_encode_kv_row(
+    Dsv4KvBlockKind kind, Dsv4KvFormat format,
+    std::span<const float> values, std::span<std::byte> output) {
+    ValidationResult result;
+    const auto expected = dsv4_kv_row_bytes(kind, format);
+    if (expected == 0U || values.size() != required_width(kind) ||
+        output.size() != expected ||
+        std::any_of(values.begin(), values.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek KV encode format, shape, or values are invalid");
+        return result;
+    }
+    if (format == Dsv4KvFormat::F32) {
+        std::memcpy(output.data(), values.data(), output.size());
+        return result;
+    }
+    if (format == Dsv4KvFormat::Fp8E4m3Group64Bf16Rope) {
+        constexpr std::size_t rope =
+            kDeepSeekV4ExecutionContract.rope_head_dim;
+        const auto nope = values.size() - rope;
+        const auto groups = nope / 64U;
+        for (std::size_t group = 0U; group < groups; ++group) {
+            const auto input = values.subspan(group * 64U, 64U);
+            float maximum = 0.0F;
+            for (const float value : input) {
+                maximum = std::max(maximum, std::abs(value));
+            }
+            std::uint8_t scale_encoded = 0U;
+            if (!scale_code(maximum, 448.0F, 0, scale_encoded)) {
+                result.errors.emplace_back(
+                    "DeepSeek KV FP8 scale is outside E8M0 range");
+                return result;
+            }
+            const float scale = dsv4_fp8_e8m0_scale_f32(scale_encoded);
+            output[nope + group] = static_cast<std::byte>(scale_encoded);
+            for (std::size_t column = 0U; column < input.size(); ++column) {
+                std::uint8_t encoded = 0U;
+                if (!encode_fp8_exact(input[column] / scale, encoded) ||
+                    decode_bf16(encode_bf16(
+                        dsv4_fp8_e4m3_f32(encoded) * scale)) != input[column]) {
+                    result.errors.emplace_back(
+                        "DeepSeek KV FP8 storage would change a cache value");
+                    return result;
+                }
+                output[group * 64U + column] = static_cast<std::byte>(encoded);
+            }
+        }
+        const auto bf16_offset = nope + groups;
+        for (std::size_t column = 0U; column < rope; ++column) {
+            const auto encoded = encode_bf16(values[nope + column]);
+            if (decode_bf16(encoded) != values[nope + column]) {
+                result.errors.emplace_back(
+                    "DeepSeek KV BF16 storage would change a RoPE value");
+                return result;
+            }
+            std::memcpy(output.data() + bf16_offset +
+                            column * sizeof(encoded),
+                        &encoded, sizeof(encoded));
+        }
+        return result;
+    }
+
+    const auto packed = values.size() / 2U;
+    const auto groups = values.size() / 32U;
+    for (std::size_t group = 0U; group < groups; ++group) {
+        const auto input = values.subspan(group * 32U, 32U);
+        float maximum = 0.0F;
+        for (const float value : input) {
+            maximum = std::max(maximum, std::abs(value));
+        }
+        std::uint8_t scale_encoded = 0U;
+        if (!scale_code(maximum, 6.0F, -126, scale_encoded)) {
+            result.errors.emplace_back(
+                "DeepSeek index FP4 scale is outside E8M0 range");
+            return result;
+        }
+        const float scale = dsv4_fp8_e8m0_scale_f32(scale_encoded);
+        output[packed + group] = static_cast<std::byte>(scale_encoded);
+        for (std::size_t column = 0U; column < input.size(); column += 2U) {
+            std::uint8_t low = 0U;
+            std::uint8_t high = 0U;
+            if (!encode_fp4_exact(input[column] / scale, low) ||
+                !encode_fp4_exact(input[column + 1U] / scale, high) ||
+                decode_bf16(encode_bf16(dsv4_fp4_e2m1_f32(low) * scale)) !=
+                    input[column] ||
+                decode_bf16(encode_bf16(dsv4_fp4_e2m1_f32(high) * scale)) !=
+                    input[column + 1U]) {
+                result.errors.emplace_back(
+                    "DeepSeek index FP4 storage would change a cache value");
+                return result;
+            }
+            output[group * 16U + column / 2U] =
+                static_cast<std::byte>(low | (high << 4U));
+        }
+    }
+    return result;
+}
+
+ValidationResult dsv4_decode_kv_row(
+    Dsv4KvBlockKind kind, Dsv4KvFormat format,
+    std::span<const std::byte> encoded, std::span<float> output) {
+    ValidationResult result;
+    const auto expected = dsv4_kv_row_bytes(kind, format);
+    if (expected == 0U || encoded.size() != expected ||
+        output.size() != required_width(kind)) {
+        result.errors.emplace_back(
+            "DeepSeek KV decode format or shape is invalid");
+        return result;
+    }
+    if (format == Dsv4KvFormat::F32) {
+        std::memcpy(output.data(), encoded.data(), encoded.size());
+    } else if (format == Dsv4KvFormat::Fp8E4m3Group64Bf16Rope) {
+        constexpr std::size_t rope =
+            kDeepSeekV4ExecutionContract.rope_head_dim;
+        const auto nope = output.size() - rope;
+        const auto groups = nope / 64U;
+        for (std::size_t group = 0U; group < groups; ++group) {
+            const auto scale_encoded = std::to_integer<std::uint8_t>(
+                encoded[nope + group]);
+            if (scale_encoded == 0xFFU) {
+                result.errors.emplace_back("DeepSeek KV FP8 scale is corrupt");
+                return result;
+            }
+            const float scale = dsv4_fp8_e8m0_scale_f32(scale_encoded);
+            for (std::size_t column = 0U; column < 64U; ++column) {
+                const auto value_encoded = std::to_integer<std::uint8_t>(
+                    encoded[group * 64U + column]);
+                if ((value_encoded & 0x7FU) == 0x7FU) {
+                    result.errors.emplace_back("DeepSeek KV FP8 value is corrupt");
+                    return result;
+                }
+                output[group * 64U + column] = decode_bf16(encode_bf16(
+                    dsv4_fp8_e4m3_f32(value_encoded) * scale));
+            }
+        }
+        const auto bf16_offset = nope + groups;
+        for (std::size_t column = 0U; column < rope; ++column) {
+            std::uint16_t value = 0U;
+            std::memcpy(&value, encoded.data() + bf16_offset +
+                                    column * sizeof(value),
+                        sizeof(value));
+            output[nope + column] = decode_bf16(value);
+        }
+    } else {
+        const auto packed = output.size() / 2U;
+        const auto groups = output.size() / 32U;
+        for (std::size_t group = 0U; group < groups; ++group) {
+            const auto scale_encoded = std::to_integer<std::uint8_t>(
+                encoded[packed + group]);
+            if (scale_encoded == 0xFFU) {
+                result.errors.emplace_back("DeepSeek index FP4 scale is corrupt");
+                return result;
+            }
+            const float scale = dsv4_fp8_e8m0_scale_f32(scale_encoded);
+            for (std::size_t column = 0U; column < 32U; column += 2U) {
+                const auto values = std::to_integer<std::uint8_t>(
+                    encoded[group * 16U + column / 2U]);
+                output[group * 32U + column] = decode_bf16(encode_bf16(
+                    dsv4_fp4_e2m1_f32(values) * scale));
+                output[group * 32U + column + 1U] = decode_bf16(encode_bf16(
+                    dsv4_fp4_e2m1_f32(values >> 4U) * scale));
+            }
+        }
+    }
+    if (std::any_of(output.begin(), output.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back("DeepSeek KV decoded values are corrupt");
+    }
+    return result;
+}
 
 struct Dsv4KvCacheState {
     struct Table {
@@ -61,7 +363,7 @@ struct Dsv4KvCacheState {
 
     struct Block {
         Dsv4KvBlockInfo info;
-        std::vector<float> host;
+        std::vector<std::byte> host;
         std::vector<CudaBuffer> devices;
         std::vector<std::uint64_t> device_last_use;
         std::vector<std::uint32_t> device_leases;
@@ -117,6 +419,44 @@ struct Dsv4KvCacheState {
         return total;
     }
 
+    [[nodiscard]] ValidationResult validate_block(const Block& block) const {
+        ValidationResult result;
+        if (block.host.size() < sizeof(BlockHeader)) {
+            result.errors.emplace_back("DeepSeek KV block header is truncated");
+            return result;
+        }
+        BlockHeader header;
+        std::memcpy(&header, block.host.data(), sizeof(header));
+        const auto row_bytes = dsv4_kv_row_bytes(block.info.kind,
+                                                 block.info.format);
+        const auto physical = dsv4_kv_block_bytes(
+            block.info.kind, block.info.format, block.info.capacity_rows);
+        if (header.magic != kBlockMagic ||
+            header.version != kDsv4KvFormatVersion ||
+            header.header_bytes != kBlockHeaderBytes ||
+            header.format != static_cast<std::uint8_t>(block.info.format) ||
+            header.kind != static_cast<std::uint8_t>(block.info.kind) ||
+            header.row_width != block.info.row_width ||
+            header.capacity_rows != block.info.capacity_rows ||
+            header.layer != block.info.layer ||
+            header.compression_ratio != block.info.compression_ratio ||
+            header.payload_bytes != block.info.payload_bytes ||
+            header.physical_bytes != block.info.physical_bytes ||
+            block.info.format_version != kDsv4KvFormatVersion ||
+            block.info.used_rows > block.info.capacity_rows ||
+            row_bytes == 0U || physical == 0U ||
+            block.info.payload_bytes !=
+                row_bytes * block.info.capacity_rows ||
+            block.info.physical_bytes != physical ||
+            block.host.size() != physical ||
+            std::any_of(header.reserved2.begin(), header.reserved2.end(),
+                        [](std::byte value) { return value != std::byte{}; })) {
+            result.errors.emplace_back(
+                "DeepSeek KV block format version or shape is corrupt");
+        }
+        return result;
+    }
+
     void erase_block(std::uint64_t id) noexcept {
         const auto found = blocks.find(id);
         if (found == blocks.end() || found->second.info.refcount != 0U ||
@@ -124,8 +464,7 @@ struct Dsv4KvCacheState {
             return;
         }
         auto& block = found->second;
-        const auto bytes = static_cast<std::uint64_t>(block.host.size()) *
-                           sizeof(float);
+        const auto bytes = static_cast<std::uint64_t>(block.host.size());
         metrics.host_used_bytes -= bytes;
         for (std::size_t slot = 0U; slot < block.devices.size(); ++slot) {
             if (block.devices[slot].valid()) {
@@ -158,12 +497,15 @@ struct Dsv4KvCacheState {
         const Block* source, std::uint64_t& output) {
         ValidationResult result;
         const auto width = required_width(kind);
-        const auto elements = static_cast<std::uint64_t>(config.block_rows) * width;
-        if (elements > std::numeric_limits<std::uint64_t>::max() / sizeof(float)) {
+        const auto format = dsv4_kv_format(kind, config.f32_oracle);
+        const auto row_bytes = dsv4_kv_row_bytes(kind, format);
+        const auto payload_bytes = row_bytes * config.block_rows;
+        const auto bytes = dsv4_kv_block_bytes(kind, format, config.block_rows);
+        if (row_bytes == 0U || bytes == 0U ||
+            payload_bytes / config.block_rows != row_bytes) {
             result.errors.emplace_back("DeepSeek KV block byte count overflows");
             return result;
         }
-        const auto bytes = elements * sizeof(float);
         if (bytes > config.host_capacity_bytes -
                         std::min(config.host_capacity_bytes,
                                  metrics.host_used_bytes)) {
@@ -189,8 +531,24 @@ struct Dsv4KvCacheState {
             block.info.compression_ratio = ratio;
             block.info.refcount = 1U;
             block.info.kind = kind;
-            block.info.format = Dsv4KvFormat::F32;
-            block.host.resize(static_cast<std::size_t>(elements));
+            block.info.format = format;
+            block.info.format_version = kDsv4KvFormatVersion;
+            block.info.payload_bytes = payload_bytes;
+            block.info.physical_bytes = bytes;
+            block.host.resize(static_cast<std::size_t>(bytes));
+            BlockHeader header;
+            header.magic = kBlockMagic;
+            header.version = kDsv4KvFormatVersion;
+            header.header_bytes = kBlockHeaderBytes;
+            header.format = static_cast<std::uint8_t>(format);
+            header.kind = static_cast<std::uint8_t>(kind);
+            header.row_width = width;
+            header.capacity_rows = config.block_rows;
+            header.layer = layer;
+            header.compression_ratio = ratio;
+            header.payload_bytes = payload_bytes;
+            header.physical_bytes = bytes;
+            std::memcpy(block.host.data(), &header, sizeof(header));
             if (source != nullptr) block.host = source->host;
             block.devices.resize(config.devices.size());
             block.device_last_use.resize(config.devices.size());
@@ -475,6 +833,15 @@ ValidationResult Dsv4KvCache::append(
             "DeepSeek KV block kind, layer, ratio, or row width is invalid");
         return result;
     }
+    std::array<std::byte,
+               kDeepSeekV4ExecutionContract.head_dim * sizeof(float)>
+        encoded_storage{};
+    const auto encoded = std::span<std::byte>(encoded_storage).first(
+        static_cast<std::size_t>(dsv4_kv_row_bytes(
+            kind, dsv4_kv_format(kind, state_->config.f32_oracle))));
+    result = dsv4_encode_kv_row(
+        kind, dsv4_kv_format(kind, state_->config.f32_oracle), values, encoded);
+    if (!result.ok()) return result;
     if (logical_row == std::numeric_limits<std::uint64_t>::max() ||
         logical_row + 1U > std::numeric_limits<std::uint64_t>::max() /
                                compression_ratio) {
@@ -537,9 +904,12 @@ ValidationResult Dsv4KvCache::append(
         }
         block = &state_->blocks.at(id);
     }
-    const auto offset = static_cast<std::size_t>(logical_row - block_begin) * width;
-    std::copy(values.begin(), values.end(), block->host.begin() + offset);
-    state_->metrics.host_write_bytes += values.size_bytes();
+    result = state_->validate_block(*block);
+    if (!result.ok()) return result;
+    const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
+        static_cast<std::size_t>(logical_row - block_begin) * encoded.size();
+    std::copy(encoded.begin(), encoded.end(), block->host.begin() + offset);
+    state_->metrics.host_write_bytes += encoded.size();
     block->info.used_rows = std::max(
         block->info.used_rows,
         static_cast<std::uint32_t>(logical_row - block_begin + 1U));
@@ -561,10 +931,10 @@ ValidationResult Dsv4KvCache::append(
     return result;
 }
 
-ParseResult<std::span<const float>> Dsv4KvCache::row(
+ParseResult<std::vector<float>> Dsv4KvCache::row(
     Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
     std::uint32_t layer, std::uint64_t logical_row) {
-    ParseResult<std::span<const float>> result;
+    ParseResult<std::vector<float>> result;
     auto* target = state_->sequence(sequence);
     if (target == nullptr) {
         result.errors.emplace_back("DeepSeek KV sequence does not exist");
@@ -585,14 +955,35 @@ ParseResult<std::span<const float>> Dsv4KvCache::row(
         ++state_->metrics.misses;
         return result;
     }
+    result.errors = state_->validate_block(*block).errors;
+    if (!result.ok()) {
+        ++state_->metrics.misses;
+        return result;
+    }
     const auto block_begin = block->info.logical_begin /
                              block->info.compression_ratio;
-    const auto offset = static_cast<std::size_t>(logical_row - block_begin) *
-                        block->info.row_width;
-    result.value = std::span<const float>(block->host).subspan(
-        offset, block->info.row_width);
+    const auto row_bytes = dsv4_kv_row_bytes(block->info.kind,
+                                             block->info.format);
+    const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
+        static_cast<std::size_t>(logical_row - block_begin) * row_bytes;
+    try {
+        result.value.resize(block->info.row_width);
+    } catch (const std::bad_alloc&) {
+        result.errors.emplace_back("cannot allocate DeepSeek KV decoded row");
+        ++state_->metrics.misses;
+        return result;
+    }
+    result.errors = dsv4_decode_kv_row(
+        block->info.kind, block->info.format,
+        std::span<const std::byte>(block->host).subspan(offset, row_bytes),
+        result.value).errors;
+    if (!result.ok()) {
+        result.value.clear();
+        ++state_->metrics.misses;
+        return result;
+    }
     ++state_->metrics.hits;
-    state_->metrics.gather_bytes += result.value.size_bytes();
+    state_->metrics.gather_bytes += row_bytes;
     return result;
 }
 
@@ -655,8 +1046,9 @@ ParseResult<Dsv4KvDeviceLease> Dsv4KvCache::acquire_device(
                 "DeepSeek KV device cache is not configured");
             return result;
         }
-        const auto bytes = static_cast<std::uint64_t>(block->host.size()) *
-                           sizeof(float);
+        result.errors = state_->validate_block(*block).errors;
+        if (!result.ok()) return result;
+        const auto bytes = static_cast<std::uint64_t>(block->host.size());
         const auto capacity = state_->config.device_capacity_bytes[device_slot];
         if (bytes > capacity) {
             result.errors.emplace_back(
@@ -693,7 +1085,7 @@ ParseResult<Dsv4KvDeviceLease> Dsv4KvCache::acquire_device(
         const auto promotion_started = std::chrono::steady_clock::now();
         const auto uploaded_result = state_->cuda->upload_buffer(
             state_->config.devices[device_slot],
-            std::as_bytes(std::span<const float>(block->host)), uploaded);
+            std::span<const std::byte>(block->host), uploaded);
         if (!uploaded_result.ok()) {
             result.errors = uploaded_result.errors;
             return result;

@@ -807,7 +807,7 @@ struct DeepSeekV4Runtime::Impl {
 
     ValidationResult warmup();
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
-    ParseResult<std::span<const float>> kv_row(
+    ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
         std::uint64_t logical_row);
     void reset_diagnostics();
@@ -1184,25 +1184,28 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     return result;
 }
 
-ParseResult<std::span<const float>> DeepSeekV4Runtime::Impl::kv_row(
+ParseResult<std::vector<float>> DeepSeekV4Runtime::Impl::kv_row(
     std::uint32_t layer, Dsv4KvBlockKind kind,
     std::uint64_t logical_row) {
     if (kv_cache != nullptr) {
         return kv_cache->row(active_sequence, kind, layer, logical_row);
     }
-    ParseResult<std::span<const float>> result;
+    ParseResult<std::vector<float>> result;
     const auto& state = attention_state[layer];
     if (kind == Dsv4KvBlockKind::Sliding) {
-        result.value = std::span<const float>(state.sliding).subspan(
+        const auto values = std::span<const float>(state.sliding).subspan(
             static_cast<std::size_t>(logical_row % kWindow) * kHeadDim,
             kHeadDim);
+        result.value.assign(values.begin(), values.end());
         return result;
     }
     const auto& compressed = kind == Dsv4KvBlockKind::LearnedIndex
         ? state.indexer_compressor.compressed : state.compressor.compressed;
-    result.value = compressed.row(logical_row);
-    if (result.value.empty()) {
+    const auto values = compressed.row(logical_row);
+    if (values.empty()) {
         result.errors.emplace_back("DeepSeek scalar KV row is unavailable");
+    } else {
+        result.value.assign(values.begin(), values.end());
     }
     return result;
 }
@@ -1401,21 +1404,7 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     for (auto& weight : index_weights) weight = round_bf16(weight * index_scale);
 
     std::vector<float> scores(compressed_count);
-    std::vector<std::span<const float>> block_keys;
-    if (kv_cache != nullptr) {
-        block_keys.reserve(compressed_count);
-        for (std::uint32_t row = 0U; row < compressed_count; ++row) {
-            auto key = kv_row(layer, Dsv4KvBlockKind::LearnedIndex, row);
-            if (!key.ok()) {
-                append_errors(result, std::move(key.errors));
-                return result;
-            }
-            block_keys.push_back(key.value);
-        }
-    }
-    const auto score_row = [&](std::size_t row) {
-        const auto key = kv_cache == nullptr
-            ? state.compressed.row(row) : block_keys[row];
+    const auto score_key = [&](std::size_t row, std::span<const float> key) {
         if (key.size() != kIndexHeadDim) {
             scores[row] = -std::numeric_limits<float>::infinity();
             return;
@@ -1426,7 +1415,19 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
             kIndexHeadDim);
         if (!scored.ok()) scores[row] = -std::numeric_limits<float>::infinity();
     };
-    if (attention_workers != nullptr && attention_workers->size() > 1U) {
+    const auto score_row = [&](std::size_t row) {
+        score_key(row, state.compressed.row(row));
+    };
+    if (kv_cache != nullptr) {
+        for (std::uint32_t row = 0U; row < compressed_count; ++row) {
+            auto key = kv_row(layer, Dsv4KvBlockKind::LearnedIndex, row);
+            if (!key.ok()) {
+                append_errors(result, std::move(key.errors));
+                return result;
+            }
+            score_key(row, key.value);
+        }
+    } else if (attention_workers != nullptr && attention_workers->size() > 1U) {
         const auto workers = std::min<std::size_t>(
             attention_workers->size(), compressed_count);
         result = attention_workers->parallel_for(
@@ -1579,7 +1580,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         : compressed_count;
     const auto score_stride = static_cast<std::size_t>(window_count) +
                               attended_compressed_count;
-    std::vector<std::span<const float>> block_rows;
+    std::vector<std::vector<float>> block_rows;
     if (kv_cache != nullptr) {
         block_rows.reserve(score_stride);
         for (std::uint32_t item = 0U; item < window_count; ++item) {
@@ -1589,7 +1590,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                 append_errors(result, std::move(row.errors));
                 return result;
             }
-            block_rows.push_back(row.value);
+            block_rows.push_back(std::move(row.value));
         }
         for (std::uint32_t item = 0U; item < attended_compressed_count; ++item) {
             const auto cache_row = use_sparse_indexer
@@ -1599,7 +1600,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                 append_errors(result, std::move(row.errors));
                 return result;
             }
-            block_rows.push_back(row.value);
+            block_rows.push_back(std::move(row.value));
         }
     }
     const bool use_cuda_attention = should_dispatch_flash_attention_cuda(
@@ -1616,8 +1617,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         std::vector<FlashAttentionSegment> segments;
         if (kv_cache != nullptr) {
             segments.reserve(block_rows.size());
-            for (const auto row : block_rows) {
-                segments.push_back({row, {}, {}});
+            for (const auto& row : block_rows) {
+                segments.push_back({std::span<const float>(row), {}, {}});
             }
         } else {
             segments.reserve(
@@ -1686,7 +1687,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                 ? std::span<const float>(layer_state.sliding).subspan(
                       static_cast<std::size_t>(absolute % kWindow) * kHeadDim,
                       kHeadDim)
-                : block_rows[item];
+                : std::span<const float>(block_rows[item]);
             double dot = 0.0;
             for (std::uint32_t dimension = 0U; dimension < kHeadDim; ++dimension) {
                 dot += static_cast<double>(query[dimension]) * key[dimension];
@@ -1701,7 +1702,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                 : item;
             const auto key = kv_cache == nullptr
                 ? layer_state.compressor.compressed.row(cache_row)
-                : block_rows[static_cast<std::size_t>(window_count) + item];
+                : std::span<const float>(
+                      block_rows[static_cast<std::size_t>(window_count) + item]);
             double dot = 0.0;
             for (std::uint32_t dimension = 0U; dimension < kHeadDim; ++dimension) {
                 dot += static_cast<double>(query[dimension]) * key[dimension];
@@ -1724,7 +1726,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                 ? std::span<const float>(layer_state.sliding).subspan(
                       static_cast<std::size_t>(absolute % kWindow) * kHeadDim,
                       kHeadDim)
-                : block_rows[item];
+                : std::span<const float>(block_rows[item]);
             const float probability = static_cast<float>(
                 std::exp(static_cast<double>(scores[score_index++] - maximum)) /
                 denominator);
@@ -1738,7 +1740,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                 : item;
             const auto value = kv_cache == nullptr
                 ? layer_state.compressor.compressed.row(cache_row)
-                : block_rows[static_cast<std::size_t>(window_count) + item];
+                : std::span<const float>(
+                      block_rows[static_cast<std::size_t>(window_count) + item]);
             const float probability = static_cast<float>(
                 std::exp(static_cast<double>(scores[score_index++] - maximum)) /
                 denominator);
@@ -2787,6 +2790,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     admission_config.device_kv_cache_bytes = kv_device_capacities;
     admission_config.maximum_context_tokens = config.maximum_context_tokens;
     admission_config.enable_dspark = config.enable_dspark;
+    admission_config.compact_kv_cache =
+        config.kv_cache_mode == Dsv4KvCacheMode::Block;
     admission_config.require_zero_nvme_decode = config.require_zero_nvme_decode;
     auto admission = plan_dsv4_resident_topology(checkpoint.value->manifest(),
                                                   admission_config);

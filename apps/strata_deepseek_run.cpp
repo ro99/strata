@@ -481,6 +481,9 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << ",\"host_parameter_bytes\":" << plan.host_parameter_bytes
            << ",\"kv_state_bytes\":" << plan.kv_state_bytes
            << ",\"index_state_bytes\":" << plan.index_state_bytes
+           << ",\"kv_cache_payload_bytes\":" << plan.kv_cache_payload_bytes
+           << ",\"kv_cache_metadata_bytes\":" << plan.kv_cache_metadata_bytes
+           << ",\"kv_cache_alignment_bytes\":" << plan.kv_cache_alignment_bytes
            << ",\"host_kv_cache_bytes\":" << plan.host_kv_cache_bytes
            << ",\"device_kv_cache_bytes\":" << plan.device_kv_cache_bytes
            << ",\"per_device_kv_cache_bytes\":";
@@ -676,6 +679,7 @@ int main(int argc, char** argv) {
         config.device_kv_cache_bytes = options.device_kv_cache_bytes;
         config.vram_weight_budgets = budgets;
         config.maximum_context_tokens = options.maximum_context_tokens;
+        config.compact_kv_cache = options.block_kv_cache;
         config.require_zero_nvme_decode = true;
         const auto admission = strata::plan_dsv4_resident_topology(
             checkpoint.value->manifest(), config);

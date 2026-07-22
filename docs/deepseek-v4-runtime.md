@@ -52,7 +52,8 @@ other declared FP8 linears retain native execution.
 - logical cache admission through the declared 1,048,576-token model limit;
 - an opt-in fixed-row block KV manager (`--block-kv-cache`) with distinct
   sliding, CSA, HCA, and learned-index tables; the scalar row/page path remains
-  selectable as the validation oracle;
+  selectable as the validation oracle; compact blocks preserve the target's
+  already-simulated FP8/BF16 KV and FP4 learned-index values exactly;
 - exact compressed-position membership through 2,048 tokens, followed by the
   target's learned top-512 selection in ratio-4 layers; ratio-128 layers retain
   their full heavily-compressed history;
@@ -76,6 +77,12 @@ use their own bounded allocator and cannot evict an in-flight lease. The staged
 weight arena
 becomes read-only. After warm-up, any checkpoint read during decode violates
 the zero-NVMe contract and fails the request.
+
+`--scalar-kv-cache` is the default F32-backed oracle. `--block-kv-cache` opts into
+versioned compact physical blocks: non-RoPE KV uses FP8 E4M3 with E8M0 scales,
+RoPE remains BF16, and learned-index rows use packed FP4 E2M1 with E8M0 scales.
+Every compact row must decode bit-identically to the existing oracle value; a
+row that would require additional rounding is rejected.
 
 The checkpoint's three DSpark stages, target-layer IDs, block size, noise token,
 Markov head, confidence head, and tensor layouts are validated. Optional DSpark

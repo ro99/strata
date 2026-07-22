@@ -1,10 +1,13 @@
 #include "test.hpp"
 
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/deepseek_ops.hpp"
 #include "strata/model_adapter.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <vector>
 
 namespace {
@@ -13,7 +16,97 @@ std::vector<float> row(std::size_t width, float value) {
     return std::vector<float>(width, value);
 }
 
+void require_bit_equal(std::span<const float> actual,
+                       std::span<const float> expected) {
+    REQUIRE(actual.size() == expected.size());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) ==
+                std::bit_cast<std::uint32_t>(expected[index]));
+    }
+}
+
 }  // namespace
+
+TEST_CASE("DeepSeek compact KV codecs are exact or reject the write") {
+    constexpr auto head_dim = strata::kDeepSeekV4ExecutionContract.head_dim;
+    constexpr auto rope_dim =
+        strata::kDeepSeekV4ExecutionContract.rope_head_dim;
+    std::vector<float> kv(head_dim);
+    for (std::size_t group = 0U; group < (head_dim - rope_dim) / 64U; ++group) {
+        const float scale = std::ldexp(1.0F, static_cast<int>(group) - 3);
+        for (std::size_t column = 0U; column < 64U; ++column) {
+            const auto code = column == 63U ? std::uint8_t{0x7EU}
+                : static_cast<std::uint8_t>(column + 1U);
+            kv[group * 64U + column] =
+                strata::dsv4_fp8_e4m3_f32(code) * scale;
+        }
+    }
+    for (std::size_t column = 0U; column < rope_dim; ++column) {
+        kv[head_dim - rope_dim + column] = std::ldexp(
+            static_cast<float>(static_cast<int>(column % 7U) - 3), -4);
+    }
+    const auto kv_format = strata::dsv4_kv_format(
+        strata::Dsv4KvBlockKind::Sliding);
+    std::vector<std::byte> encoded_kv(static_cast<std::size_t>(
+        strata::dsv4_kv_row_bytes(strata::Dsv4KvBlockKind::Sliding,
+                                  kv_format)));
+    REQUIRE(strata::dsv4_encode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, kv_format, kv, encoded_kv).ok());
+    std::vector<float> decoded_kv(head_dim);
+    REQUIRE(strata::dsv4_decode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, kv_format,
+        encoded_kv, decoded_kv).ok());
+    require_bit_equal(decoded_kv, kv);
+
+    auto lossy = kv;
+    lossy[0] = 1.1F;
+    REQUIRE(!strata::dsv4_encode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, kv_format,
+        lossy, encoded_kv).ok());
+    encoded_kv[head_dim - rope_dim] = std::byte{0xFFU};
+    REQUIRE(!strata::dsv4_decode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, kv_format,
+        encoded_kv, decoded_kv).ok());
+
+    constexpr auto index_dim =
+        strata::kDeepSeekV4ExecutionContract.index_head_dim;
+    std::vector<float> index(index_dim);
+    for (std::size_t group = 0U; group < index_dim / 32U; ++group) {
+        const float scale = std::ldexp(1.0F, static_cast<int>(group) - 2);
+        for (std::size_t column = 0U; column < 32U; ++column) {
+            const auto code = column == 31U ? std::uint8_t{7U}
+                : static_cast<std::uint8_t>(column % 8U);
+            index[group * 32U + column] =
+                strata::dsv4_fp4_e2m1_f32(code) * scale;
+        }
+    }
+    const auto index_format = strata::dsv4_kv_format(
+        strata::Dsv4KvBlockKind::LearnedIndex);
+    std::vector<std::byte> encoded_index(static_cast<std::size_t>(
+        strata::dsv4_kv_row_bytes(strata::Dsv4KvBlockKind::LearnedIndex,
+                                  index_format)));
+    REQUIRE(strata::dsv4_encode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex, index_format,
+        index, encoded_index).ok());
+    std::vector<float> decoded_index(index_dim);
+    REQUIRE(strata::dsv4_decode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex, index_format,
+        encoded_index, decoded_index).ok());
+    require_bit_equal(decoded_index, index);
+    encoded_index[index_dim / 2U] = std::byte{0xFFU};
+    REQUIRE(!strata::dsv4_decode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex, index_format,
+        encoded_index, decoded_index).ok());
+
+    std::vector<std::byte> oracle(kv.size() * sizeof(float));
+    REQUIRE(strata::dsv4_encode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, strata::Dsv4KvFormat::F32,
+        lossy, oracle).ok());
+    REQUIRE(strata::dsv4_decode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, strata::Dsv4KvFormat::F32,
+        oracle, decoded_kv).ok());
+    require_bit_equal(decoded_kv, lossy);
+}
 
 TEST_CASE("DeepSeek KV cache keeps typed block tables and masks stale rows") {
     strata::Dsv4KvCacheConfig config;
@@ -60,6 +153,14 @@ TEST_CASE("DeepSeek KV cache keeps typed block tables and masks stale rows") {
     REQUIRE(hca.value[0].compression_ratio == 128U);
     REQUIRE(learned.value[0].row_width ==
             strata::kDeepSeekV4ExecutionContract.index_head_dim);
+    REQUIRE(csa.value[0].format ==
+            strata::Dsv4KvFormat::Fp8E4m3Group64Bf16Rope);
+    REQUIRE(hca.value[0].format ==
+            strata::Dsv4KvFormat::Fp8E4m3Group64Bf16Rope);
+    REQUIRE(learned.value[0].format ==
+            strata::Dsv4KvFormat::Fp4E2m1Group32);
+    REQUIRE(learned.value[0].format_version == strata::kDsv4KvFormatVersion);
+    REQUIRE(learned.value[0].physical_bytes > learned.value[0].payload_bytes);
 
     REQUIRE(cache.truncate_sequence(created.value, 4U).ok());
     REQUIRE(!cache.row(created.value, strata::Dsv4KvBlockKind::Hca,
@@ -142,8 +243,9 @@ TEST_CASE("DeepSeek KV truncation cannot expose stale shared rows") {
 }
 
 TEST_CASE("DeepSeek KV host allocation fails at its own ceiling") {
-    constexpr std::uint64_t block_bytes =
-        2ULL * strata::kDeepSeekV4ExecutionContract.head_dim * sizeof(float);
+    const auto block_bytes = strata::dsv4_kv_block_bytes(
+        strata::Dsv4KvBlockKind::Sliding,
+        strata::dsv4_kv_format(strata::Dsv4KvBlockKind::Sliding), 2U);
     strata::Dsv4KvCacheConfig config;
     config.block_rows = 2U;
     config.sliding_window_rows = 4U;
@@ -158,7 +260,9 @@ TEST_CASE("DeepSeek KV host allocation fails at its own ceiling") {
     REQUIRE(!cache.append(created.value, strata::Dsv4KvBlockKind::Sliding,
                           1U, 1U, 0U, values).ok());
     REQUIRE(cache.stats().host_used_bytes == block_bytes);
-    REQUIRE(cache.stats().host_write_bytes == values.size() * sizeof(float));
+    REQUIRE(cache.stats().host_write_bytes == strata::dsv4_kv_row_bytes(
+        strata::Dsv4KvBlockKind::Sliding,
+        strata::dsv4_kv_format(strata::Dsv4KvBlockKind::Sliding)));
     REQUIRE(cache.stats().used_blocks == 1U);
 }
 
@@ -169,8 +273,9 @@ TEST_CASE("DeepSeek KV device eviction protects in-flight blocks") {
     const std::array<int, 1> selected{devices.front()};
     REQUIRE(backend.initialize(selected, false).ok());
 
-    constexpr std::uint64_t block_bytes =
-        2ULL * strata::kDeepSeekV4ExecutionContract.head_dim * sizeof(float);
+    const auto block_bytes = strata::dsv4_kv_block_bytes(
+        strata::Dsv4KvBlockKind::Sliding,
+        strata::dsv4_kv_format(strata::Dsv4KvBlockKind::Sliding), 2U);
     strata::Dsv4KvCacheConfig config;
     config.block_rows = 2U;
     config.sliding_window_rows = 4U;

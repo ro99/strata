@@ -1,5 +1,6 @@
 #include "strata/deepseek_admission.hpp"
 
+#include "strata/deepseek_kv_cache.hpp"
 #include "strata/model_adapter.hpp"
 
 #include <algorithm>
@@ -20,6 +21,16 @@ namespace {
 [[nodiscard]] bool add(std::uint64_t& target, std::uint64_t value) noexcept {
     if (value > std::numeric_limits<std::uint64_t>::max() - target) return false;
     target += value;
+    return true;
+}
+
+[[nodiscard]] bool multiply(std::uint64_t first, std::uint64_t second,
+                            std::uint64_t& output) noexcept {
+    if (first != 0U && second >
+            std::numeric_limits<std::uint64_t>::max() / first) {
+        return false;
+    }
+    output = first * second;
     return true;
 }
 
@@ -138,8 +149,48 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
     constexpr std::uint64_t layers = kDeepSeekV4ExecutionContract.layer_count;
     constexpr std::uint64_t head_dim = kDeepSeekV4ExecutionContract.head_dim;
     constexpr std::uint64_t window = kDeepSeekV4ExecutionContract.sliding_window;
-    constexpr std::uint64_t fp32 = 4U;
-    result.plan.kv_state_bytes = layers * window * head_dim * fp32;
+    constexpr std::uint64_t fp32 = sizeof(float);
+    const auto add_compact_blocks = [&](Dsv4KvBlockKind kind,
+                                        std::uint64_t blocks,
+                                        std::uint64_t& target) {
+        const auto format = dsv4_kv_format(kind);
+        const auto row_bytes = dsv4_kv_row_bytes(kind, format);
+        const auto block_bytes = dsv4_kv_block_bytes(
+            kind, format, kDsv4KvBlockRows);
+        std::uint64_t payload = 0U;
+        std::uint64_t metadata = 0U;
+        std::uint64_t physical = 0U;
+        if (block_bytes == 0U ||
+            !multiply(row_bytes * kDsv4KvBlockRows, blocks, payload) ||
+            !multiply(kDsv4KvBlockHeaderBytes, blocks, metadata) ||
+            !multiply(block_bytes, blocks, physical) ||
+            physical < payload || physical - payload < metadata ||
+            !add(result.plan.kv_cache_payload_bytes, payload) ||
+            !add(result.plan.kv_cache_metadata_bytes, metadata) ||
+            !add(result.plan.kv_cache_alignment_bytes,
+                 physical - payload - metadata) ||
+            !add(target, physical)) {
+            return false;
+        }
+        return true;
+    };
+    if (config.compact_kv_cache) {
+        const auto maximum_sliding_rows = std::min<std::uint64_t>(
+            config.maximum_context_tokens,
+            window + kDsv4KvBlockRows - 1U);
+        const auto sliding_blocks =
+            (maximum_sliding_rows + kDsv4KvBlockRows - 1U) /
+            kDsv4KvBlockRows;
+        if (!add_compact_blocks(Dsv4KvBlockKind::Sliding,
+                                layers * sliding_blocks,
+                                result.plan.kv_state_bytes)) {
+            result.errors.emplace_back(
+                "DeepSeek compact sliding KV byte count overflows");
+            return result;
+        }
+    } else {
+        result.plan.kv_state_bytes = layers * window * head_dim * fp32;
+    }
     const auto& deepseek = deepseek_v4_flash_dspark_spec().deepseek_v4;
     const auto& ratios = deepseek.compression_ratios;
     for (std::uint32_t layer = 0U;
@@ -148,7 +199,15 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         if (ratio == 0U) continue;
         const auto compressed =
             (static_cast<std::uint64_t>(config.maximum_context_tokens) + ratio - 1U) / ratio;
-        if (!add(result.plan.kv_state_bytes, compressed * head_dim * fp32)) {
+        const auto blocks = (compressed + kDsv4KvBlockRows - 1U) /
+                            kDsv4KvBlockRows;
+        const auto kind = ratio == 4U ? Dsv4KvBlockKind::Csa
+                                     : Dsv4KvBlockKind::Hca;
+        if (config.compact_kv_cache
+                ? !add_compact_blocks(kind, blocks,
+                                      result.plan.kv_state_bytes)
+                : !add(result.plan.kv_state_bytes,
+                       compressed * head_dim * fp32)) {
             result.errors.emplace_back("DeepSeek compressed KV byte count overflows");
             return result;
         }
@@ -163,10 +222,14 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             config.maximum_context_tokens > deepseek.index_topk * ratio) {
             constexpr std::uint64_t index_head_dim =
                 kDeepSeekV4ExecutionContract.index_head_dim;
-            const auto index_cache = compressed * index_head_dim * fp32;
             constexpr std::uint64_t index_compressor_state =
                 2U * 4U * 2U * index_head_dim * fp32 * 2U;
-            if (!add(result.plan.index_state_bytes, index_cache) ||
+            const bool index_cache_ok = config.compact_kv_cache
+                ? add_compact_blocks(Dsv4KvBlockKind::LearnedIndex, blocks,
+                                     result.plan.index_state_bytes)
+                : add(result.plan.index_state_bytes,
+                      compressed * index_head_dim * fp32);
+            if (!index_cache_ok ||
                 !add(result.plan.index_state_bytes, index_compressor_state)) {
                 result.errors.emplace_back(
                     "DeepSeek sparse-index state byte count overflows");
@@ -184,9 +247,21 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             return result;
         }
     }
+    auto minimum_host_kv_cache_bytes = result.plan.kv_state_bytes;
+    if (config.compact_kv_cache) {
+        minimum_host_kv_cache_bytes = result.plan.kv_cache_payload_bytes;
+        if (!add(minimum_host_kv_cache_bytes,
+                 result.plan.kv_cache_metadata_bytes) ||
+            !add(minimum_host_kv_cache_bytes,
+                 result.plan.kv_cache_alignment_bytes)) {
+            result.errors.emplace_back(
+                "DeepSeek compact KV cache byte count overflows");
+            return result;
+        }
+    }
     result.plan.host_kv_cache_bytes = config.host_kv_cache_bytes == 0U
-        ? result.plan.kv_state_bytes : config.host_kv_cache_bytes;
-    if (result.plan.host_kv_cache_bytes < result.plan.kv_state_bytes) {
+        ? minimum_host_kv_cache_bytes : config.host_kv_cache_bytes;
+    if (result.plan.host_kv_cache_bytes < minimum_host_kv_cache_bytes) {
         result.errors.emplace_back(
             "DeepSeek exact KV state exceeds the host KV cache budget");
     }

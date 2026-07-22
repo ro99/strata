@@ -187,6 +187,22 @@ TEST_CASE("real DeepSeek V4 DSpark checkpoint opens without format conversion wh
     REQUIRE(million_token_admission.plan.kv_state_bytes > (13ULL << 30U));
     REQUIRE(million_token_admission.plan.required_host_bytes < (216ULL << 30U));
 
+    config.compact_kv_cache = true;
+    const auto compact_million = strata::plan_dsv4_resident_topology(
+        checkpoint.value->manifest(), config);
+    REQUIRE(compact_million.ok());
+    REQUIRE(compact_million.plan.kv_state_bytes <
+            million_token_admission.plan.kv_state_bytes);
+    REQUIRE(compact_million.plan.index_state_bytes <
+            million_token_admission.plan.index_state_bytes);
+    REQUIRE(compact_million.plan.kv_cache_payload_bytes > 0U);
+    REQUIRE(compact_million.plan.kv_cache_metadata_bytes > 0U);
+    REQUIRE(compact_million.plan.host_kv_cache_bytes ==
+            compact_million.plan.kv_cache_payload_bytes +
+                compact_million.plan.kv_cache_metadata_bytes +
+                compact_million.plan.kv_cache_alignment_bytes);
+    config.compact_kv_cache = false;
+
     config.maximum_context_tokens = 1'048'577U;
     REQUIRE(!strata::plan_dsv4_resident_topology(
                  checkpoint.value->manifest(), config).ok());

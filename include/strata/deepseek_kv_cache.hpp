@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/result.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -19,7 +20,13 @@ enum class Dsv4KvBlockKind : std::uint8_t {
 
 enum class Dsv4KvFormat : std::uint8_t {
     F32,
+    Fp8E4m3Group64Bf16Rope,
+    Fp4E2m1Group32,
 };
+
+inline constexpr std::uint16_t kDsv4KvFormatVersion = 1U;
+inline constexpr std::uint32_t kDsv4KvBlockRows = 64U;
+inline constexpr std::uint16_t kDsv4KvBlockHeaderBytes = 64U;
 
 enum class Dsv4KvCacheMode : std::uint8_t {
     ScalarOracle,
@@ -29,11 +36,12 @@ enum class Dsv4KvCacheMode : std::uint8_t {
 using Dsv4SequenceHandle = std::uint64_t;
 
 struct Dsv4KvCacheConfig {
-    std::uint32_t block_rows{64U};
+    std::uint32_t block_rows{kDsv4KvBlockRows};
     std::uint32_t sliding_window_rows{128U};
     std::uint64_t host_capacity_bytes{};
     std::vector<int> devices;
     std::vector<std::uint64_t> device_capacity_bytes;
+    bool f32_oracle{};
 };
 
 struct Dsv4KvBlockInfo {
@@ -47,10 +55,27 @@ struct Dsv4KvBlockInfo {
     std::uint32_t compression_ratio{};
     std::uint32_t refcount{};
     std::uint32_t in_flight{};
+    std::uint64_t payload_bytes{};
+    std::uint64_t physical_bytes{};
     Dsv4KvBlockKind kind{Dsv4KvBlockKind::Sliding};
     Dsv4KvFormat format{Dsv4KvFormat::F32};
+    std::uint16_t format_version{kDsv4KvFormatVersion};
     std::vector<bool> device_resident;
 };
+
+[[nodiscard]] Dsv4KvFormat dsv4_kv_format(
+    Dsv4KvBlockKind kind, bool f32_oracle = false) noexcept;
+[[nodiscard]] std::uint64_t dsv4_kv_row_bytes(
+    Dsv4KvBlockKind kind, Dsv4KvFormat format) noexcept;
+[[nodiscard]] std::uint64_t dsv4_kv_block_bytes(
+    Dsv4KvBlockKind kind, Dsv4KvFormat format,
+    std::uint32_t capacity_rows) noexcept;
+[[nodiscard]] ValidationResult dsv4_encode_kv_row(
+    Dsv4KvBlockKind kind, Dsv4KvFormat format,
+    std::span<const float> values, std::span<std::byte> output);
+[[nodiscard]] ValidationResult dsv4_decode_kv_row(
+    Dsv4KvBlockKind kind, Dsv4KvFormat format,
+    std::span<const std::byte> encoded, std::span<float> output);
 
 struct Dsv4KvCacheStats {
     std::uint64_t host_capacity_bytes{};
@@ -122,7 +147,7 @@ public:
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::uint32_t compression_ratio,
         std::uint64_t logical_row, std::span<const float> values);
-    [[nodiscard]] ParseResult<std::span<const float>> row(
+    [[nodiscard]] ParseResult<std::vector<float>> row(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::uint64_t logical_row);
     [[nodiscard]] ParseResult<std::vector<float>> gather(

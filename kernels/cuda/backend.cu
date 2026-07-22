@@ -30,6 +30,19 @@ ValidationResult cuda_error(cudaError_t status, const char* operation) {
     return result;
 }
 
+template <typename State>
+void drain_activation_command(State& state, ValidationResult& result) {
+    const auto status = cudaStreamSynchronize(state.stream);
+    if (status != cudaSuccess) {
+        result.errors.emplace_back(
+            std::string("drain failed CUDA activation command: ") +
+            cudaGetErrorString(status));
+        state.activation_poisoned = true;
+    }
+    state.activation_in_flight = false;
+    state.activation_weights.clear();
+}
+
 __device__ float reduce_block(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xFFFF'FFFFU, value, offset);
@@ -312,6 +325,18 @@ __device__ float fp8_e8m0_scale_bits(unsigned char encoded) {
 
 __device__ float bf16_round(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
+}
+
+__global__ void finish_activation_kernel(float* values,
+                                         std::uint64_t elements,
+                                         bool round_to_bf16,
+                                         unsigned int* error_flag) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (index >= elements) return;
+    const float value = round_to_bf16 ? bf16_round(values[index]) : values[index];
+    values[index] = value;
+    if (!isfinite(value)) atomicExch(error_flag, 1U);
 }
 
 __global__ void deepseek_fp4_gate_up_kernel(
@@ -961,6 +986,18 @@ struct CudaBackend::Impl {
         float* output{};
         std::uint64_t input_bytes{};
         std::uint64_t output_bytes{};
+        std::array<float*, 2U> activation_buffers{};
+        void* activation_host_staging{};
+        unsigned int* activation_error{};
+        cudaEvent_t activation_completed{};
+        std::uint64_t activation_slot_bytes{};
+        std::uint64_t activation_generation{};
+        std::uint64_t activation_kernel_launches{};
+        std::uint32_t activation_current_slot{};
+        std::chrono::steady_clock::time_point activation_started{};
+        std::vector<std::shared_ptr<CudaWeight::Impl>> activation_weights;
+        bool activation_in_flight{};
+        bool activation_poisoned{};
         std::byte* attention_upload{};
         std::byte* attention_download{};
         std::byte* attention_host_upload{};
@@ -1004,6 +1041,15 @@ struct CudaBackend::Impl {
             static_cast<void>(cudaSetDevice(device));
             if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
             if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
+            for (auto* buffer : state.activation_buffers) {
+                if (buffer != nullptr) static_cast<void>(cudaFree(buffer));
+            }
+            if (state.activation_host_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.activation_host_staging));
+            }
+            if (state.activation_error != nullptr) {
+                static_cast<void>(cudaFree(state.activation_error));
+            }
             if (state.attention_upload != nullptr) {
                 static_cast<void>(cudaFree(state.attention_upload));
             }
@@ -1036,6 +1082,9 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaEventDestroy(state.activation_uploaded));
                 static_cast<void>(cudaEventDestroy(state.kernel_finished));
                 static_cast<void>(cudaEventDestroy(state.activation_downloaded));
+            }
+            if (state.activation_completed != nullptr) {
+                static_cast<void>(cudaEventDestroy(state.activation_completed));
             }
             if (state.moe_start != nullptr) {
                 static_cast<void>(cudaEventDestroy(state.moe_start));
@@ -1144,6 +1193,10 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
                 }
             }
         }
+        if (auto status = cudaEventCreate(&state.activation_completed);
+            status != cudaSuccess) {
+            return cuda_error(status, "create CUDA activation completion event");
+        }
         for (auto* event : {&state.moe_start, &state.moe_hidden_uploaded,
                             &state.moe_kernel_finished, &state.moe_download_started,
                             &state.moe_completed}) {
@@ -1209,6 +1262,77 @@ ValidationResult CudaBackend::reserve_weight_arena(int device,
     return result;
 }
 
+ValidationResult CudaBackend::reserve_activation_workspace(
+    int device, std::uint64_t bytes) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "activation workspace targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.activation_slot_bytes != 0U) {
+        result.errors.emplace_back(
+            "CUDA activation workspace is already reserved");
+        return result;
+    }
+    const auto slot_bytes = (bytes / 2U) & ~std::uint64_t{sizeof(float) - 1U};
+    if (slot_bytes < sizeof(float) ||
+        slot_bytes > std::numeric_limits<std::size_t>::max() -
+                         sizeof(unsigned int)) {
+        result.errors.emplace_back(
+            "CUDA activation workspace capacity is invalid");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for activation workspace");
+    }
+    std::array<float*, 2U> buffers{};
+    void* host_staging = nullptr;
+    unsigned int* error = nullptr;
+    const auto release = [&] {
+        for (auto* buffer : buffers) {
+            if (buffer != nullptr) static_cast<void>(cudaFree(buffer));
+        }
+        if (host_staging != nullptr) static_cast<void>(cudaFreeHost(host_staging));
+        if (error != nullptr) static_cast<void>(cudaFree(error));
+    };
+    for (auto& buffer : buffers) {
+        if (auto status = cudaMalloc(
+                &buffer, static_cast<std::size_t>(slot_bytes));
+            status != cudaSuccess) {
+            release();
+            return cuda_error(status, "reserve CUDA activation buffer");
+        }
+    }
+    if (auto status = cudaMallocHost(
+            &host_staging,
+            static_cast<std::size_t>(slot_bytes + sizeof(unsigned int)));
+        status != cudaSuccess) {
+        release();
+        return cuda_error(status, "reserve pinned activation staging");
+    }
+    if (auto status = cudaMalloc(&error, sizeof(*error));
+        status != cudaSuccess) {
+        release();
+        return cuda_error(status, "reserve CUDA activation status");
+    }
+    state.activation_buffers = buffers;
+    state.activation_host_staging = host_staging;
+    state.activation_error = error;
+    state.activation_slot_bytes = slot_bytes;
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.workspace_allocation_calls += 3U;
+        stats.workspace_allocation_bytes += slot_bytes * 2U + sizeof(*error);
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& descriptor,
                                      std::span<const std::byte> weights,
                                      std::span<const std::byte> scales,
@@ -1219,9 +1343,10 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         result.errors.emplace_back("weight upload targets an uninitialized CUDA device");
         return result;
     }
-    if (found->second.moe_in_flight) {
+    if (found->second.moe_in_flight ||
+        found->second.activation_in_flight) {
         result.errors.emplace_back(
-            "weight upload cannot overlap an in-flight DeepSeek MoE command");
+            "weight upload cannot overlap an in-flight CUDA command");
         return result;
     }
     if (descriptor.rows == 0U || descriptor.columns == 0U) {
@@ -1428,9 +1553,9 @@ ValidationResult CudaBackend::flash_attention(
         return result;
     }
     auto& state = found->second;
-    if (state.moe_in_flight) {
+    if (state.moe_in_flight || state.activation_in_flight) {
         result.errors.emplace_back(
-            "FlashAttention cannot overlap an in-flight DeepSeek MoE command");
+            "FlashAttention cannot overlap an in-flight CUDA command");
         return result;
     }
     if (request.query_rows > 65'535U || request.query_key_dim > 1'024U ||
@@ -1846,6 +1971,380 @@ ValidationResult CudaBackend::flash_attention(
     return result;
 }
 
+ValidationResult CudaBackend::begin_device_activation(
+    int device, std::span<const float> input, CudaActivation& output) {
+    ValidationResult result;
+    output = {};
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "device activation targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.activation_poisoned) {
+        result.errors.emplace_back("CUDA activation workspace is poisoned");
+        return result;
+    }
+    if (state.activation_in_flight || state.moe_in_flight) {
+        result.errors.emplace_back(
+            "CUDA activation stream already owns an in-flight command");
+        return result;
+    }
+    if (state.activation_slot_bytes == 0U) {
+        result.errors.emplace_back("CUDA activation workspace was not reserved");
+        return result;
+    }
+    if (input.empty() || input.size_bytes() > state.activation_slot_bytes) {
+        result.errors.emplace_back(
+            "CUDA activation input exceeds the reserved buffer budget");
+        return result;
+    }
+    if (!std::all_of(input.begin(), input.end(), [](float value) {
+            return std::isfinite(value);
+        })) {
+        result.errors.emplace_back("CUDA activation input is non-finite");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for activation command");
+    }
+    state.activation_in_flight = true;
+    state.activation_current_slot = 0U;
+    state.activation_kernel_launches = 0U;
+    state.activation_weights.clear();
+    ++state.activation_generation;
+    state.activation_started = std::chrono::steady_clock::now();
+    std::memcpy(state.activation_host_staging, input.data(), input.size_bytes());
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status, "record activation graph upload start");
+            drain_activation_command(state, result);
+            return result;
+        }
+    }
+    if (auto status = cudaMemsetAsync(
+            state.activation_error, 0, sizeof(*state.activation_error),
+            state.stream); status != cudaSuccess) {
+        result = cuda_error(status, "clear CUDA activation status");
+        drain_activation_command(state, result);
+        return result;
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.activation_buffers[0], state.activation_host_staging,
+            input.size_bytes(), cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        result = cuda_error(status, "upload pinned CUDA activation");
+        drain_activation_command(state, result);
+        return result;
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(
+                state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status, "record activation graph upload completion");
+            drain_activation_command(state, result);
+            return result;
+        }
+    }
+    output.device_ = device;
+    output.slot_ = 0U;
+    output.generation_ = state.activation_generation;
+    output.elements_ = input.size();
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += input.size_bytes();
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::matmul_device_activation(
+    const CudaWeight& weight, const CudaActivation& input,
+    std::uint32_t rows, CudaActivation& output, bool bf16_output) {
+    return matmul_device_activation_impl(weight, input, rows, 0U, 0U,
+                                         output, bf16_output);
+}
+
+ValidationResult CudaBackend::matmul_grouped_device_activation(
+    const CudaWeight& weight, const CudaActivation& input,
+    std::uint32_t groups, std::uint64_t rows_per_group,
+    CudaActivation& output, bool bf16_output) {
+    return matmul_device_activation_impl(weight, input, groups, groups,
+                                         rows_per_group, output,
+                                         bf16_output);
+}
+
+ValidationResult CudaBackend::matmul_device_activation_impl(
+    const CudaWeight& weight, const CudaActivation& input,
+    std::uint32_t rows, std::uint32_t groups,
+    std::uint64_t rows_per_group, CudaActivation& output,
+    bool bf16_output) {
+    ValidationResult result;
+    output = {};
+    if (!weight.valid() || !input.valid()) {
+        result.errors.emplace_back(
+            "CUDA device matmul received an invalid weight or activation");
+        return result;
+    }
+    const auto found = impl_->devices.find(input.device_);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "CUDA device matmul targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    const auto fail = [&](std::string error) {
+        result.errors.push_back(std::move(error));
+        if (state.activation_in_flight) drain_activation_command(state, result);
+    };
+    if (!state.activation_in_flight || state.activation_poisoned ||
+        input.device_ != weight.impl_->device ||
+        input.generation_ != state.activation_generation ||
+        input.slot_ != state.activation_current_slot) {
+        fail("CUDA device matmul violates activation stream ownership");
+        return result;
+    }
+    const auto& descriptor = weight.impl_->descriptor;
+    const bool regular_shape = groups == 0U && rows != 0U &&
+        input.elements_ == descriptor.columns * rows;
+    const bool grouped_shape = groups != 0U && rows == groups &&
+        rows_per_group != 0U &&
+        descriptor.rows == static_cast<std::uint64_t>(groups) * rows_per_group &&
+        input.elements_ == descriptor.columns * groups;
+    if (!regular_shape && !grouped_shape) {
+        fail("CUDA device matmul activation shapes are incompatible");
+        return result;
+    }
+    const auto output_elements = groups == 0U
+        ? descriptor.rows * rows : descriptor.rows;
+    if (output_elements > state.activation_slot_bytes / sizeof(float) ||
+        descriptor.rows > std::numeric_limits<unsigned int>::max()) {
+        fail("CUDA device matmul output exceeds the reserved buffer budget");
+        return result;
+    }
+    if (auto status = cudaSetDevice(input.device_); status != cudaSuccess) {
+        result = cuda_error(status, "select CUDA device for activation matmul");
+        drain_activation_command(state, result);
+        return result;
+    }
+    auto* device_input = state.activation_buffers[input.slot_];
+    const auto output_slot = input.slot_ ^ 1U;
+    auto* device_output = state.activation_buffers[output_slot];
+    const bool native =
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+        descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
+    if (native) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
+            rows, 1U);
+        quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            device_input, descriptor.columns, rows);
+        ++state.activation_kernel_launches;
+    }
+    const auto output_batches = groups == 0U ? rows : 1U;
+    const dim3 grid(static_cast<unsigned int>(descriptor.rows),
+                    output_batches, 1U);
+    constexpr unsigned int threads = 256U;
+    if (descriptor.encoding == CudaWeightEncoding::Plain) {
+        plain_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+            device_output, device_input, weight.impl_->weights,
+            static_cast<int>(descriptor.dtype), rows, descriptor.columns,
+            descriptor.rows, groups, rows_per_group);
+    } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
+               descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
+        const auto bits = descriptor.encoding ==
+                CudaWeightEncoding::OffsetPackedInt4 ? 4U : 8U;
+        packed_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+            device_output, device_input,
+            static_cast<const std::uint32_t*>(weight.impl_->weights),
+            static_cast<const __nv_bfloat16*>(weight.impl_->scales), bits,
+            descriptor.group_size, descriptor.packed_columns,
+            descriptor.scale_columns, rows, descriptor.columns,
+            descriptor.rows, groups, rows_per_group);
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        native_fp8_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+            device_output, device_input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.scale_columns, rows, descriptor.columns,
+            descriptor.rows, groups, rows_per_group);
+    } else {
+        native_fp4_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+            device_output, device_input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.packed_columns, descriptor.scale_columns, rows,
+            descriptor.columns, descriptor.rows, groups, rows_per_group);
+    }
+    ++state.activation_kernel_launches;
+    const auto finish_blocks = static_cast<unsigned int>(
+        (output_elements + 255U) / 256U);
+    finish_activation_kernel<<<finish_blocks, 256U, 0U, state.stream>>>(
+        device_output, output_elements, bf16_output, state.activation_error);
+    ++state.activation_kernel_launches;
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        result = cuda_error(status, "launch CUDA device activation matmul");
+        drain_activation_command(state, result);
+        return result;
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status, "record activation graph kernel completion");
+            drain_activation_command(state, result);
+            return result;
+        }
+    }
+    state.activation_current_slot = output_slot;
+    state.activation_weights.push_back(weight.impl_);
+    output.device_ = input.device_;
+    output.slot_ = output_slot;
+    output.generation_ = input.generation_;
+    output.elements_ = output_elements;
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [&input](const auto& value) { return value.device == input.device_; });
+        ++stats.matmul_calls;
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::collect_device_activation(
+    const CudaActivation& input, std::span<float> output) {
+    ValidationResult result;
+    if (!input.valid()) {
+        result.errors.emplace_back("collect received an invalid CUDA activation");
+        return result;
+    }
+    const auto found = impl_->devices.find(input.device_);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "collect targets an uninitialized CUDA activation device");
+        return result;
+    }
+    auto& state = found->second;
+    const bool valid = state.activation_in_flight &&
+        !state.activation_poisoned &&
+        input.generation_ == state.activation_generation &&
+        input.slot_ == state.activation_current_slot &&
+        input.elements_ == output.size() &&
+        state.activation_kernel_launches != 0U;
+    if (!valid) {
+        result.errors.emplace_back(
+            "collect violates CUDA activation stream order or output shape");
+        if (state.activation_in_flight) drain_activation_command(state, result);
+        return result;
+    }
+    if (auto status = cudaSetDevice(input.device_); status != cudaSuccess) {
+        result = cuda_error(status, "select CUDA device for activation collect");
+        drain_activation_command(state, result);
+        return result;
+    }
+    auto* host_bytes = static_cast<std::byte*>(state.activation_host_staging);
+    auto* host_error = reinterpret_cast<unsigned int*>(
+        host_bytes + state.activation_slot_bytes);
+    if (auto status = cudaMemcpyAsync(
+            host_bytes, state.activation_buffers[input.slot_],
+            output.size_bytes(), cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        result = cuda_error(status, "download CUDA device activation");
+        drain_activation_command(state, result);
+        return result;
+    }
+    if (auto status = cudaMemcpyAsync(
+            host_error, state.activation_error, sizeof(*host_error),
+            cudaMemcpyDeviceToHost, state.stream); status != cudaSuccess) {
+        result = cuda_error(status, "download CUDA activation status");
+        drain_activation_command(state, result);
+        return result;
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(
+                state.activation_downloaded, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status, "record activation graph download completion");
+            drain_activation_command(state, result);
+            return result;
+        }
+    }
+    if (auto status = cudaEventRecord(state.activation_completed, state.stream);
+        status != cudaSuccess) {
+        result = cuda_error(status, "record activation graph completion");
+        drain_activation_command(state, result);
+        return result;
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    const auto wait_status = cudaEventSynchronize(state.activation_completed);
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    if (wait_status != cudaSuccess) {
+        result = cuda_error(wait_status, "synchronize CUDA activation graph");
+        drain_activation_command(state, result);
+        return result;
+    }
+    state.activation_in_flight = false;
+    state.activation_weights.clear();
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_ms = 0.0F;
+        float kernel_ms = 0.0F;
+        float d2h_ms = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_ms, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure activation graph upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_ms, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure activation graph kernels");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_ms, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure activation graph download");
+        }
+        const auto ns = [](float milliseconds) {
+            return static_cast<std::uint64_t>(std::llround(
+                static_cast<double>(milliseconds) * 1.0e6));
+        };
+        h2d_nanoseconds = ns(h2d_ms);
+        kernel_nanoseconds = ns(kernel_ms);
+        d2h_nanoseconds = ns(d2h_ms);
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [&input](const auto& value) { return value.device == input.device_; });
+        stats.activation_d2h_bytes += output.size_bytes();
+        ++stats.activation_graph_calls;
+        stats.activation_graph_kernel_launches +=
+            state.activation_kernel_launches;
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
+        stats.activation_h2d_nanoseconds += h2d_nanoseconds;
+        stats.kernel_nanoseconds += kernel_nanoseconds;
+        stats.activation_d2h_nanoseconds += d2h_nanoseconds;
+    }
+    if (*host_error != 0U) {
+        result.errors.emplace_back("CUDA activation graph produced a non-finite value");
+        return result;
+    }
+    std::memcpy(output.data(), host_bytes, output.size_bytes());
+    return result;
+}
+
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
@@ -1867,9 +2366,9 @@ ValidationResult CudaBackend::matmul_impl(
         return result;
     }
     auto& state = impl_->devices.at(weight.impl_->device);
-    if (state.moe_in_flight) {
+    if (state.moe_in_flight || state.activation_in_flight) {
         result.errors.emplace_back(
-            "CUDA matmul cannot overlap an in-flight DeepSeek MoE command");
+            "CUDA matmul cannot overlap an in-flight CUDA command");
         return result;
     }
     if (auto status = cudaSetDevice(weight.impl_->device); status != cudaSuccess) {
@@ -2043,6 +2542,11 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         return result;
     }
     auto& state = found->second;
+    if (state.activation_in_flight) {
+        result.errors.emplace_back(
+            "DeepSeek MoE cannot overlap an in-flight activation command");
+        return result;
+    }
     if (state.moe_in_flight) {
         result.errors.emplace_back(
             "DeepSeek MoE workspace already has an in-flight command");
@@ -2651,8 +3155,8 @@ ValidationResult CudaBackend::collect_deepseek_moe(
 ValidationResult CudaBackend::synchronize(int device) {
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) return {{"cannot synchronize an uninitialized CUDA device"}};
-    if (found->second.moe_in_flight) {
-        return {{"use collect_deepseek_moe for an in-flight DeepSeek MoE command"}};
+    if (found->second.moe_in_flight || found->second.activation_in_flight) {
+        return {{"use the matching collect call for an in-flight CUDA command"}};
     }
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for synchronization");
@@ -2696,6 +3200,9 @@ CudaBackendStats CudaBackend::stats() const noexcept {
             result.kernel_nanoseconds, device.kernel_nanoseconds);
         result.activation_d2h_nanoseconds = std::max(
             result.activation_d2h_nanoseconds, device.activation_d2h_nanoseconds);
+        result.activation_graph_calls += device.activation_graph_calls;
+        result.activation_graph_kernel_launches +=
+            device.activation_graph_kernel_launches;
         result.deepseek_moe_calls += device.deepseek_moe_calls;
         result.deepseek_moe_kernel_launches += device.deepseek_moe_kernel_launches;
         result.deepseek_moe_h2d_transfers += device.deepseek_moe_h2d_transfers;

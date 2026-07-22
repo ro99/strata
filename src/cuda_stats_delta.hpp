@@ -25,6 +25,8 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(activation_graph_calls);
+    STRATA_CUDA_DEVICE_DELTA(activation_graph_kernel_launches);
     STRATA_CUDA_DEVICE_DELTA(deepseek_moe_calls);
     STRATA_CUDA_DEVICE_DELTA(deepseek_moe_kernel_launches);
     STRATA_CUDA_DEVICE_DELTA(deepseek_moe_h2d_transfers);
@@ -68,6 +70,8 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DELTA(kernel_nanoseconds);
     STRATA_CUDA_DELTA(activation_d2h_nanoseconds);
+    STRATA_CUDA_DELTA(activation_graph_calls);
+    STRATA_CUDA_DELTA(activation_graph_kernel_launches);
     STRATA_CUDA_DELTA(deepseek_moe_calls);
     STRATA_CUDA_DELTA(deepseek_moe_kernel_launches);
     STRATA_CUDA_DELTA(deepseek_moe_h2d_transfers);

@@ -527,6 +527,76 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
     REQUIRE(channel_output[0] == -4.0F);
 }
 
+TEST_CASE("native CUDA backend keeps an exact projection chain device resident") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+    REQUIRE(backend.reserve_activation_workspace(device, 64U).ok());
+
+    const auto upload_plain = [&](std::uint64_t rows, std::uint64_t columns,
+                                  std::span<const float> values) {
+        std::vector<std::byte> encoded(values.size() * sizeof(std::uint16_t));
+        for (std::size_t index = 0U; index < values.size(); ++index) {
+            const auto value = bf16(values[index]);
+            std::copy(value.begin(), value.end(),
+                      encoded.begin() + static_cast<std::ptrdiff_t>(index * 2U));
+        }
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::Plain;
+        descriptor.dtype = strata::SafetensorsDtype::Bf16;
+        descriptor.rows = rows;
+        descriptor.columns = columns;
+        strata::CudaWeight weight;
+        REQUIRE(backend.upload(device, descriptor, encoded, {}, weight).ok());
+        return weight;
+    };
+    const std::array<float, 8> first_values{
+        1.0F, 2.0F, 3.0F, 4.0F, -1.0F, 0.5F, 2.0F, -0.5F};
+    const std::array<float, 2> second_values{2.0F, -3.0F};
+    auto first = upload_plain(2U, 4U, first_values);
+    auto second = upload_plain(1U, 2U, second_values);
+    const std::array<float, 4> input{1.0F, 2.0F, 3.0F, 4.0F};
+
+    std::array<float, 2> intermediate{};
+    std::array<float, 1> expected{};
+    REQUIRE(backend.matmul(first, input, 1U, intermediate).ok());
+    for (auto& value : intermediate) value = round_bf16(value);
+    REQUIRE(backend.matmul(second, intermediate, 1U, expected).ok());
+    expected[0] = round_bf16(expected[0]);
+
+    const auto before = backend.stats();
+    strata::CudaActivation input_device;
+    strata::CudaActivation intermediate_device;
+    strata::CudaActivation output_device;
+    REQUIRE(backend.begin_device_activation(device, input, input_device).ok());
+    REQUIRE(backend.matmul_device_activation(
+        first, input_device, 1U, intermediate_device).ok());
+    REQUIRE(backend.matmul_device_activation(
+        second, intermediate_device, 1U, output_device).ok());
+    std::array<float, 1> actual{};
+    REQUIRE(backend.collect_device_activation(output_device, actual).ok());
+    REQUIRE(actual == expected);
+
+    const auto after = backend.stats();
+    REQUIRE(after.activation_graph_calls - before.activation_graph_calls == 1U);
+    REQUIRE(after.matmul_calls - before.matmul_calls == 2U);
+    REQUIRE(after.synchronization_calls - before.synchronization_calls == 1U);
+    REQUIRE(after.activation_h2d_bytes - before.activation_h2d_bytes ==
+            input.size() * sizeof(float));
+    REQUIRE(after.activation_d2h_bytes - before.activation_d2h_bytes ==
+            actual.size() * sizeof(float));
+    REQUIRE(after.activation_graph_kernel_launches -
+                before.activation_graph_kernel_launches == 4U);
+
+    std::array<float, 9> oversized{};
+    REQUIRE(!backend.begin_device_activation(
+        device, oversized, input_device).ok());
+}
+
 TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

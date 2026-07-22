@@ -50,6 +50,8 @@ struct CudaBackendStats {
         std::uint64_t activation_h2d_nanoseconds{};
         std::uint64_t kernel_nanoseconds{};
         std::uint64_t activation_d2h_nanoseconds{};
+        std::uint64_t activation_graph_calls{};
+        std::uint64_t activation_graph_kernel_launches{};
         std::uint64_t deepseek_moe_calls{};
         std::uint64_t deepseek_moe_kernel_launches{};
         std::uint64_t deepseek_moe_h2d_transfers{};
@@ -88,6 +90,8 @@ struct CudaBackendStats {
     std::uint64_t activation_h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
     std::uint64_t activation_d2h_nanoseconds{};
+    std::uint64_t activation_graph_calls{};
+    std::uint64_t activation_graph_kernel_launches{};
     std::uint64_t deepseek_moe_calls{};
     std::uint64_t deepseek_moe_kernel_launches{};
     std::uint64_t deepseek_moe_h2d_transfers{};
@@ -137,6 +141,24 @@ private:
     friend class CudaBackend;
 };
 
+// A non-owning view into the backend's bounded reusable activation workspace.
+// It is valid only for the active command and must be consumed in stream order.
+class CudaActivation {
+public:
+    CudaActivation() = default;
+
+    [[nodiscard]] bool valid() const noexcept { return device_ >= 0; }
+    [[nodiscard]] std::uint64_t elements() const noexcept { return elements_; }
+    [[nodiscard]] int device() const noexcept { return device_; }
+
+private:
+    int device_{-1};
+    std::uint32_t slot_{};
+    std::uint64_t generation_{};
+    std::uint64_t elements_{};
+    friend class CudaBackend;
+};
+
 // One exact DeepSeek expert projection triplet. The weight objects must remain
 // alive until the matching collect call completes. Each routed coefficient is
 // applied once before w2; the optional shared expert must use coefficient 1.0.
@@ -169,6 +191,8 @@ public:
     // no per-weight cudaMalloc fallback once the arena is enabled.
     [[nodiscard]] ValidationResult reserve_weight_arena(int device,
                                                         std::uint64_t bytes);
+    [[nodiscard]] ValidationResult reserve_activation_workspace(
+        int device, std::uint64_t bytes);
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,
@@ -180,6 +204,20 @@ public:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t groups, std::uint64_t rows_per_group,
         std::span<float> output);
+    // Commands use the backend-owned nonblocking stream and synchronize only
+    // at collect. Unsupported shapes, exhausted capacity, and stale views fail.
+    [[nodiscard]] ValidationResult begin_device_activation(
+        int device, std::span<const float> input, CudaActivation& output);
+    [[nodiscard]] ValidationResult matmul_device_activation(
+        const CudaWeight& weight, const CudaActivation& input,
+        std::uint32_t rows, CudaActivation& output,
+        bool bf16_output = true);
+    [[nodiscard]] ValidationResult matmul_grouped_device_activation(
+        const CudaWeight& weight, const CudaActivation& input,
+        std::uint32_t groups, std::uint64_t rows_per_group,
+        CudaActivation& output, bool bf16_output = true);
+    [[nodiscard]] ValidationResult collect_device_activation(
+        const CudaActivation& input, std::span<float> output);
     // Validate an explicitly requested FlashAttention device before model
     // admission. Shape-aware dispatch must not hide an unsupported
     // architecture until a later, longer request reaches the CUDA branch.
@@ -214,6 +252,11 @@ public:
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
 private:
+    [[nodiscard]] ValidationResult matmul_device_activation_impl(
+        const CudaWeight& weight, const CudaActivation& input,
+        std::uint32_t rows, std::uint32_t groups,
+        std::uint64_t rows_per_group, CudaActivation& output,
+        bool bf16_output);
     [[nodiscard]] ValidationResult matmul_impl(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,

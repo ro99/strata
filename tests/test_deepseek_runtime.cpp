@@ -8,6 +8,8 @@
 TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     const strata::Dsv4RuntimeConfig config;
     REQUIRE(config.enable_device_moe);
+    REQUIRE(!config.enable_device_activations);
+    REQUIRE(config.device_activation_workspace_bytes == (1ULL << 20U));
     REQUIRE(!config.enable_flash_attention);
     REQUIRE(config.flash_attention_minimum_rows == 256U);
     REQUIRE(config.prefill_page_tokens == 64U);
@@ -18,6 +20,20 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
     REQUIRE(config.overlap_resident_warmup);
+}
+
+TEST_CASE("DeepSeek runtime rejects an undersized device activation workspace") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.enable_device_activations = true;
+    config.device_activation_workspace_bytes = 1U;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("activation workspace") !=
+                                   std::string::npos;
+                        }));
 }
 
 TEST_CASE("DeepSeek runtime rejects an unbounded prefill page") {

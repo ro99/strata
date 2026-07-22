@@ -29,12 +29,14 @@ struct Options {
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
+    std::uint64_t device_activation_workspace_bytes{1ULL << 20U};
     double vram_fraction{0.85};
     bool admission_only{};
     bool json{};
     bool quiet{};
     bool detailed_timing{};
     bool device_moe{true};
+    bool device_activations{};
     bool flash_attention{};
     bool logit_trace{};
     bool layer_hash_trace{};
@@ -53,6 +55,8 @@ void usage() {
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
+        << "       [--device-activations|--synchronous-activations]\n"
+        << "       [--device-activation-workspace 1M]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -148,6 +152,16 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.device_moe = true;
         } else if (argument == "--serial-device-moe") {
             options.device_moe = false;
+        } else if (argument == "--device-activations") {
+            options.device_activations = true;
+        } else if (argument == "--synchronous-activations") {
+            options.device_activations = false;
+        } else if (argument == "--device-activation-workspace") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_bytes(
+                    value, options.device_activation_workspace_bytes)) {
+                return false;
+            }
         } else if (argument == "--flash-attention") {
             options.flash_attention = true;
         } else if (argument == "--scalar-attention") {
@@ -192,6 +206,9 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
     output << "{\"weight_h2d_bytes\":" << stats.weight_upload_bytes
            << ",\"activation_h2d_bytes\":" << stats.activation_h2d_bytes
            << ",\"activation_d2h_bytes\":" << stats.activation_d2h_bytes
+           << ",\"activation_graph_calls\":" << stats.activation_graph_calls
+           << ",\"activation_graph_kernel_launches\":"
+           << stats.activation_graph_kernel_launches
            << ",\"matmul_calls\":" << stats.matmul_calls
            << ",\"weight_allocation_calls\":" << stats.weight_allocation_calls
            << ",\"weight_allocation_bytes\":" << stats.weight_allocation_bytes
@@ -256,6 +273,10 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"weight_h2d_bytes\":" << device.weight_upload_bytes
                << ",\"activation_h2d_bytes\":" << device.activation_h2d_bytes
                << ",\"activation_d2h_bytes\":" << device.activation_d2h_bytes
+               << ",\"activation_graph_calls\":"
+               << device.activation_graph_calls
+               << ",\"activation_graph_kernel_launches\":"
+               << device.activation_graph_kernel_launches
                << ",\"matmul_calls\":" << device.matmul_calls
                << ",\"synchronization_calls\":" << device.synchronization_calls
                << ",\"synchronization_seconds\":"
@@ -637,6 +658,9 @@ int main(int argc, char** argv) {
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
+    config.enable_device_activations = options.device_activations;
+    config.device_activation_workspace_bytes =
+        options.device_activation_workspace_bytes;
     config.enable_flash_attention = options.flash_attention;
     config.flash_attention_minimum_rows =
         options.flash_attention_minimum_rows;
@@ -665,6 +689,8 @@ int main(int argc, char** argv) {
                   << ",\"dspark\":\"disabled\""
                   << ",\"device_moe\":"
                   << (metrics.device_moe_enabled ? "true" : "false")
+                  << ",\"device_activations\":"
+                  << (metrics.device_activations_enabled ? "true" : "false")
                   << ",\"host_attention_threads\":"
                   << metrics.host_attention_threads
                   << ",\"prefill_page_tokens\":"

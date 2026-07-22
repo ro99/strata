@@ -1488,7 +1488,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         request.scale = kAttentionScale;
         request.numerics =
             FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
-        request.maximum_workspace_bytes = kDeviceWorkspaceReserve;
+        request.maximum_workspace_bytes = kDeviceWorkspaceReserve -
+            (config.enable_device_activations
+                 ? config.device_activation_workspace_bytes : 0U);
         result = cuda.flash_attention(devices[slot], request, attended);
         if (!result.ok()) return result;
         const auto finish_head = [&](std::uint32_t head) {
@@ -1600,14 +1602,42 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     graph_stats.attention_score_nanoseconds += elapsed_nanoseconds(subphase_started);
 
     subphase_started = std::chrono::steady_clock::now();
-    std::vector<float> output_rank(static_cast<std::size_t>(kOutputGroups) *
-                                   kOutputRank);
-    result = weights->grouped(slot, prefix + "wo_a", kOutputGroups * kOutputRank,
-                              kHeads * kHeadDim / kOutputGroups, attended,
-                              kOutputGroups, kOutputRank, output_rank);
-    if (!result.ok()) return result;
-    result = linear(slot, prefix + "wo_b", kHidden,
-                    kOutputGroups * kOutputRank, output_rank, output);
+    if (config.enable_device_activations) {
+        Dsv4WeightCache::Lease wo_a;
+        Dsv4WeightCache::Lease wo_b;
+        result = weights->acquire(
+            slot, prefix + "wo_a", kOutputGroups * kOutputRank,
+            kHeads * kHeadDim / kOutputGroups, wo_a);
+        if (!result.ok()) return result;
+        result = weights->acquire(
+            slot, prefix + "wo_b", kHidden,
+            kOutputGroups * kOutputRank, wo_b);
+        if (!result.ok()) return result;
+        CudaActivation attended_device;
+        CudaActivation output_rank_device;
+        CudaActivation output_device;
+        result = cuda.begin_device_activation(
+            devices[slot], attended, attended_device);
+        if (!result.ok()) return result;
+        result = cuda.matmul_grouped_device_activation(
+            wo_a.weight(), attended_device, kOutputGroups, kOutputRank,
+            output_rank_device);
+        if (!result.ok()) return result;
+        result = cuda.matmul_device_activation(
+            wo_b.weight(), output_rank_device, 1U, output_device);
+        if (!result.ok()) return result;
+        result = cuda.collect_device_activation(output_device, output);
+    } else {
+        std::vector<float> output_rank(
+            static_cast<std::size_t>(kOutputGroups) * kOutputRank);
+        result = weights->grouped(
+            slot, prefix + "wo_a", kOutputGroups * kOutputRank,
+            kHeads * kHeadDim / kOutputGroups, attended, kOutputGroups,
+            kOutputRank, output_rank);
+        if (!result.ok()) return result;
+        result = linear(slot, prefix + "wo_b", kHidden,
+                        kOutputGroups * kOutputRank, output_rank, output);
+    }
     graph_stats.attention_output_nanoseconds += elapsed_nanoseconds(subphase_started);
     return result;
 }
@@ -2547,6 +2577,18 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "DeepSeek spine warmup worker count must be within [1, 64]");
         return result;
     }
+    constexpr std::uint64_t kMinimumActivationWorkspace =
+        2ULL * kHeads * kHeadDim * sizeof(float);
+    if (config.enable_device_activations &&
+        (config.device_activation_workspace_bytes <
+             kMinimumActivationWorkspace ||
+         config.device_activation_workspace_bytes >
+             kDeviceWorkspaceReserve)) {
+        result.errors.emplace_back(
+            "DeepSeek device activation workspace must fit the declared "
+            "reserve and the largest exact projection intermediate");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
@@ -2624,6 +2666,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result = impl_->cuda.reserve_weight_arena(
             impl_->devices[slot], weight_capacities[slot]);
         if (!result.ok()) return result;
+        if (config.enable_device_activations) {
+            result = impl_->cuda.reserve_activation_workspace(
+                impl_->devices[slot],
+                config.device_activation_workspace_bytes);
+            if (!result.ok()) return result;
+        }
     }
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
@@ -2704,6 +2752,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
     impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
+    impl_->initialization_metrics.device_activations_enabled =
+        config.enable_device_activations;
     impl_->initialization_metrics.resident_warmup_overlapped =
         config.overlap_resident_warmup;
     impl_->initialization_metrics.host_attention_threads =

@@ -44,6 +44,10 @@ ValidationResult CudaBackend::reserve_weight_arena(int, std::uint64_t) {
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::reserve_activation_workspace(int, std::uint64_t) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::upload(int, const CudaWeightDescriptor&,
                                      std::span<const std::byte>,
                                      std::span<const std::byte>, CudaWeight&) {
@@ -58,6 +62,28 @@ ValidationResult CudaBackend::matmul(const CudaWeight&, std::span<const float>,
 ValidationResult CudaBackend::matmul_grouped(
     const CudaWeight&, std::span<const float>, std::uint32_t,
     std::uint64_t, std::span<float>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::begin_device_activation(
+    int, std::span<const float>, CudaActivation&) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::matmul_device_activation(
+    const CudaWeight&, const CudaActivation&, std::uint32_t,
+    CudaActivation&, bool) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::matmul_grouped_device_activation(
+    const CudaWeight&, const CudaActivation&, std::uint32_t,
+    std::uint64_t, CudaActivation&, bool) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::collect_device_activation(
+    const CudaActivation&, std::span<float>) {
     return {{"CUDA support was not compiled into this build"}};
 }
 
@@ -85,6 +111,12 @@ ValidationResult CudaBackend::collect_deepseek_moe(
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight&, std::span<const float>, std::uint32_t,
     std::uint32_t, std::uint64_t, std::span<float>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::matmul_device_activation_impl(
+    const CudaWeight&, const CudaActivation&, std::uint32_t, std::uint32_t,
+    std::uint64_t, CudaActivation&, bool) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

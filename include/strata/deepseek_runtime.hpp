@@ -38,6 +38,8 @@ struct Dsv4RuntimeConfig {
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
     bool enable_device_moe{true};
+    bool enable_device_activations{};
+    std::uint64_t device_activation_workspace_bytes{1ULL << 20U};
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};
@@ -125,6 +127,7 @@ struct Dsv4GenerationMetrics {
     bool detailed_timing{};
     bool dspark_enabled{};
     bool device_moe_enabled{};
+    bool device_activations_enabled{};
     bool resident_warmup_overlapped{};
     std::uint32_t host_attention_threads{};
     std::uint32_t prefill_page_tokens{};

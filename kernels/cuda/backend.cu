@@ -289,17 +289,15 @@ __global__ void native_fp4_matmul_kernel(
     }
 }
 
-constexpr std::uint32_t kMaxDeepSeekRoutedExperts = 6U;
-
-struct DeepSeekFp4Batch {
-    const unsigned char* w1_weights[kMaxDeepSeekRoutedExperts]{};
-    const unsigned char* w1_scales[kMaxDeepSeekRoutedExperts]{};
-    const unsigned char* w3_weights[kMaxDeepSeekRoutedExperts]{};
-    const unsigned char* w3_scales[kMaxDeepSeekRoutedExperts]{};
-    const unsigned char* w2_weights[kMaxDeepSeekRoutedExperts]{};
-    const unsigned char* w2_scales[kMaxDeepSeekRoutedExperts]{};
-    float coefficients[kMaxDeepSeekRoutedExperts]{};
-    std::uint32_t count{};
+struct DeepSeekFp4Work {
+    const unsigned char* w1_weights{};
+    const unsigned char* w1_scales{};
+    const unsigned char* w3_weights{};
+    const unsigned char* w3_scales{};
+    const unsigned char* w2_weights{};
+    const unsigned char* w2_scales{};
+    float coefficient{};
+    std::uint32_t input_row{};
 };
 
 __device__ float fp8_e8m0_scale_bits(unsigned char encoded) {
@@ -315,18 +313,20 @@ __device__ float bf16_round(float value) {
 }
 
 __global__ void deepseek_fp4_gate_up_kernel(
-    float* activations, const float* hidden, DeepSeekFp4Batch batch,
+    float* activations, const float* hidden, const DeepSeekFp4Work* work,
+    std::uint32_t work_count,
     std::uint64_t columns, std::uint64_t intermediate,
     std::uint64_t packed_columns, std::uint64_t scale_columns,
     float swiglu_limit, const float* bf16_silu, unsigned int* error_flag) {
     const std::uint64_t output_row = blockIdx.x;
-    const std::uint32_t expert = blockIdx.y;
-    if (output_row >= intermediate || expert >= batch.count) return;
+    const std::uint32_t assignment = blockIdx.y;
+    if (output_row >= intermediate || assignment >= work_count) return;
 
-    const auto* w1 = batch.w1_weights[expert];
-    const auto* w1_scales = batch.w1_scales[expert];
-    const auto* w3 = batch.w3_weights[expert];
-    const auto* w3_scales = batch.w3_scales[expert];
+    const auto assignment_work = work[assignment];
+    const auto* w1 = assignment_work.w1_weights;
+    const auto* w1_scales = assignment_work.w1_scales;
+    const auto* w3 = assignment_work.w3_weights;
+    const auto* w3_scales = assignment_work.w3_scales;
     const std::uint64_t packed_base = output_row * packed_columns;
     const std::uint64_t scale_base = output_row * scale_columns;
     const std::uint32_t lane = threadIdx.x & 31U;
@@ -347,7 +347,9 @@ __global__ void deepseek_fp4_gate_up_kernel(
         up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
         const std::uint64_t column = group * 32U + lane;
         if (column < columns) {
-            const float input = hidden[column];
+            const float input = hidden[
+                static_cast<std::uint64_t>(assignment_work.input_row) * columns +
+                column];
             const unsigned char gate_packed = w1[packed_base + column / 2U];
             const unsigned char up_packed = w3[packed_base + column / 2U];
             const unsigned int gate_encoded = column % 2U == 0U
@@ -368,7 +370,7 @@ __global__ void deepseek_fp4_gate_up_kernel(
         const float rounded_up = bf16_round(up);
         if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
             atomicExch(error_flag, 1U);
-            activations[static_cast<std::uint64_t>(expert) * intermediate +
+            activations[static_cast<std::uint64_t>(assignment) * intermediate +
                         output_row] = __uint_as_float(0x7FC0'0000U);
             return;
         }
@@ -378,24 +380,27 @@ __global__ void deepseek_fp4_gate_up_kernel(
         const auto gate_bits = static_cast<std::uint16_t>(
             __float_as_uint(limited_gate) >> 16U);
         float activated = bf16_silu[gate_bits] * limited_up;
-        activated *= batch.coefficients[expert];
-        activations[static_cast<std::uint64_t>(expert) * intermediate + output_row] =
-            bf16_round(activated);
+        activated *= assignment_work.coefficient;
+        activations[static_cast<std::uint64_t>(assignment) * intermediate +
+                    output_row] = bf16_round(activated);
     }
 }
 
 __global__ void deepseek_fp4_down_kernel(
-    float* output, const float* activations, DeepSeekFp4Batch batch,
+    float* output, const float* activations, const DeepSeekFp4Work* work,
+    std::uint32_t work_count,
     std::uint64_t columns, std::uint64_t rows,
     std::uint64_t packed_columns, std::uint64_t scale_columns) {
     const std::uint64_t output_row = blockIdx.x;
-    const std::uint32_t expert = blockIdx.y;
-    if (output_row >= rows || expert >= batch.count) return;
-    const auto* weights = batch.w2_weights[expert];
-    const auto* scales = batch.w2_scales[expert];
+    const std::uint32_t assignment = blockIdx.y;
+    if (output_row >= rows || assignment >= work_count) return;
+    const auto assignment_work = work[assignment];
+    const auto* weights = assignment_work.w2_weights;
+    const auto* scales = assignment_work.w2_scales;
     const std::uint64_t packed_base = output_row * packed_columns;
     const std::uint64_t scale_base = output_row * scale_columns;
-    const std::uint64_t input_base = static_cast<std::uint64_t>(expert) * columns;
+    const std::uint64_t input_base =
+        static_cast<std::uint64_t>(assignment) * columns;
     const std::uint32_t lane = threadIdx.x & 31U;
     const std::uint32_t warp = threadIdx.x >> 5U;
     float sum = 0.0F;
@@ -416,7 +421,7 @@ __global__ void deepseek_fp4_down_kernel(
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0U) {
-        output[static_cast<std::uint64_t>(expert) * rows + output_row] =
+        output[static_cast<std::uint64_t>(assignment) * rows + output_row] =
             bf16_round(sum);
     }
 }
@@ -429,6 +434,7 @@ __global__ void deepseek_fp8_gate_up_kernel(
     std::uint64_t scale_columns, float swiglu_limit,
     const float* bf16_silu, unsigned int* error_flag) {
     const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
     if (output_row >= intermediate) return;
     const std::uint64_t weight_base = output_row * columns;
     const std::uint64_t scale_row = (output_row / 128U) * scale_columns;
@@ -450,7 +456,8 @@ __global__ void deepseek_fp8_gate_up_kernel(
         gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
         up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
         if (column < columns) {
-            const float input = hidden[column];
+            const float input = hidden[
+                static_cast<std::uint64_t>(batch_row) * columns + column];
             gate += input * fp8_e4m3_value(w1[weight_base + column]) * gate_scale;
             up += input * fp8_e4m3_value(w3[weight_base + column]) * up_scale;
         }
@@ -463,7 +470,8 @@ __global__ void deepseek_fp8_gate_up_kernel(
         const float rounded_up = bf16_round(up);
         if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
             atomicExch(error_flag, 1U);
-            activation[output_row] = __uint_as_float(0x7FC0'0000U);
+            activation[static_cast<std::uint64_t>(batch_row) * intermediate +
+                       output_row] = __uint_as_float(0x7FC0'0000U);
             return;
         }
         const float limited_gate = fminf(rounded_gate, swiglu_limit);
@@ -471,7 +479,8 @@ __global__ void deepseek_fp8_gate_up_kernel(
                                        fminf(rounded_up, swiglu_limit));
         const auto gate_bits = static_cast<std::uint16_t>(
             __float_as_uint(limited_gate) >> 16U);
-        activation[output_row] = bf16_round(
+        activation[static_cast<std::uint64_t>(batch_row) * intermediate +
+                   output_row] = bf16_round(
             bf16_silu[gate_bits] * limited_up);
     }
 }
@@ -482,12 +491,15 @@ __global__ void deepseek_fp8_down_kernel(
     std::uint64_t columns, std::uint64_t rows,
     std::uint64_t scale_columns) {
     const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
     if (output_row >= rows) return;
     const std::uint64_t weight_base = output_row * columns;
     const std::uint64_t scale_row = (output_row / 128U) * scale_columns;
     const std::uint32_t lane = threadIdx.x & 31U;
     const std::uint32_t warp = threadIdx.x >> 5U;
     const std::uint64_t groups = (columns + 31U) / 32U;
+    const std::uint64_t input_base =
+        static_cast<std::uint64_t>(batch_row) * columns;
     float sum = 0.0F;
     for (std::uint64_t group = warp; group < groups; group += 8U) {
         const std::uint64_t column = group * 32U + lane;
@@ -497,12 +509,15 @@ __global__ void deepseek_fp8_down_kernel(
                           : 0.0F;
         scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
         if (column < columns) {
-            sum += activation[column] *
+            sum += activation[input_base + column] *
                    fp8_e4m3_value(weights[weight_base + column]) * scale;
         }
     }
     sum = reduce_block(sum);
-    if (threadIdx.x == 0U) output[output_row] = bf16_round(sum);
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] =
+            bf16_round(sum);
+    }
 }
 
 // Decode-oriented FlashAttention-2 forward specialization. One CTA owns one
@@ -974,17 +989,21 @@ struct CudaBackend::Impl {
         float* moe_hidden{};
         float* moe_activations{};
         float* moe_output{};
+        DeepSeekFp4Work* moe_work{};
         float* moe_bf16_silu{};
         unsigned int* moe_error{};
         void* moe_host_staging{};
         std::uint64_t moe_hidden_bytes{};
         std::uint64_t moe_activation_bytes{};
         std::uint64_t moe_output_bytes{};
+        std::uint64_t moe_work_bytes{};
         std::uint64_t moe_host_staging_bytes{};
         std::uint64_t moe_hidden_columns{};
         std::uint64_t moe_intermediate_columns{};
         std::uint32_t moe_routed_count{};
+        std::uint32_t moe_shared_rows{};
         std::uint64_t moe_kernel_launches{};
+        std::vector<DeepSeekFp4Work> moe_host_work;
         std::vector<std::shared_ptr<CudaWeight::Impl>> moe_weights;
         std::vector<std::shared_ptr<CudaWeight::Impl>> quarantined_weights;
         std::shared_ptr<WeightArena> weight_arena;
@@ -1024,6 +1043,7 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaFree(state.moe_activations));
             }
             if (state.moe_output != nullptr) static_cast<void>(cudaFree(state.moe_output));
+            if (state.moe_work != nullptr) static_cast<void>(cudaFree(state.moe_work));
             if (state.moe_bf16_silu != nullptr) {
                 static_cast<void>(cudaFree(state.moe_bf16_silu));
             }
@@ -2035,6 +2055,27 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     int device, std::span<const float> hidden,
     std::span<const CudaDeepSeekMoeExpert> routed,
     const CudaDeepSeekMoeExpert* shared, float swiglu_limit) {
+    if (routed.size() > 6U) {
+        return {{"DeepSeek MoE command requires one to six routed experts or a shared expert"}};
+    }
+    std::array<CudaDeepSeekMoeRow, 6> rows{};
+    std::array<CudaDeepSeekMoeGroup, 6> groups{};
+    for (std::size_t index = 0U; index < routed.size(); ++index) {
+        rows[index].coefficient = routed[index].coefficient;
+        groups[index] = {routed[index].w1, routed[index].w3,
+                         routed[index].w2,
+                         std::span<const CudaDeepSeekMoeRow>(&rows[index], 1U)};
+    }
+    return enqueue_deepseek_moe_batch(
+        device, hidden, 1U,
+        std::span<const CudaDeepSeekMoeGroup>(groups).first(routed.size()),
+        shared, swiglu_limit);
+}
+
+ValidationResult CudaBackend::enqueue_deepseek_moe_batch(
+    int device, std::span<const float> hidden, std::uint32_t hidden_rows,
+    std::span<const CudaDeepSeekMoeGroup> routed,
+    const CudaDeepSeekMoeExpert* shared, float swiglu_limit) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -2048,10 +2089,9 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             "DeepSeek MoE workspace already has an in-flight command");
         return result;
     }
-    if (routed.size() > kMaxDeepSeekRoutedExperts ||
-        (routed.empty() && shared == nullptr)) {
+    if (hidden_rows == 0U || (routed.empty() && shared == nullptr)) {
         result.errors.emplace_back(
-            "DeepSeek MoE command requires one to six routed experts or a shared expert");
+            "DeepSeek MoE batch requires hidden rows and routed or shared work");
         return result;
     }
     if (!std::isfinite(swiglu_limit) || swiglu_limit <= 0.0F) {
@@ -2062,11 +2102,12 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
 
     std::uint64_t hidden_columns = 0U;
     std::uint64_t intermediate_columns = 0U;
-    auto validate_expert = [&](const CudaDeepSeekMoeExpert& expert,
-                               CudaWeightEncoding encoding,
-                               bool shared_expert) {
+    auto validate_expert = [&](const CudaWeight* expert_w1,
+                               const CudaWeight* expert_w3,
+                               const CudaWeight* expert_w2,
+                               CudaWeightEncoding encoding) {
         const std::array<const CudaWeight*, 3> weights{
-            expert.w1, expert.w3, expert.w2};
+            expert_w1, expert_w3, expert_w2};
         for (const auto* weight : weights) {
             if (weight == nullptr || !weight->valid()) {
                 result.errors.emplace_back(
@@ -2084,9 +2125,9 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
                 return false;
             }
         }
-        const auto& w1 = expert.w1->impl_->descriptor;
-        const auto& w3 = expert.w3->impl_->descriptor;
-        const auto& w2 = expert.w2->impl_->descriptor;
+        const auto& w1 = expert_w1->impl_->descriptor;
+        const auto& w3 = expert_w3->impl_->descriptor;
+        const auto& w2 = expert_w2->impl_->descriptor;
         const auto expected_dtype = encoding == CudaWeightEncoding::Fp4E2m1Group32
                                         ? SafetensorsDtype::I8
                                         : SafetensorsDtype::F8E4M3;
@@ -2103,12 +2144,6 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
                 "DeepSeek MoE W1/W3/W2 shapes or native encoding metadata are invalid");
             return false;
         }
-        if (!std::isfinite(expert.coefficient) ||
-            (shared_expert && expert.coefficient != 1.0F)) {
-            result.errors.emplace_back(
-                "DeepSeek MoE expert coefficient is invalid");
-            return false;
-        }
         if (hidden_columns == 0U) {
             hidden_columns = w1.columns;
             intermediate_columns = w1.rows;
@@ -2120,43 +2155,82 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         }
         return true;
     };
-    for (const auto& expert : routed) {
-        if (!validate_expert(expert, CudaWeightEncoding::Fp4E2m1Group32,
-                             false)) {
+    std::uint64_t routed_count = 0U;
+    for (const auto& group : routed) {
+        if (group.rows.empty()) {
+            result.errors.emplace_back(
+                "DeepSeek MoE routed group contains no rows");
+            return result;
+        }
+        if (!validate_expert(group.w1, group.w3, group.w2,
+                             CudaWeightEncoding::Fp4E2m1Group32)) {
+            return result;
+        }
+        for (const auto& row : group.rows) {
+            if (row.row >= hidden_rows || !std::isfinite(row.coefficient)) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE routed row or coefficient is invalid");
+                return result;
+            }
+        }
+        if (group.rows.size() >
+            std::numeric_limits<std::uint64_t>::max() - routed_count) {
+            result.errors.emplace_back("DeepSeek MoE routed row count overflows");
+            return result;
+        }
+        routed_count += group.rows.size();
+    }
+    if (shared != nullptr) {
+        if (!std::isfinite(shared->coefficient) ||
+            shared->coefficient != 1.0F) {
+            result.errors.emplace_back(
+                "DeepSeek MoE expert coefficient is invalid");
+            return result;
+        }
+        if (!validate_expert(shared->w1, shared->w3, shared->w2,
+                             CudaWeightEncoding::Fp8E4m3Block128)) {
             return result;
         }
     }
-    if (shared != nullptr &&
-        !validate_expert(*shared, CudaWeightEncoding::Fp8E4m3Block128, true)) {
+    if (hidden_rows > std::numeric_limits<std::uint16_t>::max() ||
+        routed_count > std::numeric_limits<std::uint16_t>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE routed row count exceeds the CUDA grid limit");
         return result;
     }
-    if (hidden.empty() || hidden.size() != hidden_columns ||
+    if (hidden.empty() ||
         hidden_columns > std::numeric_limits<unsigned int>::max() ||
-        intermediate_columns > std::numeric_limits<unsigned int>::max()) {
+        intermediate_columns > std::numeric_limits<unsigned int>::max() ||
+        hidden.size() != static_cast<std::uint64_t>(hidden_rows) * hidden_columns) {
         result.errors.emplace_back(
-            "DeepSeek MoE hidden row or expert dimensions are incompatible");
+            "DeepSeek MoE hidden rows or expert dimensions are incompatible");
         return result;
     }
     if (!std::all_of(hidden.begin(), hidden.end(),
                      [](float value) { return std::isfinite(value); })) {
         result.errors.emplace_back(
-            "DeepSeek MoE hidden row contains a non-finite value");
+            "DeepSeek MoE hidden rows contain a non-finite value");
         return result;
     }
 
-    const std::uint64_t expert_count =
+    const auto shared_rows = shared == nullptr ? 0U : hidden_rows;
+    const std::uint64_t expert_rows = routed_count + shared_rows;
+    const std::uint64_t expert_groups =
         static_cast<std::uint64_t>(routed.size()) + (shared == nullptr ? 0U : 1U);
     std::uint64_t hidden_bytes = 0U;
     std::uint64_t activation_bytes = 0U;
     std::uint64_t output_bytes = 0U;
+    std::uint64_t work_bytes = 0U;
     std::uint64_t host_staging_bytes = 0U;
-    if (!checked_bytes(1U, hidden_columns, sizeof(float), hidden_bytes) ||
-        !checked_bytes(expert_count, intermediate_columns, sizeof(float),
+    if (!checked_bytes(hidden_rows, hidden_columns, sizeof(float), hidden_bytes) ||
+        !checked_bytes(expert_rows, intermediate_columns, sizeof(float),
                        activation_bytes) ||
-        !checked_bytes(expert_count, hidden_columns, sizeof(float), output_bytes) ||
+        !checked_bytes(expert_rows, hidden_columns, sizeof(float), output_bytes) ||
+        !checked_bytes(routed_count, 1U, sizeof(DeepSeekFp4Work), work_bytes) ||
         hidden_bytes > std::numeric_limits<std::size_t>::max() ||
         activation_bytes > std::numeric_limits<std::size_t>::max() ||
         output_bytes > std::numeric_limits<std::size_t>::max() ||
+        work_bytes > std::numeric_limits<std::size_t>::max() ||
         output_bytes > std::numeric_limits<std::uint64_t>::max() -
                            sizeof(unsigned int)) {
         result.errors.emplace_back("DeepSeek MoE workspace size overflows");
@@ -2194,6 +2268,19 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         !ensure_workspace(state.moe_output, state.moe_output_bytes, output_bytes,
                           "allocate DeepSeek MoE output workspace")) {
         return result;
+    }
+    if (work_bytes > state.moe_work_bytes) {
+        if (state.moe_work != nullptr) static_cast<void>(cudaFree(state.moe_work));
+        state.moe_work = nullptr;
+        state.moe_work_bytes = 0U;
+        if (const auto status = cudaMalloc(
+                &state.moe_work, static_cast<std::size_t>(work_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek MoE row workspace");
+        }
+        state.moe_work_bytes = work_bytes;
+        ++allocation_calls;
+        allocation_bytes += work_bytes;
     }
     if (state.moe_bf16_silu == nullptr) {
         constexpr std::size_t entries = 1U << 16U;
@@ -2247,31 +2334,27 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         allocation_bytes += host_staging_bytes;
     }
 
-    DeepSeekFp4Batch routed_batch;
-    for (std::size_t index = 0U; index < routed.size(); ++index) {
-        const auto& expert = routed[index];
-        routed_batch.w1_weights[index] =
-            static_cast<const unsigned char*>(expert.w1->impl_->weights);
-        routed_batch.w1_scales[index] =
-            static_cast<const unsigned char*>(expert.w1->impl_->scales);
-        routed_batch.w3_weights[index] =
-            static_cast<const unsigned char*>(expert.w3->impl_->weights);
-        routed_batch.w3_scales[index] =
-            static_cast<const unsigned char*>(expert.w3->impl_->scales);
-        routed_batch.w2_weights[index] =
-            static_cast<const unsigned char*>(expert.w2->impl_->weights);
-        routed_batch.w2_scales[index] =
-            static_cast<const unsigned char*>(expert.w2->impl_->scales);
-        routed_batch.coefficients[index] = expert.coefficient;
+    state.moe_host_work.clear();
+    state.moe_host_work.reserve(static_cast<std::size_t>(routed_count));
+    for (const auto& group : routed) {
+        for (const auto& row : group.rows) {
+            state.moe_host_work.push_back({
+                static_cast<const unsigned char*>(group.w1->impl_->weights),
+                static_cast<const unsigned char*>(group.w1->impl_->scales),
+                static_cast<const unsigned char*>(group.w3->impl_->weights),
+                static_cast<const unsigned char*>(group.w3->impl_->scales),
+                static_cast<const unsigned char*>(group.w2->impl_->weights),
+                static_cast<const unsigned char*>(group.w2->impl_->scales),
+                row.coefficient, row.row});
+        }
     }
-    routed_batch.count = static_cast<std::uint32_t>(routed.size());
 
     state.moe_weights.clear();
-    state.moe_weights.reserve(static_cast<std::size_t>(expert_count * 3U));
-    for (const auto& expert : routed) {
-        state.moe_weights.push_back(expert.w1->impl_);
-        state.moe_weights.push_back(expert.w3->impl_);
-        state.moe_weights.push_back(expert.w2->impl_);
+    state.moe_weights.reserve(static_cast<std::size_t>(expert_groups * 3U));
+    for (const auto& group : routed) {
+        state.moe_weights.push_back(group.w1->impl_);
+        state.moe_weights.push_back(group.w3->impl_);
+        state.moe_weights.push_back(group.w2->impl_);
     }
     if (shared != nullptr) {
         state.moe_weights.push_back(shared->w1->impl_);
@@ -2281,7 +2364,8 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
 
     state.moe_hidden_columns = hidden_columns;
     state.moe_intermediate_columns = intermediate_columns;
-    state.moe_routed_count = routed_batch.count;
+    state.moe_routed_count = static_cast<std::uint32_t>(routed_count);
+    state.moe_shared_rows = shared_rows;
     state.moe_has_shared = shared != nullptr;
     state.moe_kernel_launches = 0U;
     state.moe_in_flight = true;
@@ -2318,6 +2402,15 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         abort_enqueue(status, "upload DeepSeek MoE hidden row");
         return result;
     }
+    if (work_bytes != 0U) {
+        if (auto status = cudaMemcpyAsync(
+                state.moe_work, state.moe_host_work.data(),
+                static_cast<std::size_t>(work_bytes), cudaMemcpyHostToDevice,
+                state.stream); status != cudaSuccess) {
+            abort_enqueue(status, "upload DeepSeek MoE routed row descriptors");
+            return result;
+        }
+    }
     if (auto status = cudaEventRecord(state.moe_hidden_uploaded, state.stream);
         status != cudaSuccess) {
         abort_enqueue(status, "record DeepSeek MoE hidden upload");
@@ -2326,10 +2419,10 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
 
     constexpr unsigned int threads = 256U;
     const dim3 hidden_quantize_grid(
-        static_cast<unsigned int>((hidden_columns + 127U) / 128U), 1U, 1U);
+        static_cast<unsigned int>((hidden_columns + 127U) / 128U), hidden_rows, 1U);
     quantize_activation_e4m3_kernel<<<hidden_quantize_grid, 128U, 0U,
                                       state.stream>>>(
-        state.moe_hidden, hidden_columns, 1U);
+        state.moe_hidden, hidden_columns, hidden_rows);
     ++state.moe_kernel_launches;
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch DeepSeek MoE hidden quantization");
@@ -2340,9 +2433,10 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         const auto& w1 = routed.front().w1->impl_->descriptor;
         const auto& w2 = routed.front().w2->impl_->descriptor;
         const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
-                             routed_batch.count, 1U);
+                             state.moe_routed_count, 1U);
         deepseek_fp4_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
-            state.moe_activations, state.moe_hidden, routed_batch,
+            state.moe_activations, state.moe_hidden, state.moe_work,
+            state.moe_routed_count,
             hidden_columns, intermediate_columns, w1.packed_columns,
             w1.scale_columns, swiglu_limit, state.moe_bf16_silu,
             state.moe_error);
@@ -2353,19 +2447,21 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         }
         const dim3 activation_grid(
             static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
-            routed_batch.count, 1U);
+            state.moe_routed_count, 1U);
         quantize_activation_e4m3_kernel<<<activation_grid, 128U, 0U,
                                           state.stream>>>(
-            state.moe_activations, intermediate_columns, routed_batch.count);
+            state.moe_activations, intermediate_columns,
+            state.moe_routed_count);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek routed activation quantization");
             return result;
         }
         const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
-                             routed_batch.count, 1U);
+                             state.moe_routed_count, 1U);
         deepseek_fp4_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
-            state.moe_output, state.moe_activations, routed_batch,
+            state.moe_output, state.moe_activations, state.moe_work,
+            state.moe_routed_count,
             intermediate_columns, hidden_columns, w2.packed_columns,
             w2.scale_columns);
         ++state.moe_kernel_launches;
@@ -2379,12 +2475,12 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         const auto& w1 = shared->w1->impl_->descriptor;
         const auto& w2 = shared->w2->impl_->descriptor;
         float* shared_activation = state.moe_activations +
-            static_cast<std::uint64_t>(routed_batch.count) * intermediate_columns;
+            routed_count * intermediate_columns;
         float* shared_output = state.moe_output +
-            static_cast<std::uint64_t>(routed_batch.count) * hidden_columns;
-        deepseek_fp8_gate_up_kernel<<<
-            static_cast<unsigned int>(intermediate_columns), threads, 0U,
-            state.stream>>>(
+            routed_count * hidden_columns;
+        const dim3 shared_gate_grid(
+            static_cast<unsigned int>(intermediate_columns), hidden_rows, 1U);
+        deepseek_fp8_gate_up_kernel<<<shared_gate_grid, threads, 0U, state.stream>>>(
             shared_activation, state.moe_hidden,
             static_cast<const unsigned char*>(shared->w1->impl_->weights),
             static_cast<const unsigned char*>(shared->w1->impl_->scales),
@@ -2399,18 +2495,18 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         }
         const dim3 shared_activation_grid(
             static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
-            1U, 1U);
+            hidden_rows, 1U);
         quantize_activation_e4m3_kernel<<<shared_activation_grid, 128U, 0U,
                                           state.stream>>>(
-            shared_activation, intermediate_columns, 1U);
+            shared_activation, intermediate_columns, hidden_rows);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared activation quantization");
             return result;
         }
-        deepseek_fp8_down_kernel<<<
-            static_cast<unsigned int>(hidden_columns), threads, 0U,
-            state.stream>>>(
+        const dim3 shared_down_grid(
+            static_cast<unsigned int>(hidden_columns), hidden_rows, 1U);
+        deepseek_fp8_down_kernel<<<shared_down_grid, threads, 0U, state.stream>>>(
             shared_output, shared_activation,
             static_cast<const unsigned char*>(shared->w2->impl_->weights),
             static_cast<const unsigned char*>(shared->w2->impl_->scales),
@@ -2432,13 +2528,13 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
         device_stats.activation_h2d_bytes += hidden_bytes;
-        device_stats.matmul_calls += 3U * expert_count;
+        device_stats.matmul_calls += 3U * expert_rows;
         device_stats.workspace_allocation_calls += allocation_calls;
         device_stats.workspace_allocation_bytes += allocation_bytes;
         ++device_stats.deepseek_moe_calls;
         device_stats.deepseek_moe_kernel_launches += state.moe_kernel_launches;
-        ++device_stats.deepseek_moe_h2d_transfers;
-        device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
+        device_stats.deepseek_moe_h2d_transfers += work_bytes == 0U ? 1U : 2U;
+        device_stats.deepseek_moe_h2d_bytes += hidden_bytes + work_bytes;
     }
     return result;
 }
@@ -2499,11 +2595,14 @@ ValidationResult CudaBackend::collect_deepseek_moe(
         }
     };
     std::uint64_t routed_elements = 0U;
+    std::uint64_t shared_elements = 0U;
     if (!checked_bytes(state.moe_routed_count, state.moe_hidden_columns, 1U,
                        routed_elements) ||
+        !checked_bytes(state.moe_shared_rows, state.moe_hidden_columns, 1U,
+                       shared_elements) ||
         routed_output.size() != routed_elements ||
         (state.moe_has_shared
-             ? shared_output.size() != state.moe_hidden_columns
+             ? shared_output.size() != shared_elements
              : !shared_output.empty())) {
         result.errors.emplace_back(
             "DeepSeek MoE collect output spans do not match the enqueued command");

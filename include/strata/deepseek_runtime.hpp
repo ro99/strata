@@ -62,6 +62,7 @@ struct Dsv4DeviceMoeStats {
     std::uint64_t batches{};
     std::uint64_t device_commands{};
     std::uint64_t routed_experts{};
+    std::uint64_t unique_routed_experts{};
     std::uint64_t shared_experts{};
     std::uint64_t nanoseconds{};
 };

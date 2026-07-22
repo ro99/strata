@@ -147,6 +147,21 @@ struct CudaDeepSeekMoeExpert {
     float coefficient{1.0F};
 };
 
+struct CudaDeepSeekMoeRow {
+    std::uint32_t row{};
+    float coefficient{1.0F};
+};
+
+// One expert weight triplet shared by every listed input row. Group and row
+// order define the flattened routed output order; shared output remains in
+// original hidden-row order.
+struct CudaDeepSeekMoeGroup {
+    const CudaWeight* w1{};
+    const CudaWeight* w3{};
+    const CudaWeight* w2{};
+    std::span<const CudaDeepSeekMoeRow> rows;
+};
+
 class CudaBackend {
 public:
     CudaBackend();
@@ -205,6 +220,10 @@ public:
     [[nodiscard]] ValidationResult enqueue_deepseek_moe(
         int device, std::span<const float> hidden,
         std::span<const CudaDeepSeekMoeExpert> routed,
+        const CudaDeepSeekMoeExpert* shared, float swiglu_limit);
+    [[nodiscard]] ValidationResult enqueue_deepseek_moe_batch(
+        int device, std::span<const float> hidden, std::uint32_t hidden_rows,
+        std::span<const CudaDeepSeekMoeGroup> routed,
         const CudaDeepSeekMoeExpert* shared, float swiglu_limit);
     [[nodiscard]] ValidationResult collect_deepseek_moe(
         int device, std::span<float> routed_output,

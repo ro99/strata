@@ -723,10 +723,10 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
     REQUIRE(after.deepseek_moe_kernel_launches -
                 before.deepseek_moe_kernel_launches == 7U);
     REQUIRE(after.deepseek_moe_h2d_transfers -
-                before.deepseek_moe_h2d_transfers == 1U);
+                before.deepseek_moe_h2d_transfers == 2U);
     REQUIRE(after.deepseek_moe_d2h_transfers -
                 before.deepseek_moe_d2h_transfers == 2U);
-    REQUIRE(after.deepseek_moe_h2d_bytes - before.deepseek_moe_h2d_bytes ==
+    REQUIRE(after.deepseek_moe_h2d_bytes - before.deepseek_moe_h2d_bytes >
             hidden_columns * sizeof(float));
     REQUIRE(after.deepseek_moe_d2h_bytes - before.deepseek_moe_d2h_bytes ==
             3U * hidden_columns * sizeof(float) + sizeof(unsigned int));
@@ -736,7 +736,7 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
     REQUIRE(after.activation_d2h_bytes - before.activation_d2h_bytes ==
             3U * hidden_columns * sizeof(float));
     REQUIRE(after.workspace_allocation_calls -
-                before.workspace_allocation_calls == 6U);
+                before.workspace_allocation_calls == 7U);
     REQUIRE(after.synchronization_calls - before.synchronization_calls == 1U);
     REQUIRE(after.deepseek_moe_h2d_nanoseconds >
             before.deepseek_moe_h2d_nanoseconds);
@@ -777,4 +777,105 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
         device, hidden, routed, &shared, 10.0F).ok());
     REQUIRE(backend.collect_deepseek_moe(
         device, routed_output, shared_output).ok());
+}
+
+TEST_CASE("native CUDA backend batches repeated DeepSeek experts across rows") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint64_t hidden_columns = 32U;
+    constexpr std::uint64_t intermediate_columns = 32U;
+    constexpr std::uint32_t hidden_rows = 3U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto routed0_w1 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 1U);
+    auto routed0_w3 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 6U);
+    auto routed0_w2 = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    auto routed1_w1 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto routed1_w3 = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 9U);
+    auto routed1_w2 = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 14U);
+    auto shared_w1 = upload_fp8(
+        backend, device, intermediate_columns, hidden_columns, 1U);
+    auto shared_w3 = upload_fp8(
+        backend, device, intermediate_columns, hidden_columns, 4U);
+    auto shared_w2 = upload_fp8(
+        backend, device, hidden_columns, intermediate_columns, 7U);
+
+    std::array<float, hidden_rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 13U) - 6) *
+                        0.0625F;
+    }
+    constexpr std::array<strata::CudaDeepSeekMoeRow, 2> routed0_rows{{
+        {0U, 0.75F}, {2U, 0.5F},
+    }};
+    constexpr std::array<strata::CudaDeepSeekMoeRow, 1> routed1_rows{{
+        {1U, 0.3125F},
+    }};
+    const std::array<strata::CudaDeepSeekMoeGroup, 2> routed{{
+        {&routed0_w1, &routed0_w3, &routed0_w2, routed0_rows},
+        {&routed1_w1, &routed1_w3, &routed1_w2, routed1_rows},
+    }};
+    const strata::CudaDeepSeekMoeExpert shared{
+        &shared_w1, &shared_w3, &shared_w2, 1.0F};
+
+    std::array<std::vector<float>, 3> routed_reference{
+        reference_expert(
+            backend, routed0_w1, routed0_w3, routed0_w2,
+            std::span<const float>(hidden).subspan(0U, hidden_columns),
+            intermediate_columns, routed0_rows[0].coefficient, true),
+        reference_expert(
+            backend, routed0_w1, routed0_w3, routed0_w2,
+            std::span<const float>(hidden).subspan(
+                2U * hidden_columns, hidden_columns),
+            intermediate_columns, routed0_rows[1].coefficient, true),
+        reference_expert(
+            backend, routed1_w1, routed1_w3, routed1_w2,
+            std::span<const float>(hidden).subspan(
+                hidden_columns, hidden_columns),
+            intermediate_columns, routed1_rows[0].coefficient, true),
+    };
+    std::array<std::vector<float>, hidden_rows> shared_reference;
+    for (std::size_t row = 0U; row < hidden_rows; ++row) {
+        shared_reference[row] = reference_expert(
+            backend, shared_w1, shared_w3, shared_w2,
+            std::span<const float>(hidden).subspan(
+                row * hidden_columns, hidden_columns),
+            intermediate_columns, 1.0F, false);
+    }
+
+    std::array<float, 3U * hidden_columns> routed_output{};
+    std::array<float, hidden_rows * hidden_columns> shared_output{};
+    const auto before = backend.stats();
+    REQUIRE(backend.enqueue_deepseek_moe_batch(
+        device, hidden, hidden_rows, routed, &shared, 10.0F).ok());
+    REQUIRE(backend.collect_deepseek_moe(
+        device, routed_output, shared_output).ok());
+    for (std::size_t row = 0U; row < routed_reference.size(); ++row) {
+        for (std::size_t column = 0U; column < hidden_columns; ++column) {
+            REQUIRE(std::bit_cast<std::uint32_t>(
+                        routed_output[row * hidden_columns + column]) ==
+                    std::bit_cast<std::uint32_t>(routed_reference[row][column]));
+        }
+    }
+    for (std::size_t row = 0U; row < hidden_rows; ++row) {
+        for (std::size_t column = 0U; column < hidden_columns; ++column) {
+            REQUIRE(std::bit_cast<std::uint32_t>(
+                        shared_output[row * hidden_columns + column]) ==
+                    std::bit_cast<std::uint32_t>(shared_reference[row][column]));
+        }
+    }
+    const auto after = backend.stats();
+    REQUIRE(after.deepseek_moe_calls - before.deepseek_moe_calls == 1U);
+    REQUIRE(after.deepseek_moe_kernel_launches -
+                before.deepseek_moe_kernel_launches == 7U);
+    REQUIRE(after.matmul_calls - before.matmul_calls == 18U);
 }

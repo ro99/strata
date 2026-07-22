@@ -267,6 +267,10 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"activation_h2d_bytes\":" << device.activation_h2d_bytes
                << ",\"activation_d2h_bytes\":" << device.activation_d2h_bytes
                << ",\"matmul_calls\":" << device.matmul_calls
+               << ",\"workspace_allocation_calls\":"
+               << device.workspace_allocation_calls
+               << ",\"workspace_allocation_bytes\":"
+               << device.workspace_allocation_bytes
                << ",\"synchronization_calls\":" << device.synchronization_calls
                << ",\"synchronization_seconds\":"
                << static_cast<double>(device.synchronization_nanoseconds) / 1.0e9
@@ -349,6 +353,7 @@ void print_device_moe_stats(
     output << "{\"batches\":" << stats.batches
            << ",\"device_commands\":" << stats.device_commands
            << ",\"routed_experts\":" << stats.routed_experts
+           << ",\"unique_routed_experts\":" << stats.unique_routed_experts
            << ",\"shared_experts\":" << stats.shared_experts
            << ",\"execution_seconds\":"
            << static_cast<double>(stats.nanoseconds) / 1.0e9

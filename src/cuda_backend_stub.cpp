@@ -77,6 +77,13 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::enqueue_deepseek_moe_batch(
+    int, std::span<const float>, std::uint32_t,
+    std::span<const CudaDeepSeekMoeGroup>,
+    const CudaDeepSeekMoeExpert*, float) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::collect_deepseek_moe(
     int, std::span<float>, std::span<float>) {
     return {{"CUDA support was not compiled into this build"}};

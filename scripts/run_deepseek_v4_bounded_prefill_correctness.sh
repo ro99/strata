@@ -64,11 +64,17 @@ jq -n \
         oracle: {
             prompt_tokens: $oracle[0].prompt_tokens,
             prefill_seconds: $oracle[0].prefill_seconds,
+            device_moe: $oracle[0].phases.prefill.device_moe_runtime,
+            cuda: $oracle[0].phases.prefill.cuda,
+            cache: $oracle[0].phases.prefill.cache,
             graph: $oracle[0].phases.prefill.graph
         },
         paged: {
             prompt_tokens: $paged[0].prompt_tokens,
             prefill_seconds: $paged[0].prefill_seconds,
+            device_moe: $paged[0].phases.prefill.device_moe_runtime,
+            cuda: $paged[0].phases.prefill.cuda,
+            cache: $paged[0].phases.prefill.cache,
             graph: $paged[0].phases.prefill.graph
         },
         gates: {
@@ -111,7 +117,25 @@ jq -n \
                  $paged[0].phases.prefill.graph.attention_projection_matmul_rows),
             attention_projection_calls_reduced:
                 ($paged[0].phases.prefill.graph.attention_projection_matmul_calls <
-                 $oracle[0].phases.prefill.graph.attention_projection_matmul_calls)
+                 $oracle[0].phases.prefill.graph.attention_projection_matmul_calls),
+            expert_rows_equal:
+                (([$oracle[0].phases.prefill.device_moe_runtime.routed_experts,
+                   $oracle[0].phases.prefill.device_moe_runtime.shared_experts]) ==
+                 ([$paged[0].phases.prefill.device_moe_runtime.routed_experts,
+                   $paged[0].phases.prefill.device_moe_runtime.shared_experts])),
+            unique_experts_reduced:
+                ($paged[0].phases.prefill.device_moe_runtime.unique_routed_experts <
+                 $oracle[0].phases.prefill.device_moe_runtime.unique_routed_experts),
+            expert_kernel_launches_reduced:
+                ($paged[0].phases.prefill.cuda.deepseek_moe_kernel_launches <
+                 $oracle[0].phases.prefill.cuda.deepseek_moe_kernel_launches),
+            leases_balanced:
+                ($oracle[0].phases.prefill.cache.lease_acquires ==
+                    $oracle[0].phases.prefill.cache.lease_releases and
+                 $paged[0].phases.prefill.cache.lease_acquires ==
+                    $paged[0].phases.prefill.cache.lease_releases and
+                 ([$oracle[0].phases.prefill.cache.active_leases[],
+                   $paged[0].phases.prefill.cache.active_leases[]] | all(. == 0)))
         }
     }
     | .acceptance_pass = ([.gates[]] | all)

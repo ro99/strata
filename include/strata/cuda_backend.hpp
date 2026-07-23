@@ -13,6 +13,8 @@
 
 namespace strata {
 
+class CudaBuffer;
+
 enum class CudaWeightEncoding : std::uint8_t {
     Plain,
     OffsetPackedInt4,
@@ -72,6 +74,19 @@ struct CudaBackendStats {
         std::uint64_t flash_attention_kernel_nanoseconds{};
         std::uint64_t flash_attention_d2h_nanoseconds{};
         std::uint64_t flash_attention_nanoseconds{};
+        std::uint64_t lightning_index_calls{};
+        std::uint64_t lightning_index_kernel_launches{};
+        std::uint64_t lightning_index_candidates{};
+        std::uint64_t lightning_index_selected{};
+        std::uint64_t lightning_index_h2d_transfers{};
+        std::uint64_t lightning_index_d2h_transfers{};
+        std::uint64_t lightning_index_h2d_bytes{};
+        std::uint64_t lightning_index_d2h_bytes{};
+        std::uint64_t lightning_index_useful_selection_bytes{};
+        std::uint64_t lightning_index_h2d_nanoseconds{};
+        std::uint64_t lightning_index_kernel_nanoseconds{};
+        std::uint64_t lightning_index_d2h_nanoseconds{};
+        std::uint64_t lightning_index_nanoseconds{};
     };
 
     std::uint64_t weight_upload_bytes{};
@@ -110,12 +125,47 @@ struct CudaBackendStats {
     std::uint64_t flash_attention_kernel_nanoseconds{};
     std::uint64_t flash_attention_d2h_nanoseconds{};
     std::uint64_t flash_attention_nanoseconds{};
+    std::uint64_t lightning_index_calls{};
+    std::uint64_t lightning_index_kernel_launches{};
+    std::uint64_t lightning_index_candidates{};
+    std::uint64_t lightning_index_selected{};
+    std::uint64_t lightning_index_h2d_transfers{};
+    std::uint64_t lightning_index_d2h_transfers{};
+    std::uint64_t lightning_index_h2d_bytes{};
+    std::uint64_t lightning_index_d2h_bytes{};
+    std::uint64_t lightning_index_useful_selection_bytes{};
+    std::uint64_t lightning_index_h2d_nanoseconds{};
+    std::uint64_t lightning_index_kernel_nanoseconds{};
+    std::uint64_t lightning_index_d2h_nanoseconds{};
+    std::uint64_t lightning_index_nanoseconds{};
     std::vector<Device> devices;
 };
 
 struct CudaDeviceMemory {
     std::uint64_t free_bytes{};
     std::uint64_t total_bytes{};
+};
+
+// Each segment contains contiguous packed FP4 E2M1 keys followed by their
+// per-32 E8M0 scales. Exactly one source must be present. Device buffers let
+// the indexer consume cache blocks without restaging the compressed history.
+struct CudaLightningIndexSegment {
+    const CudaBuffer* device_buffer{};
+    std::span<const std::byte> host_bytes;
+    std::uint64_t byte_offset{};
+    std::uint32_t rows{};
+};
+
+struct CudaLightningIndexRequest {
+    // Queries are post-projection/RoPE BF16 values. CUDA applies normalized
+    // Hadamard rotation and FP4 E2M1/per-32 E8M0 simulation before scoring.
+    std::span<const float> queries;
+    std::span<const float> weights;
+    std::span<const CudaLightningIndexSegment> segments;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t top_k{};
+    std::uint64_t maximum_workspace_bytes{32ULL << 20U};
 };
 
 class CudaWeight {
@@ -206,6 +256,8 @@ public:
     // architecture until a later, longer request reaches the CUDA branch.
     [[nodiscard]] ValidationResult validate_flash_attention_device(
         int device) const;
+    [[nodiscard]] ValidationResult validate_lightning_index_device(
+        int device) const;
     // Executes the model-neutral forward attention primitive under the
     // request's explicit numerical contract. Host segments are packed into
     // bounded reusable device workspaces; indexed rows are gathered exactly in
@@ -214,6 +266,13 @@ public:
     [[nodiscard]] ValidationResult flash_attention(
         int device, const FlashAttentionRequest& request,
         std::span<float> output);
+    // Exact bounded-workspace DeepSeek Lightning Indexer. Output contains
+    // min(top_k, candidates) positions in descending score order with lower
+    // positions winning ties. Unsupported shapes fail; no scalar fallback is
+    // selected inside the backend.
+    [[nodiscard]] ValidationResult lightning_index(
+        int device, const CudaLightningIndexRequest& request,
+        std::span<std::uint32_t> output);
     // Enqueue first on every active device, then collect each device. Routed
     // results are flattened in the same order as `routed`; shared output is
     // returned separately so the caller retains the global accumulation order.

@@ -47,6 +47,19 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(flash_attention_kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(flash_attention_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_calls);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_kernel_launches);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_candidates);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_selected);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_h2d_transfers);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_d2h_transfers);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_h2d_bytes);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_d2h_bytes);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_useful_selection_bytes);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_h2d_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_d2h_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(lightning_index_nanoseconds);
 #undef STRATA_CUDA_DEVICE_DELTA
 }
 
@@ -90,6 +103,19 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(flash_attention_kernel_nanoseconds);
     STRATA_CUDA_DELTA(flash_attention_d2h_nanoseconds);
     STRATA_CUDA_DELTA(flash_attention_nanoseconds);
+    STRATA_CUDA_DELTA(lightning_index_calls);
+    STRATA_CUDA_DELTA(lightning_index_kernel_launches);
+    STRATA_CUDA_DELTA(lightning_index_candidates);
+    STRATA_CUDA_DELTA(lightning_index_selected);
+    STRATA_CUDA_DELTA(lightning_index_h2d_transfers);
+    STRATA_CUDA_DELTA(lightning_index_d2h_transfers);
+    STRATA_CUDA_DELTA(lightning_index_h2d_bytes);
+    STRATA_CUDA_DELTA(lightning_index_d2h_bytes);
+    STRATA_CUDA_DELTA(lightning_index_useful_selection_bytes);
+    STRATA_CUDA_DELTA(lightning_index_h2d_nanoseconds);
+    STRATA_CUDA_DELTA(lightning_index_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(lightning_index_d2h_nanoseconds);
+    STRATA_CUDA_DELTA(lightning_index_nanoseconds);
 #undef STRATA_CUDA_DELTA
 }
 

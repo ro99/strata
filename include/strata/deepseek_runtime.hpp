@@ -32,6 +32,7 @@ struct Dsv4RuntimeConfig {
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     bool enable_flash_attention{};
+    bool enable_gpu_lightning_indexer{};
     bool enable_incremental_kv_continuation{true};
     // CUDA offload has a fixed launch/staging cost. The production default
     // retains parallel host attention below the measured row crossover; zero
@@ -90,6 +91,8 @@ struct Dsv4GraphStats {
     std::uint64_t attention_index_queries{};
     std::uint64_t attention_index_candidates{};
     std::uint64_t attention_index_selected{};
+    std::uint64_t attention_index_cuda_dispatches{};
+    std::uint64_t attention_index_scalar_dispatches{};
     std::uint64_t attention_cuda_dispatches{};
     std::uint64_t attention_scalar_dispatches{};
     std::uint64_t attention_score_nanoseconds{};
@@ -144,6 +147,7 @@ struct Dsv4GenerationMetrics {
     std::uint32_t host_attention_threads{};
     std::uint32_t prefill_page_tokens{};
     bool flash_attention_enabled{};
+    bool gpu_lightning_indexer_enabled{};
     std::uint32_t flash_attention_minimum_rows{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};

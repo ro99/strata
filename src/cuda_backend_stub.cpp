@@ -79,9 +79,18 @@ ValidationResult CudaBackend::validate_flash_attention_device(int) const {
     return {{"FlashAttention requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::validate_lightning_index_device(int) const {
+    return {{"Lightning Indexer requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::flash_attention(
     int, const FlashAttentionRequest&, std::span<float>) {
     return {{"FlashAttention requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::lightning_index(
+    int, const CudaLightningIndexRequest&, std::span<std::uint32_t>) {
+    return {{"Lightning Indexer requires a CUDA-enabled build"}};
 }
 
 ValidationResult CudaBackend::enqueue_deepseek_moe(

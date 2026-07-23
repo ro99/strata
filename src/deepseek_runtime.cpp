@@ -269,6 +269,10 @@ void apply_rope(std::span<float> values, std::uint64_t position,
         after.attention_index_queries - before.attention_index_queries,
         after.attention_index_candidates - before.attention_index_candidates,
         after.attention_index_selected - before.attention_index_selected,
+        after.attention_index_cuda_dispatches -
+            before.attention_index_cuda_dispatches,
+        after.attention_index_scalar_dispatches -
+            before.attention_index_scalar_dispatches,
         after.attention_cuda_dispatches - before.attention_cuda_dispatches,
         after.attention_scalar_dispatches - before.attention_scalar_dispatches,
         after.attention_score_nanoseconds - before.attention_score_nanoseconds,
@@ -890,6 +894,7 @@ void DeepSeekV4Runtime::Impl::reset_diagnostics() {
     diagnostics.logit_trace_enabled = config.enable_logit_trace;
     diagnostics.layer_hash_trace_enabled = config.enable_layer_hash_trace;
     diagnostics.logit_top_k = config.logit_trace_top_k;
+    diagnostics.index_selection_trace_hash = kDiagnosticFnvOffset;
     graph_stats.prefill_pages = 0U;
     graph_stats.prefill_max_page_tokens = 0U;
     graph_stats.prefill_max_workspace_bytes = 0U;
@@ -1361,6 +1366,18 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     std::vector<std::uint32_t>& selected) {
     ValidationResult result;
     selected.clear();
+    const auto record_selection = [&] {
+        auto hash = diagnostics.index_selection_trace_hash;
+        hash = diagnostic_hash_u32(hash, layer);
+        hash = diagnostic_hash_u32(hash, position);
+        hash = diagnostic_hash_u32(
+            hash, static_cast<std::uint32_t>(selected.size()));
+        for (const auto selected_position : selected) {
+            hash = diagnostic_hash_u32(hash, selected_position);
+        }
+        diagnostics.index_selection_trace_hash = hash;
+        ++diagnostics.index_selection_count;
+    };
     auto& state = attention_state[layer].indexer_compressor;
     if (state.ratio == 0U) {
         result.errors.emplace_back(
@@ -1376,6 +1393,7 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     if (compressed_count <= kIndexTopK) {
         selected.resize(compressed_count);
         std::iota(selected.begin(), selected.end(), 0U);
+        record_selection();
         return result;
     }
     ++graph_stats.attention_index_queries;
@@ -1394,10 +1412,12 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
         apply_rope(query.last(kRopeDim), position,
                    attention_state[layer].frequencies);
         round_bf16(query.last(kRopeDim));
-        result = dsv4_hadamard_rotate_f32(query);
-        if (!result.ok()) return result;
-        result = dsv4_fp4_e2m1_simulate_f32(query, 32U);
-        if (!result.ok()) return result;
+        if (!config.enable_gpu_lightning_indexer) {
+            result = dsv4_hadamard_rotate_f32(query);
+            if (!result.ok()) return result;
+            result = dsv4_fp4_e2m1_simulate_f32(query, 32U);
+            if (!result.ok()) return result;
+        }
     }
 
     std::vector<float> index_weights(kIndexHeads);
@@ -1407,6 +1427,77 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     constexpr float index_scale =
         1.0F / std::sqrt(static_cast<float>(kIndexHeadDim * kIndexHeads));
     for (auto& weight : index_weights) weight = round_bf16(weight * index_scale);
+
+    if (config.enable_gpu_lightning_indexer) {
+        std::vector<CudaLightningIndexSegment> segments;
+        std::vector<Dsv4KvDeviceLease> leases;
+        const bool device_resident =
+            !config.device_kv_cache_bytes.empty() &&
+            config.device_kv_cache_bytes[slot] != 0U;
+        if (device_resident) {
+            auto blocks = kv_cache->block_table(
+                active_sequence, Dsv4KvBlockKind::LearnedIndex, layer);
+            if (!blocks.ok()) {
+                append_errors(result, std::move(blocks.errors));
+                return result;
+            }
+            try {
+                segments.reserve(blocks.value.size());
+                leases.reserve(blocks.value.size());
+            } catch (const std::bad_alloc&) {
+                result.errors.emplace_back(
+                    "cannot allocate Lightning Indexer block metadata");
+                return result;
+            }
+            std::uint32_t remaining = compressed_count;
+            for (const auto& block : blocks.value) {
+                if (remaining == 0U) break;
+                const auto logical_row = block.logical_begin /
+                                         block.compression_ratio;
+                auto lease = kv_cache->acquire_device(
+                    active_sequence, Dsv4KvBlockKind::LearnedIndex,
+                    layer, logical_row, slot);
+                if (!lease.ok()) {
+                    append_errors(result, std::move(lease.errors));
+                    return result;
+                }
+                const auto rows = std::min(remaining, block.used_rows);
+                leases.push_back(std::move(lease.value));
+                segments.push_back(CudaLightningIndexSegment{
+                    leases.back().buffer(), {}, kDsv4KvBlockHeaderBytes, rows});
+                remaining -= rows;
+            }
+            if (remaining != 0U) {
+                result.errors.emplace_back(
+                    "Lightning Indexer device history is incomplete");
+                return result;
+            }
+        } else {
+            auto compact = kv_cache->learned_index_segments(
+                active_sequence, layer, compressed_count);
+            if (!compact.ok()) {
+                append_errors(result, std::move(compact.errors));
+                return result;
+            }
+            segments = std::move(compact.value);
+        }
+        selected.resize(kIndexTopK);
+        CudaLightningIndexRequest request;
+        request.queries = queries;
+        request.weights = index_weights;
+        request.segments = segments;
+        request.heads = kIndexHeads;
+        request.head_dim = kIndexHeadDim;
+        request.top_k = kIndexTopK;
+        result = cuda.lightning_index(devices[slot], request, selected);
+        if (!result.ok()) {
+            selected.clear();
+            return result;
+        }
+        ++graph_stats.attention_index_cuda_dispatches;
+        record_selection();
+        return result;
+    }
 
     std::vector<float> scores(compressed_count);
     const auto score_key = [&](std::size_t row, std::span<const float> key) {
@@ -1456,6 +1547,8 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
         return result;
     }
     selected = std::move(topk.positions);
+    ++graph_stats.attention_index_scalar_dispatches;
+    record_selection();
     return result;
 }
 
@@ -2711,6 +2804,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "DeepSeek KV block row count must be positive");
         return result;
     }
+    if (config.enable_gpu_lightning_indexer &&
+        config.kv_cache_mode != Dsv4KvCacheMode::Block) {
+        result.errors.emplace_back(
+            "GPU Lightning Indexer requires the exact compact block KV cache");
+        return result;
+    }
     if (!config.device_kv_cache_bytes.empty() &&
         config.device_kv_cache_bytes.size() != config.devices.size()) {
         result.errors.emplace_back(
@@ -2770,6 +2869,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (config.enable_flash_attention) {
         for (const int device : config.devices) {
             result = impl_->cuda.validate_flash_attention_device(device);
+            if (!result.ok()) return result;
+        }
+    }
+    if (config.enable_gpu_lightning_indexer) {
+        for (const int device : config.devices) {
+            result = impl_->cuda.validate_lightning_index_device(device);
             if (!result.ok()) return result;
         }
     }
@@ -2956,6 +3061,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.prefill_page_tokens;
     impl_->initialization_metrics.flash_attention_enabled =
         config.enable_flash_attention;
+    impl_->initialization_metrics.gpu_lightning_indexer_enabled =
+        config.enable_gpu_lightning_indexer;
     impl_->initialization_metrics.flash_attention_minimum_rows =
         config.flash_attention_minimum_rows;
     impl_->initialization_metrics.resident_read_workers =

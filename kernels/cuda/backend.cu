@@ -314,6 +314,189 @@ __device__ float bf16_round(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
+struct LightningDeviceSegment {
+    const unsigned char* keys{};
+    std::uint32_t begin{};
+    std::uint32_t rows{};
+};
+
+__device__ float lightning_fp4_magnitude(std::uint32_t encoded) {
+    constexpr float values[8]{0.0F, 0.5F, 1.0F, 1.5F,
+                              2.0F, 3.0F, 4.0F, 6.0F};
+    return values[encoded & 7U];
+}
+
+__global__ void lightning_query_fp4_kernel(
+    unsigned char* packed, const float* queries,
+    std::uint32_t heads, std::uint32_t head_dim) {
+    const auto head = blockIdx.x;
+    if (head >= heads) return;
+    extern __shared__ float values[];
+    for (std::uint32_t column = threadIdx.x; column < head_dim;
+         column += blockDim.x) {
+        values[column] = queries[static_cast<std::uint64_t>(head) * head_dim +
+                                 column];
+    }
+    __syncthreads();
+    for (std::uint32_t width = 1U; width < head_dim; width *= 2U) {
+        for (std::uint32_t pair = threadIdx.x; pair < head_dim / 2U;
+             pair += blockDim.x) {
+            const auto begin = pair / width * width * 2U;
+            const auto offset = pair % width;
+            const float first = values[begin + offset];
+            const float second = values[begin + width + offset];
+            values[begin + offset] = first + second;
+            values[begin + width + offset] = first - second;
+        }
+        __syncthreads();
+    }
+    const float normalization = rsqrtf(static_cast<float>(head_dim));
+    for (std::uint32_t column = threadIdx.x; column < head_dim;
+         column += blockDim.x) {
+        values[column] = bf16_round(values[column] * normalization);
+    }
+    __syncthreads();
+
+    const auto packed_columns = head_dim / 2U;
+    const auto groups = head_dim / 32U;
+    auto* output = packed + static_cast<std::uint64_t>(head) *
+                                (packed_columns + groups);
+    for (std::uint32_t group = threadIdx.x; group < groups;
+         group += blockDim.x) {
+        float maximum = 0.0F;
+        for (std::uint32_t column = 0U; column < 32U; ++column) {
+            maximum = fmaxf(maximum, fabsf(values[group * 32U + column]));
+        }
+        const float bounded = fmaxf(maximum, ldexpf(6.0F, -126));
+        const float scale = exp2f(ceilf(log2f(bounded / 6.0F)));
+        output[packed_columns + group] = static_cast<unsigned char>(
+            ilogbf(scale) + 127);
+        for (std::uint32_t column = 0U; column < 32U; column += 2U) {
+            unsigned int encoded[2]{};
+            for (std::uint32_t item = 0U; item < 2U; ++item) {
+                const float value = values[group * 32U + column + item];
+                const float magnitude = fminf(fabsf(value / scale), 6.0F);
+                std::uint32_t nearest = 0U;
+                float distance = fabsf(magnitude - lightning_fp4_magnitude(0U));
+                for (std::uint32_t candidate = 1U; candidate < 8U;
+                     ++candidate) {
+                    const float candidate_distance = fabsf(
+                        magnitude - lightning_fp4_magnitude(candidate));
+                    if (candidate_distance < distance ||
+                        (candidate_distance == distance &&
+                         (candidate & 1U) == 0U && (nearest & 1U) != 0U)) {
+                        nearest = candidate;
+                        distance = candidate_distance;
+                    }
+                }
+                encoded[item] = nearest | (signbit(value) ? 8U : 0U);
+            }
+            output[group * 16U + column / 2U] =
+                static_cast<unsigned char>(encoded[0] | (encoded[1] << 4U));
+        }
+    }
+}
+
+__global__ void lightning_score_kernel(
+    float* scores, const unsigned char* packed_queries,
+    const float* weights, const LightningDeviceSegment* segments,
+    std::uint32_t segment_count, std::uint32_t candidates,
+    std::uint32_t heads, std::uint32_t head_dim,
+    unsigned int* error_flag) {
+    const auto row = blockIdx.x;
+    if (row >= candidates || threadIdx.x >= heads) return;
+    std::uint32_t low = 0U;
+    std::uint32_t high = segment_count;
+    while (low < high) {
+        const auto middle = low + (high - low) / 2U;
+        if (segments[middle].begin + segments[middle].rows <= row) {
+            low = middle + 1U;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= segment_count || row < segments[low].begin) {
+        if (threadIdx.x == 0U) atomicExch(error_flag, 1U);
+        return;
+    }
+    const auto packed_columns = head_dim / 2U;
+    const auto scale_columns = head_dim / 32U;
+    const auto row_bytes = packed_columns + scale_columns;
+    const auto* key = segments[low].keys +
+        static_cast<std::uint64_t>(row - segments[low].begin) * row_bytes;
+    const auto* query = packed_queries +
+        static_cast<std::uint64_t>(threadIdx.x) * row_bytes;
+    float dot = 0.0F;
+    for (std::uint32_t column = 0U; column < head_dim; ++column) {
+        const auto key_values = key[column / 2U];
+        const auto query_values = query[column / 2U];
+        const auto key_encoded = column % 2U == 0U
+            ? key_values & 0x0FU : key_values >> 4U;
+        const auto query_encoded = column % 2U == 0U
+            ? query_values & 0x0FU : query_values >> 4U;
+        const auto key_scale = key[packed_columns + column / 32U];
+        const auto query_scale = query[packed_columns + column / 32U];
+        if (key_scale == 0xFFU || query_scale == 0xFFU) {
+            atomicExch(error_flag, 1U);
+            dot = nanf("");
+            break;
+        }
+        const float key_value = bf16_round(
+            fp4_e2m1_value(key_encoded) * fp8_e8m0_scale_bits(key_scale));
+        const float query_value = bf16_round(
+            fp4_e2m1_value(query_encoded) *
+            fp8_e8m0_scale_bits(query_scale));
+        dot = fmaf(query_value, key_value, dot);
+    }
+    __shared__ float head_scores[64];
+    head_scores[threadIdx.x] = bf16_round(dot);
+    __syncthreads();
+    if (threadIdx.x == 0U) {
+        float score = 0.0F;
+        for (std::uint32_t head = 0U; head < heads; ++head) {
+            score += bf16_round(weights[head] * fmaxf(0.0F, head_scores[head]));
+        }
+        scores[row] = bf16_round(score);
+        if (!isfinite(scores[row])) atomicExch(error_flag, 1U);
+    }
+}
+
+__global__ void lightning_topk_initialize_kernel(
+    float* top_scores, std::uint32_t* top_positions,
+    std::uint32_t top_k) {
+    for (std::uint32_t index = threadIdx.x; index < top_k;
+         index += blockDim.x) {
+        top_scores[index] = -INFINITY;
+        top_positions[index] = UINT_MAX;
+    }
+}
+
+__global__ void lightning_topk_merge_kernel(
+    const float* scores, std::uint32_t candidates,
+    float* top_scores, std::uint32_t* top_positions,
+    std::uint32_t top_k) {
+    if (threadIdx.x != 0U || blockIdx.x != 0U) return;
+    for (std::uint32_t position = 0U; position < candidates; ++position) {
+        const float score = scores[position];
+        const auto last = top_k - 1U;
+        if (score < top_scores[last] ||
+            (score == top_scores[last] && position >= top_positions[last])) {
+            continue;
+        }
+        std::uint32_t insert = last;
+        while (insert != 0U &&
+               (score > top_scores[insert - 1U] ||
+                (score == top_scores[insert - 1U] &&
+                 position < top_positions[insert - 1U]))) {
+            top_scores[insert] = top_scores[insert - 1U];
+            top_positions[insert] = top_positions[insert - 1U];
+            --insert;
+        }
+        top_scores[insert] = score;
+        top_positions[insert] = position;
+    }
+}
+
 __global__ void deepseek_fp4_gate_up_kernel(
     float* activations, const float* hidden, DeepSeekFp4Batch batch,
     std::uint64_t columns, std::uint64_t intermediate,
@@ -982,6 +1165,8 @@ struct CudaBackend::Impl {
         std::uint64_t attention_host_upload_bytes{};
         std::uint64_t attention_host_download_bytes{};
         std::uint64_t attention_score_bytes{};
+        std::byte* lightning_workspace{};
+        std::uint64_t lightning_workspace_bytes{};
         float* moe_hidden{};
         float* moe_activations{};
         float* moe_output{};
@@ -1004,6 +1189,7 @@ struct CudaBackend::Impl {
         bool moe_in_flight{};
         bool moe_poisoned{};
         bool flash_attention_supported{};
+        bool lightning_index_supported{};
     };
 
     std::unordered_map<int, DeviceState> devices;
@@ -1030,6 +1216,9 @@ struct CudaBackend::Impl {
             }
             if (state.attention_host_download != nullptr) {
                 static_cast<void>(cudaFreeHost(state.attention_host_download));
+            }
+            if (state.lightning_workspace != nullptr) {
+                static_cast<void>(cudaFree(state.lightning_workspace));
             }
             if (state.moe_hidden != nullptr) static_cast<void>(cudaFree(state.moe_hidden));
             if (state.moe_activations != nullptr) {
@@ -1156,6 +1345,7 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         state.flash_attention_supported =
             (properties.major == 8 && properties.minor == 6) ||
             (properties.major == 12 && properties.minor == 0);
+        state.lightning_index_supported = state.flash_attention_supported;
         if (auto status = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
@@ -1490,6 +1680,396 @@ ValidationResult CudaBackend::validate_flash_attention_device(int device) const 
     } else if (!found->second.flash_attention_supported) {
         result.errors.emplace_back(
             "FlashAttention CUDA kernel supports only SM86 and SM120 devices");
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::validate_lightning_index_device(int device) const {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "Lightning Indexer targets an uninitialized CUDA device");
+    } else if (!found->second.lightning_index_supported) {
+        result.errors.emplace_back(
+            "Lightning Indexer CUDA kernel supports only SM86 and SM120 devices");
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::lightning_index(
+    int device, const CudaLightningIndexRequest& request,
+    std::span<std::uint32_t> output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "Lightning Indexer targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.lightning_index_supported) {
+        result.errors.emplace_back(
+            "Lightning Indexer CUDA kernel supports only SM86 and SM120 devices");
+        return result;
+    }
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "Lightning Indexer cannot overlap an in-flight DeepSeek MoE command");
+        return result;
+    }
+    const auto query_elements = static_cast<std::uint64_t>(request.heads) *
+                                request.head_dim;
+    if (request.heads == 0U || request.heads > 64U ||
+        request.head_dim < 32U || request.head_dim > 1'024U ||
+        (request.head_dim & (request.head_dim - 1U)) != 0U ||
+        request.head_dim % 32U != 0U || request.top_k == 0U ||
+        request.queries.size() != query_elements ||
+        request.weights.size() != request.heads ||
+        std::any_of(request.queries.begin(), request.queries.end(),
+                    [](float value) { return !std::isfinite(value); }) ||
+        std::any_of(request.weights.begin(), request.weights.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "Lightning Indexer query shape or values are unsupported");
+        return result;
+    }
+    const auto row_bytes = static_cast<std::uint64_t>(request.head_dim / 2U +
+                                                       request.head_dim / 32U);
+    std::uint64_t candidates64 = 0U;
+    std::uint64_t host_key_bytes = 0U;
+    for (const auto& segment : request.segments) {
+        const bool device_source = segment.device_buffer != nullptr;
+        const bool host_source = !segment.host_bytes.empty();
+        std::uint64_t bytes = 0U;
+        if (segment.rows == 0U || device_source == host_source ||
+            !checked_bytes(segment.rows, row_bytes, 1U, bytes) ||
+            segment.byte_offset > std::numeric_limits<std::uint64_t>::max() -
+                                      bytes ||
+            candidates64 > std::numeric_limits<std::uint64_t>::max() -
+                               segment.rows) {
+            result.errors.emplace_back(
+                "Lightning Indexer key segment is invalid");
+            return result;
+        }
+        if (device_source) {
+            if (!segment.device_buffer->valid() ||
+                segment.device_buffer->device() != device ||
+                segment.byte_offset + bytes >
+                    segment.device_buffer->device_bytes()) {
+                result.errors.emplace_back(
+                    "Lightning Indexer device key segment is invalid");
+                return result;
+            }
+        } else {
+            if (segment.byte_offset + bytes > segment.host_bytes.size() ||
+                host_key_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                     bytes) {
+                result.errors.emplace_back(
+                    "Lightning Indexer host key segment is invalid");
+                return result;
+            }
+            host_key_bytes += bytes;
+        }
+        candidates64 += segment.rows;
+    }
+    if (candidates64 > 1'048'576U ||
+        request.segments.size() > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "Lightning Indexer candidate or segment count is unsupported");
+        return result;
+    }
+    const auto candidates = static_cast<std::uint32_t>(candidates64);
+    const auto selected = std::min(request.top_k, candidates);
+    if (output.size() != selected) {
+        result.errors.emplace_back(
+            "Lightning Indexer output extent is incompatible");
+        return result;
+    }
+    if (candidates == 0U) return result;
+    if (request.top_k > candidates) {
+        result.errors.emplace_back(
+            "Lightning Indexer top-k exceeds the candidate count");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for Lightning Indexer");
+    }
+
+    std::uint64_t cursor = 0U;
+    const auto region = [&](std::uint64_t bytes, std::uint64_t alignment,
+                            std::uint64_t& offset) -> bool {
+        if (!align_up(cursor, alignment, offset) ||
+            bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+            return false;
+        }
+        cursor = offset + bytes;
+        return true;
+    };
+    std::uint64_t query_bytes = 0U;
+    std::uint64_t weight_bytes = 0U;
+    std::uint64_t packed_query_bytes = 0U;
+    std::uint64_t segment_bytes = 0U;
+    std::uint64_t score_bytes = 0U;
+    std::uint64_t top_score_bytes = 0U;
+    std::uint64_t top_position_bytes = 0U;
+    if (!checked_bytes(request.queries.size(), 1U, sizeof(float), query_bytes) ||
+        !checked_bytes(request.weights.size(), 1U, sizeof(float), weight_bytes) ||
+        !checked_bytes(request.heads, row_bytes, 1U, packed_query_bytes) ||
+        !checked_bytes(request.segments.size(), 1U,
+                       sizeof(LightningDeviceSegment), segment_bytes) ||
+        !checked_bytes(candidates, 1U, sizeof(float), score_bytes) ||
+        !checked_bytes(request.top_k, 1U, sizeof(float), top_score_bytes) ||
+        !checked_bytes(request.top_k, 1U, sizeof(std::uint32_t),
+                       top_position_bytes)) {
+        result.errors.emplace_back(
+            "Lightning Indexer workspace size overflows");
+        return result;
+    }
+    std::uint64_t query_offset = 0U;
+    std::uint64_t weight_offset = 0U;
+    std::uint64_t packed_query_offset = 0U;
+    std::uint64_t segment_offset = 0U;
+    std::uint64_t host_key_offset = 0U;
+    std::uint64_t score_offset = 0U;
+    std::uint64_t top_score_offset = 0U;
+    std::uint64_t top_position_offset = 0U;
+    std::uint64_t error_offset = 0U;
+    if (!region(query_bytes, alignof(float), query_offset) ||
+        !region(weight_bytes, alignof(float), weight_offset) ||
+        !region(packed_query_bytes, 1U, packed_query_offset) ||
+        !region(segment_bytes, alignof(LightningDeviceSegment), segment_offset) ||
+        !region(host_key_bytes, 1U, host_key_offset) ||
+        !region(score_bytes, alignof(float), score_offset) ||
+        !region(top_score_bytes, alignof(float), top_score_offset) ||
+        !region(top_position_bytes, alignof(std::uint32_t),
+                top_position_offset) ||
+        !region(sizeof(unsigned int), alignof(unsigned int), error_offset) ||
+        cursor > request.maximum_workspace_bytes ||
+        cursor > std::numeric_limits<std::size_t>::max()) {
+        result.errors.emplace_back(
+            "Lightning Indexer exceeds its bounded CUDA workspace");
+        return result;
+    }
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    if (state.lightning_workspace_bytes < cursor ||
+        state.lightning_workspace_bytes > request.maximum_workspace_bytes) {
+        if (state.lightning_workspace != nullptr) {
+            static_cast<void>(cudaFree(state.lightning_workspace));
+            state.lightning_workspace = nullptr;
+            state.lightning_workspace_bytes = 0U;
+        }
+        if (auto status = cudaMalloc(&state.lightning_workspace,
+                                     static_cast<std::size_t>(cursor));
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "allocate bounded Lightning Indexer workspace");
+        }
+        state.lightning_workspace_bytes = cursor;
+        allocation_calls = 1U;
+        allocation_bytes = cursor;
+    }
+    auto* base = state.lightning_workspace;
+    auto* device_queries = reinterpret_cast<float*>(base + query_offset);
+    auto* device_weights = reinterpret_cast<float*>(base + weight_offset);
+    auto* device_packed_queries = reinterpret_cast<unsigned char*>(
+        base + packed_query_offset);
+    auto* device_segments = reinterpret_cast<LightningDeviceSegment*>(
+        base + segment_offset);
+    auto* device_host_keys = reinterpret_cast<unsigned char*>(
+        base + host_key_offset);
+    auto* device_scores = reinterpret_cast<float*>(base + score_offset);
+    auto* device_top_scores = reinterpret_cast<float*>(base + top_score_offset);
+    auto* device_top_positions = reinterpret_cast<std::uint32_t*>(
+        base + top_position_offset);
+    auto* device_error = reinterpret_cast<unsigned int*>(base + error_offset);
+
+    std::vector<LightningDeviceSegment> descriptors;
+    descriptors.reserve(request.segments.size());
+    std::uint64_t host_cursor = 0U;
+    std::uint32_t row_begin = 0U;
+    for (const auto& segment : request.segments) {
+        const auto bytes = static_cast<std::uint64_t>(segment.rows) * row_bytes;
+        const unsigned char* keys = nullptr;
+        if (segment.device_buffer != nullptr) {
+            keys = static_cast<const unsigned char*>(
+                       segment.device_buffer->impl_->data) +
+                   segment.byte_offset;
+        } else {
+            keys = device_host_keys + host_cursor;
+            host_cursor += bytes;
+        }
+        descriptors.push_back({keys, row_begin, segment.rows});
+        row_begin += segment.rows;
+    }
+
+    const auto operation_started = std::chrono::steady_clock::now();
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Lightning Indexer upload start");
+        }
+    }
+    std::uint64_t h2d_transfers = 0U;
+    std::uint64_t h2d_bytes = 0U;
+    const auto upload = [&](void* destination, const void* source,
+                            std::uint64_t bytes) -> bool {
+        if (bytes == 0U) return true;
+        if (auto status = cudaMemcpyAsync(destination, source,
+                                          static_cast<std::size_t>(bytes),
+                                          cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status, "upload Lightning Indexer input");
+            return false;
+        }
+        ++h2d_transfers;
+        h2d_bytes += bytes;
+        return true;
+    };
+    if (!upload(device_queries, request.queries.data(), query_bytes) ||
+        !upload(device_weights, request.weights.data(), weight_bytes) ||
+        !upload(device_segments, descriptors.data(), segment_bytes)) {
+        return result;
+    }
+    host_cursor = 0U;
+    for (const auto& segment : request.segments) {
+        if (segment.device_buffer != nullptr) continue;
+        const auto bytes = static_cast<std::uint64_t>(segment.rows) * row_bytes;
+        if (!upload(device_host_keys + host_cursor,
+                    segment.host_bytes.data() + segment.byte_offset, bytes)) {
+            return result;
+        }
+        host_cursor += bytes;
+    }
+    if (auto status = cudaMemsetAsync(device_error, 0,
+                                      sizeof(unsigned int), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear Lightning Indexer error state");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded,
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Lightning Indexer upload completion");
+        }
+    }
+    lightning_query_fp4_kernel<<<request.heads, 256U,
+        static_cast<std::size_t>(request.head_dim) * sizeof(float),
+        state.stream>>>(device_packed_queries, device_queries,
+                        request.heads, request.head_dim);
+    lightning_topk_initialize_kernel<<<1U, 256U, 0U, state.stream>>>(
+        device_top_scores, device_top_positions, request.top_k);
+    lightning_score_kernel<<<candidates, request.heads, 0U, state.stream>>>(
+        device_scores, device_packed_queries, device_weights,
+        device_segments, static_cast<std::uint32_t>(request.segments.size()),
+        candidates, request.heads, request.head_dim, device_error);
+    lightning_topk_merge_kernel<<<1U, 1U, 0U, state.stream>>>(
+        device_scores, candidates, device_top_scores, device_top_positions,
+        request.top_k);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch Lightning Indexer kernels");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Lightning Indexer kernel completion");
+        }
+    }
+    unsigned int host_error = 0U;
+    const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    if (auto status = cudaMemcpyAsync(output.data(), device_top_positions,
+                                      output.size_bytes(),
+                                      cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download Lightning Indexer positions");
+    }
+    if (auto status = cudaMemcpyAsync(&host_error, device_error,
+                                      sizeof(host_error),
+                                      cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download Lightning Indexer error state");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded,
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Lightning Indexer download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize Lightning Indexer");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    const auto total_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - operation_started).count());
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_ms = 0.0F;
+        float kernel_ms = 0.0F;
+        float d2h_ms = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_ms, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Lightning Indexer upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_ms, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Lightning Indexer kernels");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_ms, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Lightning Indexer download");
+        }
+        h2d_nanoseconds = static_cast<std::uint64_t>(h2d_ms * 1.0e6F);
+        kernel_nanoseconds = static_cast<std::uint64_t>(kernel_ms * 1.0e6F);
+        d2h_nanoseconds = static_cast<std::uint64_t>(d2h_ms * 1.0e6F);
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += h2d_bytes;
+        stats.activation_d2h_bytes += output_bytes + sizeof(host_error);
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
+        stats.activation_h2d_nanoseconds += h2d_nanoseconds;
+        stats.kernel_nanoseconds += kernel_nanoseconds;
+        stats.activation_d2h_nanoseconds += d2h_nanoseconds;
+        ++stats.lightning_index_calls;
+        stats.lightning_index_kernel_launches += 4U;
+        stats.lightning_index_candidates += candidates;
+        stats.lightning_index_selected += selected;
+        stats.lightning_index_h2d_transfers += h2d_transfers;
+        stats.lightning_index_d2h_transfers += 2U;
+        stats.lightning_index_h2d_bytes += h2d_bytes;
+        stats.lightning_index_d2h_bytes += output_bytes + sizeof(host_error);
+        stats.lightning_index_useful_selection_bytes +=
+            static_cast<std::uint64_t>(selected) * row_bytes;
+        stats.lightning_index_h2d_nanoseconds += h2d_nanoseconds;
+        stats.lightning_index_kernel_nanoseconds += kernel_nanoseconds;
+        stats.lightning_index_d2h_nanoseconds += d2h_nanoseconds;
+        stats.lightning_index_nanoseconds += total_nanoseconds;
+    }
+    if (host_error != 0U) {
+        result.errors.emplace_back(
+            "Lightning Indexer encountered corrupt FP4 values or incomplete keys");
     }
     return result;
 }
@@ -2820,6 +3400,34 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.flash_attention_nanoseconds = std::max(
             result.flash_attention_nanoseconds,
             device.flash_attention_nanoseconds);
+        result.lightning_index_calls += device.lightning_index_calls;
+        result.lightning_index_kernel_launches +=
+            device.lightning_index_kernel_launches;
+        result.lightning_index_candidates +=
+            device.lightning_index_candidates;
+        result.lightning_index_selected += device.lightning_index_selected;
+        result.lightning_index_h2d_transfers +=
+            device.lightning_index_h2d_transfers;
+        result.lightning_index_d2h_transfers +=
+            device.lightning_index_d2h_transfers;
+        result.lightning_index_h2d_bytes +=
+            device.lightning_index_h2d_bytes;
+        result.lightning_index_d2h_bytes +=
+            device.lightning_index_d2h_bytes;
+        result.lightning_index_useful_selection_bytes +=
+            device.lightning_index_useful_selection_bytes;
+        result.lightning_index_h2d_nanoseconds = std::max(
+            result.lightning_index_h2d_nanoseconds,
+            device.lightning_index_h2d_nanoseconds);
+        result.lightning_index_kernel_nanoseconds = std::max(
+            result.lightning_index_kernel_nanoseconds,
+            device.lightning_index_kernel_nanoseconds);
+        result.lightning_index_d2h_nanoseconds = std::max(
+            result.lightning_index_d2h_nanoseconds,
+            device.lightning_index_d2h_nanoseconds);
+        result.lightning_index_nanoseconds = std::max(
+            result.lightning_index_nanoseconds,
+            device.lightning_index_nanoseconds);
     }
     return result;
 }

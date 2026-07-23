@@ -38,6 +38,7 @@ struct Options {
     bool detailed_timing{};
     bool device_moe{true};
     bool flash_attention{};
+    bool gpu_lightning_indexer{};
     bool block_kv_cache{};
     bool logit_trace{};
     bool layer_hash_trace{};
@@ -57,6 +58,7 @@ void usage() {
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
+        << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
         << "       [--block-kv-cache|--scalar-kv-cache]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
@@ -180,6 +182,11 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.flash_attention = true;
         } else if (argument == "--scalar-attention") {
             options.flash_attention = false;
+        } else if (argument == "--gpu-lightning-indexer") {
+            options.gpu_lightning_indexer = true;
+            options.block_kv_cache = true;
+        } else if (argument == "--scalar-lightning-indexer") {
+            options.gpu_lightning_indexer = false;
         } else if (argument == "--block-kv-cache") {
             options.block_kv_cache = true;
         } else if (argument == "--scalar-kv-cache") {
@@ -280,6 +287,31 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.flash_attention_d2h_nanoseconds) / 1.0e9
            << ",\"maximum_device_flash_attention_seconds\":"
            << static_cast<double>(stats.flash_attention_nanoseconds) / 1.0e9
+           << ",\"lightning_index_calls\":" << stats.lightning_index_calls
+           << ",\"lightning_index_kernel_launches\":"
+           << stats.lightning_index_kernel_launches
+           << ",\"lightning_index_candidates\":"
+           << stats.lightning_index_candidates
+           << ",\"lightning_index_selected\":"
+           << stats.lightning_index_selected
+           << ",\"lightning_index_h2d_transfers\":"
+           << stats.lightning_index_h2d_transfers
+           << ",\"lightning_index_d2h_transfers\":"
+           << stats.lightning_index_d2h_transfers
+           << ",\"lightning_index_h2d_bytes\":"
+           << stats.lightning_index_h2d_bytes
+           << ",\"lightning_index_d2h_bytes\":"
+           << stats.lightning_index_d2h_bytes
+           << ",\"lightning_index_useful_selection_bytes\":"
+           << stats.lightning_index_useful_selection_bytes
+           << ",\"maximum_device_lightning_index_h2d_seconds\":"
+           << static_cast<double>(stats.lightning_index_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_lightning_index_kernel_seconds\":"
+           << static_cast<double>(stats.lightning_index_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_lightning_index_d2h_seconds\":"
+           << static_cast<double>(stats.lightning_index_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_lightning_index_seconds\":"
+           << static_cast<double>(stats.lightning_index_nanoseconds) / 1.0e9
            << ",\"devices\":[";
     for (std::size_t index = 0U; index < stats.devices.size(); ++index) {
         const auto& device = stats.devices[index];
@@ -343,6 +375,32 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.flash_attention_d2h_nanoseconds) / 1.0e9
                << ",\"flash_attention_seconds\":"
                << static_cast<double>(device.flash_attention_nanoseconds) / 1.0e9
+               << ",\"lightning_index_calls\":"
+               << device.lightning_index_calls
+               << ",\"lightning_index_kernel_launches\":"
+               << device.lightning_index_kernel_launches
+               << ",\"lightning_index_candidates\":"
+               << device.lightning_index_candidates
+               << ",\"lightning_index_selected\":"
+               << device.lightning_index_selected
+               << ",\"lightning_index_h2d_transfers\":"
+               << device.lightning_index_h2d_transfers
+               << ",\"lightning_index_d2h_transfers\":"
+               << device.lightning_index_d2h_transfers
+               << ",\"lightning_index_h2d_bytes\":"
+               << device.lightning_index_h2d_bytes
+               << ",\"lightning_index_d2h_bytes\":"
+               << device.lightning_index_d2h_bytes
+               << ",\"lightning_index_useful_selection_bytes\":"
+               << device.lightning_index_useful_selection_bytes
+               << ",\"lightning_index_h2d_seconds\":"
+               << static_cast<double>(device.lightning_index_h2d_nanoseconds) / 1.0e9
+               << ",\"lightning_index_kernel_seconds\":"
+               << static_cast<double>(device.lightning_index_kernel_nanoseconds) / 1.0e9
+               << ",\"lightning_index_d2h_seconds\":"
+               << static_cast<double>(device.lightning_index_d2h_nanoseconds) / 1.0e9
+               << ",\"lightning_index_seconds\":"
+               << static_cast<double>(device.lightning_index_nanoseconds) / 1.0e9
                << '}';
     }
     output << "]}";
@@ -438,6 +496,10 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.attention_index_candidates
            << ",\"attention_index_selected\":"
            << stats.attention_index_selected
+           << ",\"attention_index_cuda_dispatches\":"
+           << stats.attention_index_cuda_dispatches
+           << ",\"attention_index_scalar_dispatches\":"
+           << stats.attention_index_scalar_dispatches
            << ",\"attention_cuda_dispatches\":"
            << stats.attention_cuda_dispatches
            << ",\"attention_scalar_dispatches\":"
@@ -604,6 +666,10 @@ void print_diagnostics(std::ostream& output,
         output << ']';
     }
     output << '}';
+    output << ",\"index_selections\":{\"entry_count\":"
+           << diagnostics.index_selection_count
+           << ",\"trace_hash\":\""
+           << hex_u64(diagnostics.index_selection_trace_hash) << "\"}";
     if (diagnostics.layer_hash_trace_enabled && !diagnostics.operation_hashes.empty()) {
         output << ",\"operation_hashes\":[";
         for (std::size_t index = 0U; index < diagnostics.operation_hashes.size(); ++index) {
@@ -715,6 +781,7 @@ int main(int argc, char** argv) {
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
     config.enable_flash_attention = options.flash_attention;
+    config.enable_gpu_lightning_indexer = options.gpu_lightning_indexer;
     config.kv_cache_mode = options.block_kv_cache
         ? strata::Dsv4KvCacheMode::Block
         : strata::Dsv4KvCacheMode::ScalarOracle;
@@ -751,6 +818,8 @@ int main(int argc, char** argv) {
                   << metrics.prefill_page_tokens
                   << ",\"flash_attention\":"
                   << (metrics.flash_attention_enabled ? "true" : "false")
+                  << ",\"gpu_lightning_indexer\":"
+                  << (metrics.gpu_lightning_indexer_enabled ? "true" : "false")
                   << ",\"block_kv_cache\":"
                   << (metrics.block_kv_cache_enabled ? "true" : "false")
                   << ",\"kv_block_rows\":" << metrics.kv_block_rows
@@ -809,7 +878,8 @@ int main(int argc, char** argv) {
         std::cout << ",\"generated_token_ids\":";
         strata::cli::print_array(std::cout, generated.generated_token_ids);
         if (generated.diagnostics.logit_trace_enabled ||
-            generated.diagnostics.layer_hash_trace_enabled) {
+            generated.diagnostics.layer_hash_trace_enabled ||
+            generated.diagnostics.index_selection_count != 0U) {
             std::cout << ",\"diagnostics\":";
             print_diagnostics(std::cout, generated.diagnostics);
         }

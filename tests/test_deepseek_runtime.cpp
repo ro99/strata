@@ -9,6 +9,7 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     const strata::Dsv4RuntimeConfig config;
     REQUIRE(config.enable_device_moe);
     REQUIRE(!config.enable_flash_attention);
+    REQUIRE(!config.enable_gpu_lightning_indexer);
     REQUIRE(config.flash_attention_minimum_rows == 256U);
     REQUIRE(config.prefill_page_tokens == 64U);
     REQUIRE(!config.enable_logit_trace);
@@ -23,6 +24,19 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.kv_block_rows == 64U);
     REQUIRE(config.host_kv_cache_bytes == 0U);
     REQUIRE(config.device_kv_cache_bytes.empty());
+}
+
+TEST_CASE("DeepSeek GPU Lightning Indexer requires compact exact KV blocks") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.enable_gpu_lightning_indexer = true;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("Lightning Indexer") !=
+                                   std::string::npos;
+                        }));
 }
 
 TEST_CASE("DeepSeek runtime validates block KV cache configuration") {

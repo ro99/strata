@@ -175,8 +175,9 @@ skipped.
 ### Stage A4 — memory hierarchy and performance
 
 Status: partial. RAM/VRAM arenas, the CUDA weight cache, exact host expert
-execution, admission accounting, and instrumentation exist. The cross-request
-expert-ticket wavefront, runtime prefetch, and peer execution do not.
+execution, admission accounting, instrumentation, and opt-in budgeted DeepSeek
+expert prefetch exist. The cross-request expert-ticket wavefront and peer
+execution do not.
 
 Bring up execution tiers in this order:
 

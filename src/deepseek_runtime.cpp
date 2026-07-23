@@ -5,6 +5,7 @@
 #include "strata/deepseek_ops.hpp"
 #include "strata/model_adapter.hpp"
 #include "strata/numerics.hpp"
+#include "strata/route_predictor.hpp"
 #include "strata/sampling.hpp"
 #include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
@@ -17,7 +18,9 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -25,13 +28,16 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <numbers>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <random>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(__linux__)
 #include <unistd.h>
@@ -209,6 +215,19 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     result.evictions -= before.evictions;
     result.lease_acquires -= before.lease_acquires;
     result.lease_releases -= before.lease_releases;
+    result.demand_h2d_bytes -= before.demand_h2d_bytes;
+    result.demand_wait_nanoseconds -= before.demand_wait_nanoseconds;
+    result.prefetch_requests -= before.prefetch_requests;
+    result.prefetch_h2d_bytes -= before.prefetch_h2d_bytes;
+    result.useful_prefetch_bytes -= before.useful_prefetch_bytes;
+    result.late_prefetch_bytes -= before.late_prefetch_bytes;
+    result.duplicate_prefetch_bytes -= before.duplicate_prefetch_bytes;
+    result.evicted_prefetch_bytes -= before.evicted_prefetch_bytes;
+    result.wasted_prefetch_bytes -= before.wasted_prefetch_bytes;
+    result.cancelled_prefetch_bytes -= before.cancelled_prefetch_bytes;
+    result.prefetch_lease_acquires -= before.prefetch_lease_acquires;
+    result.prefetch_lease_releases -= before.prefetch_lease_releases;
+    result.prefetch_queue_peak = after.prefetch_queue_peak;
     return result;
 }
 
@@ -348,8 +367,10 @@ class Dsv4WeightCache {
     struct Entry {
         CudaWeight weight;
         std::uint64_t last_use{};
+        std::uint64_t prefetch_lease_until{};
         std::uint32_t leases{};
         bool pinned{};
+        bool prefetched{};
     };
     struct State {
         std::unordered_map<std::string, Entry> entries;
@@ -359,7 +380,59 @@ class Dsv4WeightCache {
         std::uint64_t clock{};
     };
 
+    struct PrefetchLinear {
+        std::string name;
+        std::uint64_t rows{};
+        std::uint64_t columns{};
+        std::uint64_t bytes{};
+    };
+
+    struct PrefetchJob {
+        ExpertKey key;
+        std::size_t slot{};
+        std::vector<PrefetchLinear> linears;
+        std::uint64_t bytes{};
+    };
+
+    enum class LoadKind : std::uint8_t {
+        Preload,
+        Demand,
+        Prefetch,
+    };
+
 public:
+    class DemandGuard {
+    public:
+        DemandGuard() = default;
+        ~DemandGuard() { reset(); }
+        DemandGuard(const DemandGuard&) = delete;
+        DemandGuard& operator=(const DemandGuard&) = delete;
+
+        DemandGuard(DemandGuard&& other) noexcept : owner_(other.owner_) {
+            other.owner_ = nullptr;
+        }
+
+        DemandGuard& operator=(DemandGuard&& other) noexcept {
+            if (this == &other) return *this;
+            reset();
+            owner_ = other.owner_;
+            other.owner_ = nullptr;
+            return *this;
+        }
+
+    private:
+        friend class Dsv4WeightCache;
+
+        explicit DemandGuard(Dsv4WeightCache* owner) : owner_(owner) {}
+
+        void reset() noexcept {
+            if (owner_ != nullptr) owner_->end_demand();
+            owner_ = nullptr;
+        }
+
+        Dsv4WeightCache* owner_{};
+    };
+
     class Lease {
     public:
         Lease() = default;
@@ -405,24 +478,53 @@ public:
 
     Dsv4WeightCache(Dsv4CheckpointReader& checkpoint,
                     Dsv4ResidentWeightStore& resident, CudaBackend& backend,
-                    std::vector<int> devices, std::vector<std::uint64_t> capacities)
+                    std::vector<int> devices,
+                    std::vector<std::uint64_t> capacities,
+                    std::uint64_t prefetch_byte_budget,
+                    std::size_t prefetch_queue_depth,
+                    std::uint64_t prefetch_lease_ticks)
         : checkpoint_(checkpoint), resident_(resident), backend_(backend),
-          devices_(std::move(devices)) {
+          devices_(std::move(devices)),
+          prefetch_byte_budget_(prefetch_byte_budget),
+          prefetch_queue_depth_(prefetch_queue_depth),
+          prefetch_lease_ticks_(prefetch_lease_ticks) {
         for (const auto capacity : capacities) states_.push_back(State{{}, capacity});
+        if (prefetch_byte_budget_ != 0U && prefetch_queue_depth_ != 0U) {
+            prefetch_worker_ = std::thread([this] { prefetch_loop(); });
+        }
+    }
+
+    ~Dsv4WeightCache() {
+        finish_prefetch();
+        {
+            std::scoped_lock lock(activity_mutex_);
+            stop_prefetch_ = true;
+        }
+        activity_changed_.notify_all();
+        if (prefetch_worker_.joinable()) prefetch_worker_.join();
+    }
+
+    [[nodiscard]] DemandGuard demand(
+        std::span<const ExpertKey> keys = {}) {
+        if (!prefetch_worker_.joinable()) return {};
+        begin_demand(keys);
+        return DemandGuard(this);
     }
 
     ValidationResult preload(std::size_t slot, std::string_view base,
                              std::uint64_t rows, std::uint64_t columns) {
+        auto demand_guard = demand();
         Entry* entry = nullptr;
-        return ensure(slot, base, rows, columns, true, false, entry);
+        return ensure(slot, base, rows, columns, LoadKind::Preload, entry);
     }
 
     ValidationResult acquire(std::size_t slot, std::string_view base,
                              std::uint64_t rows, std::uint64_t columns,
                              Lease& output) {
+        auto demand_guard = demand();
         output.reset();
         Entry* entry = nullptr;
-        auto result = ensure(slot, base, rows, columns, false, true, entry);
+        auto result = ensure(slot, base, rows, columns, LoadKind::Demand, entry);
         if (!result.ok()) return result;
         ++entry->leases;
         ++lease_acquires_;
@@ -452,9 +554,10 @@ public:
                             std::uint64_t input_columns,
                             std::span<const float> input, std::uint32_t rows,
                             std::span<float> output, bool bf16_output = true) {
+        auto demand_guard = demand();
         Entry* entry = nullptr;
         auto result = ensure(slot, base, output_columns, input_columns,
-                             false, true, entry);
+                             LoadKind::Demand, entry);
         if (!result.ok()) return result;
         result = backend_.matmul(entry->weight, input, rows, output);
         if (result.ok() && bf16_output) round_bf16(output);
@@ -468,9 +571,10 @@ public:
                              std::uint32_t groups,
                              std::uint64_t rows_per_group,
                              std::span<float> output) {
+        auto demand_guard = demand();
         Entry* entry = nullptr;
         auto result = ensure(slot, base, output_columns, input_columns,
-                             false, true, entry);
+                             LoadKind::Demand, entry);
         if (!result.ok()) return result;
         result = backend_.matmul_grouped(entry->weight, input, groups,
                                          rows_per_group, output);
@@ -485,6 +589,31 @@ public:
         result.evictions = evictions_.load(std::memory_order_relaxed);
         result.lease_acquires = lease_acquires_.load(std::memory_order_relaxed);
         result.lease_releases = lease_releases_.load(std::memory_order_relaxed);
+        result.demand_h2d_bytes = demand_h2d_bytes_.load(std::memory_order_relaxed);
+        result.demand_wait_nanoseconds =
+            demand_wait_nanoseconds_.load(std::memory_order_relaxed);
+        result.prefetch_requests = prefetch_requests_.load(std::memory_order_relaxed);
+        result.prefetch_h2d_bytes = prefetch_h2d_bytes_.load(std::memory_order_relaxed);
+        result.useful_prefetch_bytes =
+            useful_prefetch_bytes_.load(std::memory_order_relaxed);
+        result.late_prefetch_bytes =
+            late_prefetch_bytes_.load(std::memory_order_relaxed);
+        result.duplicate_prefetch_bytes =
+            duplicate_prefetch_bytes_.load(std::memory_order_relaxed);
+        result.evicted_prefetch_bytes =
+            evicted_prefetch_bytes_.load(std::memory_order_relaxed);
+        result.wasted_prefetch_bytes =
+            wasted_prefetch_bytes_.load(std::memory_order_relaxed);
+        result.cancelled_prefetch_bytes =
+            cancelled_prefetch_bytes_.load(std::memory_order_relaxed);
+        result.prefetch_lease_acquires =
+            prefetch_lease_acquires_.load(std::memory_order_relaxed);
+        result.prefetch_lease_releases =
+            prefetch_lease_releases_.load(std::memory_order_relaxed);
+        result.active_prefetch_leases =
+            active_prefetch_leases_.load(std::memory_order_relaxed);
+        result.prefetch_queue_peak =
+            prefetch_queue_peak_.load(std::memory_order_relaxed);
         for (const auto& state : states_) {
             result.used_bytes.push_back(state.used);
             result.capacity_bytes.push_back(state.capacity);
@@ -503,10 +632,105 @@ public:
         return result;
     }
 
+    void request_prefetch(ExpertKey key, std::size_t slot) {
+        ++prefetch_requests_;
+        if (!prefetch_worker_.joinable() || slot >= states_.size()) return;
+
+        const auto prefix = layer_prefix(key.layer) + "ffn.experts." +
+                            std::to_string(key.expert) + ".";
+        const std::array dimensions{
+            std::pair{std::uint64_t{kExpertIntermediate}, std::uint64_t{kHidden}},
+            std::pair{std::uint64_t{kExpertIntermediate}, std::uint64_t{kHidden}},
+            std::pair{std::uint64_t{kHidden}, std::uint64_t{kExpertIntermediate}},
+        };
+        constexpr std::array<std::string_view, 3U> operations{"w1", "w3", "w2"};
+
+        PrefetchJob job;
+        job.key = key;
+        job.slot = slot;
+        std::uint64_t expert_bytes = 0U;
+        for (std::size_t index = 0U; index < operations.size(); ++index) {
+            PrefetchLinear linear;
+            linear.name = prefix + std::string(operations[index]);
+            linear.rows = dimensions[index].first;
+            linear.columns = dimensions[index].second;
+            linear.bytes = linear_bytes(checkpoint_, linear.name);
+            if (linear.bytes == 0U ||
+                expert_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                   linear.bytes) {
+                cancelled_prefetch_bytes_ += expert_bytes;
+                return;
+            }
+            expert_bytes += linear.bytes;
+            job.linears.push_back(std::move(linear));
+        }
+
+        std::scoped_lock lock(activity_mutex_);
+        if (pending_prefetch_.contains(key)) {
+            duplicate_prefetch_bytes_ += expert_bytes;
+            return;
+        }
+        auto& state = states_[slot];
+        for (auto current = job.linears.begin(); current != job.linears.end();) {
+            const auto found = state.entries.find(current->name);
+            if (found == state.entries.end()) {
+                job.bytes += current->bytes;
+                ++current;
+            } else {
+                duplicate_prefetch_bytes_ += current->bytes;
+                current = job.linears.erase(current);
+            }
+        }
+        if (job.linears.empty()) return;
+        if (job.bytes > prefetch_byte_budget_ ||
+            prefetch_queue_.size() >= prefetch_queue_depth_) {
+            cancelled_prefetch_bytes_ += job.bytes;
+            return;
+        }
+        pending_prefetch_.insert(key);
+        prefetch_queue_.push_back(std::move(job));
+        const auto depth = static_cast<std::uint64_t>(prefetch_queue_.size());
+        auto peak = prefetch_queue_peak_.load(std::memory_order_relaxed);
+        while (peak < depth && !prefetch_queue_peak_.compare_exchange_weak(
+                   peak, depth, std::memory_order_relaxed)) {}
+        activity_changed_.notify_all();
+    }
+
+    void drain_prefetch() {
+        if (!prefetch_worker_.joinable()) return;
+        std::unique_lock lock(activity_mutex_);
+        activity_changed_.wait(lock, [this] {
+            return prefetch_queue_.empty() && !prefetch_active_;
+        });
+    }
+
+    void finish_prefetch() {
+        auto demand_guard = demand();
+        {
+            std::scoped_lock lock(activity_mutex_);
+            for (const auto& job : prefetch_queue_) {
+                cancelled_prefetch_bytes_ += job.bytes;
+                pending_prefetch_.erase(job.key);
+            }
+            prefetch_queue_.clear();
+        }
+        for (auto& state : states_) {
+            for (auto entry = state.entries.begin(); entry != state.entries.end();) {
+                if (!entry->second.prefetched) {
+                    ++entry;
+                    continue;
+                }
+                state.used -= entry->second.weight.device_bytes();
+                discard_prefetched(entry->second, false);
+                entry = state.entries.erase(entry);
+            }
+        }
+    }
+
 private:
     ValidationResult ensure(std::size_t slot, std::string_view base,
                             std::uint64_t rows, std::uint64_t columns,
-                            bool pin, bool use_resident, Entry*& output) {
+                            LoadKind kind, Entry*& output) {
         ValidationResult result;
         if (slot >= states_.size()) {
             result.errors.emplace_back("DeepSeek linear targets an invalid CUDA slot");
@@ -514,6 +738,7 @@ private:
         }
         auto& state = states_[slot];
         ++state.clock;
+        const bool pin = kind == LoadKind::Preload;
         const std::string key(base);
         auto found = state.entries.find(key);
         if (found != state.entries.end()) {
@@ -522,7 +747,14 @@ private:
                 found->second.pinned = true;
                 state.pinned += found->second.weight.device_bytes();
             }
-            ++hits_;
+            if (kind == LoadKind::Demand) {
+                ++hits_;
+                mark_prefetch_useful(found->second);
+            } else if (kind == LoadKind::Preload) {
+                ++hits_;
+            } else {
+                duplicate_prefetch_bytes_ += found->second.weight.device_bytes();
+            }
             output = &found->second;
             return result;
         }
@@ -532,13 +764,15 @@ private:
                                        key);
             return result;
         }
-        while (state.used + bytes > state.capacity) {
+        while (kind != LoadKind::Prefetch && state.used + bytes > state.capacity) {
             auto victim = state.entries.end();
             for (auto candidate = state.entries.begin(); candidate != state.entries.end();
                  ++candidate) {
                 if (candidate->second.pinned || candidate->second.leases != 0U) continue;
                 if (victim == state.entries.end() ||
-                    candidate->second.last_use < victim->second.last_use) {
+                    (candidate->second.prefetched && !victim->second.prefetched) ||
+                    (candidate->second.prefetched == victim->second.prefetched &&
+                     candidate->second.last_use < victim->second.last_use)) {
                     victim = candidate;
                 }
             }
@@ -554,23 +788,217 @@ private:
                 return result;
             }
             state.used -= victim->second.weight.device_bytes();
+            discard_prefetched(victim->second, true);
             state.entries.erase(victim);
             ++evictions_;
         }
+        if (state.used + bytes > state.capacity) {
+            result.errors.emplace_back("DeepSeek prefetch cannot displace demand weights");
+            return result;
+        }
         Entry entry;
+        const auto load_started = std::chrono::steady_clock::now();
         result = load_dsv4_cuda_linear(checkpoint_,
-                                        use_resident ? &resident_ : nullptr,
+                                        kind == LoadKind::Preload ? nullptr : &resident_,
                                         base, rows, columns,
                                         devices_[slot], backend_, entry.weight);
         if (!result.ok()) return result;
         entry.last_use = state.clock;
         entry.pinned = pin;
+        entry.prefetched = kind == LoadKind::Prefetch;
+        entry.prefetch_lease_until = entry.prefetched
+            ? state.clock + std::min(
+                prefetch_lease_ticks_,
+                std::numeric_limits<std::uint64_t>::max() - state.clock)
+            : 0U;
         state.used += entry.weight.device_bytes();
         if (pin) state.pinned += entry.weight.device_bytes();
         found = state.entries.emplace(key, std::move(entry)).first;
-        ++misses_;
+        if (kind == LoadKind::Prefetch) {
+            const auto loaded_bytes = found->second.weight.device_bytes();
+            prefetched_bytes_ += loaded_bytes;
+            prefetch_h2d_bytes_ += loaded_bytes;
+            ++prefetch_lease_acquires_;
+            ++active_prefetch_leases_;
+        } else {
+            ++misses_;
+            if (kind == LoadKind::Demand) {
+                demand_h2d_bytes_ += found->second.weight.device_bytes();
+                demand_wait_nanoseconds_ += elapsed_nanoseconds(load_started);
+            }
+        }
         output = &found->second;
         return result;
+    }
+
+    void mark_prefetch_useful(Entry& entry) noexcept {
+        if (!entry.prefetched) return;
+        const auto bytes = entry.weight.device_bytes();
+        useful_prefetch_bytes_ += bytes;
+        prefetched_bytes_ -= bytes;
+        entry.prefetched = false;
+        entry.prefetch_lease_until = 0U;
+        ++prefetch_lease_releases_;
+        --active_prefetch_leases_;
+    }
+
+    void discard_prefetched(Entry& entry, bool evicted) noexcept {
+        if (!entry.prefetched) return;
+        const auto bytes = entry.weight.device_bytes();
+        prefetched_bytes_ -= bytes;
+        wasted_prefetch_bytes_ += bytes;
+        if (evicted) evicted_prefetch_bytes_ += bytes;
+        entry.prefetched = false;
+        ++prefetch_lease_releases_;
+        --active_prefetch_leases_;
+    }
+
+    [[nodiscard]] bool evict_prefetched(std::optional<std::size_t> only_slot) {
+        std::size_t selected_slot = states_.size();
+        auto selected = states_.front().entries.end();
+        for (std::size_t slot = 0U; slot < states_.size(); ++slot) {
+            if (only_slot && slot != *only_slot) continue;
+            auto& state = states_[slot];
+            for (auto candidate = state.entries.begin();
+                 candidate != state.entries.end(); ++candidate) {
+                const auto& entry = candidate->second;
+                if (!entry.prefetched || entry.leases != 0U ||
+                    entry.prefetch_lease_until > state.clock) {
+                    continue;
+                }
+                if (selected_slot == states_.size() ||
+                    entry.last_use < selected->second.last_use) {
+                    selected_slot = slot;
+                    selected = candidate;
+                }
+            }
+        }
+        if (selected_slot == states_.size()) return false;
+        auto& state = states_[selected_slot];
+        state.used -= selected->second.weight.device_bytes();
+        discard_prefetched(selected->second, true);
+        state.entries.erase(selected);
+        ++evictions_;
+        return true;
+    }
+
+    [[nodiscard]] bool prepare_prefetch(const PrefetchJob& job) {
+        auto& state = states_[job.slot];
+        if (job.bytes > state.capacity || job.bytes > prefetch_byte_budget_) {
+            return false;
+        }
+        while (prefetched_bytes_ + job.bytes > prefetch_byte_budget_) {
+            if (!evict_prefetched(std::nullopt)) return false;
+        }
+        while (state.used + job.bytes > state.capacity) {
+            if (!evict_prefetched(job.slot)) return false;
+        }
+        return true;
+    }
+
+    void run_prefetch(const PrefetchJob& job) {
+        if (!prepare_prefetch(job)) {
+            cancelled_prefetch_bytes_ += job.bytes;
+            return;
+        }
+        std::vector<std::string_view> loaded;
+        loaded.reserve(job.linears.size());
+        for (const auto& linear : job.linears) {
+            Entry* entry = nullptr;
+            auto result = ensure(job.slot, linear.name, linear.rows,
+                                 linear.columns, LoadKind::Prefetch, entry);
+            if (result.ok()) {
+                loaded.push_back(linear.name);
+                continue;
+            }
+            cancelled_prefetch_bytes_ += job.bytes;
+            auto& state = states_[job.slot];
+            for (const auto name : loaded) {
+                const auto found = state.entries.find(std::string(name));
+                if (found == state.entries.end() || !found->second.prefetched) continue;
+                state.used -= found->second.weight.device_bytes();
+                discard_prefetched(found->second, false);
+                state.entries.erase(found);
+            }
+            return;
+        }
+    }
+
+    [[nodiscard]] static bool contains_key(
+        std::span<const ExpertKey> keys, ExpertKey key) noexcept {
+        return std::find(keys.begin(), keys.end(), key) != keys.end();
+    }
+
+    void begin_demand(std::span<const ExpertKey> keys) {
+        const auto started = std::chrono::steady_clock::now();
+        std::unique_lock lock(activity_mutex_);
+        ++waiting_demands_;
+        for (auto job = prefetch_queue_.begin(); job != prefetch_queue_.end();) {
+            if (!contains_key(keys, job->key)) {
+                ++job;
+                continue;
+            }
+            late_prefetch_bytes_ += job->bytes;
+            cancelled_prefetch_bytes_ += job->bytes;
+            pending_prefetch_.erase(job->key);
+            job = prefetch_queue_.erase(job);
+        }
+        if (active_prefetch_key_ && contains_key(keys, *active_prefetch_key_) &&
+            !active_prefetch_late_) {
+            late_prefetch_bytes_ += active_prefetch_bytes_;
+            active_prefetch_late_ = true;
+        }
+        const bool waited = prefetch_active_;
+        activity_changed_.wait(lock, [this] { return !prefetch_active_; });
+        --waiting_demands_;
+        ++active_demands_;
+        lock.unlock();
+        if (waited) demand_wait_nanoseconds_ += elapsed_nanoseconds(started);
+    }
+
+    void end_demand() noexcept {
+        {
+            std::scoped_lock lock(activity_mutex_);
+            if (active_demands_ != 0U) --active_demands_;
+        }
+        activity_changed_.notify_all();
+    }
+
+    void prefetch_loop() {
+        for (;;) {
+            PrefetchJob job;
+            {
+                std::unique_lock lock(activity_mutex_);
+                activity_changed_.wait(lock, [this] {
+                    return stop_prefetch_ ||
+                           (!prefetch_queue_.empty() && active_demands_ == 0U &&
+                            waiting_demands_ == 0U);
+                });
+                if (stop_prefetch_) return;
+                job = std::move(prefetch_queue_.front());
+                prefetch_queue_.pop_front();
+                active_prefetch_key_ = job.key;
+                active_prefetch_bytes_ = job.bytes;
+                active_prefetch_late_ = false;
+                prefetch_active_ = true;
+            }
+            try {
+                run_prefetch(job);
+            } catch (...) {
+                // Prediction is advisory; background allocation failure must
+                // never prevent the exact demand path from running.
+                cancelled_prefetch_bytes_ += job.bytes;
+            }
+            {
+                std::scoped_lock lock(activity_mutex_);
+                pending_prefetch_.erase(job.key);
+                active_prefetch_key_.reset();
+                active_prefetch_bytes_ = 0U;
+                active_prefetch_late_ = false;
+                prefetch_active_ = false;
+            }
+            activity_changed_.notify_all();
+        }
     }
 
     void release(Entry* entry) noexcept {
@@ -585,11 +1013,41 @@ private:
     CudaBackend& backend_;
     std::vector<int> devices_;
     std::vector<State> states_;
+    std::uint64_t prefetch_byte_budget_{};
+    std::size_t prefetch_queue_depth_{};
+    std::uint64_t prefetch_lease_ticks_{};
+    std::uint64_t prefetched_bytes_{};
+    std::mutex activity_mutex_;
+    std::condition_variable activity_changed_;
+    std::deque<PrefetchJob> prefetch_queue_;
+    std::unordered_set<ExpertKey, ExpertKeyHash> pending_prefetch_;
+    std::optional<ExpertKey> active_prefetch_key_;
+    std::uint64_t active_prefetch_bytes_{};
+    std::thread prefetch_worker_;
+    std::size_t active_demands_{};
+    std::size_t waiting_demands_{};
+    bool prefetch_active_{};
+    bool active_prefetch_late_{};
+    bool stop_prefetch_{};
     std::atomic<std::uint64_t> hits_{};
     std::atomic<std::uint64_t> misses_{};
     std::atomic<std::uint64_t> evictions_{};
     std::atomic<std::uint64_t> lease_acquires_{};
     std::atomic<std::uint64_t> lease_releases_{};
+    std::atomic<std::uint64_t> demand_h2d_bytes_{};
+    std::atomic<std::uint64_t> demand_wait_nanoseconds_{};
+    std::atomic<std::uint64_t> prefetch_requests_{};
+    std::atomic<std::uint64_t> prefetch_h2d_bytes_{};
+    std::atomic<std::uint64_t> useful_prefetch_bytes_{};
+    std::atomic<std::uint64_t> late_prefetch_bytes_{};
+    std::atomic<std::uint64_t> duplicate_prefetch_bytes_{};
+    std::atomic<std::uint64_t> evicted_prefetch_bytes_{};
+    std::atomic<std::uint64_t> wasted_prefetch_bytes_{};
+    std::atomic<std::uint64_t> cancelled_prefetch_bytes_{};
+    std::atomic<std::uint64_t> prefetch_lease_acquires_{};
+    std::atomic<std::uint64_t> prefetch_lease_releases_{};
+    std::atomic<std::uint64_t> active_prefetch_leases_{};
+    std::atomic<std::uint64_t> prefetch_queue_peak_{};
 };
 
 class PagedFloatRows {
@@ -684,6 +1142,8 @@ struct DeepSeekV4Runtime::Impl {
     std::array<AttentionState, kLayers> attention_state;
     std::vector<std::uint32_t> cached_token_ids;
     RouteTraceWriter route_trace;
+    RoutePredictor route_predictor;
+    std::vector<RoutePrediction> pending_prefetch_predictions;
     std::vector<RouteEvent> deferred_route_events;
     bool defer_prefill_observability{};
     std::mt19937_64 sampler;
@@ -898,6 +1358,7 @@ void DeepSeekV4Runtime::Impl::reset_diagnostics() {
     graph_stats.prefill_pages = 0U;
     graph_stats.prefill_max_page_tokens = 0U;
     graph_stats.prefill_max_workspace_bytes = 0U;
+    pending_prefetch_predictions.clear();
     deferred_route_events.clear();
     defer_prefill_observability = false;
     if (config.enable_logit_trace) {
@@ -1429,6 +1890,7 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     for (auto& weight : index_weights) weight = round_bf16(weight * index_scale);
 
     if (config.enable_gpu_lightning_indexer) {
+        auto cuda_demand = weights->demand();
         std::vector<CudaLightningIndexSegment> segments;
         std::vector<Dsv4KvDeviceLease> leases;
         const bool device_resident =
@@ -1706,6 +2168,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         config.flash_attention_minimum_rows);
     subphase_started = std::chrono::steady_clock::now();
     if (use_cuda_attention) {
+        auto cuda_demand = weights->demand();
         ++graph_stats.attention_cuda_dispatches;
         std::vector<std::uint32_t> sliding_rows(window_count);
         for (std::uint32_t item = 0U; item < window_count; ++item) {
@@ -2235,7 +2698,8 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
     if (config.enable_layer_hash_trace) {
         record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
     }
-    if (route_trace.is_open()) {
+    const bool prefetch_enabled = config.expert_prefetch_predictions != 0U;
+    if (route_trace.is_open() || prefetch_enabled) {
         RouteEvent event;
         event.request = active_request_id;
         event.token_position = position;
@@ -2247,8 +2711,18 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
         if (defer_prefill_observability && event.phase == RoutePhase::Prefill) {
             deferred_route_events.push_back(std::move(event));
         } else {
-            auto written = route_trace.write(event);
-            if (!written.ok()) return written;
+            if (prefetch_enabled) {
+                route_predictor.observe(event);
+                if (event.phase == RoutePhase::Decode) {
+                    pending_prefetch_predictions = route_predictor.predict(
+                        event, config.expert_prefetch_predictions,
+                        config.expert_prefetch_minimum_confidence);
+                }
+            }
+            if (route_trace.is_open()) {
+                auto written = route_trace.write(event);
+                if (!written.ok()) return written;
+            }
         }
     }
     output = std::move(route.value);
@@ -2260,9 +2734,24 @@ ValidationResult DeepSeekV4Runtime::Impl::execute_moe(
     std::span<const float> input, std::span<float> output) {
     ValidationResult result;
     const auto prefix = layer_prefix(layer) + "ffn.";
+    std::vector<ExpertKey> demand_keys;
+    demand_keys.reserve(route.experts.size());
+    for (const auto expert_id : route.experts) {
+        demand_keys.push_back(ExpertKey{layer, expert_id});
+    }
+    auto demand_guard = weights->demand(demand_keys);
+    const auto schedule_prefetch = [this] {
+        for (const auto& prediction : pending_prefetch_predictions) {
+            weights->request_prefetch(
+                prediction.key, expert_device(prediction.key.expert));
+        }
+        pending_prefetch_predictions.clear();
+    };
 
     if (config.enable_device_moe) {
-        return device_moe(layer, route, input, output);
+        result = device_moe(layer, route, input, output);
+        if (result.ok()) schedule_prefetch();
+        return result;
     }
 
     std::fill(output.begin(), output.end(), 0.0F);
@@ -2296,6 +2785,7 @@ ValidationResult DeepSeekV4Runtime::Impl::execute_moe(
     for (std::uint32_t column = 0U; column < kHidden; ++column) {
         output[column] = round_bf16(output[column] + shared_output[column]);
     }
+    schedule_prefetch();
     return result;
 }
 
@@ -2630,10 +3120,15 @@ ValidationResult DeepSeekV4Runtime::Impl::flush_deferred_routes() {
             return left.layer < right.layer;
         });
     for (const auto& event : deferred_route_events) {
-        auto written = route_trace.write(event);
-        if (!written.ok()) {
-            append_errors(result, std::move(written.errors));
-            break;
+        if (config.expert_prefetch_predictions != 0U) {
+            route_predictor.observe(event);
+        }
+        if (route_trace.is_open()) {
+            auto written = route_trace.write(event);
+            if (!written.ok()) {
+                append_errors(result, std::move(written.errors));
+                break;
+            }
         }
     }
     deferred_route_events.clear();
@@ -2846,6 +3341,20 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "DeepSeek spine warmup worker count must be within [1, 64]");
         return result;
     }
+    if (config.expert_prefetch_predictions > kExperts ||
+        !std::isfinite(config.expert_prefetch_minimum_confidence) ||
+        config.expert_prefetch_minimum_confidence < 0.0 ||
+        config.expert_prefetch_minimum_confidence > 1.0 ||
+        (config.expert_prefetch_predictions != 0U &&
+         (config.expert_prefetch_queue_depth == 0U ||
+          config.expert_prefetch_queue_depth > 1024U ||
+          config.expert_prefetch_byte_budget == 0U ||
+          config.expert_prefetch_lease_ticks == 0U))) {
+        result.errors.emplace_back(
+            "DeepSeek expert prefetch requires bounded predictions, bytes, queue, "
+            "lease, and confidence");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
@@ -2949,7 +3458,11 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
-        impl_->devices, weight_capacities);
+        impl_->devices, weight_capacities,
+        config.expert_prefetch_predictions == 0U
+            ? 0U : config.expert_prefetch_byte_budget,
+        config.expert_prefetch_queue_depth,
+        config.expert_prefetch_lease_ticks);
     if (config.kv_cache_mode == Dsv4KvCacheMode::Block) {
         Dsv4KvCacheConfig kv_config;
         kv_config.block_rows = config.kv_block_rows;
@@ -3070,6 +3583,16 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.spine_warmup_workers =
         static_cast<std::uint32_t>(std::min<std::size_t>(
             config.spine_warmup_workers, impl_->devices.size()));
+    impl_->initialization_metrics.expert_prefetch_predictions =
+        config.expert_prefetch_predictions;
+    impl_->initialization_metrics.expert_prefetch_queue_depth =
+        config.expert_prefetch_queue_depth;
+    impl_->initialization_metrics.expert_prefetch_byte_budget =
+        config.expert_prefetch_byte_budget;
+    impl_->initialization_metrics.expert_prefetch_lease_ticks =
+        config.expert_prefetch_lease_ticks;
+    impl_->initialization_metrics.expert_prefetch_minimum_confidence =
+        config.expert_prefetch_minimum_confidence;
     return result;
 }
 
@@ -3099,6 +3622,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
         result.errors.push_back(std::move(validation_error));
         return result;
     }
+    impl_->weights->finish_prefetch();
     ParseResult<std::vector<std::uint32_t>> encoded;
     for (;;) {
         encoded = impl_->tokenizer.encode(
@@ -3163,6 +3687,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
         result.errors = std::move(next.errors);
         return result;
     }
+    impl_->weights->drain_prefetch();
     impl_->cached_token_ids = result.prompt_token_ids;
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_started).count();
@@ -3211,6 +3736,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
             if (on_token) on_token(next.value, piece.value);
         }
     }
+    impl_->weights->finish_prefetch();
     result.metrics.decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - decode_started).count();
     result.metrics.decode_tokens = decode_steps;
@@ -3272,6 +3798,9 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     result.diagnostics = std::move(impl_->diagnostics);
     if (result.metrics.cache.lease_acquires !=
             result.metrics.cache.lease_releases ||
+        result.metrics.cache.prefetch_lease_acquires !=
+            result.metrics.cache.prefetch_lease_releases ||
+        result.metrics.cache.active_prefetch_leases != 0U ||
         std::any_of(result.metrics.cache.active_leases.begin(),
                     result.metrics.cache.active_leases.end(),
                     [](std::uint64_t count) { return count != 0U; })) {

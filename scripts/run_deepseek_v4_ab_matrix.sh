@@ -18,11 +18,16 @@ last_repetition=$((start_repetition + repetitions - 1))
 for repetition in $(seq "${start_repetition}" "${last_repetition}"); do
     for variant in baseline candidate; do
         runner=${baseline_runner}
-        if [[ "${variant}" == candidate ]]; then runner=${candidate_runner}; fi
+        prefetch_predictions=0
+        if [[ "${variant}" == candidate ]]; then
+            runner=${candidate_runner}
+            prefetch_predictions=${CANDIDATE_PREFETCH_PREDICTIONS:-0}
+        fi
         result_dir="${result_root}/${variant}-${repetition}"
         printf '%s %s %s\n' "${repetition}" "${variant}" "${runner}" \
             | tee -a "${result_root}/order.txt"
         CAPTURE_TELEMETRY=0 RUNNER="${runner}" RESULT_DIR="${result_dir}" \
+            EXPERT_PREFETCH_PREDICTIONS="${prefetch_predictions}" \
             "${repo_root}/scripts/run_deepseek_v4_observability.sh"
     done
 done

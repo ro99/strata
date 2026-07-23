@@ -202,6 +202,18 @@ comparisons, `--serial-resident-warmup` restores sequential staging and warm-up;
 `--resident-read-workers` and `--spine-warmup-workers` expose the bounded worker
 counts.
 
+Advisory routed-expert prefetch is opt-in with `--expert-prefetch N`. It reuses
+the online past-only route-transition predictor and the canonical route-trace
+event order, then asynchronously stages predicted expert triplets from the
+resident host tier into VRAM. The defaults bound the queue to eight experts and
+prefetched residency to 1 GiB; `--expert-prefetch-queue`,
+`--expert-prefetch-bytes`, `--expert-prefetch-lease`, and
+`--expert-prefetch-confidence` tune those limits. Demand has queue priority,
+cancels late matching work, and can evict prefetched entries without allowing
+prefetch to evict demand-resident or in-flight weights. JSON cache metrics expose
+demand wait/H2D and useful, late, duplicate, evicted, wasted, and total prefetch
+bytes. A zero prediction count retains the exact no-prefetch baseline.
+
 The reusable long smoke command is:
 
 ```bash

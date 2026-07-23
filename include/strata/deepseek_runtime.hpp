@@ -40,6 +40,13 @@ struct Dsv4RuntimeConfig {
     std::uint32_t flash_attention_minimum_rows{256U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
+    // Zero predictions disables advisory expert prefetch. The remaining
+    // defaults are bounded so one CLI switch is sufficient to enable it.
+    std::uint32_t expert_prefetch_predictions{};
+    std::uint32_t expert_prefetch_queue_depth{8U};
+    std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
+    std::uint64_t expert_prefetch_lease_ticks{16U};
+    double expert_prefetch_minimum_confidence{0.75};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     bool require_zero_nvme_decode{true};
@@ -59,6 +66,20 @@ struct Dsv4CacheStats {
     std::uint64_t evictions{};
     std::uint64_t lease_acquires{};
     std::uint64_t lease_releases{};
+    std::uint64_t demand_h2d_bytes{};
+    std::uint64_t demand_wait_nanoseconds{};
+    std::uint64_t prefetch_requests{};
+    std::uint64_t prefetch_h2d_bytes{};
+    std::uint64_t useful_prefetch_bytes{};
+    std::uint64_t late_prefetch_bytes{};
+    std::uint64_t duplicate_prefetch_bytes{};
+    std::uint64_t evicted_prefetch_bytes{};
+    std::uint64_t wasted_prefetch_bytes{};
+    std::uint64_t cancelled_prefetch_bytes{};
+    std::uint64_t prefetch_lease_acquires{};
+    std::uint64_t prefetch_lease_releases{};
+    std::uint64_t active_prefetch_leases{};
+    std::uint64_t prefetch_queue_peak{};
     std::vector<std::uint64_t> used_bytes;
     std::vector<std::uint64_t> capacity_bytes;
     std::vector<std::uint64_t> pinned_bytes;
@@ -151,6 +172,11 @@ struct Dsv4GenerationMetrics {
     std::uint32_t flash_attention_minimum_rows{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};
+    std::uint32_t expert_prefetch_predictions{};
+    std::uint32_t expert_prefetch_queue_depth{};
+    std::uint64_t expert_prefetch_byte_budget{};
+    std::uint64_t expert_prefetch_lease_ticks{};
+    double expert_prefetch_minimum_confidence{};
 };
 
 struct Dsv4GenerationResult {

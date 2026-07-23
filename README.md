@@ -312,6 +312,18 @@ weighted-ReLU scoring, and deterministic top-512 selection in a bounded workspac
 Compact blocks remain device-resident when `--kv-device-cache` budgets permit, and
 only selected positions return to the host. The scalar indexer remains the default.
 
+Opt-in `--expert-prefetch N` enables advisory trace-driven prefetch of routed
+expert weights into host RAM, using up to `N` past-only transition predictions
+for the next decode step. Prefetch is bounded by `--expert-prefetch-bytes`
+(default 1G), `--expert-prefetch-queue` (default 8), `--expert-prefetch-lease`
+(default 16 ticks), and `--expert-prefetch-confidence` (default 0.75). Demand
+loads have priority: prefetch is cancelled, suppressed, or deferred when
+in-flight demand or queue pressure exceeds the budget. Zero predictions (the
+default) disables prefetch entirely. The JSON output reports
+`prefetch_requests`, `useful_prefetch_bytes`, `late_prefetch_bytes`,
+`wasted_prefetch_bytes`, `duplicate_prefetch_bytes`, `evicted_prefetch_bytes`,
+`cancelled_prefetch_bytes`, and `active_prefetch_leases` per run.
+
 See [`docs/deepseek-v4-runtime.md`](docs/deepseek-v4-runtime.md) for the pinned
 checkpoint contract, measured admission plan, design boundary, and remaining
 oracle gates.

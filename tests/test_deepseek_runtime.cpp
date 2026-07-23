@@ -18,12 +18,31 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.host_attention_threads == 28U);
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
+    REQUIRE(config.expert_prefetch_predictions == 0U);
+    REQUIRE(config.expert_prefetch_queue_depth == 8U);
+    REQUIRE(config.expert_prefetch_byte_budget == (1ULL << 30U));
+    REQUIRE(config.expert_prefetch_lease_ticks == 16U);
+    REQUIRE(config.expert_prefetch_minimum_confidence == 0.75);
     REQUIRE(config.overlap_resident_warmup);
     REQUIRE(config.enable_incremental_kv_continuation);
     REQUIRE(config.kv_cache_mode == strata::Dsv4KvCacheMode::ScalarOracle);
     REQUIRE(config.kv_block_rows == 64U);
     REQUIRE(config.host_kv_cache_bytes == 0U);
     REQUIRE(config.device_kv_cache_bytes.empty());
+}
+
+TEST_CASE("DeepSeek runtime rejects unbounded expert prefetch") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.expert_prefetch_predictions = 2U;
+    config.expert_prefetch_queue_depth = 0U;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("expert prefetch") !=
+                                   std::string::npos;
+                        }));
 }
 
 TEST_CASE("DeepSeek GPU Lightning Indexer requires compact exact KV blocks") {

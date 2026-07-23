@@ -45,11 +45,13 @@ GLM uses a per-device LRU weight cache with a pinned dense spine and optional
 host execution for cold routed experts. DeepSeek stages canonical routed expert
 weights in host RAM, pins its dense/shared spine in VRAM, and leases exact
 top-k expert triplets during device execution. Device assignment is a shared,
-capacity-weighted schedule.
+capacity-weighted schedule. Its opt-in past-only predictor can queue bounded
+host-to-VRAM expert prefetch without changing exact routes or coefficients;
+demand cancels queued duplicates and may evict prefetched entries first.
 
 There is no cross-request ticket ring, peer expert RPC, route-affinity cohort
-scheduler, or predictor-driven runtime prefetch path yet. Those are target
-architecture items and cannot be claimed by current benchmarks.
+scheduler yet. Those are target architecture items and cannot be claimed by
+current benchmarks.
 
 ## Route traces
 

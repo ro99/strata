@@ -7,7 +7,24 @@ result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-observability"}
 capture_telemetry=${CAPTURE_TELEMETRY:-1}
 runner=${RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 maximum_context_tokens=${MAX_CONTEXT_TOKENS:-2048}
+maximum_new_tokens=${MAX_NEW_TOKENS:-128}
+expert_prefetch_predictions=${EXPERT_PREFETCH_PREDICTIONS:-0}
+expert_prefetch_bytes=${EXPERT_PREFETCH_BYTES:-1G}
+expert_prefetch_queue=${EXPERT_PREFETCH_QUEUE:-8}
+expert_prefetch_lease=${EXPERT_PREFETCH_LEASE:-16}
+expert_prefetch_confidence=${EXPERT_PREFETCH_CONFIDENCE:-0.75}
 mkdir -p "${result_dir}"
+
+prefetch_args=()
+if [[ "${expert_prefetch_predictions}" != 0 ]]; then
+    prefetch_args=(
+        --expert-prefetch "${expert_prefetch_predictions}"
+        --expert-prefetch-bytes "${expert_prefetch_bytes}"
+        --expert-prefetch-queue "${expert_prefetch_queue}"
+        --expert-prefetch-lease "${expert_prefetch_lease}"
+        --expert-prefetch-confidence "${expert_prefetch_confidence}"
+    )
+fi
 
 telemetry_pid=
 cleanup() {
@@ -41,10 +58,12 @@ git -C "${repo_root}" diff --binary >"${result_dir}/candidate.diff"
     --host-memory 216G \
     --vram-fraction 0.85 \
     --max-context "${maximum_context_tokens}" \
-    --max-new 128 \
+    --max-new "${maximum_new_tokens}" \
     --prompt Hello \
+    --route-trace "${result_dir}/routes.jsonl" \
     --detailed-timing \
     --json \
+    "${prefetch_args[@]}" \
     >"${result_dir}/generation.json" \
     2>"${result_dir}/generation.log"
 
@@ -67,5 +86,6 @@ jq '{
     decode_seconds,
     decode_tok_s: (.decode_steps / .decode_seconds),
     generated_token_ids,
-    phases
+    phases,
+    weight_cache
 }' "${result_dir}/generation.json" >"${result_dir}/summary.json"

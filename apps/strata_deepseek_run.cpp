@@ -28,10 +28,15 @@ struct Options {
     std::uint32_t flash_attention_minimum_rows{256U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
+    std::uint32_t expert_prefetch_predictions{};
+    std::uint32_t expert_prefetch_queue_depth{8U};
+    std::uint32_t expert_prefetch_lease_ticks{16U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
+    std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
+    double expert_prefetch_minimum_confidence{0.75};
     bool admission_only{};
     bool json{};
     bool quiet{};
@@ -54,6 +59,9 @@ void usage() {
         << "       [--host-attention-threads N|--serial-host-attention]\n"
         << "       [--resident-read-workers N]\n"
         << "       [--spine-warmup-workers N]\n"
+        << "       [--expert-prefetch N] [--expert-prefetch-bytes 1G]\n"
+        << "       [--expert-prefetch-queue N] [--expert-prefetch-lease N]\n"
+        << "       [--expert-prefetch-confidence P]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
@@ -155,6 +163,27 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (value == nullptr || !strata::cli::parse_u32(value, options.spine_warmup_workers) ||
                 options.spine_warmup_workers == 0U ||
                 options.spine_warmup_workers > 64U) return false;
+        } else if (argument == "--expert-prefetch") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_u32(
+                    value, options.expert_prefetch_predictions)) return false;
+        } else if (argument == "--expert-prefetch-bytes") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_bytes(
+                    value, options.expert_prefetch_byte_budget)) return false;
+        } else if (argument == "--expert-prefetch-queue") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_u32(
+                    value, options.expert_prefetch_queue_depth)) return false;
+        } else if (argument == "--expert-prefetch-lease") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_u32(
+                    value, options.expert_prefetch_lease_ticks)) return false;
+        } else if (argument == "--expert-prefetch-confidence") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_double(
+                    value, options.expert_prefetch_minimum_confidence,
+                    0.0, 1.0)) return false;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
@@ -411,6 +440,26 @@ void print_cache_stats(std::ostream& output, const strata::Dsv4CacheStats& stats
            << ",\"evictions\":" << stats.evictions
            << ",\"lease_acquires\":" << stats.lease_acquires
            << ",\"lease_releases\":" << stats.lease_releases
+           << ",\"demand_h2d_bytes\":" << stats.demand_h2d_bytes
+           << ",\"demand_wait_seconds\":"
+           << static_cast<double>(stats.demand_wait_nanoseconds) / 1.0e9
+           << ",\"prefetch_requests\":" << stats.prefetch_requests
+           << ",\"prefetch_h2d_bytes\":" << stats.prefetch_h2d_bytes
+           << ",\"useful_prefetch_bytes\":" << stats.useful_prefetch_bytes
+           << ",\"late_prefetch_bytes\":" << stats.late_prefetch_bytes
+           << ",\"duplicate_prefetch_bytes\":"
+           << stats.duplicate_prefetch_bytes
+           << ",\"evicted_prefetch_bytes\":" << stats.evicted_prefetch_bytes
+           << ",\"wasted_prefetch_bytes\":" << stats.wasted_prefetch_bytes
+           << ",\"cancelled_prefetch_bytes\":"
+           << stats.cancelled_prefetch_bytes
+           << ",\"prefetch_lease_acquires\":"
+           << stats.prefetch_lease_acquires
+           << ",\"prefetch_lease_releases\":"
+           << stats.prefetch_lease_releases
+           << ",\"active_prefetch_leases\":"
+           << stats.active_prefetch_leases
+           << ",\"prefetch_queue_peak\":" << stats.prefetch_queue_peak
            << ",\"used_bytes\":";
     strata::cli::print_array(output, stats.used_bytes);
     output << ",\"capacity_bytes\":";
@@ -777,6 +826,12 @@ int main(int argc, char** argv) {
     config.host_attention_threads = options.host_attention_threads;
     config.resident_read_workers = options.resident_read_workers;
     config.spine_warmup_workers = options.spine_warmup_workers;
+    config.expert_prefetch_predictions = options.expert_prefetch_predictions;
+    config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
+    config.expert_prefetch_byte_budget = options.expert_prefetch_byte_budget;
+    config.expert_prefetch_lease_ticks = options.expert_prefetch_lease_ticks;
+    config.expert_prefetch_minimum_confidence =
+        options.expert_prefetch_minimum_confidence;
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
@@ -829,6 +884,16 @@ int main(int argc, char** argv) {
                   << metrics.resident_read_workers
                   << ",\"spine_warmup_workers\":"
                   << metrics.spine_warmup_workers
+                  << ",\"expert_prefetch_predictions\":"
+                  << metrics.expert_prefetch_predictions
+                  << ",\"expert_prefetch_queue_depth\":"
+                  << metrics.expert_prefetch_queue_depth
+                  << ",\"expert_prefetch_byte_budget\":"
+                  << metrics.expert_prefetch_byte_budget
+                  << ",\"expert_prefetch_lease_ticks\":"
+                  << metrics.expert_prefetch_lease_ticks
+                  << ",\"expert_prefetch_minimum_confidence\":"
+                  << metrics.expert_prefetch_minimum_confidence
                   << ",\"resident_warmup_overlapped\":"
                   << (metrics.resident_warmup_overlapped ? "true" : "false")
                   << ",\"detailed_timing\":"
@@ -858,7 +923,9 @@ int main(int argc, char** argv) {
                   << ",\"vram_cache_hits\":" << metrics.cache.hits
                   << ",\"vram_cache_misses\":" << metrics.cache.misses
                   << ",\"vram_cache_evictions\":" << metrics.cache.evictions
-                  << ",\"kv_cache\":";
+                  << ",\"weight_cache\":";
+        print_cache_stats(std::cout, metrics.cache);
+        std::cout << ",\"kv_cache\":";
         print_kv_cache_stats(std::cout, metrics.kv_cache);
         std::cout
                   << ",\"cuda\":";

@@ -678,11 +678,13 @@ struct DeepSeekV4Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
+    std::vector<std::uint32_t> cached_token_ids;
     RouteTraceWriter route_trace;
     std::vector<RouteEvent> deferred_route_events;
     bool defer_prefill_observability{};
     std::mt19937_64 sampler;
     bool initialized{};
+    bool reusable_sequence{};
     std::uint64_t active_request_id{};
     std::uint64_t generated_requests{};
     std::uint32_t active_prompt_tokens{};
@@ -874,7 +876,8 @@ struct DeepSeekV4Runtime::Impl {
                                              std::uint32_t position,
                                              std::span<const float> hidden);
     ParseResult<std::uint32_t> forward_prefill(
-        std::span<const std::uint32_t> tokens);
+        std::span<const std::uint32_t> tokens,
+        std::uint32_t position_base);
     ValidationResult flush_deferred_routes();
     ValidationResult flush_prefill_observability();
     ParseResult<std::uint32_t> forward_token(std::uint32_t token,
@@ -1116,6 +1119,8 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
 ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     std::uint32_t active_context_tokens) {
     ValidationResult result;
+    reusable_sequence = false;
+    cached_token_ids.clear();
     if (kv_cache != nullptr) {
         result = kv_cache->reset_sequence(active_sequence);
         if (!result.ok()) return result;
@@ -2569,10 +2574,12 @@ ValidationResult DeepSeekV4Runtime::Impl::flush_prefill_observability() {
 }
 
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
-    std::span<const std::uint32_t> tokens) {
+    std::span<const std::uint32_t> tokens, std::uint32_t position_base) {
     ParseResult<std::uint32_t> result;
-    if (tokens.empty()) {
-        result.errors.emplace_back("DeepSeek prefill requires at least one token");
+    if (tokens.empty() || tokens.size() > config.maximum_context_tokens ||
+        position_base > config.maximum_context_tokens - tokens.size()) {
+        result.errors.emplace_back(
+            "DeepSeek prefill requires a non-empty in-context token range");
         return result;
     }
     const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
@@ -2584,7 +2591,8 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
                 graph_stats.prefill_max_workspace_bytes,
                 static_cast<std::uint64_t>(hidden_stride) * sizeof(float));
             result = forward_token(
-                tokens[position], static_cast<std::uint32_t>(position),
+                tokens[position],
+                position_base + static_cast<std::uint32_t>(position),
                 position + 1U == tokens.size());
             if (!result.ok()) return result;
         }
@@ -2622,19 +2630,23 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
         }
 
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto absolute_page_begin = position_base +
+                static_cast<std::uint32_t>(page_begin);
             auto status = block_page(
                 layer, tokens.subspan(page_begin, page_rows), hidden,
-                static_cast<std::uint32_t>(page_begin));
+                absolute_page_begin);
             if (!status.ok()) {
                 defer_prefill_observability = false;
                 result.errors = std::move(status.errors);
                 return result;
             }
             for (std::uint32_t row = 0U; row < page_rows; ++row) {
-                const auto absolute = static_cast<std::uint32_t>(page_begin) + row;
+                const auto token_index = page_begin + row;
+                const auto absolute = position_base +
+                    static_cast<std::uint32_t>(token_index);
                 if (config.enable_layer_hash_trace) {
                     record_layer_hash(
-                        absolute, tokens[absolute], layer,
+                        absolute, tokens[token_index], layer,
                         std::span<const float>(hidden).subspan(
                             static_cast<std::size_t>(row) * hidden_stride,
                             hidden_stride));
@@ -2652,7 +2664,8 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
             --graph_stats.forward_tokens;
             const auto last_row = std::span<const float>(hidden).last(hidden_stride);
             result = sample_hidden(tokens.back(),
-                                   static_cast<std::uint32_t>(tokens.size() - 1U),
+                                   position_base + static_cast<std::uint32_t>(
+                                       tokens.size() - 1U),
                                    last_row);
             if (!result.ok()) {
                 defer_prefill_observability = false;
@@ -3002,10 +3015,30 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     impl_->reset_diagnostics();
     const auto active_context_tokens = static_cast<std::uint32_t>(
         encoded.value.size() + maximum_new_tokens);
-    auto reset = impl_->reset_sequence(active_context_tokens);
-    if (!reset.ok()) {
-        result.errors = std::move(reset.errors);
-        return result;
+    std::size_t prefill_offset = impl_->config.enable_incremental_kv_continuation &&
+        impl_->reusable_sequence
+        ? incremental_kv_prefix_tokens(impl_->cached_token_ids,
+                                       result.prompt_token_ids)
+        : 0U;
+    if (prefill_offset != 0U &&
+        !std::all_of(impl_->attention_state.begin(),
+                     impl_->attention_state.end(),
+                     [active_context_tokens](const AttentionState& state) {
+                         return state.compressor.ratio != 4U ||
+                             active_context_tokens <=
+                                 kIndexTopK * state.compressor.ratio ||
+                             state.indexer_compressor.ratio ==
+                                 state.compressor.ratio;
+                     })) {
+        prefill_offset = 0U;
+    }
+    impl_->reusable_sequence = false;
+    if (prefill_offset == 0U) {
+        auto reset = impl_->reset_sequence(active_context_tokens);
+        if (!reset.ok()) {
+            result.errors = std::move(reset.errors);
+            return result;
+        }
     }
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();
@@ -3015,14 +3048,21 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto device_moe_before = impl_->device_moe_stats;
     const auto graph_before = impl_->graph_stats;
     const auto prefill_started = std::chrono::steady_clock::now();
-    auto next = impl_->forward_prefill(result.prompt_token_ids);
+    auto prefill_tokens = std::span<const std::uint32_t>(
+        result.prompt_token_ids).subspan(prefill_offset);
+    auto next = impl_->forward_prefill(
+        prefill_tokens, static_cast<std::uint32_t>(prefill_offset));
     if (!next.ok()) {
         result.errors = std::move(next.errors);
         return result;
     }
+    impl_->cached_token_ids = result.prompt_token_ids;
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_started).count();
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
+    result.metrics.prefill_tokens = prefill_tokens.size();
+    result.metrics.reused_prompt_tokens = prefill_offset;
+    result.metrics.incremental_kv_continuation = prefill_offset != 0U;
     const auto reads_after_prefill = impl_->checkpoint->stats();
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
@@ -3046,11 +3086,13 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto decode_started = std::chrono::steady_clock::now();
     while (next.value != stop_token &&
            result.generated_token_ids.size() < maximum_new_tokens) {
-        next = impl_->forward_token(next.value, position++, true);
+        const auto input_token = next.value;
+        next = impl_->forward_token(input_token, position++, true);
         if (!next.ok()) {
             result.errors = std::move(next.errors);
             return result;
         }
+        impl_->cached_token_ids.push_back(input_token);
         ++decode_steps;
         if (next.value != stop_token) {
             result.generated_token_ids.push_back(next.value);
@@ -3084,7 +3126,10 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     result.metrics.prefill_seconds = prefill_seconds;
     result.metrics.decode_seconds = decode_seconds;
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
+    result.metrics.prefill_tokens = prefill_tokens.size();
+    result.metrics.reused_prompt_tokens = prefill_offset;
     result.metrics.decode_tokens = decode_steps;
+    result.metrics.incremental_kv_continuation = prefill_offset != 0U;
     result.metrics.rss_bytes = resident_set_bytes();
     result.metrics.device_vram_used_bytes =
         device_vram_used_bytes(impl_->devices);
@@ -3138,6 +3183,8 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
                              std::make_move_iterator(flushed.errors.begin()),
                              std::make_move_iterator(flushed.errors.end()));
     }
+    impl_->reusable_sequence =
+        impl_->config.enable_incremental_kv_continuation && result.ok();
     return result;
 }
 

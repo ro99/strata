@@ -27,13 +27,18 @@ struct RuntimeConfig {
     bool verbose{};
     bool load_progress{};
     bool enable_flash_attention{};
+    bool enable_incremental_kv_continuation{true};
+    bool deepseek_block_kv_cache{};
 };
 
 struct GenerationMetrics {
     std::uint64_t prompt_tokens{};
+    std::uint64_t prefill_tokens{};
+    std::uint64_t reused_prompt_tokens{};
     std::uint64_t decode_tokens{};
     double prefill_seconds{};
     double decode_seconds{};
+    bool incremental_kv_continuation{};
 };
 
 struct GenerationResult {

@@ -32,6 +32,7 @@ struct Dsv4RuntimeConfig {
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     bool enable_flash_attention{};
+    bool enable_incremental_kv_continuation{true};
     // CUDA offload has a fixed launch/staging cost. The production default
     // retains parallel host attention below the measured row crossover; zero
     // forces every supported shape through CUDA for diagnostics.
@@ -117,6 +118,8 @@ struct Dsv4GenerationMetrics {
     double prefill_seconds{};
     double decode_seconds{};
     std::uint64_t prompt_tokens{};
+    std::uint64_t prefill_tokens{};
+    std::uint64_t reused_prompt_tokens{};
     std::uint64_t decode_tokens{};
     std::uint64_t rss_bytes{};
     std::vector<std::uint64_t> device_vram_used_bytes;
@@ -136,6 +139,7 @@ struct Dsv4GenerationMetrics {
     bool device_moe_enabled{};
     bool resident_warmup_overlapped{};
     bool block_kv_cache_enabled{};
+    bool incremental_kv_continuation{};
     std::uint32_t kv_block_rows{};
     std::uint32_t host_attention_threads{};
     std::uint32_t prefill_page_tokens{};

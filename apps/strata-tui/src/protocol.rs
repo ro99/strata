@@ -22,6 +22,10 @@ pub struct Envelope {
     #[serde(default)]
     pub prompt_tokens: u64,
     #[serde(default)]
+    pub prefill_tokens: u64,
+    #[serde(default)]
+    pub reused_prompt_tokens: u64,
+    #[serde(default)]
     pub decode_tokens: u64,
     #[serde(default)]
     pub prefill_seconds: f64,
@@ -70,5 +74,16 @@ mod tests {
         let error = Envelope::parse(r#"{"protocol":"strata-chat","version":2,"event":"ready"}"#)
             .unwrap_err();
         assert!(error.contains("version 2"));
+    }
+
+    #[test]
+    fn turn_done_reports_incremental_prefill_work() {
+        let event = Envelope::parse(
+            r#"{"protocol":"strata-chat","version":1,"event":"turn_done","prompt_tokens":40,"prefill_tokens":12,"reused_prompt_tokens":28}"#,
+        )
+        .unwrap();
+        assert_eq!(event.prompt_tokens, 40);
+        assert_eq!(event.prefill_tokens, 12);
+        assert_eq!(event.reused_prompt_tokens, 28);
     }
 }

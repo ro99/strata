@@ -768,6 +768,11 @@ int main(int argc, char** argv) {
                   << ",\"resident_staging_seconds\":" << metrics.resident_staging_seconds
                   << ",\"resident_warmup_seconds\":" << metrics.resident_warmup_seconds
                   << ",\"prompt_tokens\":" << metrics.prompt_tokens
+                  << ",\"prefill_tokens\":" << metrics.prefill_tokens
+                  << ",\"reused_prompt_tokens\":"
+                  << metrics.reused_prompt_tokens
+                  << ",\"incremental_kv_continuation\":"
+                  << (metrics.incremental_kv_continuation ? "true" : "false")
                   << ",\"generated_tokens\":" << generated.generated_token_ids.size()
                   << ",\"decode_steps\":" << metrics.decode_tokens
                   << ",\"rss_bytes\":" << metrics.rss_bytes
@@ -813,7 +818,8 @@ int main(int argc, char** argv) {
         std::cout << generated.text << "\n\n"
                   << "initialization: " << metrics.initialization_seconds << " s\n"
                   << "resident staging: " << metrics.resident_staging_seconds << " s\n"
-                  << "prefill: " << metrics.prompt_tokens << " tokens in "
+                  << "prefill: " << metrics.prefill_tokens << " of "
+                  << metrics.prompt_tokens << " prompt tokens in "
                   << metrics.prefill_seconds << " s\n"
                   << "generation: " << generated.generated_token_ids.size()
                   << " tokens, " << metrics.decode_tokens << " decode steps in "

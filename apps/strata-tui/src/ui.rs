@@ -452,8 +452,8 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled("LAST TURN", theme::title())),
         Line::from(""),
         metric_pair(
-            "PROMPT",
-            app.metrics.prompt_tokens,
+            "PREFILL",
+            app.metrics.prefill_tokens,
             app.metrics.prefill_tok_s,
         ),
         metric_pair(
@@ -462,6 +462,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             app.metrics.decode_tok_s,
         ),
         Line::from(""),
+        metric_line("KV REUSE", &format_number(app.metrics.reused_prompt_tokens)),
         metric_line("PREFILL", &format!("{:.2} s", app.metrics.prefill_seconds)),
         metric_line("DECODE", &format!("{:.2} s", app.metrics.decode_seconds)),
         metric_line("LOAD", &format!("{:.2} s", app.metrics.load_seconds)),

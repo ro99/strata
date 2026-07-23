@@ -22,6 +22,7 @@ struct Glm52RuntimeConfig {
     bool diagnostic_trace{};
     bool detailed_timing{};
     bool enable_flash_attention{};
+    bool enable_incremental_kv_continuation{true};
     bool host_cold_experts{};
     std::uint32_t host_worker_threads{36};
     double sampling_temperature{};
@@ -63,6 +64,8 @@ struct Glm52PhaseMetrics {
 
 struct Glm52RunMetrics {
     std::uint64_t prompt_tokens{};
+    std::uint64_t prefill_tokens{};
+    std::uint64_t reused_prompt_tokens{};
     std::uint64_t decode_tokens{};
     double prefill_seconds{};
     double decode_seconds{};
@@ -74,9 +77,11 @@ struct Glm52RunMetrics {
     Glm52PhaseMetrics decode;
     bool detailed_timing{};
     bool flash_attention_enabled{};
+    bool incremental_kv_continuation{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {
-        return prefill_seconds > 0.0 ? static_cast<double>(prompt_tokens) / prefill_seconds : 0.0;
+        return prefill_seconds > 0.0
+            ? static_cast<double>(prefill_tokens) / prefill_seconds : 0.0;
     }
     [[nodiscard]] double decode_tokens_per_second() const noexcept {
         return decode_seconds > 0.0 ? static_cast<double>(decode_tokens) / decode_seconds : 0.0;

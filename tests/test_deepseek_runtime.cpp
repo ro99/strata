@@ -18,6 +18,7 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
     REQUIRE(config.overlap_resident_warmup);
+    REQUIRE(config.enable_incremental_kv_continuation);
     REQUIRE(config.kv_cache_mode == strata::Dsv4KvCacheMode::ScalarOracle);
     REQUIRE(config.kv_block_rows == 64U);
     REQUIRE(config.host_kv_cache_bytes == 0U);

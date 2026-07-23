@@ -87,4 +87,15 @@ RuntimeDevicePlanResult plan_runtime_devices(
     return result;
 }
 
+std::size_t incremental_kv_prefix_tokens(
+    std::span<const std::uint32_t> cached_tokens,
+    std::span<const std::uint32_t> prompt_tokens) noexcept {
+    if (cached_tokens.empty() || cached_tokens.size() >= prompt_tokens.size() ||
+        !std::equal(cached_tokens.begin(), cached_tokens.end(),
+                    prompt_tokens.begin())) {
+        return 0U;
+    }
+    return cached_tokens.size();
+}
+
 }  // namespace strata

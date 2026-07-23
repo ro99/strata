@@ -462,9 +462,11 @@ struct Glm52Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::uint32_t, std::vector<float>> embedding_rows;
     std::vector<LayerKv> kv{kLayers};
+    std::vector<std::uint32_t> cached_token_ids;
     RouteTraceWriter route_trace;
     std::mt19937_64 sampler;
     bool initialized{};
+    bool reusable_sequence{};
     std::uint32_t last_second_token{};
     float last_logit_margin{};
     std::uint64_t host_aggregation_nanoseconds{};
@@ -1356,6 +1358,8 @@ struct Glm52Runtime::Impl {
     }
 
     void reset_sequence() {
+        reusable_sequence = false;
+        cached_token_ids.clear();
         host_aggregation_nanoseconds = 0U;
         for (auto& layer : kv) {
             layer.keys.clear();
@@ -1501,21 +1505,34 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
     }
     result.prompt_token_ids = encoded.value;
     impl_->active_request_id = impl_->config.request_id + impl_->generated_requests++;
-    impl_->reset_sequence();
+    std::size_t prefill_offset = impl_->config.enable_incremental_kv_continuation &&
+        impl_->reusable_sequence
+        ? incremental_kv_prefix_tokens(impl_->cached_token_ids,
+                                       result.prompt_token_ids)
+        : 0U;
+    impl_->reusable_sequence = false;
+    if (prefill_offset == 0U) impl_->reset_sequence();
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
     const auto host_before = impl_->host_stats();
     const auto aggregation_before = impl_->host_aggregation_nanoseconds;
     const auto prefill_start = std::chrono::steady_clock::now();
-    auto next = impl_->forward(result.prompt_token_ids, 0U, true);
+    auto prefill_tokens = std::span<const std::uint32_t>(
+        result.prompt_token_ids).subspan(prefill_offset);
+    auto next = impl_->forward(
+        prefill_tokens, static_cast<std::uint32_t>(prefill_offset), true);
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_start).count();
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
+    result.metrics.prefill_tokens = prefill_tokens.size();
+    result.metrics.reused_prompt_tokens = prefill_offset;
+    result.metrics.incremental_kv_continuation = prefill_offset != 0U;
     if (!next.ok()) {
         result.errors = std::move(next.errors);
         return result;
     }
+    impl_->cached_token_ids = result.prompt_token_ids;
     const auto reads_after_prefill = impl_->checkpoint->stats();
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
@@ -1549,6 +1566,7 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
             result.errors = std::move(next.errors);
             return result;
         }
+        impl_->cached_token_ids.push_back(input[0]);
         ++result.metrics.decode_tokens;
         if (impl_->config.host_cold_experts &&
             result.metrics.decode_tokens % 32U == 0U) {
@@ -1615,6 +1633,8 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
         auto flushed = impl_->route_trace.flush();
         move_errors(result.errors, std::move(flushed));
     }
+    impl_->reusable_sequence =
+        impl_->config.enable_incremental_kv_continuation && result.ok();
     return result;
 }
 

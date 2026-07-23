@@ -16,6 +16,21 @@ TEST_CASE("common runtime validation rejects duplicate devices") {
                         }));
 }
 
+TEST_CASE("incremental KV reuse requires a strict exact token prefix") {
+    const std::vector<std::uint32_t> cached{1U, 2U, 3U};
+    const std::vector<std::uint32_t> extended{1U, 2U, 3U, 4U, 5U};
+    const std::vector<std::uint32_t> unchanged{1U, 2U, 3U};
+    const std::vector<std::uint32_t> truncated{1U, 2U};
+    const std::vector<std::uint32_t> changed{1U, 2U, 9U, 4U};
+    const std::vector<std::uint32_t> empty;
+
+    REQUIRE(strata::incremental_kv_prefix_tokens(cached, extended) == 3U);
+    REQUIRE(strata::incremental_kv_prefix_tokens(cached, unchanged) == 0U);
+    REQUIRE(strata::incremental_kv_prefix_tokens(cached, truncated) == 0U);
+    REQUIRE(strata::incremental_kv_prefix_tokens(cached, changed) == 0U);
+    REQUIRE(strata::incremental_kv_prefix_tokens(empty, extended) == 0U);
+}
+
 TEST_CASE("runtime session remains fresh after failed initialization") {
     strata::RuntimeSession runtime;
     strata::RuntimeConfig config;
@@ -29,6 +44,19 @@ TEST_CASE("runtime session remains fresh after failed initialization") {
     REQUIRE(std::any_of(invalid.errors.begin(), invalid.errors.end(),
                         [](const std::string& error) {
                             return error.find("model limit") != std::string::npos;
+                        }));
+}
+
+TEST_CASE("common runtime rejects DeepSeek cache controls for GLM") {
+    strata::RuntimeSession runtime;
+    strata::RuntimeConfig config;
+    config.deepseek_block_kv_cache = true;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("DeepSeek block KV") !=
+                                   std::string::npos;
                         }));
 }
 

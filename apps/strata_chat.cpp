@@ -33,6 +33,8 @@ struct Options {
     std::uint64_t seed{33'377'335U};
     bool devices_explicit{};
     bool flash_attention{};
+    bool incremental_kv_continuation{true};
+    bool block_kv_cache{};
     bool jsonl_protocol{};
 };
 
@@ -42,7 +44,8 @@ void usage() {
         << "                    [--context-size N] [--max-new N]\n"
         << "                    [--temperature F] [--seed N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
-        << "                    [--flash-attention]\n"
+        << "                    [--flash-attention] [--full-reprefill]\n"
+        << "                    [--block-kv-cache]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
@@ -58,6 +61,14 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--flash-attention") {
             options.flash_attention = true;
+            continue;
+        }
+        if (argument == "--full-reprefill") {
+            options.incremental_kv_continuation = false;
+            continue;
+        }
+        if (argument == "--block-kv-cache") {
+            options.block_kv_cache = true;
             continue;
         }
         if (index + 1 >= argc) return false;
@@ -332,17 +343,29 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
     display.finish(runtime_tok_s);
     if (options.jsonl_protocol) {
         const double prefill_tok_s = result.metrics.prefill_seconds > 0.0
-            ? static_cast<double>(result.metrics.prompt_tokens) /
+            ? static_cast<double>(result.metrics.prefill_tokens) /
                   result.metrics.prefill_seconds
             : 0.0;
         std::ostringstream fields;
         fields << std::fixed << std::setprecision(6)
                << "\"prompt_tokens\":" << result.metrics.prompt_tokens
+               << ",\"prefill_tokens\":" << result.metrics.prefill_tokens
+               << ",\"reused_prompt_tokens\":"
+               << result.metrics.reused_prompt_tokens
+               << ",\"incremental_kv_continuation\":"
+               << (result.metrics.incremental_kv_continuation ? "true" : "false")
                << ",\"decode_tokens\":" << result.metrics.decode_tokens
                << ",\"prefill_seconds\":" << result.metrics.prefill_seconds
                << ",\"prefill_tok_s\":" << prefill_tok_s
                << ",\"decode_seconds\":" << result.metrics.decode_seconds
-               << ",\"decode_tok_s\":" << runtime_tok_s;
+               << ",\"decode_tok_s\":" << runtime_tok_s
+               << ",\"generated_token_ids\":[";
+        for (std::size_t index = 0U;
+             index < result.generated_token_ids.size(); ++index) {
+            if (index != 0U) fields << ',';
+            fields << result.generated_token_ids[index];
+        }
+        fields << ']';
         protocol_event("turn_done", fields.str());
     } else {
         std::cout << '\n';
@@ -370,7 +393,11 @@ int main(int argc, char** argv) {
                << ",\"temperature\":" << options.temperature
                << ",\"exact\":" << (options.temperature == 0.0 ? "true" : "false")
                << ",\"flash_attention\":"
-               << (options.flash_attention ? "true" : "false");
+               << (options.flash_attention ? "true" : "false")
+               << ",\"incremental_kv_continuation\":"
+               << (options.incremental_kv_continuation ? "true" : "false")
+               << ",\"block_kv_cache\":"
+               << (options.block_kv_cache ? "true" : "false");
         protocol_event("hello", fields.str());
         protocol_message("status", "Loading model");
     }
@@ -403,6 +430,9 @@ int main(int argc, char** argv) {
     config.sampling_temperature = options.temperature;
     config.sampling_seed = options.seed;
     config.enable_flash_attention = options.flash_attention;
+    config.enable_incremental_kv_continuation =
+        options.incremental_kv_continuation;
+    config.deepseek_block_kv_cache = options.block_kv_cache;
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {

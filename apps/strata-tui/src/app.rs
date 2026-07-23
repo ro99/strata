@@ -69,6 +69,8 @@ pub struct ChatMessage {
 pub struct Metrics {
     pub load_seconds: f64,
     pub prompt_tokens: u64,
+    pub prefill_tokens: u64,
+    pub reused_prompt_tokens: u64,
     pub decode_tokens: u64,
     pub prefill_seconds: f64,
     pub prefill_tok_s: f64,
@@ -301,6 +303,8 @@ impl App {
                 self.phase = RuntimePhase::Ready;
                 self.status_message = "Ready for the next prompt".into();
                 self.metrics.prompt_tokens = event.prompt_tokens;
+                self.metrics.prefill_tokens = event.prefill_tokens;
+                self.metrics.reused_prompt_tokens = event.reused_prompt_tokens;
                 self.metrics.decode_tokens = event.decode_tokens;
                 self.metrics.prefill_seconds = event.prefill_seconds;
                 self.metrics.prefill_tok_s = event.prefill_tok_s;
@@ -521,6 +525,8 @@ impl App {
         self.status_message = "Sending prompt to the runtime".into();
         self.scroll_from_bottom = 0;
         self.metrics.prompt_tokens = 0;
+        self.metrics.prefill_tokens = 0;
+        self.metrics.reused_prompt_tokens = 0;
         self.metrics.decode_tokens = 0;
         self.metrics.prefill_seconds = 0.0;
         self.metrics.decode_seconds = 0.0;

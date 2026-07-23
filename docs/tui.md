@@ -104,6 +104,8 @@ multiline and Unicode input:
 The runtime emits `hello`, `status`, `ready`, `turn_start`, `token`,
 `turn_done`, and `error`. Token records are flushed as soon as complete UTF-8 is
 available. `turn_done` carries separate prompt/decode token counts and timing.
+It also reports the prompt tokens processed this turn and those reused from the
+incremental KV cache.
 Unknown input fields are ignored for forward compatibility; malformed,
 duplicate, empty, oversized, or unsupported requests produce explicit errors.
 Protocol version mismatch is fatal in the frontend.

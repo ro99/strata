@@ -194,6 +194,12 @@ load time. Chat defaults to greedy decoding (`--temperature 0`) for deterministi
 output. Pass `--temperature 1` to enable seeded Gumbel-max sampling. Runtime and
 benchmark APIs remain greedy by default, so sampling is never enabled silently.
 
+Multi-turn chat reuses an exact cached token prefix and prefills only newly
+appended tokens. A changed or truncated history resets the cache and takes the
+full-prefill fallback. `--full-reprefill` forces that baseline for validation;
+DeepSeek chat also accepts `--block-kv-cache`. JSON `turn_done` events report
+full, processed, and reused prompt-token counts.
+
 `--vram-fraction` controls the fraction of each GPU's free memory budgeted for
 weight caching (default 0.85, valid range `(0, 0.95]`). Raise it (e.g., `0.95`)
 to keep more experts resident when free VRAM allows.

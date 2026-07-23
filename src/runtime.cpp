@@ -26,6 +26,11 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     if (config.model == RuntimeModel::Glm52) {
+        if (config.deepseek_block_kv_cache) {
+            result.errors.emplace_back(
+                "DeepSeek block KV cache cannot be used by the GLM runtime");
+            return result;
+        }
         Glm52Runtime runtime;
         Glm52RuntimeConfig concrete;
         concrete.devices = config.devices;
@@ -36,6 +41,8 @@ ValidationResult RuntimeSession::initialize(
         concrete.verbose = config.verbose;
         concrete.load_progress = config.load_progress;
         concrete.enable_flash_attention = config.enable_flash_attention;
+        concrete.enable_incremental_kv_continuation =
+            config.enable_incremental_kv_continuation;
         result = runtime.initialize(model_directory, concrete);
         if (result.ok()) impl_->runtime.emplace<Glm52Runtime>(std::move(runtime));
         return result;
@@ -49,6 +56,10 @@ ValidationResult RuntimeSession::initialize(
     concrete.sampling_seed = config.sampling_seed;
     concrete.verbose = config.verbose;
     concrete.enable_flash_attention = config.enable_flash_attention;
+    concrete.enable_incremental_kv_continuation =
+        config.enable_incremental_kv_continuation;
+    concrete.kv_cache_mode = config.deepseek_block_kv_cache
+        ? Dsv4KvCacheMode::Block : Dsv4KvCacheMode::ScalarOracle;
     result = runtime.initialize(model_directory, concrete);
     if (result.ok()) impl_->runtime.emplace<DeepSeekV4Runtime>(std::move(runtime));
     return result;
@@ -73,10 +84,15 @@ GenerationResult RuntimeSession::generate_chat_stream(
         result.text = std::move(concrete.text);
         result.prompt_token_ids = std::move(concrete.prompt_token_ids);
         result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.metrics = {concrete.metrics.prompt_tokens,
-                          concrete.metrics.decode_tokens,
-                          concrete.metrics.prefill_seconds,
-                          concrete.metrics.decode_seconds};
+        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
+        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
+        result.metrics.reused_prompt_tokens =
+            concrete.metrics.reused_prompt_tokens;
+        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
+        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
+        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
+        result.metrics.incremental_kv_continuation =
+            concrete.metrics.incremental_kv_continuation;
         result.errors = std::move(concrete.errors);
         return result;
     }
@@ -86,10 +102,15 @@ GenerationResult RuntimeSession::generate_chat_stream(
         result.text = std::move(concrete.text);
         result.prompt_token_ids = std::move(concrete.prompt_token_ids);
         result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.metrics = {concrete.metrics.prompt_tokens,
-                          concrete.metrics.decode_tokens,
-                          concrete.metrics.prefill_seconds,
-                          concrete.metrics.decode_seconds};
+        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
+        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
+        result.metrics.reused_prompt_tokens =
+            concrete.metrics.reused_prompt_tokens;
+        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
+        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
+        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
+        result.metrics.incremental_kv_continuation =
+            concrete.metrics.incremental_kv_continuation;
         result.errors = std::move(concrete.errors);
         return result;
     }

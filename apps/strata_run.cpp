@@ -303,6 +303,11 @@ int main(int argc, char** argv) {
                   << strata::cli::json_escape(options.route_trace) << '"'
                   << ",\"initialization_seconds\":" << initialization_seconds
                   << ",\"prompt_tokens\":" << metrics.prompt_tokens
+                  << ",\"prefill_tokens\":" << metrics.prefill_tokens
+                  << ",\"reused_prompt_tokens\":"
+                  << metrics.reused_prompt_tokens
+                  << ",\"incremental_kv_continuation\":"
+                  << (metrics.incremental_kv_continuation ? "true" : "false")
                   << ",\"decode_tokens\":" << metrics.decode_tokens
                   << ",\"prompt_processing_seconds\":" << metrics.prefill_seconds
                   << ",\"prompt_processing_tok_s\":"
@@ -350,7 +355,8 @@ int main(int argc, char** argv) {
     } else {
         std::cout << generated.text << "\n\n"
                   << "initialization/load: " << initialization_seconds << " s\n"
-                  << "prompt processing: " << metrics.prompt_tokens << " tokens in "
+                  << "prompt processing: " << metrics.prefill_tokens << " of "
+                  << metrics.prompt_tokens << " prompt tokens in "
                   << metrics.prefill_seconds << " s ("
                   << metrics.prefill_tokens_per_second() << " tok/s)\n"
                   << "generation: " << metrics.decode_tokens << " decode steps in "

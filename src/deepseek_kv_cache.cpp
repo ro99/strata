@@ -906,6 +906,17 @@ ValidationResult Dsv4KvCache::append(
     }
     result = state_->validate_block(*block);
     if (!result.ok()) return result;
+    if (state_->total_leases(*block) != 0U) {
+        result.errors.emplace_back(
+            "DeepSeek KV cannot mutate an in-flight device block");
+        return result;
+    }
+    for (std::size_t slot = 0U; slot < block->devices.size(); ++slot) {
+        if (!block->devices[slot].valid()) continue;
+        state_->metrics.device_used_bytes[slot] -=
+            block->devices[slot].device_bytes();
+        block->devices[slot] = {};
+    }
     const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
         static_cast<std::size_t>(logical_row - block_begin) * encoded.size();
     std::copy(encoded.begin(), encoded.end(), block->host.begin() + offset);
@@ -1012,6 +1023,69 @@ ParseResult<std::vector<float>> Dsv4KvCache::gather(
         }
         result.value.insert(result.value.end(), fetched.value.begin(),
                             fetched.value.end());
+    }
+    return result;
+}
+
+ParseResult<std::vector<CudaLightningIndexSegment>>
+Dsv4KvCache::learned_index_segments(
+    Dsv4SequenceHandle sequence, std::uint32_t layer,
+    std::uint64_t rows) const {
+    ParseResult<std::vector<CudaLightningIndexSegment>> result;
+    const auto* target = state_->sequence(sequence);
+    if (target == nullptr) {
+        result.errors.emplace_back("DeepSeek KV sequence does not exist");
+        return result;
+    }
+    const auto found = target->tables.find(
+        TableKey{Dsv4KvBlockKind::LearnedIndex, layer});
+    if (rows == 0U) return result;
+    if (found == target->tables.end() || found->second.minimum_row != 0U ||
+        rows > found->second.end_row) {
+        result.errors.emplace_back(
+            "DeepSeek learned-index compact rows are not retained");
+        return result;
+    }
+    try {
+        result.value.reserve(found->second.blocks.size());
+    } catch (const std::bad_alloc&) {
+        result.errors.emplace_back(
+            "cannot allocate DeepSeek learned-index segment metadata");
+        return result;
+    }
+    std::uint64_t emitted = 0U;
+    for (const auto id : found->second.blocks) {
+        if (emitted == rows) break;
+        const auto block_found = state_->blocks.find(id);
+        if (block_found == state_->blocks.end()) {
+            result.errors.emplace_back(
+                "DeepSeek learned-index block is unavailable");
+            result.value.clear();
+            return result;
+        }
+        const auto& block = block_found->second;
+        const auto checked = state_->validate_block(block);
+        const auto block_begin = block.info.logical_begin /
+                                 block.info.compression_ratio;
+        if (!checked.ok() ||
+            block.info.format != Dsv4KvFormat::Fp4E2m1Group32 ||
+            block_begin != emitted || block.info.used_rows == 0U) {
+            result.errors.emplace_back(
+                "DeepSeek learned-index compact block is invalid");
+            result.value.clear();
+            return result;
+        }
+        const auto segment_rows = static_cast<std::uint32_t>(std::min(
+            rows - emitted,
+            static_cast<std::uint64_t>(block.info.used_rows)));
+        result.value.push_back(CudaLightningIndexSegment{
+            nullptr, block.host, kBlockHeaderBytes, segment_rows});
+        emitted += segment_rows;
+    }
+    if (emitted != rows) {
+        result.errors.emplace_back(
+            "DeepSeek learned-index compact history is incomplete");
+        result.value.clear();
     }
     return result;
 }

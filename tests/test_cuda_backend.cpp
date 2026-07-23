@@ -1,6 +1,7 @@
 #include "test.hpp"
 
 #include "strata/cuda_backend.hpp"
+#include "strata/deepseek_kv_cache.hpp"
 #include "strata/deepseek_ops.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -160,6 +162,121 @@ TEST_CASE("native CUDA FlashAttention validates device support before dispatch")
         REQUIRE(supported.errors.front().find("supports only SM86 and SM120") !=
                 std::string::npos);
     }
+}
+
+TEST_CASE("native CUDA Lightning Indexer matches the scalar top-512 oracle") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device, true).ok());
+    const auto supported =
+        backend.validate_lightning_index_device(devices.front());
+    if (!supported.ok()) return;
+
+    constexpr std::uint32_t heads = 64U;
+    constexpr std::uint32_t head_dim = 128U;
+    constexpr std::uint32_t positions = 513U;
+    constexpr std::uint32_t top_k = 512U;
+    std::vector<float> raw_queries(
+        static_cast<std::size_t>(heads) * head_dim, 0.0F);
+    for (std::uint32_t head = 0U; head < heads; ++head) {
+        raw_queries[static_cast<std::size_t>(head) * head_dim +
+                    (head * 17U) % head_dim] = head % 2U == 0U ? 1.0F : -1.0F;
+    }
+    auto simulated_queries = raw_queries;
+    for (std::uint32_t head = 0U; head < heads; ++head) {
+        auto query = std::span<float>(simulated_queries).subspan(
+            static_cast<std::size_t>(head) * head_dim, head_dim);
+        REQUIRE(strata::dsv4_hadamard_rotate_f32(query).ok());
+        REQUIRE(strata::dsv4_fp4_e2m1_simulate_f32(query).ok());
+    }
+    std::vector<float> weights(heads);
+    for (std::uint32_t head = 0U; head < heads; ++head) {
+        weights[head] = static_cast<float>(static_cast<int>(head % 7U) - 3) /
+                        8.0F;
+    }
+    constexpr std::array<float, 15> fp4_values{
+        -6.0F, -4.0F, -3.0F, -2.0F, -1.5F, -1.0F, -0.5F,
+         0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F, 6.0F};
+    std::vector<float> keys(static_cast<std::size_t>(positions) * head_dim);
+    const auto row_bytes = strata::dsv4_kv_row_bytes(
+        strata::Dsv4KvBlockKind::LearnedIndex,
+        strata::Dsv4KvFormat::Fp4E2m1Group32);
+    std::vector<std::byte> encoded(static_cast<std::size_t>(positions) *
+                                   row_bytes);
+    for (std::uint32_t row = 0U; row < positions; ++row) {
+        auto key = std::span<float>(keys).subspan(
+            static_cast<std::size_t>(row) * head_dim, head_dim);
+        for (std::uint32_t column = 0U; column < head_dim; ++column) {
+            key[column] = fp4_values[(row * 13U + column * 7U) %
+                                     fp4_values.size()];
+        }
+        REQUIRE(strata::dsv4_encode_kv_row(
+            strata::Dsv4KvBlockKind::LearnedIndex,
+            strata::Dsv4KvFormat::Fp4E2m1Group32, key,
+            std::span<std::byte>(encoded).subspan(
+                static_cast<std::size_t>(row) * row_bytes,
+                static_cast<std::size_t>(row_bytes))).ok());
+    }
+    std::vector<float> scores(positions);
+    REQUIRE(strata::dsv4_index_scores_f32(
+        scores, simulated_queries, keys, weights, heads, head_dim).ok());
+    const auto expected = strata::dsv4_index_topk_f32(scores, top_k);
+    REQUIRE(expected.ok());
+
+    const std::array segments{strata::CudaLightningIndexSegment{
+        nullptr, encoded, 0U, positions}};
+    strata::CudaLightningIndexRequest request;
+    request.queries = raw_queries;
+    request.weights = weights;
+    request.segments = segments;
+    request.heads = heads;
+    request.head_dim = head_dim;
+    request.top_k = top_k;
+    std::vector<std::uint32_t> actual(top_k);
+    REQUIRE(backend.lightning_index(
+        devices.front(), request, actual).ok());
+    REQUIRE(actual == expected.positions);
+
+    strata::CudaBuffer resident_keys;
+    REQUIRE(backend.upload_buffer(
+        devices.front(), encoded, resident_keys).ok());
+    const std::array resident_segments{strata::CudaLightningIndexSegment{
+        &resident_keys, {}, 0U, positions}};
+    request.segments = resident_segments;
+    std::fill(actual.begin(), actual.end(), 0U);
+    REQUIRE(backend.lightning_index(
+        devices.front(), request, actual).ok());
+    REQUIRE(actual == expected.positions);
+
+    constexpr std::uint32_t maximum_candidates = 1'048'576U / 4U;
+    std::vector<std::byte> maximum_history(
+        static_cast<std::size_t>(maximum_candidates) * row_bytes);
+    const std::array maximum_segments{strata::CudaLightningIndexSegment{
+        nullptr, maximum_history, 0U, maximum_candidates}};
+    request.segments = maximum_segments;
+    std::fill(actual.begin(), actual.end(), std::numeric_limits<std::uint32_t>::max());
+    REQUIRE(backend.lightning_index(
+        devices.front(), request, actual).ok());
+    for (std::uint32_t index = 0U; index < top_k; ++index) {
+        REQUIRE(actual[index] == index);
+    }
+
+    request.segments = {};
+    std::span<std::uint32_t> empty;
+    REQUIRE(backend.lightning_index(devices.front(), request, empty).ok());
+    const auto stats = backend.stats();
+    REQUIRE(stats.lightning_index_calls == 3U);
+    REQUIRE(stats.lightning_index_kernel_launches == 12U);
+    REQUIRE(stats.lightning_index_candidates ==
+            positions * 2U + maximum_candidates);
+    REQUIRE(stats.lightning_index_selected == top_k * 3U);
+    REQUIRE(stats.lightning_index_d2h_bytes ==
+            3U * (top_k * sizeof(std::uint32_t) + sizeof(unsigned int)));
+    REQUIRE(stats.lightning_index_useful_selection_bytes ==
+            3U * top_k * row_bytes);
 }
 
 TEST_CASE("native CUDA backend executes generic tiled online FlashAttention when available") {

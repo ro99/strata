@@ -161,6 +161,22 @@ TEST_CASE("DeepSeek KV cache keeps typed block tables and masks stale rows") {
             strata::Dsv4KvFormat::Fp4E2m1Group32);
     REQUIRE(learned.value[0].format_version == strata::kDsv4KvFormatVersion);
     REQUIRE(learned.value[0].physical_bytes > learned.value[0].payload_bytes);
+    const auto compact = cache.learned_index_segments(
+        created.value, 1U, 1U);
+    REQUIRE(compact.ok() && compact.value.size() == 1U);
+    REQUIRE(compact.value[0].rows == 1U);
+    REQUIRE(compact.value[0].device_buffer == nullptr);
+    std::vector<float> compact_decoded(index.size());
+    const auto compact_row_bytes = strata::dsv4_kv_row_bytes(
+        strata::Dsv4KvBlockKind::LearnedIndex,
+        strata::Dsv4KvFormat::Fp4E2m1Group32);
+    REQUIRE(strata::dsv4_decode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex,
+        strata::Dsv4KvFormat::Fp4E2m1Group32,
+        compact.value[0].host_bytes.subspan(
+            compact.value[0].byte_offset, compact_row_bytes),
+        compact_decoded).ok());
+    require_bit_equal(compact_decoded, index);
 
     REQUIRE(cache.truncate_sequence(created.value, 4U).ok());
     REQUIRE(!cache.row(created.value, strata::Dsv4KvBlockKind::Hca,
@@ -301,8 +317,14 @@ TEST_CASE("DeepSeek KV device eviction protects in-flight blocks") {
     auto second = cache.acquire_device(
         created.value, strata::Dsv4KvBlockKind::Sliding, 0U, 2U, 0U);
     REQUIRE(second.ok() && second.value.valid());
-    REQUIRE(cache.stats().promotions == 2U);
+    second.value = {};
+    REQUIRE(cache.append(created.value, strata::Dsv4KvBlockKind::Sliding,
+                         0U, 1U, 3U, values).ok());
+    auto refreshed = cache.acquire_device(
+        created.value, strata::Dsv4KvBlockKind::Sliding, 0U, 2U, 0U);
+    REQUIRE(refreshed.ok() && refreshed.value.valid());
+    REQUIRE(cache.stats().promotions == 3U);
     REQUIRE(cache.stats().evictions == 1U);
-    REQUIRE(backend.stats().activation_h2d_bytes == block_bytes * 2U);
-    REQUIRE(backend.stats().synchronization_calls == 2U);
+    REQUIRE(backend.stats().activation_h2d_bytes == block_bytes * 3U);
+    REQUIRE(backend.stats().synchronization_calls == 3U);
 }

@@ -86,6 +86,8 @@ struct Dsv4DiagnosticTrace {
     std::uint64_t layer_hash_trace_hash{};
     std::vector<Dsv4LayerHashTraceRecord> layer_hashes;
     std::vector<Dsv4OperationHashTraceRecord> operation_hashes;
+    std::uint64_t index_selection_count{};
+    std::uint64_t index_selection_trace_hash{};
 };
 
 }  // namespace strata

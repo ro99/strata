@@ -306,7 +306,11 @@ decode win within observed variance, so the scalar path remains the default;
 Opt-in `--block-kv-cache` stores KV and learned-index rows in their native FP8 and
 FP4 encodings with versioned block headers and corruption checks, reducing per-token
 cache bytes without numerical change. `--scalar-kv-cache` (default) retains the F32
-oracle.
+oracle. `--gpu-lightning-indexer` enables the independently gated CUDA learned-index
+path and implies `--block-kv-cache`; it applies query Hadamard/FP4 simulation,
+weighted-ReLU scoring, and deterministic top-512 selection in a bounded workspace.
+Compact blocks remain device-resident when `--kv-device-cache` budgets permit, and
+only selected positions return to the host. The scalar indexer remains the default.
 
 See [`docs/deepseek-v4-runtime.md`](docs/deepseek-v4-runtime.md) for the pinned
 checkpoint contract, measured admission plan, design boundary, and remaining

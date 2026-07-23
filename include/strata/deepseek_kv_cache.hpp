@@ -153,6 +153,11 @@ public:
     [[nodiscard]] ParseResult<std::vector<float>> gather(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::span<const std::uint32_t> logical_rows);
+    // Returns stable views over compact host blocks in logical-row order.
+    // The views remain valid until that sequence/layer is mutated.
+    [[nodiscard]] ParseResult<std::vector<CudaLightningIndexSegment>>
+    learned_index_segments(Dsv4SequenceHandle sequence,
+                           std::uint32_t layer, std::uint64_t rows) const;
     [[nodiscard]] ParseResult<Dsv4KvDeviceLease> acquire_device(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::uint64_t logical_row,

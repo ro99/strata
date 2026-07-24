@@ -227,6 +227,10 @@ bool ResidencyManager::resident(ExpertKey key) const {
     return vram_.find(key) != nullptr || ram_.find(key) != nullptr;
 }
 
+bool ResidencyManager::vram_resident(ExpertKey key) const {
+    return vram_.find(key) != nullptr;
+}
+
 void ResidencyManager::finalize() {
     if (finalized_) return;
     stats_.wasted_prefetches += vram_.unused_prefetches();

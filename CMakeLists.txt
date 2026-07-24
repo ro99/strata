@@ -138,6 +138,7 @@ if(BUILD_TESTING)
         tests/test_trace.cpp
         tests/test_predictor.cpp
         tests/test_residency.cpp
+        tests/test_simulator_window.cpp
         tests/test_runtime.cpp
         tests/test_sampling.cpp
         tests/test_safetensors.cpp
@@ -158,6 +159,18 @@ if(BUILD_TESTING)
             --expert-bytes 4M
             --prefetch 4
             --lease 8
+            --json
+    )
+    add_test(
+        NAME strata-sim-window-smoke
+        COMMAND strata-sim
+            --trace ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/route_trace_v1.txt
+            --policy lease
+            --ram 64M
+            --vram 32M
+            --expert-bytes 4M
+            --window 8
+            --window-acceptance 0.7
             --json
     )
 endif()

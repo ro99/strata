@@ -53,6 +53,8 @@ public:
     void finalize();
 
     [[nodiscard]] bool resident(ExpertKey key) const;
+    // True only when the expert needs no host-to-device transfer to be used.
+    [[nodiscard]] bool vram_resident(ExpertKey key) const;
     [[nodiscard]] const ResidencyStats& stats() const noexcept { return stats_; }
     [[nodiscard]] const ResidencyConfig& config() const noexcept { return config_; }
 

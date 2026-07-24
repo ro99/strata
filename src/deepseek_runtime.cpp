@@ -1403,6 +1403,14 @@ struct DeepSeekV4Runtime::Impl {
                                 std::span<const std::uint32_t> tokens,
                                 std::span<float> hidden,
                                 std::uint32_t position_base);
+    ValidationResult head_logits(std::span<const float> hidden,
+                                 std::span<float> logits);
+    ValidationResult forward_page(std::span<const std::uint32_t> tokens,
+                                  std::uint32_t position_base,
+                                  std::span<float> hidden);
+    ValidationResult forward_window(std::span<const std::uint32_t> tokens,
+                                    std::uint32_t position_base,
+                                    std::span<float> row_logits);
     ParseResult<std::uint32_t> sample_hidden(std::uint32_t token,
                                              std::uint32_t position,
                                              std::span<const float> hidden);
@@ -3187,15 +3195,21 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     return sample_hidden(token, position, hidden);
 }
 
-ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
-    std::uint32_t token, std::uint32_t position,
-    std::span<const float> hidden) {
-    ParseResult<std::uint32_t> result;
+// The exact output head, factored out of sample_hidden so a speculative verify
+// window can obtain per-row logits without sampling or tracing them. The
+// arithmetic below is unchanged.
+ValidationResult DeepSeekV4Runtime::Impl::head_logits(
+    std::span<const float> hidden, std::span<float> logits) {
     ValidationResult validation;
     if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
-        result.errors.emplace_back(
+        validation.errors.emplace_back(
             "DeepSeek output head received an invalid hidden-state shape");
-        return result;
+        return validation;
+    }
+    if (logits.size() != kVocabulary) {
+        validation.errors.emplace_back(
+            "DeepSeek output head received an invalid logit buffer");
+        return validation;
     }
 
     const auto head_started = std::chrono::steady_clock::now();
@@ -3206,10 +3220,7 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     if (!head_projection.ok()) append_errors(validation, std::move(head_projection.errors));
     if (!head_scale.ok()) append_errors(validation, std::move(head_scale.errors));
     if (!head_base.ok()) append_errors(validation, std::move(head_base.errors));
-    if (!validation.ok()) {
-        result.errors = std::move(validation.errors);
-        return result;
-    }
+    if (!validation.ok()) return validation;
     double square_sum = 0.0;
     for (const float value : hidden) square_sum += static_cast<double>(value) * value;
     const float reciprocal = 1.0F / std::sqrt(
@@ -3233,13 +3244,20 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     }
     round_bf16(reduced);
     validation = norm(reduced, reduced, "norm.weight");
-    if (!validation.ok()) {
-        result.errors = std::move(validation.errors);
-        return result;
-    }
-    std::vector<float> logits(kVocabulary);
+    if (!validation.ok()) return validation;
     validation = linear(layer_device(kLayers - 1U), "head", kVocabulary,
                         kHidden, reduced, logits, false);
+    if (!validation.ok()) return validation;
+    graph_stats.output_head_nanoseconds += elapsed_nanoseconds(head_started);
+    return validation;
+}
+
+ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
+    std::uint32_t token, std::uint32_t position,
+    std::span<const float> hidden) {
+    ParseResult<std::uint32_t> result;
+    std::vector<float> logits(kVocabulary);
+    auto validation = head_logits(hidden, logits);
     if (!validation.ok()) {
         result.errors = std::move(validation.errors);
         return result;
@@ -3249,7 +3267,6 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     if (config.enable_logit_trace) {
         record_logits(position, token, result.value, logits);
     }
-    graph_stats.output_head_nanoseconds += elapsed_nanoseconds(head_started);
     ++graph_stats.forward_tokens;
     return result;
 }
@@ -3306,6 +3323,73 @@ ValidationResult DeepSeekV4Runtime::Impl::flush_prefill_observability() {
     return flush_deferred_routes();
 }
 
+// Layer-major forward pass over a contiguous run of token positions, factored
+// out of forward_prefill so the speculative verify window can reuse the exact
+// same traversal. Callers own the page accounting and observability flushing.
+ValidationResult DeepSeekV4Runtime::Impl::forward_page(
+    std::span<const std::uint32_t> tokens, std::uint32_t position_base,
+    std::span<float> hidden) {
+    ValidationResult result;
+    const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
+    const auto page_rows = static_cast<std::uint32_t>(tokens.size());
+    if (tokens.empty() ||
+        hidden.size() != static_cast<std::size_t>(page_rows) * hidden_stride) {
+        result.errors.emplace_back(
+            "DeepSeek forward page received an invalid hidden-state shape");
+        return result;
+    }
+    for (std::uint32_t row = 0U; row < page_rows; ++row) {
+        const auto embedding_started = std::chrono::steady_clock::now();
+        result = embed(tokens[row],
+                       hidden.subspan(static_cast<std::size_t>(row) * hidden_stride,
+                                      hidden_stride));
+        graph_stats.embedding_nanoseconds += elapsed_nanoseconds(embedding_started);
+        if (!result.ok()) return result;
+    }
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        result = block_page(layer, tokens, hidden, position_base);
+        if (!result.ok()) return result;
+        if (!config.enable_layer_hash_trace) continue;
+        for (std::uint32_t row = 0U; row < page_rows; ++row) {
+            record_layer_hash(
+                position_base + row, tokens[row], layer,
+                std::span<const float>(hidden).subspan(
+                    static_cast<std::size_t>(row) * hidden_stride, hidden_stride));
+        }
+    }
+    return result;
+}
+
+// Runs one speculative verify window and returns the exact target logits for
+// every row. It never samples and never records observability: the caller
+// decides which rows survive acceptance.
+ValidationResult DeepSeekV4Runtime::Impl::forward_window(
+    std::span<const std::uint32_t> tokens, std::uint32_t position_base,
+    std::span<float> row_logits) {
+    ValidationResult result;
+    const auto rows = static_cast<std::uint32_t>(tokens.size());
+    if (tokens.empty() ||
+        row_logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
+        result.errors.emplace_back(
+            "DeepSeek verify window received an invalid logit buffer");
+        return result;
+    }
+    const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
+    std::vector<float> hidden(static_cast<std::size_t>(rows) * hidden_stride);
+    result = forward_page(tokens, position_base, hidden);
+    if (!result.ok()) return result;
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = head_logits(
+            std::span<const float>(hidden).subspan(
+                static_cast<std::size_t>(row) * hidden_stride, hidden_stride),
+            row_logits.subspan(static_cast<std::size_t>(row) * kVocabulary,
+                               kVocabulary));
+        if (!result.ok()) return result;
+    }
+    graph_stats.forward_tokens += rows;
+    return result;
+}
+
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
     std::span<const std::uint32_t> tokens, std::uint32_t position_base) {
     ParseResult<std::uint32_t> result;
@@ -3347,44 +3431,13 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
                  static_cast<std::size_t>(kHeads) * kHeadDim + kHeadDim) *
                 sizeof(float));
 
-        for (std::uint32_t row = 0U; row < page_rows; ++row) {
-            const auto embedding_started = std::chrono::steady_clock::now();
-            auto status = embed(tokens[page_begin + row],
-                                std::span<float>(hidden).subspan(
-                                    static_cast<std::size_t>(row) * hidden_stride,
-                                    hidden_stride));
-            graph_stats.embedding_nanoseconds +=
-                elapsed_nanoseconds(embedding_started);
-            if (!status.ok()) {
-                defer_prefill_observability = false;
-                result.errors = std::move(status.errors);
-                return result;
-            }
-        }
-
-        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-            const auto absolute_page_begin = position_base +
-                static_cast<std::uint32_t>(page_begin);
-            auto status = block_page(
-                layer, tokens.subspan(page_begin, page_rows), hidden,
-                absolute_page_begin);
-            if (!status.ok()) {
-                defer_prefill_observability = false;
-                result.errors = std::move(status.errors);
-                return result;
-            }
-            for (std::uint32_t row = 0U; row < page_rows; ++row) {
-                const auto token_index = page_begin + row;
-                const auto absolute = position_base +
-                    static_cast<std::uint32_t>(token_index);
-                if (config.enable_layer_hash_trace) {
-                    record_layer_hash(
-                        absolute, tokens[token_index], layer,
-                        std::span<const float>(hidden).subspan(
-                            static_cast<std::size_t>(row) * hidden_stride,
-                            hidden_stride));
-                }
-            }
+        auto paged = forward_page(
+            tokens.subspan(page_begin, page_rows),
+            position_base + static_cast<std::uint32_t>(page_begin), hidden);
+        if (!paged.ok()) {
+            defer_prefill_observability = false;
+            result.errors = std::move(paged.errors);
+            return result;
         }
         auto routes_flushed = flush_deferred_routes();
         if (!routes_flushed.ok()) {

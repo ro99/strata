@@ -13,6 +13,9 @@ struct Dsv4AdmissionConfig {
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     std::uint32_t maximum_context_tokens{2048U};
+    // Aggregate ceiling on the routed-expert VRAM cache. Zero admits whatever
+    // the spine and workspaces leave over.
+    std::uint64_t routed_expert_vram_ceiling_bytes{};
     bool enable_dspark{};
     bool compact_kv_cache{};
     bool require_zero_nvme_decode{true};

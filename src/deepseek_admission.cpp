@@ -315,6 +315,11 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
     } else {
         result.plan.expert_vram_cache_bytes =
             result.plan.total_vram_budget_bytes - required_vram;
+        if (config.routed_expert_vram_ceiling_bytes != 0U) {
+            result.plan.expert_vram_cache_bytes =
+                std::min(result.plan.expert_vram_cache_bytes,
+                         config.routed_expert_vram_ceiling_bytes);
+        }
         if (result.plan.expert_vram_cache_bytes < result.plan.maximum_expert_bytes) {
             result.errors.emplace_back(
                 "DeepSeek VRAM budget cannot hold one routed expert projection triplet");

@@ -375,9 +375,20 @@ class Dsv4WeightCache {
     struct State {
         std::unordered_map<std::string, Entry> entries;
         std::uint64_t capacity{};
+        // Ceiling on `used - pinned`, i.e. on the routed-expert working set.
+        // Zero leaves the whole capacity available.
+        std::uint64_t unpinned_capacity{};
         std::uint64_t used{};
         std::uint64_t pinned{};
         std::uint64_t clock{};
+
+        [[nodiscard]] std::uint64_t unpinned_used() const noexcept {
+            return used >= pinned ? used - pinned : 0U;
+        }
+
+        [[nodiscard]] bool over_unpinned_ceiling(std::uint64_t bytes) const noexcept {
+            return unpinned_capacity != 0U && unpinned_used() + bytes > unpinned_capacity;
+        }
     };
 
     struct PrefetchLinear {
@@ -480,6 +491,7 @@ public:
                     Dsv4ResidentWeightStore& resident, CudaBackend& backend,
                     std::vector<int> devices,
                     std::vector<std::uint64_t> capacities,
+                    std::uint64_t unpinned_capacity,
                     std::uint64_t prefetch_byte_budget,
                     std::size_t prefetch_queue_depth,
                     std::uint64_t prefetch_lease_ticks)
@@ -488,7 +500,12 @@ public:
           prefetch_byte_budget_(prefetch_byte_budget),
           prefetch_queue_depth_(prefetch_queue_depth),
           prefetch_lease_ticks_(prefetch_lease_ticks) {
-        for (const auto capacity : capacities) states_.push_back(State{{}, capacity});
+        for (const auto capacity : capacities) {
+            State state;
+            state.capacity = capacity;
+            state.unpinned_capacity = std::min(unpinned_capacity, capacity);
+            states_.push_back(std::move(state));
+        }
         if (prefetch_byte_budget_ != 0U && prefetch_queue_depth_ != 0U) {
             prefetch_worker_ = std::thread([this] { prefetch_loop(); });
         }
@@ -537,9 +554,12 @@ public:
         ValidationResult result;
         for (std::size_t slot = 0U; slot < states_.size(); ++slot) {
             const auto& state = states_[slot];
-            const auto available = state.capacity >= state.pinned
-                                       ? state.capacity - state.pinned
-                                       : 0U;
+            auto available = state.capacity >= state.pinned
+                                 ? state.capacity - state.pinned
+                                 : 0U;
+            if (state.unpinned_capacity != 0U) {
+                available = std::min(available, state.unpinned_capacity);
+            }
             if (required_bytes > available) {
                 result.errors.emplace_back(
                     "DeepSeek device " + std::to_string(devices_[slot]) +
@@ -617,6 +637,8 @@ public:
         for (const auto& state : states_) {
             result.used_bytes.push_back(state.used);
             result.capacity_bytes.push_back(state.capacity);
+            result.unpinned_used_bytes.push_back(state.unpinned_used());
+            result.unpinned_capacity_bytes.push_back(state.unpinned_capacity);
             result.pinned_bytes.push_back(state.pinned);
             std::uint64_t leased_bytes = 0U;
             std::uint64_t active_leases = 0U;
@@ -764,7 +786,9 @@ private:
                                        key);
             return result;
         }
-        while (kind != LoadKind::Prefetch && state.used + bytes > state.capacity) {
+        while (kind != LoadKind::Prefetch &&
+               (state.used + bytes > state.capacity ||
+                (!pin && state.over_unpinned_ceiling(bytes)))) {
             auto victim = state.entries.end();
             for (auto candidate = state.entries.begin(); candidate != state.entries.end();
                  ++candidate) {
@@ -792,7 +816,8 @@ private:
             state.entries.erase(victim);
             ++evictions_;
         }
-        if (state.used + bytes > state.capacity) {
+        if (state.used + bytes > state.capacity ||
+            (!pin && state.over_unpinned_ceiling(bytes))) {
             result.errors.emplace_back("DeepSeek prefetch cannot displace demand weights");
             return result;
         }
@@ -884,13 +909,15 @@ private:
 
     [[nodiscard]] bool prepare_prefetch(const PrefetchJob& job) {
         auto& state = states_[job.slot];
-        if (job.bytes > state.capacity || job.bytes > prefetch_byte_budget_) {
+        if (job.bytes > state.capacity || job.bytes > prefetch_byte_budget_ ||
+            (state.unpinned_capacity != 0U && job.bytes > state.unpinned_capacity)) {
             return false;
         }
         while (prefetched_bytes_ + job.bytes > prefetch_byte_budget_) {
             if (!evict_prefetched(std::nullopt)) return false;
         }
-        while (state.used + job.bytes > state.capacity) {
+        while (state.used + job.bytes > state.capacity ||
+               state.over_unpinned_ceiling(job.bytes)) {
             if (!evict_prefetched(job.slot)) return false;
         }
         return true;
@@ -3416,6 +3443,17 @@ ValidationResult DeepSeekV4Runtime::initialize(
     admission_config.host_kv_cache_bytes = config.host_kv_cache_bytes;
     admission_config.device_kv_cache_bytes = kv_device_capacities;
     admission_config.maximum_context_tokens = config.maximum_context_tokens;
+    if (config.routed_expert_cache_bytes != 0U) {
+        const auto devices = static_cast<std::uint64_t>(config.devices.size());
+        if (devices != 0U && config.routed_expert_cache_bytes >
+                                 std::numeric_limits<std::uint64_t>::max() / devices) {
+            result.errors.emplace_back(
+                "DeepSeek routed-expert cache ceiling overflows the device count");
+            return result;
+        }
+        admission_config.routed_expert_vram_ceiling_bytes =
+            config.routed_expert_cache_bytes * devices;
+    }
     admission_config.enable_dspark = config.enable_dspark;
     admission_config.compact_kv_cache =
         config.kv_cache_mode == Dsv4KvCacheMode::Block;
@@ -3458,7 +3496,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
-        impl_->devices, weight_capacities,
+        impl_->devices, weight_capacities, config.routed_expert_cache_bytes,
         config.expert_prefetch_predictions == 0U
             ? 0U : config.expert_prefetch_byte_budget,
         config.expert_prefetch_queue_depth,
@@ -3583,6 +3621,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.spine_warmup_workers =
         static_cast<std::uint32_t>(std::min<std::size_t>(
             config.spine_warmup_workers, impl_->devices.size()));
+    impl_->initialization_metrics.routed_expert_cache_bytes =
+        config.routed_expert_cache_bytes;
     impl_->initialization_metrics.expert_prefetch_predictions =
         config.expert_prefetch_predictions;
     impl_->initialization_metrics.expert_prefetch_queue_depth =

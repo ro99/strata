@@ -224,6 +224,21 @@ TEST_CASE("real DeepSeek V4 DSpark checkpoint opens without format conversion wh
             admission.plan.expert_vram_cache_bytes - (6ULL << 20U));
     config.device_kv_cache_bytes.clear();
 
+    config.routed_expert_vram_ceiling_bytes = 1ULL << 30U;
+    const auto bounded = strata::plan_dsv4_resident_topology(
+        checkpoint.value->manifest(), config);
+    REQUIRE(bounded.ok());
+    REQUIRE(bounded.plan.expert_vram_cache_bytes == (1ULL << 30U));
+    REQUIRE(bounded.plan.expert_vram_cache_bytes <
+            admission.plan.expert_vram_cache_bytes);
+    REQUIRE(bounded.plan.routed_expert_host_bytes ==
+            admission.plan.routed_expert_host_bytes);
+    // An unusable ceiling is refused rather than silently widened.
+    config.routed_expert_vram_ceiling_bytes = 1U;
+    REQUIRE(!strata::plan_dsv4_resident_topology(
+                 checkpoint.value->manifest(), config).ok());
+    config.routed_expert_vram_ceiling_bytes = 0U;
+
     config.enable_dspark = true;
     const auto with_dspark = strata::plan_dsv4_resident_topology(
         checkpoint.value->manifest(), config);

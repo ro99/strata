@@ -33,6 +33,7 @@ struct Options {
     std::uint32_t expert_prefetch_lease_ticks{16U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
+    std::uint64_t routed_expert_cache_bytes{};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
@@ -62,6 +63,7 @@ void usage() {
         << "       [--expert-prefetch N] [--expert-prefetch-bytes 1G]\n"
         << "       [--expert-prefetch-queue N] [--expert-prefetch-lease N]\n"
         << "       [--expert-prefetch-confidence P]\n"
+        << "       [--routed-expert-cache BYTES]  per-device routed-expert VRAM ceiling\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
@@ -184,6 +186,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (value == nullptr || !strata::cli::parse_double(
                     value, options.expert_prefetch_minimum_confidence,
                     0.0, 1.0)) return false;
+        } else if (argument == "--routed-expert-cache") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_bytes(
+                    value, options.routed_expert_cache_bytes)) return false;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
@@ -464,6 +470,10 @@ void print_cache_stats(std::ostream& output, const strata::Dsv4CacheStats& stats
     strata::cli::print_array(output, stats.used_bytes);
     output << ",\"capacity_bytes\":";
     strata::cli::print_array(output, stats.capacity_bytes);
+    output << ",\"unpinned_used_bytes\":";
+    strata::cli::print_array(output, stats.unpinned_used_bytes);
+    output << ",\"unpinned_capacity_bytes\":";
+    strata::cli::print_array(output, stats.unpinned_capacity_bytes);
     output << ",\"pinned_bytes\":";
     strata::cli::print_array(output, stats.pinned_bytes);
     output << ",\"leased_bytes\":";
@@ -826,6 +836,7 @@ int main(int argc, char** argv) {
     config.host_attention_threads = options.host_attention_threads;
     config.resident_read_workers = options.resident_read_workers;
     config.spine_warmup_workers = options.spine_warmup_workers;
+    config.routed_expert_cache_bytes = options.routed_expert_cache_bytes;
     config.expert_prefetch_predictions = options.expert_prefetch_predictions;
     config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
     config.expert_prefetch_byte_budget = options.expert_prefetch_byte_budget;
@@ -884,6 +895,8 @@ int main(int argc, char** argv) {
                   << metrics.resident_read_workers
                   << ",\"spine_warmup_workers\":"
                   << metrics.spine_warmup_workers
+                  << ",\"routed_expert_cache_bytes\":"
+                  << metrics.routed_expert_cache_bytes
                   << ",\"expert_prefetch_predictions\":"
                   << metrics.expert_prefetch_predictions
                   << ",\"expert_prefetch_queue_depth\":"

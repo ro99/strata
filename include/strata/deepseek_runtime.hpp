@@ -40,6 +40,12 @@ struct Dsv4RuntimeConfig {
     std::uint32_t flash_attention_minimum_rows{256U};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
+    // Per-device ceiling on unpinned (routed-expert) weight-cache bytes. Zero
+    // leaves the whole weight budget available, which on a machine that fits
+    // the working set means no expert is ever evicted. Bounding it is the only
+    // way to reproduce a genuine RAM-to-PCIe offload regime here. Caching is
+    // advisory: this knob cannot change routing, precision, or top-k.
+    std::uint64_t routed_expert_cache_bytes{};
     // Zero predictions disables advisory expert prefetch. The remaining
     // defaults are bounded so one CLI switch is sufficient to enable it.
     std::uint32_t expert_prefetch_predictions{};
@@ -82,6 +88,8 @@ struct Dsv4CacheStats {
     std::uint64_t prefetch_queue_peak{};
     std::vector<std::uint64_t> used_bytes;
     std::vector<std::uint64_t> capacity_bytes;
+    std::vector<std::uint64_t> unpinned_used_bytes;
+    std::vector<std::uint64_t> unpinned_capacity_bytes;
     std::vector<std::uint64_t> pinned_bytes;
     std::vector<std::uint64_t> leased_bytes;
     std::vector<std::uint64_t> active_leases;
@@ -172,6 +180,7 @@ struct Dsv4GenerationMetrics {
     std::uint32_t flash_attention_minimum_rows{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};
+    std::uint64_t routed_expert_cache_bytes{};
     std::uint32_t expert_prefetch_predictions{};
     std::uint32_t expert_prefetch_queue_depth{};
     std::uint64_t expert_prefetch_byte_budget{};

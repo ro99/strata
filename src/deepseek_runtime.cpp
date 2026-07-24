@@ -1339,6 +1339,7 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult reserve_attention_snapshots(std::size_t rows);
     void capture_attention_snapshot(std::size_t row);
     void restore_attention_snapshot(std::size_t row);
+    ValidationResult rollback_sequence(std::uint64_t accepted_tokens);
     ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
         std::uint64_t logical_row);
@@ -1786,6 +1787,17 @@ void DeepSeekV4Runtime::Impl::restore_attention_snapshot(std::size_t row) {
         state.indexer_compressor.scores =
             snapshot[layer].indexer_compressor.scores;
     }
+}
+
+// Discards KV rows a speculative window wrote past the accepted prefix. The
+// scalar-oracle path needs nothing here: its sliding ring and compressed rows
+// are position indexed and are overwritten by the replay, and its accumulators
+// are handled by restore_attention_snapshot.
+ValidationResult DeepSeekV4Runtime::Impl::rollback_sequence(
+    std::uint64_t accepted_tokens) {
+    ValidationResult result;
+    if (kv_cache == nullptr) return result;
+    return kv_cache->truncate_sequence(active_sequence, accepted_tokens);
 }
 
 ParseResult<std::vector<float>> DeepSeekV4Runtime::Impl::kv_row(
@@ -3610,7 +3622,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (config.kv_cache_mode == Dsv4KvCacheMode::Block) {
         Dsv4KvCacheConfig kv_config;
         kv_config.block_rows = config.kv_block_rows;
-        kv_config.sliding_window_rows = kWindow;
+        // Block mode releases sliding blocks below end_row - sliding_window_rows
+        // as soon as append() advances, so a window-deep retention would drop
+        // rows a speculative rollback still needs and truncate_sequence would
+        // refuse. Retaining kMaximumDraftTokens extra rows cannot change which
+        // rows are read: readers still span at most kWindow positions.
+        kv_config.sliding_window_rows = kWindow + kMaximumDraftTokens;
         kv_config.host_capacity_bytes = impl_->memory.host_kv_cache_bytes;
         kv_config.devices = config.devices;
         kv_config.device_capacity_bytes = kv_device_capacities;

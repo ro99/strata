@@ -56,6 +56,18 @@ constexpr std::uint32_t kQueryRank = kDeepSeekV4ExecutionContract.query_lora_ran
 constexpr std::uint32_t kOutputRank = kDeepSeekV4ExecutionContract.output_lora_rank;
 constexpr std::uint32_t kOutputGroups = kDeepSeekV4ExecutionContract.output_groups;
 constexpr std::uint32_t kWindow = kDeepSeekV4ExecutionContract.sliding_window;
+// Upper bound on drafted tokens per speculative window. A window verifies one
+// row more than it drafts, so it writes sliding rows for positions p .. p+gamma
+// before a rejection can roll the sequence back to p+j, j >= 0. Reads after the
+// rollback still cover [p+j+1-kWindow, p+j], so a ring of exactly kWindow rows
+// would have already overwritten live rows. Widening it by kMaximumDraftTokens
+// makes the rollback safe; every index below is taken modulo kSlidingRing.
+//
+// Widening alone changes nothing: reads span at most kWindow consecutive
+// positions, which stay distinct under a larger modulus and are written by
+// exactly those positions. The mapping is a relabelling, not a reordering.
+constexpr std::uint32_t kMaximumDraftTokens = 8U;
+constexpr std::uint32_t kSlidingRing = kWindow + kMaximumDraftTokens;
 constexpr std::uint32_t kIndexHeads = kDeepSeekV4ExecutionContract.index_heads;
 constexpr std::uint32_t kIndexHeadDim = kDeepSeekV4ExecutionContract.index_head_dim;
 constexpr std::uint32_t kIndexTopK = kDeepSeekV4ExecutionContract.index_topk;
@@ -1622,7 +1634,7 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
         auto& state = attention_state[layer];
         if (kv_cache == nullptr) {
-            state.sliding.assign(static_cast<std::size_t>(kWindow) * kHeadDim,
+            state.sliding.assign(static_cast<std::size_t>(kSlidingRing) * kHeadDim,
                                  0.0F);
         } else {
             state.sliding.clear();
@@ -1692,7 +1704,7 @@ ParseResult<std::vector<float>> DeepSeekV4Runtime::Impl::kv_row(
     const auto& state = attention_state[layer];
     if (kind == Dsv4KvBlockKind::Sliding) {
         const auto values = std::span<const float>(state.sliding).subspan(
-            static_cast<std::size_t>(logical_row % kWindow) * kHeadDim,
+            static_cast<std::size_t>(logical_row % kSlidingRing) * kHeadDim,
             kHeadDim);
         result.value.assign(values.begin(), values.end());
         return result;
@@ -2135,7 +2147,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     } else {
         std::copy(kv.begin(), kv.end(),
                   layer_state.sliding.begin() +
-                      static_cast<std::size_t>(position % kWindow) * kHeadDim);
+                      static_cast<std::size_t>(position % kSlidingRing) * kHeadDim);
     }
     result = compressor(layer, input, position);
     if (!result.ok()) return result;
@@ -2200,7 +2212,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         std::vector<std::uint32_t> sliding_rows(window_count);
         for (std::uint32_t item = 0U; item < window_count; ++item) {
             const auto absolute = position + 1U - window_count + item;
-            sliding_rows[item] = absolute % kWindow;
+            sliding_rows[item] = absolute % kSlidingRing;
         }
         std::vector<FlashAttentionSegment> segments;
         if (kv_cache != nullptr) {
@@ -2273,7 +2285,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
             const auto absolute = position + 1U - window_count + item;
             const auto key = kv_cache == nullptr
                 ? std::span<const float>(layer_state.sliding).subspan(
-                      static_cast<std::size_t>(absolute % kWindow) * kHeadDim,
+                      static_cast<std::size_t>(absolute % kSlidingRing) * kHeadDim,
                       kHeadDim)
                 : std::span<const float>(block_rows[item]);
             double dot = 0.0;
@@ -2312,7 +2324,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
             const auto absolute = position + 1U - window_count + item;
             const auto value = kv_cache == nullptr
                 ? std::span<const float>(layer_state.sliding).subspan(
-                      static_cast<std::size_t>(absolute % kWindow) * kHeadDim,
+                      static_cast<std::size_t>(absolute % kSlidingRing) * kHeadDim,
                       kHeadDim)
                 : std::span<const float>(block_rows[item]);
             const float probability = static_cast<float>(

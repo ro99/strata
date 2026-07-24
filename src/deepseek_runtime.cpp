@@ -1156,6 +1156,27 @@ struct AttentionState {
     std::vector<float> frequencies;
 };
 
+/*
+ * Compressor accumulators are the one piece of scalar-oracle decode state that
+ * a speculative rollback cannot repair by re-running the position.
+ * compress_state() shifts the second accumulator half down into the first when
+ * a block flushes, which is not idempotent: replaying a window that crossed a
+ * ratio boundary shifts twice and corrupts the block. The compressed rows are
+ * position indexed and overwrite themselves, so only values and scores need to
+ * be captured.
+ */
+struct CompressorAccumulatorSnapshot {
+    std::vector<float> values;
+    std::vector<float> scores;
+};
+
+struct AttentionAccumulatorSnapshot {
+    CompressorAccumulatorSnapshot compressor;
+    CompressorAccumulatorSnapshot indexer_compressor;
+};
+
+constexpr std::uint64_t kMaximumAttentionSnapshotBytes = 256ULL << 20U;
+
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
@@ -1179,6 +1200,9 @@ struct DeepSeekV4Runtime::Impl {
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
+    // One entry per speculative verify row, captured before the row runs.
+    std::vector<std::array<AttentionAccumulatorSnapshot, kLayers>> attention_snapshots;
+    std::uint64_t attention_snapshot_bytes{};
     std::vector<std::uint32_t> cached_token_ids;
     RouteTraceWriter route_trace;
     RoutePredictor route_predictor;
@@ -1312,6 +1336,9 @@ struct DeepSeekV4Runtime::Impl {
 
     ValidationResult warmup();
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
+    ValidationResult reserve_attention_snapshots(std::size_t rows);
+    void capture_attention_snapshot(std::size_t row);
+    void restore_attention_snapshot(std::size_t row);
     ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
         std::uint64_t logical_row);
@@ -1691,7 +1718,74 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
             }
         }
     }
+    attention_snapshots.clear();
+    attention_snapshot_bytes = 0U;
     return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::reserve_attention_snapshots(
+    std::size_t rows) {
+    ValidationResult result;
+    attention_snapshots.clear();
+    attention_snapshot_bytes = 0U;
+    if (rows == 0U) return result;
+    std::uint64_t per_row = 0U;
+    for (const auto& state : attention_state) {
+        per_row += static_cast<std::uint64_t>(
+            state.compressor.values.size() + state.compressor.scores.size() +
+            state.indexer_compressor.values.size() +
+            state.indexer_compressor.scores.size()) * sizeof(float);
+    }
+    if (per_row != 0U &&
+        rows > kMaximumAttentionSnapshotBytes / per_row) {
+        result.errors.emplace_back(
+            "DeepSeek speculative snapshot arena exceeds its ceiling");
+        return result;
+    }
+    attention_snapshots.resize(rows);
+    for (auto& snapshot : attention_snapshots) {
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto& state = attention_state[layer];
+            snapshot[layer].compressor.values.assign(
+                state.compressor.values.size(), 0.0F);
+            snapshot[layer].compressor.scores.assign(
+                state.compressor.scores.size(), 0.0F);
+            snapshot[layer].indexer_compressor.values.assign(
+                state.indexer_compressor.values.size(), 0.0F);
+            snapshot[layer].indexer_compressor.scores.assign(
+                state.indexer_compressor.scores.size(), 0.0F);
+        }
+    }
+    attention_snapshot_bytes = per_row * rows;
+    return result;
+}
+
+void DeepSeekV4Runtime::Impl::capture_attention_snapshot(std::size_t row) {
+    if (row >= attention_snapshots.size()) return;
+    auto& snapshot = attention_snapshots[row];
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        const auto& state = attention_state[layer];
+        snapshot[layer].compressor.values = state.compressor.values;
+        snapshot[layer].compressor.scores = state.compressor.scores;
+        snapshot[layer].indexer_compressor.values =
+            state.indexer_compressor.values;
+        snapshot[layer].indexer_compressor.scores =
+            state.indexer_compressor.scores;
+    }
+}
+
+void DeepSeekV4Runtime::Impl::restore_attention_snapshot(std::size_t row) {
+    if (row >= attention_snapshots.size()) return;
+    const auto& snapshot = attention_snapshots[row];
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        auto& state = attention_state[layer];
+        state.compressor.values = snapshot[layer].compressor.values;
+        state.compressor.scores = snapshot[layer].compressor.scores;
+        state.indexer_compressor.values =
+            snapshot[layer].indexer_compressor.values;
+        state.indexer_compressor.scores =
+            snapshot[layer].indexer_compressor.scores;
+    }
 }
 
 ParseResult<std::vector<float>> DeepSeekV4Runtime::Impl::kv_row(

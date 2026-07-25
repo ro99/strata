@@ -83,15 +83,19 @@ fixed setup to measured window, and the cheaper experiment you rejected.
    randomly placed slice of a 147 GB mapping, where the same comparison is
    1.32 ms against 0.37 ms. A probe that does not reproduce the real access
    pattern can report no problem where a 3.5x problem exists.
-3. **Amortize fixed setup across every arm and repetition.** A DeepSeek arm is
-   about 44 minutes, of which the measured decode window is 1.2 minutes: 97%
-   is model load. A harness that reloads per arm turns 7 minutes of
-   measurement into 4.4 hours. Load once and drive every arm and repetition
-   inside that process; interleaving inside one process is still interleaving.
-   Reloading per arm is justified only when the thing under test changes load
-   or admission itself.
-4. **Size the measured window to the question, not to habit.** More generated
-   tokens do not help once the per-step medians have separated.
+3. **Find which part of the run is not under test, and shrink that.** Measure
+   it; do not guess which part dominates. A DeepSeek arm at a 3,565-token
+   prompt is 51 s of initialization, 38.5 min of prefill, and 73 s of decode.
+   If decode throughput is the hypothesis, 95% of the arm is measuring nothing,
+   and six arms come to six hours. Shortening the prompt to about 512 tokens
+   makes the same arm roughly two minutes.
+4. **Never inherit workload parameters from another script.** Prompt length,
+   token count, and repetition count are part of the experiment design. Sizes
+   copied from a script written for a different hypothesis are how a two-minute
+   question becomes a six-hour one.
+5. **State the arm budget before launching.** Give expected wall time per arm
+   and in total. If the total exceeds roughly half an hour, say what was
+   shortened and why the rest must stay.
 
 ## Do not launder a falsification
 

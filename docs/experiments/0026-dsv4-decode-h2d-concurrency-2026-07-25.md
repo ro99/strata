@@ -1,86 +1,103 @@
-# Experiment 0026 — decode H2D concurrency, and the rejection of the "5.9x residual"
+# Experiment 0026 — decode H2D: rejecting the copy stream, finding the NUMA term
 
 ## Contract
 
-- Hypothesis under test (inherited from experiment 0024's "Next term"): decode
+- Hypothesis under test, inherited from experiment 0024's "Next term": decode
   H2D reaches 6.74 GB/s effective against 11.9 GB/s for the same transfer in
   isolation, so pinning captured 3.33x of an available ~5.9x. The residual was
   attributed to `CudaBackend::upload` issuing H2D on the compute stream and
   synchronizing it inline, and the proposed fix was a per-device dedicated copy
   stream with `cudaStreamWaitEvent` ordering.
-- Primary metric: effective decode demand-H2D rate, and the projected effect on
+- Primary metric: effective decode demand-H2D rate and its projected effect on
   median decode steps/s.
-- Kill criterion, stated before the work: if the mechanism named in the
-  hypothesis — deferring the inline synchronize — does not raise the measured
-  rate, the hypothesis is rejected regardless of what other mechanism the probe
-  happens to suggest.
-- Correctness: no code changed. This experiment is measurement only.
+- Kill criterion, stated before the work: if deferring the inline synchronize —
+  the mechanism the hypothesis names — does not raise the measured rate, the
+  hypothesis is rejected regardless of what else the probe suggests.
+- Correctness: no runtime code changed. This experiment is measurement only.
 
-## Result: the hypothesis is rejected, and its premise was wrong
+## Result
 
-**There is no 5.9x.** The 11.9 GB/s figure in experiment 0024 was measured on
-one device and generalized to "the link". The three links differ by 2x, and each
-is already running at its own slot's practical rate.
+The hypothesis is **rejected**. The inline synchronize costs nothing, and the
+"~5.9x available" was a measurement of a configuration the runtime does not
+have. Two smaller real terms were found in its place, and neither is a copy
+stream.
 
 ## Cheap measurement first
 
-A standalone probe reproduces the production access pattern exactly: a
-registered anonymous mapping sampled at cold, randomly placed, non-repeating
-4,456,448-byte offsets (4,194,304 B of FP4 weights plus 262,144 B of scales,
-which is what every routed-expert matrix is), issued as the runtime issues them.
-Five arms, 512 copies per device, ~40 seconds total:
+`strata-topology-probe` gained a cold-slice stage that reproduces the
+production access pattern: a registered anonymous mapping sampled at randomly
+permuted, non-repeating 4,456,448-byte offsets — one FP4 routed-expert matrix,
+4,194,304 B of weights plus 262,144 B of scales — issued as the runtime issues
+them. Four arms, 512 copies per device, about 40 seconds.
 
-| arm | GB/s | ms/copy |
-|---|---:|---:|
-| 1 single device, sync per copy — dev 0 | 5.740 | 0.776 |
-| 1 single device, sync per copy — dev 1 | 11.793 | 0.378 |
-| 1 single device, sync per copy — dev 2 | 6.288 | 0.709 |
-| 2 single device, batch 64 — dev 0 | 5.984 | 0.745 |
-| 2 single device, batch 64 — dev 1 | 11.708 | 0.381 |
-| 2 single device, batch 64 — dev 2 | 6.617 | 0.673 |
-| 3 round-robin 3 devices, sync per copy | 7.250 | 0.615 |
-| 4 3 devices in flight, sync per layer | **16.470** | 0.271 |
-| 5 3 threads, 3 devices, batch 64 | 16.570 | 0.269 |
+Default placement, three independent runs, reproducible to within 1%:
 
-Arm 3 is the production pattern: one host thread, `cudaSetDevice` and an inline
-`cudaStreamSynchronize` per copy, round-robin across devices. It reproduces
-production well — 7.250 GB/s against the runtime's measured 6.742 GB/s
-(73,852,256,256 B in 10.954 s), the 7% residual being the cache lookup, arena
-extent lookup and lease bookkeeping the probe does not model.
+| arm | GB/s |
+|---|---:|
+| single device, sync per copy — dev 0 / 1 / 2 | 5.82 / 7.14 / 6.38 |
+| single device, batch 64 — dev 0 / 1 / 2 | 5.87 / 7.19 / 6.70 |
+| serial round-robin, 3 devices, sync per copy | 6.37 |
+| **3 devices in flight, one sync per layer** | **10.52** |
+| 3 threads, 3 devices, batch 64 | 10.79 |
 
-Three things follow, and only the third survives.
+**The inline synchronize costs nothing.** Arm 1 against arm 2 on the same
+device is +0.9%, +0.7% and +5.0%. A 4.46 MB copy already saturates its link and
+there is no second copy queued behind it, so a deeper queue has nothing to
+recover. The mechanism the hypothesis named is worth zero, which is the kill
+criterion.
 
-**The inline synchronize costs nothing.** Arm 1 against arm 2, on the same
-device, is +4.3%, -0.7% and +5.2%. That is inside noise. The mechanism named in
-the hypothesis — deferring the sync so a copy is not blocked — recovers nothing,
-because a 4.46 MB copy already saturates its link and there is no second copy
-queued behind it to benefit from the deeper queue.
+**Serial round-robin is the real ceiling of the current pattern.** 6.37 GB/s
+against production's measured 6.742 GB/s (73,852,256,256 B in 10.954 s).
+Production is *at* the ceiling its access pattern permits, not an eighth of a
+link's rated figure. There is no 5.9x.
 
-**The links are unequal and each is at rate.** Under load `nvidia-smi` reports
-device 0 at gen3 x8, device 1 at gen3 x8, device 2 at gen3 x16; the GPUs are a
-RTX 5060 Ti on NUMA node 0 and two RTX 3090s sharing a host bridge on NUMA node
-1. Whatever the reported width, the measured 5.98 / 11.71 / 6.62 GB/s are the
-hardware's figures, not a software defect. Serial round-robin over three links
-of those rates cannot exceed 7.250 GB/s, and production is at 6.742 — **93% of
-the ceiling the current access pattern can possibly reach**. This is the
-falsification: the gap experiment 0024 called a serialization defect is, for the
-most part, simply three unequal links used one at a time.
+**Cross-device concurrency is the one real mechanism**, worth 1.66x here, and a
+thread pool adds nothing over a single host thread issuing to per-device
+streams — wall time becomes `max_d` instead of `Σ_d`.
 
-**Cross-device concurrency is the only real term.** Arm 3 to arm 4 is 2.27x,
-and arm 5 shows a thread pool adds nothing over it: one host thread issuing to
-per-device copy streams and synchronizing once per layer captures the whole
-effect, because wall time becomes `max_d` instead of `Σ_d`.
+## Where the 11.9 GB/s came from: the arena has no NUMA policy
 
-## But the production miss pattern barely offers that concurrency
+The first run of the probe reported device 1 at 11.79 GB/s and could not be
+reproduced afterwards. Per the charter that is a defect report, not an outlier
+to discard, and the cause is the finding of this experiment. GPU 0 sits on NUMA
+node 0; GPUs 1 and 2 share a host bridge on node 1. Re-running the identical
+probe under three placement policies:
 
-A 2.27x on the mechanism is not a 2.27x on the term. Replaying the recorded
+| | dev 0 | dev 1 | dev 2 | round-robin | overlapped |
+|---|---:|---:|---:|---:|---:|
+| `numactl --membind=0` | 5.87 | 7.18 | 6.71 | 6.49 | 10.80 |
+| `numactl --interleave=all` | 5.91 | 9.68 | 6.56 | 7.00 | 14.71 |
+| `numactl --membind=1` | 5.98 | **11.93** | 6.64 | 7.40 | **16.45** |
+
+Device 1's H2D rate is **1.66x** on source placement alone, and the aggregate
+overlapped rate is **1.52x**. The 11.9 GB/s recorded in experiment 0024 is
+therefore a real figure — it is device 1 reading a node-1-local source — but it
+is not what the runtime gets, because `Dsv4ResidentWeightStore::stage` allocates
+the arena with `mmap(MAP_PRIVATE | MAP_ANONYMOUS)` and no NUMA policy, and fills
+it from a pool of read workers, so each tensor's pages land on whichever node
+its staging worker happened to run on. Production's measured 6.742 GB/s sits
+between the `membind=0` and `interleave` round-robin figures, which is what an
+unbound arena should look like.
+
+Two things follow. First, generalizing one device's isolated figure to "the
+link" is what produced a 5.9x that does not exist. Second, **the placement of
+the resident arena is an unmanaged input to the step's bottleneck resource**,
+which also makes the term non-deterministic run to run.
+
+Device 2 does not respond to placement at all (6.71 / 6.56 / 6.64) despite
+reporting gen3 x16 under load, where its two neighbours at x8 reach 5.9 and
+11.9. That is unexplained and is recorded here as an open question, not
+attributed.
+
+## The production miss pattern barely offers the concurrency
+
+A 1.66x on the mechanism is not a 1.66x on the term. Replaying the recorded
 decode route trace from experiment 0024's pinned arm against the runtime's own
 cache model — `expert_device(e) = schedule[e % 8]` with
-`schedule = [0,0,1,1,1,2,2,2]`, per-device LRU over
-`capacity_bytes - pinned_bytes` — reproduces the measured workload closely
-(18,564 simulated weight misses against 16,572 measured; 10.702 s of modelled
-serial upload against 10.954 s of measured demand wait) and gives the
-distribution that matters:
+`schedule = [0,0,1,1,1,2,2,2]`, per-device LRU over `capacity_bytes -
+pinned_bytes` — reproduces the measured workload closely (18,564 modelled weight
+misses against 16,572 measured; scaled modelled serial time 10.97 s against
+10.954 s of measured demand wait) and gives the distribution that decides it:
 
 | devices missed on, per layer-step | layer-steps | share |
 |---|---:|---:|
@@ -89,21 +106,20 @@ distribution that matters:
 | 2 | 1,001 | 18.3% |
 | 3 | 256 | 4.7% |
 
-77% of decode layer-steps have nothing to overlap. Only ~1.13 experts miss per
-layer-step, and an expert's three matrices all live on one device, so the
-typical miss burst is three copies to a single link with the other two links
-idle. Applying the per-device measured rates:
+**77% of decode layer-steps have nothing to overlap.** Only ~1.13 experts miss
+per layer-step, and an expert's three matrices all live on one device, so the
+typical burst is three copies down one link with the other two idle.
 
-| | seconds |
+| projection (modelled, scaled to measured) | seconds |
 |---|---:|
-| serial upload (modelled) | 10.702 |
-| perfectly overlapped across devices | 8.071 |
-| **ceiling on this term** | **1.326x** |
+| serial, current placement | 10.95 |
+| perfectly overlapped, current placement | 8.20 |
+| serial, arena bound to node 1 | 10.25 |
+| perfectly overlapped, arena bound to node 1 | 7.74 |
 
-Against a 40.35 s decode that is 2.69 s, or **1.071x end-to-end at a ceiling of
-zero implementation overhead**. Allowing each device's MoE to be enqueued as
-soon as its own uploads land — overlapping the 0.63 ms/layer-step of maximum
-device MoE kernel time as well — raises the ceiling to roughly 1.077x.
+Against a 40.35 s decode: overlap alone is **1.07x**, NUMA binding alone is
+**1.02x**, and both together are **1.09x** — all at a ceiling of zero
+implementation overhead.
 
 ## Cost model at the operating point
 
@@ -126,48 +142,54 @@ device MoE kernel time as well — raises the ceiling to roughly 1.077x.
 | branch norm | 1.06 | 0.3% |
 | unattributed | 9.42 | 3.0% |
 
-`argmax_r` is the H2D link at 86.25 ms/step. A mechanism that perfectly
-parallelizes it across the three links removes 21 of those 86 ms. That is the
-whole prize, and it is 6.7% of a step.
+`argmax_r` is the H2D link at 86.25 ms/step. Perfectly parallelizing it across
+the three links removes 21 of those 86 ms. That is the whole prize.
 
 ## Decision
 
-**Do not build the copy stream on this evidence.** The hypothesis as stated is
-rejected: the inline synchronize is not a defect, and the "available ~5.9x" does
-not exist. The one real mechanism — cross-device concurrency — has a measured
-ceiling of 1.326x on a term worth 27% of the step, which is 1.07x end-to-end
-before any implementation cost, on a change that must get lease lifetime and
-`moe_in_flight` ordering right against a cache that currently guarantees a
-weight is resident before it is read.
+**Do not build the copy stream.** The named mechanism is worth zero, the claimed
+5.9x does not exist, and the one real mechanism has a measured ceiling of 1.33x
+on a term worth 27% of the step — 1.07x end-to-end before paying for lease
+lifetime and `moe_in_flight` ordering against a cache that currently guarantees
+a weight is resident before it is read.
 
 Recording the regime that would have been required, per the charter's rule
 against manufacturing a favourable one: this mechanism needs miss bursts that
 span devices. It would pay if the per-layer-step miss count were several times
-higher — a smaller VRAM cache, a larger expert set, or a longer context that
-evicts more per step — or if the expert-to-device map were changed so one
-expert's three matrices split across links. Neither is the operating point that
-was asked about, and the second trades a guaranteed 3x increase in per-expert
-issue count for a 1.33x ceiling.
+higher — a smaller VRAM cache, a larger expert set, or a longer context — or if
+one expert's three matrices were split across links, which trades a guaranteed
+3x rise in per-expert issue count for a 1.33x ceiling. Neither is the operating
+point that was asked about.
 
-## What the probe defect cost, again
+## Next term
 
-Experiment 0024 already recorded that `strata-topology-probe` reported pinned
-and pageable H2D as identical because it timed a warm reused buffer. The same
-probe also measures one device at a time and never concurrently, which is why
-the one property that turned out to matter — that three unequal links are used
-serially — was invisible in it, and why a 5.9x that does not exist was carried
-forward into a plan. The probe is corrected in this branch: it now samples cold
-randomly-placed slices of a large registered mapping, and reports concurrent
-aggregate H2D across all devices alongside the per-device figures.
+**Bind the resident arena's pages to the NUMA node hosting the majority of the
+GPUs.** It targets `B_r` of the bottleneck resource rather than its overlap, it
+is a placement call at `stage()` rather than a change to the read path, and it
+removes a currently unmanaged input to the step's largest term. Projected 1.02x
+here, which is thin on its own; the stronger argument is determinism, since the
+term's rate currently depends on which staging worker touched which tensor.
+It needs its own branch, hypothesis and gate — including the question of what
+`interleave` costs the majority node, and whether an unbalanced expert-to-device
+schedule should follow the arena rather than device VRAM.
 
-## Where the term actually goes
+Beyond that: 581 MB/step moves in 43 bursts of ~13.5 MB, each serial with the
+compute that consumes it, so the links sit idle most of the step. Aggregate
+capacity gives those bytes a ~24 ms/step floor against 86 ms measured, and the
+gap is idle link time, not bandwidth. Closing it means taking the transfer off
+the critical path rather than widening it — prefetch, whose simulation gate
+experiment 0022 already cleared (7.61% fewer modelled bytes, 84.66% useful) and
+whose authorized opt-in runtime experiment has never been run. Per the charter
+its predictions stay advisory.
 
-581 MB/step is moved in 43 bursts of ~13.5 MB, each serial with the compute
-that consumes it. Aggregate link capacity is 24.3 GB/s, so those bytes have a
-24 ms/step floor against 86 ms measured — and the gap is latency and idle link
-time, not bandwidth. Reaching that floor requires taking the transfer off the
-critical path rather than widening it, which means prefetch. Experiment 0022's
-simulation already cleared its gate for two past-only predictions at 0.75
-confidence (7.61% fewer modelled bytes, 84.66% useful) and authorized an opt-in
-runtime experiment that has not been run. That, not a copy stream, is the branch
-this term deserves next — and per the charter its predictions stay advisory.
+## What the probe defect cost
+
+Experiment 0024 recorded that `strata-topology-probe` reported pinned and
+pageable H2D as identical because it timed a warm reused buffer. The same probe
+also measured one device at a time, on an unbound source buffer, and never
+concurrently — so the two properties that turned out to matter, serial use of
+three links and the NUMA placement of the source, were both invisible in it.
+The probe is corrected in this branch: it samples cold, randomly placed slices
+of a large registered mapping and reports serial, batched, round-robin and
+overlapped arms across all devices. Evidence:
+`results/deepseek-v4-cold-slice-probe.json`.

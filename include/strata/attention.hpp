@@ -40,12 +40,15 @@ enum class FlashAttentionNumerics : std::uint32_t {
 // [query_rows, query_heads, dimension]. Segment storage uses
 // [source_rows, key_value_heads, dimension]. causal_key_counts, when present,
 // gives the visible prefix of the logically concatenated segments per query.
+// query_key_mask, when present, gives exact visibility for every
+// [query_row, logical_key_row] and is mutually exclusive with causal limits.
 // A head sink is a virtual score with value zero.
 struct FlashAttentionRequest {
     std::span<const float> queries;
     std::span<const FlashAttentionSegment> segments;
     std::span<const float> head_sinks;
     std::span<const std::uint32_t> causal_key_counts;
+    std::span<const std::uint8_t> query_key_mask;
     std::uint32_t query_rows{};
     std::uint32_t query_heads{};
     std::uint32_t key_value_heads{};

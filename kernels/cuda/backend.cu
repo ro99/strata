@@ -172,17 +172,17 @@ __global__ void plain_matmul_kernel(float* output, const float* input,
     const std::uint64_t weight_base = output_row * columns;
     const std::uint64_t input_row = groups == 0U
                                         ? batch_row
-                                        : output_row / rows_per_group;
+                                        : static_cast<std::uint64_t>(batch_row) *
+                                              groups +
+                                              output_row / rows_per_group;
     const std::uint64_t input_base = input_row * columns;
     for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
         sum += plain_value(weights, dtype, weight_base + column) * input[input_base + column];
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0) {
-        const std::uint64_t output_index = groups == 0U
-                                               ? static_cast<std::uint64_t>(batch_row) * rows +
-                                                     output_row
-                                               : output_row;
+        const std::uint64_t output_index =
+            static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
     }
 }
@@ -207,7 +207,9 @@ __global__ void packed_matmul_kernel(float* output, const float* input,
     const std::uint64_t scale_base = output_row * scale_columns;
     const std::uint64_t input_row = groups == 0U
                                         ? batch_row
-                                        : output_row / rows_per_group;
+                                        : static_cast<std::uint64_t>(batch_row) *
+                                              groups +
+                                              output_row / rows_per_group;
     const std::uint64_t input_base = input_row * columns;
     for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
         const std::uint32_t word = packed[packed_base + column / lanes];
@@ -219,10 +221,8 @@ __global__ void packed_matmul_kernel(float* output, const float* input,
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0) {
-        const std::uint64_t output_index = groups == 0U
-                                               ? static_cast<std::uint64_t>(batch_row) * rows +
-                                                     output_row
-                                               : output_row;
+        const std::uint64_t output_index =
+            static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
     }
 }
@@ -237,7 +237,9 @@ __global__ void native_fp8_matmul_kernel(
     if (output_row >= rows || batch_row >= batch) return;
     const std::uint64_t input_row = groups == 0U
                                         ? batch_row
-                                        : output_row / rows_per_group;
+                                        : static_cast<std::uint64_t>(batch_row) *
+                                              groups +
+                                              output_row / rows_per_group;
     const std::uint64_t input_base = input_row * columns;
     const std::uint64_t weight_base = output_row * columns;
     float sum = 0.0F;
@@ -249,10 +251,8 @@ __global__ void native_fp8_matmul_kernel(
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0) {
-        const std::uint64_t output_index = groups == 0U
-                                               ? static_cast<std::uint64_t>(batch_row) * rows +
-                                                     output_row
-                                               : output_row;
+        const std::uint64_t output_index =
+            static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
     }
 }
@@ -268,7 +268,9 @@ __global__ void native_fp4_matmul_kernel(
     if (output_row >= rows || batch_row >= batch) return;
     const std::uint64_t input_row = groups == 0U
                                         ? batch_row
-                                        : output_row / rows_per_group;
+                                        : static_cast<std::uint64_t>(batch_row) *
+                                              groups +
+                                              output_row / rows_per_group;
     const std::uint64_t input_base = input_row * columns;
     const std::uint64_t weight_base = output_row * packed_columns;
     const std::uint64_t scale_base = output_row * scale_columns;
@@ -281,10 +283,8 @@ __global__ void native_fp4_matmul_kernel(
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0) {
-        const std::uint64_t output_index = groups == 0U
-                                               ? static_cast<std::uint64_t>(batch_row) * rows +
-                                                     output_row
-                                               : output_row;
+        const std::uint64_t output_index =
+            static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
     }
 }
@@ -811,6 +811,7 @@ __global__ void flash_attention_reference_f32_kernel(
     float* output, const float* queries, const float* keys, const float* values,
     float* score_scratch,
     const float* sinks, const std::uint32_t* causal_key_counts,
+    const std::uint8_t* query_key_mask,
     std::uint32_t query_rows, std::uint32_t query_heads,
     std::uint32_t key_value_heads, std::uint32_t query_key_dim,
     std::uint32_t value_dim, std::uint32_t key_rows, float scale,
@@ -824,6 +825,9 @@ __global__ void flash_attention_reference_f32_kernel(
     const auto kv_head = head / heads_per_kv;
     const auto visible_rows = causal_key_counts == nullptr
         ? key_rows : causal_key_counts[query_row];
+    const auto* key_mask = query_key_mask == nullptr
+        ? nullptr
+        : query_key_mask + static_cast<std::uint64_t>(query_row) * key_rows;
     const auto* query = queries +
         (static_cast<std::uint64_t>(query_row) * query_heads + head) *
             query_key_dim;
@@ -835,6 +839,7 @@ __global__ void flash_attention_reference_f32_kernel(
         (static_cast<std::uint64_t>(query_row) * query_heads + head) * key_rows;
     for (std::uint32_t row = threadIdx.x; row < visible_rows;
          row += blockDim.x) {
+        if (key_mask != nullptr && key_mask[row] == 0U) continue;
         const auto* key = keys +
             (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
                 query_key_dim;
@@ -848,12 +853,14 @@ __global__ void flash_attention_reference_f32_kernel(
     if (threadIdx.x == 0U) {
         maximum = sinks == nullptr ? -INFINITY : sinks[head];
         for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
             maximum = fmaxf(maximum, scores[row]);
         }
         denominator = sinks == nullptr
             ? 0.0
             : exp(static_cast<double>(__fsub_rn(sinks[head], maximum)));
         for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
             denominator = __dadd_rn(denominator, exp(static_cast<double>(
                 __fsub_rn(scores[row], maximum))));
         }
@@ -861,6 +868,7 @@ __global__ void flash_attention_reference_f32_kernel(
             atomicExch(error_flag, 2U);
         }
         for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
             scores[row] = static_cast<float>(exp(static_cast<double>(
                 __fsub_rn(scores[row], maximum))) / denominator);
         }
@@ -868,6 +876,7 @@ __global__ void flash_attention_reference_f32_kernel(
     __syncthreads();
 
     for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+        if (key_mask != nullptr && key_mask[row] == 0U) continue;
         const auto* value = values +
             (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
                 value_dim;
@@ -1711,7 +1720,14 @@ ValidationResult CudaBackend::matmul_grouped(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t groups, std::uint64_t rows_per_group,
     std::span<float> output) {
-    return matmul_impl(weight, input, groups, groups, rows_per_group, output);
+    return matmul_impl(weight, input, 1U, groups, rows_per_group, output);
+}
+
+ValidationResult CudaBackend::matmul_grouped_rows(
+    const CudaWeight& weight, std::span<const float> input,
+    std::uint32_t rows, std::uint32_t groups,
+    std::uint64_t rows_per_group, std::span<float> output) {
+    return matmul_impl(weight, input, rows, groups, rows_per_group, output);
 }
 
 ValidationResult CudaBackend::validate_flash_attention_device(int device) const {
@@ -2169,6 +2185,8 @@ ValidationResult CudaBackend::flash_attention(
     const auto sink_bytes = static_cast<std::uint64_t>(request.head_sinks.size_bytes());
     const auto limit_bytes = static_cast<std::uint64_t>(
         request.causal_key_counts.size_bytes());
+    const auto mask_bytes = static_cast<std::uint64_t>(
+        request.query_key_mask.size_bytes());
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
     std::uint64_t score_bytes = 0U;
     if (request.numerics ==
@@ -2207,6 +2225,11 @@ ValidationResult CudaBackend::flash_attention(
     }
     const std::uint64_t limit_offset = upload_bytes;
     if (!append_region(upload_bytes, limit_bytes)) {
+        result.errors.emplace_back("FlashAttention CUDA upload layout overflows");
+        return result;
+    }
+    const std::uint64_t mask_offset = upload_bytes;
+    if (!append_region(upload_bytes, mask_bytes)) {
         result.errors.emplace_back("FlashAttention CUDA upload layout overflows");
         return result;
     }
@@ -2340,10 +2363,14 @@ ValidationResult CudaBackend::flash_attention(
         state.attention_host_upload + sink_offset);
     auto* host_limits = reinterpret_cast<std::uint32_t*>(
         state.attention_host_upload + limit_offset);
+    auto* host_mask = reinterpret_cast<std::uint8_t*>(
+        state.attention_host_upload + mask_offset);
     std::copy(request.queries.begin(), request.queries.end(), host_queries);
     std::copy(request.head_sinks.begin(), request.head_sinks.end(), host_sinks);
     std::copy(request.causal_key_counts.begin(),
               request.causal_key_counts.end(), host_limits);
+    std::copy(request.query_key_mask.begin(),
+              request.query_key_mask.end(), host_mask);
     const auto key_row_elements = static_cast<std::size_t>(
         request.key_value_heads) * request.query_key_dim;
     const auto value_row_elements = static_cast<std::size_t>(
@@ -2396,6 +2423,8 @@ ValidationResult CudaBackend::flash_attention(
         state.attention_upload + sink_offset);
     auto* device_limits = reinterpret_cast<std::uint32_t*>(
         state.attention_upload + limit_offset);
+    auto* device_mask = reinterpret_cast<std::uint8_t*>(
+        state.attention_upload + mask_offset);
     auto* device_output = reinterpret_cast<float*>(
         state.attention_download + output_offset);
     auto* device_error = reinterpret_cast<unsigned int*>(
@@ -2435,6 +2464,7 @@ ValidationResult CudaBackend::flash_attention(
             request.head_sinks.empty() ? nullptr : device_sinks,
             request.causal_key_counts.empty()
                 ? nullptr : device_limits,
+            request.query_key_mask.empty() ? nullptr : device_mask,
             request.query_rows, request.query_heads, request.key_value_heads,
             request.query_key_dim, request.value_dim,
             static_cast<std::uint32_t>(shape.value.logical_rows), request.scale,
@@ -2564,9 +2594,10 @@ ValidationResult CudaBackend::matmul_impl(
     const bool regular_shape = groups == 0U &&
         input.size() == descriptor.columns * rows &&
         output.size() == descriptor.rows * rows;
-    const bool grouped_shape = groups != 0U && rows == groups && rows_per_group != 0U &&
+    const bool grouped_shape = groups != 0U && rows_per_group != 0U &&
         descriptor.rows == static_cast<std::uint64_t>(groups) * rows_per_group &&
-        input.size() == descriptor.columns * groups && output.size() == descriptor.rows;
+        input.size() == descriptor.columns * groups * rows &&
+        output.size() == descriptor.rows * rows;
     if (rows == 0U || (!regular_shape && !grouped_shape)) {
         result.errors.emplace_back("CUDA matmul activation shapes are incompatible");
         return result;
@@ -2624,13 +2655,14 @@ ValidationResult CudaBackend::matmul_impl(
     const bool native = descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
                         descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
     if (native) {
+        const auto input_rows = groups == 0U ? rows : rows * groups;
         const dim3 quantize_grid(
-            static_cast<unsigned int>((descriptor.columns + 127U) / 128U), rows, 1U);
+            static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
+            input_rows, 1U);
         quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U, state.stream>>>(
-            state.input, descriptor.columns, rows);
+            state.input, descriptor.columns, input_rows);
     }
-    const auto output_batches = groups == 0U ? rows : 1U;
-    const dim3 grid(static_cast<unsigned int>(descriptor.rows), output_batches, 1U);
+    const dim3 grid(static_cast<unsigned int>(descriptor.rows), rows, 1U);
     constexpr unsigned int threads = 256U;
     if (descriptor.encoding == CudaWeightEncoding::Plain) {
         plain_matmul_kernel<<<grid, threads, 0, state.stream>>>(

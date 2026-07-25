@@ -571,13 +571,25 @@ public:
                              std::uint32_t groups,
                              std::uint64_t rows_per_group,
                              std::span<float> output) {
+        return grouped_rows(slot, base, output_columns, input_columns,
+                            input, 1U, groups, rows_per_group, output);
+    }
+
+    ValidationResult grouped_rows(std::size_t slot, std::string_view base,
+                                  std::uint64_t output_columns,
+                                  std::uint64_t input_columns,
+                                  std::span<const float> input,
+                                  std::uint32_t rows,
+                                  std::uint32_t groups,
+                                  std::uint64_t rows_per_group,
+                                  std::span<float> output) {
         auto demand_guard = demand();
         Entry* entry = nullptr;
         auto result = ensure(slot, base, output_columns, input_columns,
                              LoadKind::Demand, entry);
         if (!result.ok()) return result;
-        result = backend_.matmul_grouped(entry->weight, input, groups,
-                                         rows_per_group, output);
+        result = backend_.matmul_grouped_rows(
+            entry->weight, input, rows, groups, rows_per_group, output);
         if (result.ok()) round_bf16(output);
         return result;
     }
@@ -2444,6 +2456,154 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
         for (std::uint32_t row = 0U; row < rows; ++row) finish_kv(row);
     }
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
+
+    auto& layer_state = attention_state[layer];
+    const auto last_position = position_base + rows - 1U;
+    const auto ratio = layer_state.compressor.ratio;
+    const bool use_sparse_indexer =
+        ratio == 4U && layer_state.indexer_compressor.ratio == 4U;
+    const auto maximum_score_rows =
+        std::min(last_position + 1U, kWindow) +
+        (ratio == 0U ? 0U : (last_position + 1U) / ratio);
+    const bool batch_cuda = rows > 1U && kv_cache != nullptr &&
+        !use_sparse_indexer && should_dispatch_flash_attention_cuda(
+            config.enable_flash_attention, maximum_score_rows,
+            config.flash_attention_minimum_rows);
+    if (batch_cuda) {
+        subphase_started = std::chrono::steady_clock::now();
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto position = position_base + row;
+            const auto input_row = input.subspan(
+                static_cast<std::size_t>(row) * kHidden, kHidden);
+            const auto kv_row_values = std::span<const float>(kv).subspan(
+                static_cast<std::size_t>(row) * kHeadDim, kHeadDim);
+            result = kv_cache->append(active_sequence,
+                                      Dsv4KvBlockKind::Sliding, layer,
+                                      1U, position, kv_row_values);
+            if (!result.ok()) return result;
+            result = compressor(layer, input_row, position);
+            if (!result.ok()) return result;
+        }
+        graph_stats.attention_kv_nanoseconds +=
+            elapsed_nanoseconds(subphase_started);
+
+        auto sink = host_tensor(prefix + "attn_sink", kHeads);
+        if (!sink.ok()) {
+            append_errors(result, std::move(sink.errors));
+            return result;
+        }
+        const auto sliding_begin = position_base + 1U > kWindow
+            ? position_base + 1U - kWindow : 0U;
+        const auto sliding_end = last_position + 1U;
+        const auto sliding_rows = sliding_end - sliding_begin;
+        const auto compressed_rows = ratio == 0U
+            ? 0U : (last_position + 1U) / ratio;
+        const auto key_rows = sliding_rows + compressed_rows;
+        std::vector<float> gathered(
+            static_cast<std::size_t>(key_rows) * kHeadDim);
+        for (std::uint32_t row = 0U; row < sliding_rows; ++row) {
+            auto source = kv_row(layer, Dsv4KvBlockKind::Sliding,
+                                 sliding_begin + row);
+            if (!source.ok()) {
+                append_errors(result, std::move(source.errors));
+                return result;
+            }
+            std::copy(source.value.begin(), source.value.end(),
+                      gathered.begin() +
+                          static_cast<std::ptrdiff_t>(row) * kHeadDim);
+        }
+        for (std::uint32_t row = 0U; row < compressed_rows; ++row) {
+            auto source = kv_row(layer, layer_state.compressor.kind, row);
+            if (!source.ok()) {
+                append_errors(result, std::move(source.errors));
+                return result;
+            }
+            std::copy(source.value.begin(), source.value.end(),
+                      gathered.begin() + static_cast<std::ptrdiff_t>(
+                          sliding_rows + row) * kHeadDim);
+        }
+
+        std::vector<std::uint8_t> mask(
+            static_cast<std::size_t>(rows) * key_rows, 0U);
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto position = position_base + row;
+            const auto window_count = std::min(position + 1U, kWindow);
+            const auto window_begin = position + 1U - window_count;
+            auto row_mask = std::span<std::uint8_t>(mask).subspan(
+                static_cast<std::size_t>(row) * key_rows, key_rows);
+            std::fill(row_mask.begin() +
+                          static_cast<std::ptrdiff_t>(window_begin - sliding_begin),
+                      row_mask.begin() + static_cast<std::ptrdiff_t>(
+                          position + 1U - sliding_begin),
+                      1U);
+            const auto visible_compressed = ratio == 0U
+                ? 0U : (position + 1U) / ratio;
+            std::fill_n(row_mask.begin() + sliding_rows,
+                        visible_compressed, 1U);
+        }
+
+        subphase_started = std::chrono::steady_clock::now();
+        graph_stats.attention_cuda_dispatches += rows;
+        const std::array<FlashAttentionSegment, 1> segments{{
+            {gathered, {}, {}}}};
+        std::vector<float> attended(
+            row_count * static_cast<std::size_t>(kHeads) * kHeadDim);
+        FlashAttentionRequest request;
+        request.queries = queries;
+        request.segments = segments;
+        request.head_sinks = *sink.value;
+        request.query_key_mask = mask;
+        request.query_rows = rows;
+        request.query_heads = kHeads;
+        request.key_value_heads = 1U;
+        request.query_key_dim = kHeadDim;
+        request.value_dim = kHeadDim;
+        request.scale = kAttentionScale;
+        request.numerics =
+            FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
+        request.maximum_workspace_bytes = kDeviceWorkspaceReserve;
+        {
+            auto cuda_demand = weights->demand();
+            result = cuda.flash_attention(devices[slot], request, attended);
+        }
+        if (!result.ok()) return result;
+        const auto finish_head = [&](std::size_t task) {
+            const auto row = task / kHeads;
+            auto destination = std::span<float>(attended).subspan(
+                task * kHeadDim, kHeadDim);
+            round_bf16(destination);
+            apply_rope(destination.last(kRopeDim),
+                       position_base + static_cast<std::uint32_t>(row),
+                       layer_state.frequencies, true);
+            round_bf16(destination.last(kRopeDim));
+        };
+        if (attention_workers != nullptr) {
+            result = attention_workers->parallel_for(
+                row_count * kHeads, finish_head);
+            if (!result.ok()) return result;
+        } else {
+            for (std::size_t task = 0U; task < row_count * kHeads; ++task) {
+                finish_head(task);
+            }
+        }
+        graph_stats.attention_score_nanoseconds +=
+            elapsed_nanoseconds(subphase_started);
+
+        subphase_started = std::chrono::steady_clock::now();
+        std::vector<float> output_rank(
+            row_count * static_cast<std::size_t>(kOutputGroups) * kOutputRank);
+        result = weights->grouped_rows(
+            slot, prefix + "wo_a", kOutputGroups * kOutputRank,
+            kHeads * kHeadDim / kOutputGroups, attended, rows,
+            kOutputGroups, kOutputRank, output_rank);
+        if (!result.ok()) return result;
+        result = linear_rows(slot, prefix + "wo_b", kHidden,
+                             kOutputGroups * kOutputRank, output_rank,
+                             rows, output);
+        graph_stats.attention_output_nanoseconds +=
+            elapsed_nanoseconds(subphase_started);
+        return result;
+    }
 
     for (std::uint32_t row = 0U; row < rows; ++row) {
         const auto input_row = input.subspan(

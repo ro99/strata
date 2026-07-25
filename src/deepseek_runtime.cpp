@@ -3187,27 +3187,29 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
         return result;
     }
     defer_prefill_observability = true;
-    for (std::size_t page_begin = 0U; page_begin < tokens.size();
-         page_begin += config.prefill_page_tokens) {
-        const auto page_rows = static_cast<std::uint32_t>(std::min<std::size_t>(
-            config.prefill_page_tokens, tokens.size() - page_begin));
-        std::vector<float> hidden(static_cast<std::size_t>(page_rows) * hidden_stride);
-        ++graph_stats.prefill_pages;
-        graph_stats.prefill_max_page_tokens = std::max<std::uint64_t>(
-            graph_stats.prefill_max_page_tokens, page_rows);
-        graph_stats.prefill_max_workspace_bytes = std::max<std::uint64_t>(
-            graph_stats.prefill_max_workspace_bytes,
-            static_cast<std::uint64_t>(page_rows) *
-                (2U * hidden_stride + 2U * kHidden + kQueryRank +
-                 static_cast<std::size_t>(kHeads) * kHeadDim + kHeadDim) *
-                sizeof(float));
+    // Expert residency, not activation memory, is what bounds prefill. One
+    // layer's 256 routed experts are 3.4 GB and fit the VRAM cache; all 43
+    // layers together are 147 GB and do not. Sweeping every layer inside the
+    // page loop therefore evicts the cache once per page: a 3,565-token
+    // prefill moved 3,367 GB of demand H2D, 22.9x the 147 GB it must move,
+    // with 745,172 evictions and 59% of the phase spent in demand wait.
+    // Visiting layers outermost over a tile of pages touches each layer's
+    // experts once per tile instead of once per page. A tile equal to
+    // prefill_page_tokens reproduces the page-major nest exactly.
+    const auto tile_tokens = config.prefill_layer_tile_tokens == 0U
+        ? tokens.size()
+        : std::min<std::size_t>(config.prefill_layer_tile_tokens, tokens.size());
+    for (std::size_t tile_begin = 0U; tile_begin < tokens.size();
+         tile_begin += tile_tokens) {
+        const auto tile_rows =
+            std::min<std::size_t>(tile_tokens, tokens.size() - tile_begin);
+        std::vector<float> hidden(tile_rows * hidden_stride);
 
-        for (std::uint32_t row = 0U; row < page_rows; ++row) {
+        for (std::size_t row = 0U; row < tile_rows; ++row) {
             const auto embedding_started = std::chrono::steady_clock::now();
-            auto status = embed(tokens[page_begin + row],
+            auto status = embed(tokens[tile_begin + row],
                                 std::span<float>(hidden).subspan(
-                                    static_cast<std::size_t>(row) * hidden_stride,
-                                    hidden_stride));
+                                    row * hidden_stride, hidden_stride));
             graph_stats.embedding_nanoseconds +=
                 elapsed_nanoseconds(embedding_started);
             if (!status.ok()) {
@@ -3218,26 +3220,53 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
         }
 
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-            const auto absolute_page_begin = position_base +
-                static_cast<std::uint32_t>(page_begin);
-            auto status = block_page(
-                layer, tokens.subspan(page_begin, page_rows), hidden,
-                absolute_page_begin);
-            if (!status.ok()) {
-                defer_prefill_observability = false;
-                result.errors = std::move(status.errors);
-                return result;
-            }
-            for (std::uint32_t row = 0U; row < page_rows; ++row) {
-                const auto token_index = page_begin + row;
-                const auto absolute = position_base +
-                    static_cast<std::uint32_t>(token_index);
-                if (config.enable_layer_hash_trace) {
-                    record_layer_hash(
-                        absolute, tokens[token_index], layer,
-                        std::span<const float>(hidden).subspan(
-                            static_cast<std::size_t>(row) * hidden_stride,
-                            hidden_stride));
+            for (std::size_t page_begin = 0U; page_begin < tile_rows;
+                 page_begin += config.prefill_page_tokens) {
+                const auto page_rows = static_cast<std::uint32_t>(
+                    std::min<std::size_t>(config.prefill_page_tokens,
+                                          tile_rows - page_begin));
+                if (layer == 0U) {
+                    ++graph_stats.prefill_pages;
+                    graph_stats.prefill_max_page_tokens =
+                        std::max<std::uint64_t>(
+                            graph_stats.prefill_max_page_tokens, page_rows);
+                    graph_stats.prefill_max_workspace_bytes =
+                        std::max<std::uint64_t>(
+                            graph_stats.prefill_max_workspace_bytes,
+                            static_cast<std::uint64_t>(tile_rows) *
+                                    hidden_stride * sizeof(float) +
+                                static_cast<std::uint64_t>(page_rows) *
+                                    (2U * hidden_stride + 2U * kHidden +
+                                     kQueryRank +
+                                     static_cast<std::size_t>(kHeads) *
+                                         kHeadDim +
+                                     kHeadDim) *
+                                    sizeof(float));
+                }
+                const auto absolute_page_begin =
+                    position_base +
+                    static_cast<std::uint32_t>(tile_begin + page_begin);
+                auto status = block_page(
+                    layer, tokens.subspan(tile_begin + page_begin, page_rows),
+                    std::span<float>(hidden).subspan(
+                        page_begin * hidden_stride, page_rows * hidden_stride),
+                    absolute_page_begin);
+                if (!status.ok()) {
+                    defer_prefill_observability = false;
+                    result.errors = std::move(status.errors);
+                    return result;
+                }
+                for (std::uint32_t row = 0U; row < page_rows; ++row) {
+                    const auto token_index = tile_begin + page_begin + row;
+                    if (config.enable_layer_hash_trace) {
+                        record_layer_hash(
+                            position_base +
+                                static_cast<std::uint32_t>(token_index),
+                            tokens[token_index], layer,
+                            std::span<const float>(hidden).subspan(
+                                (page_begin + row) * hidden_stride,
+                                hidden_stride));
+                    }
                 }
             }
         }
@@ -3247,8 +3276,8 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
             result.errors = std::move(routes_flushed.errors);
             return result;
         }
-        graph_stats.forward_tokens += page_rows;
-        if (page_begin + page_rows == tokens.size()) {
+        graph_stats.forward_tokens += tile_rows;
+        if (tile_begin + tile_rows == tokens.size()) {
             --graph_stats.forward_tokens;
             const auto last_row = std::span<const float>(hidden).last(hidden_stride);
             result = sample_hidden(tokens.back(),
@@ -3315,6 +3344,14 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.prefill_page_tokens > kMaximumPrefillPageTokens) {
         result.errors.emplace_back(
             "DeepSeek prefill page must be within [1, 512] tokens");
+        return result;
+    }
+    if (config.prefill_layer_tile_tokens != 0U &&
+        (config.prefill_layer_tile_tokens < config.prefill_page_tokens ||
+         config.prefill_layer_tile_tokens > config.maximum_context_tokens)) {
+        result.errors.emplace_back(
+            "DeepSeek prefill layer tile must be zero or within "
+            "[prefill page tokens, maximum context tokens]");
         return result;
     }
     if (config.enable_logit_trace &&
@@ -3587,6 +3624,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.host_attention_threads;
     impl_->initialization_metrics.prefill_page_tokens =
         config.prefill_page_tokens;
+    impl_->initialization_metrics.prefill_layer_tile_tokens =
+        config.prefill_layer_tile_tokens;
     impl_->initialization_metrics.flash_attention_enabled =
         config.enable_flash_attention;
     impl_->initialization_metrics.gpu_lightning_indexer_enabled =

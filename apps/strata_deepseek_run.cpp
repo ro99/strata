@@ -23,6 +23,7 @@ struct Options {
     std::uint32_t maximum_new_tokens{16U};
     std::uint32_t maximum_context_tokens{2048U};
     std::uint32_t prefill_page_tokens{64U};
+    std::uint32_t prefill_layer_tile_tokens{};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     std::uint32_t flash_attention_minimum_rows{256U};
@@ -149,6 +150,10 @@ bool parse_options(int argc, char** argv, Options& options) {
                     value, options.prefill_page_tokens) ||
                 options.prefill_page_tokens == 0U ||
                 options.prefill_page_tokens > 512U) return false;
+        } else if (argument == "--prefill-layer-tile") {
+            const auto* value = next(argument);
+            if (value == nullptr || !strata::cli::parse_u32(
+                    value, options.prefill_layer_tile_tokens)) return false;
         } else if (argument == "--host-attention-threads") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(value, options.host_attention_threads) ||
@@ -826,6 +831,7 @@ int main(int argc, char** argv) {
     config.device_kv_cache_bytes = options.device_kv_cache_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.prefill_page_tokens = options.prefill_page_tokens;
+    config.prefill_layer_tile_tokens = options.prefill_layer_tile_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
     config.host_attention_threads = options.host_attention_threads;
     config.resident_read_workers = options.resident_read_workers;
@@ -876,6 +882,8 @@ int main(int argc, char** argv) {
                   << metrics.host_attention_threads
                   << ",\"prefill_page_tokens\":"
                   << metrics.prefill_page_tokens
+                  << ",\"prefill_layer_tile_tokens\":"
+                  << metrics.prefill_layer_tile_tokens
                   << ",\"flash_attention\":"
                   << (metrics.flash_attention_enabled ? "true" : "false")
                   << ",\"gpu_lightning_indexer\":"

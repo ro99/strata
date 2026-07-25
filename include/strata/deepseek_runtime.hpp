@@ -29,6 +29,13 @@ struct Dsv4RuntimeConfig {
     // Prefill is executed in bounded layer-major pages. Page 64 is the
     // accepted measured default; a value of one retains the oracle traversal.
     std::uint32_t prefill_page_tokens{64U};
+    // Prefill visits layers outermost over a tile of this many tokens, so a
+    // layer's routed experts are streamed once per tile rather than once per
+    // page. Zero tiles the whole prefill range, which is the minimum possible
+    // expert traffic; setting it equal to prefill_page_tokens restores the
+    // page-major nest. Costs tile_tokens * mhc_multiplier * hidden_size * 4
+    // bytes of resident activation.
+    std::uint32_t prefill_layer_tile_tokens{};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     bool enable_flash_attention{};
@@ -173,6 +180,7 @@ struct Dsv4GenerationMetrics {
     std::uint32_t kv_block_rows{};
     std::uint32_t host_attention_threads{};
     std::uint32_t prefill_page_tokens{};
+    std::uint32_t prefill_layer_tile_tokens{};
     bool flash_attention_enabled{};
     bool gpu_lightning_indexer_enabled{};
     std::uint32_t flash_attention_minimum_rows{};

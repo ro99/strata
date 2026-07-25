@@ -213,6 +213,47 @@ TEST_CASE("DeepSeek sqrtsoftplus routing keeps selection bias out of weights") {
     REQUIRE(route.value.weights[0] < route.value.weights[1]);
 }
 
+TEST_CASE("DeepSeek shadow routing substitutes only inadmissible experts") {
+    auto spec = strata::deepseek_v4_flash_dspark_spec().router;
+    spec.routed_experts = 4U;
+    spec.experts_per_token = 2U;
+    const std::array<float, 4> logits{-2.0F, 0.0F, 1.0F, 2.0F};
+    const std::array<float, 4> bias{10.0F, 0.0F, 0.0F, 0.0F};
+    const auto exact = strata::dsv4_route_sqrtsoftplus_f32(logits, bias, spec);
+    REQUIRE(exact.ok());
+
+    // Everything admissible: the shadow must reproduce the exact route bit for
+    // bit, so a fully resident draft cannot diverge from the target.
+    const std::array<std::uint8_t, 4> all{1U, 1U, 1U, 1U};
+    const auto resident = strata::dsv4_route_substituted_sqrtsoftplus_f32(
+        logits, bias, exact.value.experts, all, spec);
+    REQUIRE(resident.ok());
+    REQUIRE(resident.value.experts == exact.value.experts);
+    REQUIRE(resident.value.weights == exact.value.weights);
+
+    // Expert 0 is cold. It is replaced by the best-scoring admissible expert,
+    // and the surviving exact expert keeps its rank.
+    const std::array<std::uint8_t, 4> without_zero{0U, 1U, 1U, 1U};
+    const auto shadow = strata::dsv4_route_substituted_sqrtsoftplus_f32(
+        logits, bias, exact.value.experts, without_zero, spec);
+    REQUIRE(shadow.ok());
+    const std::vector<std::uint32_t> expected{3U, 2U};
+    REQUIRE(shadow.value.experts == expected);
+    REQUIRE_NEAR(shadow.value.weights[0] + shadow.value.weights[1], 1.5F, 1.0e-6F);
+
+    // Hash-routed layers score their substitutes without the selection bias.
+    const auto unbiased = strata::dsv4_route_substituted_sqrtsoftplus_f32(
+        logits, {}, exact.value.experts, without_zero, spec);
+    REQUIRE(unbiased.ok());
+    REQUIRE(unbiased.value.experts == expected);
+
+    // The draft never stalls: too few admissible experts is a failure, never a
+    // demand load.
+    const std::array<std::uint8_t, 4> only_one{0U, 0U, 0U, 1U};
+    REQUIRE(!strata::dsv4_route_substituted_sqrtsoftplus_f32(
+                 logits, bias, exact.value.experts, only_one, spec).ok());
+}
+
 TEST_CASE("DeepSeek mHC Sinkhorn preserves four residual lanes") {
     constexpr std::uint32_t multiplier = 4U;
     std::array<float, 24> mixes{};

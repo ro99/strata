@@ -354,6 +354,73 @@ Dsv4RouteResult dsv4_route_hash_sqrtsoftplus_f32(
     return gather_route(logits, token_experts, spec);
 }
 
+Dsv4RouteResult dsv4_route_substituted_sqrtsoftplus_f32(
+    std::span<const float> logits, std::span<const float> selection_bias,
+    std::span<const std::uint32_t> exact_experts,
+    std::span<const std::uint8_t> admissible, const RouterSpec& spec) {
+    Dsv4RouteResult result;
+    if (!valid_router_spec(spec)) {
+        result.errors.emplace_back(
+            "router specification is not the DeepSeek V4 sqrtsoftplus/noaux_tc contract");
+        return result;
+    }
+    if (logits.size() != spec.routed_experts ||
+        admissible.size() != spec.routed_experts ||
+        exact_experts.size() != spec.experts_per_token ||
+        (!selection_bias.empty() && selection_bias.size() != logits.size())) {
+        result.errors.emplace_back(
+            "DeepSeek shadow router tensor shapes disagree with its contract");
+        return result;
+    }
+    for (std::size_t expert = 0U; expert < logits.size(); ++expert) {
+        if (!std::isfinite(logits[expert]) ||
+            (!selection_bias.empty() && !std::isfinite(selection_bias[expert]))) {
+            result.errors.emplace_back(
+                "DeepSeek shadow router tensors contain a non-finite value");
+            return result;
+        }
+    }
+
+    std::vector<std::uint32_t> selected;
+    selected.reserve(spec.experts_per_token);
+    for (const auto expert : exact_experts) {
+        if (expert >= spec.routed_experts) {
+            result.errors.emplace_back(
+                "DeepSeek shadow router received an out-of-range expert");
+            return result;
+        }
+        if (admissible[expert] != 0U &&
+            std::find(selected.begin(), selected.end(), expert) == selected.end()) {
+            selected.push_back(expert);
+        }
+    }
+    while (selected.size() < spec.experts_per_token) {
+        bool found = false;
+        std::uint32_t best = 0U;
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t expert = 0U; expert < spec.routed_experts; ++expert) {
+            if (admissible[expert] == 0U) continue;
+            if (std::find(selected.begin(), selected.end(), expert) != selected.end()) {
+                continue;
+            }
+            const float score = std::sqrt(dsv4_softplus_f32(logits[expert])) +
+                (selection_bias.empty() ? 0.0F : selection_bias[expert]);
+            if (!found || score > best_score) {
+                found = true;
+                best = expert;
+                best_score = score;
+            }
+        }
+        if (!found) {
+            result.errors.emplace_back(
+                "DeepSeek shadow router has too few admissible experts");
+            return result;
+        }
+        selected.push_back(best);
+    }
+    return gather_route(logits, selected, spec);
+}
+
 ValidationResult dsv4_swiglu_f32(std::span<float> output,
                                  std::span<const float> gate,
                                  std::span<const float> up,

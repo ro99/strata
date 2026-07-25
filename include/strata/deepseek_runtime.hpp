@@ -53,6 +53,22 @@ struct Dsv4RuntimeConfig {
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     std::uint64_t expert_prefetch_lease_ticks{16U};
     double expert_prefetch_minimum_confidence{0.75};
+    // Shadow-speculative decoding. Zero drafted tokens disables it entirely and
+    // leaves the plain autoregressive path byte-for-byte unchanged. A window
+    // drafts this many tokens and verifies one more row than it drafts.
+    std::uint32_t speculative_draft_tokens{};
+    // Accept at most one token per window. Verify row zero is a true forward at
+    // the true input token, so probe output is bit-identical to baseline by
+    // construction while acceptance, dedup, and manifest recall are measured.
+    bool speculative_probe{};
+    // Falls back to plain decode for the rest of the request when the product
+    // of the acceptance and dedup EWMAs stays below the threshold for this many
+    // consecutive windows. Never re-arms within a request.
+    double speculation_guard_threshold{1.0};
+    double speculation_guard_decay{0.75};
+    std::uint32_t speculation_guard_windows{3U};
+    std::uint32_t speculation_manifest_limit{2048U};
+    std::uint64_t speculation_manifest_byte_budget{8ULL << 30U};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     bool require_zero_nvme_decode{true};
@@ -86,6 +102,11 @@ struct Dsv4CacheStats {
     std::uint64_t prefetch_lease_releases{};
     std::uint64_t active_prefetch_leases{};
     std::uint64_t prefetch_queue_peak{};
+    std::uint64_t draft_resident_queries{};
+    std::uint64_t draft_resident_hits{};
+    // Nonzero means a speculative draft stalled on a cold transfer, which is a
+    // hard failure rather than a fallback.
+    std::uint64_t draft_demand_loads{};
     std::vector<std::uint64_t> used_bytes;
     std::vector<std::uint64_t> capacity_bytes;
     std::vector<std::uint64_t> unpinned_used_bytes;

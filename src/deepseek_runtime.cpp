@@ -456,6 +456,46 @@ public:
         Dsv4WeightCache* owner_{};
     };
 
+    /*
+     * Held for the duration of a speculative draft forward pass. While it is
+     * held, a demand load that misses the cache is a hard failure instead of a
+     * transfer: "the draft never stalls" is enforced here rather than merely
+     * intended. Prefetches are unaffected, and the exact path never sees this.
+     */
+    class DraftGuard {
+    public:
+        DraftGuard() = default;
+        ~DraftGuard() { reset(); }
+        DraftGuard(const DraftGuard&) = delete;
+        DraftGuard& operator=(const DraftGuard&) = delete;
+
+        DraftGuard(DraftGuard&& other) noexcept : owner_(other.owner_) {
+            other.owner_ = nullptr;
+        }
+
+        DraftGuard& operator=(DraftGuard&& other) noexcept {
+            if (this == &other) return *this;
+            reset();
+            owner_ = other.owner_;
+            other.owner_ = nullptr;
+            return *this;
+        }
+
+    private:
+        friend class Dsv4WeightCache;
+
+        explicit DraftGuard(Dsv4WeightCache* owner) : owner_(owner) {}
+
+        void reset() noexcept {
+            if (owner_ != nullptr) {
+                owner_->drafting_.store(false, std::memory_order_relaxed);
+            }
+            owner_ = nullptr;
+        }
+
+        Dsv4WeightCache* owner_{};
+    };
+
     class Lease {
     public:
         Lease() = default;
@@ -538,6 +578,31 @@ public:
         if (!prefetch_worker_.joinable()) return {};
         begin_demand(keys);
         return DemandGuard(this);
+    }
+
+    [[nodiscard]] DraftGuard draft() {
+        drafting_.store(true, std::memory_order_relaxed);
+        return DraftGuard(this);
+    }
+
+    // Pure lookup. Takes no demand guard and touches neither last_use nor the
+    // clock: the draft must not perturb the replacement state it is measuring.
+    [[nodiscard]] bool resident(std::size_t slot, std::string_view base) const {
+        ++draft_resident_queries_;
+        if (slot >= states_.size()) return false;
+        const auto& entries = states_[slot].entries;
+        const bool hit = entries.find(std::string(base)) != entries.end();
+        if (hit) ++draft_resident_hits_;
+        return hit;
+    }
+
+    // An expert is usable by the draft only when all three projections are
+    // already on the device.
+    [[nodiscard]] bool expert_resident(ExpertKey key, std::size_t slot) const {
+        const auto prefix = layer_prefix(key.layer) + "ffn.experts." +
+                            std::to_string(key.expert) + ".";
+        return resident(slot, prefix + "w1") && resident(slot, prefix + "w3") &&
+               resident(slot, prefix + "w2");
     }
 
     ValidationResult preload(std::size_t slot, std::string_view base,
@@ -646,6 +711,12 @@ public:
             active_prefetch_leases_.load(std::memory_order_relaxed);
         result.prefetch_queue_peak =
             prefetch_queue_peak_.load(std::memory_order_relaxed);
+        result.draft_resident_queries =
+            draft_resident_queries_.load(std::memory_order_relaxed);
+        result.draft_resident_hits =
+            draft_resident_hits_.load(std::memory_order_relaxed);
+        result.draft_demand_loads =
+            draft_demand_loads_.load(std::memory_order_relaxed);
         for (const auto& state : states_) {
             result.used_bytes.push_back(state.used);
             result.capacity_bytes.push_back(state.capacity);
@@ -669,65 +740,37 @@ public:
     void request_prefetch(ExpertKey key, std::size_t slot) {
         ++prefetch_requests_;
         if (!prefetch_worker_.joinable() || slot >= states_.size()) return;
-
-        const auto prefix = layer_prefix(key.layer) + "ffn.experts." +
-                            std::to_string(key.expert) + ".";
-        const std::array dimensions{
-            std::pair{std::uint64_t{kExpertIntermediate}, std::uint64_t{kHidden}},
-            std::pair{std::uint64_t{kExpertIntermediate}, std::uint64_t{kHidden}},
-            std::pair{std::uint64_t{kHidden}, std::uint64_t{kExpertIntermediate}},
-        };
-        constexpr std::array<std::string_view, 3U> operations{"w1", "w3", "w2"};
-
         PrefetchJob job;
-        job.key = key;
-        job.slot = slot;
         std::uint64_t expert_bytes = 0U;
-        for (std::size_t index = 0U; index < operations.size(); ++index) {
-            PrefetchLinear linear;
-            linear.name = prefix + std::string(operations[index]);
-            linear.rows = dimensions[index].first;
-            linear.columns = dimensions[index].second;
-            linear.bytes = linear_bytes(checkpoint_, linear.name);
-            if (linear.bytes == 0U ||
-                expert_bytes > std::numeric_limits<std::uint64_t>::max() -
-                                   linear.bytes) {
-                cancelled_prefetch_bytes_ += expert_bytes;
-                return;
-            }
-            expert_bytes += linear.bytes;
-            job.linears.push_back(std::move(linear));
-        }
-
+        if (!build_prefetch_job(key, slot, job, expert_bytes)) return;
         std::scoped_lock lock(activity_mutex_);
-        if (pending_prefetch_.contains(key)) {
-            duplicate_prefetch_bytes_ += expert_bytes;
-            return;
-        }
-        auto& state = states_[slot];
-        for (auto current = job.linears.begin(); current != job.linears.end();) {
-            const auto found = state.entries.find(current->name);
-            if (found == state.entries.end()) {
-                job.bytes += current->bytes;
-                ++current;
-            } else {
-                duplicate_prefetch_bytes_ += current->bytes;
-                current = job.linears.erase(current);
+        enqueue_prefetch_locked(std::move(job), expert_bytes);
+    }
+
+    // A speculative window's manifest is hundreds of keys wide. Enqueue it in
+    // consumption order under a single lock rather than re-deriving byte counts
+    // and re-taking the mutex once per key.
+    void request_prefetch_batch(std::span<const ExpertKey> keys,
+                                std::span<const std::size_t> slots) {
+        if (keys.size() != slots.size()) return;
+        prefetch_requests_ += keys.size();
+        if (!prefetch_worker_.joinable()) return;
+        std::vector<std::pair<PrefetchJob, std::uint64_t>> jobs;
+        jobs.reserve(keys.size());
+        for (std::size_t index = 0U; index < keys.size(); ++index) {
+            if (slots[index] >= states_.size()) continue;
+            PrefetchJob job;
+            std::uint64_t expert_bytes = 0U;
+            if (!build_prefetch_job(keys[index], slots[index], job, expert_bytes)) {
+                continue;
             }
+            jobs.emplace_back(std::move(job), expert_bytes);
         }
-        if (job.linears.empty()) return;
-        if (job.bytes > prefetch_byte_budget_ ||
-            prefetch_queue_.size() >= prefetch_queue_depth_) {
-            cancelled_prefetch_bytes_ += job.bytes;
-            return;
+        if (jobs.empty()) return;
+        std::scoped_lock lock(activity_mutex_);
+        for (auto& [job, expert_bytes] : jobs) {
+            enqueue_prefetch_locked(std::move(job), expert_bytes);
         }
-        pending_prefetch_.insert(key);
-        prefetch_queue_.push_back(std::move(job));
-        const auto depth = static_cast<std::uint64_t>(prefetch_queue_.size());
-        auto peak = prefetch_queue_peak_.load(std::memory_order_relaxed);
-        while (peak < depth && !prefetch_queue_peak_.compare_exchange_weak(
-                   peak, depth, std::memory_order_relaxed)) {}
-        activity_changed_.notify_all();
     }
 
     void drain_prefetch() {
@@ -762,6 +805,71 @@ public:
     }
 
 private:
+    [[nodiscard]] bool build_prefetch_job(ExpertKey key, std::size_t slot,
+                                          PrefetchJob& job,
+                                          std::uint64_t& expert_bytes) {
+        const auto prefix = layer_prefix(key.layer) + "ffn.experts." +
+                            std::to_string(key.expert) + ".";
+        const std::array dimensions{
+            std::pair{std::uint64_t{kExpertIntermediate}, std::uint64_t{kHidden}},
+            std::pair{std::uint64_t{kExpertIntermediate}, std::uint64_t{kHidden}},
+            std::pair{std::uint64_t{kHidden}, std::uint64_t{kExpertIntermediate}},
+        };
+        constexpr std::array<std::string_view, 3U> operations{"w1", "w3", "w2"};
+
+        job.key = key;
+        job.slot = slot;
+        expert_bytes = 0U;
+        for (std::size_t index = 0U; index < operations.size(); ++index) {
+            PrefetchLinear linear;
+            linear.name = prefix + std::string(operations[index]);
+            linear.rows = dimensions[index].first;
+            linear.columns = dimensions[index].second;
+            linear.bytes = linear_bytes(checkpoint_, linear.name);
+            if (linear.bytes == 0U ||
+                expert_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                   linear.bytes) {
+                cancelled_prefetch_bytes_ += expert_bytes;
+                return false;
+            }
+            expert_bytes += linear.bytes;
+            job.linears.push_back(std::move(linear));
+        }
+        return true;
+    }
+
+    void enqueue_prefetch_locked(PrefetchJob job, std::uint64_t expert_bytes) {
+        if (pending_prefetch_.contains(job.key)) {
+            duplicate_prefetch_bytes_ += expert_bytes;
+            return;
+        }
+        auto& state = states_[job.slot];
+        for (auto current = job.linears.begin(); current != job.linears.end();) {
+            const auto found = state.entries.find(current->name);
+            if (found == state.entries.end()) {
+                job.bytes += current->bytes;
+                ++current;
+            } else {
+                duplicate_prefetch_bytes_ += current->bytes;
+                current = job.linears.erase(current);
+            }
+        }
+        if (job.linears.empty()) return;
+        if (job.bytes > prefetch_byte_budget_ ||
+            prefetch_queue_.size() >= prefetch_queue_depth_) {
+            cancelled_prefetch_bytes_ += job.bytes;
+            return;
+        }
+        const auto key = job.key;
+        pending_prefetch_.insert(key);
+        prefetch_queue_.push_back(std::move(job));
+        const auto depth = static_cast<std::uint64_t>(prefetch_queue_.size());
+        auto peak = prefetch_queue_peak_.load(std::memory_order_relaxed);
+        while (peak < depth && !prefetch_queue_peak_.compare_exchange_weak(
+                   peak, depth, std::memory_order_relaxed)) {}
+        activity_changed_.notify_all();
+    }
+
     ValidationResult ensure(std::size_t slot, std::string_view base,
                             std::uint64_t rows, std::uint64_t columns,
                             LoadKind kind, Entry*& output) {
@@ -790,6 +898,15 @@ private:
                 duplicate_prefetch_bytes_ += found->second.weight.device_bytes();
             }
             output = &found->second;
+            return result;
+        }
+        if (kind == LoadKind::Demand &&
+            drafting_.load(std::memory_order_relaxed)) {
+            // A shadow draft that reaches here would have stalled on a cold
+            // transfer, which defeats the entire design. Fail loudly.
+            ++draft_demand_loads_;
+            result.errors.emplace_back(
+                "DeepSeek speculative draft demanded a non-resident weight: " + key);
             return result;
         }
         const auto bytes = linear_bytes(checkpoint_, base);
@@ -1068,6 +1185,10 @@ private:
     bool prefetch_active_{};
     bool active_prefetch_late_{};
     bool stop_prefetch_{};
+    std::atomic<bool> drafting_{};
+    mutable std::atomic<std::uint64_t> draft_resident_queries_{};
+    mutable std::atomic<std::uint64_t> draft_resident_hits_{};
+    std::atomic<std::uint64_t> draft_demand_loads_{};
     std::atomic<std::uint64_t> hits_{};
     std::atomic<std::uint64_t> misses_{};
     std::atomic<std::uint64_t> evictions_{};
@@ -1177,6 +1298,26 @@ struct AttentionAccumulatorSnapshot {
 
 constexpr std::uint64_t kMaximumAttentionSnapshotBytes = 256ULL << 20U;
 
+/*
+ * Which expert set a MoE call is allowed to execute. Exact is the only mode the
+ * verify pass and prefill ever use; Draft is confined to the speculative
+ * proposal, whose output never reaches the user. The mode is passed explicitly
+ * rather than latched on the runtime so no call site can inherit it by
+ * accident.
+ */
+enum class Dsv4MoeMode : std::uint8_t {
+    Exact,
+    Draft,
+};
+
+// How the draft approximates a cold expert.
+enum class Dsv4DraftMode : std::uint8_t {
+    // Keep every VRAM-resident expert the true router chose and substitute the
+    // rest with the best-scoring resident experts, scored and normalized by the
+    // identical router functions.
+    ResidentTopK,
+};
+
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
@@ -1208,7 +1349,17 @@ struct DeepSeekV4Runtime::Impl {
     RoutePredictor route_predictor;
     std::vector<RoutePrediction> pending_prefetch_predictions;
     std::vector<RouteEvent> deferred_route_events;
+    // Cold-expert manifest emitted by the draft's real routers, in consumption
+    // order, deduplicated across the window.
+    std::vector<ExpertKey> manifest;
+    std::unordered_set<ExpertKey, ExpertKeyHash> manifest_seen;
+    std::uint64_t shadow_moe_calls{};
+    std::uint64_t shadow_substituted_experts{};
     bool defer_prefill_observability{};
+    // Set only while a speculative draft is running. Drafted rows never reach
+    // the exact observability streams: a rejected row must leave no trace, and
+    // an accepted row is re-recorded by the verify pass that keeps it.
+    bool suppress_observability{};
     std::mt19937_64 sampler;
     bool initialized{};
     bool reusable_sequence{};
@@ -1383,9 +1534,22 @@ struct DeepSeekV4Runtime::Impl {
                                 const Dsv4Route& route,
                                 std::span<const float> input,
                                 std::span<float> output);
+    ValidationResult device_moe_draft(std::uint32_t layer,
+                                      const Dsv4Route& route,
+                                      std::span<const float> input,
+                                      std::span<float> output);
     ValidationResult moe(std::uint32_t layer, std::uint32_t token,
                          std::span<const float> input, std::span<float> output,
-                         std::uint32_t position);
+                         std::uint32_t position,
+                         Dsv4MoeMode mode = Dsv4MoeMode::Exact);
+    ValidationResult compute_route(std::uint32_t layer, std::uint32_t token,
+                                   std::span<const float> logits,
+                                   Dsv4Route& route);
+    ValidationResult record_route(std::uint32_t layer, std::uint32_t token,
+                                  std::uint32_t position, const Dsv4Route& route);
+    ValidationResult shadow_route(std::uint32_t layer,
+                                  std::span<const float> logits,
+                                  const Dsv4Route& exact, Dsv4Route& output);
     ValidationResult route_moe(std::uint32_t layer, std::uint32_t token,
                                std::span<const float> logits,
                                std::uint32_t position, Dsv4Route& route);
@@ -1398,11 +1562,14 @@ struct DeepSeekV4Runtime::Impl {
                               std::span<float> output,
                               std::uint32_t position_base);
     ValidationResult block(std::uint32_t layer, std::uint32_t token,
-                           std::span<float> hidden, std::uint32_t position);
+                           std::span<float> hidden, std::uint32_t position,
+                           Dsv4MoeMode mode = Dsv4MoeMode::Exact);
     ValidationResult block_page(std::uint32_t layer,
                                 std::span<const std::uint32_t> tokens,
                                 std::span<float> hidden,
                                 std::uint32_t position_base);
+    ValidationResult forward_draft(std::uint32_t token, std::uint32_t position,
+                                   std::span<float> logits);
     ValidationResult head_logits(std::span<const float> hidden,
                                  std::span<float> logits);
     ValidationResult forward_page(std::span<const std::uint32_t> tokens,
@@ -1452,6 +1619,7 @@ void DeepSeekV4Runtime::Impl::reset_diagnostics() {
 void DeepSeekV4Runtime::Impl::record_layer_hash(
     std::uint32_t position, std::uint32_t token, std::uint32_t layer,
     std::span<const float> hidden) {
+    if (suppress_observability) return;
     const auto hash = dsv4_stable_bf16_hash(hidden);
     diagnostics.layer_hashes.push_back({position, token, layer, hash});
     auto aggregate = diagnostics.layer_hash_trace_hash;
@@ -1465,6 +1633,7 @@ void DeepSeekV4Runtime::Impl::record_operation_hash(
     std::uint32_t position, std::uint32_t token,
     std::uint32_t layer, std::string_view operation,
     std::span<const float> values) {
+    if (suppress_observability) return;
     const auto hash = dsv4_stable_bf16_hash(values);
     diagnostics.operation_hashes.push_back(
         {position, token, layer, std::string(operation), hash});
@@ -1473,6 +1642,7 @@ void DeepSeekV4Runtime::Impl::record_operation_hash(
 void DeepSeekV4Runtime::Impl::record_logits(
     std::uint32_t position, std::uint32_t token, std::uint32_t selected,
     std::span<const float> logits) {
+    if (suppress_observability) return;
     auto analysis = analyze_dsv4_logits(logits, config.logit_trace_top_k);
     const auto& summary = analysis.summary;
     auto& aggregate = diagnostics.logit_aggregate;
@@ -2803,9 +2973,12 @@ ValidationResult DeepSeekV4Runtime::Impl::device_moe(
     return result;
 }
 
-ValidationResult DeepSeekV4Runtime::Impl::route_moe(
+// The exact router, with no observability side effects. The draft calls this
+// too: its manifest of cold experts is exact precisely because the draft runs
+// the real router.
+ValidationResult DeepSeekV4Runtime::Impl::compute_route(
     std::uint32_t layer, std::uint32_t token, std::span<const float> logits,
-    std::uint32_t position, Dsv4Route& output) {
+    Dsv4Route& output) {
     ValidationResult result;
     const auto prefix = layer_prefix(layer) + "ffn.";
     const auto& router = deepseek_v4_flash_dspark_spec().router;
@@ -2848,8 +3021,49 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
         append_errors(result, std::move(route.errors));
         return result;
     }
+    output = std::move(route.value);
+    return result;
+}
+
+// Advisory shadow selection for the draft only. Substitutes cold experts; keeps
+// every resident one, so a fully resident row reproduces the exact route.
+ValidationResult DeepSeekV4Runtime::Impl::shadow_route(
+    std::uint32_t layer, std::span<const float> logits, const Dsv4Route& exact,
+    Dsv4Route& output) {
+    ValidationResult result;
+    const auto& router = deepseek_v4_flash_dspark_spec().router;
+    std::vector<std::uint8_t> admissible(kExperts, 0U);
+    for (std::uint32_t expert_id = 0U; expert_id < kExperts; ++expert_id) {
+        admissible[expert_id] = weights->expert_resident(
+            ExpertKey{layer, expert_id}, expert_device(expert_id)) ? 1U : 0U;
+    }
+    std::span<const float> bias;
+    // Hash-routed layers carry no selection bias, so their substitutes are
+    // scored on sqrt(softplus(logit)) alone.
+    if (layer >= 3U) {
+        auto gate_bias = host_tensor(layer_prefix(layer) + "ffn.gate.bias", kExperts);
+        if (!gate_bias.ok()) {
+            append_errors(result, std::move(gate_bias.errors));
+            return result;
+        }
+        bias = *gate_bias.value;
+    }
+    auto route = dsv4_route_substituted_sqrtsoftplus_f32(
+        logits, bias, exact.experts, admissible, router);
+    if (!route.ok()) {
+        append_errors(result, std::move(route.errors));
+        return result;
+    }
+    output = std::move(route.value);
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::record_route(
+    std::uint32_t layer, std::uint32_t token, std::uint32_t position,
+    const Dsv4Route& route) {
+    ValidationResult result;
     if (config.enable_layer_hash_trace) {
-        record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
+        record_operation_hash(position, token, layer, "ffn_router_weights", route.weights);
     }
     const bool prefetch_enabled = config.expert_prefetch_predictions != 0U;
     if (route_trace.is_open() || prefetch_enabled) {
@@ -2857,8 +3071,8 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
         event.request = active_request_id;
         event.token_position = position;
         event.layer = layer;
-        event.experts = route.value.experts;
-        event.coefficients = route.value.weights;
+        event.experts = route.experts;
+        event.coefficients = route.weights;
         event.phase = position < active_prompt_tokens
                           ? RoutePhase::Prefill : RoutePhase::Decode;
         if (defer_prefill_observability && event.phase == RoutePhase::Prefill) {
@@ -2878,8 +3092,15 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
             }
         }
     }
-    output = std::move(route.value);
     return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::route_moe(
+    std::uint32_t layer, std::uint32_t token, std::span<const float> logits,
+    std::uint32_t position, Dsv4Route& output) {
+    auto result = compute_route(layer, token, logits, output);
+    if (!result.ok()) return result;
+    return record_route(layer, token, position, output);
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::execute_moe(
@@ -2942,20 +3163,60 @@ ValidationResult DeepSeekV4Runtime::Impl::execute_moe(
     return result;
 }
 
+// The shadow's only executor. forward_window never reaches this function, and
+// the counter it moves is asserted unchanged across every verify window, so a
+// verify pass silently substituting a shadow is detectable rather than merely
+// unwritten.
+ValidationResult DeepSeekV4Runtime::Impl::device_moe_draft(
+    std::uint32_t layer, const Dsv4Route& route,
+    std::span<const float> input, std::span<float> output) {
+    ++shadow_moe_calls;
+    return device_moe(layer, route, input, output);
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::moe(
     std::uint32_t layer, std::uint32_t token, std::span<const float> input,
-    std::span<float> output, std::uint32_t position) {
+    std::span<float> output, std::uint32_t position, Dsv4MoeMode mode) {
     ValidationResult result;
     const auto router_started = std::chrono::steady_clock::now();
     std::vector<float> logits(kExperts);
     result = linear(layer_device(layer), layer_prefix(layer) + "ffn.gate",
                     kExperts, kHidden, input, logits, false);
     if (!result.ok()) return result;
-    Dsv4Route route;
-    result = route_moe(layer, token, logits, position, route);
+    if (mode == Dsv4MoeMode::Exact) {
+        Dsv4Route route;
+        result = route_moe(layer, token, logits, position, route);
+        graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
+        if (!result.ok()) return result;
+        return execute_moe(layer, route, input, output);
+    }
+
+    // The draft runs the real router, so the experts it records are exactly the
+    // ones verify will need: a lossless prefetch manifest, independent of how
+    // good the shadow is.
+    Dsv4Route exact;
+    result = compute_route(layer, token, logits, exact);
+    if (!result.ok()) return result;
+    for (const auto expert_id : exact.experts) {
+        const ExpertKey key{layer, expert_id};
+        if (manifest_seen.insert(key).second) manifest.push_back(key);
+    }
+    Dsv4Route shadow;
+    result = shadow_route(layer, logits, exact, shadow);
     graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
     if (!result.ok()) return result;
-    return execute_moe(layer, route, input, output);
+    for (const auto expert_id : exact.experts) {
+        if (std::find(shadow.experts.begin(), shadow.experts.end(), expert_id) ==
+            shadow.experts.end()) {
+            ++shadow_substituted_experts;
+        }
+    }
+    if (!config.enable_device_moe) {
+        result.errors.emplace_back(
+            "DeepSeek speculative drafting requires the device MoE path");
+        return result;
+    }
+    return device_moe_draft(layer, shadow, input, output);
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::moe_page(
@@ -2996,7 +3257,7 @@ ValidationResult DeepSeekV4Runtime::Impl::moe_page(
 
 ValidationResult DeepSeekV4Runtime::Impl::block(
     std::uint32_t layer, std::uint32_t token, std::span<float> hidden,
-    std::uint32_t position) {
+    std::uint32_t position, Dsv4MoeMode mode) {
     ValidationResult result;
     if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
         result.errors.emplace_back("DeepSeek mHC hidden state has the wrong shape");
@@ -3038,7 +3299,7 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
             result = attention(layer, reduced, position, branch_output);
             graph_stats.attention_nanoseconds += elapsed_nanoseconds(phase_started);
         } else {
-            result = moe(layer, token, reduced, branch_output, position);
+            result = moe(layer, token, reduced, branch_output, position, mode);
             graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
         }
         if (!result.ok()) return result;
@@ -3193,6 +3454,39 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     }
 
     return sample_hidden(token, position, hidden);
+}
+
+/*
+ * One shadow draft token. Runs the real routers, so it emits the exact set of
+ * experts the verify window will need, but computes with resident substitutes
+ * so it never waits on a transfer. Its output is a proposal only: it reaches
+ * the user only through a verify row that recomputes the true experts.
+ *
+ * Nothing here touches the exact observability streams, and the draft guard
+ * turns any cache miss into a hard error rather than a stall.
+ */
+ValidationResult DeepSeekV4Runtime::Impl::forward_draft(
+    std::uint32_t token, std::uint32_t position, std::span<float> logits) {
+    ValidationResult result;
+    auto draft_guard = weights->draft();
+    suppress_observability = true;
+    const auto restore = [this] { suppress_observability = false; };
+    std::vector<float> hidden(static_cast<std::size_t>(kMhc) * kHidden);
+    result = embed(token, hidden);
+    if (!result.ok()) {
+        restore();
+        return result;
+    }
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        result = block(layer, token, hidden, position, Dsv4MoeMode::Draft);
+        if (!result.ok()) {
+            restore();
+            return result;
+        }
+    }
+    result = head_logits(hidden, logits);
+    restore();
+    return result;
 }
 
 // The exact output head, factored out of sample_hidden so a speculative verify

@@ -93,6 +93,26 @@ struct Dsv4IndexSelectionResult {
     std::span<const float> logits, std::span<const std::uint32_t> token_experts,
     const RouterSpec& spec);
 
+/*
+ * Advisory shadow routing for a speculative draft. Never call this on the exact
+ * path: it deliberately computes a different expert set.
+ *
+ * `exact_experts` is the set the real router chose. Every one of them that is
+ * admissible is kept in rank order; each remaining rank is filled with the
+ * highest-scoring admissible expert not already selected, using the same
+ * sqrt(softplus(logit)) score and the same optional selection bias. Weights are
+ * gathered and normalized by the identical path, so when every exact expert is
+ * admissible the result is bit-identical to the exact route.
+ *
+ * `selection_bias` may be empty, which is how hash-routed layers score their
+ * substitutes. Fails if fewer than experts_per_token experts are admissible;
+ * the draft must never stall waiting for one.
+ */
+[[nodiscard]] Dsv4RouteResult dsv4_route_substituted_sqrtsoftplus_f32(
+    std::span<const float> logits, std::span<const float> selection_bias,
+    std::span<const std::uint32_t> exact_experts,
+    std::span<const std::uint8_t> admissible, const RouterSpec& spec);
+
 [[nodiscard]] ValidationResult dsv4_swiglu_f32(
     std::span<float> output, std::span<const float> gate,
     std::span<const float> up, float limit);

@@ -20,10 +20,15 @@ model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-pinned-arena-ab"}
 runner=${RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 maximum_new_tokens=${MAX_NEW_TOKENS:-128}
+# Prefill, not model load, is what makes a DeepSeek arm expensive: a 3,565-token
+# prompt prefills for 38.5 minutes against 51 seconds of initialization and 73
+# seconds of decode. Decode throughput is what is under test, so the prompt is
+# sized to the shortest that still exercises the sliding window and leaves the
+# expert cache cold enough for demand loads to dominate.
 maximum_context_tokens=${MAX_CONTEXT_TOKENS:-4096}
 kv_device_cache=${KV_DEVICE_CACHE:-256M,256M,256M}
 repetitions=${REPETITIONS:-3}
-prompt_sentences=${PROMPT_SENTENCES:-240}
+prompt_sentences=${PROMPT_SENTENCES:-34}
 
 if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
     echo "error: A/B evidence requires a clean frozen revision" >&2

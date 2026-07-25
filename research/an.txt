@@ -1,0 +1,17 @@
+The "aha" (and how it got there)
+I ran an idea tournament: 6 independent generators attacking from different angles (speculation, data layout, routing, prefill/decode unification, KV co-tenancy, hardware DMA), each idea adversarially vetted for physical soundness, losslessness, and novelty, then synthesized. The vetting mattered — it killed my own opening idea (the residency-biased draft I walked in with) and surfaced a better one.
+
+The surviving trick — Shadow-Speculative MoE Offload:
+
+In an MoE, which experts you need (the router — tiny, resident) and the expensive weights (the expert FFNs — cold, offloaded) are two different computations, and only one is expensive. They're welded together by a data dependency: you learn which cold expert you need only when the router fires, then you stall on the fetch.
+
+Break the weld: run the model as its own draft — routers bit-exact, but cold experts computed by tiny resident "shadows" (rank-8–16 surrogates). The draft never stalls, yet its real routers emit the exact cold-expert working set γ tokens early. That's a lossless prefetch oracle with no biased proposal distribution — then verify the whole speculative window as one expert-major "mini-prefill," fetching each cold expert once.
+
+Why I didn't just write the pitch
+The vetters were brutal, and I kept their honesty in the doc rather than shipping a hype piece:
+
+It beats the obvious idea (residency-biased drafting) because biasing the draft lowers acceptance and makes you fetch experts for rejected branches — self-defeating. The shadow oracle never touches the proposal distribution, so zero acceptance tax.
+Losslessness is conditional on two invariants I wrote as hard coded assertions: exact rejection sampling (no Medusa typical-acceptance), and never substitute a shadow in verify. Get the second wrong and output is silently biased.
+Honest speedup: the γ× amortization everyone brags about is baseline speculative decoding, not this trick — crediting it is double-counting. The real marginal win is ~1.2–1.8× on top of a strong baseline, clamped by the ~50 tok/s hot-path wall and dead on the SSD tier without lossy compression.
+The killer failure mode: acceptance rate is worst exactly in the high-offload regime the trick is for (draft runs on the shadow manifold → error compounds), so throughput can regress below plain decode — hence a mandatory regression guard.
+Both docs now sit together: the theory doc says what's optimal, this one says what to build and where it breaks.

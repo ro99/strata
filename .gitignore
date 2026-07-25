@@ -13,3 +13,6 @@
 plan.md
 last-answer.md
 docs/issues/
+
+# Agent working directory
+.claude/

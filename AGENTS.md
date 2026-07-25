@@ -97,6 +97,27 @@ fixed setup to measured window, and the cheaper experiment you rejected.
    and in total. If the total exceeds roughly half an hour, say what was
    shortened and why the rest must stay.
 
+## Treat an implausible measurement as a defect, not a datapoint
+
+A number that contradicts the shape the mechanism should have is a bug report.
+Check every headline measurement against what the design predicts, not only
+against the previous run.
+
+- **Prefill must be far cheaper per token than batch-1 decode**, because a page
+  amortizes every weight read across its rows. Measured, prefill ran at 647
+  ms/token against decode's 576 ms/token — a ratio of 1.12 where the design
+  predicts a large fraction. That was reported unexamined across two
+  experiments before anyone asked why. It was a defect: prefill dispatched the
+  MoE once per (token, layer), 153,295 batch-1 calls, and reloaded the 147 GB
+  routed-expert set 23 times over for 3,367 GB of transfer.
+- **If cost per token does not fall as batch size rises, the batching is not
+  happening.** Say what the ratio should be before running, then check it.
+- **A phase that costs more than the work it contains is thrashing.** Compare
+  bytes actually moved against the working set: an order-of-magnitude excess is
+  a capacity or ordering bug, not a bandwidth cost.
+- Reporting a number you cannot explain is not neutral. Either explain it, or
+  record it as an open defect with its own branch.
+
 ## Do not launder a falsification
 
 - A kill criterion derived before the work is binding **at the operating point

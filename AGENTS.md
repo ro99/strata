@@ -68,6 +68,31 @@ Do the cheapest measurement that can falsify the idea, first. One profiling run
 beats any amount of design. If a mechanism cannot be justified from measured
 `W_r` on the target hardware, it is not ready to plan.
 
+## Make the measurement cheap before making it long
+
+A long run is a cost, not a virtue. Before launching one, state the ratio of
+fixed setup to measured window, and the cheaper experiment you rejected.
+
+1. **Measure the mechanism before the system.** A microbenchmark that
+   reproduces the mechanism in isolation usually decides the question in
+   minutes. Pinning the DeepSeek arena was settled by a 5-minute standalone
+   H2D benchmark; the 4.4-hour end-to-end A/B only confirmed it.
+2. **Reproduce the production access pattern, or the probe lies.** The
+   topology probe reported pinned and pageable H2D as identical, 12.1 GB/s
+   both, because it timed a warm reused buffer. The runtime reads a cold,
+   randomly placed slice of a 147 GB mapping, where the same comparison is
+   1.32 ms against 0.37 ms. A probe that does not reproduce the real access
+   pattern can report no problem where a 3.5x problem exists.
+3. **Amortize fixed setup across every arm and repetition.** A DeepSeek arm is
+   about 44 minutes, of which the measured decode window is 1.2 minutes: 97%
+   is model load. A harness that reloads per arm turns 7 minutes of
+   measurement into 4.4 hours. Load once and drive every arm and repetition
+   inside that process; interleaving inside one process is still interleaving.
+   Reloading per arm is justified only when the thing under test changes load
+   or admission itself.
+4. **Size the measured window to the question, not to habit.** More generated
+   tokens do not help once the per-step medians have separated.
+
 ## Do not launder a falsification
 
 - A kill criterion derived before the work is binding **at the operating point

@@ -1373,6 +1373,35 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
     return result;
 }
 
+ValidationResult CudaBackend::register_host_memory(const void* base,
+                                                   std::uint64_t bytes) {
+    ValidationResult result;
+    if (base == nullptr || bytes == 0U) {
+        result.errors.emplace_back("host registration requires a non-empty region");
+        return result;
+    }
+    // The arena is read-only after staging, so register it read-only where the
+    // driver supports it and fall back to a plain portable registration.
+    auto status = cudaHostRegister(const_cast<void*>(base),
+                                   static_cast<std::size_t>(bytes),
+                                   cudaHostRegisterPortable |
+                                       cudaHostRegisterReadOnly);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        status = cudaHostRegister(const_cast<void*>(base),
+                                  static_cast<std::size_t>(bytes),
+                                  cudaHostRegisterPortable);
+    }
+    if (status != cudaSuccess) return cuda_error(status, "register host memory");
+    return result;
+}
+
+void CudaBackend::unregister_host_memory(const void* base) noexcept {
+    if (base == nullptr) return;
+    static_cast<void>(cudaHostUnregister(const_cast<void*>(base)));
+    cudaGetLastError();
+}
+
 ValidationResult CudaBackend::reserve_weight_arena(int device,
                                                    std::uint64_t bytes) {
     ValidationResult result;

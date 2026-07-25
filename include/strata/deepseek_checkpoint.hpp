@@ -102,6 +102,11 @@ public:
         std::uint32_t read_workers = 1U,
         bool include_dspark = false);
     [[nodiscard]] std::span<const std::byte> find(std::string_view name) const noexcept;
+    // Page-locks the staged arena so demand uploads DMA out of it directly.
+    // Purely a transfer-rate optimization: it changes no bytes and no shape, so
+    // a failure is reported and left unpinned rather than aborting the run.
+    [[nodiscard]] ValidationResult pin(CudaBackend& backend);
+    [[nodiscard]] bool pinned() const noexcept { return pinned_; }
     [[nodiscard]] Dsv4ResidentStageStats stats() const noexcept { return stats_; }
 
 private:
@@ -113,6 +118,8 @@ private:
     std::uint64_t arena_bytes_{};
     std::unordered_map<std::string_view, Extent> extents_;
     Dsv4ResidentStageStats stats_;
+    CudaBackend* pinned_backend_{};
+    bool pinned_{};
     bool complete_{};
 };
 

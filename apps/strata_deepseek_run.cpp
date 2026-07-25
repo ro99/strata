@@ -33,6 +33,7 @@ struct Options {
     std::uint32_t expert_prefetch_lease_ticks{16U};
     std::uint64_t host_memory_bytes{216ULL << 30U};
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
+    bool pin_resident_arena{};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
@@ -62,6 +63,7 @@ void usage() {
         << "       [--expert-prefetch N] [--expert-prefetch-bytes 1G]\n"
         << "       [--expert-prefetch-queue N] [--expert-prefetch-lease N]\n"
         << "       [--expert-prefetch-confidence P]\n"
+        << "       [--pin-resident-arena]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
@@ -184,6 +186,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (value == nullptr || !strata::cli::parse_double(
                     value, options.expert_prefetch_minimum_confidence,
                     0.0, 1.0)) return false;
+        } else if (argument == "--pin-resident-arena") {
+            options.pin_resident_arena = true;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
@@ -826,6 +830,7 @@ int main(int argc, char** argv) {
     config.host_attention_threads = options.host_attention_threads;
     config.resident_read_workers = options.resident_read_workers;
     config.spine_warmup_workers = options.spine_warmup_workers;
+    config.pin_resident_arena = options.pin_resident_arena;
     config.expert_prefetch_predictions = options.expert_prefetch_predictions;
     config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
     config.expert_prefetch_byte_budget = options.expert_prefetch_byte_budget;
@@ -884,6 +889,9 @@ int main(int argc, char** argv) {
                   << metrics.resident_read_workers
                   << ",\"spine_warmup_workers\":"
                   << metrics.spine_warmup_workers
+                  << ",\"resident_arena_pinned\":"
+                  << (metrics.resident_arena_pinned ? "true" : "false")
+                  << ",\"resident_pin_seconds\":" << metrics.resident_pin_seconds
                   << ",\"expert_prefetch_predictions\":"
                   << metrics.expert_prefetch_predictions
                   << ",\"expert_prefetch_queue_depth\":"

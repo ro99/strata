@@ -238,6 +238,15 @@ public:
     // no per-weight cudaMalloc fallback once the arena is enabled.
     [[nodiscard]] ValidationResult reserve_weight_arena(int device,
                                                         std::uint64_t bytes);
+    // Page-locks a host region so H2D transfers DMA straight out of it instead
+    // of going through the driver's staging copy. Measured on the resident
+    // weight arena, a cold 4.46 MB slice costs 1.32 ms pageable and 0.37 ms
+    // pinned: the staging copy dominates because every expert is a different
+    // cold slice of a 147 GB mapping, not a reused warm buffer.
+    // Registration itself runs at about 2.7 GB/s, so it is a load-time cost.
+    [[nodiscard]] ValidationResult register_host_memory(const void* base,
+                                                       std::uint64_t bytes);
+    void unregister_host_memory(const void* base) noexcept;
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,

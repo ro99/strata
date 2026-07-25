@@ -53,6 +53,12 @@ ValidationResult CudaBackend::reserve_weight_arena(int, std::uint64_t) {
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::register_host_memory(const void*, std::uint64_t) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+void CudaBackend::unregister_host_memory(const void*) noexcept {}
+
 ValidationResult CudaBackend::upload(int, const CudaWeightDescriptor&,
                                      std::span<const std::byte>,
                                      std::span<const std::byte>, CudaWeight&) {

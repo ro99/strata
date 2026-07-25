@@ -214,7 +214,24 @@ Dsv4CheckpointReadStats Dsv4CheckpointReader::stats() const noexcept {
             read_nanoseconds_.load(std::memory_order_relaxed)};
 }
 
+ValidationResult Dsv4ResidentWeightStore::pin(CudaBackend& backend) {
+    ValidationResult result;
+    if (arena_ == nullptr || arena_bytes_ == 0U) {
+        result.errors.emplace_back("resident arena is not staged");
+        return result;
+    }
+    if (pinned_) return result;
+    result = backend.register_host_memory(arena_, arena_bytes_);
+    if (!result.ok()) return result;
+    pinned_backend_ = &backend;
+    pinned_ = true;
+    return result;
+}
+
 Dsv4ResidentWeightStore::~Dsv4ResidentWeightStore() {
+    if (pinned_ && pinned_backend_ != nullptr && arena_ != nullptr) {
+        pinned_backend_->unregister_host_memory(arena_);
+    }
     if (arena_ != nullptr) {
         static_cast<void>(munmap(arena_, static_cast<std::size_t>(arena_bytes_)));
     }

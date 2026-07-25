@@ -3522,6 +3522,21 @@ ValidationResult DeepSeekV4Runtime::initialize(
         append_errors(result, std::move(warmup_result.errors));
     }
     if (!result.ok()) return result;
+    // Page-lock after staging and warm-up have both finished, so registration
+    // never races an upload reading out of the same mapping. This is a pure
+    // transfer-rate optimization: if the kernel refuses to lock the pages the
+    // run continues unpinned and says so, because no output byte depends on it.
+    double pin_seconds = 0.0;
+    if (config.pin_resident_arena) {
+        const auto pin_started = std::chrono::steady_clock::now();
+        auto pinned = impl_->resident.pin(impl_->cuda);
+        pin_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - pin_started).count();
+        if (!pinned.ok() && config.verbose) {
+            std::cerr << "[deepseek-load] resident arena not pinned: "
+                      << pinned.errors.front() << '\n';
+        }
+    }
     if (config.enable_device_moe) {
         // Each exact expert is three projections. Account conservatively for
         // the arena's per-projection pointer and block alignment padding.
@@ -3580,6 +3595,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.flash_attention_minimum_rows;
     impl_->initialization_metrics.resident_read_workers =
         impl_->resident.stats().workers;
+    impl_->initialization_metrics.resident_pin_seconds = pin_seconds;
+    impl_->initialization_metrics.resident_arena_pinned = impl_->resident.pinned();
     impl_->initialization_metrics.spine_warmup_workers =
         static_cast<std::uint32_t>(std::min<std::size_t>(
             config.spine_warmup_workers, impl_->devices.size()));

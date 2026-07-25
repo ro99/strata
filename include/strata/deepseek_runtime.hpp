@@ -38,6 +38,12 @@ struct Dsv4RuntimeConfig {
     // retains parallel host attention below the measured row crossover; zero
     // forces every supported shape through CUDA for diagnostics.
     std::uint32_t flash_attention_minimum_rows{256U};
+    // Page-lock the resident weight arena after staging. Every routed expert
+    // is a cold slice of a 147 GB mapping, so the driver's pageable staging
+    // copy dominates the transfer: measured 1.32 ms pageable against 0.37 ms
+    // pinned for one 4.46 MB projection. Costs about 2.7 GB/s of one-time
+    // registration at load and locks the arena's pages for the process.
+    bool pin_resident_arena{};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};
     // Zero predictions disables advisory expert prefetch. The remaining
@@ -172,6 +178,8 @@ struct Dsv4GenerationMetrics {
     std::uint32_t flash_attention_minimum_rows{};
     std::uint32_t resident_read_workers{};
     std::uint32_t spine_warmup_workers{};
+    double resident_pin_seconds{};
+    bool resident_arena_pinned{};
     std::uint32_t expert_prefetch_predictions{};
     std::uint32_t expert_prefetch_queue_depth{};
     std::uint64_t expert_prefetch_byte_budget{};

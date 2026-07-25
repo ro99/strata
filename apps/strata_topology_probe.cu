@@ -25,11 +25,13 @@
 #include <numeric>
 #include <memory>
 #include <optional>
+#include <random>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <thread>
@@ -52,6 +54,14 @@ struct Options {
     std::size_t io_bytes{256U * 1024U * 1024U};
     std::size_t io_block_bytes{4U * 1024U * 1024U};
     std::uint32_t prefill_rows{30};
+    // The transfer stage above times one warm reused buffer against one device
+    // at a time. The runtime instead reads cold, randomly placed slices of a
+    // 138 GiB registered mapping, on three devices that are used one after the
+    // other. Both differences hid real effects (experiments 0024 and 0026), so
+    // the cold-slice stage reproduces the production access pattern.
+    std::size_t cold_arena_bytes{16ULL * 1024U * 1024U * 1024U};
+    std::size_t cold_slice_bytes{4456448U};  // one FP4 routed-expert matrix
+    std::uint32_t cold_copies{512U};
 };
 
 struct TimedSample {
@@ -147,7 +157,10 @@ void print_help() {
         << "  --io-bytes 256M         bytes per checkpoint read repetition\n"
         << "  --io-block-bytes 4M     aligned checkpoint range size\n"
         << "  --queue-depths 1,4,8    concurrent synchronous read workers\n"
-        << "  --prefill-rows 30       representative prefill row count\n";
+        << "  --prefill-rows 30       representative prefill row count\n"
+        << "  --cold-arena-bytes 16G  registered mapping sampled for cold slices\n"
+        << "  --cold-slice-bytes 4456448  one routed-expert matrix payload\n"
+        << "  --cold-copies 512       cold slices transferred per device\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -170,10 +183,18 @@ Options parse_options(int argc, char** argv) {
         else if (argument == "--io-bytes") options.io_bytes = parse_size(value);
         else if (argument == "--io-block-bytes") options.io_block_bytes = parse_size(value);
         else if (argument == "--prefill-rows") options.prefill_rows = std::stoul(value);
+        else if (argument == "--cold-arena-bytes") options.cold_arena_bytes = parse_size(value);
+        else if (argument == "--cold-slice-bytes") options.cold_slice_bytes = parse_size(value);
+        else if (argument == "--cold-copies") options.cold_copies = std::stoul(value);
         else fail("unknown argument: " + argument);
     }
     if (options.checkpoint_file.empty()) fail("--checkpoint-file is required");
     if (options.repetitions < 3U) fail("T1 requires at least three repetitions");
+    if (options.cold_slice_bytes == 0U || options.cold_copies == 0U ||
+        options.cold_arena_bytes < options.cold_slice_bytes * options.cold_copies) {
+        fail("the cold arena must hold one distinct slice per copy, so that no "
+             "slice is reused and the transfer stays cold");
+    }
     if (options.transfer_bytes == 0U || options.activation_bytes == 0U ||
         options.io_bytes == 0U || options.io_block_bytes == 0U ||
         options.prefill_rows == 0U) {
@@ -380,6 +401,171 @@ std::vector<TimedSample> transfer_samples(int device, int numa_node,
     static_cast<void>(cudaEventDestroy(end));
     static_cast<void>(cudaFree(device_buffer));
     return samples;
+}
+
+// A large registered anonymous mapping, sampled at randomly permuted slice
+// offsets so no slice is transferred twice. This is what the resident weight
+// arena looks like to a demand load: 138 GiB of MAP_PRIVATE|MAP_ANONYMOUS
+// page-locked once at load, read at a cold offset chosen by the router.
+class ColdArena {
+public:
+    ColdArena(std::size_t bytes, std::size_t slice_bytes)
+        : bytes_(bytes), slice_bytes_(slice_bytes) {
+        data_ = static_cast<std::byte*>(mmap(nullptr, bytes_, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (data_ == MAP_FAILED) fail("mmap cold arena failed");
+        // Populate first, so registration is not charged for page faults.
+        std::memset(data_, 0x5A, bytes_);
+        const auto started = Clock::now();
+        cuda_check(cudaHostRegister(data_, bytes_, cudaHostRegisterPortable),
+                   "register cold arena");
+        registration_seconds_ = seconds_since(started);
+        order_.resize(bytes_ / slice_bytes_);
+        for (std::size_t index = 0; index < order_.size(); ++index) order_[index] = index;
+        std::shuffle(order_.begin(), order_.end(), std::mt19937_64(20260725U));
+    }
+    ~ColdArena() {
+        if (data_ != MAP_FAILED && data_ != nullptr) {
+            static_cast<void>(cudaHostUnregister(data_));
+            static_cast<void>(munmap(data_, bytes_));
+        }
+    }
+    ColdArena(const ColdArena&) = delete;
+    ColdArena& operator=(const ColdArena&) = delete;
+
+    [[nodiscard]] const void* slice(std::size_t index) const noexcept {
+        return data_ + order_[index % order_.size()] * slice_bytes_;
+    }
+    [[nodiscard]] std::size_t slices() const noexcept { return order_.size(); }
+    [[nodiscard]] double registration_seconds() const noexcept {
+        return registration_seconds_;
+    }
+
+private:
+    std::byte* data_{};
+    std::size_t bytes_{};
+    std::size_t slice_bytes_{};
+    std::vector<std::size_t> order_;
+    double registration_seconds_{};
+};
+
+struct ColdSliceResult {
+    std::string arm;
+    int device{};  // -1 for an arm that spans every device
+    std::uint64_t copies{};
+    double seconds{};
+    double gb_s{};
+};
+
+// Three arms over the same cold slices:
+//   serial   - what the runtime does: one host thread, cudaSetDevice and an
+//              inline cudaStreamSynchronize per copy, round-robin across
+//              devices. Reported per device and as a round-robin aggregate.
+//   batched  - one device, queue depth 64, one synchronize per batch. Isolates
+//              whether the inline synchronize costs anything.
+//   overlapped - every device's copy issued to its own stream before any
+//              synchronize. Isolates cross-device concurrency.
+std::vector<ColdSliceResult> cold_slice_samples(const Options& options,
+                                                double& registration_seconds) {
+    ColdArena arena(options.cold_arena_bytes, options.cold_slice_bytes);
+    registration_seconds = arena.registration_seconds();
+    constexpr std::size_t kQueueDepth = 64U;
+    const auto copies = static_cast<std::size_t>(options.cold_copies);
+    const auto payload = static_cast<double>(options.cold_slice_bytes);
+
+    struct DeviceState {
+        int device{};
+        cudaStream_t stream{};
+        std::byte* ring{};
+    };
+    std::vector<DeviceState> states;
+    for (const int device : options.devices) {
+        DeviceState state;
+        state.device = device;
+        cuda_check(cudaSetDevice(device), "select CUDA device for cold slices");
+        cuda_check(cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking),
+                   "create cold slice stream");
+        void* ring = nullptr;
+        cuda_check(cudaMalloc(&ring, options.cold_slice_bytes * kQueueDepth),
+                   "allocate cold slice ring");
+        state.ring = static_cast<std::byte*>(ring);
+        observe_vram(device);
+        states.push_back(state);
+    }
+    // The ring is kQueueDepth deep, so a batched arm never overwrites a
+    // destination whose copy is still in flight.
+    const auto destination = [&](const DeviceState& state, std::size_t step) {
+        return state.ring + (step % kQueueDepth) * options.cold_slice_bytes;
+    };
+
+    std::vector<ColdSliceResult> results;
+    const auto record = [&](std::string arm, int device, std::size_t count,
+                            double seconds) {
+        results.push_back({std::move(arm), device, count, seconds,
+                           static_cast<double>(count) * payload / seconds / 1e9});
+    };
+
+    for (auto& state : states) {
+        cuda_check(cudaSetDevice(state.device), "select device for serial arm");
+        auto started = Clock::now();
+        for (std::size_t step = 0; step < copies; ++step) {
+            cuda_check(cudaMemcpyAsync(destination(state, step), arena.slice(step),
+                                       options.cold_slice_bytes,
+                                       cudaMemcpyHostToDevice, state.stream),
+                       "cold slice serial copy");
+            cuda_check(cudaStreamSynchronize(state.stream), "cold slice serial sync");
+        }
+        record("serial", state.device, copies, seconds_since(started));
+
+        started = Clock::now();
+        for (std::size_t step = 0; step < copies; ++step) {
+            cuda_check(cudaMemcpyAsync(destination(state, step), arena.slice(step),
+                                       options.cold_slice_bytes,
+                                       cudaMemcpyHostToDevice, state.stream),
+                       "cold slice batched copy");
+            if ((step + 1U) % kQueueDepth == 0U) {
+                cuda_check(cudaStreamSynchronize(state.stream), "cold slice batch sync");
+            }
+        }
+        cuda_check(cudaStreamSynchronize(state.stream), "cold slice batch drain");
+        record("batched", state.device, copies, seconds_since(started));
+    }
+
+    auto started = Clock::now();
+    for (std::size_t step = 0; step < copies; ++step) {
+        for (auto& state : states) {
+            cuda_check(cudaSetDevice(state.device), "select device for round robin");
+            cuda_check(cudaMemcpyAsync(destination(state, step), arena.slice(step),
+                                       options.cold_slice_bytes,
+                                       cudaMemcpyHostToDevice, state.stream),
+                       "cold slice round robin copy");
+            cuda_check(cudaStreamSynchronize(state.stream), "cold slice round robin sync");
+        }
+    }
+    record("serial_round_robin", -1, copies * states.size(), seconds_since(started));
+
+    started = Clock::now();
+    for (std::size_t step = 0; step < copies; ++step) {
+        for (auto& state : states) {
+            cuda_check(cudaSetDevice(state.device), "select device for overlap issue");
+            cuda_check(cudaMemcpyAsync(destination(state, step), arena.slice(step),
+                                       options.cold_slice_bytes,
+                                       cudaMemcpyHostToDevice, state.stream),
+                       "cold slice overlapped copy");
+        }
+        for (auto& state : states) {
+            cuda_check(cudaSetDevice(state.device), "select device for overlap sync");
+            cuda_check(cudaStreamSynchronize(state.stream), "cold slice overlapped sync");
+        }
+    }
+    record("overlapped", -1, copies * states.size(), seconds_since(started));
+
+    for (auto& state : states) {
+        cuda_check(cudaSetDevice(state.device), "select device for cold slice teardown");
+        static_cast<void>(cudaStreamDestroy(state.stream));
+        static_cast<void>(cudaFree(state.ring));
+    }
+    return results;
 }
 
 std::vector<double> allocation_samples(int device, std::size_t bytes,
@@ -877,6 +1063,10 @@ int main(int argc, char** argv) {
             }
         }
 
+        std::cerr << "[T1] cold slice transfers\n";
+        double cold_registration_seconds = 0.0;
+        const auto cold_slices = cold_slice_samples(options, cold_registration_seconds);
+
         std::vector<std::pair<int, std::vector<double>>> allocations;
         std::vector<std::pair<int, std::vector<double>>> synchronizations;
         for (const int device : options.devices) {
@@ -945,6 +1135,9 @@ int main(int argc, char** argv) {
                   << ",\"io_bytes\":" << options.io_bytes
                   << ",\"io_block_bytes\":" << options.io_block_bytes
                   << ",\"prefill_rows\":" << options.prefill_rows
+                  << ",\"cold_arena_bytes\":" << options.cold_arena_bytes
+                  << ",\"cold_slice_bytes\":" << options.cold_slice_bytes
+                  << ",\"cold_copies\":" << options.cold_copies
                   << ",\"checkpoint_file\":\""
                   << strata::cli::json_escape(options.checkpoint_file)
                   << "\"}";
@@ -990,6 +1183,17 @@ int main(int argc, char** argv) {
             std::cout << '}';
         }
         std::cout << ']';
+        std::cout << ",\"cold_slice_transfers\":{\"registration_seconds\":"
+                  << cold_registration_seconds << ",\"arms\":[";
+        for (std::size_t index = 0; index < cold_slices.size(); ++index) {
+            if (index != 0U) std::cout << ',';
+            const auto& arm = cold_slices[index];
+            std::cout << "{\"arm\":\"" << arm.arm << "\",\"device\":" << arm.device
+                      << ",\"copies\":" << arm.copies
+                      << ",\"seconds\":" << arm.seconds
+                      << ",\"gb_s\":" << arm.gb_s << '}';
+        }
+        std::cout << "]}";
         std::cout << ",\"allocation\":[";
         for (std::size_t index = 0; index < allocations.size(); ++index) {
             if (index != 0U) std::cout << ',';

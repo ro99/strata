@@ -3569,7 +3569,9 @@ ValidationResult DeepSeekV4Runtime::initialize(
         auto pinned = impl_->resident.pin(impl_->cuda);
         pin_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - pin_started).count();
-        if (!pinned.ok() && config.verbose) {
+        if (!pinned.ok()) {
+            // Always say so. A silent failure here leaves the run at the
+            // pageable transfer rate while every metric claims otherwise.
             std::cerr << "[deepseek-load] resident arena not pinned: "
                       << pinned.errors.front() << '\n';
         }

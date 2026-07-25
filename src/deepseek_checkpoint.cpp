@@ -221,7 +221,28 @@ ValidationResult Dsv4ResidentWeightStore::pin(CudaBackend& backend) {
         return result;
     }
     if (pinned_) return result;
+    // stage() seals the arena with mprotect(PROT_READ). cudaHostRegister
+    // refuses a read-only mapping with cudaErrorInvalidValue, and
+    // cudaHostRegisterReadOnly is not an escape here: all three devices report
+    // cudaDevAttrHostRegisterReadOnlySupported == 0, so that flag returns
+    // "operation not supported". The arena therefore has to be writable across
+    // the registration call. Staging and warm-up have both joined before pin()
+    // is reached, so nothing else can touch the mapping, and the seal is
+    // restored immediately afterwards. Registering while writable and then
+    // resealing leaves H2D out of the mapping working.
+    const auto span = static_cast<std::size_t>(arena_bytes_);
+    if (mprotect(arena_, span, PROT_READ | PROT_WRITE) != 0) {
+        result.errors.emplace_back(
+            "cannot unseal DeepSeek resident arena for registration: " +
+            std::string(std::strerror(errno)));
+        return result;
+    }
     result = backend.register_host_memory(arena_, arena_bytes_);
+    if (mprotect(arena_, span, PROT_READ) != 0) {
+        result.errors.emplace_back(
+            "cannot reseal DeepSeek resident arena after registration: " +
+            std::string(std::strerror(errno)));
+    }
     if (!result.ok()) return result;
     pinned_backend_ = &backend;
     pinned_ = true;

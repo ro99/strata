@@ -41,9 +41,9 @@ struct Dsv4RuntimeConfig {
     bool enable_flash_attention{};
     bool enable_gpu_lightning_indexer{};
     bool enable_incremental_kv_continuation{true};
-    // CUDA offload has a fixed launch/staging cost. The production default
-    // retains parallel host attention below the measured row crossover; zero
-    // forces every supported shape through CUDA for diagnostics.
+    // Zero sends every supported shape to CUDA, the measured production
+    // crossover. Keep the knob because launch/staging costs are hardware- and
+    // context-dependent.
     std::uint32_t flash_attention_minimum_rows{};
     // Page-lock the resident weight arena after staging. Every routed expert
     // is a cold slice of a 147 GB mapping, so the driver's pageable staging

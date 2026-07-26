@@ -44,7 +44,7 @@ struct Dsv4RuntimeConfig {
     // CUDA offload has a fixed launch/staging cost. The production default
     // retains parallel host attention below the measured row crossover; zero
     // forces every supported shape through CUDA for diagnostics.
-    std::uint32_t flash_attention_minimum_rows{256U};
+    std::uint32_t flash_attention_minimum_rows{};
     // Page-lock the resident weight arena after staging. Every routed expert
     // is a cold slice of a 147 GB mapping, so the driver's pageable staging
     // copy dominates the transfer: measured 1.32 ms pageable against 0.37 ms

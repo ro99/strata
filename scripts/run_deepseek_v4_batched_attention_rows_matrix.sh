@@ -99,6 +99,24 @@ jq -n \
     --slurpfile hybrid "${result_dir}/candidate-hybrid.json" '
     def med: sort | .[length / 2 | floor];
     def arm($runs): {
+        initialization_seconds: ([$runs[].initialization_seconds] | med),
+        prefill_seconds: ([$runs[].prefill_seconds] | med),
+        prefill_attention_seconds:
+            ([$runs[].phases.prefill.graph.attention_seconds] | med),
+        prefill_attention_score_seconds:
+            ([$runs[].phases.prefill.graph.attention_score_seconds] | med),
+        prefill_synchronization_seconds:
+            ([$runs[].phases.prefill.cuda.critical_path_synchronization_seconds] | med),
+        prefill_kernel_seconds:
+            ([$runs[].phases.prefill.cuda.critical_path_kernel_seconds] | med),
+        prefill_weight_h2d_bytes:
+            ([$runs[].phases.prefill.cuda.weight_h2d_bytes] | med),
+        prefill_activation_h2d_bytes:
+            ([$runs[].phases.prefill.cuda.activation_h2d_bytes] | med),
+        prefill_activation_d2h_bytes:
+            ([$runs[].phases.prefill.cuda.activation_d2h_bytes] | med),
+        prefill_flash_attention_calls:
+            ([$runs[].phases.prefill.cuda.flash_attention_calls] | med),
         decode_tokens_per_second: [$runs[] | .decode_steps / .decode_seconds],
         median_decode_tokens_per_second:
             ([$runs[] | .decode_steps / .decode_seconds] | med),

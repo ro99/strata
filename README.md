@@ -8,7 +8,7 @@ The motivation is ordinary: most people who want to run a large model do not hav
 
 This is the machine the project is built and measured on. It's an ordinary workstation, not a server:
 
-| | |
+| Memory Type | Hardware |
 |---|---|
 | GPUs | RTX 5060 Ti 16 GiB, RTX 3090 24 GiB, RTX 3090 24 GiB (64 GiB total) |
 | RAM | 251 GiB DDR4 |

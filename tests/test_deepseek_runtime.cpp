@@ -10,7 +10,7 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.enable_device_moe);
     REQUIRE(!config.enable_flash_attention);
     REQUIRE(!config.enable_gpu_lightning_indexer);
-    REQUIRE(config.flash_attention_minimum_rows == 256U);
+    REQUIRE(config.flash_attention_minimum_rows == 0U);
     REQUIRE(config.prefill_page_tokens == 64U);
     REQUIRE(!config.enable_logit_trace);
     REQUIRE(!config.enable_layer_hash_trace);

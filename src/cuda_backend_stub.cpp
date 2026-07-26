@@ -81,6 +81,12 @@ ValidationResult CudaBackend::matmul_grouped(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::matmul_grouped_rows(
+    const CudaWeight&, std::span<const float>, std::uint32_t,
+    std::uint32_t, std::uint64_t, std::span<float>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::validate_flash_attention_device(int) const {
     return {{"FlashAttention requires a CUDA-enabled build"}};
 }

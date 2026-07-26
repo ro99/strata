@@ -91,6 +91,48 @@ TEST_CASE("generic online FlashAttention observes per-query causal limits") {
     REQUIRE(output[3] > 4.0F);
 }
 
+TEST_CASE("generic exact FlashAttention observes disjoint per-query visibility") {
+    const std::array<float, 4> queries{1.0F, 0.0F, 0.0F, 1.0F};
+    const std::array<float, 8> keys{
+        1.0F, 0.0F, 0.0F, 1.0F, 1.0F, 1.0F, -1.0F, 1.0F};
+    const std::array<std::uint8_t, 8> mask{
+        1U, 0U, 1U, 0U,
+        0U, 1U, 0U, 1U};
+    const std::array<strata::FlashAttentionSegment, 1> segments{{
+        {keys, {}, {}}}};
+    strata::FlashAttentionRequest request;
+    request.queries = queries;
+    request.segments = segments;
+    request.query_key_mask = mask;
+    request.query_rows = 2U;
+    request.query_heads = 1U;
+    request.key_value_heads = 1U;
+    request.query_key_dim = 2U;
+    request.value_dim = 2U;
+    request.scale = 1.0F;
+    request.numerics =
+        strata::FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
+    std::array<float, 4> output{};
+    REQUIRE(strata::flash_attention_reference_f32(request, output).ok());
+
+    const std::array<std::uint32_t, 2> first_rows{0U, 2U};
+    const std::array<std::uint32_t, 2> second_rows{1U, 3U};
+    for (std::size_t row = 0U; row < 2U; ++row) {
+        const std::array<strata::FlashAttentionSegment, 1> selected{{
+            {keys, {}, row == 0U
+                ? std::span<const std::uint32_t>(first_rows)
+                : std::span<const std::uint32_t>(second_rows)}}};
+        request.queries = std::span<const float>(queries).subspan(row * 2U, 2U);
+        request.segments = selected;
+        request.query_key_mask = {};
+        request.query_rows = 1U;
+        std::array<float, 2> expected{};
+        REQUIRE(strata::flash_attention_reference_f32(request, expected).ok());
+        REQUIRE(output[row * 2U] == expected[0]);
+        REQUIRE(output[row * 2U + 1U] == expected[1]);
+    }
+}
+
 TEST_CASE("generic FlashAttention scalar oracle preserves compatibility contracts") {
     const std::array<float, 2> query{1.0F, 0.0F};
     const std::array<float, 4> keys{1.0F, 0.0F, 0.0F, 1.0F};

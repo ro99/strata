@@ -260,6 +260,10 @@ public:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t groups, std::uint64_t rows_per_group,
         std::span<float> output);
+    [[nodiscard]] ValidationResult matmul_grouped_rows(
+        const CudaWeight& weight, std::span<const float> input,
+        std::uint32_t rows, std::uint32_t groups,
+        std::uint64_t rows_per_group, std::span<float> output);
     // Validate an explicitly requested FlashAttention device before model
     // admission. Shape-aware dispatch must not hide an unsupported
     // architecture until a later, longer request reaches the CUDA branch.

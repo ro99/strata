@@ -121,9 +121,11 @@ ParseResult<FlashAttentionShape> validate_flash_attention_request(
     if ((!request.head_sinks.empty() &&
          request.head_sinks.size() != request.query_heads) ||
         (!request.causal_key_counts.empty() &&
-         request.causal_key_counts.size() != request.query_rows)) {
+         request.causal_key_counts.size() != request.query_rows) ||
+        (!request.causal_key_counts.empty() &&
+         !request.query_key_mask.empty())) {
         result.errors.emplace_back(
-            "FlashAttention sink or causal-limit storage has an incompatible shape");
+            "FlashAttention sink, causal-limit, or visibility storage has an incompatible shape");
         return result;
     }
     for (const auto sink : request.head_sinks) {
@@ -178,6 +180,37 @@ ParseResult<FlashAttentionShape> validate_flash_attention_request(
         result.errors.emplace_back("FlashAttention aliased packed dimensions disagree");
         return result;
     }
+    std::uint64_t mask_elements = 0U;
+    if (!multiply(request.query_rows, result.value.logical_rows,
+                  mask_elements) ||
+        (!request.query_key_mask.empty() &&
+         request.query_key_mask.size() != mask_elements)) {
+        result.errors.emplace_back(
+            "FlashAttention query visibility mask has an incompatible shape");
+        return result;
+    }
+    if (!request.query_key_mask.empty()) {
+        if (request.numerics !=
+            FlashAttentionNumerics::f64_dot_f32_score_f32_accum) {
+            result.errors.emplace_back(
+                "FlashAttention exact visibility masks require the F64-dot compatibility contract");
+            return result;
+        }
+        for (std::uint32_t query = 0U; query < request.query_rows; ++query) {
+            const auto begin = request.query_key_mask.begin() +
+                static_cast<std::ptrdiff_t>(query * result.value.logical_rows);
+            const auto end = begin +
+                static_cast<std::ptrdiff_t>(result.value.logical_rows);
+            if (request.head_sinks.empty() &&
+                std::none_of(begin, end, [](std::uint8_t value) {
+                    return value != 0U;
+                })) {
+                result.errors.emplace_back(
+                    "FlashAttention query visibility mask hides every normalization term");
+                return result;
+            }
+        }
+    }
     for (const auto limit : request.causal_key_counts) {
         if (limit > result.value.logical_rows) {
             result.errors.emplace_back(
@@ -209,6 +242,10 @@ ParseResult<FlashAttentionShape> validate_flash_attention_request(
         !add(packed_elements, score_elements, packed_elements) ||
         !add(packed_elements, request.head_sinks.size(), packed_elements) ||
         !add(packed_elements, request.causal_key_counts.size(), packed_elements) ||
+        !add(packed_elements,
+             request.query_key_mask.size() / sizeof(float) +
+                 (request.query_key_mask.size() % sizeof(float) != 0U),
+             packed_elements) ||
         !add(packed_elements, 1U, packed_elements)) {
         result.errors.emplace_back("FlashAttention total workspace size overflows");
         return result;
@@ -248,9 +285,15 @@ ValidationResult flash_attention_reference_f32(
 
     for (std::uint32_t query_row = 0U; query_row < request.query_rows;
          ++query_row) {
+        const bool masked = !request.query_key_mask.empty();
         const auto visible = request.causal_key_counts.empty()
             ? shape.value.logical_rows
             : request.causal_key_counts[query_row];
+        const auto key_visible = [&](std::uint64_t logical_row) {
+            return !masked || request.query_key_mask[
+                static_cast<std::size_t>(query_row) *
+                    shape.value.logical_rows + logical_row] != 0U;
+        };
         for (std::uint32_t head = 0U; head < request.query_heads; ++head) {
             const auto kv_head = head / heads_per_kv;
             const auto query = request.queries.subspan(
@@ -273,7 +316,9 @@ ValidationResult flash_attention_reference_f32(
                 std::uint64_t logical_base = 0U;
                 for (const auto& segment : request.segments) {
                     auto segment_info = segment_shape(request, segment);
-                    const auto segment_visible = visible <= logical_base
+                    const auto segment_visible = masked
+                        ? segment_info.value.logical_rows
+                        : visible <= logical_base
                         ? 0U
                         : std::min(segment_info.value.logical_rows,
                                    visible - logical_base);
@@ -281,6 +326,7 @@ ValidationResult flash_attention_reference_f32(
                         request.key_value_heads) * request.query_key_dim;
                     for (std::uint64_t logical_row = 0U;
                          logical_row < segment_visible; ++logical_row) {
+                        if (!key_visible(logical_base + logical_row)) continue;
                         const auto source_row = segment.row_indices.empty()
                             ? logical_row
                             : segment.row_indices[
@@ -315,7 +361,7 @@ ValidationResult flash_attention_reference_f32(
                         maximum = std::max(maximum, score);
                     }
                     logical_base += segment_info.value.logical_rows;
-                    if (logical_base >= visible) break;
+                    if (!masked && logical_base >= visible) break;
                 }
                 double denominator = 0.0;
                 float denominator_f32 = 0.0F;
@@ -351,7 +397,9 @@ ValidationResult flash_attention_reference_f32(
                 logical_base = 0U;
                 for (const auto& segment : request.segments) {
                     auto segment_info = segment_shape(request, segment);
-                    const auto segment_visible = visible <= logical_base
+                    const auto segment_visible = masked
+                        ? segment_info.value.logical_rows
+                        : visible <= logical_base
                         ? 0U
                         : std::min(segment_info.value.logical_rows,
                                    visible - logical_base);
@@ -361,6 +409,7 @@ ValidationResult flash_attention_reference_f32(
                         ? segment.keys : segment.values;
                     for (std::uint64_t logical_row = 0U;
                          logical_row < segment_visible; ++logical_row) {
+                        if (!key_visible(logical_base + logical_row)) continue;
                         const auto source_row = segment.row_indices.empty()
                             ? logical_row
                             : segment.row_indices[
@@ -382,7 +431,7 @@ ValidationResult flash_attention_reference_f32(
                         }
                     }
                     logical_base += segment_info.value.logical_rows;
-                    if (logical_base >= visible) break;
+                    if (!masked && logical_base >= visible) break;
                 }
                 if (!std::all_of(destination.begin(), destination.end(),
                                  [](float value) { return std::isfinite(value); })) {

@@ -516,6 +516,63 @@ TEST_CASE("native CUDA FlashAttention preserves an all-F32 adapter contract") {
     }
 }
 
+TEST_CASE("native CUDA exact FlashAttention batches disjoint query visibility") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    constexpr std::uint32_t query_rows = 3U;
+    constexpr std::uint32_t heads = 4U;
+    constexpr std::uint32_t dimension = 64U;
+    constexpr std::uint32_t key_rows = 9U;
+    std::vector<float> queries(query_rows * heads * dimension);
+    std::vector<float> keys(key_rows * dimension);
+    std::vector<std::uint8_t> mask(query_rows * key_rows);
+    for (std::size_t index = 0U; index < queries.size(); ++index) {
+        queries[index] = static_cast<float>(static_cast<int>(index % 19U) - 9) /
+                         32.0F;
+    }
+    for (std::size_t index = 0U; index < keys.size(); ++index) {
+        keys[index] = static_cast<float>(static_cast<int>(index % 23U) - 11) /
+                      32.0F;
+    }
+    for (std::uint32_t query = 0U; query < query_rows; ++query) {
+        for (std::uint32_t key = 0U; key < key_rows; ++key) {
+            mask[query * key_rows + key] =
+                static_cast<std::uint8_t>((key + query) % 3U != 0U);
+        }
+    }
+    const std::array<strata::FlashAttentionSegment, 1> segments{{
+        {keys, {}, {}}}};
+    strata::FlashAttentionRequest request;
+    request.queries = queries;
+    request.segments = segments;
+    request.query_key_mask = mask;
+    request.query_rows = query_rows;
+    request.query_heads = heads;
+    request.key_value_heads = 1U;
+    request.query_key_dim = dimension;
+    request.value_dim = dimension;
+    request.scale = 1.0F / 8.0F;
+    request.numerics =
+        strata::FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
+    std::vector<float> expected(queries.size());
+    std::vector<float> actual(queries.size());
+    REQUIRE(strata::flash_attention_reference_f32(request, expected).ok());
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device, true).ok());
+    const auto status = backend.flash_attention(
+        devices.front(), request, actual);
+    if (!status.ok() && !status.errors.empty() &&
+        status.errors.front().find("supports only SM86 and SM120") !=
+            std::string::npos) {
+        return;
+    }
+    REQUIRE(status.ok());
+    REQUIRE(actual == expected);
+}
+
 TEST_CASE("native CUDA backend reuses a strict bounded weight arena when available") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;
@@ -746,6 +803,17 @@ TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections
                                    grouped_output).ok());
     REQUIRE(grouped_output[0] == 17.0F);
     REQUIRE(grouped_output[1] == 53.0F);
+    constexpr std::array<float, 8> grouped_rows_input{
+        5.0F, 6.0F, 7.0F, 8.0F,
+        1.0F, 1.0F, 2.0F, 3.0F};
+    std::array<float, 4> grouped_rows_output{};
+    REQUIRE(backend.matmul_grouped_rows(
+        grouped_weight, grouped_rows_input, 2U, 2U, 1U,
+        grouped_rows_output).ok());
+    REQUIRE(grouped_rows_output[0] == 17.0F);
+    REQUIRE(grouped_rows_output[1] == 53.0F);
+    REQUIRE(grouped_rows_output[2] == 3.0F);
+    REQUIRE(grouped_rows_output[3] == 18.0F);
 }
 
 TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when available") {

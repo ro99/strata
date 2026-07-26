@@ -28,6 +28,7 @@ public:
     [[nodiscard]] bool finished();
     [[nodiscard]] std::string parse_string();
     [[nodiscard]] std::uint64_t parse_uint64();
+    [[nodiscard]] double parse_number();
     [[nodiscard]] bool parse_bool();
     void skip_value();
 
@@ -36,7 +37,7 @@ public:
 private:
     void skip_whitespace();
     void skip_value(std::size_t depth);
-    void skip_number();
+    [[nodiscard]] std::string_view consume_number();
     [[nodiscard]] std::uint32_t parse_hex_quad();
     [[noreturn]] void fail(const std::string& message) const;
 

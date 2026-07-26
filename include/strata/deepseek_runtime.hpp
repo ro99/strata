@@ -6,6 +6,7 @@
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/deepseek_diagnostics.hpp"
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
 #include <cstdint>
@@ -199,9 +200,11 @@ struct Dsv4GenerationResult {
     std::string text;
     std::vector<std::uint32_t> prompt_token_ids;
     std::vector<std::uint32_t> generated_token_ids;
+    std::vector<TokenLogprob> logprobs;
     Dsv4GenerationMetrics metrics;
     Dsv4DiagnosticTrace diagnostics;
     std::vector<std::string> errors;
+    bool stopped{};
 
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
@@ -225,6 +228,12 @@ public:
     [[nodiscard]] Dsv4GenerationResult generate_chat_stream(
         std::span<const ChatMessage> messages,
         std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token = {});
+    [[nodiscard]] Dsv4GenerationResult generate_chat_stream(
+        std::span<const ChatMessage> messages,
+        std::uint32_t maximum_new_tokens,
+        const SamplingOptions& sampling,
+        std::span<const std::string> stop,
         const TokenStreamCallback& on_token = {});
     [[nodiscard]] const Dsv4MemoryPlan& memory_plan() const noexcept;
 

@@ -2,6 +2,7 @@
 
 #include "strata/chat_protocol.hpp"
 #include "strata/result.hpp"
+#include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
 #include <cstdint>
@@ -46,10 +47,18 @@ struct GenerationResult {
     std::string text;
     std::vector<std::uint32_t> prompt_token_ids;
     std::vector<std::uint32_t> generated_token_ids;
+    std::vector<TokenLogprob> logprobs;
     GenerationMetrics metrics;
     std::vector<std::string> errors;
+    bool stopped{};
 
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
+};
+
+struct GenerationOptions {
+    std::uint32_t maximum_new_tokens{256U};
+    SamplingOptions sampling;
+    std::vector<std::string> stop;
 };
 
 // Stable application-facing facade. Architecture-specific diagnostics and
@@ -71,6 +80,10 @@ public:
     [[nodiscard]] GenerationResult generate_chat_stream(
         std::span<const ChatMessage> messages,
         std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token = {});
+    [[nodiscard]] GenerationResult generate_chat_stream(
+        std::span<const ChatMessage> messages,
+        const GenerationOptions& options,
         const TokenStreamCallback& on_token = {});
 
 private:

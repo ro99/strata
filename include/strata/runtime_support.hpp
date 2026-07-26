@@ -1,13 +1,38 @@
 #pragma once
 
 #include "strata/result.hpp"
+#include "strata/chat_protocol.hpp"
+#include "strata/types.hpp"
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace strata {
+
+class StopSequenceBuffer {
+public:
+    explicit StopSequenceBuffer(std::span<const std::string> stops)
+        : stops_(stops) {}
+
+    void append(std::uint32_t token, std::string_view piece,
+                const TokenStreamCallback& callback);
+    void finish(const TokenStreamCallback& callback);
+
+    [[nodiscard]] bool stopped() const noexcept { return stopped_; }
+    [[nodiscard]] const std::string& text() const noexcept { return text_; }
+
+private:
+    void emit(std::size_t end, std::uint32_t token,
+              const TokenStreamCallback& callback);
+
+    std::span<const std::string> stops_;
+    std::string text_;
+    std::size_t emitted_{};
+    bool stopped_{};
+};
 
 struct RuntimeDevicePlan {
     std::vector<int> devices;
@@ -31,5 +56,11 @@ using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
 [[nodiscard]] std::size_t incremental_kv_prefix_tokens(
     std::span<const std::uint32_t> cached_tokens,
     std::span<const std::uint32_t> prompt_tokens) noexcept;
+
+[[nodiscard]] bool trim_oldest_chat_turn(
+    std::vector<ChatMessage>& messages);
+
+// Returns the complete valid UTF-8 prefix, or string_view::npos for invalid input.
+[[nodiscard]] std::size_t complete_utf8_prefix(std::string_view text) noexcept;
 
 }  // namespace strata

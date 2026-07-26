@@ -204,6 +204,26 @@ full, processed, and reused prompt-token counts.
 weight caching (default 0.85, valid range `(0, 0.95]`). Raise it (e.g., `0.95`)
 to keep more experts resident when free VRAM allows.
 
+## OpenAI-compatible server
+
+`strata-server` serves the existing C++ runtime over HTTP without a framework
+or a second inference path:
+
+```bash
+./build/strata-server --model models/glm52 --model-type glm \
+  --model-id glm52 --context-size 2048 --devices 0,1,2
+
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"glm52","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+The server exposes `/v1/models`, `/v1/health`, `/v1/chat/completions`,
+`/v1/completions`, and `/v1/tokenize`. `/v1/embeddings`, image input, and tool
+selection return explicit unsupported errors when the loaded base model has no
+exact runtime path for them. SIGINT and SIGTERM drain the active request and
+release runtime state before exit.
+
 For a sanitizer build:
 
 ```bash

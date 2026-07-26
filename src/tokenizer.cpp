@@ -745,7 +745,13 @@ std::string render_glm52_chat_prompt(std::span<const ChatMessage> messages,
         output += "<|system|>Reasoning Effort: " + effort;
     }
     for (const auto& message : messages) {
-        output += message.role == ChatRole::User ? "<|user|>" : "<|assistant|>";
+        switch (message.role) {
+            case ChatRole::System: output += "<|system|>"; break;
+            case ChatRole::User: output += "<|user|>"; break;
+            case ChatRole::Assistant: output += "<|assistant|>"; break;
+            case ChatRole::Tool: output += "<|tool|>"; break;
+        }
+        if (!message.name.empty()) output += message.name + ": ";
         if (message.role == ChatRole::Assistant) {
             output += enable_thinking ? "<think>" : "<think></think>";
         }
@@ -767,7 +773,13 @@ std::string render_deepseek_v4_chat_prompt(
     std::span<const ChatMessage> messages, bool enable_thinking) {
     std::string output = "<｜begin▁of▁sentence｜>";
     for (const auto& message : messages) {
-        output += message.role == ChatRole::User ? "<｜User｜>" : "<｜Assistant｜>";
+        switch (message.role) {
+            case ChatRole::System: output += "<｜System｜>"; break;
+            case ChatRole::User: output += "<｜User｜>"; break;
+            case ChatRole::Assistant: output += "<｜Assistant｜>"; break;
+            case ChatRole::Tool: output += "<｜Tool｜>"; break;
+        }
+        if (!message.name.empty()) output += message.name + ": ";
         if (message.role == ChatRole::Assistant) {
             output += enable_thinking ? "<think>" : "</think>";
         }

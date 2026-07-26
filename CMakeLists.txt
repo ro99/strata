@@ -51,6 +51,7 @@ add_library(strata_core STATIC
     src/json_cursor.cpp
     src/model.cpp
     src/numerics.cpp
+    src/openai_protocol.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
     src/worker_pool.cpp
@@ -103,6 +104,9 @@ target_link_libraries(strata-deepseek-run PRIVATE strata_core)
 add_executable(strata-chat apps/strata_chat.cpp)
 target_link_libraries(strata-chat PRIVATE strata_core)
 
+add_executable(strata-server apps/strata_server.cpp)
+target_link_libraries(strata-server PRIVATE strata_core)
+
 add_executable(strata-host-expert-probe apps/strata_host_expert_probe.cpp)
 target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 
@@ -134,6 +138,7 @@ if(BUILD_TESTING)
         tests/test_deepseek_diagnostics.cpp
         tests/test_deepseek_runtime.cpp
         tests/test_model.cpp
+        tests/test_openai_protocol.cpp
         tests/test_q4.cpp
         tests/test_trace.cpp
         tests/test_predictor.cpp
@@ -162,7 +167,7 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat
+install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat strata-server
         strata-host-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)

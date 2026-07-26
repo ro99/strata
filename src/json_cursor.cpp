@@ -1,6 +1,8 @@
 #include "json_cursor.hpp"
 
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <limits>
 
 namespace strata::detail {
@@ -166,7 +168,8 @@ bool JsonCursor::parse_bool() {
     fail("expected boolean");
 }
 
-void JsonCursor::skip_number() {
+std::string_view JsonCursor::consume_number() {
+    const auto begin = offset_;
     if (offset_ < input_.size() && input_[offset_] == '-') ++offset_;
     if (offset_ >= input_.size()) fail("truncated number");
     if (input_[offset_] == '0') {
@@ -201,6 +204,19 @@ void JsonCursor::skip_number() {
             ++offset_;
         }
     }
+    return input_.substr(begin, offset_ - begin);
+}
+
+double JsonCursor::parse_number() {
+    skip_whitespace();
+    const auto text = consume_number();
+    double value = 0.0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        !std::isfinite(value)) {
+        fail("invalid finite number");
+    }
+    return value;
 }
 
 void JsonCursor::skip_value() {
@@ -245,7 +261,7 @@ void JsonCursor::skip_value(std::size_t depth) {
             if (input_.substr(offset_, 4U) != "null") fail("invalid literal");
             offset_ += 4U;
             return;
-        default: skip_number(); return;
+        default: static_cast<void>(consume_number()); return;
     }
 }
 

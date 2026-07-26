@@ -47,8 +47,12 @@ bool parse_message(detail::JsonCursor& cursor, ChatMessage& message,
         message.role = ChatRole::User;
     } else if (role == "assistant") {
         message.role = ChatRole::Assistant;
+    } else if (role == "system") {
+        message.role = ChatRole::System;
+    } else if (role == "tool") {
+        message.role = ChatRole::Tool;
     } else {
-        error = "chat message role must be \"user\" or \"assistant\"";
+        error = "unsupported chat message role";
         return false;
     }
     if (message.role == ChatRole::User && message.content.empty()) {
@@ -66,21 +70,34 @@ bool validate_chat_messages(std::span<const ChatMessage> messages,
         error = "prompt request must contain at least one chat message";
         return false;
     }
-    for (std::size_t index = 0; index < messages.size(); ++index) {
-        const auto expected = index % 2U == 0U ? ChatRole::User
-                                               : ChatRole::Assistant;
-        if (messages[index].role != expected) {
-            error = "chat messages must alternate user and assistant roles";
+    ChatRole previous = ChatRole::System;
+    bool started = false;
+    for (const auto& message : messages) {
+        if (message.role == ChatRole::System) {
+            if (started) {
+                error = "system messages must precede conversation messages";
+                return false;
+            }
+            continue;
+        }
+        if ((message.role == ChatRole::User && started &&
+             previous == ChatRole::User) ||
+            (message.role == ChatRole::Assistant &&
+             (!started || previous == ChatRole::Assistant)) ||
+            (message.role == ChatRole::Tool && previous != ChatRole::Assistant &&
+             previous != ChatRole::Tool)) {
+            error = "chat messages must alternate valid conversation roles";
             return false;
         }
-        if (messages[index].role == ChatRole::User &&
-            messages[index].content.empty()) {
-            error = "user message content must not be empty";
+        if (message.role != ChatRole::Assistant && message.content.empty()) {
+            error = "chat message content must not be empty";
             return false;
         }
+        previous = message.role;
+        started = true;
     }
-    if (messages.back().role != ChatRole::User) {
-        error = "prompt request must end with a user message";
+    if (!started || (previous != ChatRole::User && previous != ChatRole::Tool)) {
+        error = "prompt request must end with a user or tool message";
         return false;
     }
     error.clear();

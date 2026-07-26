@@ -5,6 +5,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace strata {
@@ -13,13 +14,22 @@ inline constexpr unsigned int chat_protocol_version = 1U;
 inline constexpr std::size_t maximum_chat_request_bytes = 16U * 1024U * 1024U;
 
 enum class ChatRole : std::uint8_t {
+    System,
     User,
     Assistant,
+    Tool,
 };
 
 struct ChatMessage {
+    ChatMessage() = default;
+    ChatMessage(ChatRole message_role, std::string message_content,
+                std::string message_name = {})
+        : role(message_role), content(std::move(message_content)),
+          name(std::move(message_name)) {}
+
     ChatRole role{ChatRole::User};
     std::string content;
+    std::string name;
 };
 
 struct ChatRequest {

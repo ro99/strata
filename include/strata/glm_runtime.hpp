@@ -2,6 +2,7 @@
 
 #include "strata/checkpoint.hpp"
 #include "strata/chat_protocol.hpp"
+#include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
 #include <cstdint>
@@ -92,8 +93,10 @@ struct Glm52GenerationResult {
     std::string text;
     std::vector<std::uint32_t> prompt_token_ids;
     std::vector<std::uint32_t> generated_token_ids;
+    std::vector<TokenLogprob> logprobs;
     Glm52RunMetrics metrics;
     std::vector<std::string> errors;
+    bool stopped{};
 
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
@@ -117,6 +120,12 @@ public:
     [[nodiscard]] Glm52GenerationResult generate_chat_stream(
         std::span<const ChatMessage> messages,
         std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token = {});
+    [[nodiscard]] Glm52GenerationResult generate_chat_stream(
+        std::span<const ChatMessage> messages,
+        std::uint32_t maximum_new_tokens,
+        const SamplingOptions& sampling,
+        std::span<const std::string> stop,
         const TokenStreamCallback& on_token = {});
 
 private:

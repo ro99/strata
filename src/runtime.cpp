@@ -11,6 +11,7 @@ namespace strata {
 
 struct RuntimeSession::Impl {
     std::variant<std::monostate, Glm52Runtime, DeepSeekV4Runtime> runtime;
+    SamplingOptions sampling;
 };
 
 RuntimeSession::RuntimeSession() : impl_(std::make_unique<Impl>()) {}
@@ -25,6 +26,8 @@ ValidationResult RuntimeSession::initialize(
         result.errors.emplace_back("runtime session is already initialized");
         return result;
     }
+    impl_->sampling.temperature = config.sampling_temperature;
+    impl_->sampling.seed = config.sampling_seed;
     if (config.model == RuntimeModel::Glm52) {
         if (config.deepseek_block_kv_cache) {
             result.errors.emplace_back(
@@ -78,13 +81,25 @@ GenerationResult RuntimeSession::generate_chat_stream(
     std::span<const ChatMessage> messages,
     std::uint32_t maximum_new_tokens,
     const TokenStreamCallback& on_token) {
+    GenerationOptions options;
+    options.maximum_new_tokens = maximum_new_tokens;
+    options.sampling = impl_->sampling;
+    return generate_chat_stream(messages, options, on_token);
+}
+
+GenerationResult RuntimeSession::generate_chat_stream(
+    std::span<const ChatMessage> messages,
+    const GenerationOptions& options,
+    const TokenStreamCallback& on_token) {
     GenerationResult result;
     if (auto* runtime = std::get_if<Glm52Runtime>(&impl_->runtime)) {
         auto concrete = runtime->generate_chat_stream(
-            messages, maximum_new_tokens, on_token);
+            messages, options.maximum_new_tokens, options.sampling,
+            options.stop, on_token);
         result.text = std::move(concrete.text);
         result.prompt_token_ids = std::move(concrete.prompt_token_ids);
         result.generated_token_ids = std::move(concrete.generated_token_ids);
+        result.logprobs = std::move(concrete.logprobs);
         result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
         result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
         result.metrics.reused_prompt_tokens =
@@ -95,14 +110,17 @@ GenerationResult RuntimeSession::generate_chat_stream(
         result.metrics.incremental_kv_continuation =
             concrete.metrics.incremental_kv_continuation;
         result.errors = std::move(concrete.errors);
+        result.stopped = concrete.stopped;
         return result;
     }
     if (auto* runtime = std::get_if<DeepSeekV4Runtime>(&impl_->runtime)) {
         auto concrete = runtime->generate_chat_stream(
-            messages, maximum_new_tokens, on_token);
+            messages, options.maximum_new_tokens, options.sampling,
+            options.stop, on_token);
         result.text = std::move(concrete.text);
         result.prompt_token_ids = std::move(concrete.prompt_token_ids);
         result.generated_token_ids = std::move(concrete.generated_token_ids);
+        result.logprobs = std::move(concrete.logprobs);
         result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
         result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
         result.metrics.reused_prompt_tokens =
@@ -113,6 +131,7 @@ GenerationResult RuntimeSession::generate_chat_stream(
         result.metrics.incremental_kv_continuation =
             concrete.metrics.incremental_kv_continuation;
         result.errors = std::move(concrete.errors);
+        result.stopped = concrete.stopped;
         return result;
     }
     result.errors.emplace_back("runtime session is not initialized");

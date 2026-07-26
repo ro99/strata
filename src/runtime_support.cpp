@@ -4,10 +4,51 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <unordered_set>
 
 namespace strata {
+
+void StopSequenceBuffer::emit(std::size_t end, std::uint32_t token,
+                              const TokenStreamCallback& callback) {
+    if (end <= emitted_) return;
+    if (callback) callback(token, std::string_view(text_).substr(emitted_, end - emitted_));
+    emitted_ = end;
+}
+
+void StopSequenceBuffer::append(std::uint32_t token, std::string_view piece,
+                                const TokenStreamCallback& callback) {
+    if (stopped_) return;
+    text_.append(piece);
+    std::size_t stop_at = std::string::npos;
+    for (const auto& stop : stops_) {
+        const auto found = text_.find(stop, emitted_);
+        if (!stop.empty() && found < stop_at) stop_at = found;
+    }
+    if (stop_at != std::string::npos) {
+        emit(stop_at, token, callback);
+        text_.resize(stop_at);
+        stopped_ = true;
+        return;
+    }
+    std::size_t held = 0U;
+    for (const auto& stop : stops_) {
+        const auto maximum = std::min(stop.size() - (stop.empty() ? 0U : 1U),
+                                      text_.size());
+        for (std::size_t length = maximum; length > held; --length) {
+            if (text_.compare(text_.size() - length, length, stop, 0U, length) == 0) {
+                held = length;
+                break;
+            }
+        }
+    }
+    emit(text_.size() - held, token, callback);
+}
+
+void StopSequenceBuffer::finish(const TokenStreamCallback& callback) {
+    if (!stopped_) emit(text_.size(), 0U, callback);
+}
 
 ValidationResult validate_common_runtime_config(
     std::span<const int> devices, double vram_fraction,
@@ -96,6 +137,46 @@ std::size_t incremental_kv_prefix_tokens(
         return 0U;
     }
     return cached_tokens.size();
+}
+
+bool trim_oldest_chat_turn(std::vector<ChatMessage>& messages) {
+    const auto first = std::find_if(messages.begin(), messages.end(),
+        [](const ChatMessage& message) { return message.role != ChatRole::System; });
+    if (first == messages.end()) return false;
+    const auto next = std::find_if(std::next(first), messages.end(),
+        [](const ChatMessage& message) { return message.role == ChatRole::User; });
+    if (next == messages.end()) return false;
+    messages.erase(first, next);
+    return true;
+}
+
+std::size_t complete_utf8_prefix(std::string_view text) noexcept {
+    std::size_t offset = 0U;
+    while (offset < text.size()) {
+        const auto lead = static_cast<unsigned char>(text[offset]);
+        std::size_t length = 0U;
+        if (lead <= 0x7FU) length = 1U;
+        else if (lead >= 0xC2U && lead <= 0xDFU) length = 2U;
+        else if (lead >= 0xE0U && lead <= 0xEFU) length = 3U;
+        else if (lead >= 0xF0U && lead <= 0xF4U) length = 4U;
+        else return std::string_view::npos;
+        if (text.size() - offset < length) return offset;
+        for (std::size_t index = 1U; index < length; ++index) {
+            if ((static_cast<unsigned char>(text[offset + index]) & 0xC0U) != 0x80U) {
+                return std::string_view::npos;
+            }
+        }
+        const auto second = length == 1U
+            ? 0U : static_cast<unsigned char>(text[offset + 1U]);
+        if ((lead == 0xE0U && second < 0xA0U) ||
+            (lead == 0xEDU && second > 0x9FU) ||
+            (lead == 0xF0U && second < 0x90U) ||
+            (lead == 0xF4U && second > 0x8FU)) {
+            return std::string_view::npos;
+        }
+        offset += length;
+    }
+    return offset;
 }
 
 }  // namespace strata

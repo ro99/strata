@@ -1159,6 +1159,9 @@ struct DeepSeekV4Runtime::Impl {
     std::vector<RouteEvent> deferred_route_events;
     bool defer_prefill_observability{};
     std::mt19937_64 sampler;
+    SamplingOptions active_sampling;
+    std::vector<std::uint32_t> sampled_token_counts;
+    TokenLogprob last_sample;
     bool initialized{};
     bool reusable_sequence{};
     std::uint64_t active_request_id{};
@@ -3264,8 +3267,10 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
         result.errors = std::move(validation.errors);
         return result;
     }
-    result.value = sample_logits_gumbel(
-        logits, config.sampling_temperature, sampler);
+    last_sample = sample_logits(
+        logits, active_sampling, sampled_token_counts, sampler);
+    result.value = last_sample.token;
+    ++sampled_token_counts[result.value];
     if (config.enable_logit_trace) {
         record_logits(position, token, result.value, logits);
     }
@@ -3831,6 +3836,18 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     std::span<const ChatMessage> messages,
     std::uint32_t maximum_new_tokens,
     const TokenStreamCallback& on_token) {
+    SamplingOptions sampling;
+    sampling.temperature = impl_->config.sampling_temperature;
+    sampling.seed = impl_->config.sampling_seed;
+    return generate_chat_stream(messages, maximum_new_tokens, sampling, {}, on_token);
+}
+
+Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
+    std::span<const ChatMessage> messages,
+    std::uint32_t maximum_new_tokens,
+    const SamplingOptions& sampling,
+    std::span<const std::string> stop,
+    const TokenStreamCallback& on_token) {
     Dsv4GenerationResult result;
     if (!impl_->initialized) {
         result.errors.emplace_back("DeepSeek runtime is not initialized");
@@ -3840,28 +3857,41 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
         result.errors.emplace_back("maximum_new_tokens must be positive");
         return result;
     }
+    if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0 ||
+        sampling.temperature > 10.0 || !std::isfinite(sampling.top_p) ||
+        sampling.top_p <= 0.0 || sampling.top_p > 1.0 ||
+        !std::isfinite(sampling.presence_penalty) ||
+        sampling.presence_penalty < -2.0 || sampling.presence_penalty > 2.0 ||
+        !std::isfinite(sampling.frequency_penalty) ||
+        sampling.frequency_penalty < -2.0 || sampling.frequency_penalty > 2.0) {
+        result.errors.emplace_back("invalid sampling options");
+        return result;
+    }
+    impl_->active_sampling = sampling;
+    impl_->sampled_token_counts.assign(kVocabulary, 0U);
+    impl_->sampler.seed(sampling.seed);
     std::string validation_error;
     if (!validate_chat_messages(messages, validation_error)) {
         result.errors.push_back(std::move(validation_error));
         return result;
     }
     impl_->weights->finish_prefetch();
+    std::vector<ChatMessage> active_messages(messages.begin(), messages.end());
     ParseResult<std::vector<std::uint32_t>> encoded;
     for (;;) {
         encoded = impl_->tokenizer.encode(
-            render_deepseek_v4_chat_prompt(messages, false));
+            render_deepseek_v4_chat_prompt(active_messages, false));
         if (!encoded.ok()) {
             result.errors = std::move(encoded.errors);
             return result;
         }
         if (encoded.value.size() + maximum_new_tokens <=
             impl_->config.maximum_context_tokens) break;
-        if (messages.size() <= 1U) {
+        if (!trim_oldest_chat_turn(active_messages)) {
             result.errors.emplace_back(
                 "prompt and requested DeepSeek generation exceed the context ceiling");
             return result;
         }
-        messages = messages.subspan(2U);
     }
     result.prompt_token_ids = encoded.value;
     impl_->active_request_id = impl_->generated_requests++;
@@ -3926,20 +3956,22 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto device_moe_after_prefill = impl_->device_moe_stats;
     const auto graph_after_prefill = impl_->graph_stats;
     constexpr std::uint32_t stop_token = 1U;
+    StopSequenceBuffer output(stop);
     if (next.value != stop_token) {
         result.generated_token_ids.push_back(next.value);
+        result.logprobs.push_back(impl_->last_sample);
         const auto piece = impl_->tokenizer.decode_token(next.value);
         if (!piece.ok()) {
             result.errors = std::move(piece.errors);
             return result;
         }
-        if (on_token) on_token(next.value, piece.value);
+        output.append(next.value, piece.value, on_token);
     }
     std::uint32_t position = static_cast<std::uint32_t>(
         result.prompt_token_ids.size());
     std::uint64_t decode_steps = 0U;
     const auto decode_started = std::chrono::steady_clock::now();
-    while (next.value != stop_token &&
+    while (next.value != stop_token && !output.stopped() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const auto input_token = next.value;
         next = impl_->forward_token(input_token, position++, true);
@@ -3951,24 +3983,22 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
         ++decode_steps;
         if (next.value != stop_token) {
             result.generated_token_ids.push_back(next.value);
+            result.logprobs.push_back(impl_->last_sample);
             const auto piece = impl_->tokenizer.decode_token(next.value);
             if (!piece.ok()) {
                 result.errors = std::move(piece.errors);
                 return result;
             }
-            if (on_token) on_token(next.value, piece.value);
+            output.append(next.value, piece.value, on_token);
         }
     }
+    output.finish(on_token);
+    result.stopped = output.stopped();
     impl_->weights->finish_prefetch();
     result.metrics.decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - decode_started).count();
     result.metrics.decode_tokens = decode_steps;
-    auto decoded = impl_->tokenizer.decode(result.generated_token_ids);
-    if (!decoded.ok()) {
-        result.errors = std::move(decoded.errors);
-        return result;
-    }
-    result.text = std::move(decoded.value);
+    result.text = output.text();
     const auto reads_after_decode = impl_->checkpoint->stats();
     const auto cuda_after_decode = impl_->cuda.stats();
     const auto cache_after_decode = impl_->weights->stats();

@@ -62,6 +62,15 @@ struct Options {
     std::size_t cold_arena_bytes{16ULL * 1024U * 1024U * 1024U};
     std::size_t cold_slice_bytes{4456448U};  // one FP4 routed-expert matrix
     std::uint32_t cold_copies{512U};
+    // The cold-slice stage above times copies with nothing else running, so it
+    // can only answer how fast a copy is, never whether a copy and a kernel can
+    // proceed at the same time. Experiment 0026 rejected a dedicated copy
+    // stream on a queue-depth measurement, which is a different property: the
+    // runtime issues every H2D on the same stream its kernels use and
+    // synchronizes it, so no compute is ever in flight during an upload and a
+    // deeper queue has nothing to recover. The overlap stage supplies the
+    // missing arm.
+    std::uint32_t overlap_copies{256U};
 };
 
 struct TimedSample {
@@ -160,7 +169,8 @@ void print_help() {
         << "  --prefill-rows 30       representative prefill row count\n"
         << "  --cold-arena-bytes 16G  registered mapping sampled for cold slices\n"
         << "  --cold-slice-bytes 4456448  one routed-expert matrix payload\n"
-        << "  --cold-copies 512       cold slices transferred per device\n";
+        << "  --cold-copies 512       cold slices transferred per device\n"
+        << "  --overlap-copies 256    copy/kernel iterations per overlap arm\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -186,6 +196,7 @@ Options parse_options(int argc, char** argv) {
         else if (argument == "--cold-arena-bytes") options.cold_arena_bytes = parse_size(value);
         else if (argument == "--cold-slice-bytes") options.cold_slice_bytes = parse_size(value);
         else if (argument == "--cold-copies") options.cold_copies = std::stoul(value);
+        else if (argument == "--overlap-copies") options.overlap_copies = std::stoul(value);
         else fail("unknown argument: " + argument);
     }
     if (options.checkpoint_file.empty()) fail("--checkpoint-file is required");
@@ -195,6 +206,7 @@ Options parse_options(int argc, char** argv) {
         fail("the cold arena must hold one distinct slice per copy, so that no "
              "slice is reused and the transfer stays cold");
     }
+    if (options.overlap_copies == 0U) fail("overlap copies must be positive");
     if (options.transfer_bytes == 0U || options.activation_bytes == 0U ||
         options.io_bytes == 0U || options.io_block_bytes == 0U ||
         options.prefill_rows == 0U) {
@@ -466,9 +478,7 @@ struct ColdSliceResult {
 //   overlapped - every device's copy issued to its own stream before any
 //              synchronize. Isolates cross-device concurrency.
 std::vector<ColdSliceResult> cold_slice_samples(const Options& options,
-                                                double& registration_seconds) {
-    ColdArena arena(options.cold_arena_bytes, options.cold_slice_bytes);
-    registration_seconds = arena.registration_seconds();
+                                                ColdArena& arena) {
     constexpr std::size_t kQueueDepth = 64U;
     const auto copies = static_cast<std::size_t>(options.cold_copies);
     const auto payload = static_cast<double>(options.cold_slice_bytes);
@@ -564,6 +574,275 @@ std::vector<ColdSliceResult> cold_slice_samples(const Options& options,
         cuda_check(cudaSetDevice(state.device), "select device for cold slice teardown");
         static_cast<void>(cudaStreamDestroy(state.stream));
         static_cast<void>(cudaFree(state.ring));
+    }
+    return results;
+}
+
+// A stand-in for the compute a demand load blocks: it streams one routed-expert
+// triplet out of HBM per pass, which is the property that could stop an H2D
+// from overlapping it, since the copy writes into the same HBM. The arithmetic
+// is not the model's and does not need to be; what has to be reproduced is the
+// device-memory pressure and the launch duration. Every thread stores, so no
+// pass can be eliminated as dead.
+__global__ void overlap_probe_kernel(const uint4* __restrict__ source,
+                                     std::size_t elements, unsigned int passes,
+                                     uint4* __restrict__ sink) {
+    const std::size_t stride =
+        static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    const std::size_t start =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    uint4 accumulator = make_uint4(0U, 0U, 0U, 0U);
+    for (unsigned int pass = 0; pass < passes; ++pass) {
+        for (std::size_t index = start; index < elements; index += stride) {
+            const uint4 value = source[index];
+            accumulator.x += value.x;
+            accumulator.y += value.y;
+            accumulator.z += value.z;
+            accumulator.w += value.w;
+        }
+    }
+    sink[start] = accumulator;
+}
+
+struct OverlapResult {
+    int device{};
+    std::uint64_t iterations{};
+    std::uint64_t kernel_passes{};
+    std::uint64_t kernel_read_bytes{};
+    bool verified{};
+    // Medians over options.repetitions of the whole four-arm block.
+    double copy_only_seconds{};
+    double kernel_only_seconds{};
+    double shared_stream_seconds{};
+    double split_stream_seconds{};
+    double overlap_efficiency{};
+    double shared_stream_sum_ratio{};
+    // kernel_only / copy_only. Calibration targets 1.0; report it so a reader
+    // can see whether the arm actually landed at its intended operating point.
+    double duration_ratio{};
+    // What a split stream is worth on this device at this mix.
+    double shared_over_split{};
+};
+
+// The one question experiment 0026 did not ask: with a kernel actually running,
+// does the copy proceed alongside it?
+//
+//   copy_only     - N cold slices, synchronize per copy.
+//   kernel_only   - N kernel launches, synchronize per launch. Calibrated so a
+//                   launch costs about what a copy costs, because equal terms
+//                   is where a sum and a max are furthest apart.
+//   shared_stream - copy and kernel per iteration on ONE stream, which is what
+//                   CudaBackend::upload does today. Expect copy_only +
+//                   kernel_only.
+//   split_stream  - copy on a dedicated copy stream, kernel on the compute
+//                   stream, both issued before either is awaited. Expect
+//                   max(copy_only, kernel_only) if the engines overlap.
+//
+// overlap_efficiency = (shared - split) / min(copy_only, kernel_only): 1.0 means
+// the smaller term disappeared completely, 0.0 means a copy stream is worth
+// nothing here and the mechanism is dead. The ratio is reported rather than a
+// speedup so it does not depend on the calibrated duration mix.
+std::vector<OverlapResult> overlap_samples(const Options& options,
+                                           ColdArena& arena) {
+    constexpr std::size_t kRingDepth = 4U;
+    constexpr unsigned int kBlocks = 256U;
+    constexpr unsigned int kThreads = 256U;
+    constexpr unsigned int kMaximumPasses = 4096U;
+    const auto iterations = static_cast<std::size_t>(options.overlap_copies);
+    // Start past the cold stage's slices so the two stages do not read the same
+    // offsets. ColdArena wraps, and a 16 GiB arena read in permuted order stays
+    // cache-cold either way.
+    const auto slice_base = static_cast<std::size_t>(options.cold_copies);
+    // Three matrices: what one routed expert costs to load and to execute.
+    const auto weight_bytes = options.cold_slice_bytes * 3U;
+    const auto elements = weight_bytes / sizeof(uint4);
+    const auto sink_bytes = static_cast<std::size_t>(kBlocks) * kThreads *
+                            sizeof(uint4);
+
+    std::vector<OverlapResult> results;
+    for (const int device : options.devices) {
+        cuda_check(cudaSetDevice(device), "select device for overlap arms");
+        cudaStream_t compute_stream{};
+        cudaStream_t copy_stream{};
+        cuda_check(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking),
+                   "create overlap compute stream");
+        cuda_check(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking),
+                   "create overlap copy stream");
+        void* ring = nullptr;
+        void* weights = nullptr;
+        void* sink = nullptr;
+        cuda_check(cudaMalloc(&ring, options.cold_slice_bytes * kRingDepth),
+                   "allocate overlap ring");
+        cuda_check(cudaMalloc(&weights, weight_bytes), "allocate overlap weights");
+        cuda_check(cudaMalloc(&sink, sink_bytes), "allocate overlap sink");
+        cuda_check(cudaMemset(weights, 0x31, weight_bytes), "seed overlap weights");
+        cuda_check(cudaMemset(sink, 0, sink_bytes), "clear overlap sink");
+        observe_vram(device);
+
+        const auto destination = [&](std::size_t step) {
+            return static_cast<std::byte*>(ring) +
+                   (step % kRingDepth) * options.cold_slice_bytes;
+        };
+        const auto launch = [&](unsigned int passes, cudaStream_t stream) {
+            overlap_probe_kernel<<<kBlocks, kThreads, 0U, stream>>>(
+                static_cast<const uint4*>(weights), elements, passes,
+                static_cast<uint4*>(sink));
+            cuda_check(cudaGetLastError(), "launch overlap probe kernel");
+        };
+
+        const auto copy_arm = [&](std::size_t repetition) {
+            const auto started = Clock::now();
+            for (std::size_t step = 0; step < iterations; ++step) {
+                cuda_check(cudaMemcpyAsync(
+                               destination(step),
+                               arena.slice(slice_base + repetition * iterations + step),
+                               options.cold_slice_bytes, cudaMemcpyHostToDevice,
+                               copy_stream),
+                           "overlap copy-only transfer");
+                cuda_check(cudaStreamSynchronize(copy_stream), "overlap copy-only sync");
+            }
+            return seconds_since(started);
+        };
+
+        // Calibrate against this device's own copy cost, measured here rather
+        // than assumed, so the two terms are comparable on every device.
+        const double calibration_copy_seconds = copy_arm(0U);
+        const double per_copy_seconds =
+            calibration_copy_seconds / static_cast<double>(iterations);
+        launch(1U, compute_stream);
+        cuda_check(cudaStreamSynchronize(compute_stream), "warm overlap probe kernel");
+        // Cost per pass is not constant: the first pass over the expert triplet
+        // comes from HBM, later passes hit L2, and a one-pass launch carries
+        // undiluted launch overhead. Extrapolating linearly from passes=1
+        // overshot the target by 6x on two of three devices, so measure at the
+        // current pass count and correct, rather than predicting from one point.
+        const auto launch_seconds = [&](unsigned int candidate) {
+            constexpr unsigned int kProbeLaunches = 8U;
+            launch(candidate, compute_stream);
+            cuda_check(cudaStreamSynchronize(compute_stream),
+                       "warm overlap probe calibration");
+            const auto started = Clock::now();
+            for (unsigned int probe = 0; probe < kProbeLaunches; ++probe) {
+                launch(candidate, compute_stream);
+                cuda_check(cudaStreamSynchronize(compute_stream),
+                           "measure overlap probe launch");
+            }
+            return seconds_since(started) / kProbeLaunches;
+        };
+        unsigned int passes = 1U;
+        double calibrated_launch_seconds = 0.0;
+        for (unsigned int attempt = 0; attempt < 6U; ++attempt) {
+            calibrated_launch_seconds = launch_seconds(passes);
+            if (calibrated_launch_seconds <= 0.0) break;
+            const double ratio = per_copy_seconds / calibrated_launch_seconds;
+            if (ratio > 0.85 && ratio < 1.15) break;
+            const auto next = static_cast<unsigned int>(std::clamp<double>(
+                std::llround(static_cast<double>(passes) * ratio), 1.0,
+                kMaximumPasses));
+            if (next == passes) break;
+            passes = next;
+        }
+
+        std::vector<double> copy_only;
+        std::vector<double> kernel_only;
+        std::vector<double> shared_stream;
+        std::vector<double> split_stream;
+        for (unsigned int repetition = 0; repetition < options.repetitions;
+             ++repetition) {
+            copy_only.push_back(copy_arm(repetition));
+
+            auto started = Clock::now();
+            for (std::size_t step = 0; step < iterations; ++step) {
+                launch(passes, compute_stream);
+                cuda_check(cudaStreamSynchronize(compute_stream),
+                           "overlap kernel-only sync");
+            }
+            kernel_only.push_back(seconds_since(started));
+
+            started = Clock::now();
+            for (std::size_t step = 0; step < iterations; ++step) {
+                cuda_check(cudaMemcpyAsync(
+                               destination(step),
+                               arena.slice(slice_base + repetition * iterations + step),
+                               options.cold_slice_bytes, cudaMemcpyHostToDevice,
+                               compute_stream),
+                           "overlap shared-stream transfer");
+                launch(passes, compute_stream);
+                cuda_check(cudaStreamSynchronize(compute_stream),
+                           "overlap shared-stream sync");
+            }
+            shared_stream.push_back(seconds_since(started));
+
+            started = Clock::now();
+            for (std::size_t step = 0; step < iterations; ++step) {
+                cuda_check(cudaMemcpyAsync(
+                               destination(step),
+                               arena.slice(slice_base + repetition * iterations + step),
+                               options.cold_slice_bytes, cudaMemcpyHostToDevice,
+                               copy_stream),
+                           "overlap split-stream transfer");
+                launch(passes, compute_stream);
+                cuda_check(cudaStreamSynchronize(copy_stream),
+                           "overlap split-stream copy sync");
+                cuda_check(cudaStreamSynchronize(compute_stream),
+                           "overlap split-stream kernel sync");
+            }
+            split_stream.push_back(seconds_since(started));
+        }
+
+        // Both engines must have done the work the arms claim: the last copy's
+        // destination must equal its source slice, and the kernel must have
+        // written a nonzero accumulator.
+        std::vector<std::byte> landed(options.cold_slice_bytes);
+        cuda_check(cudaMemcpy(landed.data(),
+                              destination(iterations - 1U),
+                              options.cold_slice_bytes, cudaMemcpyDeviceToHost),
+                   "read back overlap ring");
+        const auto* expected = static_cast<const std::byte*>(arena.slice(
+            slice_base + (options.repetitions - 1U) * iterations + iterations - 1U));
+        std::vector<std::byte> observed_sink(sink_bytes);
+        cuda_check(cudaMemcpy(observed_sink.data(), sink, sink_bytes,
+                              cudaMemcpyDeviceToHost),
+                   "read back overlap sink");
+
+        OverlapResult result;
+        result.device = device;
+        result.iterations = iterations;
+        result.kernel_passes = passes;
+        result.kernel_read_bytes = static_cast<std::uint64_t>(weight_bytes) * passes;
+        result.verified =
+            std::memcmp(landed.data(), expected, options.cold_slice_bytes) == 0 &&
+            std::any_of(observed_sink.begin(), observed_sink.end(),
+                        [](std::byte value) { return value != std::byte{0}; });
+        result.copy_only_seconds = median(copy_only);
+        result.kernel_only_seconds = median(kernel_only);
+        result.shared_stream_seconds = median(shared_stream);
+        result.split_stream_seconds = median(split_stream);
+        const double smaller =
+            std::min(result.copy_only_seconds, result.kernel_only_seconds);
+        result.overlap_efficiency =
+            smaller > 0.0
+                ? (result.shared_stream_seconds - result.split_stream_seconds) / smaller
+                : 0.0;
+        const double serial_sum =
+            result.copy_only_seconds + result.kernel_only_seconds;
+        result.shared_stream_sum_ratio =
+            serial_sum > 0.0 ? result.shared_stream_seconds / serial_sum : 0.0;
+        result.duration_ratio =
+            result.copy_only_seconds > 0.0
+                ? result.kernel_only_seconds / result.copy_only_seconds
+                : 0.0;
+        result.shared_over_split =
+            result.split_stream_seconds > 0.0
+                ? result.shared_stream_seconds / result.split_stream_seconds
+                : 0.0;
+        results.push_back(result);
+
+        static_cast<void>(cudaStreamDestroy(compute_stream));
+        static_cast<void>(cudaStreamDestroy(copy_stream));
+        static_cast<void>(cudaFree(ring));
+        static_cast<void>(cudaFree(weights));
+        static_cast<void>(cudaFree(sink));
     }
     return results;
 }
@@ -1063,9 +1342,22 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::cerr << "[T1] cold slice transfers\n";
+        // One registration serves both stages, and the arena is released before
+        // the later stages so its pinned pages do not perturb them.
         double cold_registration_seconds = 0.0;
-        const auto cold_slices = cold_slice_samples(options, cold_registration_seconds);
+        std::vector<ColdSliceResult> cold_slices;
+        std::vector<OverlapResult> overlaps;
+        {
+            ColdArena arena(options.cold_arena_bytes, options.cold_slice_bytes);
+            cold_registration_seconds = arena.registration_seconds();
+            std::cerr << "[T1] cold slice transfers\n";
+            cold_slices = cold_slice_samples(options, arena);
+            std::cerr << "[T1] copy/kernel overlap\n";
+            overlaps = overlap_samples(options, arena);
+        }
+        for (const auto& overlap : overlaps) {
+            if (!overlap.verified) fail("overlap arm validation failed");
+        }
 
         std::vector<std::pair<int, std::vector<double>>> allocations;
         std::vector<std::pair<int, std::vector<double>>> synchronizations;
@@ -1138,6 +1430,7 @@ int main(int argc, char** argv) {
                   << ",\"cold_arena_bytes\":" << options.cold_arena_bytes
                   << ",\"cold_slice_bytes\":" << options.cold_slice_bytes
                   << ",\"cold_copies\":" << options.cold_copies
+                  << ",\"overlap_copies\":" << options.overlap_copies
                   << ",\"checkpoint_file\":\""
                   << strata::cli::json_escape(options.checkpoint_file)
                   << "\"}";
@@ -1194,6 +1487,28 @@ int main(int argc, char** argv) {
                       << ",\"gb_s\":" << arm.gb_s << '}';
         }
         std::cout << "]}";
+        std::cout << ",\"copy_kernel_overlap\":[";
+        for (std::size_t index = 0; index < overlaps.size(); ++index) {
+            if (index != 0U) std::cout << ',';
+            const auto& overlap = overlaps[index];
+            std::cout << "{\"device\":" << overlap.device
+                      << ",\"iterations\":" << overlap.iterations
+                      << ",\"kernel_passes\":" << overlap.kernel_passes
+                      << ",\"kernel_read_bytes_per_launch\":"
+                      << overlap.kernel_read_bytes
+                      << ",\"verified\":" << (overlap.verified ? "true" : "false")
+                      << ",\"copy_only_seconds\":" << overlap.copy_only_seconds
+                      << ",\"kernel_only_seconds\":" << overlap.kernel_only_seconds
+                      << ",\"shared_stream_seconds\":" << overlap.shared_stream_seconds
+                      << ",\"split_stream_seconds\":" << overlap.split_stream_seconds
+                      << ",\"overlap_efficiency\":" << overlap.overlap_efficiency
+                      << ",\"shared_stream_sum_ratio\":"
+                      << overlap.shared_stream_sum_ratio
+                      << ",\"duration_ratio\":" << overlap.duration_ratio
+                      << ",\"shared_over_split\":" << overlap.shared_over_split
+                      << '}';
+        }
+        std::cout << ']';
         std::cout << ",\"allocation\":[";
         for (std::size_t index = 0; index < allocations.size(); ++index) {
             if (index != 0U) std::cout << ',';

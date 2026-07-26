@@ -49,6 +49,7 @@ pub struct RunConfig {
     pub vram_fraction: String,
     pub seed: String,
     pub flash_attention: bool,
+    pub pin_resident_arena: bool,
     pub chat_binary: String,
 }
 
@@ -65,6 +66,7 @@ impl Default for RunConfig {
             vram_fraction: "0.85".into(),
             seed: "33377335".into(),
             flash_attention: false,
+            pin_resident_arena: false,
             chat_binary: detect_chat_binary(),
         }
     }
@@ -131,6 +133,7 @@ impl RunConfig {
             vram_fraction,
             seed,
             flash_attention: self.flash_attention,
+            pin_resident_arena: self.pin_resident_arena,
             chat_binary: binary.to_string(),
         })
     }
@@ -147,6 +150,7 @@ pub struct ValidatedConfig {
     pub vram_fraction: f64,
     pub seed: u64,
     pub flash_attention: bool,
+    pub pin_resident_arena: bool,
     pub chat_binary: String,
 }
 
@@ -174,6 +178,9 @@ impl ValidatedConfig {
         ];
         if self.flash_attention {
             args.push("--flash-attention".into());
+        }
+        if self.pin_resident_arena {
+            args.push("--pin-resident-arena".into());
         }
         args
     }
@@ -204,6 +211,7 @@ pub fn parse_cli() -> Result<Cli, String> {
             "--help" | "-h" => return Err(help_text().into()),
             "--setup" => force_setup = true,
             "--flash-attention" => config.flash_attention = true,
+            "--pin-resident-arena" => config.pin_resident_arena = true,
             "--model" => {
                 config.model_path = next()?;
                 supplied_model = true;
@@ -244,6 +252,7 @@ Usage: strata-tui [OPTIONS]\n\n\
   --vram-fraction F           free VRAM cache fraction (max 0.95)\n\
   --seed N                    sampling seed\n\
   --flash-attention           enable the CUDA FlashAttention candidate\n\
+  --pin-resident-arena        pin the DeepSeek resident weight arena\n\
   --chat-binary PATH          strata-chat executable\n\
   --setup                     open the launch form even with a full config\n\
   -h, --help                  print this help"
@@ -352,5 +361,24 @@ mod tests {
             ..RunConfig::default()
         };
         assert!(config.validate().unwrap_err().contains("at most 2048"));
+    }
+
+    #[test]
+    fn pinned_arena_is_forwarded_to_chat() {
+        let config = RunConfig {
+            model_path: ".".into(),
+            model_type: ModelType::DeepSeek,
+            context_size: "2048".into(),
+            pin_resident_arena: true,
+            chat_binary: "strata-chat".into(),
+            ..RunConfig::default()
+        }
+        .validate()
+        .unwrap();
+        assert!(
+            config
+                .command_args()
+                .contains(&"--pin-resident-arena".into())
+        );
     }
 }

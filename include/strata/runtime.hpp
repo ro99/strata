@@ -29,6 +29,7 @@ struct RuntimeConfig {
     bool enable_flash_attention{};
     bool enable_incremental_kv_continuation{true};
     bool deepseek_block_kv_cache{};
+    bool pin_resident_arena{};
 };
 
 struct GenerationMetrics {

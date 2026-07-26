@@ -89,12 +89,13 @@ pub enum SetupField {
     VramFraction,
     Seed,
     FlashAttention,
+    PinResidentArena,
     ChatBinary,
     Launch,
 }
 
 impl SetupField {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ModelType,
         Self::ModelPath,
         Self::Devices,
@@ -104,6 +105,7 @@ impl SetupField {
         Self::VramFraction,
         Self::Seed,
         Self::FlashAttention,
+        Self::PinResidentArena,
         Self::ChatBinary,
         Self::Launch,
     ];
@@ -119,13 +121,17 @@ impl SetupField {
             Self::VramFraction => "VRAM FRACTION",
             Self::Seed => "SEED",
             Self::FlashAttention => "ATTENTION",
+            Self::PinResidentArena => "RESIDENT ARENA",
             Self::ChatBinary => "RUNTIME",
             Self::Launch => "",
         }
     }
 
     const fn is_text(self) -> bool {
-        !matches!(self, Self::ModelType | Self::FlashAttention | Self::Launch)
+        !matches!(
+            self,
+            Self::ModelType | Self::FlashAttention | Self::PinResidentArena | Self::Launch
+        )
     }
 }
 
@@ -419,6 +425,9 @@ impl App {
             KeyCode::Char(' ') if self.current_setup_field() == SetupField::FlashAttention => {
                 self.setup.flash_attention = !self.setup.flash_attention;
             }
+            KeyCode::Char(' ') if self.current_setup_field() == SetupField::PinResidentArena => {
+                self.setup.pin_resident_arena = !self.setup.pin_resident_arena;
+            }
             KeyCode::Left => self.setup_cursor_left(),
             KeyCode::Right => self.setup_cursor_right(),
             KeyCode::Home => self.setup_cursor = 0,
@@ -601,6 +610,13 @@ impl App {
                     "●  CUDA FlashAttention".into()
                 } else {
                     "○  Scalar reference".into()
+                }
+            }
+            SetupField::PinResidentArena => {
+                if self.setup.pin_resident_arena {
+                    "●  Pinned".into()
+                } else {
+                    "○  Pageable".into()
                 }
             }
             SetupField::ChatBinary => self.setup.chat_binary.clone(),

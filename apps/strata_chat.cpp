@@ -35,6 +35,7 @@ struct Options {
     bool flash_attention{};
     bool incremental_kv_continuation{true};
     bool block_kv_cache{};
+    bool pin_resident_arena{};
     bool jsonl_protocol{};
 };
 
@@ -45,7 +46,7 @@ void usage() {
         << "                    [--temperature F] [--seed N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention] [--full-reprefill]\n"
-        << "                    [--block-kv-cache]\n"
+        << "                    [--block-kv-cache] [--pin-resident-arena]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
@@ -69,6 +70,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--block-kv-cache") {
             options.block_kv_cache = true;
+            continue;
+        }
+        if (argument == "--pin-resident-arena") {
+            options.pin_resident_arena = true;
             continue;
         }
         if (index + 1 >= argc) return false;
@@ -397,7 +402,9 @@ int main(int argc, char** argv) {
                << ",\"incremental_kv_continuation\":"
                << (options.incremental_kv_continuation ? "true" : "false")
                << ",\"block_kv_cache\":"
-               << (options.block_kv_cache ? "true" : "false");
+               << (options.block_kv_cache ? "true" : "false")
+               << ",\"pin_resident_arena\":"
+               << (options.pin_resident_arena ? "true" : "false");
         protocol_event("hello", fields.str());
         protocol_message("status", "Loading model");
     }
@@ -433,6 +440,7 @@ int main(int argc, char** argv) {
     config.enable_incremental_kv_continuation =
         options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;
+    config.pin_resident_arena = options.pin_resident_arena;
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {

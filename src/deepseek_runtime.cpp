@@ -2470,6 +2470,28 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
             config.enable_flash_attention, maximum_score_rows,
             config.flash_attention_minimum_rows);
     if (batch_cuda) {
+        const auto sliding_begin = position_base + 1U > kWindow
+            ? position_base + 1U - kWindow : 0U;
+        const auto sliding_end = last_position + 1U;
+        const auto sliding_rows = sliding_end - sliding_begin;
+        const auto historical_sliding_rows = position_base - sliding_begin;
+        const auto compressed_rows = ratio == 0U
+            ? 0U : (last_position + 1U) / ratio;
+        const auto key_rows = sliding_rows + compressed_rows;
+        std::vector<float> gathered(
+            static_cast<std::size_t>(key_rows) * kHeadDim);
+        for (std::uint32_t row = 0U; row < historical_sliding_rows; ++row) {
+            auto source = kv_row(layer, Dsv4KvBlockKind::Sliding,
+                                 sliding_begin + row);
+            if (!source.ok()) {
+                append_errors(result, std::move(source.errors));
+                return result;
+            }
+            std::copy(source.value.begin(), source.value.end(),
+                      gathered.begin() +
+                          static_cast<std::ptrdiff_t>(row) * kHeadDim);
+        }
+
         subphase_started = std::chrono::steady_clock::now();
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto position = position_base + row;
@@ -2483,6 +2505,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
             if (!result.ok()) return result;
             result = compressor(layer, input_row, position);
             if (!result.ok()) return result;
+            std::copy(kv_row_values.begin(), kv_row_values.end(),
+                      gathered.begin() + static_cast<std::ptrdiff_t>(
+                          historical_sliding_rows + row) * kHeadDim);
         }
         graph_stats.attention_kv_nanoseconds +=
             elapsed_nanoseconds(subphase_started);
@@ -2491,26 +2516,6 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
         if (!sink.ok()) {
             append_errors(result, std::move(sink.errors));
             return result;
-        }
-        const auto sliding_begin = position_base + 1U > kWindow
-            ? position_base + 1U - kWindow : 0U;
-        const auto sliding_end = last_position + 1U;
-        const auto sliding_rows = sliding_end - sliding_begin;
-        const auto compressed_rows = ratio == 0U
-            ? 0U : (last_position + 1U) / ratio;
-        const auto key_rows = sliding_rows + compressed_rows;
-        std::vector<float> gathered(
-            static_cast<std::size_t>(key_rows) * kHeadDim);
-        for (std::uint32_t row = 0U; row < sliding_rows; ++row) {
-            auto source = kv_row(layer, Dsv4KvBlockKind::Sliding,
-                                 sliding_begin + row);
-            if (!source.ok()) {
-                append_errors(result, std::move(source.errors));
-                return result;
-            }
-            std::copy(source.value.begin(), source.value.end(),
-                      gathered.begin() +
-                          static_cast<std::ptrdiff_t>(row) * kHeadDim);
         }
         for (std::uint32_t row = 0U; row < compressed_rows; ++row) {
             auto source = kv_row(layer, layer_state.compressor.kind, row);

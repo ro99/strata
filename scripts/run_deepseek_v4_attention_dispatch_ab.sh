@@ -40,7 +40,7 @@ set -euo pipefail
 # cold; decode is what is under test, so nothing longer is justified.
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
+model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-attention-dispatch-ab"}
 runner=${RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 maximum_new_tokens=${MAX_NEW_TOKENS:-128}

@@ -20,7 +20,7 @@ std::filesystem::path tokenizer_fixture() {
 
 std::filesystem::path deepseek_tokenizer_fixture() {
     return std::filesystem::path(STRATA_SOURCE_DIR) /
-           "models/DeepSeek-V4-Flash-DSpark/tokenizer.json";
+           "models/dsv4f/tokenizer.json";
 }
 
 }  // namespace
@@ -44,8 +44,24 @@ TEST_CASE("chat rendering includes prior user and assistant turns") {
             "<|user|>And its population?<|assistant|><think></think>");
     REQUIRE(strata::render_deepseek_v4_chat_prompt(messages) ==
             "<｜begin▁of▁sentence｜><｜User｜>Capital of France?"
-            "<｜Assistant｜></think>Paris<｜User｜>And its population?"
+            "<｜Assistant｜></think>Paris<｜end▁of▁sentence｜>"
+            "<｜User｜>And its population?"
             "<｜Assistant｜></think>");
+}
+
+TEST_CASE("DeepSeek V4 Flash 0731 rendering follows system and tool-result encoding") {
+    const std::array messages{
+        strata::ChatMessage{strata::ChatRole::System, "Be concise."},
+        strata::ChatMessage{strata::ChatRole::User, "Check it."},
+        strata::ChatMessage{strata::ChatRole::Assistant, "Calling tools."},
+        strata::ChatMessage{strata::ChatRole::Tool, "{\"ok\":true}"},
+        strata::ChatMessage{strata::ChatRole::Tool, "done"},
+    };
+    REQUIRE(strata::render_deepseek_v4_chat_prompt(messages, true) ==
+            "<｜begin▁of▁sentence｜>Be concise.<｜User｜>Check it."
+            "<｜Assistant｜></think>Calling tools.<｜end▁of▁sentence｜>"
+            "<｜User｜><tool_result>{\"ok\":true}</tool_result>\n\n"
+            "<tool_result>done</tool_result><｜Assistant｜><think>");
 }
 
 TEST_CASE("real GLM tokenizer produces the frozen baseline prompt ids when available") {

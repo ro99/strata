@@ -772,18 +772,28 @@ std::string render_deepseek_v4_user_prompt(std::string_view user_text,
 std::string render_deepseek_v4_chat_prompt(
     std::span<const ChatMessage> messages, bool enable_thinking) {
     std::string output = "<｜begin▁of▁sentence｜>";
+    bool continuing_tool_results = false;
     for (const auto& message : messages) {
         switch (message.role) {
-            case ChatRole::System: output += "<｜System｜>"; break;
-            case ChatRole::User: output += "<｜User｜>"; break;
-            case ChatRole::Assistant: output += "<｜Assistant｜>"; break;
-            case ChatRole::Tool: output += "<｜Tool｜>"; break;
+            case ChatRole::System:
+                output += message.content;
+                continuing_tool_results = false;
+                continue;
+            case ChatRole::User:
+                output += "<｜User｜>" + message.content;
+                continuing_tool_results = false;
+                continue;
+            case ChatRole::Assistant:
+                output += "<｜Assistant｜></think>" + message.content +
+                          "<｜end▁of▁sentence｜>";
+                continuing_tool_results = false;
+                continue;
+            case ChatRole::Tool:
+                output += continuing_tool_results ? "\n\n" : "<｜User｜>";
+                output += "<tool_result>" + message.content + "</tool_result>";
+                continuing_tool_results = true;
+                continue;
         }
-        if (!message.name.empty()) output += message.name + ": ";
-        if (message.role == ChatRole::Assistant) {
-            output += enable_thinking ? "<think>" : "</think>";
-        }
-        output += message.content;
     }
     output += "<｜Assistant｜>";
     output += enable_thinking ? "<think>" : "</think>";

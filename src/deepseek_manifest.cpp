@@ -244,10 +244,10 @@ std::string_view to_string(Dsv4TensorEncoding encoding) noexcept {
     return "unknown";
 }
 
-Dsv4ManifestResult build_deepseek_v4_flash_dspark_index_manifest(
+Dsv4ManifestResult build_deepseek_v4_flash_0731_index_manifest(
     SafetensorsIndex index) {
     Dsv4ManifestResult result;
-    const auto expected = deepseek_v4_flash_dspark_spec();
+    const auto expected = deepseek_v4_flash_0731_spec();
     result.manifest.indexed_tensor_bytes = index.total_size;
     result.manifest.shards = std::move(index.shards);
     if (index.total_size != expected.source.indexed_tensor_bytes) {
@@ -343,12 +343,12 @@ Dsv4ManifestResult build_deepseek_v4_flash_dspark_index_manifest(
     return result;
 }
 
-Dsv4ManifestResult validate_deepseek_v4_flash_dspark_checkpoint(
+Dsv4ManifestResult validate_deepseek_v4_flash_0731_checkpoint(
     const std::string& model_directory, Dsv4IndexManifest manifest,
     const Dsv4CheckpointOptions& options) {
     Dsv4ManifestResult result;
     result.manifest = std::move(manifest);
-    const auto expected = deepseek_v4_flash_dspark_spec();
+    const auto expected = deepseek_v4_flash_0731_spec();
     std::unordered_map<std::string, std::size_t> tensors;
     tensors.reserve(result.manifest.tensors.size());
     for (std::size_t index = 0U; index < result.manifest.tensors.size(); ++index) {

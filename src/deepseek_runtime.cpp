@@ -1462,7 +1462,7 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
         if (!loaded.ok()) append_errors(target, std::move(loaded.errors));
     };
 
-    const auto ratios = deepseek_v4_flash_dspark_spec().deepseek_v4.compression_ratios;
+    const auto ratios = deepseek_v4_flash_0731_spec().deepseek_v4.compression_ratios;
     const auto preload_layer = [this, &preload, &ratios](
         ValidationResult& target, std::uint32_t layer) {
         const auto slot = layer_device(layer);
@@ -1606,7 +1606,7 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
         result = kv_cache->reset_sequence(active_sequence);
         if (!result.ok()) return result;
     }
-    const auto ratios = deepseek_v4_flash_dspark_spec().deepseek_v4.compression_ratios;
+    const auto ratios = deepseek_v4_flash_0731_spec().deepseek_v4.compression_ratios;
     for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
         auto& state = attention_state[layer];
         if (kv_cache == nullptr) {
@@ -2823,7 +2823,7 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
     std::uint32_t position, Dsv4Route& output) {
     ValidationResult result;
     const auto prefix = layer_prefix(layer) + "ffn.";
-    const auto& router = deepseek_v4_flash_dspark_spec().router;
+    const auto& router = deepseek_v4_flash_0731_spec().router;
     Dsv4RouteResult route;
     if (layer < 3U) {
         const auto name = prefix + "gate.tid2eid";
@@ -3484,7 +3484,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.sampling_temperature, "DeepSeek");
     if (!result.ok()) return result;
     const auto model_context =
-        deepseek_v4_flash_dspark_spec().max_context_tokens;
+        deepseek_v4_flash_0731_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
         config.maximum_context_tokens > model_context) {
         result.errors.emplace_back(

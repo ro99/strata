@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
+model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-direct-read-ab"}
 candidate=${CANDIDATE_BINARY:-"${repo_root}/build/strata-deepseek-run"}
 reference=${REFERENCE_BINARY:-"/tmp/strata-dsv4-direct-read-baseline/build/strata-deepseek-run"}

@@ -300,7 +300,7 @@ fn parse_f64(label: &str, text: &str) -> Result<f64, String> {
 }
 
 fn detect_model() -> (String, ModelType, String) {
-    let deepseek = Path::new("models/DeepSeek-V4-Flash-DSpark");
+    let deepseek = Path::new("models/dsv4f");
     if deepseek.is_dir() {
         return (
             deepseek.to_string_lossy().into_owned(),

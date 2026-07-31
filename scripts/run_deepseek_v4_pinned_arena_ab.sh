@@ -16,7 +16,7 @@ set -euo pipefail
 #   output byte changing.
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
+model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-pinned-arena-ab"}
 runner=${RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 maximum_new_tokens=${MAX_NEW_TOKENS:-128}

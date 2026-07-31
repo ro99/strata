@@ -169,9 +169,9 @@ ValidationResult validate_model(const ModelSpec& spec) {
     return result;
 }
 
-ModelSpec deepseek_v4_flash_dspark_spec() {
+ModelSpec deepseek_v4_flash_0731_spec() {
     ModelSpec spec;
-    spec.name = "deepseek-ai/DeepSeek-V4-Flash-DSpark";
+    spec.name = "deepseek-ai/DeepSeek-V4-Flash-0731";
     spec.architecture = ArchitectureKind::DeepSeek;
     spec.attention = AttentionKind::HybridCompressedSparse;
     spec.router.selection = RouterSelectionKind::NoAuxTc;
@@ -186,8 +186,8 @@ ModelSpec deepseek_v4_flash_dspark_spec() {
 
     spec.mixed_quantization.kind = QuantizationKind::NativeFp4Fp8;
     spec.native_fp4_fp8 = {8U, 128U, 8U, 128U, 128U, 4U, 32U, true};
-    spec.source.repository = "deepseek-ai/DeepSeek-V4-Flash-DSpark";
-    spec.source.revision = "62af8fffb2f7030cac4de2f0169f5b8d1101b646";
+    spec.source.repository = "deepseek-ai/DeepSeek-V4-Flash-0731";
+    spec.source.revision = "9e165c30e2704aec5d9d593cce3eebd58bbef1cb";
     spec.source.index_sha256 =
         "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b";
     spec.source.tensor_count = 72'317U;
@@ -232,22 +232,22 @@ ModelSpec deepseek_v4_flash_dspark_spec() {
     return spec;
 }
 
-ValidationResult validate_deepseek_v4_flash_dspark(const ModelSpec& spec) {
+ValidationResult validate_deepseek_v4_flash_0731(const ModelSpec& spec) {
     auto result = validate_model(spec);
-    const auto expected = deepseek_v4_flash_dspark_spec();
+    const auto expected = deepseek_v4_flash_0731_spec();
     const auto require = [&result](bool condition, std::string_view message) {
         if (!condition) result.errors.emplace_back(message);
     };
     require(spec.source.repository == expected.source.repository &&
                 spec.source.revision == expected.source.revision &&
                 spec.source.index_sha256 == expected.source.index_sha256,
-            "unexpected DeepSeek-V4-Flash-DSpark source identity");
+            "unexpected DeepSeek-V4-Flash-0731 source identity");
     require(spec.source.tensor_count == expected.source.tensor_count &&
                 spec.source.indexed_tensor_bytes == expected.source.indexed_tensor_bytes &&
                 spec.source.shard_file_bytes == expected.source.shard_file_bytes &&
                 spec.source.main_shards == expected.source.main_shards &&
                 spec.source.mtp_shards == expected.source.mtp_shards,
-            "unexpected DeepSeek-V4-Flash-DSpark checkpoint extent");
+            "unexpected DeepSeek-V4-Flash-0731 checkpoint extent");
     require(spec.architecture == expected.architecture &&
                 spec.attention == expected.attention &&
                 spec.hidden_size == expected.hidden_size &&
@@ -255,7 +255,7 @@ ValidationResult validate_deepseek_v4_flash_dspark(const ModelSpec& spec) {
                 spec.max_context_tokens == expected.max_context_tokens &&
                 spec.shared_experts == expected.shared_experts &&
                 spec.expert_intermediate_size == expected.expert_intermediate_size,
-            "unexpected DeepSeek-V4-Flash-DSpark architecture dimensions");
+            "unexpected DeepSeek-V4-Flash-0731 architecture dimensions");
     require(spec.router.selection == expected.router.selection &&
                 spec.router.scoring == expected.router.scoring &&
                 spec.router.routed_experts == expected.router.routed_experts &&
@@ -263,7 +263,7 @@ ValidationResult validate_deepseek_v4_flash_dspark(const ModelSpec& spec) {
                 spec.router.normalize_topk == expected.router.normalize_topk &&
                 spec.router.selection_bias == expected.router.selection_bias &&
                 spec.router.routed_scale == expected.router.routed_scale,
-            "unexpected DeepSeek-V4-Flash-DSpark router semantics");
+            "unexpected DeepSeek-V4-Flash-0731 router semantics");
     const auto& actual_quantization = spec.native_fp4_fp8;
     const auto& wanted_quantization = expected.native_fp4_fp8;
     require(spec.mixed_quantization.kind == QuantizationKind::NativeFp4Fp8 &&
@@ -278,7 +278,7 @@ ValidationResult validate_deepseek_v4_flash_dspark(const ModelSpec& spec) {
                 actual_quantization.fp4_group_size == wanted_quantization.fp4_group_size &&
                 actual_quantization.power_of_two_scales ==
                     wanted_quantization.power_of_two_scales,
-            "unexpected DeepSeek-V4-Flash-DSpark native quantization");
+            "unexpected DeepSeek-V4-Flash-0731 native quantization");
     const auto& actual = spec.deepseek_v4;
     const auto& wanted = expected.deepseek_v4;
     require(actual.attention_heads == wanted.attention_heads &&
@@ -302,7 +302,7 @@ ValidationResult validate_deepseek_v4_flash_dspark(const ModelSpec& spec) {
                 actual.swiglu_limit == wanted.swiglu_limit &&
                 actual.compression_ratios == wanted.compression_ratios &&
                 actual.dspark_target_layers == wanted.dspark_target_layers,
-            "unexpected DeepSeek-V4-Flash-DSpark hybrid attention, mHC, or DSpark contract");
+            "unexpected DeepSeek-V4-Flash-0731 hybrid attention, mHC, or DSpark contract");
     return result;
 }
 

@@ -1,7 +1,7 @@
 # GLM-5.2 and DeepSeek-V4 bring-up plan
 
 Strata starts with frontier-scale MoE models. GLM-5.2 is the primary target from
-the first branch; DeepSeek-V4-Flash-DSpark is the first fully resident proof of
+the first branch; DeepSeek-V4-Flash-0731 is the first fully resident proof of
 concept. There is no smaller pretrained model in the critical path.
 
 Status: this is the bring-up contract and retains imperative steps even after
@@ -15,10 +15,10 @@ listed here.
 The first implementation must pin revisions rather than follow moving model
 repository heads.
 
-| Property | GLM-5.2 | DeepSeek-V4-Flash-DSpark |
+| Property | GLM-5.2 | DeepSeek-V4-Flash-0731 |
 |---|---:|---:|
-| Repository | `QuantTrio/GLM-5.2-Int4-Int8Mix` | `deepseek-ai/DeepSeek-V4-Flash-DSpark` |
-| Revision inspected | `1d3bcfe5ec549ecd000fd80b37f191183842e983` | `62af8fffb2f7030cac4de2f0169f5b8d1101b646` |
+| Repository | `QuantTrio/GLM-5.2-Int4-Int8Mix` | `deepseek-ai/DeepSeek-V4-Flash-0731` |
+| Revision inspected | `1d3bcfe5ec549ecd000fd80b37f191183842e983` | `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` |
 | Index SHA-256 | `43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b` | `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b` |
 | Indexed tensors | 177,569 | 72,317 |
 | Weight shards | 128 (124 main + 4 MTP) | 48 |
@@ -28,7 +28,8 @@ repository heads.
 | Source precision | INT4/INT8 packed weights plus BF16/F32 | FP4 experts, FP8 spine, BF16/F32 sensitive tensors |
 | Strata handling | Preserve native extents; no additional quantization | Preserve native extents; no additional quantization |
 
-These values were read from the pinned target repositories on 2026-07-14. The
+The GLM values were read on 2026-07-14 and the DeepSeek values were refreshed
+for 0731 on 2026-07-31. The
 downloader must verify the pinned revision, per-file size/hash, index totals, and
 license files again before transferring weights.
 
@@ -199,7 +200,7 @@ Gate: correctness passes, median tok/s exceeds the baseline outside run
 variance, and no hidden quality, routing, precision, memory, or I/O difference
 explains the result.
 
-## Target B — DeepSeek-V4-Flash-DSpark
+## Target B — DeepSeek-V4-Flash-0731
 
 This target is not a generic older-DeepSeek stand-in. It introduces architecture
 and storage formats that Strata must support natively:
@@ -284,6 +285,6 @@ contract and median end-to-end throughput improves outside variance.
 
 No third checkpoint is on the critical path. Reusable dense, MoE, attention,
 quantization, and scheduler operations should remain architecture-neutral, but
-new model adapters wait until GLM-5.2 and DeepSeek-V4-Flash-DSpark are working.
+new model adapters wait until GLM-5.2 and DeepSeek-V4-Flash-0731 are working.
 The project is judged by these two targets, not by the length of a compatibility
 list.

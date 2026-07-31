@@ -31,7 +31,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 #     './scripts/run_deepseek_v4_device_moe_ab.sh'
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
+model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
 reference_binary=${REFERENCE_BINARY:-"${repo_root}/build/strata-deepseek-run"}
 candidate_binary=${CANDIDATE_BINARY:-"${repo_root}/build/strata-deepseek-run"}
 smoke=${SMOKE:-0}

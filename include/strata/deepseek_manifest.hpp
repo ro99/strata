@@ -85,9 +85,9 @@ struct Dsv4ManifestResult {
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
-[[nodiscard]] Dsv4ManifestResult build_deepseek_v4_flash_dspark_index_manifest(
+[[nodiscard]] Dsv4ManifestResult build_deepseek_v4_flash_0731_index_manifest(
     SafetensorsIndex index);
-[[nodiscard]] Dsv4ManifestResult validate_deepseek_v4_flash_dspark_checkpoint(
+[[nodiscard]] Dsv4ManifestResult validate_deepseek_v4_flash_0731_checkpoint(
     const std::string& model_directory, Dsv4IndexManifest manifest,
     const Dsv4CheckpointOptions& options = {});
 [[nodiscard]] std::string_view to_string(Dsv4TensorRole role) noexcept;

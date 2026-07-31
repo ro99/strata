@@ -5,6 +5,7 @@
 #include "strata/deepseek_ops.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -45,14 +46,14 @@ Dsv4CheckpointOpenResult Dsv4CheckpointReader::open(std::string model_directory,
         result.errors = std::move(index.errors);
         return result;
     }
-    auto built = build_deepseek_v4_flash_dspark_index_manifest(std::move(index.value));
+    auto built = build_deepseek_v4_flash_0731_index_manifest(std::move(index.value));
     if (!built.ok()) {
         result.errors = std::move(built.errors);
         return result;
     }
     Dsv4CheckpointOptions options;
     options.require_read_only = require_read_only;
-    auto validated = validate_deepseek_v4_flash_dspark_checkpoint(
+    auto validated = validate_deepseek_v4_flash_0731_checkpoint(
         model_directory, std::move(built.manifest), options);
     if (!validated.ok()) {
         result.errors = std::move(validated.errors);
@@ -71,6 +72,21 @@ Dsv4CheckpointOpenResult Dsv4CheckpointReader::open(std::string model_directory,
                                        reader->manifest_.shards, "DeepSeek");
     if (!opened.ok()) {
         result.errors = std::move(opened.errors);
+        return result;
+    }
+    constexpr std::array<std::byte, 8> expected_signature{
+        std::byte{0x8cU}, std::byte{0x54U}, std::byte{0xa2U}, std::byte{0x44U},
+        std::byte{0xccU}, std::byte{0x54U}, std::byte{0x6cU}, std::byte{0x55U}};
+    const auto signature = reader->read_slice(
+        "layers.0.ffn.experts.0.w1.weight", 0U, expected_signature.size());
+    if (!signature.ok()) {
+        result.errors = signature.errors;
+        return result;
+    }
+    if (!std::equal(signature.value.begin(), signature.value.end(),
+                    expected_signature.begin())) {
+        result.errors.emplace_back(
+            "checkpoint weights are not DeepSeek-V4-Flash-0731");
         return result;
     }
     result.value = std::move(reader);

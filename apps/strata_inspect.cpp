@@ -326,7 +326,7 @@ int main(int argc, char** argv) {
         });
     const bool deepseek_v4 = has_deepseek_embedding && has_deepseek_mhc;
     if (deepseek_v4) {
-        auto result = strata::build_deepseek_v4_flash_dspark_index_manifest(
+        auto result = strata::build_deepseek_v4_flash_0731_index_manifest(
             std::move(parsed.value));
         if (!result.ok()) {
             for (const auto& error : result.errors) std::cerr << "error: " << error << '\n';
@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
             strata::Dsv4CheckpointOptions options;
             options.require_all_shards = !allow_incomplete;
             options.require_read_only = require_read_only;
-            result = strata::validate_deepseek_v4_flash_dspark_checkpoint(
+            result = strata::validate_deepseek_v4_flash_0731_checkpoint(
                 model_directory, std::move(result.manifest), options);
             if (!result.ok()) {
                 for (const auto& error : result.errors) {
@@ -353,7 +353,7 @@ int main(int argc, char** argv) {
         if (json) {
             std::cout << "{\n"
                       << "  \"status\": \"ok\",\n"
-                      << "  \"architecture\": \"deepseek_v4_flash_dspark\",\n"
+                      << "  \"architecture\": \"deepseek_v4_flash_0731\",\n"
                       << "  \"tensor_count\": " << manifest.tensors.size() << ",\n"
                       << "  \"indexed_tensor_bytes\": "
                       << manifest.indexed_tensor_bytes << ",\n"
@@ -376,7 +376,7 @@ int main(int argc, char** argv) {
                       << "}\n";
         } else {
             std::cout << "status=ok\n"
-                      << "architecture=deepseek_v4_flash_dspark\n"
+                      << "architecture=deepseek_v4_flash_0731\n"
                       << "tensor_count=" << manifest.tensors.size() << '\n'
                       << "indexed_tensor_bytes=" << manifest.indexed_tensor_bytes << '\n'
                       << "shards=" << manifest.shards.size() << '\n'

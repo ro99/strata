@@ -6,7 +6,7 @@ set -euo pipefail
 # attention and re-measure the candidate's 256-row hybrid crossover.
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
+model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
 baseline=${BASELINE_RUNNER:?set BASELINE_RUNNER to the main executable}
 candidate=${CANDIDATE_RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-batched-attention-rows-matrix"}

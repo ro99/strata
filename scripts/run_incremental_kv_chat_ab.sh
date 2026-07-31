@@ -5,7 +5,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 model_type=${MODEL_TYPE:-deepseek}
 if [[ "${model_type}" == deepseek ]]; then
-    default_model_dir="${repo_root}/models/DeepSeek-V4-Flash-DSpark"
+    default_model_dir="${repo_root}/models/dsv4f"
 else
     default_model_dir="${repo_root}/models/glm52"
 fi

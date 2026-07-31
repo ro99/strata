@@ -38,7 +38,7 @@ strata::SafetensorsIndex synthetic_dsv4_index() {
     add("hc_head_fn", 48U);
     add("hc_head_scale", 48U);
 
-    const auto compression = strata::deepseek_v4_flash_dspark_spec()
+    const auto compression = strata::deepseek_v4_flash_0731_spec()
                                  .deepseek_v4.compression_ratios;
     for (std::uint32_t block = 0U; block < 46U; ++block) {
         const bool dspark = block >= 43U;
@@ -108,8 +108,8 @@ strata::SafetensorsIndex synthetic_dsv4_index() {
 
 }  // namespace
 
-TEST_CASE("pinned DeepSeek V4 DSpark index classifies the native checkpoint") {
-    const auto result = strata::build_deepseek_v4_flash_dspark_index_manifest(
+TEST_CASE("pinned DeepSeek V4 Flash 0731 index classifies the native checkpoint") {
+    const auto result = strata::build_deepseek_v4_flash_0731_index_manifest(
         synthetic_dsv4_index());
     REQUIRE(result.ok());
     REQUIRE(result.manifest.tensors.size() == 72'317U);
@@ -125,14 +125,14 @@ TEST_CASE("pinned DeepSeek V4 manifest rejects a missing FP4 scale") {
         index.entries.begin(), index.entries.end(), [](const auto& entry) {
             return entry.name == "layers.0.ffn.experts.0.w1.scale";
         }));
-    const auto result = strata::build_deepseek_v4_flash_dspark_index_manifest(
+    const auto result = strata::build_deepseek_v4_flash_0731_index_manifest(
         std::move(index));
     REQUIRE(!result.ok());
 }
 
-TEST_CASE("real DeepSeek V4 DSpark checkpoint opens without format conversion when available") {
+TEST_CASE("real DeepSeek V4 Flash 0731 checkpoint opens without format conversion when available") {
     const auto model = std::filesystem::path(STRATA_SOURCE_DIR) /
-                       "models/DeepSeek-V4-Flash-DSpark";
+                       "models/dsv4f";
     if (!std::filesystem::exists(model / "model.safetensors.index.json")) {
         SKIP("pinned DeepSeek checkpoint fixture is absent");
     }
@@ -145,7 +145,7 @@ TEST_CASE("real DeepSeek V4 DSpark checkpoint opens without format conversion wh
     const auto bytes = checkpoint.value->read_slice(tensor->name, 0U, 8U);
     REQUIRE(bytes.ok());
     constexpr std::array<std::uint8_t, 8> expected{
-        0xacU, 0x54U, 0xa2U, 0x44U, 0xccU, 0x54U, 0x6cU, 0x55U};
+        0x8cU, 0x54U, 0xa2U, 0x44U, 0xccU, 0x54U, 0x6cU, 0x55U};
     for (std::size_t index = 0U; index < expected.size(); ++index) {
         REQUIRE(std::to_integer<std::uint8_t>(bytes.value[index]) == expected[index]);
     }

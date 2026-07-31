@@ -14,7 +14,7 @@ This is the machine the project is built and measured on. It's an ordinary works
 | RAM | 251 GiB DDR4 |
 | CPU | Xeon E5-2680 v4 |
 
-On this hardware Strata currently runs two checkpoints: DeepSeek-V4-Flash-DSpark (167 GB, 43 layers, 256 experts, top-6), staged into host RAM so decode does not touch storage after warm-up, and GLM-5.2 (405 GB, 78 layers, 256 experts, top-8), which is larger than the machine's combined VRAM and RAM and therefore runs directly against the checkpoint on disk.
+On this hardware Strata supports two checkpoints: DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into host RAM so decode does not touch storage after warm-up, and GLM-5.2 (405 GB, 78 layers, 256 experts, top-8), which is larger than the machine's combined VRAM and RAM and therefore runs directly against the checkpoint on disk.
 
 ## What "exact" means here
 
@@ -49,7 +49,7 @@ Place a checkpoint under `models/` in its original Safetensors form. Strata read
 
 ```bash
 ./build/strata-chat \
-  --model models/DeepSeek-V4-Flash-DSpark --model-type deepseek \
+  --model models/dsv4f --model-type deepseek \
   --context-size 8192 --max-new 256 --devices 0,1,2
 ```
 
@@ -94,21 +94,27 @@ It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`,
 
 | Model | Layout | Native precision | Status on this hardware |
 |---|---|---|---|
-| DeepSeek-V4-Flash-DSpark | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
+| DeepSeek-V4-Flash-0731 | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
 | GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 experts, INT8 group-128 linears, BF16/F32 | Larger than combined memory; I/O-dependent |
 
 Both run their declared attention and routing mechanisms as-is: hybrid compressed attention, manifold-constrained hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek; MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for GLM.
 
-Measured on the machine above:
+The current 0731 checkpoint has not yet been benchmarked. For context, the last
+validated DeepSeek measurement used the now-unsupported preview checkpoint:
 
-| | DeepSeek-V4 | GLM-5.2 |
+| | DeepSeek V4 preview (historical) | GLM-5.2 |
 |---|---:|---:|
 | Checkpoint size | 167 GB | 405 GB |
 | Decode | ~4.0 tok/s | 0.283 tok/s |
 | Checkpoint reads during decode | 0 | 910 GB/run |
 | Load time | ~22 s | ~23 s |
 
-DeepSeek's number is from an 18-token prompt, 152 generated tokens, three GPUs, 216 GiB host ceiling, `--flash-attention --pin-resident-arena`. GLM's is a median of three runs, 30-token prompt, 128 generated tokens. Neither number transfers to a different context length or prompt — see [docs/experiments/](docs/experiments/) for the full records and their operating points.
+The historical DeepSeek number is from an 18-token prompt, 152 generated tokens,
+three GPUs, 216 GiB host ceiling, `--flash-attention --pin-resident-arena`; it
+must not be attributed to 0731. GLM's is a median of three runs, 30-token prompt,
+128 generated tokens. Neither number transfers to a different context length or
+prompt — see [docs/experiments/](docs/experiments/) for the full records and
+their operating points.
 
 The difference between the two rows is mostly explained by whether the checkpoint fits in RAM. DeepSeek does, so decode after warm-up doesn't touch storage. GLM doesn't, so every decode step pays for storage traffic. Reducing that cost for checkpoints in GLM's position, without changing precision or routing, is the current research direction.
 

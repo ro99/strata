@@ -1,7 +1,7 @@
 # Research roadmap
 
 GLM-5.2 is the primary target from the first implementation branch.
-DeepSeek-V4-Flash-DSpark is the native mixed-FP4/FP8 resident proof of concept.
+DeepSeek-V4-Flash-0731 is the native mixed-FP4/FP8 resident proof of concept.
 Every phase answers one bounded question against one of those real checkpoints.
 
 Status snapshot: this roadmap mixes completed foundations with open promotion

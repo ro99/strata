@@ -94,7 +94,7 @@ extents inside Safetensors shards when:
 - runtime opens all source files read-only;
 - kernels implement the declared native format without conversion.
 
-QuantTrio/GLM-5.2-Int4-Int8Mix and DeepSeek-V4-Flash-DSpark use this path so
+QuantTrio/GLM-5.2-Int4-Int8Mix and DeepSeek-V4-Flash-0731 use this path so
 Strata does not create redundant 405 GB or 167 GB rewritten copies.
 
 ## Planned native packs

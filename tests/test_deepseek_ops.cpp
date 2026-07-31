@@ -30,10 +30,10 @@ float bf16_value(float value) {
 
 TEST_CASE("DeepSeek native FP4 fixture matches target checkpoint bytes") {
     // First 16 packed bytes and the first E8M0 scale from
-    // layers.0.ffn.experts.0.w1 in revision 62af8fff... .
+    // layers.0.ffn.experts.0.w1 in revision 9e165c30... .
     constexpr std::array<std::uint8_t, 16> encoded{
-        0xacU, 0x54U, 0xa2U, 0x44U, 0xccU, 0x54U, 0x6cU, 0x55U,
-        0x2aU, 0x2cU, 0xe0U, 0xecU, 0x2dU, 0xfdU, 0x85U, 0x42U};
+        0x8cU, 0x54U, 0xa2U, 0x44U, 0xccU, 0x54U, 0x6cU, 0x55U,
+        0x20U, 0x2cU, 0xe0U, 0xeaU, 0x2dU, 0xfdU, 0x05U, 0x22U};
     std::array<std::byte, 16> weights{};
     for (std::size_t index = 0U; index < encoded.size(); ++index) {
         weights[index] = static_cast<std::byte>(encoded[index]);
@@ -45,7 +45,7 @@ TEST_CASE("DeepSeek native FP4 fixture matches target checkpoint bytes") {
     const auto result = strata::dsv4_fp4_e2m1_matvec_f32(
         output, input, weights, scales, 1U, 32U);
     REQUIRE(result.ok());
-    REQUIRE_NEAR(output[0], 0.046875F, 1.0e-7F);
+    REQUIRE_NEAR(output[0], 0.0546875F, 1.0e-7F);
 }
 
 TEST_CASE("DeepSeek indexer Hadamard and FP4 activation path matches target semantics") {
@@ -143,7 +143,7 @@ TEST_CASE("DeepSeek learned index selects the scalar-oracle top 512 at the bound
 TEST_CASE("DeepSeek native FP8 fixture matches target checkpoint bytes") {
     // First eight values and block scale from layers.0.attn.wq_a.
     constexpr std::array<std::uint8_t, 8> encoded{
-        0xe0U, 0xf0U, 0x6dU, 0x6cU, 0x68U, 0x41U, 0x63U, 0xefU};
+        0xe0U, 0xf0U, 0x6cU, 0x6cU, 0x69U, 0x41U, 0x63U, 0xefU};
     std::array<std::byte, 128> weights{};
     for (std::size_t index = 0U; index < encoded.size(); ++index) {
         weights[index] = static_cast<std::byte>(encoded[index]);
@@ -200,7 +200,7 @@ TEST_CASE("DeepSeek block FP8-to-BF16 conversion matches the scalar oracle") {
 }
 
 TEST_CASE("DeepSeek sqrtsoftplus routing keeps selection bias out of weights") {
-    auto spec = strata::deepseek_v4_flash_dspark_spec().router;
+    auto spec = strata::deepseek_v4_flash_0731_spec().router;
     spec.routed_experts = 4U;
     spec.experts_per_token = 2U;
     const std::array<float, 4> logits{-2.0F, 0.0F, 1.0F, 2.0F};

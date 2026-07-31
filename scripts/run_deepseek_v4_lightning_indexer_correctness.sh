@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model_dir=${MODEL_DIR:-"${repo_root}/models/DeepSeek-V4-Flash-DSpark"}
+model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
 result_dir=${RESULT_DIR:-"${repo_root}/results/deepseek-v4-lightning-indexer-correctness-v2"}
 runner=${RUNNER:-"${repo_root}/build/strata-deepseek-run"}
 prompt_repetitions=${PROMPT_REPETITIONS:-2050}

@@ -62,7 +62,7 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             "DeepSeek KV and VRAM device budget counts must match");
     }
     const auto model_context =
-        deepseek_v4_flash_dspark_spec().max_context_tokens;
+        deepseek_v4_flash_0731_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
         config.maximum_context_tokens > model_context) {
         result.errors.emplace_back(
@@ -191,7 +191,7 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
     } else {
         result.plan.kv_state_bytes = layers * window * head_dim * fp32;
     }
-    const auto& deepseek = deepseek_v4_flash_dspark_spec().deepseek_v4;
+    const auto& deepseek = deepseek_v4_flash_0731_spec().deepseek_v4;
     const auto& ratios = deepseek.compression_ratios;
     for (std::uint32_t layer = 0U;
          layer < kDeepSeekV4ExecutionContract.layer_count; ++layer) {

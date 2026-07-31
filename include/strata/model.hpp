@@ -155,8 +155,8 @@ struct ModelSpec {
 [[nodiscard]] ModelSpec quanttrio_glm52_int4_int8_mix_spec();
 [[nodiscard]] ValidationResult validate_quanttrio_glm52_int4_int8_mix(
     const ModelSpec& spec);
-[[nodiscard]] ModelSpec deepseek_v4_flash_dspark_spec();
-[[nodiscard]] ValidationResult validate_deepseek_v4_flash_dspark(
+[[nodiscard]] ModelSpec deepseek_v4_flash_0731_spec();
+[[nodiscard]] ValidationResult validate_deepseek_v4_flash_0731(
     const ModelSpec& spec);
 
 }  // namespace strata

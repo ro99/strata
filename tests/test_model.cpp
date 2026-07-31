@@ -81,3 +81,14 @@ TEST_CASE("QuantTrio GLM-5.2 rejects silent precision and manifest changes") {
     model.router.scoring = strata::RouterScoreKind::Softmax;
     REQUIRE(!strata::validate_quanttrio_glm52_int4_int8_mix(model).ok());
 }
+
+TEST_CASE("DeepSeek V4 Flash 0731 rejects the preview source identity") {
+    auto model = strata::deepseek_v4_flash_0731_spec();
+    REQUIRE(strata::validate_deepseek_v4_flash_0731(model).ok());
+    REQUIRE(model.name == "deepseek-ai/DeepSeek-V4-Flash-0731");
+    REQUIRE(model.source.revision ==
+            "9e165c30e2704aec5d9d593cce3eebd58bbef1cb");
+
+    model.source.repository = "deepseek-ai/DeepSeek-V4-Flash-DSpark";
+    REQUIRE(!strata::validate_deepseek_v4_flash_0731(model).ok());
+}

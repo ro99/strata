@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash-DSpark runtime
+# DeepSeek-V4-Flash-0731 runtime
 
 ## Design answer
 
@@ -27,11 +27,13 @@ not fit aggregate memory into a sparse model.
 
 ## Pinned target
 
-The adapter accepts only the inspected `DeepSeek-V4-Flash-DSpark` checkpoint:
+The adapter accepts only the inspected `DeepSeek-V4-Flash-0731` checkpoint:
 
-- repository revision `62af8fffb2f7030cac4de2f0169f5b8d1101b646`;
+- repository revision `9e165c30e2704aec5d9d593cce3eebd58bbef1cb`;
 - index SHA-256
   `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b`;
+- first eight packed bytes of `layers.0.ffn.experts.0.w1.weight`
+  `8c 54 a2 44 cc 54 6c 55`, which rejects the structurally identical preview;
 - 48 shards, 72,317 tensors, and 166,878,536,440 indexed bytes;
 - 35,328 native FP4 E2M1/per-32 E8M0 modules and 390 native FP8
   E4M3/128x128 E8M0 modules.
@@ -46,7 +48,9 @@ other declared FP8 linears retain native execution.
 
 `strata-deepseek-run` implements the main 43-layer autoregressive graph:
 
-- BF16 embedding and response-head boundary with the target tokenizer/template;
+- BF16 embedding and response-head boundary with the target tokenizer and 0731
+  message encoding: system text follows BOS directly, assistant turns end in
+  EOS, and tool results are merged into user turns;
 - low-rank 64-head attention, 128-token sliding state, attention sinks, YaRN,
   and compression ratios 4 and 128;
 - logical cache admission through the declared 1,048,576-token model limit;
@@ -126,8 +130,9 @@ caches are host-resident and lazily committed.
 
 ## Initial resident smoke evidence
 
-This section preserves the first successful resident smoke from 2026-07-15. It
-is historical evidence, not the current performance baseline. See the repository
+This section preserves the first successful resident smoke from 2026-07-15 on
+the now-unsupported preview checkpoint. It is historical evidence, not the
+current performance baseline. See the repository
 `README.md` and later records under `docs/experiments/` for promoted loading,
 execution, and long-context results.
 
@@ -174,14 +179,14 @@ Validate all source headers and native layouts:
 
 ```bash
 ./build/strata-inspect \
-  --model models/DeepSeek-V4-Flash-DSpark --headers --json
+  --model models/dsv4f --headers --json
 ```
 
 Check the real machine topology without staging 147 GB:
 
 ```bash
 ./build/strata-deepseek-run \
-  --model models/DeepSeek-V4-Flash-DSpark \
+  --model models/dsv4f \
   --devices 0,1,2 --host-memory 216G --max-context 2048 \
   --admission-only --json
 ```
@@ -190,7 +195,7 @@ Run the exact base graph:
 
 ```bash
 ./build/strata-deepseek-run \
-  --model models/DeepSeek-V4-Flash-DSpark \
+  --model models/dsv4f \
   --devices 0,1,2 --host-memory 216G --max-context 2048 \
   --prompt 'Hello' --max-new 16 --json
 ```

@@ -99,11 +99,11 @@ jq -n \
     },
     gates: {
       flag_and_calls_exercised:
-        ([$r[0][] | .prepack_mhc == false and
-                     .phases.decode.graph.mhc_prepacked_calls == 0] | all) and
-        ([$c[0][] | .prepack_mhc == true and
-                     .phases.decode.graph.mhc_prepacked_calls ==
-                         (86 * .decode_steps)] | all),
+        (([$r[0][] | .prepack_mhc == false and
+                      .phases.decode.graph.mhc_prepacked_calls == 0] | all) and
+         ([$c[0][] | .prepack_mhc == true and
+                      .phases.decode.graph.mhc_prepacked_calls ==
+                          (86 * .decode_steps)] | all)),
       generated_tokens_equal:
         ([range(0; $r[0] | length) as $i |
           $r[0][$i].generated_token_ids == $c[0][$i].generated_token_ids] | all),

@@ -31,6 +31,7 @@ struct RuntimeConfig {
     bool enable_incremental_kv_continuation{true};
     bool deepseek_block_kv_cache{};
     bool pin_resident_arena{};
+    bool prepack_mhc_projection{true};
 };
 
 struct GenerationMetrics {

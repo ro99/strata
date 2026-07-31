@@ -35,7 +35,7 @@ struct Options {
     std::uint64_t host_memory_bytes{216ULL << 30U};
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     bool pin_resident_arena{};
-    bool prepack_mhc{};
+    bool prepack_mhc{true};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
@@ -65,7 +65,7 @@ void usage() {
         << "       [--expert-prefetch N] [--expert-prefetch-bytes 1G]\n"
         << "       [--expert-prefetch-queue N] [--expert-prefetch-lease N]\n"
         << "       [--expert-prefetch-confidence P]\n"
-        << "       [--pin-resident-arena] [--prepack-mhc]\n"
+        << "       [--pin-resident-arena] [--prepack-mhc|--no-prepack-mhc]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
@@ -196,6 +196,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.pin_resident_arena = true;
         } else if (argument == "--prepack-mhc") {
             options.prepack_mhc = true;
+        } else if (argument == "--no-prepack-mhc") {
+            options.prepack_mhc = false;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;

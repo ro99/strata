@@ -38,7 +38,7 @@ runner="${result_dir}/strata-deepseek-run"
 run_case() {
     local arm=$1 repetition=$2
     local name="${arm}/run-$(printf '%02d' "${repetition}")"
-    local -a candidate=() diagnostics=()
+    local -a candidate=(--no-prepack-mhc) diagnostics=()
     [[ "${arm}" == candidate ]] && candidate=(--prepack-mhc)
     [[ "${trace}" == 1 ]] && diagnostics=(--logit-trace --layer-hash-trace)
     mkdir -p "${result_dir}/${name}"

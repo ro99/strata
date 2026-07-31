@@ -36,6 +36,7 @@ struct Options {
     bool incremental_kv_continuation{true};
     bool block_kv_cache{};
     bool pin_resident_arena{};
+    bool prepack_mhc{true};
     bool jsonl_protocol{};
 };
 
@@ -47,6 +48,7 @@ void usage() {
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention] [--full-reprefill]\n"
         << "                    [--block-kv-cache] [--pin-resident-arena]\n"
+        << "                    [--no-prepack-mhc]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
@@ -74,6 +76,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--pin-resident-arena") {
             options.pin_resident_arena = true;
+            continue;
+        }
+        if (argument == "--no-prepack-mhc") {
+            options.prepack_mhc = false;
             continue;
         }
         if (index + 1 >= argc) return false;
@@ -404,7 +410,9 @@ int main(int argc, char** argv) {
                << ",\"block_kv_cache\":"
                << (options.block_kv_cache ? "true" : "false")
                << ",\"pin_resident_arena\":"
-               << (options.pin_resident_arena ? "true" : "false");
+               << (options.pin_resident_arena ? "true" : "false")
+               << ",\"prepack_mhc\":"
+               << (options.prepack_mhc ? "true" : "false");
         protocol_event("hello", fields.str());
         protocol_message("status", "Loading model");
     }
@@ -441,6 +449,7 @@ int main(int argc, char** argv) {
         options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.pin_resident_arena = options.pin_resident_arena;
+    config.prepack_mhc_projection = options.prepack_mhc;
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {

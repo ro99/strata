@@ -70,6 +70,7 @@ Flags worth knowing:
 | `--host-memory 216G` | Host RAM ceiling for the resident weight arena |
 | `--pin-resident-arena` | Page-lock DeepSeek's resident weights for faster host-to-device demand loads |
 | `--flash-attention` | Use the exact CUDA attention fast path where it is faster |
+| `--no-prepack-mhc` | Disable the default exact AVX2-packed mHC projection path |
 
 ### Terminal UI
 

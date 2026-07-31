@@ -9,6 +9,16 @@
 #include <limits>
 #include <numeric>
 
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define STRATA_MHC_AVX2 1
+#define STRATA_MHC_TARGET_AVX2 __attribute__((target("avx2")))
+#else
+#define STRATA_MHC_AVX2 0
+#define STRATA_MHC_TARGET_AVX2
+#endif
+
 namespace strata {
 
 namespace {
@@ -572,6 +582,119 @@ ValidationResult dsv4_mhc_pre_f32(
         for (std::size_t column = 0U; column < reduced.size(); ++column) {
             reduced[column] += mix.pre[copy] *
                 hidden_copies[static_cast<std::size_t>(copy) * reduced.size() + column];
+        }
+    }
+    return result;
+}
+
+bool dsv4_mhc_prepacked_supported() noexcept {
+#if STRATA_MHC_AVX2
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+#else
+    return false;
+#endif
+}
+
+ValidationResult dsv4_pack_mhc_projection_f32(
+    std::span<float> output, std::span<const float> row_major,
+    std::size_t rows, std::size_t columns) {
+    ValidationResult result;
+    constexpr std::size_t width = 4U;
+    if (rows == 0U || columns == 0U || rows % width != 0U ||
+        row_major.size() != rows * columns || output.size() != row_major.size()) {
+        result.errors.emplace_back(
+            "DeepSeek mHC projection prepack spans are incompatible");
+        return result;
+    }
+    for (std::size_t row = 0U; row < rows; row += width) {
+        const std::size_t block = row / width;
+        for (std::size_t column = 0U; column < columns; ++column) {
+            for (std::size_t lane = 0U; lane < width; ++lane) {
+                output[(block * columns + column) * width + lane] =
+                    row_major[(row + lane) * columns + column];
+            }
+        }
+    }
+    return result;
+}
+
+#if STRATA_MHC_AVX2
+STRATA_MHC_TARGET_AVX2
+static void dsv4_mhc_project_prepacked_avx2(
+    std::span<float> projected, std::span<const float> hidden,
+    std::span<const float> packed) {
+    constexpr std::size_t width = 4U;
+    const std::size_t blocks = projected.size() / width;
+    for (std::size_t block = 0U; block < blocks; ++block) {
+        __m256d sums = _mm256_setzero_pd();
+        for (std::size_t column = 0U; column < hidden.size(); ++column) {
+            const __m128 weights = _mm_loadu_ps(
+                packed.data() + (block * hidden.size() + column) * width);
+            const __m256d weights_f64 = _mm256_cvtps_pd(weights);
+            const __m256d value = _mm256_set1_pd(
+                static_cast<double>(hidden[column]));
+            sums = _mm256_add_pd(sums, _mm256_mul_pd(weights_f64, value));
+        }
+        std::array<double, width> lanes{};
+        _mm256_storeu_pd(lanes.data(), sums);
+        for (std::size_t lane = 0U; lane < width; ++lane) {
+            projected[block * width + lane] = static_cast<float>(lanes[lane]);
+        }
+    }
+}
+#endif
+
+ValidationResult dsv4_mhc_prepacked_f32(
+    std::span<float> reduced, Dsv4MhcMix& mix,
+    std::span<const float> hidden_copies,
+    std::span<const float> packed_projection,
+    std::span<const float> scale, std::span<const float> base,
+    std::uint32_t multiplier, std::uint32_t iterations, float epsilon) {
+    ValidationResult result;
+    constexpr std::size_t width = 4U;
+    if (!dsv4_mhc_prepacked_supported()) {
+        result.errors.emplace_back("DeepSeek prepacked mHC requires x86 AVX2");
+        return result;
+    }
+    if (multiplier == 0U || hidden_copies.empty() ||
+        hidden_copies.size() % multiplier != 0U ||
+        reduced.size() != hidden_copies.size() / multiplier ||
+        base.empty() || base.size() % width != 0U ||
+        packed_projection.size() != base.size() * hidden_copies.size()) {
+        result.errors.emplace_back(
+            "DeepSeek prepacked mHC spans are incompatible");
+        return result;
+    }
+    double square_sum = 0.0;
+    for (const float value : hidden_copies) {
+        if (!std::isfinite(value)) {
+            result.errors.emplace_back("DeepSeek mHC hidden state is not finite");
+            return result;
+        }
+        square_sum += static_cast<double>(value) * value;
+    }
+    const float reciprocal = 1.0F / std::sqrt(
+        static_cast<float>(square_sum / static_cast<double>(hidden_copies.size())) +
+        epsilon);
+    std::vector<float> projected(base.size());
+#if STRATA_MHC_AVX2
+    dsv4_mhc_project_prepacked_avx2(projected, hidden_copies,
+                                    packed_projection);
+#endif
+    for (auto& value : projected) value *= reciprocal;
+    auto split = dsv4_mhc_split_sinkhorn_f32(
+        projected, scale, base, multiplier, iterations, epsilon);
+    if (!split.ok()) {
+        result.errors = std::move(split.errors);
+        return result;
+    }
+    mix = std::move(split.value);
+    std::fill(reduced.begin(), reduced.end(), 0.0F);
+    for (std::uint32_t copy = 0U; copy < multiplier; ++copy) {
+        for (std::size_t column = 0U; column < reduced.size(); ++column) {
+            reduced[column] += mix.pre[copy] * hidden_copies[
+                static_cast<std::size_t>(copy) * reduced.size() + column];
         }
     }
     return result;

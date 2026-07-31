@@ -62,6 +62,7 @@ ValidationResult RuntimeSession::initialize(
     concrete.enable_incremental_kv_continuation =
         config.enable_incremental_kv_continuation;
     concrete.pin_resident_arena = config.pin_resident_arena;
+    concrete.prepack_mhc_projection = config.prepack_mhc_projection;
     concrete.kv_cache_mode = config.deepseek_block_kv_cache
         ? Dsv4KvCacheMode::Block : Dsv4KvCacheMode::ScalarOracle;
     result = runtime.initialize(model_directory, concrete);

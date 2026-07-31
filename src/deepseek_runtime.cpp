@@ -276,6 +276,7 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             ? 0U : after.prefill_max_workspace_bytes,
         after.embedding_nanoseconds - before.embedding_nanoseconds,
         after.mhc_pre_nanoseconds - before.mhc_pre_nanoseconds,
+        after.mhc_prepacked_calls - before.mhc_prepacked_calls,
         after.branch_norm_nanoseconds - before.branch_norm_nanoseconds,
         after.attention_nanoseconds - before.attention_nanoseconds,
         after.attention_query_nanoseconds - before.attention_query_nanoseconds,
@@ -1150,6 +1151,7 @@ struct DeepSeekV4Runtime::Impl {
     std::vector<std::uint64_t> capacities;
     std::vector<std::size_t> schedule;
     std::unordered_map<std::string, std::vector<float>> host_tensors;
+    std::unordered_map<std::string, std::vector<float>> prepacked_mhc;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
     std::vector<std::uint32_t> cached_token_ids;
@@ -1287,6 +1289,12 @@ struct DeepSeekV4Runtime::Impl {
     }
 
     ValidationResult warmup();
+    ValidationResult mhc_pre(std::span<float> reduced, Dsv4MhcMix& mix,
+                             std::span<const float> hidden,
+                             const std::string& projection_name,
+                             std::span<const float> projection,
+                             std::span<const float> scale,
+                             std::span<const float> base);
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
     ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
@@ -1461,6 +1469,29 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
         auto loaded = raw_tensor(name, ceiling);
         if (!loaded.ok()) append_errors(target, std::move(loaded.errors));
     };
+    const auto load_mhc = [this](ValidationResult& target,
+                                 const std::string& name) {
+        if (!target.ok()) return;
+        auto loaded = host_tensor(name, kMix * kMhc * kHidden);
+        if (!loaded.ok()) {
+            append_errors(target, std::move(loaded.errors));
+            return;
+        }
+        if (!config.prepack_mhc_projection) return;
+        try {
+            std::vector<float> packed(loaded.value->size());
+            auto status = dsv4_pack_mhc_projection_f32(
+                packed, *loaded.value, kMix, kMhc * kHidden);
+            if (!status.ok()) {
+                append_errors(target, std::move(status.errors));
+                return;
+            }
+            prepacked_mhc.emplace(name, std::move(packed));
+        } catch (const std::bad_alloc&) {
+            target.errors.emplace_back(
+                "cannot allocate DeepSeek prepacked mHC projection");
+        }
+    };
 
     const auto ratios = deepseek_v4_flash_0731_spec().deepseek_v4.compression_ratios;
     const auto preload_layer = [this, &preload, &ratios](
@@ -1499,7 +1530,7 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
             }
         }
     };
-    const auto load_host_layer = [this, &load_host, &load_raw, &ratios](
+    const auto load_host_layer = [this, &load_host, &load_raw, &load_mhc, &ratios](
         ValidationResult& target, std::uint32_t layer) {
         const auto prefix = layer_prefix(layer);
         const auto attention = prefix + "attn.";
@@ -1509,8 +1540,7 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
         load_host(target, prefix + "attn_norm.weight", kHidden);
         load_host(target, prefix + "ffn_norm.weight", kHidden);
         for (const auto* branch : {"attn", "ffn"}) {
-            load_host(target, prefix + "hc_" + branch + "_fn",
-                      kMix * kMhc * kHidden);
+            load_mhc(target, prefix + "hc_" + branch + "_fn");
             load_host(target, prefix + "hc_" + branch + "_scale", 3U);
             load_host(target, prefix + "hc_" + branch + "_base", kMix);
         }
@@ -1595,6 +1625,28 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
     }
     if (result.ok()) load_host_head(result);
     return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::mhc_pre(
+    std::span<float> reduced, Dsv4MhcMix& mix,
+    std::span<const float> hidden, const std::string& projection_name,
+    std::span<const float> projection, std::span<const float> scale,
+    std::span<const float> base) {
+    if (!config.prepack_mhc_projection) {
+        return dsv4_mhc_pre_f32(
+            reduced, mix, hidden, projection, scale, base);
+    }
+    const auto found = prepacked_mhc.find(projection_name);
+    if (found == prepacked_mhc.end()) {
+        ValidationResult result;
+        result.errors.emplace_back(
+            "DeepSeek prepacked mHC projection is unavailable: " +
+            projection_name);
+        return result;
+    }
+    ++graph_stats.mhc_prepacked_calls;
+    return dsv4_mhc_prepacked_f32(
+        reduced, mix, hidden, found->second, scale, base);
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
@@ -3020,7 +3072,8 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
     const auto prefix = layer_prefix(layer);
     for (const auto* branch_name : {"attn", "ffn"}) {
         const std::string branch(branch_name);
-        auto projection = host_tensor(prefix + "hc_" + branch + "_fn",
+        const auto projection_name = prefix + "hc_" + branch + "_fn";
+        auto projection = host_tensor(projection_name,
                                       kMix * kMhc * kHidden);
         auto scale = host_tensor(prefix + "hc_" + branch + "_scale", 3U);
         auto base = host_tensor(prefix + "hc_" + branch + "_base", kMix);
@@ -3032,8 +3085,8 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
         std::vector<float> reduced(kHidden);
         Dsv4MhcMix mix;
         auto phase_started = std::chrono::steady_clock::now();
-        result = dsv4_mhc_pre_f32(reduced, mix, residual, *projection.value,
-                                  *scale.value, *base.value);
+        result = mhc_pre(reduced, mix, residual, projection_name,
+                         *projection.value, *scale.value, *base.value);
         graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         round_bf16(reduced);
@@ -3088,7 +3141,8 @@ ValidationResult DeepSeekV4Runtime::Impl::block_page(
     const auto prefix = layer_prefix(layer);
     for (const auto* branch_name : {"attn", "ffn"}) {
         const std::string branch(branch_name);
-        auto projection = host_tensor(prefix + "hc_" + branch + "_fn",
+        const auto projection_name = prefix + "hc_" + branch + "_fn";
+        auto projection = host_tensor(projection_name,
                                       kMix * kMhc * kHidden);
         auto scale = host_tensor(prefix + "hc_" + branch + "_scale", 3U);
         auto base = host_tensor(prefix + "hc_" + branch + "_base", kMix);
@@ -3107,9 +3161,9 @@ ValidationResult DeepSeekV4Runtime::Impl::block_page(
             const auto residual_row = std::span<const float>(residual).subspan(
                 row * hidden_stride, hidden_stride);
             auto phase_started = std::chrono::steady_clock::now();
-            result = dsv4_mhc_pre_f32(reduced_row, mixes[row], residual_row,
-                                      *projection.value, *scale.value,
-                                      *base.value);
+            result = mhc_pre(reduced_row, mixes[row], residual_row,
+                             projection_name, *projection.value,
+                             *scale.value, *base.value);
             graph_stats.mhc_pre_nanoseconds +=
                 elapsed_nanoseconds(phase_started);
             if (!result.ok()) return result;
@@ -3568,6 +3622,11 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "the base-model executor; refusing a silent approximation");
         return result;
     }
+    if (config.prepack_mhc_projection && !dsv4_mhc_prepacked_supported()) {
+        result.errors.emplace_back(
+            "DeepSeek prepacked mHC requires x86 AVX2");
+        return result;
+    }
     impl_ = std::make_unique<Impl>();
     auto checkpoint = Dsv4CheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
@@ -3624,6 +3683,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     admission_config.device_kv_cache_bytes = kv_device_capacities;
     admission_config.maximum_context_tokens = config.maximum_context_tokens;
     admission_config.enable_dspark = config.enable_dspark;
+    admission_config.enable_mhc_prepack = config.prepack_mhc_projection;
     admission_config.compact_kv_cache =
         config.kv_cache_mode == Dsv4KvCacheMode::Block;
     admission_config.require_zero_nvme_decode = config.require_zero_nvme_decode;

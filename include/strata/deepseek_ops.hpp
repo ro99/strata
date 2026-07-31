@@ -127,6 +127,21 @@ struct Dsv4IndexSelectionResult {
     std::uint32_t iterations = kDsv4MhcSinkhornIterations,
     float epsilon = kDsv4NormEpsilon);
 
+[[nodiscard]] bool dsv4_mhc_prepacked_supported() noexcept;
+
+[[nodiscard]] ValidationResult dsv4_pack_mhc_projection_f32(
+    std::span<float> output, std::span<const float> row_major,
+    std::size_t rows, std::size_t columns);
+
+[[nodiscard]] ValidationResult dsv4_mhc_prepacked_f32(
+    std::span<float> reduced, Dsv4MhcMix& mix,
+    std::span<const float> hidden_copies,
+    std::span<const float> packed_projection,
+    std::span<const float> scale, std::span<const float> base,
+    std::uint32_t multiplier = kDsv4MhcMultiplier,
+    std::uint32_t iterations = kDsv4MhcSinkhornIterations,
+    float epsilon = kDsv4NormEpsilon);
+
 [[nodiscard]] ValidationResult dsv4_mhc_post_f32(
     std::span<float> output_copies, std::span<const float> branch,
     std::span<const float> residual_copies, const Dsv4MhcMix& mix,

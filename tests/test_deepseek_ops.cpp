@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -232,6 +233,42 @@ TEST_CASE("DeepSeek mHC Sinkhorn preserves four residual lanes") {
         }
         REQUIRE_NEAR(sum, 1.0F, 1.0e-5F);
     }
+}
+
+TEST_CASE("DeepSeek prepacked mHC preserves exact projection order") {
+    if (!strata::dsv4_mhc_prepacked_supported()) return;
+    constexpr std::size_t columns = 16U;
+    constexpr std::size_t rows = 24U;
+    std::array<float, columns> hidden{};
+    std::array<float, rows * columns> projection{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index) - 8) / 16.0F;
+    }
+    for (std::size_t index = 0U; index < projection.size(); ++index) {
+        projection[index] =
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 128.0F;
+    }
+    std::array<float, rows * columns> packed{};
+    REQUIRE(strata::dsv4_pack_mhc_projection_f32(
+                packed, projection, rows, columns).ok());
+    constexpr std::array<float, 3> scale{0.75F, 0.5F, 0.25F};
+    std::array<float, rows> base{};
+    std::array<float, columns / 4U> oracle{};
+    std::array<float, columns / 4U> candidate{};
+    strata::Dsv4MhcMix oracle_mix;
+    strata::Dsv4MhcMix candidate_mix;
+    REQUIRE(strata::dsv4_mhc_pre_f32(
+                oracle, oracle_mix, hidden, projection, scale, base).ok());
+    REQUIRE(strata::dsv4_mhc_prepacked_f32(
+                candidate, candidate_mix, hidden, packed, scale, base).ok());
+    REQUIRE(std::memcmp(oracle.data(), candidate.data(), sizeof(oracle)) == 0);
+    REQUIRE(oracle_mix.pre == candidate_mix.pre);
+    REQUIRE(oracle_mix.post == candidate_mix.post);
+    REQUIRE(oracle_mix.combination == candidate_mix.combination);
+    REQUIRE(!strata::dsv4_mhc_prepacked_f32(
+                 candidate, candidate_mix, hidden,
+                 std::span<const float>(packed).first(packed.size() - 1U),
+                 scale, base).ok());
 }
 
 TEST_CASE("DeepSeek mHC post mixing uses source rows and destination columns") {

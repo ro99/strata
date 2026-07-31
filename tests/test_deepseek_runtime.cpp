@@ -18,6 +18,7 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(config.host_attention_threads == 28U);
     REQUIRE(config.resident_read_workers == 8U);
     REQUIRE(config.spine_warmup_workers == 3U);
+    REQUIRE(config.prepack_mhc_projection);
     REQUIRE(config.expert_prefetch_predictions == 0U);
     REQUIRE(config.expert_prefetch_queue_depth == 8U);
     REQUIRE(config.expert_prefetch_byte_budget == (1ULL << 30U));

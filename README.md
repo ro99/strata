@@ -50,10 +50,15 @@ Place a checkpoint under `models/` in its original Safetensors form. Strata read
 ```bash
 ./build/strata-chat \
   --model models/dsv4f --model-type deepseek \
-  --context-size 8192 --max-new 256 --devices 0,1,2
+  --context-size 8192 --max-new 256 --devices 0,1,2 \
+  --vram-fraction 0.95 --pin-resident-arena --flash-attention
 ```
 
 Startup prints the selected devices, the VRAM budget per device, load progress, and elapsed load time. Decoding defaults to greedy (`--temperature 0`) for reproducible output; `--temperature 1` enables seeded sampling. Multi-turn chat reuses the cached prefix and only prefills new tokens.
+
+The DeepSeek command above favors decode throughput: pinning adds about 17
+seconds to startup on the development machine, then avoids pageable host-staging
+stalls while loading expert weights into VRAM.
 
 Flags worth knowing:
 
@@ -63,6 +68,8 @@ Flags worth knowing:
 | `--context-size N` | Context ceiling enforced by the runtime |
 | `--vram-fraction F` | Fraction of free VRAM budgeted for weight caching (default `0.85`) |
 | `--host-memory 216G` | Host RAM ceiling for the resident weight arena |
+| `--pin-resident-arena` | Page-lock DeepSeek's resident weights for faster host-to-device demand loads |
+| `--flash-attention` | Use the exact CUDA attention fast path where it is faster |
 
 ### Terminal UI
 

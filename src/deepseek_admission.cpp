@@ -283,6 +283,18 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         }
     }
     result.plan.host_workspace_bytes = 1ULL << 30U;
+    if (config.enable_mhc_prepack) {
+        constexpr std::uint64_t mhc_prepack_bytes =
+            2U * layers * kDeepSeekV4ExecutionContract.mix_width *
+            kDeepSeekV4ExecutionContract.mhc_multiplier *
+            kDeepSeekV4ExecutionContract.hidden_size * fp32;
+        result.plan.mhc_prepack_bytes = mhc_prepack_bytes;
+        if (!add(result.plan.host_workspace_bytes, mhc_prepack_bytes)) {
+            result.errors.emplace_back(
+                "DeepSeek mHC prepack byte count overflows");
+            return result;
+        }
+    }
     result.plan.vram_workspace_bytes =
         static_cast<std::uint64_t>(config.vram_weight_budgets.size()) * (256ULL << 20U);
     result.plan.required_host_bytes = result.plan.routed_expert_host_bytes;

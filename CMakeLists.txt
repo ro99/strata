@@ -110,6 +110,9 @@ target_link_libraries(strata-server PRIVATE strata_core)
 add_executable(strata-host-expert-probe apps/strata_host_expert_probe.cpp)
 target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 
+add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
+target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
+
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
     add_executable(strata-topology-probe apps/strata_topology_probe.cu)

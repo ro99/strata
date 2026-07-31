@@ -35,6 +35,7 @@ struct Options {
     std::uint64_t host_memory_bytes{216ULL << 30U};
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     bool pin_resident_arena{};
+    bool prepack_mhc{};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
@@ -64,7 +65,7 @@ void usage() {
         << "       [--expert-prefetch N] [--expert-prefetch-bytes 1G]\n"
         << "       [--expert-prefetch-queue N] [--expert-prefetch-lease N]\n"
         << "       [--expert-prefetch-confidence P]\n"
-        << "       [--pin-resident-arena]\n"
+        << "       [--pin-resident-arena] [--prepack-mhc]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
@@ -193,6 +194,8 @@ bool parse_options(int argc, char** argv, Options& options) {
                     0.0, 1.0)) return false;
         } else if (argument == "--pin-resident-arena") {
             options.pin_resident_arena = true;
+        } else if (argument == "--prepack-mhc") {
+            options.prepack_mhc = true;
         } else if (argument == "--host-memory") {
             const auto* value = next(argument);
             if (value == nullptr || !parse_bytes(value, options.host_memory_bytes)) return false;
@@ -535,6 +538,7 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.prefill_max_workspace_bytes
            << ",\"embedding_seconds\":" << seconds(stats.embedding_nanoseconds)
            << ",\"mhc_pre_seconds\":" << seconds(stats.mhc_pre_nanoseconds)
+           << ",\"mhc_prepacked_calls\":" << stats.mhc_prepacked_calls
            << ",\"branch_norm_seconds\":"
            << seconds(stats.branch_norm_nanoseconds)
            << ",\"attention_seconds\":" << seconds(stats.attention_nanoseconds)
@@ -610,6 +614,7 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
     strata::cli::print_array(output, plan.per_device_kv_cache_bytes);
     output
            << ",\"host_workspace_bytes\":" << plan.host_workspace_bytes
+           << ",\"mhc_prepack_bytes\":" << plan.mhc_prepack_bytes
            << ",\"total_vram_budget_bytes\":" << plan.total_vram_budget_bytes
            << ",\"resident_spine_vram_bytes\":" << plan.resident_spine_vram_bytes
            << ",\"vram_workspace_bytes\":" << plan.vram_workspace_bytes
@@ -803,6 +808,7 @@ int main(int argc, char** argv) {
         config.device_kv_cache_bytes = options.device_kv_cache_bytes;
         config.vram_weight_budgets = budgets;
         config.maximum_context_tokens = options.maximum_context_tokens;
+        config.enable_mhc_prepack = options.prepack_mhc;
         config.compact_kv_cache = options.block_kv_cache;
         config.require_zero_nvme_decode = true;
         const auto admission = strata::plan_dsv4_resident_topology(
@@ -837,6 +843,7 @@ int main(int argc, char** argv) {
     config.resident_read_workers = options.resident_read_workers;
     config.spine_warmup_workers = options.spine_warmup_workers;
     config.pin_resident_arena = options.pin_resident_arena;
+    config.prepack_mhc_projection = options.prepack_mhc;
     config.expert_prefetch_predictions = options.expert_prefetch_predictions;
     config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
     config.expert_prefetch_byte_budget = options.expert_prefetch_byte_budget;
@@ -899,6 +906,8 @@ int main(int argc, char** argv) {
                   << metrics.spine_warmup_workers
                   << ",\"resident_arena_pinned\":"
                   << (metrics.resident_arena_pinned ? "true" : "false")
+                  << ",\"prepack_mhc\":"
+                  << (options.prepack_mhc ? "true" : "false")
                   << ",\"resident_pin_seconds\":" << metrics.resident_pin_seconds
                   << ",\"expert_prefetch_predictions\":"
                   << metrics.expert_prefetch_predictions

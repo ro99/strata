@@ -178,6 +178,15 @@ TEST_CASE("real DeepSeek V4 Flash 0731 checkpoint opens without format conversio
     REQUIRE(admission.plan.resident_spine_vram_bytes > (8ULL << 30U));
     REQUIRE(admission.plan.maximum_expert_bytes > (12ULL << 20U));
 
+    config.enable_mhc_prepack = true;
+    const auto prepacked_admission = strata::plan_dsv4_resident_topology(
+        checkpoint.value->manifest(), config);
+    REQUIRE(prepacked_admission.ok());
+    REQUIRE(prepacked_admission.plan.mhc_prepack_bytes == 135'266'304ULL);
+    REQUIRE(prepacked_admission.plan.required_host_bytes ==
+            admission.plan.required_host_bytes + 135'266'304ULL);
+    config.enable_mhc_prepack = false;
+
     config.maximum_context_tokens = 1'048'576U;
     const auto million_token_admission = strata::plan_dsv4_resident_topology(
         checkpoint.value->manifest(), config);

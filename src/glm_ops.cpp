@@ -113,6 +113,66 @@ ValidationResult glm_rope_interleaved_f32(std::span<float> values,
     return result;
 }
 
+GlmIndexResult glm_index_topk_f32(
+    std::span<const float> queries, std::span<const float> weights,
+    std::span<const float> keys, std::uint32_t heads,
+    std::uint32_t dimensions, std::uint32_t top_k) {
+    GlmIndexResult result;
+    if (heads == 0U || dimensions == 0U || top_k == 0U ||
+        queries.size() != static_cast<std::size_t>(heads) * dimensions ||
+        weights.size() != heads || keys.empty() || keys.size() % dimensions != 0U) {
+        result.errors.emplace_back("GLM indexer tensor shapes are incompatible");
+        return result;
+    }
+    struct Candidate {
+        float score{};
+        std::uint32_t position{};
+    };
+    const auto tokens = keys.size() / dimensions;
+    if (tokens > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back("GLM indexer position count overflows");
+        return result;
+    }
+    std::vector<Candidate> candidates(tokens);
+    const float query_scale = 1.0F / std::sqrt(static_cast<float>(dimensions));
+    const float weight_scale = 1.0F / std::sqrt(static_cast<float>(heads));
+    for (std::size_t token = 0U; token < tokens; ++token) {
+        float score = 0.0F;
+        const auto key = keys.subspan(token * dimensions, dimensions);
+        for (std::uint32_t head = 0U; head < heads; ++head) {
+            float dot = 0.0F;
+            const auto query = queries.subspan(
+                static_cast<std::size_t>(head) * dimensions, dimensions);
+            for (std::uint32_t dimension = 0U; dimension < dimensions; ++dimension) {
+                dot += query[dimension] * key[dimension];
+            }
+            if (!std::isfinite(dot)) {
+                result.errors.emplace_back("GLM indexer dot product is non-finite");
+                return result;
+            }
+            score += weights[head] * weight_scale *
+                     std::max(0.0F, dot * query_scale);
+        }
+        if (!std::isfinite(score)) {
+            result.errors.emplace_back("GLM indexer score is non-finite");
+            return result;
+        }
+        candidates[token] = {score, static_cast<std::uint32_t>(token)};
+    }
+    const auto selected = std::min<std::size_t>(top_k, candidates.size());
+    std::partial_sort(
+        candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(selected),
+        candidates.end(), [](const Candidate& left, const Candidate& right) {
+            return left.score > right.score ||
+                   (left.score == right.score && left.position < right.position);
+        });
+    result.positions.reserve(selected);
+    for (std::size_t index = 0U; index < selected; ++index) {
+        result.positions.push_back(candidates[index].position);
+    }
+    return result;
+}
+
 GlmRouteResult glm_route_logits_noaux_tc(std::span<const float> logits,
                                          std::span<const float> correction_bias,
                                          const RouterSpec& spec) {

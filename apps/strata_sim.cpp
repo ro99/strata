@@ -35,6 +35,7 @@ struct Options {
     bool compare{};
     bool strict{};
     bool json{};
+    bool measure_decode{};
 };
 
 [[noreturn]] void usage(int code) {
@@ -53,6 +54,7 @@ struct Options {
         << "  --peer-activation-bytes N  network bytes per remote expert batch\n"
         << "  --cold-read-budget BYTES   total permitted NVMe reads (0 = unlimited)\n"
         << "  --strict                   refuse reads beyond the cold budget\n"
+        << "  --measure-decode           warm on prefill, report decode only\n"
         << "  --json                     machine-readable output\n";
     std::exit(code);
 }
@@ -113,6 +115,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--cold-read-budget") {
             options.cold_read_budget = parse_bytes(next());
         } else if (argument == "--strict") options.strict = true;
+        else if (argument == "--measure-decode") options.measure_decode = true;
         else if (argument == "--json") options.json = true;
         else throw std::invalid_argument("unknown option: " + std::string(argument));
     }
@@ -138,6 +141,8 @@ strata::SimulationConfig make_config(const Options& options, ReplacementPolicy p
     config.residency.strict_cold_read_budget = options.strict;
     config.prefetch_limit = options.prefetch;
     config.minimum_prediction_confidence = options.confidence;
+    config.measured_phase = options.measure_decode
+        ? strata::RoutePhase::Decode : strata::RoutePhase::Unknown;
     return config;
 }
 

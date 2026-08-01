@@ -78,10 +78,10 @@ or implement any later stage in this chat.
 Unless a stage explicitly narrows a metric or resource limit, all agents use
 this contract.
 
-- Model: pinned `QuantTrio/GLM-5.2-Int4-Int8Mix` revision already declared by
+- Model: pinned GLM W4A16 checkpoint already declared by
   the repository.
-- Precision: native INT4 group-128 routed experts, INT8 group-128 ordinary
-  linears, channelwise INT8 MTP tensors, and declared BF16/FP32 tensors.
+- Precision: native INT4 group-128 linears with W4A16 execution, plus declared
+  BF16/FP32 sensitive tensors.
 - Execution: exact base autoregressive graph, exact top-8 routing, MTP disabled
   until a later plan explicitly authorizes it.
 - Baseline prompt: `What is the closer start to sun, and how distant it is from it?`

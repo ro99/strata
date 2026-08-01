@@ -26,6 +26,13 @@ struct GlmRouteResult {
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
+struct GlmIndexResult {
+    std::vector<std::uint32_t> positions;
+    std::vector<std::string> errors;
+
+    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
+};
+
 [[nodiscard]] ValidationResult glm_layer_norm_f32(
     std::span<float> values, std::span<const float> weight,
     std::span<const float> bias, float epsilon = kGlm52IndexerNormEpsilon);
@@ -36,6 +43,14 @@ struct GlmRouteResult {
     std::span<float> values, std::uint64_t position,
     std::uint32_t rope_dimensions = kGlm52RopeDimensions,
     float theta = kGlm52RopeTheta);
+
+// Exact GLM DSA reference selection for one query row. Queries are
+// [heads, dimensions], keys are [tokens, dimensions], and equal scores retain
+// the lower token position.
+[[nodiscard]] GlmIndexResult glm_index_topk_f32(
+    std::span<const float> queries, std::span<const float> weights,
+    std::span<const float> keys, std::uint32_t heads,
+    std::uint32_t dimensions, std::uint32_t top_k);
 
 // Applies the pinned sigmoid/noaux_tc rule to precomputed router logits. The
 // correction bias participates in top-k selection only; returned weights come

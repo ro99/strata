@@ -58,7 +58,7 @@ performance result under the charter's three-interleaved-repetition rule.
 
 ## GLM full-model evidence
 
-The one-pair GLM correctness run used the pinned QuantTrio GLM-5.2 checkpoint,
+The one-pair GLM correctness run used the then-pinned GLM checkpoint,
 devices `0,1,2`, context ceiling 256, detailed timings, sequential route
 traces, greedy decoding, and two generated tokens. The artifact is under
 `results/glm52-flash-attention-correctness-exact/`.

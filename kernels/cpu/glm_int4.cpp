@@ -18,7 +18,7 @@ ValidationResult validate(const GlmInt4MatrixView& matrix,
         matrix.packed_columns != (matrix.columns + 7U) / 8U ||
         matrix.scale_columns != (matrix.columns + 127U) / 128U ||
         input.size() != matrix.columns || output.size() != matrix.rows) {
-        result.errors.emplace_back("invalid QuantTrio INT4 group-128 matvec shape");
+        result.errors.emplace_back("invalid INT4 group-128 matvec shape");
         return result;
     }
     if (matrix.rows > std::numeric_limits<std::uint64_t>::max() /
@@ -31,7 +31,7 @@ ValidationResult validate(const GlmInt4MatrixView& matrix,
             std::numeric_limits<std::uint64_t>::max() / 2U ||
         matrix.packed.size() != matrix.rows * matrix.packed_columns * 4U ||
         matrix.scales.size() != matrix.rows * matrix.scale_columns * 2U) {
-        result.errors.emplace_back("invalid QuantTrio INT4 group-128 payload size");
+        result.errors.emplace_back("invalid INT4 group-128 payload size");
     }
     return result;
 }
@@ -179,7 +179,7 @@ ValidationResult glm_int4_group128_matvec_rows(
     auto result = validate(matrix, input, output);
     if (!result.ok()) return result;
     if (row_begin >= row_end || row_end > matrix.rows) {
-        result.errors.emplace_back("invalid QuantTrio INT4 matvec row range");
+        result.errors.emplace_back("invalid INT4 matvec row range");
         return result;
     }
 #if defined(__x86_64__) || defined(__i386__)

@@ -31,7 +31,7 @@ io_bytes=${IO_BYTES:-256M}
 io_block_bytes=${IO_BLOCK_BYTES:-4M}
 queue_depths=${QUEUE_DEPTHS:-1,4,8}
 prefill_rows=${PREFILL_ROWS:-30}
-expected_index_sha256=43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b
+expected_index_sha256=74d73bfaa26425beaf618342f4a0851b21d9198138b76bfb678f88164d987beb
 
 if [[ -z "${checkpoint_file}" ]]; then
     checkpoint_file=$(find "${model_dir}" -maxdepth 1 -type f \

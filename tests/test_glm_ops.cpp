@@ -9,7 +9,7 @@
 namespace {
 
 strata::RouterSpec router_spec(std::uint32_t experts, std::uint32_t topk) {
-    auto spec = strata::quanttrio_glm52_int4_int8_mix_spec().router;
+    auto spec = strata::glm52_w4a16_spec().router;
     spec.routed_experts = experts;
     spec.experts_per_token = topk;
     return spec;
@@ -47,6 +47,18 @@ TEST_CASE("GLM interleaved RoPE writes split real and imaginary halves") {
     REQUIRE(values[3] == 4.0F);
     REQUIRE(values[4] == 91.0F);
     REQUIRE(values[5] == 92.0F);
+}
+
+TEST_CASE("GLM sparse indexer scores heads and resolves ties by position") {
+    const std::array<float, 4> queries{1.0F, 0.0F, 0.0F, 1.0F};
+    const std::array<float, 2> weights{1.0F, 1.0F};
+    const std::array<float, 8> keys{
+        1.0F, 0.0F, 0.0F, 1.0F,
+        1.0F, 1.0F, 1.0F, 0.0F};
+    const auto result = strata::glm_index_topk_f32(
+        queries, weights, keys, 2U, 2U, 3U);
+    REQUIRE(result.ok());
+    REQUIRE(result.positions == std::vector<std::uint32_t>({2U, 0U, 1U}));
 }
 
 TEST_CASE("GLM router correction bias changes selection but not coefficient source") {

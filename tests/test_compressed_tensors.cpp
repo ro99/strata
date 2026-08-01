@@ -23,9 +23,8 @@ void store_le_u64(std::byte* output, std::uint64_t value) {
 
 }  // namespace
 
-TEST_CASE("real QuantTrio INT4 group-128 expert layout is accepted") {
-    // Revision 1d3bcfe5, model-00005-of-00124, layers.11.mlp.experts.16.down_proj.
-    const auto model = strata::quanttrio_glm52_int4_int8_mix_spec();
+TEST_CASE("GLM W4A16 group-128 expert layout is accepted") {
+    const auto model = strata::glm52_w4a16_spec();
     strata::CompressedTensorLayout layout;
     layout.logical_rows = 6144;
     layout.logical_columns = 2048;
@@ -43,39 +42,18 @@ TEST_CASE("real QuantTrio INT4 group-128 expert layout is accepted") {
                  .ok());
 }
 
-TEST_CASE("real QuantTrio INT8 group-128 attention layout is accepted") {
-    // Revision 1d3bcfe5, model-00037-of-00124, layers.3.self_attn.q_a_proj.
-    const auto model = strata::quanttrio_glm52_int4_int8_mix_spec();
+TEST_CASE("GLM W4A16 group-128 attention layout is accepted") {
+    const auto model = strata::glm52_w4a16_spec();
     strata::CompressedTensorLayout layout;
     layout.logical_rows = 2048;
     layout.logical_columns = 6144;
     layout.packed_rows = 2048;
-    layout.packed_columns = 1536;
+    layout.packed_columns = 768;
     layout.scale_rows = 2048;
     layout.scale_columns = 48;
     REQUIRE(strata::validate_compressed_tensor_layout(
                 layout, model.mixed_quantization.linears)
                 .ok());
-}
-
-TEST_CASE("real QuantTrio channelwise INT8 MTP layout is accepted") {
-    // Revision 1d3bcfe5, mtp-00001-of-00004, layers.78.mlp.experts.0.gate_proj.
-    const auto model = strata::quanttrio_glm52_int4_int8_mix_spec();
-    strata::CompressedTensorLayout layout;
-    layout.logical_rows = 2048;
-    layout.logical_columns = 6144;
-    layout.packed_rows = 2048;
-    layout.packed_columns = 1536;
-    layout.scale_rows = 2048;
-    layout.scale_columns = 1;
-    REQUIRE(strata::validate_compressed_tensor_layout(layout,
-                                                       model.mixed_quantization.mtp)
-                .ok());
-
-    layout.scale_columns = 48;
-    REQUIRE(!strata::validate_compressed_tensor_layout(layout,
-                                                        model.mixed_quantization.mtp)
-                 .ok());
 }
 
 TEST_CASE("compressed logical shape decodes exact little-endian I64 values") {

@@ -15,6 +15,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 
@@ -290,6 +291,7 @@ __global__ void native_fp4_matmul_kernel(
 }
 
 constexpr std::uint32_t kMaxDeepSeekRoutedExperts = 6U;
+constexpr std::uint32_t kMaxMoeExperts = 9U;
 
 struct DeepSeekFp4Batch {
     const unsigned char* w1_weights[kMaxDeepSeekRoutedExperts]{};
@@ -300,6 +302,18 @@ struct DeepSeekFp4Batch {
     const unsigned char* w2_scales[kMaxDeepSeekRoutedExperts]{};
     float coefficients[kMaxDeepSeekRoutedExperts]{};
     std::uint32_t count{};
+};
+
+struct PackedInt4MoeBatch {
+    const std::uint32_t* gate_weights[kMaxMoeExperts]{};
+    const __nv_bfloat16* gate_scales[kMaxMoeExperts]{};
+    const std::uint32_t* up_weights[kMaxMoeExperts]{};
+    const __nv_bfloat16* up_scales[kMaxMoeExperts]{};
+    const std::uint32_t* down_weights[kMaxMoeExperts]{};
+    const __nv_bfloat16* down_scales[kMaxMoeExperts]{};
+    float coefficients[kMaxMoeExperts]{};
+    std::uint32_t count{};
+    std::uint32_t rows{};
 };
 
 __device__ float fp8_e8m0_scale_bits(unsigned char encoded) {
@@ -494,6 +508,91 @@ __global__ void lightning_topk_merge_kernel(
         }
         top_scores[insert] = score;
         top_positions[insert] = position;
+    }
+}
+
+__global__ void packed_int4_moe_gate_up_kernel(
+    float* activations, const float* hidden, PackedInt4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    std::uint32_t group_size, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto* gate_weights = batch.gate_weights[expert];
+    const auto* gate_scales = batch.gate_scales[expert];
+    const auto* up_weights = batch.up_weights[expert];
+    const auto* up_scales = batch.up_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base = static_cast<std::uint64_t>(row) * columns;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const auto shift = static_cast<unsigned int>((column % 8U) * 4U);
+        const auto gate_raw = (gate_weights[weight_base + column / 8U] >> shift) & 0x0FU;
+        const auto up_raw = (up_weights[weight_base + column / 8U] >> shift) & 0x0FU;
+        const auto scale_column = column / group_size;
+        const float input = hidden[input_base + column];
+        gate += input * static_cast<float>(static_cast<int>(gate_raw) - 8) *
+                __bfloat162float(gate_scales[scale_base + scale_column]);
+        up += input * static_cast<float>(static_cast<int>(up_raw) - 8) *
+              __bfloat162float(up_scales[scale_base + scale_column]);
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F
+                                  ? 1.0F / (1.0F + exponential)
+                                  : exponential / (1.0F + exponential);
+        const auto activation =
+            (static_cast<std::uint64_t>(expert) * batch.rows + row) *
+                intermediate + output_row;
+        activations[activation] = gate * sigmoid * up * batch.coefficients[expert];
+    }
+}
+
+__global__ void packed_int4_moe_down_kernel(
+    float* output, const float* activations, PackedInt4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    std::uint32_t group_size, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= rows || expert >= batch.count) return;
+
+    const auto* weights = batch.down_weights[expert];
+    const auto* scales = batch.down_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base =
+        (static_cast<std::uint64_t>(expert) * batch.rows + row) * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const auto shift = static_cast<unsigned int>((column % 8U) * 4U);
+        const auto raw = (weights[weight_base + column / 8U] >> shift) & 0x0FU;
+        sum += activations[input_base + column] *
+               static_cast<float>(static_cast<int>(raw) - 8) *
+               __bfloat162float(scales[scale_base + column / group_size]);
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
+               output_row] = sum;
     }
 }
 
@@ -1007,6 +1106,127 @@ __global__ void flash_attention_reference_all_f32_kernel(
     }
 }
 
+constexpr std::uint32_t kGlmHeads = 64U;
+constexpr std::uint32_t kGlmNope = 192U;
+constexpr std::uint32_t kGlmRope = 64U;
+constexpr std::uint32_t kGlmValue = 256U;
+constexpr std::uint32_t kGlmLatent = 512U;
+
+__device__ float glm_int4_product(
+    float activation, const std::uint32_t* packed,
+    const __nv_bfloat16* scales, std::uint32_t row,
+    std::uint32_t column) {
+    constexpr std::uint32_t packed_columns = kGlmLatent / 8U;
+    constexpr std::uint32_t scale_columns = kGlmLatent / 128U;
+    const auto word = packed[static_cast<std::uint64_t>(row) * packed_columns +
+                             column / 8U];
+    const auto raw = (word >> ((column % 8U) * 4U)) & 0x0FU;
+    const float quantized = static_cast<float>(static_cast<int>(raw) - 8);
+    const float scale = __bfloat162float(
+        scales[static_cast<std::uint64_t>(row) * scale_columns +
+               column / 128U]);
+    return __fmul_rn(__fmul_rn(activation, quantized), scale);
+}
+
+__global__ void glm_absorbed_attention_kernel(
+    float* output, const float* queries, const float* latent,
+    const float* rope, const std::uint32_t* causal_key_counts,
+    const std::uint32_t* packed, const __nv_bfloat16* scales,
+    std::uint32_t query_rows, std::uint32_t key_rows, float attention_scale,
+    unsigned int* error_flag) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (head >= kGlmHeads || query_row >= query_rows) return;
+    const auto visible_rows = causal_key_counts[query_row];
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(query_row) * kGlmHeads + head) *
+            (kGlmNope + kGlmRope);
+    const auto weight_row = head * (kGlmNope + kGlmValue);
+    extern __shared__ float scratch[];
+    auto* absorbed_query = scratch;
+    auto* context_latent = absorbed_query + kGlmLatent;
+    auto* scores = context_latent + kGlmLatent;
+
+    for (std::uint32_t column = threadIdx.x; column < kGlmLatent;
+         column += blockDim.x) {
+        float sum = 0.0F;
+        for (std::uint32_t dimension = 0U; dimension < kGlmNope;
+             ++dimension) {
+            sum = __fadd_rn(sum, glm_int4_product(
+                query[dimension], packed, scales,
+                weight_row + dimension, column));
+        }
+        absorbed_query[column] = sum;
+    }
+    __syncthreads();
+
+    for (std::uint32_t row = threadIdx.x; row < visible_rows;
+         row += blockDim.x) {
+        float score = 0.0F;
+        const auto* latent_row = latent +
+            static_cast<std::uint64_t>(row) * kGlmLatent;
+        const auto* rope_row = rope +
+            static_cast<std::uint64_t>(row) * kGlmRope;
+        for (std::uint32_t column = 0U; column < kGlmLatent; ++column) {
+            score = __fadd_rn(score, __fmul_rn(
+                absorbed_query[column], latent_row[column]));
+        }
+        for (std::uint32_t dimension = 0U; dimension < kGlmRope;
+             ++dimension) {
+            score = __fadd_rn(score, __fmul_rn(
+                query[kGlmNope + dimension], rope_row[dimension]));
+        }
+        scores[row] = __fmul_rn(score, attention_scale);
+        if (!isfinite(scores[row])) atomicExch(error_flag, 1U);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0U) {
+        float maximum = scores[0];
+        for (std::uint32_t row = 1U; row < visible_rows; ++row) {
+            maximum = fmaxf(maximum, scores[row]);
+        }
+        float denominator = 0.0F;
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            scores[row] = expf(__fsub_rn(scores[row], maximum));
+            denominator = __fadd_rn(denominator, scores[row]);
+        }
+        if (!isfinite(denominator) || denominator <= 0.0F) {
+            atomicExch(error_flag, 2U);
+            denominator = 1.0F;
+        }
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            scores[row] = __fdiv_rn(scores[row], denominator);
+        }
+    }
+    __syncthreads();
+
+    for (std::uint32_t column = threadIdx.x; column < kGlmLatent;
+         column += blockDim.x) {
+        float sum = 0.0F;
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            sum = __fadd_rn(sum, __fmul_rn(
+                scores[row], latent[static_cast<std::uint64_t>(row) *
+                                    kGlmLatent + column]));
+        }
+        context_latent[column] = sum;
+    }
+    __syncthreads();
+
+    if (threadIdx.x < kGlmValue) {
+        float sum = 0.0F;
+        const auto row = weight_row + kGlmNope + threadIdx.x;
+        for (std::uint32_t column = 0U; column < kGlmLatent; ++column) {
+            sum = __fadd_rn(sum, glm_int4_product(
+                context_latent[column], packed, scales, row, column));
+        }
+        output[(static_cast<std::uint64_t>(query_row) * kGlmHeads + head) *
+                   kGlmValue + threadIdx.x] = sum;
+        if (!isfinite(sum)) atomicExch(error_flag, 3U);
+    }
+    (void)key_rows;
+}
+
 bool checked_bytes(std::uint64_t left, std::uint64_t right, std::uint64_t element_bytes,
                    std::uint64_t& result) {
     if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left) return false;
@@ -1188,6 +1408,7 @@ struct CudaBackend::Impl {
         std::uint64_t moe_host_staging_bytes{};
         std::uint64_t moe_hidden_columns{};
         std::uint64_t moe_intermediate_columns{};
+        std::uint32_t moe_rows{1U};
         std::uint32_t moe_routed_count{};
         std::uint64_t moe_kernel_launches{};
         std::vector<std::shared_ptr<CudaWeight::Impl>> moe_weights;
@@ -2581,6 +2802,293 @@ ValidationResult CudaBackend::flash_attention(
     return result;
 }
 
+ValidationResult CudaBackend::glm_absorbed_attention(
+    const CudaWeight& key_value_projection,
+    const CudaGlmAbsorbedAttentionRequest& request,
+    std::span<float> output) {
+    ValidationResult result;
+    if (!key_value_projection.valid()) {
+        result.errors.emplace_back(
+            "GLM absorbed attention received an invalid projection");
+        return result;
+    }
+    const auto& descriptor = key_value_projection.impl_->descriptor;
+    constexpr std::uint64_t projection_rows =
+        static_cast<std::uint64_t>(kGlmHeads) * (kGlmNope + kGlmValue);
+    if (descriptor.encoding != CudaWeightEncoding::OffsetPackedInt4 ||
+        descriptor.dtype != SafetensorsDtype::I32 ||
+        descriptor.rows != projection_rows ||
+        descriptor.columns != kGlmLatent || descriptor.group_size != 128U ||
+        descriptor.packed_columns != kGlmLatent / 8U ||
+        descriptor.scale_columns != kGlmLatent / 128U) {
+        result.errors.emplace_back(
+            "GLM absorbed attention requires the target OffsetPackedInt4 kv_b projection");
+        return result;
+    }
+    const auto query_rows = request.causal_key_counts.size();
+    if (query_rows == 0U || query_rows > 65'535U ||
+        request.queries.size() !=
+            query_rows * kGlmHeads * (kGlmNope + kGlmRope) ||
+        request.latent.empty() || request.latent.size() % kGlmLatent != 0U ||
+        output.size() != query_rows * kGlmHeads * kGlmValue ||
+        !std::isfinite(request.scale) || request.scale <= 0.0F) {
+        result.errors.emplace_back("GLM absorbed attention activation shape is invalid");
+        return result;
+    }
+    const auto key_rows = request.latent.size() / kGlmLatent;
+    if (key_rows > 2'048U ||
+        request.rope.size() != key_rows * kGlmRope ||
+        std::any_of(request.causal_key_counts.begin(),
+                    request.causal_key_counts.end(),
+                    [key_rows](std::uint32_t rows) {
+                        return rows == 0U || rows > key_rows;
+                    })) {
+        result.errors.emplace_back(
+            "GLM absorbed attention causal window is invalid or exceeds 2,048 tokens");
+        return result;
+    }
+    const auto found = impl_->devices.find(key_value_projection.impl_->device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "GLM absorbed attention targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "GLM absorbed attention cannot overlap an in-flight MoE command");
+        return result;
+    }
+    if (auto status = cudaSetDevice(key_value_projection.impl_->device);
+        status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for GLM absorbed attention");
+    }
+
+    const auto query_bytes = static_cast<std::uint64_t>(request.queries.size_bytes());
+    const auto latent_bytes = static_cast<std::uint64_t>(request.latent.size_bytes());
+    const auto rope_bytes = static_cast<std::uint64_t>(request.rope.size_bytes());
+    const auto limit_bytes = static_cast<std::uint64_t>(
+        request.causal_key_counts.size_bytes());
+    const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    if (query_bytes > std::numeric_limits<std::uint64_t>::max() - latent_bytes ||
+        query_bytes + latent_bytes >
+            std::numeric_limits<std::uint64_t>::max() - rope_bytes ||
+        query_bytes + latent_bytes + rope_bytes >
+            std::numeric_limits<std::uint64_t>::max() - limit_bytes ||
+        output_bytes > std::numeric_limits<std::uint64_t>::max() -
+                           sizeof(unsigned int)) {
+        result.errors.emplace_back("GLM absorbed attention workspace size overflows");
+        return result;
+    }
+    const auto latent_offset = query_bytes;
+    const auto rope_offset = latent_offset + latent_bytes;
+    const auto limit_offset = rope_offset + rope_bytes;
+    const auto input_bytes = limit_offset + limit_bytes;
+    const auto error_offset = output_bytes;
+    const auto output_workspace_bytes = output_bytes + sizeof(unsigned int);
+    if (input_bytes > request.maximum_workspace_bytes ||
+        output_workspace_bytes > request.maximum_workspace_bytes - input_bytes) {
+        result.errors.emplace_back(
+            "GLM absorbed attention exceeds its bounded CUDA workspace");
+        return result;
+    }
+
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    if (input_bytes > state.input_bytes) {
+        if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
+        if (auto status = cudaMalloc(
+                &state.input, static_cast<std::size_t>(input_bytes));
+            status != cudaSuccess) {
+            state.input = nullptr;
+            state.input_bytes = 0U;
+            return cuda_error(status,
+                              "allocate GLM absorbed attention input workspace");
+        }
+        state.input_bytes = input_bytes;
+        ++allocation_calls;
+        allocation_bytes += input_bytes;
+    }
+    if (output_workspace_bytes > state.output_bytes) {
+        if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
+        if (auto status = cudaMalloc(
+                &state.output, static_cast<std::size_t>(output_workspace_bytes));
+            status != cudaSuccess) {
+            state.output = nullptr;
+            state.output_bytes = 0U;
+            return cuda_error(status,
+                              "allocate GLM absorbed attention output workspace");
+        }
+        state.output_bytes = output_workspace_bytes;
+        ++allocation_calls;
+        allocation_bytes += output_workspace_bytes;
+    }
+
+    auto* device_input = reinterpret_cast<std::byte*>(state.input);
+    auto* device_output = reinterpret_cast<std::byte*>(state.output);
+    auto* device_error = reinterpret_cast<unsigned int*>(
+        device_output + error_offset);
+    const auto operation_started = std::chrono::steady_clock::now();
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record GLM absorbed attention upload start");
+        }
+    }
+    for (const auto& copy : {
+             std::tuple{device_input,
+                        static_cast<const void*>(request.queries.data()), query_bytes},
+             std::tuple{device_input + latent_offset,
+                        static_cast<const void*>(request.latent.data()), latent_bytes},
+             std::tuple{device_input + rope_offset,
+                        static_cast<const void*>(request.rope.data()), rope_bytes},
+             std::tuple{device_input + limit_offset,
+                        static_cast<const void*>(request.causal_key_counts.data()),
+                        limit_bytes}}) {
+        if (auto status = cudaMemcpyAsync(
+                std::get<0>(copy), std::get<1>(copy),
+                static_cast<std::size_t>(std::get<2>(copy)),
+                cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "upload GLM absorbed attention inputs");
+        }
+    }
+    if (auto status = cudaMemsetAsync(device_error, 0, sizeof(*device_error),
+                                      state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear GLM absorbed attention status");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record GLM absorbed attention upload completion");
+        }
+    }
+    const dim3 grid(kGlmHeads, static_cast<unsigned int>(query_rows), 1U);
+    constexpr unsigned int threads = 256U;
+    const auto shared_bytes =
+        static_cast<std::size_t>(2U * kGlmLatent + key_rows) * sizeof(float);
+    glm_absorbed_attention_kernel<<<grid, threads, shared_bytes, state.stream>>>(
+        reinterpret_cast<float*>(device_output),
+        reinterpret_cast<const float*>(device_input),
+        reinterpret_cast<const float*>(device_input + latent_offset),
+        reinterpret_cast<const float*>(device_input + rope_offset),
+        reinterpret_cast<const std::uint32_t*>(device_input + limit_offset),
+        static_cast<const std::uint32_t*>(key_value_projection.impl_->weights),
+        static_cast<const __nv_bfloat16*>(key_value_projection.impl_->scales),
+        static_cast<std::uint32_t>(query_rows),
+        static_cast<std::uint32_t>(key_rows), request.scale, device_error);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch GLM absorbed attention");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record GLM absorbed attention kernel completion");
+        }
+    }
+    unsigned int numerical_error = 0U;
+    if (auto status = cudaMemcpyAsync(
+            output.data(), device_output, static_cast<std::size_t>(output_bytes),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download GLM absorbed attention output");
+    }
+    if (auto status = cudaMemcpyAsync(
+            &numerical_error, device_error, sizeof(numerical_error),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download GLM absorbed attention status");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record GLM absorbed attention download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize GLM absorbed attention");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    const auto operation_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - operation_started).count());
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_ms = 0.0F;
+        float kernel_ms = 0.0F;
+        float d2h_ms = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_ms, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure GLM absorbed attention upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_ms, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure GLM absorbed attention kernel");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_ms, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure GLM absorbed attention download");
+        }
+        h2d_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
+        d2h_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [&](const auto& value) {
+                return value.device == key_value_projection.impl_->device;
+            });
+        stats.activation_h2d_bytes += input_bytes;
+        stats.activation_d2h_bytes += output_workspace_bytes;
+        stats.matmul_calls += 2U;
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
+        stats.activation_h2d_nanoseconds += h2d_nanoseconds;
+        stats.kernel_nanoseconds += kernel_nanoseconds;
+        stats.activation_d2h_nanoseconds += d2h_nanoseconds;
+        ++stats.flash_attention_calls;
+        ++stats.flash_attention_kernel_launches;
+        stats.flash_attention_h2d_transfers += 4U;
+        stats.flash_attention_d2h_transfers += 2U;
+        stats.flash_attention_h2d_bytes += input_bytes;
+        stats.flash_attention_d2h_bytes += output_workspace_bytes;
+        stats.flash_attention_useful_staging_bytes += latent_bytes + rope_bytes;
+        stats.flash_attention_h2d_nanoseconds += h2d_nanoseconds;
+        stats.flash_attention_kernel_nanoseconds += kernel_nanoseconds;
+        stats.flash_attention_d2h_nanoseconds += d2h_nanoseconds;
+        stats.flash_attention_nanoseconds += operation_nanoseconds;
+    }
+    if (numerical_error != 0U) {
+        result.errors.emplace_back(
+            numerical_error == 1U
+                ? "GLM absorbed attention score is non-finite"
+                : numerical_error == 2U
+                    ? "GLM absorbed attention softmax denominator is invalid"
+                    : "GLM absorbed attention output is non-finite");
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
@@ -3018,6 +3526,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
 
     state.moe_hidden_columns = hidden_columns;
     state.moe_intermediate_columns = intermediate_columns;
+    state.moe_rows = 1U;
     state.moe_routed_count = routed_batch.count;
     state.moe_has_shared = shared != nullptr;
     state.moe_kernel_launches = 0U;
@@ -3180,6 +3689,292 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     return result;
 }
 
+ValidationResult CudaBackend::enqueue_moe(
+    int device, std::span<const float> hidden, std::uint32_t rows,
+    std::span<const CudaMoeExpert> routed, const CudaMoeExpert* shared) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back("MoE command targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back("MoE workspace already has an in-flight command");
+        return result;
+    }
+    const auto expert_count = routed.size() + (shared == nullptr ? 0U : 1U);
+    if (rows == 0U || expert_count == 0U || expert_count > kMaxMoeExperts ||
+        routed.size() > 8U) {
+        result.errors.emplace_back("MoE command has an unsupported row or expert count");
+        return result;
+    }
+
+    std::uint64_t hidden_columns = 0U;
+    std::uint64_t intermediate_columns = 0U;
+    const auto validate_expert = [&](const CudaMoeExpert& expert,
+                                     bool shared_expert) {
+        const std::array<const CudaWeight*, 3> weights{
+            expert.gate, expert.up, expert.down};
+        for (const auto* weight : weights) {
+            if (weight == nullptr || !weight->valid() ||
+                weight->impl_->device != device ||
+                weight->impl_->descriptor.encoding !=
+                    CudaWeightEncoding::OffsetPackedInt4 ||
+                weight->impl_->descriptor.dtype != SafetensorsDtype::I32 ||
+                weight->impl_->descriptor.group_size != 128U) {
+                result.errors.emplace_back(
+                    "MoE command contains an incompatible INT4 CUDA weight");
+                return false;
+            }
+        }
+        const auto& gate = expert.gate->impl_->descriptor;
+        const auto& up = expert.up->impl_->descriptor;
+        const auto& down = expert.down->impl_->descriptor;
+        if (gate.rows == 0U || gate.columns == 0U ||
+            up.rows != gate.rows || up.columns != gate.columns ||
+            down.rows != gate.columns || down.columns != gate.rows ||
+            gate.packed_columns != up.packed_columns ||
+            gate.scale_columns != up.scale_columns ||
+            down.packed_columns != (down.columns + 7U) / 8U ||
+            down.scale_columns != (down.columns + 127U) / 128U) {
+            result.errors.emplace_back("MoE gate/up/down shapes are incompatible");
+            return false;
+        }
+        if (!std::isfinite(expert.coefficient) ||
+            (shared_expert && expert.coefficient != 1.0F)) {
+            result.errors.emplace_back("MoE expert coefficient is invalid");
+            return false;
+        }
+        if (hidden_columns == 0U) {
+            hidden_columns = gate.columns;
+            intermediate_columns = gate.rows;
+        } else if (hidden_columns != gate.columns ||
+                   intermediate_columns != gate.rows) {
+            result.errors.emplace_back(
+                "MoE experts do not share one activation shape");
+            return false;
+        }
+        return true;
+    };
+    for (const auto& expert : routed) {
+        if (!validate_expert(expert, false)) return result;
+    }
+    if (shared != nullptr && !validate_expert(*shared, true)) return result;
+
+    std::uint64_t hidden_elements = 0U;
+    if (!checked_bytes(rows, hidden_columns, 1U, hidden_elements) ||
+        hidden.size() != hidden_elements ||
+        std::any_of(hidden.begin(), hidden.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back("MoE hidden rows are incompatible");
+        return result;
+    }
+
+    std::uint64_t hidden_bytes = 0U;
+    std::uint64_t activation_rows = 0U;
+    std::uint64_t activation_bytes = 0U;
+    std::uint64_t output_bytes = 0U;
+    if (!checked_bytes(rows, hidden_columns, sizeof(float), hidden_bytes) ||
+        !checked_bytes(expert_count, rows, 1U, activation_rows) ||
+        !checked_bytes(activation_rows, intermediate_columns, sizeof(float),
+                       activation_bytes) ||
+        !checked_bytes(activation_rows, hidden_columns, sizeof(float),
+                       output_bytes) ||
+        output_bytes > std::numeric_limits<std::uint64_t>::max() -
+                           sizeof(unsigned int)) {
+        result.errors.emplace_back("MoE workspace size overflows");
+        return result;
+    }
+    if (hidden_columns > std::numeric_limits<unsigned int>::max() ||
+        intermediate_columns > std::numeric_limits<unsigned int>::max() ||
+        activation_rows > std::numeric_limits<unsigned int>::max()) {
+        result.errors.emplace_back("MoE CUDA grid dimensions overflow");
+        return result;
+    }
+    const auto host_staging_bytes = output_bytes + sizeof(unsigned int);
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for MoE");
+    }
+
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    const auto ensure_workspace = [&](float*& pointer, std::uint64_t& capacity,
+                                      std::uint64_t required,
+                                      const char* operation) {
+        if (required <= capacity) return true;
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = nullptr;
+        capacity = 0U;
+        if (const auto status =
+                cudaMalloc(&pointer, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return true;
+    };
+    if (!ensure_workspace(state.moe_hidden, state.moe_hidden_bytes, hidden_bytes,
+                          "allocate MoE hidden workspace") ||
+        !ensure_workspace(state.moe_activations, state.moe_activation_bytes,
+                          activation_bytes,
+                          "allocate MoE activation workspace") ||
+        !ensure_workspace(state.moe_output, state.moe_output_bytes, output_bytes,
+                          "allocate MoE output workspace")) {
+        return result;
+    }
+    if (state.moe_error == nullptr) {
+        if (const auto status = cudaMalloc(&state.moe_error, sizeof(unsigned int));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate MoE error flag");
+        }
+        ++allocation_calls;
+        allocation_bytes += sizeof(unsigned int);
+    }
+    if (host_staging_bytes > state.moe_host_staging_bytes) {
+        if (state.moe_host_staging != nullptr) {
+            static_cast<void>(cudaFreeHost(state.moe_host_staging));
+        }
+        state.moe_host_staging = nullptr;
+        state.moe_host_staging_bytes = 0U;
+        if (const auto status = cudaMallocHost(
+                &state.moe_host_staging,
+                static_cast<std::size_t>(host_staging_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate MoE host staging");
+        }
+        state.moe_host_staging_bytes = host_staging_bytes;
+        ++allocation_calls;
+        allocation_bytes += host_staging_bytes;
+    }
+
+    PackedInt4MoeBatch batch;
+    state.moe_weights.clear();
+    state.moe_weights.reserve(expert_count * 3U);
+    const auto append_expert = [&](const CudaMoeExpert& expert,
+                                   std::size_t index) {
+        batch.gate_weights[index] = static_cast<const std::uint32_t*>(
+            expert.gate->impl_->weights);
+        batch.gate_scales[index] = static_cast<const __nv_bfloat16*>(
+            expert.gate->impl_->scales);
+        batch.up_weights[index] = static_cast<const std::uint32_t*>(
+            expert.up->impl_->weights);
+        batch.up_scales[index] = static_cast<const __nv_bfloat16*>(
+            expert.up->impl_->scales);
+        batch.down_weights[index] = static_cast<const std::uint32_t*>(
+            expert.down->impl_->weights);
+        batch.down_scales[index] = static_cast<const __nv_bfloat16*>(
+            expert.down->impl_->scales);
+        batch.coefficients[index] = expert.coefficient;
+        state.moe_weights.push_back(expert.gate->impl_);
+        state.moe_weights.push_back(expert.up->impl_);
+        state.moe_weights.push_back(expert.down->impl_);
+    };
+    for (std::size_t index = 0U; index < routed.size(); ++index) {
+        append_expert(routed[index], index);
+    }
+    if (shared != nullptr) append_expert(*shared, routed.size());
+    batch.count = static_cast<std::uint32_t>(expert_count);
+    batch.rows = rows;
+
+    state.moe_hidden_columns = hidden_columns;
+    state.moe_intermediate_columns = intermediate_columns;
+    state.moe_rows = rows;
+    state.moe_routed_count = static_cast<std::uint32_t>(routed.size());
+    state.moe_has_shared = shared != nullptr;
+    state.moe_kernel_launches = 0U;
+    state.moe_in_flight = true;
+    state.moe_poisoned = false;
+    const auto abort_enqueue = [&](cudaError_t status, const char* operation) {
+        result = cuda_error(status, operation);
+        const auto drain_status = cudaStreamSynchronize(state.stream);
+        if (drain_status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("drain failed MoE enqueue: ") +
+                cudaGetErrorString(drain_status));
+            state.moe_poisoned = true;
+        } else {
+            state.moe_in_flight = false;
+            state.moe_weights.clear();
+        }
+    };
+
+    if (auto status = cudaEventRecord(state.moe_start, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record MoE start");
+        return result;
+    }
+    if (auto status = cudaMemsetAsync(
+            state.moe_error, 0, sizeof(unsigned int), state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "reset MoE error flag");
+        return result;
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.moe_hidden, hidden.data(), static_cast<std::size_t>(hidden_bytes),
+            cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "upload MoE hidden rows");
+        return result;
+    }
+    if (auto status = cudaEventRecord(state.moe_hidden_uploaded, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record MoE hidden upload");
+        return result;
+    }
+
+    const auto& gate = (routed.empty() ? shared->gate : routed.front().gate)
+                           ->impl_->descriptor;
+    const auto& down = (routed.empty() ? shared->down : routed.front().down)
+                           ->impl_->descriptor;
+    constexpr unsigned int threads = 256U;
+    const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
+                         static_cast<unsigned int>(activation_rows), 1U);
+    packed_int4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+        state.moe_activations, state.moe_hidden, batch, hidden_columns,
+        intermediate_columns, gate.packed_columns, gate.scale_columns,
+        gate.group_size, state.moe_error);
+    ++state.moe_kernel_launches;
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        abort_enqueue(status, "launch INT4 MoE gate/up SwiGLU");
+        return result;
+    }
+    const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
+                         static_cast<unsigned int>(activation_rows), 1U);
+    packed_int4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+        state.moe_output, state.moe_activations, batch, intermediate_columns,
+        hidden_columns, down.packed_columns, down.scale_columns,
+        down.group_size, state.moe_error);
+    ++state.moe_kernel_launches;
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        abort_enqueue(status, "launch INT4 MoE down projection");
+        return result;
+    }
+    if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record MoE kernel completion");
+        return result;
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        device_stats.activation_h2d_bytes += hidden_bytes;
+        device_stats.matmul_calls += 3U * expert_count;
+        device_stats.workspace_allocation_calls += allocation_calls;
+        device_stats.workspace_allocation_bytes += allocation_bytes;
+        ++device_stats.deepseek_moe_calls;
+        device_stats.deepseek_moe_kernel_launches += state.moe_kernel_launches;
+        ++device_stats.deepseek_moe_h2d_transfers;
+        device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::collect_deepseek_moe(
     int device, std::span<float> routed_output,
     std::span<float> shared_output) {
@@ -3235,12 +4030,18 @@ ValidationResult CudaBackend::collect_deepseek_moe(
             state.moe_weights.clear();
         }
     };
+    std::uint64_t routed_rows = 0U;
     std::uint64_t routed_elements = 0U;
-    if (!checked_bytes(state.moe_routed_count, state.moe_hidden_columns, 1U,
+    std::uint64_t shared_elements = 0U;
+    if (!checked_bytes(state.moe_routed_count, state.moe_rows, 1U,
+                       routed_rows) ||
+        !checked_bytes(routed_rows, state.moe_hidden_columns, 1U,
                        routed_elements) ||
+        !checked_bytes(state.moe_rows, state.moe_hidden_columns, 1U,
+                       shared_elements) ||
         routed_output.size() != routed_elements ||
         (state.moe_has_shared
-             ? shared_output.size() != state.moe_hidden_columns
+             ? shared_output.size() != shared_elements
              : !shared_output.empty())) {
         result.errors.emplace_back(
             "DeepSeek MoE collect output spans do not match the enqueued command");
@@ -3370,7 +4171,7 @@ ValidationResult CudaBackend::collect_deepseek_moe(
     }
     if (*host_error != 0U) {
         result.errors.emplace_back(
-            "DeepSeek MoE W1/W3 produced a non-finite BF16 activation");
+            "MoE projection produced a non-finite activation");
         return result;
     }
     if (!routed_output.empty()) {
@@ -3383,6 +4184,12 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                     static_cast<std::size_t>(shared_bytes));
     }
     return result;
+}
+
+ValidationResult CudaBackend::collect_moe(
+    int device, std::span<float> routed_output,
+    std::span<float> shared_output) {
+    return collect_deepseek_moe(device, routed_output, shared_output);
 }
 
 ValidationResult CudaBackend::synchronize(int device) {

@@ -39,10 +39,6 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#if defined(__linux__)
-#include <unistd.h>
-#endif
-
 namespace strata {
 
 namespace {
@@ -310,39 +306,6 @@ void apply_rope(std::span<float> values, std::uint64_t position,
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - started).count());
-}
-
-[[nodiscard]] std::uint64_t resident_set_bytes() noexcept {
-#if defined(__linux__)
-    std::ifstream input("/proc/self/statm");
-    std::uint64_t virtual_pages = 0U;
-    std::uint64_t resident_pages = 0U;
-    input >> virtual_pages >> resident_pages;
-    static_cast<void>(virtual_pages);
-    const long page_bytes = sysconf(_SC_PAGESIZE);
-    if (!input || page_bytes <= 0 ||
-        resident_pages > std::numeric_limits<std::uint64_t>::max() /
-                             static_cast<std::uint64_t>(page_bytes)) {
-        return 0U;
-    }
-    return resident_pages * static_cast<std::uint64_t>(page_bytes);
-#else
-    return 0U;
-#endif
-}
-
-[[nodiscard]] std::vector<std::uint64_t> device_vram_used_bytes(
-    std::span<const int> devices) {
-    std::vector<std::uint64_t> result;
-    result.reserve(devices.size());
-    for (const int device : devices) {
-        const auto memory = CudaBackend::device_memory(device);
-        result.push_back(memory.ok() && memory.value.total_bytes >=
-                                           memory.value.free_bytes
-                             ? memory.value.total_bytes - memory.value.free_bytes
-                             : 0U);
-    }
-    return result;
 }
 
 [[nodiscard]] std::uint64_t linear_bytes(const Dsv4CheckpointReader& checkpoint,
@@ -4029,7 +3992,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (impl_->kv_cache != nullptr) {
         impl_->initialization_metrics.kv_cache = impl_->kv_cache->stats();
     }
-    impl_->initialization_metrics.rss_bytes = resident_set_bytes();
+    impl_->initialization_metrics.rss_bytes = process_resident_set_bytes();
     impl_->initialization_metrics.device_vram_used_bytes =
         device_vram_used_bytes(impl_->devices);
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
@@ -4260,7 +4223,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     result.metrics.reused_prompt_tokens = prefill_offset;
     result.metrics.decode_tokens = decode_steps;
     result.metrics.incremental_kv_continuation = prefill_offset != 0U;
-    result.metrics.rss_bytes = resident_set_bytes();
+    result.metrics.rss_bytes = process_resident_set_bytes();
     result.metrics.device_vram_used_bytes =
         device_vram_used_bytes(impl_->devices);
     result.metrics.generation_checkpoint_reads = read_delta(reads_after_decode,

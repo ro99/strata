@@ -50,7 +50,7 @@ GlmCheckpointOpenResult GlmCheckpointReader::open(std::string model_directory,
         result.errors = std::move(index.errors);
         return result;
     }
-    auto built = build_quanttrio_glm52_index_manifest(std::move(index.value));
+    auto built = build_glm52_w4a16_index_manifest(std::move(index.value));
     if (!built.ok()) {
         result.errors = std::move(built.errors);
         return result;
@@ -59,7 +59,7 @@ GlmCheckpointOpenResult GlmCheckpointReader::open(std::string model_directory,
     options.require_all_shards = true;
     options.require_read_only = require_read_only;
     options.validate_logical_shapes = true;
-    auto validated = validate_quanttrio_glm52_checkpoint(
+    auto validated = validate_glm52_w4a16_checkpoint(
         model_directory, std::move(built.manifest), options);
     if (!validated.ok()) {
         result.errors = std::move(validated.errors);
@@ -348,9 +348,8 @@ ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,
                                    std::string(base_name));
         return result;
     }
-    const std::uint32_t bits = packed->encoding == GlmTensorEncoding::Int4Group128 ? 4U : 8U;
-    const std::uint32_t group_size =
-        packed->encoding == GlmTensorEncoding::Int8Channel ? 0U : 128U;
+    constexpr std::uint32_t bits = 4U;
+    constexpr std::uint32_t group_size = 128U;
     const auto expected_packed_columns =
         (expected_columns + (32U / bits) - 1U) / (32U / bits);
     const auto expected_scale_columns = group_size == 0U
@@ -371,8 +370,7 @@ ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,
     if (!result.ok()) return result;
 
     CudaWeightDescriptor descriptor;
-    descriptor.encoding = bits == 4U ? CudaWeightEncoding::OffsetPackedInt4
-                                     : CudaWeightEncoding::OffsetPackedInt8;
+    descriptor.encoding = CudaWeightEncoding::OffsetPackedInt4;
     descriptor.dtype = SafetensorsDtype::I32;
     descriptor.rows = expected_rows;
     descriptor.columns = expected_columns;

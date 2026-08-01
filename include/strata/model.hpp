@@ -52,7 +52,7 @@ struct RouterSpec {
 
 enum class QuantizationKind : std::uint8_t {
     Uniform,
-    CompressedTensorsInt4Int8Mix,
+    CompressedTensorsW4A16,
     NativeFp4Fp8,
 };
 
@@ -152,8 +152,8 @@ struct ModelSpec {
 };
 
 [[nodiscard]] ValidationResult validate_model(const ModelSpec& spec);
-[[nodiscard]] ModelSpec quanttrio_glm52_int4_int8_mix_spec();
-[[nodiscard]] ValidationResult validate_quanttrio_glm52_int4_int8_mix(
+[[nodiscard]] ModelSpec glm52_w4a16_spec();
+[[nodiscard]] ValidationResult validate_glm52_w4a16(
     const ModelSpec& spec);
 [[nodiscard]] ModelSpec deepseek_v4_flash_0731_spec();
 [[nodiscard]] ValidationResult validate_deepseek_v4_flash_0731(

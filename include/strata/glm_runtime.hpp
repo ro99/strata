@@ -55,11 +55,31 @@ struct Glm52HostExpertStats {
     std::uint64_t mapping_sweep_nanoseconds{};
 };
 
+struct Glm52GraphStats {
+    std::uint64_t forward_tokens{};
+    std::uint64_t embedding_nanoseconds{};
+    std::uint64_t input_norm_nanoseconds{};
+    std::uint64_t attention_nanoseconds{};
+    std::uint64_t attention_residual_nanoseconds{};
+    std::uint64_t post_attention_norm_nanoseconds{};
+    std::uint64_t dense_mlp_nanoseconds{};
+    std::uint64_t moe_nanoseconds{};
+    std::uint64_t moe_router_nanoseconds{};
+    std::uint64_t moe_prepare_nanoseconds{};
+    std::uint64_t moe_routed_nanoseconds{};
+    std::uint64_t moe_shared_nanoseconds{};
+    std::uint64_t mlp_residual_nanoseconds{};
+    std::uint64_t output_head_nanoseconds{};
+    std::uint64_t future_entropy_nanoseconds{};
+    std::uint64_t future_entropy_passes{};
+};
+
 struct Glm52PhaseMetrics {
     CheckpointReadStats checkpoint_reads;
     CudaBackendStats cuda;
     Glm52CacheStats cache;
     Glm52HostExpertStats host_experts;
+    Glm52GraphStats graph;
     std::uint64_t host_aggregation_nanoseconds{};
 };
 
@@ -74,8 +94,11 @@ struct Glm52RunMetrics {
     CudaBackendStats cuda;
     Glm52CacheStats cache;
     Glm52HostExpertStats host_experts;
+    Glm52GraphStats graph;
     Glm52PhaseMetrics prefill;
     Glm52PhaseMetrics decode;
+    std::uint64_t rss_bytes{};
+    std::vector<std::uint64_t> device_vram_used_bytes;
     bool detailed_timing{};
     bool flash_attention_enabled{};
     bool incremental_kv_continuation{};

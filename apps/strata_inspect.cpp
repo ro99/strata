@@ -396,7 +396,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    auto result = strata::build_quanttrio_glm52_index_manifest(std::move(parsed.value));
+    auto result = strata::build_glm52_w4a16_index_manifest(std::move(parsed.value));
     if (!result.ok()) {
         for (const auto& error : result.errors) std::cerr << "error: " << error << '\n';
         return 1;
@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
         strata::GlmCheckpointOptions options;
         options.require_all_shards = !allow_incomplete;
         options.require_read_only = require_read_only;
-        result = strata::validate_quanttrio_glm52_checkpoint(
+        result = strata::validate_glm52_w4a16_checkpoint(
             model_directory, std::move(result.manifest), options);
         if (!result.ok()) {
             for (const auto& error : result.errors) std::cerr << "error: " << error << '\n';
@@ -427,8 +427,6 @@ int main(int argc, char** argv) {
                   << "  \"shards\": " << manifest.shards.size() << ",\n"
                   << "  \"quantized_modules\": " << manifest.quantized_modules << ",\n"
                   << "  \"int4_group128_modules\": " << manifest.int4_modules << ",\n"
-                  << "  \"int8_group128_modules\": " << manifest.int8_group_modules << ",\n"
-                  << "  \"int8_channel_modules\": " << manifest.int8_channel_modules << ",\n"
                   << "  \"scanned_shards\": " << manifest.scanned_shards << ",\n"
                   << "  \"resolved_tensors\": " << manifest.resolved_tensors << ",\n"
                   << "  \"validated_layouts\": " << manifest.validated_layouts << ",\n"
@@ -442,8 +440,6 @@ int main(int argc, char** argv) {
                   << "shards=" << manifest.shards.size() << '\n'
                   << "quantized_modules=" << manifest.quantized_modules << '\n'
                   << "int4_group128_modules=" << manifest.int4_modules << '\n'
-                  << "int8_group128_modules=" << manifest.int8_group_modules << '\n'
-                  << "int8_channel_modules=" << manifest.int8_channel_modules << '\n'
                   << "scanned_shards=" << manifest.scanned_shards << '\n'
                   << "resolved_tensors=" << manifest.resolved_tensors << '\n'
                   << "validated_layouts=" << manifest.validated_layouts << '\n'

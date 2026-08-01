@@ -22,9 +22,9 @@ Gate: sanitizer tests and deterministic simulator output.
 
 ## Phase 1 — GLM-5.2 source lock and one-module vertical slice (implemented; external oracle gate open)
 
-- Pin `QuantTrio/GLM-5.2-Int4-Int8Mix` configuration, index, license, hashes,
+- Pin the GLM W4A16 configuration, index, license, hashes,
   and byte totals.
-- Parse and classify all 177,569 tensors across 128 shards.
+- Parse and classify all 175,527 tensors across eight shards.
 - Range-read one real expert's packed I32 values, BF16 group scales, and I64
   logical shape.
 - Decode the native signed INT4 group-128 representation with bounded memory.
@@ -35,10 +35,10 @@ recorded reconstruction metrics on an actual GLM-5.2 quantized module.
 
 ## Phase 2 — zero-rewrite GLM-5.2 import (implemented runtime path)
 
-- Build a content-addressed sidecar over the 124 main and four MTP shards.
+- Build a content-addressed sidecar over the eight base-model shards.
 - Validate every packed value/scale/shape triplet against the pinned
   `compressed-tensors` policy.
-- Preserve INT4 experts, INT8 linears and MTP, and BF16/FP32 tensors exactly.
+- Preserve INT4 linears and BF16/FP32 sensitive tensors exactly.
 - Open source shards read-only and keep runtime state outside the model files.
 - Resume downloads without creating a second converted weight copy.
 

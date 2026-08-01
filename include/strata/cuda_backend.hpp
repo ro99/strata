@@ -168,6 +168,15 @@ struct CudaLightningIndexRequest {
     std::uint64_t maximum_workspace_bytes{32ULL << 20U};
 };
 
+struct CudaGlmAbsorbedAttentionRequest {
+    std::span<const float> queries;
+    std::span<const float> latent;
+    std::span<const float> rope;
+    std::span<const std::uint32_t> causal_key_counts;
+    float scale{};
+    std::uint64_t maximum_workspace_bytes{768ULL << 20U};
+};
+
 class CudaWeight {
 public:
     CudaWeight();
@@ -213,6 +222,15 @@ struct CudaDeepSeekMoeExpert {
     const CudaWeight* w1{};
     const CudaWeight* w3{};
     const CudaWeight* w2{};
+    float coefficient{1.0F};
+};
+
+// Model-neutral gate/up/down expert descriptor for the common device MoE
+// workspace. Weight objects must remain alive until collection completes.
+struct CudaMoeExpert {
+    const CudaWeight* gate{};
+    const CudaWeight* up{};
+    const CudaWeight* down{};
     float coefficient{1.0F};
 };
 
@@ -279,6 +297,12 @@ public:
     [[nodiscard]] ValidationResult flash_attention(
         int device, const FlashAttentionRequest& request,
         std::span<float> output);
+    // Exact GLM-5.2 MLA weight absorption for the dense causal window. It
+    // avoids materializing per-head K/V from the compact 512+64 cache.
+    [[nodiscard]] ValidationResult glm_absorbed_attention(
+        const CudaWeight& key_value_projection,
+        const CudaGlmAbsorbedAttentionRequest& request,
+        std::span<float> output);
     // Exact bounded-workspace DeepSeek Lightning Indexer. Output contains
     // min(top_k, candidates) positions in descending score order with lower
     // positions winning ties. Unsupported shapes fail; no scalar fallback is
@@ -302,6 +326,13 @@ public:
     [[nodiscard]] ValidationResult collect_deepseek_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output);
+    [[nodiscard]] ValidationResult enqueue_moe(
+        int device, std::span<const float> hidden, std::uint32_t rows,
+        std::span<const CudaMoeExpert> routed,
+        const CudaMoeExpert* shared = nullptr);
+    [[nodiscard]] ValidationResult collect_moe(
+        int device, std::span<float> routed_output,
+        std::span<float> shared_output = {});
     [[nodiscard]] ValidationResult synchronize(int device);
 
     [[nodiscard]] CudaBackendStats stats() const noexcept;

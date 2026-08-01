@@ -21,14 +21,14 @@ constexpr std::array<std::uint64_t, static_cast<std::size_t>(GlmTensorRole::Coun
     kExpectedRoleCounts{
         1U,       // embedding
         1U,       // output head
-        317U,     // model and per-layer norms
-        1175U,    // attention linears and their packed metadata
-        110U,     // DSA indexers
-        21U,      // three dense MLPs
-        152U,     // router weights and correction biases
-        684U,     // shared experts
-        175104U,  // routed experts
-        4U,       // MTP state projections and norms
+        313U,     // model and per-layer norms
+        1170U,    // attention linears and their packed metadata
+        390U,     // DSA indexers
+        27U,      // three dense MLPs
+        150U,     // router weights and correction biases
+        675U,     // shared experts
+        172800U,  // routed experts
+        0U,       // optional prediction-head state is not in the base checkpoint
     };
 
 struct ClassifiedName {
@@ -64,10 +64,6 @@ struct TripletState {
     switch (encoding) {
         case GlmTensorEncoding::Int4Group128:
             return {4, QuantizationGranularity::Group, 128, true};
-        case GlmTensorEncoding::Int8Group128:
-            return {8, QuantizationGranularity::Group, 128, true};
-        case GlmTensorEncoding::Int8Channel:
-            return {8, QuantizationGranularity::Channel, 0, true};
         case GlmTensorEncoding::Plain: return {};
     }
     return {};
@@ -97,14 +93,8 @@ void append_error(GlmManifestResult& result, const GlmCheckpointOptions& options
     return value;
 }
 
-[[nodiscard]] GlmTensorEncoding encoding_for(GlmTensorRole role, std::int32_t layer) {
-    if (layer == 78 && (role == GlmTensorRole::Attention ||
-                        role == GlmTensorRole::SharedExpert ||
-                        role == GlmTensorRole::RoutedExpert)) {
-        return GlmTensorEncoding::Int8Channel;
-    }
-    if (role == GlmTensorRole::RoutedExpert) return GlmTensorEncoding::Int4Group128;
-    return GlmTensorEncoding::Int8Group128;
+[[nodiscard]] GlmTensorEncoding encoding_for() {
+    return GlmTensorEncoding::Int4Group128;
 }
 
 [[nodiscard]] std::optional<ClassifiedName> classify(std::string_view name,
@@ -134,12 +124,11 @@ void append_error(GlmManifestResult& result, const GlmCheckpointOptions& options
         error = "invalid layer tensor name " + std::string(name);
         return std::nullopt;
     }
-    if (*layer < 0 || *layer > 78) {
-        error = "tensor layer is outside [0, 78]: " + std::string(name);
+    if (*layer < 0 || *layer >= 78) {
+        error = "tensor layer is outside [0, 77]: " + std::string(name);
         return std::nullopt;
     }
     result.layer = *layer;
-    result.mtp = *layer == 78;
     const auto tail = name.substr(++cursor);
 
     constexpr std::string_view packed_suffix = ".weight_packed";
@@ -212,7 +201,7 @@ void append_error(GlmManifestResult& result, const GlmCheckpointOptions& options
             error = "forbidden quantized tensor role " + std::string(name);
             return std::nullopt;
         }
-        result.encoding = encoding_for(result.role, result.layer);
+        result.encoding = encoding_for();
         result.quantized_base = std::string(name.substr(0, name.size() -
             (result.component == GlmTensorComponent::PackedWeight ? packed_suffix.size() :
              result.component == GlmTensorComponent::Scale ? scale_suffix.size() :
@@ -264,15 +253,13 @@ std::string_view to_string(GlmTensorEncoding encoding) noexcept {
     switch (encoding) {
         case GlmTensorEncoding::Plain: return "plain";
         case GlmTensorEncoding::Int4Group128: return "int4_group128";
-        case GlmTensorEncoding::Int8Group128: return "int8_group128";
-        case GlmTensorEncoding::Int8Channel: return "int8_channel";
     }
     return "unknown";
 }
 
-GlmManifestResult build_quanttrio_glm52_index_manifest(SafetensorsIndex index) {
+GlmManifestResult build_glm52_w4a16_index_manifest(SafetensorsIndex index) {
     GlmManifestResult result;
-    const auto expected = quanttrio_glm52_int4_int8_mix_spec();
+    const auto expected = glm52_w4a16_spec();
     result.manifest.indexed_tensor_bytes = index.total_size;
     result.manifest.shards = std::move(index.shards);
 
@@ -283,23 +270,18 @@ GlmManifestResult build_quanttrio_glm52_index_manifest(SafetensorsIndex index) {
         result.errors.emplace_back("unexpected indexed tensor count");
     }
 
-    std::array<bool, 124U> main_seen{};
-    std::array<bool, 4U> mtp_seen{};
+    std::array<bool, 8U> main_seen{};
     for (const auto& shard : result.manifest.shards) {
         std::uint32_t ordinal = 0;
-        if (parse_shard_name(shard, "model-", 124U, ordinal)) {
+        if (parse_shard_name(shard, "model-", 8U, ordinal)) {
             if (main_seen[ordinal - 1U]) result.errors.emplace_back("duplicate main shard " + shard);
             main_seen[ordinal - 1U] = true;
-        } else if (parse_shard_name(shard, "mtp-", 4U, ordinal)) {
-            if (mtp_seen[ordinal - 1U]) result.errors.emplace_back("duplicate MTP shard " + shard);
-            mtp_seen[ordinal - 1U] = true;
         } else {
             result.errors.emplace_back("unexpected shard name " + shard);
         }
     }
-    if (!std::all_of(main_seen.begin(), main_seen.end(), [](bool seen) { return seen; }) ||
-        !std::all_of(mtp_seen.begin(), mtp_seen.end(), [](bool seen) { return seen; })) {
-        result.errors.emplace_back("Safetensors index does not cover all 124 main and four MTP shards");
+    if (!std::all_of(main_seen.begin(), main_seen.end(), [](bool seen) { return seen; })) {
+        result.errors.emplace_back("Safetensors index does not cover all eight shards");
     }
 
     result.manifest.tensors.reserve(index.entries.size());
@@ -345,18 +327,14 @@ GlmManifestResult build_quanttrio_glm52_index_manifest(SafetensorsIndex index) {
         ++result.manifest.quantized_modules;
         switch (triplet.encoding) {
             case GlmTensorEncoding::Int4Group128: ++result.manifest.int4_modules; break;
-            case GlmTensorEncoding::Int8Group128: ++result.manifest.int8_group_modules; break;
-            case GlmTensorEncoding::Int8Channel: ++result.manifest.int8_channel_modules; break;
             case GlmTensorEncoding::Plain:
                 result.errors.emplace_back("quantized triplet has a plain encoding for " + base);
                 break;
         }
     }
 
-    if (result.manifest.quantized_modules != 58992U ||
-        result.manifest.int4_modules != 57600U ||
-        result.manifest.int8_group_modules != 616U ||
-        result.manifest.int8_channel_modules != 776U) {
+    if (result.manifest.quantized_modules != 58224U ||
+        result.manifest.int4_modules != 58224U) {
         result.errors.emplace_back("unexpected compressed-tensors module counts");
     }
     for (std::size_t role = 0; role < kExpectedRoleCounts.size(); ++role) {
@@ -370,12 +348,12 @@ GlmManifestResult build_quanttrio_glm52_index_manifest(SafetensorsIndex index) {
     return result;
 }
 
-GlmManifestResult validate_quanttrio_glm52_checkpoint(
+GlmManifestResult validate_glm52_w4a16_checkpoint(
     const std::string& model_directory, GlmIndexManifest manifest,
     const GlmCheckpointOptions& options) {
     GlmManifestResult result;
     result.manifest = std::move(manifest);
-    const auto expected = quanttrio_glm52_int4_int8_mix_spec();
+    const auto expected = glm52_w4a16_spec();
     std::unordered_map<std::string, std::size_t> tensor_by_name;
     tensor_by_name.reserve(result.manifest.tensors.size());
     for (std::size_t index = 0; index < result.manifest.tensors.size(); ++index) {

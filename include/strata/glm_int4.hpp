@@ -18,7 +18,7 @@ struct GlmInt4MatrixView {
     std::uint32_t group_size{};
 };
 
-// Scalar target-format oracle for QuantTrio offset-packed INT4 with BF16
+// Scalar target-format oracle for offset-packed INT4 with BF16
 // group scales. This format stores q + 8 in each nibble; it is deliberately
 // distinct from the two's-complement Q4 ABI reference.
 [[nodiscard]] ValidationResult glm_int4_group128_matvec_reference(

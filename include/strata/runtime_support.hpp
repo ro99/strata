@@ -53,6 +53,10 @@ using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
     std::uint64_t minimum_device_budget,
     std::string_view model_label);
 
+[[nodiscard]] std::uint64_t process_resident_set_bytes() noexcept;
+[[nodiscard]] std::vector<std::uint64_t> device_vram_used_bytes(
+    std::span<const int> devices);
+
 [[nodiscard]] std::size_t incremental_kv_prefix_tokens(
     std::span<const std::uint32_t> cached_tokens,
     std::span<const std::uint32_t> prompt_tokens) noexcept;

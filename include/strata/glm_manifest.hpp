@@ -37,8 +37,6 @@ enum class GlmTensorComponent : std::uint8_t {
 enum class GlmTensorEncoding : std::uint8_t {
     Plain,
     Int4Group128,
-    Int8Group128,
-    Int8Channel,
 };
 
 struct GlmManifestTensor {
@@ -63,8 +61,6 @@ struct GlmIndexManifest {
     std::array<std::uint64_t, static_cast<std::size_t>(GlmTensorRole::Count)> role_counts{};
     std::uint64_t quantized_modules{};
     std::uint64_t int4_modules{};
-    std::uint64_t int8_group_modules{};
-    std::uint64_t int8_channel_modules{};
     std::uint64_t resolved_tensors{};
     std::uint64_t validated_layouts{};
     std::uint64_t scanned_shards{};
@@ -86,9 +82,9 @@ struct GlmManifestResult {
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
-[[nodiscard]] GlmManifestResult build_quanttrio_glm52_index_manifest(
+[[nodiscard]] GlmManifestResult build_glm52_w4a16_index_manifest(
     SafetensorsIndex index);
-[[nodiscard]] GlmManifestResult validate_quanttrio_glm52_checkpoint(
+[[nodiscard]] GlmManifestResult validate_glm52_w4a16_checkpoint(
     const std::string& model_directory, GlmIndexManifest manifest,
     const GlmCheckpointOptions& options = {});
 [[nodiscard]] std::string_view to_string(GlmTensorRole role) noexcept;

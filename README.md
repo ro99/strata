@@ -14,7 +14,7 @@ This is the machine the project is built and measured on. It's an ordinary works
 | RAM | 251 GiB DDR4 |
 | CPU | Xeon E5-2680 v4 |
 
-On this hardware Strata supports two checkpoints: DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into host RAM so decode does not touch storage after warm-up, and GLM-5.2 (405 GB, 78 layers, 256 experts, top-8), which is larger than the machine's combined VRAM and RAM and therefore runs directly against the checkpoint on disk.
+On this hardware Strata supports two checkpoints: DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into host RAM so decode does not touch storage after warm-up, and GLM-5.2 W4A16 (388 GB, 78 layers, 256 experts, top-8), which is larger than the machine's combined VRAM and RAM and therefore remains I/O-dependent.
 
 ## What "exact" means here
 
@@ -217,7 +217,7 @@ It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`,
 | Model | Layout | Native precision | Status on this hardware |
 |---|---|---|---|
 | DeepSeek-V4-Flash-0731 | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
-| GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 experts, INT8 group-128 linears, BF16/F32 | Larger than combined memory; I/O-dependent |
+| GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 linears, BF16/F32 sensitive tensors; W4A16 execution | Larger than combined memory; I/O-dependent |
 
 Both run their declared attention and routing mechanisms as-is: hybrid compressed attention, manifold-constrained hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek; MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for GLM.
 
@@ -226,7 +226,7 @@ validated DeepSeek measurement used the now-unsupported preview checkpoint:
 
 | | DeepSeek V4 preview (historical) | GLM-5.2 |
 |---|---:|---:|
-| Checkpoint size | 167 GB | 405 GB |
+| Checkpoint size | 167 GB | 388 GB |
 | Decode | ~4.0 tok/s | 0.283 tok/s |
 | Checkpoint reads during decode | 0 | 910 GB/run |
 | Load time | ~22 s | ~23 s |
@@ -252,7 +252,7 @@ The difference between the two rows is mostly explained by whether the checkpoin
 - **Residency.** The dense/shared spine is pinned in VRAM. Routed experts live
   in a host RAM arena and are leased into VRAM per decode step through an LRU
   cache with a capacity-weighted schedule across GPUs.
-- **Kernels.** Native INT4 group-128, INT8 group-128, FP4 E2M1, and FP8 E4M3
+- **Kernels.** Native INT4 group-128, FP4 E2M1, and FP8 E4M3
   CUDA kernels for compute capabilities 8.6 and 12.0, checked against a CPU
   reference implementation.
 - **Instrumentation.** Every run reports checkpoint reads, H2D/D2H bytes, cache

@@ -74,3 +74,19 @@ TEST_CASE("simulator learns transitions and accounts all routes") {
     REQUIRE(result.residency.accesses == 4);
     REQUIRE(result.transitions_learned > 0);
 }
+
+TEST_CASE("simulator can warm on prefill and measure decode only") {
+    std::vector<strata::RouteEvent> events{
+        {0, 0, 3, {1}, {}, strata::RoutePhase::Prefill},
+        {0, 1, 3, {1}, {}, strata::RoutePhase::Decode},
+    };
+    strata::SimulationConfig config;
+    config.residency.expert_bytes = 10;
+    config.residency.vram_capacity_bytes = 10;
+    config.measured_phase = strata::RoutePhase::Decode;
+    const auto result = strata::simulate(events, config);
+    REQUIRE(result.events == 1);
+    REQUIRE(result.residency.accesses == 1);
+    REQUIRE(result.residency.vram_hits == 1);
+    REQUIRE(result.residency.nvme_read_bytes == 0);
+}

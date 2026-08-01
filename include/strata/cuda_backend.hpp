@@ -216,6 +216,15 @@ struct CudaDeepSeekMoeExpert {
     float coefficient{1.0F};
 };
 
+// Model-neutral gate/up/down expert descriptor for the common device MoE
+// workspace. Weight objects must remain alive until collection completes.
+struct CudaMoeExpert {
+    const CudaWeight* gate{};
+    const CudaWeight* up{};
+    const CudaWeight* down{};
+    float coefficient{1.0F};
+};
+
 class CudaBackend {
 public:
     CudaBackend();
@@ -302,6 +311,13 @@ public:
     [[nodiscard]] ValidationResult collect_deepseek_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output);
+    [[nodiscard]] ValidationResult enqueue_moe(
+        int device, std::span<const float> hidden, std::uint32_t rows,
+        std::span<const CudaMoeExpert> routed,
+        const CudaMoeExpert* shared = nullptr);
+    [[nodiscard]] ValidationResult collect_moe(
+        int device, std::span<float> routed_output,
+        std::span<float> shared_output = {});
     [[nodiscard]] ValidationResult synchronize(int device);
 
     [[nodiscard]] CudaBackendStats stats() const noexcept;

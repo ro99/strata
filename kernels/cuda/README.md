@@ -6,7 +6,7 @@ when a CUDA compiler is available and otherwise builds
 it reports errors for CUDA operations and never pretends that GPU work succeeded.
 
 The native backend currently provides persistent weight arenas and workspaces,
-plain BF16, QuantTrio INT4/INT8, native DeepSeek FP4/FP8 matmuls, grouped
+plain BF16, packed INT4/INT8, native DeepSeek FP4/FP8 matmuls, grouped
 projections, and asynchronous DeepSeek expert execution. Its operation fixtures
 live in `tests/test_cuda_backend.cpp`.
 

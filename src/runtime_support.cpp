@@ -4,9 +4,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <unordered_set>
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 namespace strata {
 
@@ -124,6 +129,37 @@ RuntimeDevicePlanResult plan_runtime_devices(
         for (std::uint64_t count = 0U; count < shares; ++count) {
             result.value.weighted_schedule.push_back(slot);
         }
+    }
+    return result;
+}
+
+std::uint64_t process_resident_set_bytes() noexcept {
+#if defined(__linux__)
+    std::ifstream input("/proc/self/statm");
+    std::uint64_t virtual_pages = 0U;
+    std::uint64_t resident_pages = 0U;
+    input >> virtual_pages >> resident_pages;
+    static_cast<void>(virtual_pages);
+    const long page_bytes = sysconf(_SC_PAGESIZE);
+    if (!input || page_bytes <= 0 ||
+        resident_pages > std::numeric_limits<std::uint64_t>::max() /
+                             static_cast<std::uint64_t>(page_bytes)) return 0U;
+    return resident_pages * static_cast<std::uint64_t>(page_bytes);
+#else
+    return 0U;
+#endif
+}
+
+std::vector<std::uint64_t> device_vram_used_bytes(
+    std::span<const int> devices) {
+    std::vector<std::uint64_t> result;
+    result.reserve(devices.size());
+    for (const int device : devices) {
+        const auto memory = CudaBackend::device_memory(device);
+        result.push_back(memory.ok() && memory.value.total_bytes >=
+                                           memory.value.free_bytes
+                             ? memory.value.total_bytes - memory.value.free_bytes
+                             : 0U);
     }
     return result;
 }

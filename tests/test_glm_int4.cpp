@@ -10,7 +10,7 @@
 #include <cstring>
 #include <vector>
 
-TEST_CASE("QuantTrio INT4 group-128 AVX2 matvec matches its target-format oracle") {
+TEST_CASE("INT4 group-128 AVX2 matvec matches its target-format oracle") {
     constexpr std::uint64_t rows = 5U;
     constexpr std::uint64_t columns = 256U;
     constexpr std::uint64_t packed_columns = columns / 8U;

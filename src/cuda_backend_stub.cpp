@@ -117,6 +117,17 @@ ValidationResult CudaBackend::collect_deepseek_moe(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::enqueue_moe(
+    int, std::span<const float>, std::uint32_t,
+    std::span<const CudaMoeExpert>, const CudaMoeExpert*) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::collect_moe(
+    int, std::span<float>, std::span<float>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight&, std::span<const float>, std::uint32_t,
     std::uint32_t, std::uint64_t, std::span<float>) {

@@ -148,6 +148,20 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.flash_attention_d2h_nanoseconds) / 1.0e9
            << ",\"maximum_device_flash_attention_seconds\":"
            << static_cast<double>(stats.flash_attention_nanoseconds) / 1.0e9
+           << ",\"moe_calls\":" << stats.deepseek_moe_calls
+           << ",\"moe_kernel_launches\":" << stats.deepseek_moe_kernel_launches
+           << ",\"moe_h2d_transfers\":" << stats.deepseek_moe_h2d_transfers
+           << ",\"moe_d2h_transfers\":" << stats.deepseek_moe_d2h_transfers
+           << ",\"moe_h2d_bytes\":" << stats.deepseek_moe_h2d_bytes
+           << ",\"moe_d2h_bytes\":" << stats.deepseek_moe_d2h_bytes
+           << ",\"maximum_device_moe_h2d_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_moe_kernel_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_moe_d2h_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_moe_seconds\":"
+           << static_cast<double>(stats.deepseek_moe_nanoseconds) / 1.0e9
            << ",\"devices\":[";
     for (std::size_t index = 0; index < stats.devices.size(); ++index) {
         const auto& device = stats.devices[index];
@@ -196,6 +210,23 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.flash_attention_d2h_nanoseconds) / 1.0e9
                << ",\"flash_attention_seconds\":"
                << static_cast<double>(device.flash_attention_nanoseconds) / 1.0e9
+               << ",\"moe_calls\":" << device.deepseek_moe_calls
+               << ",\"moe_kernel_launches\":"
+               << device.deepseek_moe_kernel_launches
+               << ",\"moe_h2d_transfers\":"
+               << device.deepseek_moe_h2d_transfers
+               << ",\"moe_d2h_transfers\":"
+               << device.deepseek_moe_d2h_transfers
+               << ",\"moe_h2d_bytes\":" << device.deepseek_moe_h2d_bytes
+               << ",\"moe_d2h_bytes\":" << device.deepseek_moe_d2h_bytes
+               << ",\"moe_h2d_seconds\":"
+               << static_cast<double>(device.deepseek_moe_h2d_nanoseconds) / 1.0e9
+               << ",\"moe_kernel_seconds\":"
+               << static_cast<double>(device.deepseek_moe_kernel_nanoseconds) / 1.0e9
+               << ",\"moe_d2h_seconds\":"
+               << static_cast<double>(device.deepseek_moe_d2h_nanoseconds) / 1.0e9
+               << ",\"moe_seconds\":"
+               << static_cast<double>(device.deepseek_moe_nanoseconds) / 1.0e9
                << '}';
     }
     output << "]}";
@@ -222,6 +253,32 @@ void print_cache_stats(std::ostream& output, const strata::Glm52CacheStats& stat
     output << '}';
 }
 
+void print_graph_stats(std::ostream& output, const strata::Glm52GraphStats& stats) {
+    const auto seconds = [](std::uint64_t nanoseconds) {
+        return static_cast<double>(nanoseconds) / 1.0e9;
+    };
+    output << "{\"forward_tokens\":" << stats.forward_tokens
+           << ",\"embedding_seconds\":" << seconds(stats.embedding_nanoseconds)
+           << ",\"input_norm_seconds\":" << seconds(stats.input_norm_nanoseconds)
+           << ",\"attention_seconds\":" << seconds(stats.attention_nanoseconds)
+           << ",\"attention_residual_seconds\":"
+           << seconds(stats.attention_residual_nanoseconds)
+           << ",\"post_attention_norm_seconds\":"
+           << seconds(stats.post_attention_norm_nanoseconds)
+           << ",\"dense_mlp_seconds\":" << seconds(stats.dense_mlp_nanoseconds)
+           << ",\"moe_seconds\":" << seconds(stats.moe_nanoseconds)
+           << ",\"moe_router_seconds\":" << seconds(stats.moe_router_nanoseconds)
+           << ",\"moe_prepare_seconds\":" << seconds(stats.moe_prepare_nanoseconds)
+           << ",\"moe_routed_seconds\":" << seconds(stats.moe_routed_nanoseconds)
+           << ",\"moe_shared_seconds\":" << seconds(stats.moe_shared_nanoseconds)
+           << ",\"mlp_residual_seconds\":" << seconds(stats.mlp_residual_nanoseconds)
+           << ",\"output_head_seconds\":" << seconds(stats.output_head_nanoseconds)
+           << ",\"future_entropy_seconds\":"
+           << seconds(stats.future_entropy_nanoseconds)
+           << ",\"future_entropy_passes\":" << stats.future_entropy_passes
+           << '}';
+}
+
 void print_phase(std::ostream& output, const strata::Glm52PhaseMetrics& phase) {
     output << "{\"checkpoint_read_calls\":" << phase.checkpoint_reads.calls
            << ",\"checkpoint_read_bytes\":" << phase.checkpoint_reads.bytes
@@ -243,6 +300,8 @@ void print_phase(std::ostream& output, const strata::Glm52PhaseMetrics& phase) {
     print_cuda_stats(output, phase.cuda);
     output << ",\"cache\":";
     print_cache_stats(output, phase.cache);
+    output << ",\"graph\":";
+    print_graph_stats(output, phase.graph);
     output << '}';
 }
 
@@ -270,8 +329,8 @@ int main(int argc, char** argv) {
     config.route_trace_path = options.route_trace;
 
     if (!options.quiet) {
-        std::cerr << "[contract] exact main-model greedy decode; INT4/INT8 checkpoint unchanged\n"
-                  << "[contract] DSA full-attention region enforced at <=2048 tokens\n"
+        std::cerr << "[contract] exact main-model greedy decode; W4A16 checkpoint unchanged\n"
+                  << "[contract] exact DSA full attention through 2048 tokens; sparse thereafter\n"
                   << "[contract] MTP proposal acceleration disabled for this baseline\n";
     }
     strata::Glm52Runtime runtime;
@@ -314,6 +373,10 @@ int main(int argc, char** argv) {
                   << metrics.prefill_tokens_per_second()
                   << ",\"generation_seconds\":" << metrics.decode_seconds
                   << ",\"generation_tok_s\":" << metrics.decode_tokens_per_second()
+                  << ",\"rss_bytes\":" << metrics.rss_bytes
+                  << ",\"device_vram_used_bytes\":";
+        strata::cli::print_array(std::cout, metrics.device_vram_used_bytes);
+        std::cout
                   << ",\"checkpoint_read_calls\":" << metrics.checkpoint_reads.calls
                   << ",\"checkpoint_read_bytes\":" << metrics.checkpoint_reads.bytes
                   << ",\"checkpoint_read_seconds\":"
@@ -347,6 +410,8 @@ int main(int argc, char** argv) {
         std::cout << ",\"decode\":";
         print_phase(std::cout, metrics.decode);
         std::cout << '}';
+        std::cout << ",\"graph\":";
+        print_graph_stats(std::cout, metrics.graph);
         std::cout << ",\"prompt_token_ids\":";
         strata::cli::print_array(std::cout, generated.prompt_token_ids);
         std::cout << ",\"generated_token_ids\":";

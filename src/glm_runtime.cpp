@@ -17,17 +17,19 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
-#include <future>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <iostream>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace strata {
 
@@ -51,6 +53,9 @@ constexpr std::uint32_t kTopK = kGlm52ExecutionContract.experts_per_token;
 constexpr std::uint32_t kVocabulary = kGlm52ExecutionContract.vocabulary_size;
 constexpr std::uint32_t kDsaThreshold =
     kGlm52ExecutionContract.sparse_attention_topk;
+constexpr std::uint32_t kIndexHeads = 32U;
+constexpr std::uint32_t kIndexDim = 128U;
+constexpr std::uint32_t kIndexQuery = kIndexHeads * kIndexDim;
 constexpr float kAttentionScale = kGlm52ExecutionContract.attention_scale;
 constexpr std::uint64_t kFlashAttentionWorkspaceReserve = 768ULL << 20U;
 
@@ -65,8 +70,19 @@ std::uint64_t state_hash(std::span<const float> values) noexcept {
     return hash;
 }
 
+std::uint64_t elapsed_nanoseconds(
+    std::chrono::steady_clock::time_point started) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
 std::string layer_prefix(std::uint32_t layer) {
     return "model.layers." + std::to_string(layer) + ".";
+}
+
+constexpr bool full_indexer_layer(std::uint32_t layer) noexcept {
+    return layer < 3U || (layer >= 6U && layer <= 74U && (layer - 6U) % 4U == 0U);
 }
 
 void move_errors(std::vector<std::string>& destination, ValidationResult source,
@@ -131,8 +147,8 @@ ValidationResult validate_linear_shape(const GlmCheckpointReader& checkpoint,
         result.errors.emplace_back("runtime compressed linear is missing: " + std::string(base));
         return result;
     }
-    const std::uint32_t bits = packed->encoding == GlmTensorEncoding::Int4Group128 ? 4U : 8U;
-    const std::uint32_t group = packed->encoding == GlmTensorEncoding::Int8Channel ? 0U : 128U;
+    constexpr std::uint32_t bits = 4U;
+    constexpr std::uint32_t group = 128U;
     const auto packed_columns = (columns + (32U / bits) - 1U) / (32U / bits);
     const auto scale_columns = group == 0U ? 1U : (columns + group - 1U) / group;
     if (packed->source_shape != std::vector<std::uint64_t>{rows, packed_columns} ||
@@ -185,6 +201,17 @@ ValidationResult validate_runtime_graph_contract(const GlmCheckpointReader& chec
                                      kHeads * (kNope + kValueHead), kKvLora));
         append(validate_linear_shape(checkpoint, attention + "o_proj", kHidden,
                                      kHeads * kValueHead));
+        const auto indexer = attention + "indexer.";
+        append(validate_linear_shape(checkpoint, indexer + "wq_b",
+                                     kIndexQuery, kQueryLora));
+        append(validate_linear_shape(checkpoint, indexer + "wk",
+                                     kIndexDim, kHidden));
+        append(validate_linear_shape(checkpoint, indexer + "weights_proj",
+                                     kIndexHeads, kHidden));
+        append(validate_vector_shape(checkpoint, indexer + "k_norm.weight",
+                                     kIndexDim));
+        append(validate_vector_shape(checkpoint, indexer + "k_norm.bias",
+                                     kIndexDim));
         const auto mlp = prefix + "mlp.";
         if (layer < 3U) {
             append(validate_linear_shape(checkpoint, mlp + "gate_proj",
@@ -220,6 +247,7 @@ class WeightCache {
     struct Entry {
         CudaWeight weight;
         std::uint64_t last_use{};
+        std::uint64_t leases{};
         bool pinned{};
     };
     struct State {
@@ -236,6 +264,44 @@ class WeightCache {
     };
 
 public:
+    class Lease {
+    public:
+        Lease() = default;
+        ~Lease() { release(); }
+        Lease(Lease&& other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)),
+              device_slot_(other.device_slot_), key_(std::move(other.key_)),
+              weight_(std::exchange(other.weight_, nullptr)) {}
+        Lease& operator=(Lease&& other) noexcept {
+            if (this == &other) return *this;
+            release();
+            owner_ = std::exchange(other.owner_, nullptr);
+            device_slot_ = other.device_slot_;
+            key_ = std::move(other.key_);
+            weight_ = std::exchange(other.weight_, nullptr);
+            return *this;
+        }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+
+        [[nodiscard]] const CudaWeight& weight() const { return *weight_; }
+
+    private:
+        WeightCache* owner_{};
+        std::size_t device_slot_{};
+        std::string key_;
+        CudaWeight* weight_{};
+
+        void release() noexcept {
+            if (owner_ != nullptr) {
+                owner_->release(device_slot_, key_);
+                owner_ = nullptr;
+                weight_ = nullptr;
+            }
+        }
+        friend class WeightCache;
+    };
+
     WeightCache(GlmCheckpointReader& checkpoint, CudaBackend& backend,
                 std::vector<int> devices, std::vector<std::uint64_t> capacities)
         : checkpoint_(checkpoint), backend_(backend), devices_(std::move(devices)) {
@@ -279,6 +345,29 @@ public:
         Entry* entry = nullptr;
         return ensure_locked(state, device_slot, base, output_columns,
                              input_columns, true, entry);
+    }
+
+    ValidationResult acquire(std::size_t device_slot, std::string_view base,
+                             std::uint64_t output_columns,
+                             std::uint64_t input_columns, Lease& lease) {
+        ValidationResult result;
+        if (device_slot >= states_.size()) {
+            result.errors.emplace_back("linear lease targets an invalid runtime device slot");
+            return result;
+        }
+        lease.release();
+        auto& state = *states_[device_slot];
+        std::scoped_lock lock(state.mutex);
+        Entry* entry = nullptr;
+        result = ensure_locked(state, device_slot, base, output_columns,
+                               input_columns, false, entry);
+        if (!result.ok()) return result;
+        ++entry->leases;
+        lease.owner_ = this;
+        lease.device_slot_ = device_slot;
+        lease.key_ = std::string(base);
+        lease.weight_ = &entry->weight;
+        return result;
     }
 
     bool expert_resident(std::size_t device_slot, std::string_view prefix) const {
@@ -346,14 +435,14 @@ private:
             auto victim = state.entries.end();
             for (auto candidate = state.entries.begin(); candidate != state.entries.end();
                  ++candidate) {
-                if (candidate->second.pinned) continue;
+                if (candidate->second.pinned || candidate->second.leases != 0U) continue;
                 if (victim == state.entries.end() ||
                     candidate->second.last_use < victim->second.last_use) {
                     victim = candidate;
                 }
             }
             if (victim == state.entries.end()) {
-                result.errors.emplace_back("pinned resident spine exceeds VRAM cache capacity on device " +
+                result.errors.emplace_back("resident or in-flight weights exceed VRAM cache capacity on device " +
                                            std::to_string(devices_[device_slot]));
                 return result;
             }
@@ -377,6 +466,16 @@ private:
         ++state.misses;
         output = &found->second;
         return result;
+    }
+
+    void release(std::size_t device_slot, const std::string& key) noexcept {
+        if (device_slot >= states_.size()) return;
+        auto& state = *states_[device_slot];
+        std::scoped_lock lock(state.mutex);
+        const auto found = state.entries.find(key);
+        if (found != state.entries.end() && found->second.leases != 0U) {
+            --found->second.leases;
+        }
     }
 
     GlmCheckpointReader& checkpoint_;
@@ -432,10 +531,32 @@ Glm52HostExpertStats host_expert_delta(const Glm52HostExpertStats& after,
             after.mapping_sweep_nanoseconds - before.mapping_sweep_nanoseconds};
 }
 
+Glm52GraphStats graph_delta(const Glm52GraphStats& after,
+                            const Glm52GraphStats& before) noexcept {
+    return {
+        after.forward_tokens - before.forward_tokens,
+        after.embedding_nanoseconds - before.embedding_nanoseconds,
+        after.input_norm_nanoseconds - before.input_norm_nanoseconds,
+        after.attention_nanoseconds - before.attention_nanoseconds,
+        after.attention_residual_nanoseconds - before.attention_residual_nanoseconds,
+        after.post_attention_norm_nanoseconds - before.post_attention_norm_nanoseconds,
+        after.dense_mlp_nanoseconds - before.dense_mlp_nanoseconds,
+        after.moe_nanoseconds - before.moe_nanoseconds,
+        after.moe_router_nanoseconds - before.moe_router_nanoseconds,
+        after.moe_prepare_nanoseconds - before.moe_prepare_nanoseconds,
+        after.moe_routed_nanoseconds - before.moe_routed_nanoseconds,
+        after.moe_shared_nanoseconds - before.moe_shared_nanoseconds,
+        after.mlp_residual_nanoseconds - before.mlp_residual_nanoseconds,
+        after.output_head_nanoseconds - before.output_head_nanoseconds,
+        after.future_entropy_nanoseconds - before.future_entropy_nanoseconds,
+        after.future_entropy_passes - before.future_entropy_passes,
+    };
+}
+
 struct LayerKv {
-    std::vector<float> keys;
-    std::vector<float> values;
+    std::vector<float> latent;
     std::vector<float> rope;
+    std::vector<float> index_keys;
 };
 
 struct ExpertJob {
@@ -455,6 +576,7 @@ struct Glm52Runtime::Impl {
     ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::unique_ptr<WeightCache> weights;
+    std::unique_ptr<HostWorkerPool> expert_workers;
     std::unique_ptr<HostWorkerPool> host_workers;
     std::vector<int> devices;
     std::vector<std::uint64_t> capacities;
@@ -476,6 +598,7 @@ struct Glm52Runtime::Impl {
     std::uint64_t host_aggregation_nanoseconds{};
     std::uint64_t active_request_id{};
     std::uint64_t generated_requests{};
+    Glm52GraphStats graph_stats;
     std::atomic<std::uint64_t> host_expert_count{};
     std::atomic<std::uint64_t> host_expert_matvec_calls{};
     std::atomic<std::uint64_t> host_expert_weight_bytes{};
@@ -557,6 +680,12 @@ struct Glm52Runtime::Impl {
             preload(device, attention + "kv_a_proj_with_mqa", kKvLora + kRope, kHidden);
             preload(device, attention + "kv_b_proj", kHeads * (kNope + kValueHead), kKvLora);
             preload(device, attention + "o_proj", kHidden, kHeads * kValueHead);
+            if (full_indexer_layer(layer)) {
+                const auto indexer = attention + "indexer.";
+                preload(device, indexer + "wq_b", kIndexQuery, kQueryLora);
+                preload(device, indexer + "wk", kIndexDim, kHidden);
+                preload(device, indexer + "weights_proj", kIndexHeads, kHidden);
+            }
             const auto mlp = prefix + "mlp.";
             if (layer < 3U) {
                 preload(device, mlp + "gate_proj", kDenseIntermediate, kHidden);
@@ -577,6 +706,17 @@ struct Glm52Runtime::Impl {
             auto kv_norm = host_tensor(attention + "kv_a_layernorm.weight", kKvLora);
             for (auto* loaded : {&input_norm, &post_norm, &query_norm, &kv_norm}) {
                 if (!loaded->ok() && result.ok()) result.errors = std::move(loaded->errors);
+            }
+            if (full_indexer_layer(layer)) {
+                auto index_weight = host_tensor(
+                    attention + "indexer.k_norm.weight", kIndexDim);
+                auto index_bias = host_tensor(
+                    attention + "indexer.k_norm.bias", kIndexDim);
+                for (auto* loaded : {&index_weight, &index_bias}) {
+                    if (!loaded->ok() && result.ok()) {
+                        result.errors = std::move(loaded->errors);
+                    }
+                }
             }
             if (layer >= 3U) {
                 auto bias = host_tensor(mlp + "gate.e_score_correction_bias", kExperts);
@@ -645,9 +785,11 @@ struct Glm52Runtime::Impl {
         return result;
     }
 
-    ValidationResult attention(std::uint32_t layer, std::span<const float> input,
-                               std::uint32_t rows, std::uint32_t position_base,
-                               std::span<float> output) {
+    ValidationResult attention(
+        std::uint32_t layer, std::span<const float> input,
+        std::uint32_t rows, std::uint32_t position_base,
+        std::vector<std::vector<std::uint32_t>>& topk_indices,
+        std::span<float> output) {
         ValidationResult result;
         const auto prefix = layer_prefix(layer) + "self_attn.";
         const auto device = layer_device(layer);
@@ -674,12 +816,12 @@ struct Glm52Runtime::Impl {
                         kQueryLora, query_residual, rows, queries);
         if (!result.ok()) return result;
         for (std::uint32_t row = 0; row < rows; ++row) {
-            const auto position = position_base + row;
             for (std::uint32_t head = 0; head < kHeads; ++head) {
                 auto rope_values = std::span<float>(queries).subspan(
                     (static_cast<std::size_t>(row) * kHeads + head) * kQueryHead + kNope,
                     kRope);
-                auto status = glm_rope_interleaved_f32(rope_values, position);
+                auto status = glm_rope_interleaved_f32(
+                    rope_values, position_base + row);
                 if (!status.ok()) return status;
             }
         }
@@ -706,67 +848,147 @@ struct Glm52Runtime::Impl {
             auto rope_destination = std::span<float>(new_rope).subspan(
                 static_cast<std::size_t>(row) * kRope, kRope);
             std::copy(source.begin() + kKvLora, source.end(), rope_destination.begin());
-            status = glm_rope_interleaved_f32(rope_destination, position_base + row);
+            status = glm_rope_interleaved_f32(
+                rope_destination, position_base + row);
             if (!status.ok()) return status;
         }
 
-        constexpr std::uint32_t kv_output = kHeads * (kNope + kValueHead);
-        std::vector<float> reconstructed(static_cast<std::size_t>(rows) * kv_output);
-        result = linear(device, prefix + "kv_b_proj", kv_output, kKvLora,
-                        latent, rows, reconstructed);
-        if (!result.ok()) return result;
-
         auto& cache = kv[layer];
         const auto existing = cache.rope.size() / kRope;
-        if (existing != position_base) {
-            result.errors.emplace_back("KV cache position is not contiguous at layer " +
+        if (existing != position_base || cache.latent.size() != existing * kKvLora) {
+            result.errors.emplace_back("compact KV cache is not contiguous at layer " +
                                        std::to_string(layer));
             return result;
         }
+        cache.latent.insert(cache.latent.end(), latent.begin(), latent.end());
         cache.rope.insert(cache.rope.end(), new_rope.begin(), new_rope.end());
-        cache.keys.reserve(cache.keys.size() + static_cast<std::size_t>(rows) * kHeads * kNope);
-        cache.values.reserve(cache.values.size() +
-                             static_cast<std::size_t>(rows) * kHeads * kValueHead);
-        for (std::uint32_t row = 0; row < rows; ++row) {
-            const auto* source = reconstructed.data() + static_cast<std::size_t>(row) * kv_output;
-            for (std::uint32_t head = 0; head < kHeads; ++head) {
-                const auto* block = source + static_cast<std::size_t>(head) * (kNope + kValueHead);
-                cache.keys.insert(cache.keys.end(), block, block + kNope);
-                cache.values.insert(cache.values.end(), block + kNope,
-                                    block + kNope + kValueHead);
-            }
-        }
 
-        std::vector<float> context(static_cast<std::size_t>(rows) * kHeads * kValueHead);
-        if (config.enable_flash_attention) {
-            const auto token_count = cache.rope.size() / kRope;
-            std::vector<float> logical_keys(
-                token_count * kHeads * kQueryHead);
-            for (std::size_t token = 0U; token < token_count; ++token) {
-                const auto* rope_key = cache.rope.data() + token * kRope;
-                for (std::uint32_t head = 0U; head < kHeads; ++head) {
-                    const auto* nope_key = cache.keys.data() +
-                        (token * kHeads + head) * kNope;
-                    auto* destination = logical_keys.data() +
-                        (token * kHeads + head) * kQueryHead;
-                    std::copy(nope_key, nope_key + kNope, destination);
-                    std::copy(rope_key, rope_key + kRope, destination + kNope);
+        if (full_indexer_layer(layer)) {
+            const auto indexer = prefix + "indexer.";
+            if (cache.index_keys.size() != existing * kIndexDim) {
+                result.errors.emplace_back("indexer cache is not contiguous at layer " +
+                                           std::to_string(layer));
+                return result;
+            }
+            std::vector<float> index_queries(
+                static_cast<std::size_t>(rows) * kIndexQuery);
+            std::vector<float> index_keys(
+                static_cast<std::size_t>(rows) * kIndexDim);
+            std::vector<float> index_weights(
+                static_cast<std::size_t>(rows) * kIndexHeads);
+            result = linear(device, indexer + "wq_b", kIndexQuery, kQueryLora,
+                            query_residual, rows, index_queries);
+            if (!result.ok()) return result;
+            result = linear(device, indexer + "wk", kIndexDim, kHidden,
+                            input, rows, index_keys);
+            if (!result.ok()) return result;
+            result = linear(device, indexer + "weights_proj", kIndexHeads,
+                            kHidden, input, rows, index_weights);
+            if (!result.ok()) return result;
+            auto index_norm_weight = host_tensor(indexer + "k_norm.weight", kIndexDim);
+            auto index_norm_bias = host_tensor(indexer + "k_norm.bias", kIndexDim);
+            if (!index_norm_weight.ok() || !index_norm_bias.ok()) {
+                result.errors = index_norm_weight.ok()
+                    ? std::move(index_norm_bias.errors)
+                    : std::move(index_norm_weight.errors);
+                return result;
+            }
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                auto key = std::span<float>(index_keys).subspan(
+                    static_cast<std::size_t>(row) * kIndexDim, kIndexDim);
+                result = glm_layer_norm_f32(
+                    key, *index_norm_weight.value, *index_norm_bias.value);
+                if (!result.ok()) return result;
+                result = glm_rope_interleaved_f32(
+                    key, position_base + row, kRope);
+                if (!result.ok()) return result;
+                for (std::uint32_t head = 0U; head < kIndexHeads; ++head) {
+                    auto query = std::span<float>(index_queries).subspan(
+                        (static_cast<std::size_t>(row) * kIndexHeads + head) *
+                            kIndexDim,
+                        kIndexDim);
+                    result = glm_rope_interleaved_f32(
+                        query, position_base + row, kRope);
+                    if (!result.ok()) return result;
                 }
             }
-            std::vector<std::uint32_t> causal_limits(rows);
+            cache.index_keys.insert(
+                cache.index_keys.end(), index_keys.begin(), index_keys.end());
+            topk_indices.assign(rows, {});
             for (std::uint32_t row = 0U; row < rows; ++row) {
-                causal_limits[row] = position_base + row + 1U;
+                const auto candidates = static_cast<std::size_t>(position_base + row) + 1U;
+                auto selected = glm_index_topk_f32(
+                    std::span<const float>(index_queries).subspan(
+                        static_cast<std::size_t>(row) * kIndexQuery, kIndexQuery),
+                    std::span<const float>(index_weights).subspan(
+                        static_cast<std::size_t>(row) * kIndexHeads, kIndexHeads),
+                    std::span<const float>(cache.index_keys).first(
+                        candidates * kIndexDim),
+                    kIndexHeads, kIndexDim, kDsaThreshold);
+                if (!selected.ok()) {
+                    result.errors = std::move(selected.errors);
+                    return result;
+                }
+                topk_indices[row] = std::move(selected.positions);
             }
+        } else if (topk_indices.size() != rows ||
+                   std::any_of(topk_indices.begin(), topk_indices.end(),
+                               [](const auto& value) { return value.empty(); })) {
+            result.errors.emplace_back(
+                "shared DSA layer has no selection from a preceding full layer");
+            return result;
+        }
+
+        constexpr std::uint32_t kv_output = kHeads * (kNope + kValueHead);
+        const auto reconstruct = [&](std::span<const std::uint32_t> positions,
+                                     std::vector<float>& logical_keys,
+                                     std::vector<float>& values) {
+            ValidationResult status;
+            std::vector<float> gathered(positions.size() * kKvLora);
+            for (std::size_t row = 0U; row < positions.size(); ++row) {
+                const auto source = std::span<const float>(cache.latent).subspan(
+                    static_cast<std::size_t>(positions[row]) * kKvLora, kKvLora);
+                std::copy(source.begin(), source.end(),
+                          gathered.begin() + static_cast<std::ptrdiff_t>(row * kKvLora));
+            }
+            std::vector<float> reconstructed(positions.size() * kv_output);
+            status = linear(device, prefix + "kv_b_proj", kv_output, kKvLora,
+                            gathered, static_cast<std::uint32_t>(positions.size()),
+                            reconstructed);
+            if (!status.ok()) return status;
+            logical_keys.resize(positions.size() * kHeads * kQueryHead);
+            values.resize(positions.size() * kHeads * kValueHead);
+            for (std::size_t row = 0U; row < positions.size(); ++row) {
+                const auto* rope_key = cache.rope.data() +
+                                       static_cast<std::size_t>(positions[row]) * kRope;
+                const auto* source = reconstructed.data() + row * kv_output;
+                for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                    const auto* block = source +
+                        static_cast<std::size_t>(head) * (kNope + kValueHead);
+                    auto* key = logical_keys.data() +
+                        (row * kHeads + head) * kQueryHead;
+                    auto* value = values.data() +
+                        (row * kHeads + head) * kValueHead;
+                    std::copy(block, block + kNope, key);
+                    std::copy(rope_key, rope_key + kRope, key + kNope);
+                    std::copy(block + kNope, block + kNope + kValueHead, value);
+                }
+            }
+            return status;
+        };
+        const auto attend = [&](std::span<const float> query_rows,
+                                std::uint32_t query_count,
+                                std::span<const float> logical_keys,
+                                std::span<const float> values,
+                                std::span<const std::uint32_t> causal_limits,
+                                std::span<float> context) {
             const std::array<FlashAttentionSegment, 1> segments{{
-                {logical_keys,
-                 std::span<const float>(cache.values).first(
-                     token_count * kHeads * kValueHead),
-                 {}}}};
+                {logical_keys, values, {}}}};
             FlashAttentionRequest request;
-            request.queries = queries;
+            request.queries = query_rows;
             request.segments = segments;
             request.causal_key_counts = causal_limits;
-            request.query_rows = rows;
+            request.query_rows = query_count;
             request.query_heads = kHeads;
             request.key_value_heads = kHeads;
             request.query_key_dim = kQueryHead;
@@ -775,42 +997,44 @@ struct Glm52Runtime::Impl {
             request.numerics =
                 FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
             request.maximum_workspace_bytes = kFlashAttentionWorkspaceReserve;
-            result = cuda.flash_attention(devices[device], request, context);
+            return config.enable_flash_attention
+                ? cuda.flash_attention(devices[device], request, context)
+                : flash_attention_reference_f32(request, context);
+        };
+
+        std::vector<float> context(static_cast<std::size_t>(rows) * kHeads * kValueHead);
+        const auto token_count = cache.rope.size() / kRope;
+        if (token_count <= kDsaThreshold) {
+            std::vector<std::uint32_t> positions(token_count);
+            std::iota(positions.begin(), positions.end(), 0U);
+            std::vector<float> logical_keys;
+            std::vector<float> values;
+            result = reconstruct(positions, logical_keys, values);
+            if (!result.ok()) return result;
+            std::vector<std::uint32_t> causal_limits(rows);
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                causal_limits[row] = position_base + row + 1U;
+            }
+            result = attend(queries, rows, logical_keys, values,
+                            causal_limits, context);
             if (!result.ok()) return result;
         } else {
-            for (std::uint32_t row = 0; row < rows; ++row) {
-                const std::uint32_t position = position_base + row;
-                const std::size_t token_count = static_cast<std::size_t>(position) + 1U;
-                std::vector<float> scores(token_count);
-                for (std::uint32_t head = 0; head < kHeads; ++head) {
-                    const auto* query = queries.data() +
-                        (static_cast<std::size_t>(row) * kHeads + head) * kQueryHead;
-                    for (std::size_t token = 0; token < token_count; ++token) {
-                        const auto* key = cache.keys.data() +
-                            (token * kHeads + head) * kNope;
-                        const auto* rope_key = cache.rope.data() + token * kRope;
-                        float score = 0.0F;
-                        for (std::uint32_t index = 0; index < kNope; ++index) {
-                            score += query[index] * key[index];
-                        }
-                        for (std::uint32_t index = 0; index < kRope; ++index) {
-                            score += query[kNope + index] * rope_key[index];
-                        }
-                        scores[token] = score * kAttentionScale;
-                    }
-                    auto status = glm_softmax_f32(scores);
-                    if (!status.ok()) return status;
-                    auto* destination = context.data() +
-                        (static_cast<std::size_t>(row) * kHeads + head) * kValueHead;
-                    std::fill(destination, destination + kValueHead, 0.0F);
-                    for (std::size_t token = 0; token < token_count; ++token) {
-                        const auto* value = cache.values.data() +
-                            (token * kHeads + head) * kValueHead;
-                        for (std::uint32_t index = 0; index < kValueHead; ++index) {
-                            destination[index] += scores[token] * value[index];
-                        }
-                    }
-                }
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                auto positions = topk_indices[row];
+                std::sort(positions.begin(), positions.end());
+                std::vector<float> logical_keys;
+                std::vector<float> values;
+                result = reconstruct(positions, logical_keys, values);
+                if (!result.ok()) return result;
+                result = attend(
+                    std::span<const float>(queries).subspan(
+                        static_cast<std::size_t>(row) * kHeads * kQueryHead,
+                        kHeads * kQueryHead),
+                    1U, logical_keys, values, {},
+                    std::span<float>(context).subspan(
+                        static_cast<std::size_t>(row) * kHeads * kValueHead,
+                        kHeads * kValueHead));
+                if (!result.ok()) return result;
             }
         }
         return linear(device, prefix + "o_proj", kHidden, kHeads * kValueHead,
@@ -1112,28 +1336,110 @@ struct Glm52Runtime::Impl {
             std::memory_order_relaxed);
     }
 
-    void run_expert_job(std::uint32_t layer, ExpertJob& job,
-                        std::span<const float> input) {
-        std::vector<float> gathered(job.rows.size() * kHidden);
-        for (std::size_t row = 0; row < job.rows.size(); ++row) {
-            const auto source = input.subspan(static_cast<std::size_t>(job.rows[row]) * kHidden,
-                                              kHidden);
-            std::copy(source.begin(), source.end(),
-                      gathered.begin() + static_cast<std::ptrdiff_t>(row * kHidden));
+    ValidationResult acquire_moe_expert(
+        std::size_t device, std::string_view prefix, CudaMoeExpert& expert,
+        std::vector<WeightCache::Lease>& leases) {
+        ValidationResult result;
+        const auto start = leases.size();
+        for (const auto suffix : {"gate_proj", "up_proj", "down_proj"}) {
+            leases.emplace_back();
+            const bool down = suffix == std::string_view("down_proj");
+            result = weights->acquire(
+                device, std::string(prefix) + suffix,
+                down ? kHidden : kExpertIntermediate,
+                down ? kExpertIntermediate : kHidden, leases.back());
+            if (!result.ok()) return result;
         }
-        job.output.resize(gathered.size());
-        const auto prefix = layer_prefix(layer) + "mlp.experts." +
-                            std::to_string(job.expert) + ".";
-        const auto status = mlp_triplet(job.device_slot, prefix, kExpertIntermediate,
-                                        gathered, static_cast<std::uint32_t>(job.rows.size()),
-                                        job.output);
-        move_errors(job.errors, status);
+        expert = {&leases[start].weight(), &leases[start + 1U].weight(),
+                  &leases[start + 2U].weight(), 1.0F};
+        return result;
+    }
+
+    ValidationResult run_moe_command(
+        std::uint32_t layer, std::size_t device,
+        std::span<ExpertJob*> routed, std::span<const float> input,
+        std::uint32_t rows, std::vector<float>* shared_output) {
+        ValidationResult result;
+        std::vector<WeightCache::Lease> leases;
+        leases.reserve((routed.size() + (shared_output == nullptr ? 0U : 1U)) * 3U);
+        std::vector<CudaMoeExpert> experts(routed.size());
+        for (std::size_t index = 0; index < routed.size(); ++index) {
+            const auto prefix = layer_prefix(layer) + "mlp.experts." +
+                                std::to_string(routed[index]->expert) + ".";
+            result = acquire_moe_expert(device, prefix, experts[index], leases);
+            if (!result.ok()) return result;
+        }
+        CudaMoeExpert shared;
+        if (shared_output != nullptr) {
+            result = acquire_moe_expert(
+                device, layer_prefix(layer) + "mlp.shared_experts.", shared, leases);
+            if (!result.ok()) return result;
+            shared_output->resize(static_cast<std::size_t>(rows) * kHidden);
+        }
+        result = cuda.enqueue_moe(
+            devices[device], input, rows, experts,
+            shared_output == nullptr ? nullptr : &shared);
+        if (!result.ok()) return result;
+        std::vector<float> routed_output(
+            routed.size() * static_cast<std::size_t>(rows) * kHidden);
+        result = cuda.collect_moe(
+            devices[device], routed_output,
+            shared_output == nullptr ? std::span<float>{}
+                                     : std::span<float>(*shared_output));
+        if (!result.ok()) return result;
+        const auto elements = static_cast<std::size_t>(rows) * kHidden;
+        for (std::size_t index = 0; index < routed.size(); ++index) {
+            routed[index]->output.assign(
+                routed_output.begin() + static_cast<std::ptrdiff_t>(index * elements),
+                routed_output.begin() + static_cast<std::ptrdiff_t>((index + 1U) * elements));
+        }
+        return result;
+    }
+
+    ValidationResult run_device_experts(
+        std::uint32_t layer, std::size_t device,
+        std::span<ExpertJob> jobs, std::span<const std::uint8_t> host_jobs,
+        std::span<const float> input, std::uint32_t rows,
+        std::vector<float>& shared_output) {
+        std::vector<ExpertJob*> selected;
+        for (std::size_t index = 0; index < jobs.size(); ++index) {
+            if (host_jobs[index] == 0U && jobs[index].device_slot == device) {
+                selected.push_back(&jobs[index]);
+            }
+        }
+        const bool owns_shared = device == layer_device(layer);
+        if (selected.empty() && !owns_shared) return {};
+        if (rows == 1U) {
+            return run_moe_command(layer, device, selected, input, rows,
+                                   owns_shared ? &shared_output : nullptr);
+        }
+        ValidationResult result;
+        for (auto* job : selected) {
+            std::vector<float> gathered(job->rows.size() * kHidden);
+            for (std::size_t row = 0; row < job->rows.size(); ++row) {
+                const auto source = input.subspan(
+                    static_cast<std::size_t>(job->rows[row]) * kHidden, kHidden);
+                std::copy(source.begin(), source.end(),
+                          gathered.begin() +
+                              static_cast<std::ptrdiff_t>(row * kHidden));
+            }
+            std::array command{job};
+            result = run_moe_command(
+                layer, device, command, gathered,
+                static_cast<std::uint32_t>(job->rows.size()), nullptr);
+            if (!result.ok()) return result;
+        }
+        if (owns_shared) {
+            result = run_moe_command(layer, device, {}, input, rows, &shared_output);
+        }
+        return result;
     }
 
     ValidationResult sparse_mlp(std::uint32_t layer, std::span<const float> input,
                                 std::uint32_t rows, std::uint32_t position_base,
                                 bool prefill, std::span<float> output) {
         ValidationResult result;
+        const auto router_started = std::chrono::steady_clock::now();
         const auto prefix = layer_prefix(layer) + "mlp.";
         std::vector<float> logits(static_cast<std::size_t>(rows) * kExperts);
         result = linear(layer_device(layer), prefix + "gate", kExperts, kHidden,
@@ -1144,7 +1450,7 @@ struct Glm52Runtime::Impl {
             result.errors = std::move(bias.errors);
             return result;
         }
-        const auto router = quanttrio_glm52_int4_int8_mix_spec().router;
+        const auto router = glm52_w4a16_spec().router;
         std::vector<GlmRoute> routes(rows);
         for (std::uint32_t row = 0; row < rows; ++row) {
             auto routed = glm_route_logits_noaux_tc(
@@ -1161,7 +1467,9 @@ struct Glm52Runtime::Impl {
                 return result;
             }
         }
+        graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
 
+        const auto prepare_started = std::chrono::steady_clock::now();
         std::array<std::int32_t, kExperts> job_by_expert{};
         job_by_expert.fill(-1);
         std::vector<ExpertJob> jobs;
@@ -1194,10 +1502,16 @@ struct Glm52Runtime::Impl {
                 }
             }
         }
+        graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
 
-        std::vector<std::future<void>> workers;
-        if (std::find(host_jobs.begin(), host_jobs.end(), 1U) != host_jobs.end()) {
-            workers.push_back(std::async(std::launch::async, [&] {
+        const auto routed_started = std::chrono::steady_clock::now();
+        const bool has_host_jobs =
+            std::find(host_jobs.begin(), host_jobs.end(), 1U) != host_jobs.end();
+        std::vector<float> shared;
+        std::vector<std::vector<std::string>> device_errors(devices.size());
+        auto dispatched = expert_workers->parallel_for(
+            devices.size() + (has_host_jobs ? 1U : 0U), [&](std::size_t task) {
+            if (task == devices.size()) {
                 std::vector<ExpertJob*> wavefront;
                 for (std::size_t index = 0; index < jobs.size(); ++index) {
                     if (host_jobs[index] != 0U) {
@@ -1205,19 +1519,20 @@ struct Glm52Runtime::Impl {
                     }
                 }
                 run_host_expert_wavefront(layer, wavefront, input);
-            }));
+                return;
+            }
+            auto status = run_device_experts(
+                layer, task, jobs, host_jobs, input, rows, shared);
+            device_errors[task] = std::move(status.errors);
+        });
+        graph_stats.moe_routed_nanoseconds += elapsed_nanoseconds(routed_started);
+        if (!dispatched.ok()) return dispatched;
+        for (auto& errors : device_errors) {
+            result.errors.insert(result.errors.end(),
+                                 std::make_move_iterator(errors.begin()),
+                                 std::make_move_iterator(errors.end()));
         }
-        for (std::size_t device = 0; device < devices.size(); ++device) {
-            workers.push_back(std::async(std::launch::async, [&, device] {
-                for (std::size_t index = 0; index < jobs.size(); ++index) {
-                    if (host_jobs[index] == 0U &&
-                        jobs[index].device_slot == device) {
-                        run_expert_job(layer, jobs[index], input);
-                    }
-                }
-            }));
-        }
-        for (auto& worker : workers) worker.get();
+        if (!result.ok()) return result;
         const auto aggregation_started = std::chrono::steady_clock::now();
         std::fill(output.begin(), output.end(), 0.0F);
         for (const auto& job : jobs) {
@@ -1245,10 +1560,6 @@ struct Glm52Runtime::Impl {
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - aggregation_started).count());
 
-        std::vector<float> shared(output.size());
-        result = mlp_triplet(layer_device(layer), prefix + "shared_experts.",
-                             kExpertIntermediate, input, rows, shared);
-        if (!result.ok()) return result;
         const auto shared_aggregation_started = std::chrono::steady_clock::now();
         for (std::size_t index = 0; index < output.size(); ++index) output[index] += shared[index];
         host_aggregation_nanoseconds += static_cast<std::uint64_t>(
@@ -1262,31 +1573,47 @@ struct Glm52Runtime::Impl {
         ValidationResult result;
         std::vector<float> normalized(hidden.size());
         std::vector<float> branch(hidden.size());
+        std::vector<std::vector<std::uint32_t>> topk_indices(rows);
         for (std::uint32_t layer = 0; layer < kLayers; ++layer) {
             const auto layer_started = std::chrono::steady_clock::now();
             const auto prefix = layer_prefix(layer);
+            auto phase_started = std::chrono::steady_clock::now();
             result = norm_rows(normalized, hidden, rows, prefix + "input_layernorm.weight");
+            graph_stats.input_norm_nanoseconds += elapsed_nanoseconds(phase_started);
             if (!result.ok()) return result;
-            result = attention(layer, normalized, rows, position_base, branch);
+            phase_started = std::chrono::steady_clock::now();
+            result = attention(layer, normalized, rows, position_base,
+                               topk_indices, branch);
+            graph_stats.attention_nanoseconds += elapsed_nanoseconds(phase_started);
             if (!result.ok()) return result;
+            phase_started = std::chrono::steady_clock::now();
             for (std::size_t index = 0; index < hidden.size(); ++index) hidden[index] += branch[index];
+            graph_stats.attention_residual_nanoseconds += elapsed_nanoseconds(phase_started);
             if (config.diagnostic_trace) {
                 std::cerr << "[state] phase=" << (rows > 1U ? "prefill" : "decode")
                           << " position=" << position_base << " rows=" << rows
                           << " layer=" << layer << " stage=attention hash=" << std::hex
                           << state_hash(hidden) << std::dec << '\n';
             }
+            phase_started = std::chrono::steady_clock::now();
             result = norm_rows(normalized, hidden, rows,
                                prefix + "post_attention_layernorm.weight");
+            graph_stats.post_attention_norm_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
             if (!result.ok()) return result;
+            phase_started = std::chrono::steady_clock::now();
             if (layer < 3U) {
                 result = mlp_triplet(layer_device(layer), prefix + "mlp.",
                                      kDenseIntermediate, normalized, rows, branch);
+                graph_stats.dense_mlp_nanoseconds += elapsed_nanoseconds(phase_started);
             } else {
                 result = sparse_mlp(layer, normalized, rows, position_base, prefill, branch);
+                graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
             }
             if (!result.ok()) return result;
+            phase_started = std::chrono::steady_clock::now();
             for (std::size_t index = 0; index < hidden.size(); ++index) hidden[index] += branch[index];
+            graph_stats.mlp_residual_nanoseconds += elapsed_nanoseconds(phase_started);
             if (config.diagnostic_trace) {
                 std::cerr << "[state] phase=" << (rows > 1U ? "prefill" : "decode")
                           << " position=" << position_base << " rows=" << rows
@@ -1316,11 +1643,15 @@ struct Glm52Runtime::Impl {
             result.errors.emplace_back("forward pass exceeds the configured context ceiling");
             return result;
         }
+        graph_stats.forward_tokens += rows;
         std::vector<float> hidden(static_cast<std::size_t>(rows) * kHidden);
+        auto phase_started = std::chrono::steady_clock::now();
         result = embed(token_ids, hidden);
+        graph_stats.embedding_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         result = forward_layers(hidden, rows, position_base, prefill);
         if (!result.ok()) return result;
+        phase_started = std::chrono::steady_clock::now();
         auto final_norm = host_tensor("model.norm.weight", kHidden);
         if (!final_norm.ok()) {
             result.errors = std::move(final_norm.errors);
@@ -1332,19 +1663,24 @@ struct Glm52Runtime::Impl {
                               kGlm52RmsNormEpsilon);
         if (!result.ok()) return result;
         logits.assign(kVocabulary, 0.0F);
-        return linear(layer_device(kLayers - 1U), "lm_head", kVocabulary,
-                      kHidden, normalized, 1U, logits);
+        result = linear(layer_device(kLayers - 1U), "lm_head", kVocabulary,
+                        kHidden, normalized, 1U, logits);
+        graph_stats.output_head_nanoseconds += elapsed_nanoseconds(phase_started);
+        return result;
     }
 
     // Drops every cached row from `tokens` onward. The cache is append-only
     // and contiguous, so truncating the three vectors restores the state the
     // speculative pass started from exactly, with no recomputation.
     void rewind_kv(std::uint32_t tokens) {
-        for (auto& cache : kv) {
+        for (std::uint32_t layer = 0U; layer < kv.size(); ++layer) {
+            auto& cache = kv[layer];
             cache.rope.resize(static_cast<std::size_t>(tokens) * kRope);
-            cache.keys.resize(static_cast<std::size_t>(tokens) * kHeads * kNope);
-            cache.values.resize(
-                static_cast<std::size_t>(tokens) * kHeads * kValueHead);
+            cache.latent.resize(static_cast<std::size_t>(tokens) * kKvLora);
+            if (full_indexer_layer(layer)) {
+                cache.index_keys.resize(
+                    static_cast<std::size_t>(tokens) * kIndexDim);
+            }
         }
     }
 
@@ -1367,7 +1703,10 @@ struct Glm52Runtime::Impl {
         std::vector<float> logits;
         for (std::size_t index = 0U; index < candidates.size(); ++index) {
             const std::array<std::uint32_t, 1> speculative{candidates[index]};
+            const auto started = std::chrono::steady_clock::now();
             result = compute_logits(speculative, cached_tokens, false, logits);
+            graph_stats.future_entropy_nanoseconds += elapsed_nanoseconds(started);
+            ++graph_stats.future_entropy_passes;
             // Rewind whether or not the pass succeeded: a partially appended
             // row would desynchronize the cache from the accepted sequence.
             rewind_kv(cached_tokens);
@@ -1431,9 +1770,9 @@ struct Glm52Runtime::Impl {
         cached_token_ids.clear();
         host_aggregation_nanoseconds = 0U;
         for (auto& layer : kv) {
-            layer.keys.clear();
-            layer.values.clear();
+            layer.latent.clear();
             layer.rope.clear();
+            layer.index_keys.clear();
         }
     }
 };
@@ -1455,9 +1794,10 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
         config.sampling_temperature, "GLM");
     if (!result.ok()) return result;
     if (config.maximum_context_tokens == 0U ||
-        config.maximum_context_tokens > kDsaThreshold) {
+        config.maximum_context_tokens >
+            kGlm52ExecutionContract.maximum_context_tokens) {
         result.errors.emplace_back(
-            "baseline exact runtime context must be within the 2,048-token full-attention region");
+            "GLM runtime context exceeds the declared model ceiling");
         return result;
     }
     if (config.host_cold_experts &&
@@ -1514,6 +1854,27 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     impl_->device_schedule = std::move(device_plan.value.weighted_schedule);
     impl_->weights = std::make_unique<WeightCache>(*impl_->checkpoint, impl_->cuda,
                                                    impl_->devices, capacities);
+    try {
+        for (std::uint32_t layer = 0U; layer < impl_->kv.size(); ++layer) {
+            auto& cache = impl_->kv[layer];
+            cache.latent.reserve(
+                static_cast<std::size_t>(config.maximum_context_tokens) * kKvLora);
+            cache.rope.reserve(
+                static_cast<std::size_t>(config.maximum_context_tokens) * kRope);
+            if (full_indexer_layer(layer)) {
+                cache.index_keys.reserve(
+                    static_cast<std::size_t>(config.maximum_context_tokens) * kIndexDim);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        result.errors.emplace_back("cannot reserve the configured compact GLM KV cache");
+        return result;
+    } catch (const std::length_error&) {
+        result.errors.emplace_back("configured compact GLM KV cache is too large");
+        return result;
+    }
+    impl_->expert_workers = std::make_unique<HostWorkerPool>(
+        impl_->devices.size() + (config.host_cold_experts ? 1U : 0U));
     if (config.host_cold_experts) {
         impl_->host_workers =
             std::make_unique<HostWorkerPool>(config.host_worker_threads);
@@ -1606,6 +1967,7 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
     const auto cuda_before = impl_->cuda.stats();
     const auto cache_before = impl_->weights->stats();
     const auto host_before = impl_->host_stats();
+    const auto graph_before = impl_->graph_stats;
     const auto aggregation_before = impl_->host_aggregation_nanoseconds;
     const auto prefill_start = std::chrono::steady_clock::now();
     auto prefill_tokens = std::span<const std::uint32_t>(
@@ -1627,6 +1989,7 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
     const auto cuda_after_prefill = impl_->cuda.stats();
     const auto cache_after_prefill = impl_->weights->stats();
     const auto host_after_prefill = impl_->host_stats();
+    const auto graph_after_prefill = impl_->graph_stats;
     const auto aggregation_after_prefill = impl_->host_aggregation_nanoseconds;
     if (impl_->config.verbose) {
         std::cerr << "[token] position=" << result.prompt_token_ids.size()
@@ -1697,12 +2060,14 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
     const auto cuda_after_decode = impl_->cuda.stats();
     const auto cache_after_decode = impl_->weights->stats();
     const auto host_after_decode = impl_->host_stats();
+    const auto graph_after_decode = impl_->graph_stats;
     const auto aggregation_after_decode = impl_->host_aggregation_nanoseconds;
     result.metrics.prefill.checkpoint_reads = checkpoint_delta(reads_after_prefill, reads_before);
     result.metrics.prefill.cuda = cuda_delta(cuda_after_prefill, cuda_before);
     result.metrics.prefill.cache = cache_delta(cache_after_prefill, cache_before);
     result.metrics.prefill.host_experts = host_expert_delta(
         host_after_prefill, host_before);
+    result.metrics.prefill.graph = graph_delta(graph_after_prefill, graph_before);
     result.metrics.prefill.host_aggregation_nanoseconds =
         aggregation_after_prefill - aggregation_before;
     result.metrics.decode.checkpoint_reads = checkpoint_delta(
@@ -1711,12 +2076,16 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
     result.metrics.decode.cache = cache_delta(cache_after_decode, cache_after_prefill);
     result.metrics.decode.host_experts = host_expert_delta(
         host_after_decode, host_after_prefill);
+    result.metrics.decode.graph = graph_delta(graph_after_decode, graph_after_prefill);
     result.metrics.decode.host_aggregation_nanoseconds =
         aggregation_after_decode - aggregation_after_prefill;
     result.metrics.checkpoint_reads = checkpoint_delta(reads_after_decode, reads_before);
     result.metrics.cuda = cuda_delta(cuda_after_decode, cuda_before);
     result.metrics.cache = cache_delta(cache_after_decode, cache_before);
     result.metrics.host_experts = host_expert_delta(host_after_decode, host_before);
+    result.metrics.graph = graph_delta(graph_after_decode, graph_before);
+    result.metrics.rss_bytes = process_resident_set_bytes();
+    result.metrics.device_vram_used_bytes = device_vram_used_bytes(impl_->devices);
     result.metrics.detailed_timing = impl_->config.detailed_timing;
     result.metrics.flash_attention_enabled =
         impl_->config.enable_flash_attention;

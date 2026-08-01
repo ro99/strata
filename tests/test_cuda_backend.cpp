@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_kv_cache.hpp"
 #include "strata/deepseek_ops.hpp"
+#include "strata/numerics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +97,62 @@ strata::CudaWeight upload_fp8(
     strata::CudaWeight result;
     REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
     return result;
+}
+
+strata::CudaWeight upload_int4(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns, std::uint8_t seed) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::OffsetPackedInt4;
+    descriptor.dtype = strata::SafetensorsDtype::I32;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = (columns + 7U) / 8U;
+    descriptor.scale_columns = (columns + 127U) / 128U;
+    descriptor.group_size = 128U;
+    std::vector<std::byte> packed(
+        static_cast<std::size_t>(rows * descriptor.packed_columns * 4U));
+    for (std::uint64_t row = 0U; row < rows; ++row) {
+        for (std::uint64_t word = 0U; word < descriptor.packed_columns; ++word) {
+            std::uint32_t value = 0U;
+            for (std::uint32_t lane = 0U; lane < 8U; ++lane) {
+                value |= static_cast<std::uint32_t>(
+                    (seed + row * 3U + word * 5U + lane * 7U) & 0x0FU)
+                    << (lane * 4U);
+            }
+            store_u32(packed.data() + static_cast<std::ptrdiff_t>(
+                (row * descriptor.packed_columns + word) * 4U), value);
+        }
+    }
+    const auto scale = bf16(0.015625F);
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(rows * descriptor.scale_columns * 2U));
+    for (std::size_t index = 0U; index < scales.size(); index += 2U) {
+        std::copy(scale.begin(), scale.end(),
+                  scales.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, packed, scales, result).ok());
+    return result;
+}
+
+std::vector<float> reference_int4_expert(
+    strata::CudaBackend& backend, const strata::CudaWeight& gate,
+    const strata::CudaWeight& up, const strata::CudaWeight& down,
+    std::span<const float> hidden, std::uint32_t rows,
+    std::uint64_t intermediate) {
+    std::vector<float> gate_output(
+        static_cast<std::size_t>(rows) * intermediate);
+    std::vector<float> up_output(gate_output.size());
+    REQUIRE(backend.matmul(gate, hidden, rows, gate_output).ok());
+    REQUIRE(backend.matmul(up, hidden, rows, up_output).ok());
+    for (std::size_t index = 0U; index < gate_output.size(); ++index) {
+        gate_output[index] = strata::silu_f32(gate_output[index]) *
+                             up_output[index];
+    }
+    std::vector<float> output(hidden.size());
+    REQUIRE(backend.matmul(down, gate_output, rows, output).ok());
+    return output;
 }
 
 strata::CudaWeight upload_fp4_nan_scale(
@@ -814,6 +871,73 @@ TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections
     REQUIRE(grouped_rows_output[1] == 53.0F);
     REQUIRE(grouped_rows_output[2] == 3.0F);
     REQUIRE(grouped_rows_output[3] == 18.0F);
+}
+
+TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE commands") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 2U;
+    constexpr std::uint64_t hidden_columns = 6144U;
+    constexpr std::uint64_t intermediate_columns = 2048U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate0 = upload_int4(
+        backend, device, intermediate_columns, hidden_columns, 1U);
+    auto up0 = upload_int4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto down0 = upload_int4(
+        backend, device, hidden_columns, intermediate_columns, 5U);
+    auto gate1 = upload_int4(
+        backend, device, intermediate_columns, hidden_columns, 7U);
+    auto up1 = upload_int4(
+        backend, device, intermediate_columns, hidden_columns, 9U);
+    auto down1 = upload_int4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    auto shared_gate = upload_int4(
+        backend, device, intermediate_columns, hidden_columns, 13U);
+    auto shared_up = upload_int4(
+        backend, device, intermediate_columns, hidden_columns, 2U);
+    auto shared_down = upload_int4(
+        backend, device, hidden_columns, intermediate_columns, 4U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 13U) - 6) /
+                        16.0F;
+    }
+    const auto reference0 = reference_int4_expert(
+        backend, gate0, up0, down0, hidden, rows, intermediate_columns);
+    const auto reference1 = reference_int4_expert(
+        backend, gate1, up1, down1, hidden, rows, intermediate_columns);
+    const auto reference_shared = reference_int4_expert(
+        backend, shared_gate, shared_up, shared_down, hidden, rows,
+        intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 2> routed{{
+        {&gate0, &up0, &down0, 1.0F},
+        {&gate1, &up1, &down1, 1.0F},
+    }};
+    const strata::CudaMoeExpert shared{
+        &shared_gate, &shared_up, &shared_down, 1.0F};
+    std::array<float, 2U * rows * hidden_columns> routed_output{};
+    std::array<float, rows * hidden_columns> shared_output{};
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, &shared).ok());
+    REQUIRE(backend.collect_moe(device, routed_output, shared_output).ok());
+    for (std::size_t index = 0U; index < reference0.size(); ++index) {
+        REQUIRE_NEAR(routed_output[index], reference0[index], 1.0e-4F);
+        REQUIRE_NEAR(routed_output[reference0.size() + index],
+                     reference1[index], 1.0e-4F);
+        REQUIRE_NEAR(shared_output[index], reference_shared[index], 1.0e-4F);
+    }
+    const auto first = backend.stats();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, &shared).ok());
+    REQUIRE(backend.collect_moe(device, routed_output, shared_output).ok());
+    const auto second = backend.stats();
+    REQUIRE(second.workspace_allocation_calls == first.workspace_allocation_calls);
+    REQUIRE(second.deepseek_moe_calls - first.deepseek_moe_calls == 1U);
+    REQUIRE(second.deepseek_moe_kernel_launches -
+                first.deepseek_moe_kernel_launches == 2U);
 }
 
 TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when available") {

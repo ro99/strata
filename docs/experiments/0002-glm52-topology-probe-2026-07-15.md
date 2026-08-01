@@ -64,7 +64,7 @@ after timing so validation does not cap measured I/O throughput.
 
 All three matrices used Linux `6.8.0-100-generic`, CUDA runtime 12.8, CUDA
 driver API 13.2 / NVIDIA driver 595.71.05, two NUMA nodes, and the pinned
-QuantTrio index hash
+checkpoint index hash
 `43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b`.
 The probe captured this live PCIe state before measurement:
 

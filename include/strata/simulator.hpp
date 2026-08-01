@@ -13,6 +13,7 @@ struct SimulationConfig {
     ResidencyConfig residency;
     std::size_t prefetch_limit{};
     double minimum_prediction_confidence{0.50};
+    RoutePhase measured_phase{RoutePhase::Unknown};
 };
 
 struct SimulationResult {

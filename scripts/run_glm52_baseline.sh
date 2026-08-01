@@ -26,11 +26,12 @@ trace_routes=${TRACE_ROUTES:-1}
 detailed_timing=${DETAILED_TIMING:-0}
 flash_attention=${FLASH_ATTENTION:-0}
 prompt='What is the closer start to sun, and how distant it is from it?'
-expected_index_sha256=43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b
+expected_index_sha256=74d73bfaa26425beaf618342f4a0851b21d9198138b76bfb678f88164d987beb
 model_source=$(findmnt -no SOURCE --target "${model_dir}")
-block_name=$(lsblk -no PKNAME "${model_source}" | head -n 1)
+model_device=${model_source%%\[*}
+block_name=$(lsblk -no PKNAME "${model_device}" | head -n 1)
 if [[ -z "${block_name}" ]]; then
-    block_name=$(basename "${model_source}")
+    block_name=$(basename "${model_device}")
 fi
 block_stat="/sys/class/block/${block_name}/stat"
 

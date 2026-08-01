@@ -42,7 +42,7 @@ ValidationResult validate_model(const ModelSpec& spec) {
         result.errors.emplace_back("routed_scale must be finite and positive");
     }
 
-    if (spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsInt4Int8Mix) {
+    if (spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW4A16) {
         const auto validate_quantized_role = [&result](const QuantizedWeightSpec& role,
                                                         std::string_view name) {
             if (!quantization_allowed(role.bits)) {
@@ -306,9 +306,9 @@ ValidationResult validate_deepseek_v4_flash_0731(const ModelSpec& spec) {
     return result;
 }
 
-ModelSpec quanttrio_glm52_int4_int8_mix_spec() {
+ModelSpec glm52_w4a16_spec() {
     ModelSpec spec;
-    spec.name = "QuantTrio/GLM-5.2-Int4-Int8Mix";
+    spec.name = "glm-moe-dsa-w4a16";
     spec.architecture = ArchitectureKind::GlmMoeDsa;
     spec.attention = AttentionKind::Mla;
     spec.router.selection = RouterSelectionKind::NoAuxTc;
@@ -321,27 +321,25 @@ ModelSpec quanttrio_glm52_int4_int8_mix_spec() {
     spec.router.selection_bias = true;
     spec.router.routed_scale = kGlm52ExecutionContract.routed_scale;
 
-    spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsInt4Int8Mix;
+    spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsW4A16;
     spec.mixed_quantization.activation_bits = 16;
-    spec.mixed_quantization.quantized_linear_start_layer = 1;
+    spec.mixed_quantization.quantized_linear_start_layer = 0;
     spec.mixed_quantization.quantized_expert_start_layer = 3;
     spec.mixed_quantization.mtp_layer_index = 78;
     spec.mixed_quantization.routed_experts = {
         4, QuantizationGranularity::Group, 128, true};
     spec.mixed_quantization.linears = {
-        8, QuantizationGranularity::Group, 128, true};
+        4, QuantizationGranularity::Group, 128, true};
     spec.mixed_quantization.mtp = {
-        8, QuantizationGranularity::Channel, 0, true};
+        4, QuantizationGranularity::Group, 128, true};
 
-    spec.source.repository = "QuantTrio/GLM-5.2-Int4-Int8Mix";
-    spec.source.revision = "1d3bcfe5ec549ecd000fd80b37f191183842e983";
     spec.source.index_sha256 =
-        "43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b";
-    spec.source.tensor_count = 177'569;
-    spec.source.indexed_tensor_bytes = 405'459'090'304ULL;
-    spec.source.shard_file_bytes = 405'481'014'016ULL;
-    spec.source.main_shards = 124;
-    spec.source.mtp_shards = 4;
+        "74d73bfaa26425beaf618342f4a0851b21d9198138b76bfb678f88164d987beb";
+    spec.source.tensor_count = 175'527;
+    spec.source.indexed_tensor_bytes = 387'667'154'688ULL;
+    spec.source.shard_file_bytes = 387'689'209'608ULL;
+    spec.source.main_shards = 8;
+    spec.source.mtp_shards = 0;
 
     spec.quant_bits = 4;
     spec.hidden_size = kGlm52ExecutionContract.hidden_size;
@@ -358,38 +356,34 @@ ModelSpec quanttrio_glm52_int4_int8_mix_spec() {
     return spec;
 }
 
-ValidationResult validate_quanttrio_glm52_int4_int8_mix(const ModelSpec& spec) {
+ValidationResult validate_glm52_w4a16(const ModelSpec& spec) {
     auto result = validate_model(spec);
-    const auto expected = quanttrio_glm52_int4_int8_mix_spec();
+    const auto expected = glm52_w4a16_spec();
     const auto require = [&result](bool condition, std::string_view message) {
         if (!condition) result.errors.emplace_back(message);
     };
 
-    require(spec.source.repository == expected.source.repository,
-            "unexpected QuantTrio GLM-5.2 repository");
-    require(spec.source.revision == expected.source.revision,
-            "unexpected QuantTrio GLM-5.2 revision");
     require(spec.source.index_sha256 == expected.source.index_sha256,
-            "unexpected QuantTrio GLM-5.2 index hash");
+            "unexpected GLM W4A16 index hash");
     require(spec.source.tensor_count == expected.source.tensor_count,
-            "unexpected QuantTrio GLM-5.2 tensor count");
+            "unexpected GLM W4A16 tensor count");
     require(spec.source.indexed_tensor_bytes == expected.source.indexed_tensor_bytes,
-            "unexpected QuantTrio GLM-5.2 indexed byte count");
+            "unexpected GLM W4A16 indexed byte count");
     require(spec.source.shard_file_bytes == expected.source.shard_file_bytes,
-            "unexpected QuantTrio GLM-5.2 shard byte count");
+            "unexpected GLM W4A16 shard byte count");
     require(spec.source.main_shards == expected.source.main_shards &&
                 spec.source.mtp_shards == expected.source.mtp_shards,
-            "unexpected QuantTrio GLM-5.2 shard count");
+            "unexpected GLM W4A16 shard count");
 
     require(spec.architecture == expected.architecture && spec.attention == expected.attention,
-            "unexpected QuantTrio GLM-5.2 architecture");
+            "unexpected GLM W4A16 architecture");
     require(spec.hidden_size == expected.hidden_size &&
                 spec.layer_count == expected.layer_count &&
                 spec.dense_prefix_layers == expected.dense_prefix_layers &&
                 spec.shared_experts == expected.shared_experts &&
                 spec.expert_intermediate_size == expected.expert_intermediate_size &&
                 spec.max_context_tokens == expected.max_context_tokens,
-            "unexpected QuantTrio GLM-5.2 model dimensions");
+            "unexpected GLM W4A16 model dimensions");
     require(spec.router.selection == expected.router.selection &&
                 spec.router.scoring == expected.router.scoring &&
                 spec.router.routed_experts == expected.router.routed_experts &&
@@ -399,7 +393,7 @@ ValidationResult validate_quanttrio_glm52_int4_int8_mix(const ModelSpec& spec) {
                 spec.router.normalize_topk == expected.router.normalize_topk &&
                 spec.router.selection_bias == expected.router.selection_bias &&
                 spec.router.routed_scale == expected.router.routed_scale,
-            "unexpected QuantTrio GLM-5.2 router semantics");
+            "unexpected GLM W4A16 router semantics");
     require(spec.glm_moe_dsa.sparse_attention_topk ==
                     expected.glm_moe_dsa.sparse_attention_topk &&
                 spec.glm_moe_dsa.index_share_frequency ==
@@ -407,7 +401,7 @@ ValidationResult validate_quanttrio_glm52_int4_int8_mix(const ModelSpec& spec) {
                 spec.glm_moe_dsa.mtp_layers == expected.glm_moe_dsa.mtp_layers &&
                 spec.glm_moe_dsa.index_share_for_mtp ==
                     expected.glm_moe_dsa.index_share_for_mtp,
-            "unexpected QuantTrio GLM-5.2 DSA or MTP semantics");
+            "unexpected GLM W4A16 DSA or MTP semantics");
 
     const auto& actual_quantization = spec.mixed_quantization;
     const auto& expected_quantization = expected.mixed_quantization;
@@ -428,7 +422,7 @@ ValidationResult validate_quanttrio_glm52_int4_int8_mix(const ModelSpec& spec) {
                           expected_quantization.routed_experts) &&
                 same_role(actual_quantization.linears, expected_quantization.linears) &&
                 same_role(actual_quantization.mtp, expected_quantization.mtp),
-            "unexpected QuantTrio GLM-5.2 quantization semantics");
+            "unexpected GLM W4A16 quantization semantics");
     return result;
 }
 

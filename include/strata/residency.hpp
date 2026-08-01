@@ -51,6 +51,7 @@ public:
     [[nodiscard]] AccessResult access(ExpertKey key, std::uint64_t tick);
     bool prefetch(ExpertKey key, std::uint64_t tick, double confidence);
     void finalize();
+    void reset_stats() noexcept { stats_ = {}; finalized_ = false; }
 
     [[nodiscard]] bool resident(ExpertKey key) const;
     [[nodiscard]] const ResidencyStats& stats() const noexcept { return stats_; }

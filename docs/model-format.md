@@ -37,22 +37,18 @@ The model packer will emit fixed-size records containing:
 One routed expert's gate, up, down, and scales share an atomic placement group.
 Shared experts are marked resident-spine data.
 
-## QuantTrio compressed-tensors layouts
+## Packed compressed-tensors layouts
 
-The GLM-5.2 target is already quantized. Strata preserves three native
-`compressed-tensors` encodings rather than requantizing them:
+The GLM-5.2 target is already quantized. Strata preserves its native
+`compressed-tensors` encoding rather than requantizing it:
 
-- `CT_INT4_SYM_G128`: offset-packed signed four-bit routed-expert weights,
+- `CT_INT4_SYM_G128`: offset-packed signed four-bit linear weights,
   symmetric BF16
   scale per 128 logical input elements, W4A16 with FP32 accumulation;
-- `CT_INT8_SYM_G128`: signed eight-bit ordinary linear weights, symmetric BF16
-  scale per 128 logical input elements, W8A16 with FP32 accumulation;
-- `CT_INT8_SYM_CHANNEL`: signed eight-bit MTP weights with one symmetric BF16
-  scale per output channel, W8A16 with FP32 accumulation.
 
 Each quantized module has an I32 `weight_packed` tensor, a BF16 `weight_scale`
 tensor, and an I64 two-element `weight_shape` tensor. INT4 packs eight logical
-values per I32; INT8 packs four. Stored integer lanes are offset binary: decode
+values per I32. Stored integer lanes are offset binary: decode
 as `raw - 2^(bits-1)`, with the first logical value in the least-significant
 bits. This is distinct from Strata's standalone two's-complement Q4 oracle.
 
@@ -69,8 +65,7 @@ scales, and kernels.
 
 The required source layouts are:
 
-- `CT_INT4_SYM_G128`, `CT_INT8_SYM_G128`, and `CT_INT8_SYM_CHANNEL` for the
-  pinned QuantTrio GLM-5.2 checkpoint;
+- `CT_INT4_SYM_G128` for the pinned GLM W4A16 checkpoint;
 - `FP8_E4M3_B128X128`: DeepSeek supporting matrices with declared 128×128 block
   scales;
 - `FP4_E2M1_K32`: DeepSeek-V4 expert values packed two per byte, using the
@@ -94,8 +89,8 @@ extents inside Safetensors shards when:
 - runtime opens all source files read-only;
 - kernels implement the declared native format without conversion.
 
-QuantTrio/GLM-5.2-Int4-Int8Mix and DeepSeek-V4-Flash-0731 use this path so
-Strata does not create redundant 405 GB or 167 GB rewritten copies.
+The GLM W4A16 and DeepSeek-V4-Flash-0731 checkpoints use this path so
+Strata does not create redundant 388 GB or 167 GB rewritten copies.
 
 ## Planned native packs
 

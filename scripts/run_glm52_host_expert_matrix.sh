@@ -12,7 +12,7 @@ devices=${CUDA_DEVICES:-0,1,2}
 vram_fraction=${VRAM_FRACTION:-0.95}
 host_workers=${HOST_WORKERS:-36}
 prompt='What is the closer start to sun, and how distant it is from it?'
-expected_index_sha256=43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b
+expected_index_sha256=74d73bfaa26425beaf618342f4a0851b21d9198138b76bfb678f88164d987beb
 
 mkdir -p "${result_dir}"
 command -v jq >/dev/null 2>&1 || {

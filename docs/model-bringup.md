@@ -17,15 +17,15 @@ repository heads.
 
 | Property | GLM-5.2 | DeepSeek-V4-Flash-0731 |
 |---|---:|---:|
-| Repository | `QuantTrio/GLM-5.2-Int4-Int8Mix` | `deepseek-ai/DeepSeek-V4-Flash-0731` |
+| Checkpoint | local W4A16 source | `deepseek-ai/DeepSeek-V4-Flash-0731` |
 | Revision inspected | `1d3bcfe5ec549ecd000fd80b37f191183842e983` | `9e165c30e2704aec5d9d593cce3eebd58bbef1cb` |
-| Index SHA-256 | `43298345833417b1ad2a8b76d012a83d4f2275d532e5ab38e118566f1ac7b12b` | `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b` |
-| Indexed tensors | 177,569 | 72,317 |
-| Weight shards | 128 (124 main + 4 MTP) | 48 |
-| Indexed tensor payload | 405,459,090,304 bytes | 166,878,536,440 bytes |
-| Weight shard files | 405,481,014,016 bytes | 166,886,535,336 bytes repository storage |
+| Index SHA-256 | `74d73bfaa26425beaf618342f4a0851b21d9198138b76bfb678f88164d987beb` | `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b` |
+| Indexed tensors | 175,527 | 72,317 |
+| Weight shards | 8 | 48 |
+| Indexed tensor payload | 387,667,154,688 bytes | 166,878,536,440 bytes |
+| Weight shard files | 387,689,209,608 bytes | 166,886,535,336 bytes repository storage |
 | License reported by repository | MIT | MIT |
-| Source precision | INT4/INT8 packed weights plus BF16/F32 | FP4 experts, FP8 spine, BF16/F32 sensitive tensors |
+| Source precision | INT4 group-128 linears plus BF16/F32 sensitive tensors | FP4 experts, FP8 spine, BF16/F32 sensitive tensors |
 | Strata handling | Preserve native extents; no additional quantization | Preserve native extents; no additional quantization |
 
 The GLM values were read on 2026-07-14 and the DeepSeek values were refreshed
@@ -45,8 +45,8 @@ GLM-5.2 defines Strata's primary architecture and performance contract:
 - MLA-style low-rank query/KV projections;
 - DSA top-2048 sparse attention with IndexShare reuse every four layers;
 - a one-million-token maximum context;
-- symmetric INT4 group-128 routed experts, symmetric INT8 group-128 ordinary
-  linears, channelwise INT8 MTP, and BF16/FP32 sensitive tensors.
+- symmetric INT4 group-128 linears with W4A16 execution and BF16/FP32 sensitive
+  tensors. The optional MTP weights are not present in this base checkpoint.
 
 The source uses the `compressed-tensors` `pack-quantized` convention. Quantized
 modules are represented by an I32 `weight_packed` tensor, a BF16 `weight_scale`
@@ -56,10 +56,9 @@ not itself a precision declaration.
 
 | Layer scope | Declared weight representation |
 |---|---|
-| Layer 0 | BF16 |
-| Layers 1–2 | ordinary linears: symmetric INT8 group-128 |
-| Layers 3–77 | routed experts: symmetric INT4 group-128; ordinary linears: symmetric INT8 group-128 |
-| Layer 78 MTP | channelwise symmetric INT8 |
+| Layers 0–2 | dense and attention linears: symmetric INT4 group-128 |
+| Layers 3–77 | routed, shared-expert, and attention linears: symmetric INT4 group-128 |
+| Optional MTP | absent from the base checkpoint |
 | Routers, indexers, norms, embeddings, special heads | pinned BF16 or FP32 source dtype |
 
 ### Stage A0 — metadata-only target lock
@@ -72,9 +71,9 @@ file metadata. Do not begin the bulk transfer yet.
 
 Implement a C++ inspector that:
 
-1. parses the 177,569-entry tensor index with bounded memory;
-2. recognizes all 124 main shards, four MTP shards, and the
-   405,459,090,304-byte indexed payload total;
+1. parses the 175,527-entry tensor index with bounded memory;
+2. recognizes all eight shards and the 387,667,154,688-byte indexed payload
+   total;
 3. assigns every tensor an explicit role—dense spine, router, shared expert,
    routed expert, DSA/IndexShare, MTP, embedding, head, norm, or metadata;
 4. joins every quantized module's packed values, scales, and logical shape and
@@ -126,10 +125,6 @@ weight transfer begins.
   length, dtype, shape, role, and placement group.
 - Validate that INT4 group-128 tensors pack eight logical weights per I32 and
   have one BF16 scale per output-row/group pair.
-- Validate that INT8 group-128 tensors pack four logical weights per I32 and
-  have one BF16 scale per output-row/group pair.
-- Validate that MTP INT8 tensors pack four logical weights per I32 and have one
-  BF16 scale per output channel.
 - Preserve BF16 embeddings, norms, indexers, special heads, and FP32 router
   tensors without conversion.
 - Open model shards read-only at runtime; placement state and route history
@@ -137,7 +132,7 @@ weight transfer begins.
 - Record full source hashes and manifest completion, but do not write duplicate
   weight payloads.
 
-The base disk budget is 405,481,014,016 bytes for the source shard files plus
+The base disk budget is 387,689,209,608 bytes for the source shard files plus
 metadata, resumable download state, the small sidecar, and a safety margin. The
 exact planner output—not the model card's rounded 378 GiB figure—authorizes the
 download. A second converted pack is outside the plan.

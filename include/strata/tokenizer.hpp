@@ -16,6 +16,7 @@ namespace strata {
 enum class TokenizerContract : std::uint8_t {
     Glm52,
     DeepSeekV4,
+    Gemma4,
 };
 
 [[nodiscard]] ParseResult<std::vector<std::string>> pretokenize(
@@ -56,6 +57,7 @@ private:
     std::array<std::string, 256> byte_to_piece_;
     std::array<std::int16_t, 1024> codepoint_to_byte_{};
     bool ignore_merges_{};
+    bool sentencepiece_bpe_{};
     TokenizerContract contract_{TokenizerContract::Glm52};
 };
 
@@ -69,6 +71,10 @@ private:
 [[nodiscard]] std::string render_deepseek_v4_user_prompt(
     std::string_view user_text, bool enable_thinking = false);
 [[nodiscard]] std::string render_deepseek_v4_chat_prompt(
+    std::span<const ChatMessage> messages, bool enable_thinking = false);
+[[nodiscard]] std::string render_gemma4_user_prompt(
+    std::string_view user_text, bool enable_thinking = false);
+[[nodiscard]] std::string render_gemma4_chat_prompt(
     std::span<const ChatMessage> messages, bool enable_thinking = false);
 
 }  // namespace strata

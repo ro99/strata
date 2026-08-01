@@ -14,7 +14,12 @@ This is the machine the project is built and measured on. It's an ordinary works
 | RAM | 251 GiB DDR4 |
 | CPU | Xeon E5-2680 v4 |
 
-On this hardware Strata supports two checkpoints: DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into host RAM so decode does not touch storage after warm-up, and GLM-5.2 W4A16 (388 GB, 78 layers, 256 experts, top-8), which is larger than the machine's combined VRAM and RAM and therefore remains I/O-dependent.
+On this hardware Strata supports three checkpoints: Gemma 4 31B-IT W8A16
+(35.1 GB, dense text and vision), resident across the three GPUs;
+DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into
+host RAM so decode does not touch storage after warm-up; and GLM-5.2 W4A16
+(388 GB, 78 layers, 256 experts, top-8), which is larger than the machine's
+combined VRAM and RAM and therefore remains I/O-dependent.
 
 ## What "exact" means here
 
@@ -37,7 +42,9 @@ These are enforced in code, not just documented, and they're part of why some nu
 
 ## Quick start
 
-You need a C++20 compiler, CMake 3.20+, Make, and CUDA 12.8 (or a compatible toolchain) for the GPU backend.
+You need a C++20 compiler, CMake 3.20+, Make, and CUDA 12.8 (or a compatible
+toolchain) for the GPU backend. Gemma 4 image requests additionally use the
+installed ImageMagick decoder for bounded PNG, JPEG, and WebP inputs.
 
 ```bash
 git clone https://github.com/ro99/strata
@@ -52,6 +59,14 @@ Place a checkpoint under `models/` in its original Safetensors form. Strata read
   --model models/dsv4f --model-type deepseek \
   --context-size 8192 --max-new 256 --devices 0,1,2 \
   --vram-fraction 0.95 --pin-resident-arena --flash-attention
+```
+
+Gemma 4 uses its native W8A16 checkpoint directly and enables CUDA attention:
+
+```bash
+./build/strata-chat \
+  --model models/gemma4 --model-type gemma4 \
+  --context-size 2048 --max-new 256 --devices 0,1,2
 ```
 
 Startup prints the selected devices, the VRAM budget per device, load progress, elapsed load time, and the active sampler. Decoding defaults to greedy (`--temperature 0`) for reproducible output. Multi-turn chat reuses the cached prefix and only prefills new tokens.
@@ -216,10 +231,16 @@ It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`,
 
 | Model | Layout | Native precision | Status on this hardware |
 |---|---|---|---|
+| Gemma 4 31B-IT | 60 dense hybrid-attention layers; 27-layer vision tower | INT8 group-32 text linears, BF16 vision/embeddings and BF16 KV | Fully resident across GPU VRAM; text and OpenAI image-content generation |
 | DeepSeek-V4-Flash-0731 | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
 | GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 linears, BF16/F32 sensitive tensors; W4A16 execution | Larger than combined memory; I/O-dependent |
 
-Both run their declared attention and routing mechanisms as-is: hybrid compressed attention, manifold-constrained hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek; MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for GLM.
+Each runs its declared model semantics as-is: local/global grouped-query
+attention, proportional RoPE, GeGLU, soft-capped logits, and bidirectional
+image blocks for Gemma 4; hybrid compressed attention, manifold-constrained
+hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek; and
+MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for
+GLM.
 
 The current 0731 checkpoint has not yet been benchmarked. For context, the last
 validated DeepSeek measurement used the now-unsupported preview checkpoint:
@@ -252,7 +273,7 @@ The difference between the two rows is mostly explained by whether the checkpoin
 - **Residency.** The dense/shared spine is pinned in VRAM. Routed experts live
   in a host RAM arena and are leased into VRAM per decode step through an LRU
   cache with a capacity-weighted schedule across GPUs.
-- **Kernels.** Native INT4 group-128, FP4 E2M1, and FP8 E4M3
+- **Kernels.** Native INT4 group-128, INT8 group-32, FP4 E2M1, and FP8 E4M3
   CUDA kernels for compute capabilities 8.6 and 12.0, checked against a CPU
   reference implementation.
 - **Instrumentation.** Every run reports checkpoint reads, H2D/D2H bytes, cache
@@ -262,7 +283,10 @@ For more detail: [docs/current-architecture.md](docs/current-architecture.md) de
 
 ## Roadmap
 
-Model adapters are kept narrow by design — an adapter owns its tokenizer, tensor roles, router semantics, and operations, and nothing outside that. Gemma, Qwen, and diffusion models are the intended next architectures once GLM-5.2 and DeepSeek-V4 clear their remaining correctness gates.
+Model adapters are kept narrow by design — an adapter owns its tokenizer,
+tensor roles, router semantics, and operations, and nothing outside that. Qwen
+and diffusion models are the intended next architectures once the current
+correctness gates clear.
 
 The main open research problem is making decode independent of storage for checkpoints like GLM's, where the model doesn't fit in the machine's combined memory. Work on custom quantization or pruning to shrink checkpoints further is also of interest, but it will be held to the same rule as everything else here: it has to clear a measured quality gate before it ships, and the four-bit floor is not something that moves to get there.
 

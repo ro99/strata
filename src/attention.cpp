@@ -190,10 +190,9 @@ ParseResult<FlashAttentionShape> validate_flash_attention_request(
         return result;
     }
     if (!request.query_key_mask.empty()) {
-        if (request.numerics !=
-            FlashAttentionNumerics::f64_dot_f32_score_f32_accum) {
+        if (request.numerics == FlashAttentionNumerics::tiled_online_f64) {
             result.errors.emplace_back(
-                "FlashAttention exact visibility masks require the F64-dot compatibility contract");
+                "FlashAttention exact visibility masks require a compatibility contract");
             return result;
         }
         for (std::uint32_t query = 0U; query < request.query_rows; ++query) {

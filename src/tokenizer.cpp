@@ -6,6 +6,7 @@
 #include <cctype>
 #include <limits>
 #include <optional>
+#include <queue>
 #include <utility>
 
 namespace strata {
@@ -478,9 +479,15 @@ ParseResult<std::vector<std::string>> pretokenize(
         result.errors = runes.errors;
         return result;
     }
-    return contract == TokenizerContract::Glm52
-               ? pretokenize_glm(text, runes.value)
-               : pretokenize_deepseek(text, runes.value);
+    if (contract == TokenizerContract::Glm52) {
+        return pretokenize_glm(text, runes.value);
+    }
+    if (contract == TokenizerContract::DeepSeekV4) {
+        return pretokenize_deepseek(text, runes.value);
+    }
+    ParseResult<std::vector<std::string>> result;
+    result.value.emplace_back(text);
+    return result;
 }
 
 ModelTokenizer::ModelTokenizer() {
@@ -540,12 +547,18 @@ ParseResult<ModelTokenizer> ModelTokenizer::load(const std::string& path) {
             result.value.vocabulary_.size() == 128000U &&
             result.value.merge_ranks_.size() == 127741U &&
             added_tokens.size() == 1283U && !result.value.ignore_merges_;
-        if (!glm52 && !deepseek_v4) {
+        const bool gemma4 = saw_added && saw_model &&
+            result.value.vocabulary_.size() == 262144U &&
+            result.value.merge_ranks_.size() == 514906U &&
+            added_tokens.size() == 24U && !result.value.ignore_merges_;
+        if (!glm52 && !deepseek_v4 && !gemma4) {
             throw std::runtime_error(
-                "tokenizer does not match a pinned GLM-5.2 or DeepSeek-V4 contract");
+                "tokenizer does not match a pinned GLM-5.2, DeepSeek-V4, or Gemma-4 contract");
         }
-        result.value.contract_ = deepseek_v4 ? TokenizerContract::DeepSeekV4
-                                             : TokenizerContract::Glm52;
+        result.value.contract_ = gemma4 ? TokenizerContract::Gemma4
+            : deepseek_v4 ? TokenizerContract::DeepSeekV4
+                          : TokenizerContract::Glm52;
+        result.value.sentencepiece_bpe_ = gemma4;
         result.value.added_tokens_.reserve(added_tokens.size());
         for (auto& [content, id] : added_tokens) {
             result.value.added_tokens_.push_back({std::move(content), id});
@@ -589,6 +602,106 @@ std::int32_t ModelTokenizer::token_id(std::string_view piece) const noexcept {
 ParseResult<std::vector<std::uint32_t>> ModelTokenizer::encode_piece(
     std::string_view bytes) const {
     ParseResult<std::vector<std::uint32_t>> result;
+    if (sentencepiece_bpe_) {
+        std::string normalized;
+        normalized.reserve(bytes.size());
+        for (const char value : bytes) {
+            if (value == ' ') normalized += "▁";
+            else normalized.push_back(value);
+        }
+        struct Node {
+            std::string symbol;
+            std::size_t previous{};
+            std::size_t next{};
+            std::uint32_t generation{};
+            bool alive{true};
+        };
+        struct Candidate {
+            std::uint32_t rank{};
+            std::size_t left{};
+            std::size_t right{};
+            std::uint32_t left_generation{};
+            std::uint32_t right_generation{};
+        };
+        const auto later = [](const Candidate& left, const Candidate& right) {
+            return left.rank > right.rank ||
+                   (left.rank == right.rank && left.left > right.left);
+        };
+        std::vector<Node> nodes;
+        for (std::size_t cursor = 0U; cursor < normalized.size();) {
+            const auto decoded = decode_utf8(normalized, cursor);
+            if (!decoded) {
+                result.errors.emplace_back("tokenizer input is not valid UTF-8");
+                return result;
+            }
+            const auto index = nodes.size();
+            nodes.push_back({normalized.substr(cursor, decoded->second),
+                             index == 0U ? index : index - 1U, index + 1U});
+            cursor += decoded->second;
+        }
+        if (nodes.empty()) return result;
+        nodes.back().next = nodes.size();
+        std::priority_queue<Candidate, std::vector<Candidate>, decltype(later)>
+            candidates(later);
+        const auto enqueue = [&](std::size_t left) {
+            if (left >= nodes.size() || !nodes[left].alive) return;
+            const auto right = nodes[left].next;
+            if (right >= nodes.size() || !nodes[right].alive) return;
+            const auto found = merge_ranks_.find(
+                merge_key(nodes[left].symbol, nodes[right].symbol));
+            if (found != merge_ranks_.end()) {
+                candidates.push({found->second, left, right,
+                                 nodes[left].generation,
+                                 nodes[right].generation});
+            }
+        };
+        for (std::size_t index = 0U; index + 1U < nodes.size(); ++index) {
+            enqueue(index);
+        }
+        while (!candidates.empty()) {
+            const auto candidate = candidates.top();
+            candidates.pop();
+            if (!nodes[candidate.left].alive || !nodes[candidate.right].alive ||
+                nodes[candidate.left].next != candidate.right ||
+                nodes[candidate.left].generation != candidate.left_generation ||
+                nodes[candidate.right].generation != candidate.right_generation) {
+                continue;
+            }
+            auto& left = nodes[candidate.left];
+            auto& right = nodes[candidate.right];
+            left.symbol += right.symbol;
+            ++left.generation;
+            right.alive = false;
+            ++right.generation;
+            left.next = right.next;
+            if (right.next < nodes.size()) {
+                nodes[right.next].previous = candidate.left;
+            }
+            if (left.previous != candidate.left) enqueue(left.previous);
+            enqueue(candidate.left);
+        }
+        for (std::size_t index = 0U; index < nodes.size(); index = nodes[index].next) {
+            const auto found = vocabulary_.find(nodes[index].symbol);
+            if (found != vocabulary_.end()) {
+                result.value.push_back(found->second);
+                continue;
+            }
+            for (const unsigned char value : nodes[index].symbol) {
+                constexpr char digits[] = "0123456789ABCDEF";
+                std::string fallback = "<0x00>";
+                fallback[3] = digits[value >> 4U];
+                fallback[4] = digits[value & 0x0FU];
+                const auto byte = vocabulary_.find(fallback);
+                if (byte == vocabulary_.end()) {
+                    result.errors.emplace_back("Gemma byte fallback is absent from the vocabulary");
+                    result.value.clear();
+                    return result;
+                }
+                result.value.push_back(byte->second);
+            }
+        }
+        return result;
+    }
     std::string byte_level;
     for (const auto value : bytes) byte_level += byte_to_piece_[static_cast<unsigned char>(value)];
     if (ignore_merges_) {
@@ -686,6 +799,32 @@ ParseResult<std::string> ModelTokenizer::decode_token(std::uint32_t token) const
     const auto& piece = id_to_piece_[token];
     if (added_id_[token]) {
         result.value = piece;
+        return result;
+    }
+    if (sentencepiece_bpe_) {
+        if (piece.size() == 6U && piece.starts_with("<0x") && piece[5] == '>') {
+            const auto nibble = [](char value) -> int {
+                if (value >= '0' && value <= '9') return value - '0';
+                if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+                return -1;
+            };
+            const auto high = nibble(piece[3]);
+            const auto low = nibble(piece[4]);
+            if (high < 0 || low < 0) {
+                result.errors.emplace_back("Gemma byte fallback token is malformed");
+                return result;
+            }
+            result.value.push_back(static_cast<char>((high << 4) | low));
+            return result;
+        }
+        for (std::size_t cursor = 0U; cursor < piece.size();) {
+            if (piece.compare(cursor, std::string_view("▁").size(), "▁") == 0) {
+                result.value.push_back(' ');
+                cursor += std::string_view("▁").size();
+            } else {
+                result.value.push_back(piece[cursor++]);
+            }
+        }
         return result;
     }
     std::size_t cursor = 0;
@@ -797,6 +936,37 @@ std::string render_deepseek_v4_chat_prompt(
     }
     output += "<｜Assistant｜>";
     output += enable_thinking ? "<think>" : "</think>";
+    return output;
+}
+
+std::string render_gemma4_user_prompt(std::string_view user_text,
+                                      bool enable_thinking) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(user_text)}};
+    return render_gemma4_chat_prompt(messages, enable_thinking);
+}
+
+std::string render_gemma4_chat_prompt(
+    std::span<const ChatMessage> messages, bool enable_thinking) {
+    std::string output = "<bos>";
+    for (const auto& message : messages) {
+        switch (message.role) {
+            case ChatRole::System: output += "<|turn>system\n"; break;
+            case ChatRole::User: output += "<|turn>user\n"; break;
+            case ChatRole::Assistant: output += "<|turn>model\n"; break;
+            case ChatRole::Tool:
+                output += "<|tool_response>response:";
+                output += message.name.empty() ? "unknown" : message.name;
+                output += "{value:<|\"|>";
+                output += message.content;
+                output += "<|\"|>}<tool_response|>";
+                continue;
+        }
+        output += message.content;
+        output += "<turn|>\n";
+    }
+    output += "<|turn>model\n";
+    if (!enable_thinking) output += "<|channel>thought\n<channel|>";
     return output;
 }
 

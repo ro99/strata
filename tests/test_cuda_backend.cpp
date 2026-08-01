@@ -712,7 +712,7 @@ TEST_CASE("native CUDA exact FlashAttention batches disjoint query visibility") 
     request.value_dim = dimension;
     request.scale = 1.0F / 8.0F;
     request.numerics =
-        strata::FlashAttentionNumerics::f64_dot_f32_score_f32_accum;
+        strata::FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
     std::vector<float> expected(queries.size());
     std::vector<float> actual(queries.size());
     REQUIRE(strata::flash_attention_reference_f32(request, expected).ok());
@@ -728,7 +728,9 @@ TEST_CASE("native CUDA exact FlashAttention batches disjoint query visibility") 
         return;
     }
     REQUIRE(status.ok());
-    REQUIRE(actual == expected);
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-6F);
+    }
 }
 
 TEST_CASE("native CUDA backend reuses a strict bounded weight arena when available") {

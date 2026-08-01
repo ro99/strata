@@ -89,8 +89,13 @@ bool validate_chat_messages(std::span<const ChatMessage> messages,
             error = "chat messages must alternate valid conversation roles";
             return false;
         }
-        if (message.role != ChatRole::Assistant && message.content.empty()) {
+        if (message.role != ChatRole::Assistant && message.content.empty() &&
+            message.parts.empty()) {
             error = "chat message content must not be empty";
+            return false;
+        }
+        if (!message.parts.empty() && message.role != ChatRole::User) {
+            error = "multimodal content is supported only in user messages";
             return false;
         }
         previous = message.role;

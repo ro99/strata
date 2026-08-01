@@ -39,6 +39,10 @@ add_library(strata_core STATIC
     src/compressed_tensors.cpp
     ${STRATA_CUDA_SOURCE}
     src/glm_ops.cpp
+    src/gemma4_ops.cpp
+    src/gemma4_checkpoint.cpp
+    src/gemma4_image.cpp
+    src/gemma4_runtime.cpp
     src/glm_runtime.cpp
     src/glm_manifest.cpp
     src/deepseek_manifest.cpp
@@ -134,6 +138,9 @@ if(BUILD_TESTING)
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
         tests/test_glm_ops.cpp
+        tests/test_gemma4_ops.cpp
+        tests/test_gemma4_checkpoint.cpp
+        tests/test_gemma4_image.cpp
         tests/test_glm_int4.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp

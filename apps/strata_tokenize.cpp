@@ -17,15 +17,15 @@ int main(int argc, char** argv) {
             model_type = argv[++index];
         } else {
             std::cerr << "usage: strata-tokenize --tokenizer FILE --model-type "
-                         "glm|deepseek|raw --prompt TEXT\n";
+                         "gemma4|glm|deepseek|raw --prompt TEXT\n";
             return 2;
         }
     }
     if (tokenizer_path.empty() || prompt.empty() ||
-        (model_type != "glm" && model_type != "deepseek" &&
+        (model_type != "gemma4" && model_type != "glm" && model_type != "deepseek" &&
          model_type != "raw")) {
         std::cerr << "usage: strata-tokenize --tokenizer FILE --model-type "
-                     "glm|deepseek|raw --prompt TEXT\n";
+                     "gemma4|glm|deepseek|raw --prompt TEXT\n";
         return 2;
     }
     const auto loaded = strata::ModelTokenizer::load(tokenizer_path);
@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
         rendered = strata::render_glm52_user_prompt(prompt);
     } else if (model_type == "deepseek") {
         rendered = strata::render_deepseek_v4_user_prompt(prompt);
+    } else if (model_type == "gemma4") {
+        rendered = strata::render_gemma4_user_prompt(prompt);
     } else {
         rendered = prompt;
     }

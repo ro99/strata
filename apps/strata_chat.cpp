@@ -91,7 +91,7 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
 
 void usage() {
     std::cerr
-        << "usage: strata-chat --model DIR --model-type deepseek|glm\n"
+        << "usage: strata-chat --model DIR --model-type gemma4|deepseek|glm\n"
         << "                    [--context-size N] [--max-new N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention] [--full-reprefill]\n"
@@ -237,7 +237,8 @@ bool parse_options(int argc, char** argv, Options& options) {
         return false;
     }
     return !options.model.empty() &&
-           (options.model_type == "glm" || options.model_type == "deepseek");
+           (options.model_type == "glm" || options.model_type == "deepseek" ||
+            options.model_type == "gemma4");
 }
 
 // A run is reproducible when nothing stochastic is enabled. Temperature alone
@@ -605,7 +606,8 @@ int main(int argc, char** argv) {
               << " seed=" << options.sampling.seed << '\n'
               << "[sampler] " << sampler_summary(options.sampling) << '\n'
               << "[attention] "
-              << (options.flash_attention ? "CUDA FlashAttention" : "scalar reference")
+              << ((options.flash_attention || options.model_type == "gemma4")
+                      ? "CUDA FlashAttention" : "scalar reference")
               << '\n'
               << "[contract] "
               << (deterministic(options.sampling) ? "exact greedy"
@@ -622,14 +624,17 @@ int main(int argc, char** argv) {
     strata::RuntimeConfig config;
     config.model = options.model_type == "glm"
                        ? strata::RuntimeModel::Glm52
+                   : options.model_type == "gemma4"
+                       ? strata::RuntimeModel::Gemma4
                        : strata::RuntimeModel::DeepSeekV4;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;
     config.vram_cache_fraction = options.vram_fraction;
     config.verbose = options.model_type == "deepseek";
-    config.load_progress = options.model_type == "glm";
+    config.load_progress = options.model_type != "deepseek";
     config.sampling = options.sampling;
-    config.enable_flash_attention = options.flash_attention;
+    config.enable_flash_attention =
+        options.flash_attention || options.model_type == "gemma4";
     config.enable_incremental_kv_continuation =
         options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;

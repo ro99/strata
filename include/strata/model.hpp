@@ -14,6 +14,7 @@ enum class ArchitectureKind : std::uint8_t {
     StandardMoe,
     DeepSeek,
     GlmMoeDsa,
+    Gemma4,
 };
 
 enum class AttentionKind : std::uint8_t {
@@ -22,6 +23,7 @@ enum class AttentionKind : std::uint8_t {
     Mqa,
     Mla,
     HybridCompressedSparse,
+    HybridLocalGlobal,
 };
 
 enum class RouterSelectionKind : std::uint8_t {
@@ -53,6 +55,7 @@ struct RouterSpec {
 enum class QuantizationKind : std::uint8_t {
     Uniform,
     CompressedTensorsW4A16,
+    CompressedTensorsW8A16,
     NativeFp4Fp8,
 };
 
@@ -132,6 +135,35 @@ struct DeepSeekV4Spec {
     std::vector<std::uint32_t> dspark_target_layers;
 };
 
+struct Gemma4Spec {
+    std::uint32_t attention_heads{};
+    std::uint32_t local_key_value_heads{};
+    std::uint32_t global_key_value_heads{};
+    std::uint32_t local_head_dim{};
+    std::uint32_t global_head_dim{};
+    std::uint32_t intermediate_size{};
+    std::uint32_t sliding_window{};
+    std::uint32_t global_attention_stride{};
+    std::uint32_t vision_hidden_size{};
+    std::uint32_t vision_layers{};
+    std::uint32_t vision_attention_heads{};
+    std::uint32_t vision_head_dim{};
+    std::uint32_t vision_intermediate_size{};
+    std::uint32_t vision_patch_size{};
+    std::uint32_t vision_position_embeddings{};
+    std::uint32_t vision_pooling_kernel{};
+    std::uint32_t image_token_id{};
+    std::uint32_t default_image_tokens{};
+    float rms_epsilon{};
+    float local_rope_theta{};
+    float global_rope_theta{};
+    float global_rope_proportion{};
+    float vision_rope_theta{};
+    float final_logit_softcap{};
+    bool global_key_equals_value{};
+    bool vision_bidirectional{};
+};
+
 struct ModelSpec {
     std::string name;
     ArchitectureKind architecture{ArchitectureKind::Dense};
@@ -142,6 +174,7 @@ struct ModelSpec {
     SourceManifestSpec source;
     GlmMoeDsaSpec glm_moe_dsa;
     DeepSeekV4Spec deepseek_v4;
+    Gemma4Spec gemma4;
     std::uint32_t quant_bits{kMinimumQuantBits};
     std::uint32_t hidden_size{};
     std::uint32_t layer_count{};
@@ -157,6 +190,9 @@ struct ModelSpec {
     const ModelSpec& spec);
 [[nodiscard]] ModelSpec deepseek_v4_flash_0731_spec();
 [[nodiscard]] ValidationResult validate_deepseek_v4_flash_0731(
+    const ModelSpec& spec);
+[[nodiscard]] ModelSpec gemma4_31b_it_w8a16_spec();
+[[nodiscard]] ValidationResult validate_gemma4_31b_it_w8a16(
     const ModelSpec& spec);
 
 }  // namespace strata

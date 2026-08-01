@@ -42,7 +42,8 @@ ValidationResult validate_model(const ModelSpec& spec) {
         result.errors.emplace_back("routed_scale must be finite and positive");
     }
 
-    if (spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW4A16) {
+    if (spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW4A16 ||
+        spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW8A16) {
         const auto validate_quantized_role = [&result](const QuantizedWeightSpec& role,
                                                         std::string_view name) {
             if (!quantization_allowed(role.bits)) {
@@ -96,7 +97,8 @@ ValidationResult validate_model(const ModelSpec& spec) {
         }
     }
 
-    if (spec.architecture == ArchitectureKind::Dense) {
+    if (spec.architecture == ArchitectureKind::Dense ||
+        spec.architecture == ArchitectureKind::Gemma4) {
         if (spec.router.selection != RouterSelectionKind::None ||
             spec.router.scoring != RouterScoreKind::None ||
             spec.router.routed_experts != 0 || spec.router.experts_per_token != 0) {
@@ -104,6 +106,11 @@ ValidationResult validate_model(const ModelSpec& spec) {
         }
         if (spec.shared_experts != 0) {
             result.errors.emplace_back("dense architecture cannot declare shared experts");
+        }
+        if (spec.architecture == ArchitectureKind::Gemma4 &&
+            spec.attention != AttentionKind::HybridLocalGlobal) {
+            result.errors.emplace_back(
+                "Gemma 4 adapter requires hybrid local/global attention");
         }
         return result;
     }
@@ -423,6 +430,123 @@ ValidationResult validate_glm52_w4a16(const ModelSpec& spec) {
                 same_role(actual_quantization.linears, expected_quantization.linears) &&
                 same_role(actual_quantization.mtp, expected_quantization.mtp),
             "unexpected GLM W4A16 quantization semantics");
+    return result;
+}
+
+ModelSpec gemma4_31b_it_w8a16_spec() {
+    ModelSpec spec;
+    const auto& contract = kGemma4ExecutionContract;
+    spec.name = "google/gemma-4-31B-it";
+    spec.architecture = ArchitectureKind::Gemma4;
+    spec.attention = AttentionKind::HybridLocalGlobal;
+    spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsW8A16;
+    spec.mixed_quantization.activation_bits = 16U;
+    spec.mixed_quantization.quantized_linear_start_layer = 0U;
+    spec.mixed_quantization.quantized_expert_start_layer = contract.layer_count;
+    spec.mixed_quantization.mtp_layer_index = contract.layer_count;
+    spec.mixed_quantization.linears = {
+        8U, QuantizationGranularity::Group, 32U, true};
+    spec.mixed_quantization.routed_experts = spec.mixed_quantization.linears;
+    spec.mixed_quantization.mtp = spec.mixed_quantization.linears;
+    spec.source.repository = "google/gemma-4-31B-it";
+    spec.source.index_sha256 =
+        "d6d47cb0547c6090c4b81aa5fe90d72026c2124b06c53c2d9efeec0e693fd421";
+    spec.source.tensor_count = 2'008U;
+    spec.source.indexed_tensor_bytes = 35'089'877'112ULL;
+    spec.source.shard_file_bytes = 35'090'140'728ULL;
+    spec.source.main_shards = 7U;
+    spec.quant_bits = 8U;
+    spec.hidden_size = contract.hidden_size;
+    spec.layer_count = contract.layer_count;
+    spec.max_context_tokens = contract.maximum_context_tokens;
+    spec.gemma4 = {
+        contract.attention_heads,
+        contract.local_key_value_heads,
+        contract.global_key_value_heads,
+        contract.local_head_dim,
+        contract.global_head_dim,
+        contract.intermediate_size,
+        contract.sliding_window,
+        6U,
+        contract.vision_hidden_size,
+        contract.vision_layer_count,
+        contract.vision_attention_heads,
+        contract.vision_head_dim,
+        contract.vision_intermediate_size,
+        contract.vision_patch_size,
+        contract.vision_position_embeddings,
+        contract.vision_pooling_kernel,
+        258'880U,
+        contract.default_image_tokens,
+        contract.rms_epsilon,
+        contract.local_rope_theta,
+        contract.global_rope_theta,
+        contract.global_rope_proportion,
+        contract.vision_rope_theta,
+        contract.final_logit_softcap,
+        true,
+        true,
+    };
+    return spec;
+}
+
+ValidationResult validate_gemma4_31b_it_w8a16(const ModelSpec& spec) {
+    auto result = validate_model(spec);
+    const auto expected = gemma4_31b_it_w8a16_spec();
+    const auto require = [&result](bool condition, std::string_view message) {
+        if (!condition) result.errors.emplace_back(message);
+    };
+    require(spec.source.repository == expected.source.repository &&
+                spec.source.index_sha256 == expected.source.index_sha256,
+            "unexpected Gemma 4 31B source identity");
+    require(spec.source.tensor_count == expected.source.tensor_count &&
+                spec.source.indexed_tensor_bytes == expected.source.indexed_tensor_bytes &&
+                spec.source.shard_file_bytes == expected.source.shard_file_bytes &&
+                spec.source.main_shards == expected.source.main_shards,
+            "unexpected Gemma 4 31B checkpoint extent");
+    require(spec.architecture == expected.architecture &&
+                spec.attention == expected.attention &&
+                spec.hidden_size == expected.hidden_size &&
+                spec.layer_count == expected.layer_count &&
+                spec.max_context_tokens == expected.max_context_tokens,
+            "unexpected Gemma 4 31B architecture dimensions");
+    const auto& actual = spec.gemma4;
+    const auto& wanted = expected.gemma4;
+    require(actual.attention_heads == wanted.attention_heads &&
+                actual.local_key_value_heads == wanted.local_key_value_heads &&
+                actual.global_key_value_heads == wanted.global_key_value_heads &&
+                actual.local_head_dim == wanted.local_head_dim &&
+                actual.global_head_dim == wanted.global_head_dim &&
+                actual.intermediate_size == wanted.intermediate_size &&
+                actual.sliding_window == wanted.sliding_window &&
+                actual.global_attention_stride == wanted.global_attention_stride &&
+                actual.vision_hidden_size == wanted.vision_hidden_size &&
+                actual.vision_layers == wanted.vision_layers &&
+                actual.vision_attention_heads == wanted.vision_attention_heads &&
+                actual.vision_head_dim == wanted.vision_head_dim &&
+                actual.vision_intermediate_size == wanted.vision_intermediate_size &&
+                actual.vision_patch_size == wanted.vision_patch_size &&
+                actual.vision_position_embeddings == wanted.vision_position_embeddings &&
+                actual.vision_pooling_kernel == wanted.vision_pooling_kernel &&
+                actual.image_token_id == wanted.image_token_id &&
+                actual.default_image_tokens == wanted.default_image_tokens &&
+                actual.rms_epsilon == wanted.rms_epsilon &&
+                actual.local_rope_theta == wanted.local_rope_theta &&
+                actual.global_rope_theta == wanted.global_rope_theta &&
+                actual.global_rope_proportion == wanted.global_rope_proportion &&
+                actual.vision_rope_theta == wanted.vision_rope_theta &&
+                actual.final_logit_softcap == wanted.final_logit_softcap &&
+                actual.global_key_equals_value == wanted.global_key_equals_value &&
+                actual.vision_bidirectional == wanted.vision_bidirectional,
+            "unexpected Gemma 4 hybrid attention or vision contract");
+    const auto& quantization = spec.mixed_quantization;
+    require(quantization.kind == QuantizationKind::CompressedTensorsW8A16 &&
+                quantization.activation_bits == 16U &&
+                quantization.linears.bits == 8U &&
+                quantization.linears.granularity == QuantizationGranularity::Group &&
+                quantization.linears.group_size == 32U &&
+                quantization.linears.symmetric && spec.quant_bits == 8U,
+            "unexpected Gemma 4 W8A16 quantization semantics");
     return result;
 }
 

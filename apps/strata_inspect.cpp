@@ -2,6 +2,8 @@
 #include "strata/compressed_tensors.hpp"
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_manifest.hpp"
+#include "strata/gemma4_checkpoint.hpp"
+#include "strata/model.hpp"
 #include "strata/safetensors.hpp"
 
 #include <array>
@@ -14,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 namespace {
@@ -315,6 +318,78 @@ int main(int argc, char** argv) {
     if (!parsed.ok()) {
         for (const auto& error : parsed.errors) std::cerr << "error: " << error << '\n';
         return 1;
+    }
+    const bool gemma4 = std::any_of(
+        parsed.value.entries.begin(), parsed.value.entries.end(), [](const auto& entry) {
+            return entry.name == "model.language_model.embed_tokens.weight";
+        });
+    if (gemma4) {
+        const auto spec = strata::gemma4_31b_it_w8a16_spec();
+        const auto quantized_modules = std::count_if(
+            parsed.value.entries.begin(), parsed.value.entries.end(), [](const auto& entry) {
+                return entry.name.ends_with(".weight_packed");
+            });
+        if (parsed.value.total_size != spec.source.indexed_tensor_bytes ||
+            parsed.value.entries.size() != spec.source.tensor_count ||
+            parsed.value.shards.size() != spec.source.main_shards ||
+            quantized_modules != 410) {
+            std::cerr << "error: index does not match the pinned Gemma 4 31B W8A16 checkpoint\n";
+            return 1;
+        }
+        if (headers) {
+            if (model_directory.empty()) {
+                std::cerr << "error: --headers requires --model DIR\n";
+                return 2;
+            }
+            if (allow_incomplete) {
+                std::cerr << "error: Gemma 4 exact validation requires all seven shards\n";
+                return 2;
+            }
+            if (require_read_only) {
+                for (const auto& shard : parsed.value.shards) {
+                    struct stat status {};
+                    const auto path = model_directory + '/' + shard;
+                    if (stat(path.c_str(), &status) != 0 ||
+                        (status.st_mode & static_cast<mode_t>(
+                            S_IWUSR | S_IWGRP | S_IWOTH)) != 0) {
+                        std::cerr << "error: Gemma 4 source shard is missing or writable: "
+                                  << shard << '\n';
+                        return 1;
+                    }
+                }
+            }
+            const auto checkpoint = strata::Gemma4CheckpointReader::open(
+                model_directory);
+            if (!checkpoint.ok()) {
+                for (const auto& error : checkpoint.errors) {
+                    std::cerr << "error: " << error << '\n';
+                }
+                return 1;
+            }
+        }
+        if (json) {
+            std::cout << "{\n"
+                      << "  \"status\": \"ok\",\n"
+                      << "  \"architecture\": \"gemma4_31b_it\",\n"
+                      << "  \"tensor_count\": " << parsed.value.entries.size() << ",\n"
+                      << "  \"indexed_tensor_bytes\": " << parsed.value.total_size << ",\n"
+                      << "  \"shards\": " << parsed.value.shards.size() << ",\n"
+                      << "  \"quantized_modules\": " << quantized_modules << ",\n"
+                      << "  \"int8_group32_modules\": " << quantized_modules << ",\n"
+                      << "  \"scanned_shards\": "
+                      << (headers ? parsed.value.shards.size() : 0U) << "\n}\n";
+        } else {
+            std::cout << "status=ok\n"
+                      << "architecture=gemma4_31b_it\n"
+                      << "tensor_count=" << parsed.value.entries.size() << '\n'
+                      << "indexed_tensor_bytes=" << parsed.value.total_size << '\n'
+                      << "shards=" << parsed.value.shards.size() << '\n'
+                      << "quantized_modules=" << quantized_modules << '\n'
+                      << "int8_group32_modules=" << quantized_modules << '\n'
+                      << "scanned_shards="
+                      << (headers ? parsed.value.shards.size() : 0U) << '\n';
+        }
+        return 0;
     }
     const bool has_deepseek_embedding = std::any_of(
         parsed.value.entries.begin(), parsed.value.entries.end(), [](const auto& entry) {

@@ -23,7 +23,7 @@ dependency.
 ## Launch
 
 Running without arguments opens the launch form. If a known checkpoint exists
-under `models/`, the form discovers it. It also discovers `build/strata-chat`, a
+under `models/` (`gemma4`, `dsv4f`, or `glm52`), the form discovers it. It also discovers `build/strata-chat`, a
 `strata-chat` next to the TUI executable, or `STRATA_CHAT_BIN`.
 
 ```bash

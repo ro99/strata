@@ -23,6 +23,11 @@ std::filesystem::path deepseek_tokenizer_fixture() {
            "models/dsv4f/tokenizer.json";
 }
 
+std::filesystem::path gemma4_tokenizer_fixture() {
+    return std::filesystem::path(STRATA_SOURCE_DIR) /
+           "models/gemma4/tokenizer.json";
+}
+
 }  // namespace
 
 TEST_CASE("GLM single-user chat rendering matches the pinned template") {
@@ -155,4 +160,30 @@ TEST_CASE("DeepSeek V4 tokenizer matches Unicode and digit-split canonical ids")
     REQUIRE(encoded.ok());
     REQUIRE(encoded.value ==
             std::vector<std::uint32_t>({619U, 6895U, 22U}));
+}
+
+TEST_CASE("Gemma 4 chat rendering and SentencePiece BPE match the target tokenizer") {
+    const auto path = gemma4_tokenizer_fixture();
+    if (!std::filesystem::exists(path)) SKIP("pinned Gemma 4 tokenizer fixture is absent");
+    const auto tokenizer = strata::ModelTokenizer::load(path.string());
+    REQUIRE(tokenizer.ok());
+    REQUIRE(tokenizer.value.vocabulary_size() == 262144U);
+
+    const auto rendered = strata::render_gemma4_user_prompt("hello");
+    REQUIRE(rendered ==
+            "<bos><|turn>user\nhello<turn|>\n<|turn>model\n"
+            "<|channel>thought\n<channel|>");
+    const auto encoded = tokenizer.value.encode(rendered);
+    REQUIRE(encoded.ok());
+    REQUIRE(encoded.value == std::vector<std::uint32_t>(
+        {2U, 105U, 2364U, 107U, 23391U, 106U, 107U, 105U, 4368U,
+         107U, 100U, 45518U, 107U, 101U}));
+
+    const auto unicode = tokenizer.value.encode(" hello olá 日本語");
+    REQUIRE(unicode.ok());
+    REQUIRE(unicode.value == std::vector<std::uint32_t>(
+        {29104U, 4276U, 236898U, 33375U, 238582U}));
+    const auto decoded = tokenizer.value.decode(unicode.value);
+    REQUIRE(decoded.ok());
+    REQUIRE(decoded.value == " hello olá 日本語");
 }

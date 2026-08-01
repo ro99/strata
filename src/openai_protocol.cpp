@@ -3,6 +3,7 @@
 #include "json_cursor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <exception>
@@ -11,28 +12,104 @@
 namespace strata {
 namespace {
 
-bool parse_content_part(detail::JsonCursor& cursor, std::string& content,
+bool decode_base64(std::string_view encoded, std::string& decoded) {
+    static constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (encoded.empty() || encoded.size() % 4U != 0U) return false;
+    decoded.clear();
+    decoded.reserve(encoded.size() / 4U * 3U);
+    for (std::size_t offset = 0U; offset < encoded.size(); offset += 4U) {
+        std::array<unsigned int, 4> values{};
+        unsigned int padding = 0U;
+        for (std::size_t index = 0U; index < 4U; ++index) {
+            const char value = encoded[offset + index];
+            if (value == '=') {
+                if (index < 2U || offset + 4U != encoded.size()) return false;
+                values[index] = 0U;
+                ++padding;
+            } else {
+                const auto found = alphabet.find(value);
+                if (found == std::string_view::npos || padding != 0U) return false;
+                values[index] = static_cast<unsigned int>(found);
+            }
+        }
+        if (padding > 2U) return false;
+        const auto bits = (values[0] << 18U) | (values[1] << 12U) |
+                          (values[2] << 6U) | values[3];
+        decoded.push_back(static_cast<char>((bits >> 16U) & 0xffU));
+        if (padding < 2U) decoded.push_back(static_cast<char>((bits >> 8U) & 0xffU));
+        if (padding == 0U) decoded.push_back(static_cast<char>(bits & 0xffU));
+    }
+    return true;
+}
+
+bool parse_image_url(detail::JsonCursor& cursor, std::string& url) {
+    if (cursor.peek() == '"') {
+        url = cursor.parse_string();
+        return true;
+    }
+    cursor.expect('{');
+    while (!cursor.consume('}')) {
+        const auto key = cursor.parse_string();
+        cursor.expect(':');
+        if (key == "url") url = cursor.parse_string();
+        else cursor.skip_value();
+        if (cursor.consume('}')) break;
+        cursor.expect(',');
+    }
+    return !url.empty();
+}
+
+bool parse_content_part(detail::JsonCursor& cursor, ChatMessage& message,
                         std::string& error) {
     cursor.expect('{');
     std::string type;
     std::string text;
+    std::string image_url;
     while (!cursor.consume('}')) {
         const auto key = cursor.parse_string();
         cursor.expect(':');
         if (key == "type") type = cursor.parse_string();
         else if (key == "text") text = cursor.parse_string();
+        else if (key == "image_url") {
+            if (!parse_image_url(cursor, image_url)) {
+                error = "image_url requires a URL";
+                return false;
+            }
+        }
         else cursor.skip_value();
         if (cursor.consume('}')) break;
         cursor.expect(',');
     }
     if (type == "text") {
-        content += text;
+        message.content += text;
+        message.parts.push_back({ChatContentKind::Text, std::move(text), {}});
         return true;
     }
-    error = type == "image_url"
-        ? "this loaded model does not support image content"
-        : "unsupported message content part";
-    return false;
+    if (type != "image_url") {
+        error = "unsupported message content part";
+        return false;
+    }
+    constexpr std::string_view prefix = "data:";
+    const auto separator = image_url.find(";base64,");
+    if (!image_url.starts_with(prefix) || separator == std::string::npos) {
+        error = "image_url must be a base64 data URL";
+        return false;
+    }
+    const auto mime = std::string_view(image_url).substr(
+        prefix.size(), separator - prefix.size());
+    if (mime != "image/png" && mime != "image/jpeg" && mime != "image/webp") {
+        error = "image_url MIME type must be PNG, JPEG, or WebP";
+        return false;
+    }
+    std::string decoded;
+    if (!decode_base64(std::string_view(image_url).substr(separator + 8U), decoded)) {
+        error = "image_url contains invalid base64";
+        return false;
+    }
+    message.parts.push_back(
+        {ChatContentKind::Image, std::move(decoded), std::string(mime)});
+    return true;
 }
 
 bool parse_message(detail::JsonCursor& cursor, ChatMessage& message,
@@ -56,7 +133,7 @@ bool parse_message(detail::JsonCursor& cursor, ChatMessage& message,
             } else if (cursor.peek() == '[') {
                 cursor.expect('[');
                 while (!cursor.consume(']')) {
-                    if (!parse_content_part(cursor, message.content, error)) return false;
+                    if (!parse_content_part(cursor, message, error)) return false;
                     if (cursor.consume(']')) break;
                     cursor.expect(',');
                 }

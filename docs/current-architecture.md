@@ -13,7 +13,7 @@ Strata has four dependency layers:
    trace contract.
 2. **Model adapters** own immutable pinned execution contracts, tokenizer and
    chat-template behavior, tensor classification, router semantics, and exact
-   GLM-5.2 or DeepSeek-V4 operations.
+   GLM-5.2, DeepSeek-V4, or Gemma 4 operations.
 3. **Execution** owns device admission and placement, runtime initialization,
    request/session state, generation, cache policy, and metrics. Applications
    use `RuntimeSession`; research tools may use the concrete model runtimes for
@@ -28,7 +28,9 @@ runtime result types for ordinary generation.
 ## Current execution model
 
 The current executors are architecture-specific and exact. GLM performs a
-batched prefill followed by token-at-a-time decode. DeepSeek performs bounded
+batched prefill followed by token-at-a-time decode. Gemma 4 performs bounded
+prefill with whole vision blocks, hybrid local/global attention, and a BF16
+local-ring/global-full KV cache. DeepSeek performs bounded
 layer-major prefill pages with a multi-row router projection, exact row-ordered
 causal/cache transitions, and token-at-a-time decode. Each executor performs its
 own exact attention, router, shared-expert, routed-expert, residual, and
@@ -41,7 +43,8 @@ mathematics stays isolated behind pinned adapter contracts.
 
 ## Current residency and scheduling
 
-GLM uses a per-device LRU weight cache with a pinned dense spine and optional
+Gemma 4 places its dense text graph and vision tower resident across the
+capacity-weighted GPU schedule. GLM uses a per-device LRU weight cache with a pinned dense spine and optional
 host execution for cold routed experts. DeepSeek stages canonical routed expert
 weights in host RAM, pins its dense/shared spine in VRAM, and leases exact
 top-k expert triplets during device execution. Device assignment is a shared,

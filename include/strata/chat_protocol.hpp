@@ -20,6 +20,17 @@ enum class ChatRole : std::uint8_t {
     Tool,
 };
 
+enum class ChatContentKind : std::uint8_t {
+    Text,
+    Image,
+};
+
+struct ChatContentPart {
+    ChatContentKind kind{ChatContentKind::Text};
+    std::string data;
+    std::string mime_type;
+};
+
 struct ChatMessage {
     ChatMessage() = default;
     ChatMessage(ChatRole message_role, std::string message_content,
@@ -30,6 +41,7 @@ struct ChatMessage {
     ChatRole role{ChatRole::User};
     std::string content;
     std::string name;
+    std::vector<ChatContentPart> parts;
 };
 
 struct ChatRequest {

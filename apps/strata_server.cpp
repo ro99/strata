@@ -62,7 +62,7 @@ void stop_server(int) {
 
 void usage() {
     std::cerr
-        << "usage: strata-server --model DIR --model-type deepseek|glm\n"
+        << "usage: strata-server --model DIR --model-type gemma4|deepseek|glm\n"
         << "                     [--model-id ID] [--host ADDRESS] [--port N]\n"
         << "                     [--context-size N] [--max-new N]\n"
         << "                     [--devices 0,1,2] [--vram-fraction F]\n"
@@ -119,7 +119,8 @@ bool parse_options(int argc, char** argv, Options& options) {
         options.model_id = std::filesystem::path(options.model).filename().string();
     }
     return !options.model.empty() && !options.model_id.empty() &&
-        (options.model_type == "glm" || options.model_type == "deepseek");
+        (options.model_type == "glm" || options.model_type == "deepseek" ||
+         options.model_type == "gemma4");
 }
 
 std::string lower(std::string_view text) {
@@ -632,15 +633,19 @@ int main(int argc, char** argv) {
     }
     strata::RuntimeConfig config;
     config.model = options.model_type == "glm"
-        ? strata::RuntimeModel::Glm52 : strata::RuntimeModel::DeepSeekV4;
+        ? strata::RuntimeModel::Glm52
+        : options.model_type == "gemma4"
+            ? strata::RuntimeModel::Gemma4
+            : strata::RuntimeModel::DeepSeekV4;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;
     config.vram_cache_fraction = options.vram_fraction;
-    config.enable_flash_attention = options.flash_attention;
+    config.enable_flash_attention =
+        options.flash_attention || options.model_type == "gemma4";
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.pin_resident_arena = options.pin_resident_arena;
     config.verbose = options.model_type == "deepseek";
-    config.load_progress = options.model_type == "glm";
+    config.load_progress = options.model_type != "deepseek";
     strata::RuntimeSession runtime;
     std::cerr << "[startup] loading " << options.model_id << "...\n";
     const auto initialized = runtime.initialize(options.model, config);

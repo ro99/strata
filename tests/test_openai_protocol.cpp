@@ -106,6 +106,19 @@ TEST_CASE("OpenAI protocol rejects silent semantic fallbacks") {
         request, error));
 }
 
+TEST_CASE("OpenAI protocol preserves base64 image parts for Gemma 4") {
+    strata::OpenAiChatRequest request;
+    std::string error;
+    REQUIRE(strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw=="}}]}]})",
+        request, error));
+    REQUIRE(request.messages.front().content == "look");
+    REQUIRE(request.messages.front().parts.size() == 2U);
+    REQUIRE(request.messages.front().parts.back().kind ==
+            strata::ChatContentKind::Image);
+    REQUIRE(request.messages.front().parts.back().data.size() == 4U);
+}
+
 TEST_CASE("legacy completions and tokenize requests parse") {
     strata::OpenAiChatRequest completion;
     std::string error;

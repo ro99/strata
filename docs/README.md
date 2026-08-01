@@ -12,6 +12,8 @@ benchmark must not be used as evidence of current behavior.
   including explicit scheduler gaps.
 - `deepseek-v4-runtime.md` — current DeepSeek contract plus clearly labeled
   historical bring-up evidence.
+- Gemma 4's pinned checkpoint, tokenizer, text/vision graph, and public runtime
+  contract are described in the root README and `current-architecture.md`.
 - `tui.md` — Ratatui build, operator controls, memory bounds, and the versioned
   `strata-chat` frontend protocol.
 - `../kernels/cuda/README.md` — native CUDA and non-CUDA stub behavior.

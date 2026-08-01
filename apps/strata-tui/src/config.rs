@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 pub enum ModelType {
     Glm,
     DeepSeek,
+    Gemma4,
 }
 
 impl ModelType {
@@ -13,6 +14,7 @@ impl ModelType {
         match self {
             Self::Glm => "glm",
             Self::DeepSeek => "deepseek",
+            Self::Gemma4 => "gemma4",
         }
     }
 
@@ -20,6 +22,7 @@ impl ModelType {
         match self {
             Self::Glm => "GLM-5.2",
             Self::DeepSeek => "DeepSeek V4",
+            Self::Gemma4 => "Gemma 4 31B",
         }
     }
 
@@ -27,13 +30,15 @@ impl ModelType {
         match self {
             Self::Glm => 2_048,
             Self::DeepSeek => 1_048_576,
+            Self::Gemma4 => 262_144,
         }
     }
 
     pub const fn toggled(self) -> Self {
         match self {
             Self::Glm => Self::DeepSeek,
-            Self::DeepSeek => Self::Glm,
+            Self::DeepSeek => Self::Gemma4,
+            Self::Gemma4 => Self::Glm,
         }
     }
 }
@@ -289,6 +294,7 @@ pub fn parse_cli() -> Result<Cli, String> {
                 config.model_type = match next()?.as_str() {
                     "glm" => ModelType::Glm,
                     "deepseek" => ModelType::DeepSeek,
+                    "gemma4" => ModelType::Gemma4,
                     value => return Err(format!("Unknown model type: {value}")),
                 };
                 supplied_type = true;
@@ -323,7 +329,7 @@ pub const fn help_text() -> &'static str {
     "strata-tui — a Ratatui cockpit for Strata\n\n\
 Usage: strata-tui [OPTIONS]\n\n\
   --model DIR                 model directory\n\
-  --model-type glm|deepseek   runtime adapter\n\
+  --model-type gemma4|glm|deepseek   runtime adapter\n\
   --devices 0,1,2            CUDA device list\n\
   --context-size N            logical context ceiling\n\
   --max-new N                 maximum generated tokens\n\
@@ -380,6 +386,14 @@ fn parse_f64(label: &str, text: &str) -> Result<f64, String> {
 }
 
 fn detect_model() -> (String, ModelType, String) {
+    let gemma4 = Path::new("models/gemma4");
+    if gemma4.is_dir() {
+        return (
+            gemma4.to_string_lossy().into_owned(),
+            ModelType::Gemma4,
+            "2048".into(),
+        );
+    }
     let deepseek = Path::new("models/dsv4f");
     if deepseek.is_dir() {
         return (

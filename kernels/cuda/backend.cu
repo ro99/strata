@@ -1016,6 +1016,7 @@ __device__ float flash_attention_sequential_dot_f32(
 __global__ void flash_attention_reference_all_f32_kernel(
     float* output, const float* queries, const float* keys, const float* values,
     const float* sinks, const std::uint32_t* causal_key_counts,
+    const std::uint8_t* query_key_mask,
     std::uint32_t query_rows, std::uint32_t query_heads,
     std::uint32_t key_value_heads, std::uint32_t query_key_dim,
     std::uint32_t value_dim, std::uint32_t key_rows, float scale,
@@ -1029,6 +1030,9 @@ __global__ void flash_attention_reference_all_f32_kernel(
     const auto kv_head = head / heads_per_kv;
     const auto visible_rows = causal_key_counts == nullptr
         ? key_rows : causal_key_counts[query_row];
+    const auto* key_mask = query_key_mask == nullptr
+        ? nullptr
+        : query_key_mask + static_cast<std::uint64_t>(query_row) * key_rows;
     const auto* query = queries +
         (static_cast<std::uint64_t>(query_row) * query_heads + head) *
             query_key_dim;
@@ -1040,6 +1044,7 @@ __global__ void flash_attention_reference_all_f32_kernel(
     if (threadIdx.x == 0U) {
         maximum = sinks == nullptr ? -INFINITY : sinks[head];
         for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
             const auto* key = keys +
                 (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
                     query_key_dim;
@@ -1052,6 +1057,7 @@ __global__ void flash_attention_reference_all_f32_kernel(
         denominator = sinks == nullptr
             ? 0.0F : expf(__fsub_rn(sinks[head], maximum));
         for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
             const auto* key = keys +
                 (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
                     query_key_dim;
@@ -1068,6 +1074,7 @@ __global__ void flash_attention_reference_all_f32_kernel(
     __syncthreads();
 
     for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+        if (key_mask != nullptr && key_mask[row] == 0U) continue;
         if (threadIdx.x == 0U) {
             const auto* key = keys +
                 (static_cast<std::uint64_t>(row) * key_value_heads + kv_head) *
@@ -2673,6 +2680,7 @@ ValidationResult CudaBackend::flash_attention(
             request.head_sinks.empty() ? nullptr : device_sinks,
             request.causal_key_counts.empty()
                 ? nullptr : device_limits,
+            request.query_key_mask.empty() ? nullptr : device_mask,
             request.query_rows, request.query_heads, request.key_value_heads,
             request.query_key_dim, request.value_dim,
             static_cast<std::uint32_t>(shape.value.logical_rows), request.scale,

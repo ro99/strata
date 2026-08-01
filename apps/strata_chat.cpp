@@ -93,6 +93,8 @@ void usage() {
         << "Truncation reads the model's own distribution, so --min-p and\n"
         << "--top-p mean the same thing at any temperature. --preset writes\n"
         << "defaults; flags given after it override them.\n\n"
+        << "--temperature alone, with no --preset, is plain temperature\n"
+        << "sampling and nothing else: no truncation, no penalties, no XTC.\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
         << "The jsonl protocol reads prompt text and an optional messages array.\n";
 }

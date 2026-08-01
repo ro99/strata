@@ -57,9 +57,13 @@ impl SamplerPreset {
         }
     }
 
+    // Describes what the preset adds, not the resulting temperature: the
+    // TEMPERATURE field is separate and editable after the preset is chosen,
+    // so a label claiming "greedy" here would go stale the moment someone
+    // types a nonzero temperature without touching this field again.
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Precise => "PRECISE  (greedy, reproducible)",
+            Self::Precise => "PRECISE  (no extra stages)",
             Self::Balanced => "BALANCED (min-p, light repetition control)",
             Self::Creative => "CREATIVE (min-p + XTC + DRY)",
         }

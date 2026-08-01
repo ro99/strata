@@ -43,16 +43,20 @@ Add `--setup` to prefill the form instead of launching. Add
 `--flash-attention` only when intentionally selecting the CUDA FlashAttention
 candidate.
 
-The `SAMPLER` field cycles the three strata-chat presets with `←`/`→`:
-`PRECISE` is exact greedy, `BALANCED` adds min-p truncation and a light
-repetition penalty, and `CREATIVE` adds XTC and DRY on top. Cycling the preset
-rewrites the `TEMPERATURE` field to match, and an edited temperature wins over
-the preset's default. Individual sampler knobs are not on the form; pass them
-to `strata-chat` directly when a preset is not the shape you want.
+The `SAMPLER` field cycles the three strata-chat presets with `←`/`→`.
+`PRECISE` adds no stages at all — the `TEMPERATURE` field is the only thing in
+effect, so this is where to land for plain temperature sampling (or greedy, at
+temperature 0). `BALANCED` adds min-p truncation and a light repetition
+penalty. `CREATIVE` adds XTC and DRY on top of a lower min-p. Cycling the
+preset rewrites `TEMPERATURE` to the value the bundle assumes (`0` for
+precise, `1` for the other two), and editing `TEMPERATURE` afterward always
+overrides that default — the preset's other stages stay in effect regardless.
+Individual sampler knobs beyond temperature are not on the form; pass them to
+`strata-chat` directly when a preset is not the shape you want.
 
 The form labels a session exact only when nothing stochastic is enabled. That
 is temperature zero *and* no XTC, since XTC draws from the generator at any
-temperature.
+temperature — so `CREATIVE` never shows as exact, even at temperature 0.
 
 ## Interface
 

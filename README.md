@@ -87,15 +87,30 @@ Truncating on the natural distribution is what makes the thresholds mean what
 they say: `--min-p 0.05` is "at least 5% as likely as the best token according
 to the model" at any temperature.
 
-Three presets cover most use:
+**Just want temperature?** Pass `--temperature` with no `--preset` and nothing
+else runs — no truncation, no penalties, no XTC:
 
-| Preset | Stages | Use |
+```bash
+./build/strata-chat --model models/dsv4f --model-type deepseek --temperature 0.9
+```
+
+The startup banner echoes exactly what's active, e.g. `[sampler]
+temperature=0.9`; if other stages were silently on, they'd show there too. In
+the TUI, this means leaving the `SAMPLER` field on `PRECISE` — it writes no
+stages of its own — and editing `TEMPERATURE` directly; an edited temperature
+always overrides whatever the preset last wrote there.
+
+Three presets bundle the stages that are otherwise on nine separate flags:
+
+| Preset | Stages | What to expect |
 |---|---|---|
-| `--preset precise` | greedy | Reproducible output, factual work |
-| `--preset balanced` | `min_p 0.05`, light repetition penalty | General chat |
-| `--preset creative` | `min_p 0.02`, XTC, DRY | Prose, where the top token is the flat one |
+| `--preset precise` | none (temperature only, default `0`) | Deterministic at temperature 0; with temperature raised, plain softmax sampling over the full vocabulary — the most expensive path per token, ~4.6 ms/token at DeepSeek's vocabulary, and the one most prone to picking an implausible tail token at high temperature since nothing truncates it |
+| `--preset balanced` | `min_p 0.05`, `repetition_penalty 1.05` over the last 256 tokens | Cuts tokens under 5% as likely as the best one, so the tail can't get picked; mild pushback on restating the same tokens. Closest to "temperature sampling, but safe" |
+| `--preset creative` | `min_p 0.02`, XTC 50% at threshold 0.1, DRY, `repetition_penalty 1.03` over the last 512 tokens | Half the time, removes whichever safe/obvious token was in reach and forces a still-plausible alternative instead — the mechanism aimed at "goes to the mean" prose. DRY leans against the loops that removing the safe choice tends to invite. Expect more variance run to run; verify on your own material before trusting it unsupervised |
 
-A preset writes defaults; any flag after it overrides them.
+A preset writes defaults; any flag after it overrides them — including
+`--temperature`, which is how you'd run e.g. `--preset creative --temperature
+0.7` to keep XTC/DRY but sample less aggressively.
 
 | Flag | Purpose |
 |---|---|

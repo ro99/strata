@@ -62,7 +62,7 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
 
 #[allow(clippy::too_many_lines)]
 fn render_setup(frame: &mut Frame, area: Rect, app: &App) {
-    if area.width < 64 || area.height < 22 {
+    if area.width < 64 || area.height < 23 {
         render_setup_too_small(frame, area);
         return;
     }
@@ -169,7 +169,7 @@ fn render_setup(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         vec![
             Line::from(Span::styled(
-                "Temperature 0 preserves exact greedy decoding; sampling is always explicit.",
+                "PRECISE is exact greedy. BALANCED and CREATIVE sample; CREATIVE also uses XTC and DRY.",
                 theme::muted(),
             )),
             Line::from(Span::styled(

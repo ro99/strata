@@ -28,9 +28,8 @@ struct Options {
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
-    double temperature{};
+    strata::SamplingOptions sampling{strata::greedy_sampling()};
     double vram_fraction{0.85};
-    std::uint64_t seed{33'377'335U};
     bool devices_explicit{};
     bool flash_attention{};
     bool incremental_kv_continuation{true};
@@ -40,17 +39,60 @@ struct Options {
     bool jsonl_protocol{};
 };
 
+// Bundles that make the sampler usable without knowing what nine knobs do.
+// A preset only writes defaults; any explicit flag after it wins.
+bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampling) {
+    if (name == "precise") {
+        sampling.temperature = 0.0;
+        return true;
+    }
+    if (name == "balanced") {
+        sampling.temperature = 1.0;
+        sampling.min_p = 0.05;
+        sampling.repetition_penalty = 1.05;
+        sampling.penalty_window = 256U;
+        return true;
+    }
+    if (name == "creative") {
+        // Truncate on min_p rather than top_p so the tail is cut by relative
+        // plausibility, then use XTC to drop the safe continuation and DRY to
+        // break the loops that removing it tends to invite.
+        sampling.temperature = 1.0;
+        sampling.min_p = 0.02;
+        sampling.xtc_probability = 0.5;
+        sampling.xtc_threshold = 0.1;
+        sampling.dry_multiplier = 0.8;
+        sampling.dry_base = 1.75;
+        sampling.dry_allowed_length = 2U;
+        sampling.repetition_penalty = 1.03;
+        sampling.penalty_window = 512U;
+        return true;
+    }
+    return false;
+}
+
 void usage() {
     std::cerr
         << "usage: strata-chat --model DIR --model-type deepseek|glm\n"
         << "                    [--context-size N] [--max-new N]\n"
-        << "                    [--temperature F] [--seed N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention] [--full-reprefill]\n"
         << "                    [--block-kv-cache] [--pin-resident-arena]\n"
         << "                    [--no-prepack-mhc]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
+        << "sampler:            [--preset precise|balanced|creative]\n"
+        << "                    [--temperature F] [--seed N]\n"
+        << "                    [--top-k N] [--top-p F] [--min-p F] [--typical-p F]\n"
+        << "                    [--xtc-probability F] [--xtc-threshold F]\n"
+        << "                    [--presence-penalty F] [--frequency-penalty F]\n"
+        << "                    [--repetition-penalty F] [--penalty-window N]\n"
+        << "                    [--dry-multiplier F] [--dry-base F]\n"
+        << "                    [--dry-allowed-length N] [--dry-window N]\n"
+        << "                    [--no-repeat-ngram N]\n\n"
+        << "Truncation reads the model's own distribution, so --min-p and\n"
+        << "--top-p mean the same thing at any temperature. --preset writes\n"
+        << "defaults; flags given after it override them.\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
         << "The jsonl protocol reads prompt text and an optional messages array.\n";
 }
@@ -92,11 +134,43 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (argument == "--max-new") {
             if (!strata::cli::parse_positive_u32(next(), options.max_new_tokens)) return false;
         } else if (argument == "--temperature") {
-            if (!strata::cli::parse_double(next(), options.temperature, 0.0, 10.0)) return false;
+            if (!strata::cli::parse_double(next(), options.sampling.temperature, 0.0, 10.0)) return false;
         } else if (argument == "--vram-fraction") {
             if (!strata::cli::parse_double(next(), options.vram_fraction, 0.0, 0.95)) return false;
         } else if (argument == "--seed") {
-            if (!strata::cli::parse_u64(next(), options.seed)) return false;
+            if (!strata::cli::parse_u64(next(), options.sampling.seed)) return false;
+        } else if (argument == "--preset") {
+            if (!apply_sampler_preset(next(), options.sampling)) return false;
+        } else if (argument == "--top-k") {
+            if (!strata::cli::parse_u32(next(), options.sampling.top_k)) return false;
+        } else if (argument == "--top-p") {
+            if (!strata::cli::parse_double(next(), options.sampling.top_p, 0.0, 1.0)) return false;
+        } else if (argument == "--min-p") {
+            if (!strata::cli::parse_double(next(), options.sampling.min_p, 0.0, 1.0)) return false;
+        } else if (argument == "--typical-p") {
+            if (!strata::cli::parse_double(next(), options.sampling.typical_p, 0.0, 1.0)) return false;
+        } else if (argument == "--xtc-probability") {
+            if (!strata::cli::parse_double(next(), options.sampling.xtc_probability, 0.0, 1.0)) return false;
+        } else if (argument == "--xtc-threshold") {
+            if (!strata::cli::parse_double(next(), options.sampling.xtc_threshold, 0.0, 1.0)) return false;
+        } else if (argument == "--presence-penalty") {
+            if (!strata::cli::parse_double(next(), options.sampling.presence_penalty, -2.0, 2.0)) return false;
+        } else if (argument == "--frequency-penalty") {
+            if (!strata::cli::parse_double(next(), options.sampling.frequency_penalty, -2.0, 2.0)) return false;
+        } else if (argument == "--repetition-penalty") {
+            if (!strata::cli::parse_double(next(), options.sampling.repetition_penalty, 0.0, 10.0)) return false;
+        } else if (argument == "--penalty-window") {
+            if (!strata::cli::parse_u32(next(), options.sampling.penalty_window)) return false;
+        } else if (argument == "--dry-multiplier") {
+            if (!strata::cli::parse_double(next(), options.sampling.dry_multiplier, 0.0, 10.0)) return false;
+        } else if (argument == "--dry-base") {
+            if (!strata::cli::parse_double(next(), options.sampling.dry_base, 1.0, 8.0)) return false;
+        } else if (argument == "--dry-allowed-length") {
+            if (!strata::cli::parse_positive_u32(next(), options.sampling.dry_allowed_length)) return false;
+        } else if (argument == "--dry-window") {
+            if (!strata::cli::parse_u32(next(), options.sampling.dry_window)) return false;
+        } else if (argument == "--no-repeat-ngram") {
+            if (!strata::cli::parse_u32(next(), options.sampling.no_repeat_ngram)) return false;
         } else if (argument == "--devices") {
             if (!strata::cli::parse_devices(next(), options.devices)) return false;
             options.devices_explicit = true;
@@ -109,8 +183,51 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
     }
     if (!options.devices_explicit) options.devices = {0, 1, 2};
+    std::string sampling_error;
+    if (!strata::validate_sampling_options(options.sampling, sampling_error)) {
+        std::cerr << "invalid sampler option: " << sampling_error << '\n';
+        return false;
+    }
     return !options.model.empty() &&
            (options.model_type == "glm" || options.model_type == "deepseek");
+}
+
+// A run is reproducible when nothing stochastic is enabled. Temperature alone
+// no longer decides that: XTC draws even at temperature zero.
+bool deterministic(const strata::SamplingOptions& sampling) {
+    return sampling.temperature == 0.0 && sampling.xtc_probability == 0.0;
+}
+
+// Compact description of which stages are actually on, for the startup banner
+// and the JSONL handshake. Silent stages are omitted rather than printed at
+// their identity value.
+std::string sampler_summary(const strata::SamplingOptions& sampling) {
+    std::ostringstream text;
+    text << "temperature=" << sampling.temperature;
+    if (sampling.top_k != 0U) text << " top_k=" << sampling.top_k;
+    if (sampling.top_p < 1.0) text << " top_p=" << sampling.top_p;
+    if (sampling.min_p > 0.0) text << " min_p=" << sampling.min_p;
+    if (sampling.typical_p < 1.0) text << " typical_p=" << sampling.typical_p;
+    if (sampling.xtc_probability > 0.0) {
+        text << " xtc=" << sampling.xtc_probability << '@' << sampling.xtc_threshold;
+    }
+    if (sampling.presence_penalty != 0.0) {
+        text << " presence=" << sampling.presence_penalty;
+    }
+    if (sampling.frequency_penalty != 0.0) {
+        text << " frequency=" << sampling.frequency_penalty;
+    }
+    if (sampling.repetition_penalty != 1.0) {
+        text << " repetition=" << sampling.repetition_penalty;
+    }
+    if (sampling.penalty_window != 0U) text << " window=" << sampling.penalty_window;
+    if (sampling.dry_multiplier > 0.0) {
+        text << " dry=" << sampling.dry_multiplier << '^' << sampling.dry_base;
+    }
+    if (sampling.no_repeat_ngram != 0U) {
+        text << " no_repeat_ngram=" << sampling.no_repeat_ngram;
+    }
+    return text.str();
 }
 
 void protocol_event(std::string_view event, std::string_view fields = {}) {
@@ -401,8 +518,10 @@ int main(int argc, char** argv) {
                << strata::cli::devices_text(options.devices)
                << "\",\"context_size\":" << options.context_size
                << ",\"max_new_tokens\":" << options.max_new_tokens
-               << ",\"temperature\":" << options.temperature
-               << ",\"exact\":" << (options.temperature == 0.0 ? "true" : "false")
+               << ",\"temperature\":" << options.sampling.temperature
+               << ",\"exact\":" << (deterministic(options.sampling) ? "true" : "false")
+               << ",\"sampler\":\""
+               << strata::cli::json_escape(sampler_summary(options.sampling)) << '"'
                << ",\"flash_attention\":"
                << (options.flash_attention ? "true" : "false")
                << ",\"incremental_kv_continuation\":"
@@ -422,14 +541,15 @@ int main(int argc, char** argv) {
               << " devices=" << strata::cli::devices_text(options.devices)
               << " context=" << options.context_size
               << " max_new=" << options.max_new_tokens
-              << " temperature=" << options.temperature
               << " vram_fraction=" << options.vram_fraction
-              << " seed=" << options.seed << '\n'
+              << " seed=" << options.sampling.seed << '\n'
+              << "[sampler] " << sampler_summary(options.sampling) << '\n'
               << "[attention] "
               << (options.flash_attention ? "CUDA FlashAttention" : "scalar reference")
               << '\n'
               << "[contract] "
-              << (options.temperature == 0.0 ? "exact greedy" : "seeded Gumbel-max sampled")
+              << (deterministic(options.sampling) ? "exact greedy"
+                                                  : "seeded Gumbel-max sampled")
               << " base-model decode; no hidden fallback\n"
               << "[startup] loading model; this can take several minutes...\n";
     const auto initialization_started = std::chrono::steady_clock::now();
@@ -442,8 +562,7 @@ int main(int argc, char** argv) {
     config.vram_cache_fraction = options.vram_fraction;
     config.verbose = options.model_type == "deepseek";
     config.load_progress = options.model_type == "glm";
-    config.sampling_temperature = options.temperature;
-    config.sampling_seed = options.seed;
+    config.sampling = options.sampling;
     config.enable_flash_attention = options.flash_attention;
     config.enable_incremental_kv_continuation =
         options.incremental_kv_continuation;

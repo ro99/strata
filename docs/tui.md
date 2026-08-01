@@ -36,20 +36,30 @@ A complete command bypasses the form:
 ./target/release/strata-tui \
   --model models/glm52 --model-type glm \
   --devices 0,1,2 --context-size 2048 --max-new 512 \
-  --temperature 0 --vram-fraction 0.85
+  --preset precise --vram-fraction 0.85
 ```
 
 Add `--setup` to prefill the form instead of launching. Add
 `--flash-attention` only when intentionally selecting the CUDA FlashAttention
-candidate. The launch form labels temperature zero as exact greedy and any
-nonzero temperature as seeded sampling.
+candidate.
+
+The `SAMPLER` field cycles the three strata-chat presets with `←`/`→`:
+`PRECISE` is exact greedy, `BALANCED` adds min-p truncation and a light
+repetition penalty, and `CREATIVE` adds XTC and DRY on top. Cycling the preset
+rewrites the `TEMPERATURE` field to match, and an edited temperature wins over
+the preset's default. Individual sampler knobs are not on the form; pass them
+to `strata-chat` directly when a preset is not the shape you want.
+
+The form labels a session exact only when nothing stochastic is enabled. That
+is temperature zero *and* no XTC, since XTC draws from the generator at any
+temperature.
 
 ## Interface
 
 The session view is responsive. At 96 columns and wider it shows the
 conversation beside a telemetry rail; smaller terminals keep the conversation
 and surface the phase in the header. The chat view needs at least 48 by 15; the
-one-time launch form needs 64 by 22. Smaller terminals receive a clear resize
+one-time launch form needs 64 by 23. Smaller terminals receive a clear resize
 prompt rather than a broken layout.
 
 The telemetry rail reports:

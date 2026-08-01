@@ -85,6 +85,7 @@ pub enum SetupField {
     Devices,
     Context,
     MaxNew,
+    Sampler,
     Temperature,
     VramFraction,
     Seed,
@@ -95,12 +96,13 @@ pub enum SetupField {
 }
 
 impl SetupField {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ModelType,
         Self::ModelPath,
         Self::Devices,
         Self::Context,
         Self::MaxNew,
+        Self::Sampler,
         Self::Temperature,
         Self::VramFraction,
         Self::Seed,
@@ -117,6 +119,7 @@ impl SetupField {
             Self::Devices => "CUDA DEVICES",
             Self::Context => "CONTEXT",
             Self::MaxNew => "MAX NEW",
+            Self::Sampler => "SAMPLER",
             Self::Temperature => "TEMPERATURE",
             Self::VramFraction => "VRAM FRACTION",
             Self::Seed => "SEED",
@@ -130,7 +133,11 @@ impl SetupField {
     const fn is_text(self) -> bool {
         !matches!(
             self,
-            Self::ModelType | Self::FlashAttention | Self::PinResidentArena | Self::Launch
+            Self::ModelType
+                | Self::Sampler
+                | Self::FlashAttention
+                | Self::PinResidentArena
+                | Self::Launch
         )
     }
 }
@@ -422,6 +429,9 @@ impl App {
             {
                 self.toggle_model();
             }
+            KeyCode::Left | KeyCode::Right if self.current_setup_field() == SetupField::Sampler => {
+                self.cycle_sampler();
+            }
             KeyCode::Char(' ') if self.current_setup_field() == SetupField::FlashAttention => {
                 self.setup.flash_attention = !self.setup.flash_attention;
             }
@@ -602,6 +612,7 @@ impl App {
             SetupField::Devices => self.setup.devices.clone(),
             SetupField::Context => self.setup.context_size.clone(),
             SetupField::MaxNew => self.setup.max_new.clone(),
+            SetupField::Sampler => format!("‹  {}  ›", self.setup.sampler.label()),
             SetupField::Temperature => self.setup.temperature.clone(),
             SetupField::VramFraction => self.setup.vram_fraction.clone(),
             SetupField::Seed => self.setup.seed.clone(),
@@ -662,6 +673,16 @@ impl App {
         } else if self.setup.model_type == ModelType::DeepSeek && self.setup.context_size == "2048"
         {
             self.setup.context_size = "8192".into();
+        }
+    }
+
+    /// Cycling the preset rewrites the temperature field with it, so the form
+    /// never shows a temperature the chosen bundle would immediately override.
+    fn cycle_sampler(&mut self) {
+        let previous = self.setup.sampler;
+        self.setup.sampler = previous.cycled();
+        if self.setup.temperature == previous.temperature() {
+            self.setup.temperature = self.setup.sampler.temperature().into();
         }
     }
 

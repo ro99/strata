@@ -28,6 +28,48 @@ TEST_CASE("OpenAI chat requests preserve messages and generation controls") {
     REQUIRE(request.logprobs);
 }
 
+TEST_CASE("sampler extensions reach both OpenAI endpoints") {
+    const std::string knobs =
+        R"("top_k":40,"min_p":0.05,"typical_p":0.9,"xtc_probability":0.5,)"
+        R"("xtc_threshold":0.15,"repetition_penalty":1.1,"penalty_window":256,)"
+        R"("dry_multiplier":0.8,"dry_base":1.75,"dry_allowed_length":3,)"
+        R"("dry_window":512,"no_repeat_ngram":4)";
+    const auto check = [](const strata::SamplingOptions& sampling) {
+        REQUIRE(sampling.top_k == 40U);
+        REQUIRE(sampling.min_p == 0.05);
+        REQUIRE(sampling.typical_p == 0.9);
+        REQUIRE(sampling.xtc_probability == 0.5);
+        REQUIRE(sampling.xtc_threshold == 0.15);
+        REQUIRE(sampling.repetition_penalty == 1.1);
+        REQUIRE(sampling.penalty_window == 256U);
+        REQUIRE(sampling.dry_multiplier == 0.8);
+        REQUIRE(sampling.dry_allowed_length == 3U);
+        REQUIRE(sampling.dry_window == 512U);
+        REQUIRE(sampling.no_repeat_ngram == 4U);
+    };
+
+    strata::OpenAiChatRequest chat;
+    std::string error;
+    REQUIRE(strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"x"}],)" + knobs + "}",
+        chat, error));
+    check(chat.generation.sampling);
+
+    strata::OpenAiChatRequest completion;
+    REQUIRE(strata::parse_openai_completion_request(
+        R"({"model":"local","prompt":"x",)" + knobs + "}", completion, error));
+    check(completion.generation.sampling);
+
+    // The shared validator gates the extensions on both endpoints too.
+    REQUIRE(!strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"x"}],"min_p":1.5})",
+        chat, error));
+    REQUIRE(error.find("min_p") != std::string::npos);
+    REQUIRE(!strata::parse_openai_completion_request(
+        R"({"model":"local","prompt":"x","dry_base":0.5})", completion, error));
+    REQUIRE(error.find("dry_base") != std::string::npos);
+}
+
 TEST_CASE("OpenAI protocol rejects silent semantic fallbacks") {
     strata::OpenAiChatRequest request;
     std::string error;

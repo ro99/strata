@@ -26,8 +26,7 @@ ValidationResult RuntimeSession::initialize(
         result.errors.emplace_back("runtime session is already initialized");
         return result;
     }
-    impl_->sampling.temperature = config.sampling_temperature;
-    impl_->sampling.seed = config.sampling_seed;
+    impl_->sampling = config.sampling;
     if (config.model == RuntimeModel::Glm52) {
         if (config.deepseek_block_kv_cache) {
             result.errors.emplace_back(
@@ -39,8 +38,8 @@ ValidationResult RuntimeSession::initialize(
         concrete.devices = config.devices;
         concrete.vram_cache_fraction = config.vram_cache_fraction;
         concrete.maximum_context_tokens = config.maximum_context_tokens;
-        concrete.sampling_temperature = config.sampling_temperature;
-        concrete.sampling_seed = config.sampling_seed;
+        concrete.sampling_temperature = config.sampling.temperature;
+        concrete.sampling_seed = config.sampling.seed;
         concrete.verbose = config.verbose;
         concrete.load_progress = config.load_progress;
         concrete.enable_flash_attention = config.enable_flash_attention;
@@ -55,8 +54,8 @@ ValidationResult RuntimeSession::initialize(
     concrete.devices = config.devices;
     concrete.vram_cache_fraction = config.vram_cache_fraction;
     concrete.maximum_context_tokens = config.maximum_context_tokens;
-    concrete.sampling_temperature = config.sampling_temperature;
-    concrete.sampling_seed = config.sampling_seed;
+    concrete.sampling_temperature = config.sampling.temperature;
+    concrete.sampling_seed = config.sampling.seed;
     concrete.verbose = config.verbose;
     concrete.enable_flash_attention = config.enable_flash_attention;
     concrete.enable_incremental_kv_continuation =

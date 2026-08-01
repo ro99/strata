@@ -54,7 +54,7 @@ Place a checkpoint under `models/` in its original Safetensors form. Strata read
   --vram-fraction 0.95 --pin-resident-arena --flash-attention
 ```
 
-Startup prints the selected devices, the VRAM budget per device, load progress, and elapsed load time. Decoding defaults to greedy (`--temperature 0`) for reproducible output; `--temperature 1` enables seeded sampling. Multi-turn chat reuses the cached prefix and only prefills new tokens.
+Startup prints the selected devices, the VRAM budget per device, load progress, elapsed load time, and the active sampler. Decoding defaults to greedy (`--temperature 0`) for reproducible output. Multi-turn chat reuses the cached prefix and only prefills new tokens.
 
 The DeepSeek command above favors decode throughput: pinning adds about 17
 seconds to startup on the development machine, then avoids pageable host-staging
@@ -71,6 +71,57 @@ Flags worth knowing:
 | `--pin-resident-arena` | Page-lock DeepSeek's resident weights for faster host-to-device demand loads |
 | `--flash-attention` | Use the exact CUDA attention fast path where it is faster |
 | `--no-prepack-mhc` | Disable the default exact AVX2-packed mHC projection path |
+
+### Samplers
+
+The sampler runs as a fixed pipeline. Penalties rewrite the logits, every
+truncation stage then reads the model's own distribution, and temperature
+rescales only the surviving candidates before a seeded Gumbel-max draw:
+
+```
+presence/frequency/repetition → DRY → n-gram ban → logit bias
+  → top_k → top_p → min_p → typical_p → XTC → temperature → draw
+```
+
+Truncating on the natural distribution is what makes the thresholds mean what
+they say: `--min-p 0.05` is "at least 5% as likely as the best token according
+to the model" at any temperature.
+
+Three presets cover most use:
+
+| Preset | Stages | Use |
+|---|---|---|
+| `--preset precise` | greedy | Reproducible output, factual work |
+| `--preset balanced` | `min_p 0.05`, light repetition penalty | General chat |
+| `--preset creative` | `min_p 0.02`, XTC, DRY | Prose, where the top token is the flat one |
+
+A preset writes defaults; any flag after it overrides them.
+
+| Flag | Purpose |
+|---|---|
+| `--temperature F` | Rescales survivors before the draw; `0` is greedy |
+| `--top-k N` | Keep the `N` most likely tokens |
+| `--top-p F` | Keep the smallest set carrying mass `F` |
+| `--min-p F` | Keep tokens at least `F` times as likely as the best one |
+| `--typical-p F` | Keep the tokens whose surprisal is nearest the distribution's entropy |
+| `--xtc-probability F` `--xtc-threshold F` | With probability `F`, drop every candidate above the threshold except the least likely of them |
+| `--presence-penalty F` `--frequency-penalty F` | Subtractive repetition penalties |
+| `--repetition-penalty F` `--penalty-window N` | Multiplicative penalty, optionally bounded to the last `N` tokens |
+| `--dry-multiplier F` `--dry-base F` `--dry-allowed-length N` `--dry-window N` | Penalize the token extending the longest repeated suffix |
+| `--no-repeat-ngram N` | Hard ban on completing an `N`-gram already in the output |
+
+XTC is the stage aimed squarely at flat prose: it removes the safe continuation
+and leaves a plausible one in its place. It draws from the generator even at
+temperature zero, so a run using it is seeded-reproducible but not greedy, and
+the startup banner reports it as sampled rather than exact.
+
+Every knob is also accepted by the OpenAI-compatible server, under the same
+names, on both `/v1/chat/completions` and `/v1/completions`.
+
+Reported `logprobs` are the model's natural log probabilities, computed from the
+unmodified logits before penalties, truncation, and temperature. They describe
+the model rather than the sampler settings, so they stay comparable across
+requests that used different knobs.
 
 ### Terminal UI
 

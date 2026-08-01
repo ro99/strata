@@ -38,6 +38,57 @@ impl ModelType {
     }
 }
 
+/// The sampler bundles strata-chat exposes as `--preset`. The form offers the
+/// bundle rather than nine separate fields; anyone who wants a specific knob
+/// can still pass it on the strata-chat command line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SamplerPreset {
+    Precise,
+    Balanced,
+    Creative,
+}
+
+impl SamplerPreset {
+    pub const fn as_arg(self) -> &'static str {
+        match self {
+            Self::Precise => "precise",
+            Self::Balanced => "balanced",
+            Self::Creative => "creative",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Precise => "PRECISE  (greedy, reproducible)",
+            Self::Balanced => "BALANCED (min-p, light repetition control)",
+            Self::Creative => "CREATIVE (min-p + XTC + DRY)",
+        }
+    }
+
+    /// Temperature the bundle assumes. Cycling the preset rewrites the
+    /// temperature field so the two are never quietly inconsistent.
+    pub const fn temperature(self) -> &'static str {
+        match self {
+            Self::Precise => "0",
+            Self::Balanced | Self::Creative => "1",
+        }
+    }
+
+    /// XTC draws from the generator regardless of temperature, so the creative
+    /// bundle is never reproducible-by-temperature the way the others are.
+    pub const fn draws(self) -> bool {
+        matches!(self, Self::Creative)
+    }
+
+    pub const fn cycled(self) -> Self {
+        match self {
+            Self::Precise => Self::Balanced,
+            Self::Balanced => Self::Creative,
+            Self::Creative => Self::Precise,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub model_path: String,
@@ -45,6 +96,7 @@ pub struct RunConfig {
     pub devices: String,
     pub context_size: String,
     pub max_new: String,
+    pub sampler: SamplerPreset,
     pub temperature: String,
     pub vram_fraction: String,
     pub seed: String,
@@ -62,6 +114,7 @@ impl Default for RunConfig {
             devices: "0,1,2".into(),
             context_size,
             max_new: "512".into(),
+            sampler: SamplerPreset::Precise,
             temperature: "0".into(),
             vram_fraction: "0.85".into(),
             seed: "33377335".into(),
@@ -129,6 +182,7 @@ impl RunConfig {
                 .join(","),
             context_size,
             max_new,
+            sampler: self.sampler,
             temperature,
             vram_fraction,
             seed,
@@ -146,6 +200,7 @@ pub struct ValidatedConfig {
     pub devices: String,
     pub context_size: u32,
     pub max_new: u32,
+    pub sampler: SamplerPreset,
     pub temperature: f64,
     pub vram_fraction: f64,
     pub seed: u64,
@@ -167,6 +222,10 @@ impl ValidatedConfig {
             self.context_size.to_string(),
             "--max-new".into(),
             self.max_new.to_string(),
+            // The preset writes defaults and --temperature overrides it, so
+            // the field the operator edited always wins.
+            "--preset".into(),
+            self.sampler.as_arg().into(),
             "--temperature".into(),
             self.temperature.to_string(),
             "--vram-fraction".into(),
@@ -186,7 +245,7 @@ impl ValidatedConfig {
     }
 
     pub const fn is_exact(&self) -> bool {
-        self.temperature == 0.0
+        self.temperature == 0.0 && !self.sampler.draws()
     }
 }
 
@@ -228,6 +287,15 @@ pub fn parse_cli() -> Result<Cli, String> {
             "--context-size" | "--max-context" => config.context_size = next()?,
             "--max-new" => config.max_new = next()?,
             "--temperature" => config.temperature = next()?,
+            "--preset" => {
+                config.sampler = match next()?.as_str() {
+                    "precise" => SamplerPreset::Precise,
+                    "balanced" => SamplerPreset::Balanced,
+                    "creative" => SamplerPreset::Creative,
+                    value => return Err(format!("Unknown sampler preset: {value}")),
+                };
+                config.temperature = config.sampler.temperature().into();
+            }
             "--vram-fraction" => config.vram_fraction = next()?,
             "--seed" => config.seed = next()?,
             "--chat-binary" => config.chat_binary = next()?,
@@ -248,6 +316,7 @@ Usage: strata-tui [OPTIONS]\n\n\
   --devices 0,1,2            CUDA device list\n\
   --context-size N            logical context ceiling\n\
   --max-new N                 maximum generated tokens\n\
+  --preset NAME               precise, balanced, or creative sampler\n\
   --temperature F             0 is exact greedy decoding\n\
   --vram-fraction F           free VRAM cache fraction (max 0.95)\n\
   --seed N                    sampling seed\n\
@@ -361,6 +430,47 @@ mod tests {
             ..RunConfig::default()
         };
         assert!(config.validate().unwrap_err().contains("at most 2048"));
+    }
+
+    #[test]
+    fn sampler_preset_is_forwarded_before_temperature() {
+        let config = RunConfig {
+            model_path: ".".into(),
+            model_type: ModelType::DeepSeek,
+            context_size: "2048".into(),
+            sampler: SamplerPreset::Creative,
+            temperature: "1".into(),
+            chat_binary: "strata-chat".into(),
+            ..RunConfig::default()
+        }
+        .validate()
+        .unwrap();
+        let args = config.command_args();
+        let preset = args.iter().position(|value| value == "--preset").unwrap();
+        let temperature = args
+            .iter()
+            .position(|value| value == "--temperature")
+            .unwrap();
+        assert_eq!(args[preset + 1], "creative");
+        assert!(preset < temperature, "an edited temperature must win");
+        // XTC draws even at temperature zero, so the creative bundle can never
+        // be reported as an exact run.
+        assert!(!config.is_exact());
+    }
+
+    #[test]
+    fn precise_preset_stays_reproducible() {
+        let config = RunConfig {
+            model_path: ".".into(),
+            model_type: ModelType::DeepSeek,
+            context_size: "2048".into(),
+            sampler: SamplerPreset::Precise,
+            chat_binary: "strata-chat".into(),
+            ..RunConfig::default()
+        }
+        .validate()
+        .unwrap();
+        assert!(config.is_exact());
     }
 
     #[test]

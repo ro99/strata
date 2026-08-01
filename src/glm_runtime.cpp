@@ -467,6 +467,7 @@ struct Glm52Runtime::Impl {
     std::mt19937_64 sampler;
     SamplingOptions active_sampling;
     std::vector<std::uint32_t> sampled_token_counts;
+    std::vector<std::uint32_t> sampled_token_ids;
     TokenLogprob last_sample;
     bool initialized{};
     bool reusable_sequence{};
@@ -1354,9 +1355,11 @@ struct Glm52Runtime::Impl {
             }
         }
         last_sample = sample_logits(
-            logits, active_sampling, sampled_token_counts, sampler);
+            logits, active_sampling,
+            SamplingHistory{sampled_token_counts, sampled_token_ids}, sampler);
         result.value = last_sample.token;
         ++sampled_token_counts[result.value];
+        sampled_token_ids.push_back(result.value);
         last_second_token = second;
         last_logit_margin = logits[best] - logits[second];
         return result;
@@ -1499,18 +1502,14 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
         result.errors.emplace_back("maximum_new_tokens must be positive");
         return result;
     }
-    if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0 ||
-        sampling.temperature > 10.0 || !std::isfinite(sampling.top_p) ||
-        sampling.top_p <= 0.0 || sampling.top_p > 1.0 ||
-        !std::isfinite(sampling.presence_penalty) ||
-        sampling.presence_penalty < -2.0 || sampling.presence_penalty > 2.0 ||
-        !std::isfinite(sampling.frequency_penalty) ||
-        sampling.frequency_penalty < -2.0 || sampling.frequency_penalty > 2.0) {
-        result.errors.emplace_back("invalid sampling options");
+    std::string sampling_error;
+    if (!validate_sampling_options(sampling, sampling_error)) {
+        result.errors.emplace_back("invalid sampling option: " + sampling_error);
         return result;
     }
     impl_->active_sampling = sampling;
     impl_->sampled_token_counts.assign(kVocabulary, 0U);
+    impl_->sampled_token_ids.clear();
     impl_->sampler.seed(sampling.seed);
     std::string validation_error;
     if (!validate_chat_messages(messages, validation_error)) {

@@ -110,6 +110,62 @@ bool parse_stop(detail::JsonCursor& cursor, std::vector<std::string>& stop,
     return true;
 }
 
+// Sampler knobs beyond the OpenAI schema. Shared by the chat and completion
+// parsers so a knob cannot reach one endpoint and not the other. `handled`
+// reports whether the key belonged here at all.
+bool parse_sampler_extension(std::string_view key, detail::JsonCursor& cursor,
+                             SamplingOptions& sampling, bool& handled,
+                             std::string& error) {
+    handled = true;
+    const auto bounded_u32 = [&cursor, &error](std::uint32_t& target,
+                                               std::uint64_t limit,
+                                               const char* name) {
+        const auto value = cursor.parse_uint64();
+        if (value > limit) {
+            error = std::string(name) + " is out of range";
+            return false;
+        }
+        target = static_cast<std::uint32_t>(value);
+        return true;
+    };
+    if (key == "top_k") return bounded_u32(sampling.top_k, 1U << 20U, "top_k");
+    if (key == "min_p") sampling.min_p = cursor.parse_number();
+    else if (key == "typical_p") sampling.typical_p = cursor.parse_number();
+    else if (key == "xtc_probability") sampling.xtc_probability = cursor.parse_number();
+    else if (key == "xtc_threshold") sampling.xtc_threshold = cursor.parse_number();
+    else if (key == "repetition_penalty") {
+        sampling.repetition_penalty = cursor.parse_number();
+    } else if (key == "penalty_window") {
+        return bounded_u32(sampling.penalty_window, 1U << 24U, "penalty_window");
+    } else if (key == "dry_multiplier") sampling.dry_multiplier = cursor.parse_number();
+    else if (key == "dry_base") sampling.dry_base = cursor.parse_number();
+    else if (key == "dry_allowed_length") {
+        return bounded_u32(sampling.dry_allowed_length, 1U << 16U, "dry_allowed_length");
+    } else if (key == "dry_window") {
+        return bounded_u32(sampling.dry_window, 1U << 24U, "dry_window");
+    } else if (key == "no_repeat_ngram") {
+        return bounded_u32(sampling.no_repeat_ngram, 1U << 16U, "no_repeat_ngram");
+    } else {
+        handled = false;
+    }
+    return true;
+}
+
+// The HTTP surface caps temperature at the OpenAI-documented 2.0; every other
+// range comes from the sampler's own validator.
+bool validate_request_sampling(const SamplingOptions& sampling, std::string& error) {
+    if (sampling.temperature > 2.0) {
+        error = "invalid generation parameter range";
+        return false;
+    }
+    std::string field;
+    if (!validate_sampling_options(sampling, field)) {
+        error = "invalid generation parameter range: " + field;
+        return false;
+    }
+    return true;
+}
+
 bool parse_logit_bias(detail::JsonCursor& cursor, SamplingOptions& sampling,
                       std::string& error) {
     if (cursor.peek() == 'n') {
@@ -253,7 +309,13 @@ bool parse_openai_chat_request(
                     cursor.skip_value();
                 }
             } else {
-                cursor.skip_value();
+                bool handled = false;
+                if (!parse_sampler_extension(key, cursor,
+                                             request.generation.sampling,
+                                             handled, error)) {
+                    return false;
+                }
+                if (!handled) cursor.skip_value();
             }
             if (cursor.consume('}')) break;
             cursor.expect(',');
@@ -271,16 +333,11 @@ bool parse_openai_chat_request(
         return false;
     }
     if (tool_choice_none) request.has_tools = false;
-    if (request.n == 0U || request.generation.maximum_new_tokens == 0U ||
-        request.generation.sampling.temperature < 0.0 ||
-        request.generation.sampling.temperature > 2.0 ||
-        request.generation.sampling.top_p <= 0.0 ||
-        request.generation.sampling.top_p > 1.0 ||
-        std::abs(request.generation.sampling.presence_penalty) > 2.0 ||
-        std::abs(request.generation.sampling.frequency_penalty) > 2.0) {
+    if (request.n == 0U || request.generation.maximum_new_tokens == 0U) {
         error = "invalid generation parameter range";
         return false;
     }
+    if (!validate_request_sampling(request.generation.sampling, error)) return false;
     if (request.generation.sampling.top_logprobs != 0U && !request.logprobs) {
         error = "top_logprobs requires logprobs=true";
         return false;
@@ -361,7 +418,13 @@ bool parse_openai_completion_request(
                 request.generation.sampling.top_logprobs =
                     static_cast<std::uint32_t>(count);
             } else {
-                cursor.skip_value();
+                bool handled = false;
+                if (!parse_sampler_extension(key, cursor,
+                                             request.generation.sampling,
+                                             handled, error)) {
+                    return false;
+                }
+                if (!handled) cursor.skip_value();
             }
             if (cursor.consume('}')) break;
             cursor.expect(',');
@@ -379,16 +442,11 @@ bool parse_openai_completion_request(
         return false;
     }
     if (request.n == 0U || request.n > 16U ||
-        request.generation.maximum_new_tokens == 0U ||
-        request.generation.sampling.temperature < 0.0 ||
-        request.generation.sampling.temperature > 2.0 ||
-        request.generation.sampling.top_p <= 0.0 ||
-        request.generation.sampling.top_p > 1.0 ||
-        std::abs(request.generation.sampling.presence_penalty) > 2.0 ||
-        std::abs(request.generation.sampling.frequency_penalty) > 2.0) {
+        request.generation.maximum_new_tokens == 0U) {
         error = "invalid generation parameter range";
         return false;
     }
+    if (!validate_request_sampling(request.generation.sampling, error)) return false;
     request.messages.push_back({ChatRole::User, std::move(prompt)});
     return true;
 }

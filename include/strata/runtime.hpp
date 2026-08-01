@@ -23,8 +23,9 @@ struct RuntimeConfig {
     std::vector<int> devices{0, 1, 2};
     double vram_cache_fraction{0.85};
     std::uint32_t maximum_context_tokens{2048U};
-    double sampling_temperature{};
-    std::uint64_t sampling_seed{33'377'335U};
+    // Session default sampler. Greedy unless the caller asks otherwise, so a
+    // run stays reproducible until someone opts into a stochastic stage.
+    SamplingOptions sampling{greedy_sampling()};
     bool verbose{};
     bool load_progress{};
     bool enable_flash_attention{};

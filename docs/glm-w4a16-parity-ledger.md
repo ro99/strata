@@ -12,7 +12,7 @@ own gates are listed explicitly and are not treated as parity requirements.
 | Process RSS, per-device VRAM, checkpoint, CUDA, and graph-phase metrics | already shared | The current worktree shares the generic RSS/VRAM helpers and adds GLM phase attribution. |
 | Route tracing and decode-only placement replay | already shared | GLM emits sequential routes; the retained simulator can warm on prefill and measure decode. |
 | Layer-major bounded batched prefill | already shared | GLM advances the admitted prompt rows through each layer and batches its linear projections. |
-| Generic FlashAttention | already shared | GLM uses the common exact backend for both causal full attention and reconstructed sparse selections. |
+| Generic FlashAttention | already shared | GLM uses exact absorbed CUDA attention for the dense causal window and the common backend for reconstructed sparse selections. |
 | Incremental KV continuation and speculative rewind | already shared | GLM retains exact prefix continuation and rewinds every cache component after lookahead. |
 | Bounded reusable CUDA activation workspaces, streams, and events | already shared | GLM now uses the backend-owned per-device MoE buffers instead of three synchronous matmuls. |
 | Persistent CUDA weight arena | already shared | The backend capability exists, but GLM does not select it: the equal-budget GLM gate rejected it. It is not restored here. |
@@ -24,9 +24,10 @@ own gates are listed explicitly and are not treated as parity requirements.
 | Multi-device enqueue/collect overlap | applicable and missing | Implemented with one persistent task per device and cache leases held through collection. |
 | Device-resident activations across the complete graph | applicable and missing | The experimental DeepSeek branch is not in the validated baseline. Limit this integration to the requested MoE boundary; broader graph residency needs its own correctness contract. |
 | DeepSeek compact/tiered KV block manager | model-semantic and requiring a GLM implementation | Implemented as GLM-native latent-512 plus RoPE-64 storage, with 128-dimensional index keys only on full-index layers. At the model ceiling the retained cache is 199,716,831,232 bytes (186.0 GiB). |
+| Dense MLA weight absorption | model-semantic and requiring a GLM implementation | Implemented through 2,048 tokens for the target 28,672 by 512 OffsetPackedInt4 `kv_b_proj`; expanded K/V never crosses the host boundary. |
 | Learned sparse index selection | model-semantic and requiring a GLM implementation | Implemented with 32 heads by 128 dimensions, ReLU scores, learned head weights, causal stable top-2048, and interleaved RoPE. |
 | Cross-layer index sharing | model-semantic and requiring a GLM implementation | Implemented: full layers are 0, 1, 2, then 6, 10, ..., 74; intervening layers reuse the latest selection. |
-| Sparse attention KV reconstruction | model-semantic and requiring a GLM implementation | Implemented: selected compact latents are reconstructed through each layer's `kv_b_proj`; expanded per-head history is never retained. |
+| Sparse attention KV reconstruction | model-semantic and requiring a GLM implementation | Implemented beyond 2,048 tokens: selected compact latents are reconstructed through each layer's `kv_b_proj`; expanded per-head history is never retained. |
 | GLM sigmoid/`noaux_tc` routing and routed scale | model-semantic and requiring a GLM implementation | Already implemented and retained; DeepSeek `sqrtsoftplus` behavior is not substituted. |
 | GLM shared-expert semantics | model-semantic and requiring a GLM implementation | Implemented in the common device MoE command without changing routed/shared host accumulation order. |
 | mHC projection and residual state | impossible because the checkpoint lacks required tensors | GLM declares ordinary residual connections, not mHC; no behavior is fabricated. |
@@ -35,4 +36,4 @@ own gates are listed explicitly and are not treated as parity requirements.
 
 The integrated correctness order is binding: common MoE execution, GLM index
 selection, compact KV reconstruction, target-layout fixtures, `make check`, and
-then one full-checkpoint generation/profile screening run.
+then bounded full-checkpoint generation/profile screening.

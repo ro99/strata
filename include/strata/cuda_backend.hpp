@@ -168,6 +168,15 @@ struct CudaLightningIndexRequest {
     std::uint64_t maximum_workspace_bytes{32ULL << 20U};
 };
 
+struct CudaGlmAbsorbedAttentionRequest {
+    std::span<const float> queries;
+    std::span<const float> latent;
+    std::span<const float> rope;
+    std::span<const std::uint32_t> causal_key_counts;
+    float scale{};
+    std::uint64_t maximum_workspace_bytes{768ULL << 20U};
+};
+
 class CudaWeight {
 public:
     CudaWeight();
@@ -287,6 +296,12 @@ public:
     // never select another numerical path silently.
     [[nodiscard]] ValidationResult flash_attention(
         int device, const FlashAttentionRequest& request,
+        std::span<float> output);
+    // Exact GLM-5.2 MLA weight absorption for the dense causal window. It
+    // avoids materializing per-head K/V from the compact 512+64 cache.
+    [[nodiscard]] ValidationResult glm_absorbed_attention(
+        const CudaWeight& key_value_projection,
+        const CudaGlmAbsorbedAttentionRequest& request,
         std::span<float> output);
     // Exact bounded-workspace DeepSeek Lightning Indexer. Output contains
     // min(top_k, candidates) positions in descending score order with lower

@@ -1004,7 +1004,26 @@ struct Glm52Runtime::Impl {
 
         std::vector<float> context(static_cast<std::size_t>(rows) * kHeads * kValueHead);
         const auto token_count = cache.rope.size() / kRope;
-        if (token_count <= kDsaThreshold) {
+        if (token_count <= kDsaThreshold && config.enable_flash_attention) {
+            std::vector<std::uint32_t> causal_limits(rows);
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                causal_limits[row] = position_base + row + 1U;
+            }
+            WeightCache::Lease projection;
+            result = weights->acquire(
+                device, prefix + "kv_b_proj", kv_output, kKvLora, projection);
+            if (!result.ok()) return result;
+            CudaGlmAbsorbedAttentionRequest request;
+            request.queries = queries;
+            request.latent = cache.latent;
+            request.rope = cache.rope;
+            request.causal_key_counts = causal_limits;
+            request.scale = kAttentionScale;
+            request.maximum_workspace_bytes = kFlashAttentionWorkspaceReserve;
+            result = cuda.glm_absorbed_attention(
+                projection.weight(), request, context);
+            if (!result.ok()) return result;
+        } else if (token_count <= kDsaThreshold) {
             std::vector<std::uint32_t> positions(token_count);
             std::iota(positions.begin(), positions.end(), 0U);
             std::vector<float> logical_keys;

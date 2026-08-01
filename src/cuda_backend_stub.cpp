@@ -100,6 +100,12 @@ ValidationResult CudaBackend::flash_attention(
     return {{"FlashAttention requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::glm_absorbed_attention(
+    const CudaWeight&, const CudaGlmAbsorbedAttentionRequest&,
+    std::span<float>) {
+    return {{"GLM absorbed attention requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::lightning_index(
     int, const CudaLightningIndexRequest&, std::span<std::uint32_t>) {
     return {{"Lightning Indexer requires a CUDA-enabled build"}};

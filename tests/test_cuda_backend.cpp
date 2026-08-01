@@ -573,6 +573,107 @@ TEST_CASE("native CUDA FlashAttention preserves an all-F32 adapter contract") {
     }
 }
 
+TEST_CASE("native CUDA GLM absorbed attention matches expanded target-shape KV") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    constexpr std::uint32_t query_rows = 2U;
+    constexpr std::uint32_t key_rows = 5U;
+    constexpr std::uint32_t heads = 64U;
+    constexpr std::uint32_t nope = 192U;
+    constexpr std::uint32_t rope_dim = 64U;
+    constexpr std::uint32_t value_dim = 256U;
+    constexpr std::uint32_t latent_dim = 512U;
+    constexpr std::uint32_t projected_dim = heads * (nope + value_dim);
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device, true).ok());
+    auto projection = upload_int4(
+        backend, devices.front(), projected_dim, latent_dim, 9U);
+    std::vector<float> queries(query_rows * heads * (nope + rope_dim));
+    std::vector<float> latent(key_rows * latent_dim);
+    std::vector<float> rope(key_rows * rope_dim);
+    for (std::size_t index = 0U; index < queries.size(); ++index) {
+        queries[index] = static_cast<float>(static_cast<int>(index % 29U) - 14) /
+                         128.0F;
+    }
+    for (std::size_t index = 0U; index < latent.size(); ++index) {
+        latent[index] = static_cast<float>(static_cast<int>(index % 23U) - 11) /
+                        128.0F;
+    }
+    for (std::size_t index = 0U; index < rope.size(); ++index) {
+        rope[index] = static_cast<float>(static_cast<int>(index % 19U) - 9) /
+                      128.0F;
+    }
+
+    std::vector<float> projected(key_rows * projected_dim);
+    REQUIRE(backend.matmul(projection, latent, key_rows, projected).ok());
+    std::vector<float> keys(key_rows * heads * (nope + rope_dim));
+    std::vector<float> values(key_rows * heads * value_dim);
+    for (std::uint32_t row = 0U; row < key_rows; ++row) {
+        for (std::uint32_t head = 0U; head < heads; ++head) {
+            const auto* source = projected.data() +
+                (static_cast<std::size_t>(row) * heads + head) *
+                    (nope + value_dim);
+            auto* key = keys.data() +
+                (static_cast<std::size_t>(row) * heads + head) *
+                    (nope + rope_dim);
+            auto* value = values.data() +
+                (static_cast<std::size_t>(row) * heads + head) * value_dim;
+            std::copy_n(source, nope, key);
+            std::copy_n(rope.data() + static_cast<std::size_t>(row) * rope_dim,
+                        rope_dim, key + nope);
+            std::copy_n(source + nope, value_dim, value);
+        }
+    }
+    const std::array<std::uint32_t, query_rows> causal_limits{4U, 5U};
+    const std::array<strata::FlashAttentionSegment, 1> segments{{
+        {keys, values, {}}}};
+    strata::FlashAttentionRequest reference_request;
+    reference_request.queries = queries;
+    reference_request.segments = segments;
+    reference_request.causal_key_counts = causal_limits;
+    reference_request.query_rows = query_rows;
+    reference_request.query_heads = heads;
+    reference_request.key_value_heads = heads;
+    reference_request.query_key_dim = nope + rope_dim;
+    reference_request.value_dim = value_dim;
+    reference_request.scale = 1.0F / std::sqrt(static_cast<float>(nope + rope_dim));
+    reference_request.numerics =
+        strata::FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
+    std::vector<float> expected(query_rows * heads * value_dim);
+    REQUIRE(strata::flash_attention_reference_f32(
+        reference_request, expected).ok());
+
+    strata::CudaGlmAbsorbedAttentionRequest request;
+    request.queries = queries;
+    request.latent = latent;
+    request.rope = rope;
+    request.causal_key_counts = causal_limits;
+    request.scale = reference_request.scale;
+    std::vector<float> actual(expected.size());
+    const auto before = backend.stats();
+    REQUIRE(backend.glm_absorbed_attention(
+        projection, request, actual).ok());
+    const auto after = backend.stats();
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        const float tolerance = 2.0e-3F *
+            std::max(1.0F, std::abs(expected[index]));
+        REQUIRE(std::abs(actual[index] - expected[index]) <= tolerance);
+    }
+    REQUIRE(after.flash_attention_calls == before.flash_attention_calls + 1U);
+    REQUIRE(after.flash_attention_kernel_launches ==
+            before.flash_attention_kernel_launches + 1U);
+    REQUIRE(after.flash_attention_h2d_bytes ==
+            before.flash_attention_h2d_bytes + queries.size() * sizeof(float) +
+                latent.size() * sizeof(float) + rope.size() * sizeof(float) +
+                causal_limits.size() * sizeof(std::uint32_t));
+    REQUIRE(after.flash_attention_d2h_bytes ==
+            before.flash_attention_d2h_bytes + actual.size() * sizeof(float) +
+                sizeof(unsigned int));
+}
+
 TEST_CASE("native CUDA exact FlashAttention batches disjoint query visibility") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

@@ -1,6 +1,9 @@
 #pragma once
 
+#include "strata/result.hpp"
+
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <span>
 #include <string>
@@ -9,13 +12,26 @@
 
 namespace strata {
 
+// Selects the two exponents of the future-entropy score from one crossfader.
+// Both mappings agree at the endpoints and differ only in between.
+enum class FutureEntropyCurve : std::uint8_t {
+    // a = 1 - max(0, alpha), b = 1 - max(0, -alpha). Count Bayesie's mapping:
+    // alpha 0 is exactly s = p * H_hat, the article's headline score.
+    Article,
+    // a = 1 - t, b = t for t = (alpha + 1) / 2. Constant exponent sum, so
+    // alpha 0 is sqrt(p * H_hat). The reference implementation's mapping,
+    // kept because its measured operating points were tuned against it.
+    Crossfade,
+};
+
 // Sampling runs as a fixed pipeline. Penalties rewrite the model's logits;
 // every truncation stage then reads the resulting natural distribution, and
 // temperature rescales only the surviving candidates immediately before the
 // Gumbel-max draw. The order is:
 //
 //   repetition/presence/frequency -> DRY -> n-gram ban -> logit bias
-//   -> top_k -> top_p -> min_p -> typical_p -> XTC -> temperature -> draw
+//   -> top_k -> top_p -> min_p -> typical_p -> XTC -> future entropy
+//   -> temperature -> draw
 //
 // Truncating on the natural distribution is what makes the thresholds mean
 // what they say: min_p 0.05 is "at least 5% as likely as the best token
@@ -55,6 +71,39 @@ struct SamplingOptions {
     // Hard ban on any token completing an n-gram already in the sequence.
     std::uint32_t no_repeat_ngram{};
 
+    // Future entropy: prefer candidates that keep the next step's options
+    // open. The model is run one step past each surviving candidate w to get
+    // q_w = p(V | c + w); the normalized entropy of that distribution's top-n
+    //
+    //   H_hat(w) = [-sum q~_w(v) ln q~_w(v)] / ln n   in [0, 1]
+    //
+    // reweights the candidate by how much future choice it unlocks:
+    //
+    //   s(w) = p(w | c)^a * H_hat(w)^b
+    //
+    // The draw is then made from s renormalized over the candidates, so
+    // temperature rescales the blended score rather than the raw probability.
+    //
+    // This is the only stage that costs forward passes: one per candidate, so
+    // a decode step costs (future_entropy_candidates + 1) of them. It also
+    // needs a lookahead evaluator; without one the sample reports a failure
+    // rather than quietly degrading to ordinary sampling.
+    //
+    // A truncation stage that cuts the tail on relative plausibility is
+    // required in front of it, min_p 0.05 upwards. Broken word-fragments have
+    // maximally uncertain futures, so entropy selects them unless something
+    // has already removed them.
+    std::uint32_t future_entropy_candidates{};   // 0 disables the stage
+    std::uint32_t future_entropy_top_n{30U};     // width of q_w for H_hat
+    double future_entropy_alpha{};               // -1 probability, +1 entropy
+    FutureEntropyCurve future_entropy_curve{FutureEntropyCurve::Article};
+
+    // Rhythmic decoding: alpha oscillates over the generated sequence as
+    // alpha + amplitude * sin(2*pi*step/period), clamped back into [-1, 1],
+    // so the text alternates between exploratory and consolidating phases.
+    double future_entropy_wave_amplitude{};      // 0 disables the wave
+    double future_entropy_wave_period{60.0};     // in generated tokens
+
     std::uint64_t seed{33'377'335U};
     std::vector<std::pair<std::uint32_t, double>> logit_bias;
     std::uint32_t top_logprobs{};
@@ -78,7 +127,32 @@ struct TokenLogprob {
     std::uint32_t token{};
     double logprob{};
     std::vector<std::pair<std::uint32_t, double>> top;
+    // Only the future-entropy stage can fail: it is the one stage that needs
+    // the model rather than the logits it was handed.
+    std::vector<std::string> errors;
+
+    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
+
+// Runs the model one step past each candidate and reports how open the future
+// it unlocks is. `candidates` is in descending model probability; write
+// H_hat(w) in [0, 1] for each into `normalized_entropy`, same order.
+//
+// The evaluator owns the speculative state: it must leave the runtime exactly
+// as it found it, because the token the sampler goes on to pick is decoded
+// from that state. Returning errors fails the sample rather than falling back.
+using FutureEntropyEvaluator = std::function<ValidationResult(
+    std::span<const std::uint32_t> candidates, std::uint32_t top_n,
+    std::span<double> normalized_entropy)>;
+
+// H_hat over the renormalized top-n of softmax(logits), scaled to [0, 1] by
+// ln n. Shared so both runtimes measure the future the same way.
+[[nodiscard]] double normalized_top_n_entropy(
+    std::span<const float> logits, std::uint32_t top_n);
+
+// The alpha in force at generation step `step`, after the wave and the clamp.
+[[nodiscard]] double future_entropy_alpha_at(
+    const SamplingOptions& options, std::uint64_t step);
 
 // Reproducible decode: no stage draws from the generator.
 [[nodiscard]] inline SamplingOptions greedy_sampling() {
@@ -87,9 +161,12 @@ struct TokenLogprob {
     return options;
 }
 
+// `lookahead` is required exactly when future_entropy_candidates is non-zero,
+// and unused otherwise.
 [[nodiscard]] TokenLogprob sample_logits(
     std::span<const float> logits, const SamplingOptions& options,
-    const SamplingHistory& history, std::mt19937_64& generator);
+    const SamplingHistory& history, std::mt19937_64& generator,
+    const FutureEntropyEvaluator& lookahead = {});
 
 [[nodiscard]] std::uint32_t sample_logits_gumbel(
     std::span<const float> logits, double temperature, std::mt19937_64& generator);

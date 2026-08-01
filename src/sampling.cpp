@@ -174,6 +174,11 @@ void apply_ngram_ban(std::vector<double>& scores,
     }
 }
 
+// Floor under H_hat before the logarithm. A candidate whose future is entirely
+// decided scores zero on the entropy factor, and ln 0 would erase it from the
+// draw outright rather than merely rank it last.
+constexpr double kEntropyFloor = 1e-6;
+
 // Natural log probabilities, from the unmodified logits: the model's own view,
 // independent of whatever penalties and truncation the caller asked for.
 void record_natural_logprobs(std::span<const float> logits, std::uint32_t chosen,
@@ -196,9 +201,50 @@ void record_natural_logprobs(std::span<const float> logits, std::uint32_t chosen
 
 }  // namespace
 
+double normalized_top_n_entropy(std::span<const float> logits,
+                                std::uint32_t top_n) {
+    const auto width = std::min<std::size_t>(top_n, logits.size());
+    // One option is no choice at all, and ln 1 = 0 leaves the ratio undefined.
+    if (width < 2U) return 0.0;
+    std::vector<float> values(logits.begin(), logits.end());
+    std::nth_element(values.begin(),
+                     values.begin() + static_cast<std::ptrdiff_t>(width),
+                     values.end(), std::greater<float>());
+    values.resize(width);
+    const double maximum = static_cast<double>(
+        *std::max_element(values.begin(), values.end()));
+    // Every candidate banned: no future to be open about.
+    if (!std::isfinite(maximum)) return 0.0;
+    double total = 0.0;
+    for (const auto value : values) {
+        total += std::exp(static_cast<double>(value) - maximum);
+    }
+    double entropy = 0.0;
+    for (const auto value : values) {
+        const double probability =
+            std::exp(static_cast<double>(value) - maximum) / total;
+        if (probability > 0.0) entropy -= probability * std::log(probability);
+    }
+    return std::clamp(entropy / std::log(static_cast<double>(width)), 0.0, 1.0);
+}
+
+double future_entropy_alpha_at(const SamplingOptions& options,
+                               std::uint64_t step) {
+    double alpha = options.future_entropy_alpha;
+    if (options.future_entropy_wave_amplitude != 0.0 &&
+        options.future_entropy_wave_period > 0.0) {
+        constexpr double two_pi = 6.283185307179586;
+        alpha += options.future_entropy_wave_amplitude *
+                 std::sin(two_pi * static_cast<double>(step) /
+                          options.future_entropy_wave_period);
+    }
+    return std::clamp(alpha, -1.0, 1.0);
+}
+
 TokenLogprob sample_logits(
     std::span<const float> logits, const SamplingOptions& options,
-    const SamplingHistory& history, std::mt19937_64& generator) {
+    const SamplingHistory& history, std::mt19937_64& generator,
+    const FutureEntropyEvaluator& lookahead) {
     TokenLogprob result;
     if (logits.empty()) return result;
 
@@ -208,8 +254,9 @@ TokenLogprob sample_logits(
         !options.logit_bias.empty();
     const bool ordered = options.top_k != 0U || options.top_p < 1.0 ||
         options.typical_p < 1.0;
+    const bool future_entropy = options.future_entropy_candidates != 0U;
     const bool truncated = ordered || options.min_p > 0.0 ||
-        options.xtc_probability > 0.0;
+        options.xtc_probability > 0.0 || future_entropy;
     const bool reporting = options.top_logprobs != 0U || options.return_logprobs;
 
     // Default decode path: no stage touches the distribution, so draw straight
@@ -259,7 +306,7 @@ TokenLogprob sample_logits(
     // top_p, typical_p and XTC are all defined against probabilities; min_p and
     // the n-gram ban are pure logit comparisons and need no normalizer.
     const bool needs_total = options.top_p < 1.0 || options.typical_p < 1.0 ||
-        options.xtc_probability > 0.0;
+        options.xtc_probability > 0.0 || future_entropy;
     const double log_total = needs_total ? log_sum_exp(scores, maximum) : 0.0;
 
     std::vector<std::uint32_t> candidates;
@@ -340,6 +387,68 @@ TokenLogprob sample_logits(
             scores.begin(), std::max_element(scores.begin(), scores.end()))));
     }
 
+    // Future entropy runs last, so its forward passes are spent only on tokens
+    // every cheaper stage has already accepted. With one candidate left there
+    // is no ranking to change, and the lookahead is skipped rather than paid.
+    if (future_entropy && candidates.size() > 1U) {
+        if (!lookahead) {
+            result.errors.emplace_back(
+                "future-entropy sampling requires a lookahead evaluator");
+            return result;
+        }
+        // Neither typical_p nor the unordered min_p/XTC path leaves the
+        // survivors in probability order, so rank them here rather than
+        // assume it: the lookahead budget must go to the likeliest tokens.
+        const auto better = [&scores](std::uint32_t left, std::uint32_t right) {
+            if (scores[left] != scores[right]) return scores[left] > scores[right];
+            return left < right;
+        };
+        if (candidates.size() > options.future_entropy_candidates) {
+            const auto width = static_cast<std::ptrdiff_t>(
+                options.future_entropy_candidates);
+            std::nth_element(candidates.begin(), candidates.begin() + width,
+                             candidates.end(), better);
+            candidates.resize(static_cast<std::size_t>(width));
+        }
+        std::sort(candidates.begin(), candidates.end(), better);
+
+        std::vector<double> entropy(candidates.size(), 0.0);
+        auto evaluated = lookahead(candidates, options.future_entropy_top_n,
+                                   entropy);
+        if (!evaluated.ok()) {
+            result.errors = std::move(evaluated.errors);
+            return result;
+        }
+
+        const double alpha = future_entropy_alpha_at(
+            options, static_cast<std::uint64_t>(history.tokens.size()));
+        double probability_exponent = 1.0 - std::max(0.0, alpha);
+        double entropy_exponent = 1.0 - std::max(0.0, -alpha);
+        if (options.future_entropy_curve == FutureEntropyCurve::Crossfade) {
+            const double blend = (alpha + 1.0) / 2.0;
+            probability_exponent = 1.0 - blend;
+            entropy_exponent = blend;
+        }
+
+        // s(w) = p(w|c)^a * H_hat(w)^b, carried in logs so the Gumbel-max draw
+        // below turns it into an exact draw from s renormalized over the
+        // candidates. A zero exponent means that factor is identically 1, and
+        // must not be formed at all: 0 * ln 0 is NaN where the identity needs
+        // it to vanish.
+        for (std::size_t index = 0U; index < candidates.size(); ++index) {
+            const auto token = candidates[index];
+            double blended = 0.0;
+            if (probability_exponent != 0.0) {
+                blended += probability_exponent * (scores[token] - log_total);
+            }
+            if (entropy_exponent != 0.0) {
+                blended += entropy_exponent *
+                    std::log(std::max(entropy[index], kEntropyFloor));
+            }
+            scores[token] = blended;
+        }
+    }
+
     if (options.temperature <= 0.0) {
         const auto better = [&scores](std::uint32_t left, std::uint32_t right) {
             return scores[left] < scores[right];
@@ -403,6 +512,28 @@ bool validate_sampling_options(const SamplingOptions& options, std::string& erro
     if (!in_range(options.dry_multiplier, 0.0, 10.0)) return reject("dry_multiplier");
     if (!in_range(options.dry_base, 1.0, 8.0)) return reject("dry_base");
     if (options.dry_allowed_length == 0U) return reject("dry_allowed_length");
+    if (!in_range(options.future_entropy_alpha, -1.0, 1.0)) {
+        return reject("future_entropy_alpha");
+    }
+    if (!in_range(options.future_entropy_wave_amplitude, 0.0, 2.0)) {
+        return reject("future_entropy_wave_amplitude");
+    }
+    if (!in_range(options.future_entropy_wave_period, 0.0, 1e6) ||
+        options.future_entropy_wave_period <= 0.0) {
+        return reject("future_entropy_wave_period");
+    }
+    // Each candidate is a forward pass, so the ceiling is a cost guard rather
+    // than a correctness one: 64 already makes a decode step 65 passes long.
+    if (options.future_entropy_candidates > 64U) {
+        return reject("future_entropy_candidates");
+    }
+    if (options.future_entropy_candidates == 1U) {
+        return reject("future_entropy_candidates");
+    }
+    if (options.future_entropy_candidates != 0U &&
+        options.future_entropy_top_n < 2U) {
+        return reject("future_entropy_top_n");
+    }
     error.clear();
     return true;
 }

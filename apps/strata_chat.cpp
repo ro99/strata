@@ -68,6 +68,24 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
         sampling.penalty_window = 512U;
         return true;
     }
+    if (name == "future-entropy") {
+        // Costs 21 forward passes per token, not one. min_p is not optional
+        // here: broken word-fragments have maximally uncertain futures, so
+        // without a relative-plausibility cut the entropy term selects them.
+        // DRY is what the reference implementation reports missing — an
+        // entropy-scored loop, once entered, is locked in by min_p.
+        sampling.temperature = 1.0;
+        sampling.min_p = 0.05;
+        sampling.future_entropy_candidates = 20U;
+        sampling.future_entropy_top_n = 30U;
+        sampling.future_entropy_alpha = 0.0;
+        sampling.dry_multiplier = 0.8;
+        sampling.dry_base = 1.75;
+        sampling.dry_allowed_length = 2U;
+        sampling.repetition_penalty = 1.03;
+        sampling.penalty_window = 512U;
+        return true;
+    }
     return false;
 }
 
@@ -81,7 +99,7 @@ void usage() {
         << "                    [--no-prepack-mhc]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
-        << "sampler:            [--preset precise|balanced|creative]\n"
+        << "sampler:            [--preset precise|balanced|creative|future-entropy]\n"
         << "                    [--temperature F] [--seed N]\n"
         << "                    [--top-k N] [--top-p F] [--min-p F] [--typical-p F]\n"
         << "                    [--xtc-probability F] [--xtc-threshold F]\n"
@@ -90,11 +108,20 @@ void usage() {
         << "                    [--dry-multiplier F] [--dry-base F]\n"
         << "                    [--dry-allowed-length N] [--dry-window N]\n"
         << "                    [--no-repeat-ngram N]\n\n"
+        << "future entropy:     [--future-entropy N] [--future-entropy-top-n N]\n"
+        << "                    [--alpha F] [--future-entropy-curve article|crossfade]\n"
+        << "                    [--alpha-wave-amplitude F] [--alpha-wave-period F]\n\n"
         << "Truncation reads the model's own distribution, so --min-p and\n"
         << "--top-p mean the same thing at any temperature. --preset writes\n"
         << "defaults; flags given after it override them.\n\n"
         << "--temperature alone, with no --preset, is plain temperature\n"
         << "sampling and nothing else: no truncation, no penalties, no XTC.\n\n"
+        << "--future-entropy N scores each of the N likeliest candidates by how\n"
+        << "open the distribution one step past it is, and costs one extra\n"
+        << "forward pass per candidate: a token takes N+1 decode steps, not\n"
+        << "one. --alpha crossfades from -1 (ordinary sampling, the stage is\n"
+        << "a no-op) to +1 (future entropy alone). Pair it with --min-p 0.05\n"
+        << "or higher; entropy favours broken word-fragments otherwise.\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
         << "The jsonl protocol reads prompt text and an optional messages array.\n";
 }
@@ -173,6 +200,25 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (!strata::cli::parse_u32(next(), options.sampling.dry_window)) return false;
         } else if (argument == "--no-repeat-ngram") {
             if (!strata::cli::parse_u32(next(), options.sampling.no_repeat_ngram)) return false;
+        } else if (argument == "--future-entropy") {
+            if (!strata::cli::parse_u32(next(), options.sampling.future_entropy_candidates)) return false;
+        } else if (argument == "--future-entropy-top-n") {
+            if (!strata::cli::parse_u32(next(), options.sampling.future_entropy_top_n)) return false;
+        } else if (argument == "--alpha") {
+            if (!strata::cli::parse_double(next(), options.sampling.future_entropy_alpha, -1.0, 1.0)) return false;
+        } else if (argument == "--future-entropy-curve") {
+            const auto curve = next();
+            if (curve == "article") {
+                options.sampling.future_entropy_curve = strata::FutureEntropyCurve::Article;
+            } else if (curve == "crossfade") {
+                options.sampling.future_entropy_curve = strata::FutureEntropyCurve::Crossfade;
+            } else {
+                return false;
+            }
+        } else if (argument == "--alpha-wave-amplitude") {
+            if (!strata::cli::parse_double(next(), options.sampling.future_entropy_wave_amplitude, 0.0, 2.0)) return false;
+        } else if (argument == "--alpha-wave-period") {
+            if (!strata::cli::parse_double(next(), options.sampling.future_entropy_wave_period, 1.0, 1e6)) return false;
         } else if (argument == "--devices") {
             if (!strata::cli::parse_devices(next(), options.devices)) return false;
             options.devices_explicit = true;
@@ -228,6 +274,18 @@ std::string sampler_summary(const strata::SamplingOptions& sampling) {
     }
     if (sampling.no_repeat_ngram != 0U) {
         text << " no_repeat_ngram=" << sampling.no_repeat_ngram;
+    }
+    if (sampling.future_entropy_candidates != 0U) {
+        text << " future_entropy=" << sampling.future_entropy_candidates
+             << '/' << sampling.future_entropy_top_n
+             << " alpha=" << sampling.future_entropy_alpha
+             << (sampling.future_entropy_curve ==
+                         strata::FutureEntropyCurve::Crossfade
+                     ? " curve=crossfade" : "");
+        if (sampling.future_entropy_wave_amplitude != 0.0) {
+            text << " alpha_wave=" << sampling.future_entropy_wave_amplitude
+                 << '@' << sampling.future_entropy_wave_period;
+        }
     }
     return text.str();
 }
@@ -552,8 +610,14 @@ int main(int argc, char** argv) {
               << "[contract] "
               << (deterministic(options.sampling) ? "exact greedy"
                                                   : "seeded Gumbel-max sampled")
-              << " base-model decode; no hidden fallback\n"
-              << "[startup] loading model; this can take several minutes...\n";
+              << " base-model decode; no hidden fallback\n";
+    if (options.sampling.future_entropy_candidates != 0U) {
+        std::cerr << "[sampler] future entropy looks ahead one step per "
+                  << "candidate: expect about "
+                  << (options.sampling.future_entropy_candidates + 1U)
+                  << "x the decode time of the same settings without it\n";
+    }
+    std::cerr << "[startup] loading model; this can take several minutes...\n";
     const auto initialization_started = std::chrono::steady_clock::now();
     strata::RuntimeConfig config;
     config.model = options.model_type == "glm"

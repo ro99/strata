@@ -1130,6 +1130,31 @@ struct AttentionState {
     std::vector<float> frequencies;
 };
 
+// Everything a one-token forward pass mutates and a rollback must put back.
+// The compressor accumulators are fixed-size scratch that a pass overwrites in
+// place, so they are copied whole; the sliding and compressed caches are
+// append- or ring-addressed, so only the single row a pass can reach is kept.
+struct CompressorSnapshot {
+    std::vector<float> values;
+    std::vector<float> scores;
+    std::vector<float> compressed_row;
+    std::size_t compressed_index{};
+    bool compressed_saved{};
+};
+
+struct LayerSnapshot {
+    CompressorSnapshot compressor;
+    CompressorSnapshot indexer;
+    std::vector<float> sliding_row;
+    std::size_t sliding_index{};
+    bool sliding_saved{};
+};
+
+struct SpeculativeState {
+    std::vector<LayerSnapshot> layers;
+    std::uint64_t tokens{};
+};
+
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
@@ -1160,6 +1185,10 @@ struct DeepSeekV4Runtime::Impl {
     std::vector<RoutePrediction> pending_prefetch_predictions;
     std::vector<RouteEvent> deferred_route_events;
     bool defer_prefill_observability{};
+    // Set only while a future-entropy lookahead is in flight. Suppresses the
+    // observability that describes the emitted sequence; the graph itself is
+    // unchanged, so the logits a lookahead reads are the real ones.
+    bool speculative_pass{};
     std::mt19937_64 sampler;
     SamplingOptions active_sampling;
     std::vector<std::uint32_t> sampled_token_counts;
@@ -1360,6 +1389,10 @@ struct DeepSeekV4Runtime::Impl {
                                 std::span<const std::uint32_t> tokens,
                                 std::span<float> hidden,
                                 std::uint32_t position_base);
+    ValidationResult forward_hidden(std::uint32_t token, std::uint32_t position,
+                                    std::span<float> hidden);
+    ValidationResult head_logits(std::span<const float> hidden,
+                                 std::vector<float>& logits);
     ParseResult<std::uint32_t> sample_hidden(std::uint32_t token,
                                              std::uint32_t position,
                                              std::span<const float> hidden);
@@ -1371,6 +1404,11 @@ struct DeepSeekV4Runtime::Impl {
     ParseResult<std::uint32_t> forward_token(std::uint32_t token,
                                              std::uint32_t position,
                                              bool logits);
+    SpeculativeState capture_speculative_state(std::uint32_t position) const;
+    ValidationResult restore_speculative_state(const SpeculativeState& saved);
+    ValidationResult future_entropy(std::span<const std::uint32_t> candidates,
+                                    std::uint32_t top_n, std::uint32_t position,
+                                    std::span<double> normalized_entropy);
 };
 
 void DeepSeekV4Runtime::Impl::reset_diagnostics() {
@@ -2920,7 +2958,10 @@ ValidationResult DeepSeekV4Runtime::Impl::route_moe(
         record_operation_hash(position, token, layer, "ffn_router_weights", route.value.weights);
     }
     const bool prefetch_enabled = config.expert_prefetch_predictions != 0U;
-    if (route_trace.is_open() || prefetch_enabled) {
+    // A speculative pass is rolled back, so its routes are not part of the
+    // sequence. Recording them would put tokens that were never emitted into
+    // the trace and teach the predictor a history that did not happen.
+    if (!speculative_pass && (route_trace.is_open() || prefetch_enabled)) {
         RouteEvent event;
         event.request = active_request_id;
         event.token_position = position;
@@ -3234,27 +3275,31 @@ ValidationResult DeepSeekV4Runtime::Impl::block_page(
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::forward_hidden(
+    std::uint32_t token, std::uint32_t position, std::span<float> hidden) {
+    const auto embedding_started = std::chrono::steady_clock::now();
+    auto result = embed(token, hidden);
+    graph_stats.embedding_nanoseconds += elapsed_nanoseconds(embedding_started);
+    if (!result.ok()) return result;
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        result = block(layer, token, hidden, position);
+        if (!result.ok()) return result;
+        if (config.enable_layer_hash_trace) {
+            record_layer_hash(position, token, layer, hidden);
+        }
+    }
+    return result;
+}
+
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     std::uint32_t token, std::uint32_t position, bool logits_required) {
     ParseResult<std::uint32_t> result;
     result.value = token;
     std::vector<float> hidden(static_cast<std::size_t>(kMhc) * kHidden);
-    const auto embedding_started = std::chrono::steady_clock::now();
-    auto validation = embed(token, hidden);
-    graph_stats.embedding_nanoseconds += elapsed_nanoseconds(embedding_started);
+    auto validation = forward_hidden(token, position, hidden);
     if (!validation.ok()) {
         result.errors = std::move(validation.errors);
         return result;
-    }
-    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-        validation = block(layer, token, hidden, position);
-        if (!validation.ok()) {
-            result.errors = std::move(validation.errors);
-            return result;
-        }
-        if (config.enable_layer_hash_trace) {
-            record_layer_hash(position, token, layer, hidden);
-        }
     }
     if (!logits_required) {
         ++graph_stats.forward_tokens;
@@ -3265,18 +3310,138 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     return sample_hidden(token, position, hidden);
 }
 
-ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
-    std::uint32_t token, std::uint32_t position,
-    std::span<const float> hidden) {
-    ParseResult<std::uint32_t> result;
-    ValidationResult validation;
-    if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
+// A one-token pass writes the compressor accumulators in place, may shift them
+// when a block closes, and appends at most one row to each of the sliding and
+// compressed caches. `position` is the position that pass will occupy, which
+// fixes which single row of each cache it can reach.
+SpeculativeState DeepSeekV4Runtime::Impl::capture_speculative_state(
+    std::uint32_t position) const {
+    SpeculativeState saved;
+    saved.layers.resize(kLayers);
+    saved.tokens = position;
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        const auto& state = attention_state[layer];
+        auto& snapshot = saved.layers[layer];
+        const auto capture = [&](const CompressorState& source,
+                                 CompressorSnapshot& destination) {
+            if (source.ratio == 0U) return;
+            destination.values = source.values;
+            destination.scores = source.scores;
+            // With a block cache the compressed rows live in the KV cache and
+            // are undone by truncating the sequence instead.
+            if (kv_cache != nullptr) return;
+            destination.compressed_index = position / source.ratio;
+            const auto row = source.compressed.row(destination.compressed_index);
+            if (row.empty()) return;
+            destination.compressed_row.assign(row.begin(), row.end());
+            destination.compressed_saved = true;
+        };
+        capture(state.compressor, snapshot.compressor);
+        capture(state.indexer_compressor, snapshot.indexer);
+        if (kv_cache == nullptr && !state.sliding.empty()) {
+            snapshot.sliding_index =
+                static_cast<std::size_t>(position % kWindow) * kHeadDim;
+            snapshot.sliding_row.assign(
+                state.sliding.begin() +
+                    static_cast<std::ptrdiff_t>(snapshot.sliding_index),
+                state.sliding.begin() +
+                    static_cast<std::ptrdiff_t>(snapshot.sliding_index + kHeadDim));
+            snapshot.sliding_saved = true;
+        }
+    }
+    return saved;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::restore_speculative_state(
+    const SpeculativeState& saved) {
+    ValidationResult result;
+    if (kv_cache != nullptr) {
+        result = kv_cache->truncate_sequence(active_sequence, saved.tokens);
+        if (!result.ok()) return result;
+    }
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        auto& state = attention_state[layer];
+        const auto& snapshot = saved.layers[layer];
+        const auto restore = [&](CompressorState& target,
+                                 const CompressorSnapshot& source) {
+            if (target.ratio == 0U) return;
+            target.values = source.values;
+            target.scores = source.scores;
+            if (kv_cache != nullptr) return;
+            if (source.compressed_saved) {
+                auto row = target.compressed.writable_row(source.compressed_index);
+                if (row.size() == source.compressed_row.size()) {
+                    std::copy(source.compressed_row.begin(),
+                              source.compressed_row.end(), row.begin());
+                }
+                return;
+            }
+            // The row was unallocated before the pass. Nothing ever reads past
+            // the accepted compressed count, so zeroing an allocation the pass
+            // made is observably the state it started in, and it cannot leave
+            // a speculative row behind for a later read to find.
+            if (target.compressed.row(source.compressed_index).empty()) return;
+            auto row = target.compressed.writable_row(source.compressed_index);
+            std::fill(row.begin(), row.end(), 0.0F);
+        };
+        restore(state.compressor, snapshot.compressor);
+        restore(state.indexer_compressor, snapshot.indexer);
+        if (snapshot.sliding_saved) {
+            std::copy(snapshot.sliding_row.begin(), snapshot.sliding_row.end(),
+                      state.sliding.begin() +
+                          static_cast<std::ptrdiff_t>(snapshot.sliding_index));
+        }
+    }
+    return result;
+}
+
+// One lookahead step per candidate: decode `c + w`, measure how open the
+// resulting distribution is, then put the runtime back. Sequential rather than
+// batched because the graph carries a single sequence, so each candidate costs
+// a full decode step on top of the one that produced these logits.
+ValidationResult DeepSeekV4Runtime::Impl::future_entropy(
+    std::span<const std::uint32_t> candidates, std::uint32_t top_n,
+    std::uint32_t position, std::span<double> normalized_entropy) {
+    ValidationResult result;
+    const auto speculative_position = position + 1U;
+    if (speculative_position >= config.maximum_context_tokens) {
         result.errors.emplace_back(
-            "DeepSeek output head received an invalid hidden-state shape");
+            "future-entropy lookahead exceeds the configured context ceiling");
         return result;
     }
+    const auto lookahead_started = std::chrono::steady_clock::now();
+    const auto saved = capture_speculative_state(speculative_position);
+    speculative_pass = true;
+    std::vector<float> hidden(static_cast<std::size_t>(kMhc) * kHidden);
+    std::vector<float> logits;
+    for (std::size_t index = 0U; index < candidates.size(); ++index) {
+        ++graph_stats.future_entropy_passes;
+        result = forward_hidden(candidates[index], speculative_position, hidden);
+        if (result.ok()) result = head_logits(hidden, logits);
+        // Restore whether or not the pass succeeded: a half-applied pass would
+        // desynchronize the caches from the accepted sequence.
+        auto restored = restore_speculative_state(saved);
+        if (!result.ok()) break;
+        if (!restored.ok()) {
+            result = std::move(restored);
+            break;
+        }
+        normalized_entropy[index] = normalized_top_n_entropy(logits, top_n);
+    }
+    speculative_pass = false;
+    graph_stats.future_entropy_nanoseconds +=
+        elapsed_nanoseconds(lookahead_started);
+    return result;
+}
 
-    const auto head_started = std::chrono::steady_clock::now();
+ValidationResult DeepSeekV4Runtime::Impl::head_logits(
+    std::span<const float> hidden, std::vector<float>& logits) {
+    ValidationResult validation;
+    if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
+        validation.errors.emplace_back(
+            "DeepSeek output head received an invalid hidden-state shape");
+        return validation;
+    }
 
     auto head_projection = host_tensor("hc_head_fn", kMhc * kMhc * kHidden);
     auto head_scale = host_tensor("hc_head_scale", 1U);
@@ -3284,10 +3449,7 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     if (!head_projection.ok()) append_errors(validation, std::move(head_projection.errors));
     if (!head_scale.ok()) append_errors(validation, std::move(head_scale.errors));
     if (!head_base.ok()) append_errors(validation, std::move(head_base.errors));
-    if (!validation.ok()) {
-        result.errors = std::move(validation.errors);
-        return result;
-    }
+    if (!validation.ok()) return validation;
     double square_sum = 0.0;
     for (const float value : hidden) square_sum += static_cast<double>(value) * value;
     const float reciprocal = 1.0F / std::sqrt(
@@ -3311,27 +3473,50 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     }
     round_bf16(reduced);
     validation = norm(reduced, reduced, "norm.weight");
+    if (!validation.ok()) return validation;
+    logits.assign(kVocabulary, 0.0F);
+    return linear(layer_device(kLayers - 1U), "head", kVocabulary,
+                  kHidden, reduced, logits, false);
+}
+
+ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
+    std::uint32_t token, std::uint32_t position,
+    std::span<const float> hidden) {
+    ParseResult<std::uint32_t> result;
+    const auto head_started = std::chrono::steady_clock::now();
+    std::vector<float> logits;
+    auto validation = head_logits(hidden, logits);
+    // Stop the head timer before sampling: with a lookahead in the pipeline
+    // the draw is whole forward passes, and folding those into the output head
+    // would report the graph's cheapest phase as its most expensive one.
+    graph_stats.output_head_nanoseconds += elapsed_nanoseconds(head_started);
     if (!validation.ok()) {
         result.errors = std::move(validation.errors);
         return result;
     }
-    std::vector<float> logits(kVocabulary);
-    validation = linear(layer_device(kLayers - 1U), "head", kVocabulary,
-                        kHidden, reduced, logits, false);
-    if (!validation.ok()) {
-        result.errors = std::move(validation.errors);
-        return result;
+    FutureEntropyEvaluator lookahead;
+    if (active_sampling.future_entropy_candidates != 0U) {
+        lookahead = [this, position](std::span<const std::uint32_t> candidates,
+                                     std::uint32_t top_n,
+                                     std::span<double> normalized_entropy) {
+            return future_entropy(candidates, top_n, position,
+                                  normalized_entropy);
+        };
     }
     last_sample = sample_logits(
         logits, active_sampling,
-        SamplingHistory{sampled_token_counts, sampled_token_ids}, sampler);
+        SamplingHistory{sampled_token_counts, sampled_token_ids}, sampler,
+        lookahead);
+    if (!last_sample.ok()) {
+        result.errors = last_sample.errors;
+        return result;
+    }
     result.value = last_sample.token;
     ++sampled_token_counts[result.value];
     sampled_token_ids.push_back(result.value);
     if (config.enable_logit_trace) {
         record_logits(position, token, result.value, logits);
     }
-    graph_stats.output_head_nanoseconds += elapsed_nanoseconds(head_started);
     ++graph_stats.forward_tokens;
     return result;
 }

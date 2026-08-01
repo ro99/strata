@@ -278,6 +278,280 @@ TEST_CASE("sampler validation rejects each out-of-range knob") {
     REQUIRE(rejects([](auto& o) {
         o.temperature = std::numeric_limits<double>::quiet_NaN();
     }, "temperature"));
+    REQUIRE(rejects([](auto& o) {
+        o.future_entropy_alpha = 1.5;
+    }, "future_entropy_alpha"));
+    REQUIRE(rejects([](auto& o) {
+        o.future_entropy_wave_period = 0.0;
+    }, "future_entropy_wave_period"));
+    REQUIRE(rejects([](auto& o) {
+        o.future_entropy_candidates = 65U;
+    }, "future_entropy_candidates"));
+    // One candidate cannot be reranked, so asking to look ahead at exactly one
+    // is a mistake worth naming rather than an expensive no-op.
+    REQUIRE(rejects([](auto& o) {
+        o.future_entropy_candidates = 1U;
+    }, "future_entropy_candidates"));
+    REQUIRE(rejects([](auto& o) {
+        o.future_entropy_candidates = 4U;
+        o.future_entropy_top_n = 1U;
+    }, "future_entropy_top_n"));
+}
+
+TEST_CASE("normalized future entropy spans a flat and a decided distribution") {
+    // A uniform top-n carries the maximum entropy ln n, so the ratio is 1.
+    constexpr std::array<float, 4> uniform{2.0F, 2.0F, 2.0F, 2.0F};
+    REQUIRE(std::abs(strata::normalized_top_n_entropy(uniform, 4U) - 1.0) < 1e-9);
+    // One token taking essentially all the mass carries almost none.
+    constexpr std::array<float, 4> decided{80.0F, 0.0F, 0.0F, 0.0F};
+    REQUIRE(strata::normalized_top_n_entropy(decided, 4U) < 1e-6);
+    // Only the top-n participate: widening n past the live tokens lowers the
+    // ratio, because ln n grows while the entropy does not.
+    constexpr std::array<float, 4> pair{5.0F, 5.0F, -80.0F, -80.0F};
+    REQUIRE(std::abs(strata::normalized_top_n_entropy(pair, 2U) - 1.0) < 1e-9);
+    REQUIRE(strata::normalized_top_n_entropy(pair, 4U) < 0.51);
+    // ln 1 is zero, so a single option has no measurable future.
+    REQUIRE(strata::normalized_top_n_entropy(uniform, 1U) == 0.0);
+}
+
+TEST_CASE("the alpha crossfader reproduces the article's exponents") {
+    strata::SamplingOptions options;
+    // The article's mapping: a = 1 - max(0, alpha), b = 1 - max(0, -alpha).
+    // Endpoints are pure probability and pure entropy, and alpha 0 is the
+    // headline s = p * H_hat with both exponents at one.
+    options.future_entropy_alpha = -1.0;
+    REQUIRE(strata::future_entropy_alpha_at(options, 0U) == -1.0);
+    options.future_entropy_alpha = 1.0;
+    REQUIRE(strata::future_entropy_alpha_at(options, 0U) == 1.0);
+
+    // The alpha-wave sweeps a sine over the generated tokens and clamps.
+    options.future_entropy_alpha = 0.0;
+    options.future_entropy_wave_amplitude = 1.0;
+    options.future_entropy_wave_period = 4.0;
+    REQUIRE(std::abs(strata::future_entropy_alpha_at(options, 0U)) < 1e-12);
+    REQUIRE(std::abs(strata::future_entropy_alpha_at(options, 1U) - 1.0) < 1e-12);
+    REQUIRE(std::abs(strata::future_entropy_alpha_at(options, 3U) + 1.0) < 1e-12);
+    options.future_entropy_alpha = 0.5;
+    options.future_entropy_wave_amplitude = 2.0;
+    REQUIRE(strata::future_entropy_alpha_at(options, 1U) == 1.0);
+    REQUIRE(strata::future_entropy_alpha_at(options, 3U) == -1.0);
+}
+
+TEST_CASE("future entropy reranks candidates by the future they unlock") {
+    // Token 0 is the likeliest by a wide margin but leads somewhere decided;
+    // token 1 is less likely and leads somewhere wide open.
+    constexpr std::array<float, 3> logits{4.0F, 3.0F, -20.0F};
+    const std::array<double, 3> futures{0.01, 0.99, 0.5};
+    std::vector<std::uint32_t> seen;
+    const strata::FutureEntropyEvaluator lookahead =
+        [&futures, &seen](std::span<const std::uint32_t> candidates,
+                          std::uint32_t top_n, std::span<double> entropy) {
+            REQUIRE(top_n == 8U);
+            seen.assign(candidates.begin(), candidates.end());
+            for (std::size_t index = 0U; index < candidates.size(); ++index) {
+                entropy[index] = futures[candidates[index]];
+            }
+            return strata::ValidationResult{};
+        };
+
+    strata::SamplingOptions options;
+    options.temperature = 0.0;
+    options.future_entropy_candidates = 2U;
+    options.future_entropy_top_n = 8U;
+    std::mt19937_64 generator(7U);
+
+    // alpha -1 is ordinary sampling: the stage must not move the argmax.
+    options.future_entropy_alpha = -1.0;
+    auto sampled = strata::sample_logits(logits, options, {}, generator, lookahead);
+    REQUIRE(sampled.ok());
+    REQUIRE(sampled.token == 0U);
+    // The lookahead budget goes to the likeliest candidates, in that order.
+    REQUIRE(seen.size() == 2U);
+    REQUIRE(seen[0] == 0U);
+    REQUIRE(seen[1] == 1U);
+
+    // alpha +1 scores on the future alone, so the wider future wins despite
+    // being the less likely token.
+    options.future_entropy_alpha = 1.0;
+    sampled = strata::sample_logits(logits, options, {}, generator, lookahead);
+    REQUIRE(sampled.ok());
+    REQUIRE(sampled.token == 1U);
+
+    // alpha 0 is p * H_hat: 0.731 * 0.01 against 0.269 * 0.99, so the open
+    // future still wins, but now on the product rather than on entropy alone.
+    options.future_entropy_alpha = 0.0;
+    sampled = strata::sample_logits(logits, options, {}, generator, lookahead);
+    REQUIRE(sampled.ok());
+    REQUIRE(sampled.token == 1U);
+}
+
+TEST_CASE("future entropy draws from the blended score, not its argmax") {
+    // Equally likely tokens with equal futures must stay equally likely: the
+    // stage reweights the draw, it does not collapse it onto the best score.
+    constexpr std::array<float, 2> logits{0.0F, 0.0F};
+    const strata::FutureEntropyEvaluator lookahead =
+        [](std::span<const std::uint32_t> candidates, std::uint32_t,
+           std::span<double> entropy) {
+            for (std::size_t index = 0U; index < candidates.size(); ++index) {
+                entropy[index] = 0.5;
+            }
+            return strata::ValidationResult{};
+        };
+    strata::SamplingOptions options;
+    options.temperature = 1.0;
+    options.future_entropy_candidates = 2U;
+    options.future_entropy_alpha = 0.0;
+    std::mt19937_64 generator(33'377'335U);
+    std::size_t first = 0U;
+    constexpr std::size_t draws = 4'000U;
+    for (std::size_t iteration = 0U; iteration < draws; ++iteration) {
+        const auto sampled =
+            strata::sample_logits(logits, options, {}, generator, lookahead);
+        REQUIRE(sampled.ok());
+        if (sampled.token == 0U) ++first;
+    }
+    const double share = static_cast<double>(first) / static_cast<double>(draws);
+    REQUIRE(std::abs(share - 0.5) < 0.05);
+}
+
+TEST_CASE("future entropy weights the draw in proportion to the score") {
+    // Two equally likely tokens whose futures are 3:1 apart must be drawn 3:1
+    // apart at alpha 0, where s = p * H_hat and p cancels.
+    constexpr std::array<float, 2> logits{0.0F, 0.0F};
+    const strata::FutureEntropyEvaluator lookahead =
+        [](std::span<const std::uint32_t> candidates, std::uint32_t,
+           std::span<double> entropy) {
+            for (std::size_t index = 0U; index < candidates.size(); ++index) {
+                entropy[index] = candidates[index] == 0U ? 0.75 : 0.25;
+            }
+            return strata::ValidationResult{};
+        };
+    strata::SamplingOptions options;
+    options.temperature = 1.0;
+    options.future_entropy_candidates = 2U;
+    options.future_entropy_alpha = 0.0;
+    std::mt19937_64 generator(33'377'335U);
+    std::size_t first = 0U;
+    constexpr std::size_t draws = 4'000U;
+    for (std::size_t iteration = 0U; iteration < draws; ++iteration) {
+        const auto sampled =
+            strata::sample_logits(logits, options, {}, generator, lookahead);
+        REQUIRE(sampled.ok());
+        if (sampled.token == 0U) ++first;
+    }
+    const double share = static_cast<double>(first) / static_cast<double>(draws);
+    REQUIRE(std::abs(share - 0.75) < 0.05);
+}
+
+TEST_CASE("the two crossfader curves agree only at the endpoints") {
+    constexpr std::array<float, 2> logits{1.0F, 0.0F};
+    const strata::FutureEntropyEvaluator lookahead =
+        [](std::span<const std::uint32_t> candidates, std::uint32_t,
+           std::span<double> entropy) {
+            for (std::size_t index = 0U; index < candidates.size(); ++index) {
+                entropy[index] = candidates[index] == 0U ? 0.2 : 0.8;
+            }
+            return strata::ValidationResult{};
+        };
+    strata::SamplingOptions options;
+    options.temperature = 1.0;
+    options.future_entropy_candidates = 2U;
+    options.future_entropy_alpha = 0.0;
+
+    // At alpha 0 the article scores p * H_hat and the crossfade scores its
+    // square root, so the crossfade is the flatter of the two distributions.
+    const auto share = [&options, &logits, &lookahead]() {
+        std::mt19937_64 generator(33'377'335U);
+        std::size_t first = 0U;
+        constexpr std::size_t draws = 4'000U;
+        for (std::size_t iteration = 0U; iteration < draws; ++iteration) {
+            first += strata::sample_logits(logits, options, {}, generator,
+                                           lookahead).token == 0U ? 1U : 0U;
+        }
+        return static_cast<double>(first) / static_cast<double>(draws);
+    };
+    options.future_entropy_curve = strata::FutureEntropyCurve::Article;
+    const double article = share();
+    options.future_entropy_curve = strata::FutureEntropyCurve::Crossfade;
+    const double crossfade = share();
+    REQUIRE(article < 0.5);
+    REQUIRE(crossfade > article);
+    REQUIRE(std::abs(crossfade - 0.5) < std::abs(article - 0.5));
+}
+
+TEST_CASE("future entropy reports a missing or failing lookahead") {
+    constexpr std::array<float, 3> logits{3.0F, 2.0F, 1.0F};
+    strata::SamplingOptions options;
+    options.temperature = 1.0;
+    options.future_entropy_candidates = 2U;
+    std::mt19937_64 generator(7U);
+
+    // No evaluator: the stage cannot run, and a sample that silently skipped
+    // it would be a different sampler wearing the same settings.
+    const auto missing = strata::sample_logits(logits, options, {}, generator);
+    REQUIRE(!missing.ok());
+
+    const strata::FutureEntropyEvaluator failing =
+        [](std::span<const std::uint32_t>, std::uint32_t, std::span<double>) {
+            strata::ValidationResult result;
+            result.errors.emplace_back("lookahead exceeded the context ceiling");
+            return result;
+        };
+    const auto failed =
+        strata::sample_logits(logits, options, {}, generator, failing);
+    REQUIRE(!failed.ok());
+    REQUIRE(failed.errors.front() == "lookahead exceeded the context ceiling");
+}
+
+TEST_CASE("future entropy is skipped when truncation leaves one candidate") {
+    // A single survivor has no ranking to change, so the lookahead must not
+    // be called at all: it would cost a forward pass and decide nothing.
+    constexpr std::array<float, 3> logits{9.0F, 1.0F, 0.0F};
+    bool called = false;
+    const strata::FutureEntropyEvaluator lookahead =
+        [&called](std::span<const std::uint32_t>, std::uint32_t,
+                  std::span<double>) {
+            called = true;
+            return strata::ValidationResult{};
+        };
+    strata::SamplingOptions options;
+    options.temperature = 1.0;
+    options.top_k = 1U;
+    options.future_entropy_candidates = 4U;
+    std::mt19937_64 generator(7U);
+    const auto sampled =
+        strata::sample_logits(logits, options, {}, generator, lookahead);
+    REQUIRE(sampled.ok());
+    REQUIRE(sampled.token == 0U);
+    REQUIRE(!called);
+}
+
+TEST_CASE("future entropy runs after truncation, on the survivors only") {
+    // min_p cuts the tail first; the lookahead budget is then spent only on
+    // what survived, so an implausible token cannot be revived by its future.
+    constexpr std::array<float, 4> logits{4.0F, 3.6F, -6.0F, -8.0F};
+    std::vector<std::uint32_t> seen;
+    const strata::FutureEntropyEvaluator lookahead =
+        [&seen](std::span<const std::uint32_t> candidates, std::uint32_t,
+                std::span<double> entropy) {
+            seen.assign(candidates.begin(), candidates.end());
+            for (std::size_t index = 0U; index < candidates.size(); ++index) {
+                // The tail, if it ever got here, would look maximally open.
+                entropy[index] = candidates[index] >= 2U ? 1.0 : 0.1;
+            }
+            return strata::ValidationResult{};
+        };
+    strata::SamplingOptions options;
+    options.temperature = 1.0;
+    options.min_p = 0.05;
+    options.future_entropy_candidates = 16U;
+    options.future_entropy_alpha = 1.0;
+    std::mt19937_64 generator(7U);
+    const auto sampled =
+        strata::sample_logits(logits, options, {}, generator, lookahead);
+    REQUIRE(sampled.ok());
+    REQUIRE(seen.size() == 2U);
+    REQUIRE(sampled.token < 2U);
 }
 
 TEST_CASE("stop sequences are withheld across token-piece boundaries") {

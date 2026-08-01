@@ -580,6 +580,9 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << ",\"mhc_post_seconds\":" << seconds(stats.mhc_post_nanoseconds)
            << ",\"output_head_seconds\":"
            << seconds(stats.output_head_nanoseconds)
+           << ",\"future_entropy_seconds\":"
+           << seconds(stats.future_entropy_nanoseconds)
+           << ",\"future_entropy_passes\":" << stats.future_entropy_passes
            << '}';
 }
 

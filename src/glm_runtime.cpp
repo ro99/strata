@@ -1304,25 +1304,23 @@ struct Glm52Runtime::Impl {
         return result;
     }
 
-    ParseResult<std::uint32_t> forward(std::span<const std::uint32_t> token_ids,
-                                       std::uint32_t position_base, bool prefill) {
-        ParseResult<std::uint32_t> result;
+    // Runs the graph and returns the logits for the last row. Appends the rows
+    // to the KV cache, so a speculative call must be undone with
+    // `rewind_kv(position_base)`.
+    ValidationResult compute_logits(std::span<const std::uint32_t> token_ids,
+                                    std::uint32_t position_base, bool prefill,
+                                    std::vector<float>& logits) {
+        ValidationResult result;
         const auto rows = static_cast<std::uint32_t>(token_ids.size());
         if (rows == 0U || position_base + rows > config.maximum_context_tokens) {
             result.errors.emplace_back("forward pass exceeds the configured context ceiling");
             return result;
         }
         std::vector<float> hidden(static_cast<std::size_t>(rows) * kHidden);
-        auto status = embed(token_ids, hidden);
-        if (!status.ok()) {
-            result.errors = std::move(status.errors);
-            return result;
-        }
-        status = forward_layers(hidden, rows, position_base, prefill);
-        if (!status.ok()) {
-            result.errors = std::move(status.errors);
-            return result;
-        }
+        result = embed(token_ids, hidden);
+        if (!result.ok()) return result;
+        result = forward_layers(hidden, rows, position_base, prefill);
+        if (!result.ok()) return result;
         auto final_norm = host_tensor("model.norm.weight", kHidden);
         if (!final_norm.ok()) {
             result.errors = std::move(final_norm.errors);
@@ -1330,15 +1328,61 @@ struct Glm52Runtime::Impl {
         }
         std::vector<float> normalized(kHidden);
         const auto last = std::span<const float>(hidden).last(kHidden);
-        status = rms_norm_f32(normalized, last, *final_norm.value,
+        result = rms_norm_f32(normalized, last, *final_norm.value,
                               kGlm52RmsNormEpsilon);
-        if (!status.ok()) {
-            result.errors = std::move(status.errors);
+        if (!result.ok()) return result;
+        logits.assign(kVocabulary, 0.0F);
+        return linear(layer_device(kLayers - 1U), "lm_head", kVocabulary,
+                      kHidden, normalized, 1U, logits);
+    }
+
+    // Drops every cached row from `tokens` onward. The cache is append-only
+    // and contiguous, so truncating the three vectors restores the state the
+    // speculative pass started from exactly, with no recomputation.
+    void rewind_kv(std::uint32_t tokens) {
+        for (auto& cache : kv) {
+            cache.rope.resize(static_cast<std::size_t>(tokens) * kRope);
+            cache.keys.resize(static_cast<std::size_t>(tokens) * kHeads * kNope);
+            cache.values.resize(
+                static_cast<std::size_t>(tokens) * kHeads * kValueHead);
+        }
+    }
+
+    // One lookahead step per candidate: decode `c + w`, measure how open the
+    // resulting distribution is, then rewind. Sequential rather than batched
+    // because the KV cache holds a single sequence, so each candidate costs a
+    // full decode step.
+    // `cached_tokens` is the length of the accepted sequence, which is both
+    // the position each candidate would occupy and the rewind target.
+    ValidationResult future_entropy(std::span<const std::uint32_t> candidates,
+                                    std::uint32_t top_n,
+                                    std::uint32_t cached_tokens,
+                                    std::span<double> normalized_entropy) {
+        ValidationResult result;
+        if (cached_tokens >= config.maximum_context_tokens) {
+            result.errors.emplace_back(
+                "future-entropy lookahead exceeds the configured context ceiling");
             return result;
         }
-        std::vector<float> logits(kVocabulary);
-        status = linear(layer_device(kLayers - 1U), "lm_head", kVocabulary,
-                        kHidden, normalized, 1U, logits);
+        std::vector<float> logits;
+        for (std::size_t index = 0U; index < candidates.size(); ++index) {
+            const std::array<std::uint32_t, 1> speculative{candidates[index]};
+            result = compute_logits(speculative, cached_tokens, false, logits);
+            // Rewind whether or not the pass succeeded: a partially appended
+            // row would desynchronize the cache from the accepted sequence.
+            rewind_kv(cached_tokens);
+            if (!result.ok()) return result;
+            normalized_entropy[index] = normalized_top_n_entropy(logits, top_n);
+        }
+        return result;
+    }
+
+    ParseResult<std::uint32_t> forward(std::span<const std::uint32_t> token_ids,
+                                       std::uint32_t position_base, bool prefill) {
+        ParseResult<std::uint32_t> result;
+        const auto rows = static_cast<std::uint32_t>(token_ids.size());
+        std::vector<float> logits;
+        auto status = compute_logits(token_ids, position_base, prefill, logits);
         if (!status.ok()) {
             result.errors = std::move(status.errors);
             return result;
@@ -1354,9 +1398,26 @@ struct Glm52Runtime::Impl {
                 second = token;
             }
         }
+        // The lookahead decodes from the state this pass just left behind, so
+        // it starts where the accepted sequence now ends.
+        const auto cached_tokens = position_base + rows;
+        FutureEntropyEvaluator lookahead;
+        if (active_sampling.future_entropy_candidates != 0U) {
+            lookahead = [this, cached_tokens](
+                std::span<const std::uint32_t> candidates, std::uint32_t top_n,
+                std::span<double> normalized_entropy) {
+                return future_entropy(candidates, top_n, cached_tokens,
+                                      normalized_entropy);
+            };
+        }
         last_sample = sample_logits(
             logits, active_sampling,
-            SamplingHistory{sampled_token_counts, sampled_token_ids}, sampler);
+            SamplingHistory{sampled_token_counts, sampled_token_ids}, sampler,
+            lookahead);
+        if (!last_sample.ok()) {
+            result.errors = last_sample.errors;
+            return result;
+        }
         result.value = last_sample.token;
         ++sampled_token_counts[result.value];
         sampled_token_ids.push_back(result.value);

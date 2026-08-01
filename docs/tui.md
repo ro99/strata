@@ -43,20 +43,26 @@ Add `--setup` to prefill the form instead of launching. Add
 `--flash-attention` only when intentionally selecting the CUDA FlashAttention
 candidate.
 
-The `SAMPLER` field cycles the three strata-chat presets with `←`/`→`.
+The `SAMPLER` field cycles the four strata-chat presets with `←`/`→`.
 `PRECISE` adds no stages at all — the `TEMPERATURE` field is the only thing in
 effect, so this is where to land for plain temperature sampling (or greedy, at
 temperature 0). `BALANCED` adds min-p truncation and a light repetition
-penalty. `CREATIVE` adds XTC and DRY on top of a lower min-p. Cycling the
-preset rewrites `TEMPERATURE` to the value the bundle assumes (`0` for
-precise, `1` for the other two), and editing `TEMPERATURE` afterward always
-overrides that default — the preset's other stages stay in effect regardless.
-Individual sampler knobs beyond temperature are not on the form; pass them to
-`strata-chat` directly when a preset is not the shape you want.
+penalty. `CREATIVE` adds XTC and DRY on top of a lower min-p.
+`FUTURE-ENTROPY` scores candidates by how much future choice they unlock, and
+is the one bundle that changes the cost of a token rather than only its
+distribution: it decodes one lookahead step per candidate, so expect roughly
+21× the time per token. Cycling the preset rewrites `TEMPERATURE` to the value
+the bundle assumes (`0` for precise, `1` for the other three), and editing
+`TEMPERATURE` afterward always overrides that default — the preset's other
+stages stay in effect regardless. Individual sampler knobs beyond temperature
+are not on the form; pass them to `strata-chat` directly when a preset is not
+the shape you want.
 
 The form labels a session exact only when nothing stochastic is enabled. That
 is temperature zero *and* no XTC, since XTC draws from the generator at any
-temperature — so `CREATIVE` never shows as exact, even at temperature 0.
+temperature — so `CREATIVE` never shows as exact, even at temperature 0. The
+future-entropy lookahead draws nothing itself, so `FUTURE-ENTROPY` is reported
+by the same rule as `BALANCED`.
 
 ## Interface
 

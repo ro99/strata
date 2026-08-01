@@ -139,6 +139,12 @@ struct Dsv4GraphStats {
     std::uint64_t moe_prepare_nanoseconds{};
     std::uint64_t mhc_post_nanoseconds{};
     std::uint64_t output_head_nanoseconds{};
+    // Future-entropy lookahead, kept separate because it is whole speculative
+    // forward passes rather than a phase of one. The per-phase counters above
+    // include the work these passes did; this is how much of it was
+    // speculative, and `future_entropy_passes` is how many passes that was.
+    std::uint64_t future_entropy_nanoseconds{};
+    std::uint64_t future_entropy_passes{};
 };
 
 struct Dsv4PhaseMetrics {

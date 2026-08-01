@@ -145,6 +145,27 @@ bool parse_sampler_extension(std::string_view key, detail::JsonCursor& cursor,
         return bounded_u32(sampling.dry_window, 1U << 24U, "dry_window");
     } else if (key == "no_repeat_ngram") {
         return bounded_u32(sampling.no_repeat_ngram, 1U << 16U, "no_repeat_ngram");
+    } else if (key == "future_entropy_candidates") {
+        return bounded_u32(sampling.future_entropy_candidates, 64U,
+                           "future_entropy_candidates");
+    } else if (key == "future_entropy_top_n") {
+        return bounded_u32(sampling.future_entropy_top_n, 1U << 20U,
+                           "future_entropy_top_n");
+    } else if (key == "alpha") sampling.future_entropy_alpha = cursor.parse_number();
+    else if (key == "future_entropy_curve") {
+        const auto curve = cursor.parse_string();
+        if (curve == "article") {
+            sampling.future_entropy_curve = FutureEntropyCurve::Article;
+        } else if (curve == "crossfade") {
+            sampling.future_entropy_curve = FutureEntropyCurve::Crossfade;
+        } else {
+            error = "future_entropy_curve is not a known curve";
+            return false;
+        }
+    } else if (key == "alpha_wave_amplitude") {
+        sampling.future_entropy_wave_amplitude = cursor.parse_number();
+    } else if (key == "alpha_wave_period") {
+        sampling.future_entropy_wave_period = cursor.parse_number();
     } else {
         handled = false;
     }

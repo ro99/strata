@@ -46,6 +46,7 @@ pub enum SamplerPreset {
     Precise,
     Balanced,
     Creative,
+    FutureEntropy,
 }
 
 impl SamplerPreset {
@@ -54,6 +55,7 @@ impl SamplerPreset {
             Self::Precise => "precise",
             Self::Balanced => "balanced",
             Self::Creative => "creative",
+            Self::FutureEntropy => "future-entropy",
         }
     }
 
@@ -66,6 +68,7 @@ impl SamplerPreset {
             Self::Precise => "PRECISE  (no extra stages)",
             Self::Balanced => "BALANCED (min-p, light repetition control)",
             Self::Creative => "CREATIVE (min-p + XTC + DRY)",
+            Self::FutureEntropy => "FUTURE-ENTROPY (lookahead; ~21x slower)",
         }
     }
 
@@ -74,12 +77,14 @@ impl SamplerPreset {
     pub const fn temperature(self) -> &'static str {
         match self {
             Self::Precise => "0",
-            Self::Balanced | Self::Creative => "1",
+            Self::Balanced | Self::Creative | Self::FutureEntropy => "1",
         }
     }
 
     /// XTC draws from the generator regardless of temperature, so the creative
     /// bundle is never reproducible-by-temperature the way the others are.
+    /// The future-entropy lookahead is itself deterministic, so that bundle
+    /// draws only through its temperature, like the balanced one.
     pub const fn draws(self) -> bool {
         matches!(self, Self::Creative)
     }
@@ -88,7 +93,8 @@ impl SamplerPreset {
         match self {
             Self::Precise => Self::Balanced,
             Self::Balanced => Self::Creative,
-            Self::Creative => Self::Precise,
+            Self::Creative => Self::FutureEntropy,
+            Self::FutureEntropy => Self::Precise,
         }
     }
 }
@@ -296,6 +302,7 @@ pub fn parse_cli() -> Result<Cli, String> {
                     "precise" => SamplerPreset::Precise,
                     "balanced" => SamplerPreset::Balanced,
                     "creative" => SamplerPreset::Creative,
+                    "future-entropy" => SamplerPreset::FutureEntropy,
                     value => return Err(format!("Unknown sampler preset: {value}")),
                 };
                 config.temperature = config.sampler.temperature().into();
@@ -320,7 +327,7 @@ Usage: strata-tui [OPTIONS]\n\n\
   --devices 0,1,2            CUDA device list\n\
   --context-size N            logical context ceiling\n\
   --max-new N                 maximum generated tokens\n\
-  --preset NAME               precise, balanced, or creative sampler\n\
+  --preset NAME               precise, balanced, creative, or future-entropy\n\
   --temperature F             0 is exact greedy decoding\n\
   --vram-fraction F           free VRAM cache fraction (max 0.95)\n\
   --seed N                    sampling seed\n\

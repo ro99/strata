@@ -33,7 +33,10 @@ TEST_CASE("sampler extensions reach both OpenAI endpoints") {
         R"("top_k":40,"min_p":0.05,"typical_p":0.9,"xtc_probability":0.5,)"
         R"("xtc_threshold":0.15,"repetition_penalty":1.1,"penalty_window":256,)"
         R"("dry_multiplier":0.8,"dry_base":1.75,"dry_allowed_length":3,)"
-        R"("dry_window":512,"no_repeat_ngram":4)";
+        R"("dry_window":512,"no_repeat_ngram":4,)"
+        R"("future_entropy_candidates":20,"future_entropy_top_n":30,)"
+        R"("alpha":0.5,"future_entropy_curve":"crossfade",)"
+        R"("alpha_wave_amplitude":0.6,"alpha_wave_period":50)";
     const auto check = [](const strata::SamplingOptions& sampling) {
         REQUIRE(sampling.top_k == 40U);
         REQUIRE(sampling.min_p == 0.05);
@@ -46,6 +49,13 @@ TEST_CASE("sampler extensions reach both OpenAI endpoints") {
         REQUIRE(sampling.dry_allowed_length == 3U);
         REQUIRE(sampling.dry_window == 512U);
         REQUIRE(sampling.no_repeat_ngram == 4U);
+        REQUIRE(sampling.future_entropy_candidates == 20U);
+        REQUIRE(sampling.future_entropy_top_n == 30U);
+        REQUIRE(sampling.future_entropy_alpha == 0.5);
+        REQUIRE(sampling.future_entropy_curve ==
+                strata::FutureEntropyCurve::Crossfade);
+        REQUIRE(sampling.future_entropy_wave_amplitude == 0.6);
+        REQUIRE(sampling.future_entropy_wave_period == 50.0);
     };
 
     strata::OpenAiChatRequest chat;
@@ -68,6 +78,16 @@ TEST_CASE("sampler extensions reach both OpenAI endpoints") {
     REQUIRE(!strata::parse_openai_completion_request(
         R"({"model":"local","prompt":"x","dry_base":0.5})", completion, error));
     REQUIRE(error.find("dry_base") != std::string::npos);
+    REQUIRE(!strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"x"}],)"
+        R"("alpha":2.0})", chat, error));
+    REQUIRE(error.find("future_entropy_alpha") != std::string::npos);
+    // An unknown curve must be named, not silently taken as the default: the
+    // two curves are different samplers at every alpha but the endpoints.
+    REQUIRE(!strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"x"}],)"
+        R"("future_entropy_curve":"balanced"})", chat, error));
+    REQUIRE(error.find("future_entropy_curve") != std::string::npos);
 }
 
 TEST_CASE("OpenAI protocol rejects silent semantic fallbacks") {

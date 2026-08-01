@@ -328,3 +328,65 @@ TEST_CASE("DeepSeek KV device eviction protects in-flight blocks") {
     REQUIRE(backend.stats().activation_h2d_bytes == block_bytes * 3U);
     REQUIRE(backend.stats().synchronization_calls == 3U);
 }
+
+TEST_CASE("DeepSeek KV truncation restores the state a lookahead started from") {
+    // The future-entropy lookahead decodes one speculative token per candidate
+    // and then rolls the sequence back. What it rolls back to has to be
+    // bit-identical to never having decoded it, because the token the sampler
+    // goes on to emit is decoded from exactly this state.
+    constexpr auto head_dim = strata::kDeepSeekV4ExecutionContract.head_dim;
+    strata::Dsv4KvCacheConfig config;
+    config.block_rows = 4U;
+    config.sliding_window_rows = 16U;
+    config.host_capacity_bytes = 1U << 20U;
+    strata::Dsv4KvCache cache(config);
+    const auto sequence = cache.create_sequence();
+    REQUIRE(sequence.ok());
+
+    // Six accepted tokens, spanning a block boundary so the rollback has to
+    // release a block rather than only move an end marker.
+    constexpr std::uint64_t accepted = 6U;
+    for (std::uint64_t position = 0U; position < accepted; ++position) {
+        REQUIRE(cache.append(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                             0U, 1U, position,
+                             row(head_dim, static_cast<float>(position + 1U))).ok());
+    }
+    const auto accepted_blocks = cache.stats().used_blocks;
+    const auto before = cache.block_table(
+        sequence.value, strata::Dsv4KvBlockKind::Sliding, 0U);
+    REQUIRE(before.ok());
+
+    // Three candidates, each decoded at the same position and then undone.
+    for (std::uint32_t candidate = 0U; candidate < 3U; ++candidate) {
+        REQUIRE(cache.append(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                             0U, 1U, accepted,
+                             row(head_dim, -static_cast<float>(candidate + 1U))).ok());
+        REQUIRE(cache.truncate_sequence(sequence.value, accepted).ok());
+
+        const auto after = cache.block_table(
+            sequence.value, strata::Dsv4KvBlockKind::Sliding, 0U);
+        REQUIRE(after.ok());
+        REQUIRE(after.value.size() == before.value.size());
+        REQUIRE(cache.stats().used_blocks == accepted_blocks);
+        // The speculative row is gone, not merely hidden behind an end marker.
+        REQUIRE(!cache.row(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                           0U, accepted).ok());
+        // Every accepted row still reads back exactly as it was written.
+        for (std::uint64_t position = 0U; position < accepted; ++position) {
+            const auto stored = cache.row(
+                sequence.value, strata::Dsv4KvBlockKind::Sliding, 0U, position);
+            REQUIRE(stored.ok());
+            require_bit_equal(stored.value,
+                              row(head_dim, static_cast<float>(position + 1U)));
+        }
+    }
+
+    // And the sequence still accepts the real token at the position the
+    // speculative ones occupied, with no contiguity complaint.
+    REQUIRE(cache.append(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                         0U, 1U, accepted, row(head_dim, 12.0F)).ok());
+    const auto emitted = cache.row(
+        sequence.value, strata::Dsv4KvBlockKind::Sliding, 0U, accepted);
+    REQUIRE(emitted.ok());
+    require_bit_equal(emitted.value, row(head_dim, 12.0F));
+}

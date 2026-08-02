@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/chat_protocol.hpp"
+#include "strata/placement.hpp"
 #include "strata/result.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
@@ -34,6 +35,13 @@ struct RuntimeConfig {
     bool deepseek_block_kv_cache{};
     bool pin_resident_arena{};
     bool prepack_mhc_projection{true};
+    // Placement plan cache. An empty directory selects the default location;
+    // see placement_cache_directory. A cached plan that matches this
+    // checkpoint, hardware, and request is reused instead of recomputed.
+    std::string placement_cache_directory;
+    bool use_placement_cache{true};
+    bool refresh_placement_plan{};
+    bool report_placement_plan{};
 };
 
 struct GenerationMetrics {
@@ -63,6 +71,11 @@ struct GenerationOptions {
     SamplingOptions sampling;
     std::vector<std::string> stop;
 };
+
+// Placement inputs implied by a runtime configuration. Applications use this to
+// dry-run a load without constructing a session.
+[[nodiscard]] PlacementRequest placement_request_for(
+    const std::string& model_directory, const RuntimeConfig& config);
 
 // Stable application-facing facade. Architecture-specific diagnostics and
 // research controls remain available through the concrete runtimes.

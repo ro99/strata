@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/chat_protocol.hpp"
+#include "strata/placement.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
@@ -23,6 +24,11 @@ struct Gemma4RuntimeConfig {
     bool load_progress{};
     bool enable_flash_attention{true};
     bool enable_incremental_kv_continuation{true};
+    // Optional pre-solved placement. When present and prescriptive it supplies
+    // the layer-to-device assignment and the admitted per-device budgets, so
+    // the load performs exactly the placement a dry run printed. Borrowed for
+    // the duration of initialize only.
+    const PlacementPlan* placement{};
 };
 
 struct Gemma4RunMetrics {

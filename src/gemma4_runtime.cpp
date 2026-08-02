@@ -1138,31 +1138,60 @@ ValidationResult Gemma4Runtime::initialize(
             if (!result.ok()) return result;
         }
     }
-    const auto local_rows = std::min(
-        config.maximum_context_tokens, c.sliding_window);
-    const auto local_kv_bytes =
-        50ULL * local_rows * c.local_key_value_heads * c.local_head_dim *
-        2U * sizeof(std::uint16_t);
-    const auto global_kv_bytes =
-        10ULL * config.maximum_context_tokens * c.global_key_value_heads *
-        c.global_head_dim * 2U * sizeof(std::uint16_t);
-    const auto kv_bytes_per_device =
-        (local_kv_bytes + global_kv_bytes + config.devices.size() - 1U) /
-        config.devices.size();
-    const auto attention_reserve =
-        kMinimumAttentionWorkspace + kv_bytes_per_device;
-    auto plan = plan_runtime_devices(
-        config.devices, config.vram_cache_fraction, attention_reserve,
-        2ULL << 30U, "Gemma 4");
-    if (!plan.ok()) {
-        result.errors = std::move(plan.errors);
-        return result;
-    }
+    // A pre-solved plan already sized every layer, cache, and workspace against
+    // this hardware, so it replaces the uniform per-device KV estimate below
+    // with the exact per-device figure it committed to.
+    const bool planned_placement = config.placement != nullptr &&
+        config.placement->prescriptive &&
+        config.placement->layer_device.size() == c.layer_count &&
+        config.placement->device_budget_bytes.size() == config.devices.size() &&
+        config.placement->request.devices == config.devices &&
+        config.placement->request.maximum_context_tokens ==
+            config.maximum_context_tokens;
     std::vector<std::size_t> layer_schedule(c.layer_count);
-    for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
-        layer_schedule[layer] = plan.value.weighted_schedule[
-            static_cast<std::size_t>(layer) *
-            plan.value.weighted_schedule.size() / c.layer_count];
+    std::vector<std::uint64_t> weight_capacities;
+    if (planned_placement) {
+        layer_schedule = config.placement->layer_device;
+        for (std::size_t slot = 0U; slot < config.devices.size(); ++slot) {
+            const auto budget = config.placement->device_budget_bytes[slot];
+            const auto reserved = kMinimumAttentionWorkspace +
+                placement_component_bytes(*config.placement,
+                                          PlacementClass::KvCache, slot);
+            if (budget <= reserved) {
+                result.errors.emplace_back(
+                    "Gemma 4 placement plan leaves no weight capacity on CUDA device " +
+                    std::to_string(config.devices[slot]));
+                return result;
+            }
+            weight_capacities.push_back(budget - reserved);
+        }
+    } else {
+        const auto local_rows = std::min(
+            config.maximum_context_tokens, c.sliding_window);
+        const auto local_kv_bytes =
+            50ULL * local_rows * c.local_key_value_heads * c.local_head_dim *
+            2U * sizeof(std::uint16_t);
+        const auto global_kv_bytes =
+            10ULL * config.maximum_context_tokens * c.global_key_value_heads *
+            c.global_head_dim * 2U * sizeof(std::uint16_t);
+        const auto kv_bytes_per_device =
+            (local_kv_bytes + global_kv_bytes + config.devices.size() - 1U) /
+            config.devices.size();
+        const auto attention_reserve =
+            kMinimumAttentionWorkspace + kv_bytes_per_device;
+        auto plan = plan_runtime_devices(
+            config.devices, config.vram_cache_fraction, attention_reserve,
+            2ULL << 30U, "Gemma 4");
+        if (!plan.ok()) {
+            result.errors = std::move(plan.errors);
+            return result;
+        }
+        for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
+            layer_schedule[layer] = plan.value.weighted_schedule[
+                static_cast<std::size_t>(layer) *
+                plan.value.weighted_schedule.size() / c.layer_count];
+        }
+        weight_capacities = std::move(plan.value.weight_capacities);
     }
     std::vector<std::uint64_t> planned(config.devices.size());
     for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
@@ -1207,10 +1236,12 @@ ValidationResult Gemma4Runtime::initialize(
         }
     }
     for (std::size_t device = 0U; device < planned.size(); ++device) {
-        if (planned[device] > plan.value.weight_capacities[device]) {
+        if (planned[device] > weight_capacities[device]) {
             result.errors.emplace_back(
-                "Gemma 4 resident weights exceed admitted VRAM on CUDA device " +
-                std::to_string(config.devices[device]));
+                "Gemma 4 resident weights need " + format_bytes(planned[device]) +
+                " on CUDA device " + std::to_string(config.devices[device]) +
+                " but only " + format_bytes(weight_capacities[device]) +
+                " is admitted after the KV cache and attention workspace");
             return result;
         }
     }

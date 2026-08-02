@@ -48,13 +48,53 @@ capacity-weighted GPU schedule. GLM uses a per-device LRU weight cache with a pi
 host execution for cold routed experts. DeepSeek stages canonical routed expert
 weights in host RAM, pins its dense/shared spine in VRAM, and leases exact
 top-k expert triplets during device execution. Device assignment is a shared,
-capacity-weighted schedule. Its opt-in past-only predictor can queue bounded
+capacity-weighted schedule; see "Placement planning" for how it is sized,
+reported, and cached. Its opt-in past-only predictor can queue bounded
 host-to-VRAM expert prefetch without changing exact routes or coefficients;
 demand cancels queued duplicates and may evict prefetched entries first.
 
 There is no cross-request ticket ring, peer expert RPC, route-affinity cohort
 scheduler yet. Those are target architecture items and cannot be claimed by
 current benchmarks.
+
+## Placement planning
+
+`strata/placement.hpp` sizes a checkpoint against measured hardware before any
+weight is read. It has three pieces:
+
+- An **inventory** — every placeable module with its device bytes, host bytes,
+  and the bytes it contributes to one batch-1 decode step. Model-specific, built
+  from checkpoint headers only, hardware-independent, and therefore reproducible
+  and testable without a GPU.
+- A **solver** — a pure function from inventory plus a hardware probe to a plan.
+  It assigns layer blocks, applies the tier order device → host → NVMe to
+  spillable classes only, and reports the per-resource `W_r` volume of a decode
+  step. It measures no bandwidth and produces no duration.
+- A **plan cache** — the solved plan as JSON under `~/.cache/strata/plans`,
+  keyed by checkpoint identity (shard names, sizes, mtimes), GPU identity,
+  context size, device list, VRAM fraction, and flags. Any mismatch is a miss
+  and the plan is recomputed; a plan is never reinterpreted across a schema
+  version.
+
+Only sparse classes are marked spillable. A densely read class is read on every
+step, so moving it out of VRAM to make room for a sparsely read one is negative
+under a `max` over resources, and for a dense model larger than aggregate
+resident memory the plan reports I/O dependence rather than manufacturing
+sparsity.
+
+Placement is **prescriptive for Gemma 4**: the plan chooses contiguous,
+byte-balanced layer blocks sized to each device's admitted budget, and
+`Gemma4Runtime::initialize` consumes that assignment and those budgets. It is
+**descriptive for GLM and DeepSeek**: the solver reproduces the VRAM-weighted
+round-robin those runtimes already use and reports the resulting placement
+without changing it, so a planning defect cannot regress a validated runtime.
+DeepSeek's KV and compressor-state sizing is delegated to
+`plan_dsv4_resident_topology` rather than restated.
+
+`RuntimeSession::initialize` resolves and verifies a plan before constructing a
+runtime. Verification re-probes free VRAM, because the cached budget was taken
+at plan time and another process may have claimed memory since; a prescriptive
+plan that no longer fits is an error, and a descriptive one warns.
 
 ## Route traces
 

@@ -37,6 +37,10 @@ struct Options {
     bool pin_resident_arena{};
     bool prepack_mhc{true};
     bool jsonl_protocol{};
+    std::string plan_cache;
+    bool dry_run{};
+    bool use_plan_cache{true};
+    bool replan{};
 };
 
 // Bundles that make the sampler usable without knowing what nine knobs do.
@@ -99,6 +103,8 @@ void usage() {
         << "                    [--no-prepack-mhc]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
+        << "placement:          [--dry-run] [--replan]\n"
+        << "                    [--plan-cache DIR] [--no-plan-cache]\n\n"
         << "sampler:            [--preset precise|balanced|creative|future-entropy]\n"
         << "                    [--temperature F] [--seed N]\n"
         << "                    [--top-k N] [--top-p F] [--min-p F] [--typical-p F]\n"
@@ -123,7 +129,14 @@ void usage() {
         << "a no-op) to +1 (future entropy alone). Pair it with --min-p 0.05\n"
         << "or higher; entropy favours broken word-fragments otherwise.\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
-        << "The jsonl protocol reads prompt text and an optional messages array.\n";
+        << "The jsonl protocol reads prompt text and an optional messages array.\n\n"
+        << "--dry-run sizes every component against this machine, prints where\n"
+        << "each one would go, writes the plan to the cache, and exits without\n"
+        << "reading a single weight. The next real load reuses that plan, so it\n"
+        << "places exactly what the dry run printed. --replan recomputes and\n"
+        << "overwrites a cached plan; --no-plan-cache neither reads nor writes\n"
+        << "one. A plan is keyed by checkpoint, GPUs, context size, and device\n"
+        << "list: change any of them and it is recomputed automatically.\n";
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -153,11 +166,24 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.prepack_mhc = false;
             continue;
         }
+        if (argument == "--dry-run") {
+            options.dry_run = true;
+            continue;
+        }
+        if (argument == "--no-plan-cache") {
+            options.use_plan_cache = false;
+            continue;
+        }
+        if (argument == "--replan") {
+            options.replan = true;
+            continue;
+        }
         if (index + 1 >= argc) return false;
         const auto next = [&]() { return std::string_view(argv[++index]); };
         if (argument == "--model") options.model = std::string(next());
         else if (argument == "--model-type") options.model_type = std::string(next());
         else if (argument == "--prompt") options.prompt = std::string(next());
+        else if (argument == "--plan-cache") options.plan_cache = std::string(next());
         else if (argument == "--context-size" || argument == "--max-context") {
             if (!strata::cli::parse_positive_u32(next(), options.context_size)) return false;
         } else if (argument == "--max-new") {
@@ -615,6 +641,62 @@ int main(int argc, char** argv) {
         protocol_message("status", "Loading model");
     }
 
+    strata::RuntimeConfig config;
+    config.model = options.model_type == "glm"
+                       ? strata::RuntimeModel::Glm52
+                   : options.model_type == "gemma4"
+                       ? strata::RuntimeModel::Gemma4
+                       : strata::RuntimeModel::DeepSeekV4;
+    config.devices = options.devices;
+    config.maximum_context_tokens = options.context_size;
+    config.vram_cache_fraction = options.vram_fraction;
+    config.verbose = options.model_type == "deepseek";
+    config.load_progress = options.model_type != "deepseek";
+    config.sampling = options.sampling;
+    config.enable_flash_attention =
+        options.flash_attention || options.model_type == "gemma4";
+    config.enable_incremental_kv_continuation =
+        options.incremental_kv_continuation;
+    config.deepseek_block_kv_cache = options.block_kv_cache;
+    config.pin_resident_arena = options.pin_resident_arena;
+    config.prepack_mhc_projection = options.prepack_mhc;
+    config.placement_cache_directory = options.plan_cache;
+    config.use_placement_cache = options.use_plan_cache;
+    config.refresh_placement_plan = options.replan;
+    config.report_placement_plan = true;
+
+    if (options.dry_run) {
+        const auto resolved = strata::resolve_placement_plan(
+            strata::placement_request_for(options.model, config),
+            options.plan_cache, options.use_plan_cache, options.replan);
+        if (!resolved.ok()) {
+            for (const auto& error : resolved.errors) {
+                std::cerr << "error: " << error << '\n';
+                if (options.jsonl_protocol) protocol_message("error", error, true);
+            }
+            return 1;
+        }
+        if (options.jsonl_protocol) {
+            std::cout << strata::encode_placement_plan(resolved.value.plan)
+                      << std::flush;
+        } else {
+            std::cout << strata::render_placement_report(resolved.value.plan);
+        }
+        if (resolved.value.from_cache) {
+            std::cerr << "[dry-run] reused cached plan "
+                      << resolved.value.cache_path << '\n';
+        } else if (resolved.value.stored) {
+            std::cerr << "[dry-run] wrote plan " << resolved.value.cache_path
+                      << '\n';
+        } else {
+            std::cerr << "[dry-run] plan not cached (--no-plan-cache)\n";
+        }
+        std::cerr << "[dry-run] no weights were read"
+                  << (resolved.value.stored || resolved.value.from_cache
+                          ? "; the next load reuses this plan\n" : "\n");
+        return resolved.value.plan.fits ? 0 : 1;
+    }
+
     strata::RuntimeSession runtime;
     std::cerr << "[startup] model_type=" << options.model_type
               << " devices=" << strata::cli::devices_text(options.devices)
@@ -639,25 +721,6 @@ int main(int argc, char** argv) {
     }
     std::cerr << "[startup] loading model; this can take several minutes...\n";
     const auto initialization_started = std::chrono::steady_clock::now();
-    strata::RuntimeConfig config;
-    config.model = options.model_type == "glm"
-                       ? strata::RuntimeModel::Glm52
-                   : options.model_type == "gemma4"
-                       ? strata::RuntimeModel::Gemma4
-                       : strata::RuntimeModel::DeepSeekV4;
-    config.devices = options.devices;
-    config.maximum_context_tokens = options.context_size;
-    config.vram_cache_fraction = options.vram_fraction;
-    config.verbose = options.model_type == "deepseek";
-    config.load_progress = options.model_type != "deepseek";
-    config.sampling = options.sampling;
-    config.enable_flash_attention =
-        options.flash_attention || options.model_type == "gemma4";
-    config.enable_incremental_kv_continuation =
-        options.incremental_kv_continuation;
-    config.deepseek_block_kv_cache = options.block_kv_cache;
-    config.pin_resident_arena = options.pin_resident_arena;
-    config.prepack_mhc_projection = options.prepack_mhc;
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {

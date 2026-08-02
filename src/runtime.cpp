@@ -6,6 +6,7 @@
 
 #include <array>
 #include <algorithm>
+#include <iostream>
 #include <utility>
 #include <variant>
 
@@ -15,7 +16,35 @@ struct RuntimeSession::Impl {
     std::variant<std::monostate, Glm52Runtime, DeepSeekV4Runtime,
                  Gemma4Runtime> runtime;
     SamplingOptions sampling;
+    PlacementPlan placement;
+    bool placement_ready{};
 };
+
+namespace {
+
+[[nodiscard]] PlacementModel placement_model(RuntimeModel model) noexcept {
+    switch (model) {
+        case RuntimeModel::Glm52: return PlacementModel::Glm52;
+        case RuntimeModel::DeepSeekV4: return PlacementModel::DeepSeekV4;
+        case RuntimeModel::Gemma4: return PlacementModel::Gemma4;
+    }
+    return PlacementModel::Gemma4;
+}
+
+}  // namespace
+
+PlacementRequest placement_request_for(const std::string& model_directory,
+                                       const RuntimeConfig& config) {
+    PlacementRequest request;
+    request.model = placement_model(config.model);
+    request.model_directory = model_directory;
+    request.devices = config.devices;
+    request.vram_cache_fraction = config.vram_cache_fraction;
+    request.maximum_context_tokens = config.maximum_context_tokens;
+    request.flash_attention = config.enable_flash_attention;
+    request.block_kv_cache = config.deepseek_block_kv_cache;
+    return request;
+}
 
 RuntimeSession::RuntimeSession() : impl_(std::make_unique<Impl>()) {}
 RuntimeSession::~RuntimeSession() = default;
@@ -30,6 +59,51 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     impl_->sampling = config.sampling;
+
+    // Resolve placement before anything is uploaded. The plan decides where
+    // Gemma 4 puts each layer; for GLM and DeepSeek it reports and admits the
+    // placement those runtimes already perform without changing it, so a
+    // planning defect cannot regress a validated runtime.
+    auto resolved = resolve_placement_plan(
+        placement_request_for(model_directory, config),
+        config.placement_cache_directory, config.use_placement_cache,
+        config.refresh_placement_plan);
+    if (resolved.ok()) {
+        impl_->placement = std::move(resolved.value.plan);
+        impl_->placement_ready = true;
+        if (config.report_placement_plan) {
+            std::cerr << render_placement_report(impl_->placement)
+                      << "[placement] ";
+            if (resolved.value.from_cache) {
+                std::cerr << "reused cached plan " << resolved.value.cache_path;
+            } else if (resolved.value.stored) {
+                std::cerr << "computed and cached plan "
+                          << resolved.value.cache_path;
+            } else {
+                std::cerr << "computed plan; not cached";
+            }
+            std::cerr << '\n';
+        }
+        auto hardware = probe_placement_hardware(config.devices);
+        if (hardware.ok()) {
+            const auto verified =
+                verify_placement_plan(impl_->placement, hardware.value);
+            if (!verified.ok() && impl_->placement.prescriptive) {
+                result.errors = verified.errors;
+                return result;
+            }
+            for (const auto& error : verified.errors) {
+                std::cerr << "[placement] warning: " << error << '\n';
+            }
+        }
+    } else if (config.report_placement_plan) {
+        for (const auto& error : resolved.errors) {
+            std::cerr << "[placement] warning: " << error << '\n';
+        }
+    }
+    const auto* placement =
+        impl_->placement_ready ? &impl_->placement : nullptr;
+
     if (config.model == RuntimeModel::Glm52) {
         if (config.deepseek_block_kv_cache) {
             result.errors.emplace_back(
@@ -70,6 +144,7 @@ ValidationResult RuntimeSession::initialize(
         concrete.enable_flash_attention = config.enable_flash_attention;
         concrete.enable_incremental_kv_continuation =
             config.enable_incremental_kv_continuation;
+        concrete.placement = placement;
         result = runtime.initialize(model_directory, concrete);
         if (result.ok()) impl_->runtime.emplace<Gemma4Runtime>(std::move(runtime));
         return result;

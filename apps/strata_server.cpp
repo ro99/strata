@@ -44,6 +44,10 @@ struct Options {
     bool flash_attention{};
     bool block_kv_cache{};
     bool pin_resident_arena{};
+    std::string plan_cache;
+    bool dry_run{};
+    bool use_plan_cache{true};
+    bool replan{};
 };
 
 struct HttpRequest {
@@ -67,7 +71,12 @@ void usage() {
         << "                     [--context-size N] [--max-new N]\n"
         << "                     [--devices 0,1,2] [--vram-fraction F]\n"
         << "                     [--flash-attention] [--block-kv-cache]\n"
-        << "                     [--pin-resident-arena]\n";
+        << "                     [--pin-resident-arena]\n"
+        << "                     [--dry-run] [--replan]\n"
+        << "                     [--plan-cache DIR] [--no-plan-cache]\n\n"
+        << "--dry-run sizes every component against this machine, prints the\n"
+        << "placement, caches it, and exits without reading a weight. Run it\n"
+        << "before starting a service to see whether the configuration fits.\n";
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -89,9 +98,22 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.pin_resident_arena = true;
             continue;
         }
+        if (argument == "--dry-run") {
+            options.dry_run = true;
+            continue;
+        }
+        if (argument == "--no-plan-cache") {
+            options.use_plan_cache = false;
+            continue;
+        }
+        if (argument == "--replan") {
+            options.replan = true;
+            continue;
+        }
         if (index + 1 >= argc) return false;
         const auto next = [&]() { return std::string_view(argv[++index]); };
         if (argument == "--model") options.model = next();
+        else if (argument == "--plan-cache") options.plan_cache = next();
         else if (argument == "--model-type") options.model_type = next();
         else if (argument == "--model-id") options.model_id = next();
         else if (argument == "--host") options.host = next();
@@ -625,12 +647,6 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
-    auto tokenizer = strata::ModelTokenizer::load(
-        (std::filesystem::path(options.model) / "tokenizer.json").string());
-    if (!tokenizer.ok()) {
-        for (const auto& error : tokenizer.errors) std::cerr << "error: " << error << '\n';
-        return 1;
-    }
     strata::RuntimeConfig config;
     config.model = options.model_type == "glm"
         ? strata::RuntimeModel::Glm52
@@ -646,6 +662,32 @@ int main(int argc, char** argv) {
     config.pin_resident_arena = options.pin_resident_arena;
     config.verbose = options.model_type == "deepseek";
     config.load_progress = options.model_type != "deepseek";
+    config.placement_cache_directory = options.plan_cache;
+    config.use_placement_cache = options.use_plan_cache;
+    config.refresh_placement_plan = options.replan;
+    config.report_placement_plan = true;
+
+    if (options.dry_run) {
+        const auto resolved = strata::resolve_placement_plan(
+            strata::placement_request_for(options.model, config),
+            options.plan_cache, options.use_plan_cache, options.replan);
+        if (!resolved.ok()) {
+            for (const auto& error : resolved.errors) {
+                std::cerr << "error: " << error << '\n';
+            }
+            return 1;
+        }
+        std::cout << strata::render_placement_report(resolved.value.plan);
+        std::cerr << "[dry-run] plan at " << resolved.value.cache_path << '\n';
+        return resolved.value.plan.fits ? 0 : 1;
+    }
+
+    auto tokenizer = strata::ModelTokenizer::load(
+        (std::filesystem::path(options.model) / "tokenizer.json").string());
+    if (!tokenizer.ok()) {
+        for (const auto& error : tokenizer.errors) std::cerr << "error: " << error << '\n';
+        return 1;
+    }
     strata::RuntimeSession runtime;
     std::cerr << "[startup] loading " << options.model_id << "...\n";
     const auto initialized = runtime.initialize(options.model, config);

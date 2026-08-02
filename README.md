@@ -71,6 +71,70 @@ Gemma 4 uses its native W8A16 checkpoint directly and enables CUDA attention:
 
 Startup prints the selected devices, the VRAM budget per device, load progress, elapsed load time, and the active sampler. Decoding defaults to greedy (`--temperature 0`) for reproducible output. Multi-turn chat reuses the cached prefix and only prefills new tokens.
 
+### Planning a load before making it (`--dry-run`)
+
+Whether a model is fast usually comes down to one question that is invisible
+until the weights are already loaded: does everything fit on the GPUs, or is
+some class of weight being streamed on every decode step? `--dry-run` answers it
+in about a second, without reading a single weight:
+
+```bash
+./build/strata-chat \
+  --model models/gemma4 --model-type gemma4 \
+  --context-size 8192 --devices 0,1,2 --dry-run
+```
+
+```
+component               size     tier      cuda:0      cuda:1      cuda:2    per step
+-------------------------------------------------------------------------------------
+attention           8.39 GiB   device    3.36 GiB    3.49 GiB    1.55 GiB    8.39 GiB
+feed-forward       20.59 GiB   device    8.24 GiB    8.58 GiB    3.78 GiB   20.59 GiB
+norm                5.06 MiB   device    2.02 MiB    2.11 MiB  950.00 KiB    5.06 MiB
+output-head         2.62 GiB   device           -           -    2.62 GiB    2.62 GiB
+vision              1.03 GiB   device    1.03 GiB           -           -           -
+kv-cache            1.41 GiB   device  576.00 MiB  592.00 MiB  272.00 MiB    1.41 GiB
+workspace           2.25 GiB   device  768.00 MiB  768.00 MiB  768.00 MiB           -
+-------------------------------------------------------------------------------------
+device total       36.29 GiB            13.93 GiB   13.40 GiB    8.96 GiB
+admitted budget                         19.81 GiB   19.81 GiB   13.04 GiB
+
+  layer blocks  cuda:0=0..23, cuda:1=24..48, cuda:2=49..59
+  hops          2 cross-device activation transfers per decode step
+  decode reads  33.02 GiB device, 0 B host-to-device, 0 B nvme  (bytes per step, not a duration)
+  max context   200599 tokens at this placement
+  verdict       fits: every weight, cache, and workspace is device resident
+```
+
+The plan is then cached under `~/.cache/strata/plans` and the next real load
+reuses it, so what runs is what the dry run printed. A plan is keyed by
+checkpoint contents, GPU set, context size, and device list; change any of them
+and it is recomputed automatically. `--replan` forces a fresh one,
+`--no-plan-cache` neither reads nor writes one, and `--plan-cache DIR` (or
+`$STRATA_PLAN_CACHE`) moves the directory.
+
+Read the table as an instance of the cost model in
+`research/moe-tiered-memory-decode-optimization.md`: the `per step` column is the
+`W_r` volume each component contributes to one batch-1 decode step, split by the
+resource that serves it. It is a byte count, not a duration — the planner
+measures no bandwidth and converts nothing to milliseconds.
+
+What each verdict means:
+
+| Verdict | Meaning |
+|---|---|
+| `fits` | Every weight, cache, and workspace is device resident. Decode reads no PCIe and no NVMe. |
+| `fits with a host tier` | Sparse classes are cached in VRAM over a host-resident copy. Decode streams the misses over PCIe. |
+| `I/O dependent` | The resident set exceeds VRAM plus host RAM, so steady-state decode reads NVMe. Caching cannot manufacture sparsity in a dense model. |
+
+Placement is prescriptive for Gemma 4: the plan chooses contiguous, byte-balanced
+layer blocks sized to each GPU's admitted budget, and the load performs exactly
+that assignment. For GLM and DeepSeek the plan is descriptive — it sizes and
+admits the placement those runtimes already perform and reports it without
+changing it, so a planning defect cannot regress a validated runtime.
+
+`--dry-run` exits `0` when the configuration fits and `1` when it does not, so it
+works as a preflight check in a script. `strata-server` takes the same flags.
+
 The DeepSeek command above favors decode throughput: pinning adds about 17
 seconds to startup on the development machine, then avoids pageable host-staging
 stalls while loading expert weights into VRAM.
@@ -86,6 +150,10 @@ Flags worth knowing:
 | `--pin-resident-arena` | Page-lock DeepSeek's resident weights for faster host-to-device demand loads |
 | `--flash-attention` | Use the exact CUDA attention fast path where it is faster |
 | `--no-prepack-mhc` | Disable the default exact AVX2-packed mHC projection path |
+| `--dry-run` | Size and place every component against this machine, print the plan, cache it, and exit without reading weights |
+| `--replan` | Recompute and overwrite a cached placement plan |
+| `--plan-cache DIR` | Directory for cached plans (default `~/.cache/strata/plans`) |
+| `--no-plan-cache` | Neither read nor write a cached plan |
 
 ### Samplers
 

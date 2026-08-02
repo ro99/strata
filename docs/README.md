@@ -9,7 +9,8 @@ benchmark must not be used as evidence of current behavior.
 - `../README.md` — current capabilities, validation limits, commands, and promoted
   machine baselines.
 - `current-architecture.md` — implemented dependency and execution boundaries,
-  including explicit scheduler gaps.
+  including explicit scheduler gaps and the placement planner behind
+  `--dry-run`.
 - `deepseek-v4-runtime.md` — current DeepSeek contract plus clearly labeled
   historical bring-up evidence.
 - Gemma 4's pinned checkpoint, tokenizer, text/vision graph, and public runtime

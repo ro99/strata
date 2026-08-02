@@ -56,6 +56,9 @@ add_library(strata_core STATIC
     src/model.cpp
     src/numerics.cpp
     src/openai_protocol.cpp
+    src/placement.cpp
+    src/placement_cache.cpp
+    src/placement_model.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
     src/worker_pool.cpp
@@ -149,6 +152,7 @@ if(BUILD_TESTING)
         tests/test_deepseek_runtime.cpp
         tests/test_model.cpp
         tests/test_openai_protocol.cpp
+        tests/test_placement.cpp
         tests/test_q4.cpp
         tests/test_trace.cpp
         tests/test_predictor.cpp

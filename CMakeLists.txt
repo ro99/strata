@@ -48,6 +48,7 @@ add_library(strata_core STATIC
     src/kimi_k3_ops.cpp
     src/kimi_k3_manifest.cpp
     src/kimi_k3_checkpoint.cpp
+    src/kimi_k3_kv_cache.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
     src/deepseek_ops.cpp
@@ -151,6 +152,7 @@ if(BUILD_TESTING)
         tests/test_kimi_k3_ops.cpp
         tests/test_kimi_k3_manifest.cpp
         tests/test_kimi_k3_checkpoint.cpp
+        tests/test_kimi_k3_kv_cache.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp

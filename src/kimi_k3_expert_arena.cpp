@@ -138,8 +138,10 @@ ValidationResult kimi_apply_write_guard(const KimiWriteGuardConfig& config) {
 }
 
 ParseResult<std::uint64_t> kimi_disk_sectors_written(const std::string& disk) {
-    // /sys/block/<disk>/stat field 10 (zero-based index 6) is cumulative
-    // sectors written.
+    // `/sys/block/<disk>/stat` field 7 (zero-based index 6) is cumulative
+    // sectors written. It is field 10 of a `/proc/diskstats` row, which carries
+    // three extra leading columns; reading index 9 here lands on `io_ticks`
+    // instead and reports milliseconds of activity as if they were sectors.
     auto sectors = disk_stat_field(disk, 6U);
     if (!sectors.ok()) return sectors;
     sectors.value *= kSectorBytes;

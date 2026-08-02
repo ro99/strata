@@ -45,6 +45,8 @@ add_library(strata_core STATIC
     src/gemma4_runtime.cpp
     src/glm_runtime.cpp
     src/glm_manifest.cpp
+    src/kimi_k3_manifest.cpp
+    src/kimi_k3_checkpoint.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
     src/deepseek_ops.cpp
@@ -145,6 +147,8 @@ if(BUILD_TESTING)
         tests/test_gemma4_checkpoint.cpp
         tests/test_gemma4_image.cpp
         tests/test_glm_int4.cpp
+        tests/test_kimi_k3_manifest.cpp
+        tests/test_kimi_k3_checkpoint.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp

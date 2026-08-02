@@ -107,4 +107,88 @@ inline constexpr Gemma4ExecutionContract kGemma4ExecutionContract{
     return layer < kGemma4ExecutionContract.layer_count && (layer + 1U) % 6U == 0U;
 }
 
+// Kimi-K3. Hybrid backbone: three Kimi Delta Attention layers then one gated
+// NoPE MLA layer, repeating, plus a final MLA layer at the end of the backbone.
+// Only the routed experts are quantized (MXFP4); the whole dense spine is BF16.
+struct KimiK3ExecutionContract {
+    std::uint32_t hidden_size;
+    std::uint32_t layer_count;
+    std::uint32_t attention_heads;
+    std::uint32_t key_value_heads;
+    // Gated MLA.
+    std::uint32_t query_lora_rank;
+    std::uint32_t kv_lora_rank;
+    std::uint32_t nope_head_dim;
+    std::uint32_t rope_head_dim;
+    std::uint32_t value_head_dim;
+    // KDA.
+    std::uint32_t linear_attention_heads;
+    std::uint32_t linear_head_dim;
+    std::uint32_t short_conv_kernel;
+    std::uint32_t decay_rank;
+    // Feed-forward and MoE.
+    std::uint32_t dense_intermediate_size;
+    std::uint32_t expert_intermediate_size;
+    std::uint32_t routed_expert_hidden_size;
+    std::uint32_t routed_experts;
+    std::uint32_t experts_per_token;
+    std::uint32_t expert_groups;
+    std::uint32_t selected_expert_groups;
+    std::uint32_t shared_experts;
+    std::uint32_t dense_prefix_layers;
+    // Attention residuals.
+    std::uint32_t attention_residual_block_size;
+    std::uint32_t vocabulary_size;
+    std::uint32_t maximum_context_tokens;
+    std::uint32_t image_token_id;
+    // Vision (MoonViT-V2).
+    std::uint32_t vision_hidden_size;
+    std::uint32_t vision_layer_count;
+    std::uint32_t vision_attention_heads;
+    std::uint32_t vision_qkv_hidden_size;
+    std::uint32_t vision_intermediate_size;
+    std::uint32_t vision_patch_size;
+    std::uint32_t vision_position_embedding_extent;
+    std::uint32_t vision_merge_kernel;
+    std::uint32_t vision_projector_hidden_size;
+    float rms_epsilon;
+    float routed_scale;
+    // SiTU-GLU: [b1 tanh(g/b1) sigmoid(g)] * [b2 tanh(u/b2)].
+    float situ_gate_beta;
+    float situ_linear_beta;
+    // KDA decay: alpha = exp(gate_lower_bound * sigmoid(exp(A_log) * z)).
+    float kda_gate_lower_bound;
+};
+
+inline constexpr KimiK3ExecutionContract kKimiK3ExecutionContract{
+    7168U, 93U, 96U, 96U,
+    1536U, 512U, 128U, 64U, 128U,
+    96U, 128U, 4U, 128U,
+    33792U, 3072U, 3584U, 896U, 16U, 1U, 1U, 2U, 1U,
+    12U, 163840U, 1'048'576U, 163605U,
+    1024U, 27U, 12U, 1536U, 4096U, 14U, 64U, 2U, 4096U,
+    1.0e-5F, 1.0F, 4.0F, 25.0F, -5.0F};
+
+// `linear_attn_config.full_attn_layers` is 1-based in the checkpoint and lists
+// every fourth layer plus a final one: {4, 8, ..., 88, 92, 93}. Expressed here
+// on Strata's 0-based layer index, which is what every caller uses.
+[[nodiscard]] constexpr bool kimi_k3_full_attention_layer(
+    std::uint32_t layer) noexcept {
+    return layer < kKimiK3ExecutionContract.layer_count &&
+           ((layer + 1U) % 4U == 0U ||
+            layer + 1U == kKimiK3ExecutionContract.layer_count);
+}
+
+[[nodiscard]] constexpr bool kimi_k3_kda_layer(std::uint32_t layer) noexcept {
+    return layer < kKimiK3ExecutionContract.layer_count &&
+           !kimi_k3_full_attention_layer(layer);
+}
+
+// Layer 0 is the dense MLP prefix (`first_k_dense_replace = 1`); every later
+// layer carries a LatentMoE block.
+[[nodiscard]] constexpr bool kimi_k3_moe_layer(std::uint32_t layer) noexcept {
+    return layer >= kKimiK3ExecutionContract.dense_prefix_layers &&
+           layer < kKimiK3ExecutionContract.layer_count;
+}
+
 }  // namespace strata

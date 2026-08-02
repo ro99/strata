@@ -323,6 +323,19 @@ public:
         ++emitted_;
         const auto now = std::chrono::steady_clock::now();
         if (!decode_started_) decode_started_ = now;
+        if (last_token_time_) {
+            const double interval = std::chrono::duration<double>(
+                now - *last_token_time_).count();
+            if (interval_count_ == intervals_.size()) {
+                interval_total_ -= intervals_[interval_cursor_];
+            } else {
+                ++interval_count_;
+            }
+            intervals_[interval_cursor_] = interval;
+            interval_total_ += interval;
+            interval_cursor_ = (interval_cursor_ + 1U) % intervals_.size();
+        }
+        last_token_time_ = now;
         pending_utf8_.append(piece.data(), piece.size());
         flush_pending_utf8();
         if (interactive_) {
@@ -482,10 +495,10 @@ private:
     }
 
     double tokens_per_second(std::chrono::steady_clock::time_point now) const {
-        if (!decode_started_ || emitted_ < 2U) return 0.0;
-        const double seconds = std::chrono::duration<double>(
-            now - *decode_started_).count();
-        return seconds > 0.0 ? static_cast<double>(emitted_ - 1U) / seconds : 0.0;
+        (void)now;
+        return interval_total_ > 0.0
+            ? static_cast<double>(interval_count_) / interval_total_
+            : 0.0;
     }
 
     void set_title(std::string_view title) const {
@@ -498,6 +511,11 @@ private:
     std::uint64_t emitted_{};
     std::string pending_utf8_;
     std::optional<std::chrono::steady_clock::time_point> decode_started_;
+    std::optional<std::chrono::steady_clock::time_point> last_token_time_;
+    std::array<double, 16> intervals_{};
+    std::size_t interval_cursor_{};
+    std::size_t interval_count_{};
+    double interval_total_{};
 };
 
 bool answer(strata::RuntimeSession& runtime, const Options& options,

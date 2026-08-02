@@ -67,6 +67,8 @@ __device__ double reduce_block_double(double value) {
     return value;
 }
 
+__device__ float bf16_round(float value);
+
 __device__ float plain_value(const void* weights, int dtype, std::uint64_t index) {
     if (dtype == static_cast<int>(SafetensorsDtype::Bf16)) {
         return __bfloat162float(static_cast<const __nv_bfloat16*>(weights)[index]);
@@ -225,6 +227,297 @@ __global__ void packed_matmul_kernel(float* output, const float* input,
         const std::uint64_t output_index =
             static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
+    }
+}
+
+__global__ void packed_int8_group32_matvec_kernel(
+    float* output, const float* input, const std::uint32_t* packed,
+    const __nv_bfloat16* scales, std::uint64_t packed_columns,
+    std::uint64_t scale_columns, std::uint64_t columns,
+    std::uint64_t rows) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x) *
+                                warps_per_block + warp;
+    if (output_row >= rows) return;
+
+    const auto packed_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    float sum = 0.0F;
+    for (std::uint64_t packed_column = lane; packed_column < packed_columns;
+         packed_column += warpSize) {
+        const auto word = packed[packed_base + packed_column];
+        const auto column = packed_column * 4U;
+        const float scale = __bfloat162float(
+            scales[scale_base + column / 32U]);
+#pragma unroll
+        for (unsigned int item = 0U; item < 4U; ++item) {
+            const auto raw = static_cast<std::uint8_t>(word >> (item * 8U));
+            sum += input[column + item] *
+                   static_cast<float>(static_cast<int>(raw) - 128) * scale;
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum = __fadd_rn(
+            sum, __shfl_down_sync(0xFFFF'FFFFU, sum, offset));
+    }
+    if (lane == 0U) output[output_row] = bf16_round(sum);
+}
+
+__global__ void bf16_matvec_kernel(
+    float* output, const float* input, const __nv_bfloat16* weights,
+    std::uint64_t columns, std::uint64_t rows) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x) *
+                                warps_per_block + warp;
+    if (output_row >= rows) return;
+
+    const auto base = output_row * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = lane; column < columns; column += warpSize) {
+        sum = __fadd_rn(
+            sum,
+            __fmul_rn(input[column],
+                      __bfloat162float(weights[base + column])));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum = __fadd_rn(
+            sum, __shfl_down_sync(0xFFFF'FFFFU, sum, offset));
+    }
+    if (lane == 0U) output[output_row] = sum;
+}
+
+__global__ void gemma4_softcap_logits_kernel(
+    float* values, std::uint64_t count, float softcap) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (index >= count) return;
+    float value = bf16_round(values[index]);
+    value = bf16_round(value / softcap);
+    value = bf16_round(tanhf(value));
+    values[index] = bf16_round(value * softcap);
+}
+
+__device__ void gemma4_norm_vector_block(
+    float* output, const float* input, const float* weight,
+    std::uint32_t columns, float epsilon, unsigned int* error_flag) {
+    double squared_sum = 0.0;
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float value = input[column];
+        if (!isfinite(value) || !isfinite(weight[column])) {
+            atomicExch(error_flag, 1U);
+        }
+        squared_sum = __dadd_rn(
+            squared_sum,
+            __dmul_rn(static_cast<double>(value), static_cast<double>(value)));
+    }
+    squared_sum = reduce_block_double(squared_sum);
+    __shared__ float reciprocal;
+    if (threadIdx.x == 0U) {
+        reciprocal = 1.0F / sqrtf(
+            static_cast<float>(squared_sum / static_cast<double>(columns)) +
+            epsilon);
+    }
+    __syncthreads();
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        output[column] = bf16_round(input[column] * reciprocal * weight[column]);
+    }
+    __syncthreads();
+}
+
+__global__ void gemma4_rms_norm_kernel(
+    float* output, const float* input, const float* weight,
+    std::uint32_t columns, float epsilon, unsigned int* error_flag) {
+    if (blockIdx.x != 0U) return;
+    gemma4_norm_vector_block(
+        output, input, weight, columns, epsilon, error_flag);
+}
+
+__global__ void gemma4_norm_rope_kernel(
+    float* values, const float* weight, std::uint32_t heads,
+    std::uint32_t head_dim, std::uint32_t position, float theta,
+    float rotary_proportion, unsigned int* error_flag) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= heads || threadIdx.x != 0U) return;
+    auto* row = values + static_cast<std::uint64_t>(head) * head_dim;
+    double squared_sum = 0.0;
+    for (std::uint32_t column = 0U; column < head_dim; ++column) {
+        const float value = row[column];
+        if (!isfinite(value) || (weight != nullptr && !isfinite(weight[column]))) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        squared_sum = __dadd_rn(
+            squared_sum,
+            __dmul_rn(static_cast<double>(value), static_cast<double>(value)));
+    }
+    const float reciprocal = 1.0F / sqrtf(
+        static_cast<float>(squared_sum / static_cast<double>(head_dim)) +
+        1.0e-6F);
+    for (std::uint32_t column = 0U; column < head_dim; ++column) {
+        row[column] = bf16_round(
+            row[column] * reciprocal * (weight == nullptr ? 1.0F : weight[column]));
+    }
+    if (theta == 0.0F) return;
+    const auto half = head_dim / 2U;
+    const auto angles = static_cast<std::uint32_t>(
+        rotary_proportion * static_cast<float>(head_dim) / 2.0F);
+    for (std::uint32_t index = 0U; index < angles; ++index) {
+        const float first = row[index];
+        const float second = row[half + index];
+        const float inverse_frequency = powf(
+            theta, -2.0F * static_cast<float>(index) /
+                       static_cast<float>(head_dim));
+        const float angle = static_cast<float>(position) * inverse_frequency;
+        const float cosine = cosf(angle);
+        const float sine = sinf(angle);
+        row[index] = bf16_round(first * cosine - second * sine);
+        row[half + index] = bf16_round(second * cosine + first * sine);
+    }
+}
+
+__global__ void gemma4_store_kv_kernel(
+    __nv_bfloat16* cache, const float* keys, const float* values,
+    std::uint32_t position, std::uint32_t capacity_rows,
+    std::uint32_t columns) {
+    const auto column = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+    if (column >= columns) return;
+    const auto row = position % capacity_rows;
+    const auto offset = static_cast<std::uint64_t>(row) * columns + column;
+    const auto plane = static_cast<std::uint64_t>(capacity_rows) * columns;
+    cache[offset] = __float2bfloat16_rn(keys[column]);
+    cache[plane + offset] = __float2bfloat16_rn(values[column]);
+}
+
+__global__ void gemma4_attention_kernel(
+    float* output, float* scores, const float* queries,
+    const __nv_bfloat16* cache, std::uint32_t position,
+    std::uint32_t capacity_rows, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t head_dim,
+    unsigned int* error_flag) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= query_heads) return;
+    const auto visible_rows = min(position + 1U, capacity_rows);
+    const auto first_position = position + 1U - visible_rows;
+    const auto kv_head = head / (query_heads / key_value_heads);
+    const auto* query = queries + static_cast<std::uint64_t>(head) * head_dim;
+    const auto plane = static_cast<std::uint64_t>(capacity_rows) *
+                       key_value_heads * head_dim;
+    auto* head_scores = scores + static_cast<std::uint64_t>(head) *
+                                  capacity_rows;
+    for (std::uint32_t row = threadIdx.x; row < visible_rows;
+         row += blockDim.x) {
+        const auto absolute = first_position + row;
+        const auto physical = absolute % capacity_rows;
+        const auto* key = cache +
+            (static_cast<std::uint64_t>(physical) * key_value_heads + kv_head) *
+                head_dim;
+        float score = 0.0F;
+        for (std::uint32_t column = 0U; column < head_dim; ++column) {
+            score = __fadd_rn(
+                score,
+                __fmul_rn(query[column], __bfloat162float(key[column])));
+        }
+        head_scores[row] = score;
+        if (!isfinite(score)) atomicExch(error_flag, 2U);
+    }
+    __syncthreads();
+
+    __shared__ float denominator;
+    if (threadIdx.x == 0U) {
+        float maximum = -INFINITY;
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            maximum = fmaxf(maximum, head_scores[row]);
+        }
+        denominator = 0.0F;
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            const float probability = expf(__fsub_rn(head_scores[row], maximum));
+            head_scores[row] = probability;
+            denominator = __fadd_rn(denominator, probability);
+        }
+        if (!isfinite(denominator) || denominator <= 0.0F) {
+            atomicExch(error_flag, 3U);
+        }
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            head_scores[row] = __fdiv_rn(head_scores[row], denominator);
+        }
+    }
+    __syncthreads();
+
+    for (std::uint32_t column = threadIdx.x; column < head_dim;
+         column += blockDim.x) {
+        float sum = 0.0F;
+        for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+            const auto absolute = first_position + row;
+            const auto physical = absolute % capacity_rows;
+            const auto value_offset =
+                (static_cast<std::uint64_t>(physical) * key_value_heads +
+                 kv_head) * head_dim + column;
+            sum = __fadd_rn(
+                sum,
+                __fmul_rn(head_scores[row],
+                          __bfloat162float(cache[plane + value_offset])));
+        }
+        output[static_cast<std::uint64_t>(head) * head_dim + column] =
+            bf16_round(sum);
+        if (!isfinite(sum)) atomicExch(error_flag, 4U);
+    }
+}
+
+__global__ void gemma4_post_attention_kernel(
+    float* hidden, float* normalized, const float* branch,
+    const float* post_attention_norm, const float* pre_feedforward_norm,
+    std::uint32_t columns, unsigned int* error_flag) {
+    if (blockIdx.x != 0U) return;
+    gemma4_norm_vector_block(
+        normalized, branch, post_attention_norm, columns, 1.0e-6F,
+        error_flag);
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        hidden[column] = bf16_round(hidden[column] + normalized[column]);
+    }
+    __syncthreads();
+    gemma4_norm_vector_block(
+        normalized, hidden, pre_feedforward_norm, columns, 1.0e-6F,
+        error_flag);
+}
+
+__global__ void gemma4_geglu_kernel(
+    float* gate, const float* up, std::uint32_t columns,
+    unsigned int* error_flag) {
+    const auto column = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+    if (column >= columns) return;
+    if (!isfinite(gate[column]) || !isfinite(up[column])) {
+        atomicExch(error_flag, 1U);
+        return;
+    }
+    constexpr float coefficient = 0.7978845608028654F;
+    const float value = gate[column];
+    const float activated = 0.5F * value *
+        (1.0F + tanhf(coefficient *
+                      (value + 0.044715F * value * value * value)));
+    gate[column] = bf16_round(bf16_round(activated) * up[column]);
+}
+
+__global__ void gemma4_post_feedforward_kernel(
+    float* hidden, float* normalized, const float* branch,
+    const float* post_feedforward_norm, std::uint32_t columns,
+    float scalar, unsigned int* error_flag) {
+    if (blockIdx.x != 0U) return;
+    gemma4_norm_vector_block(
+        normalized, branch, post_feedforward_norm, columns, 1.0e-6F,
+        error_flag);
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        hidden[column] = bf16_round(
+            bf16_round(hidden[column] + normalized[column]) * scalar);
     }
 }
 
@@ -1401,6 +1694,13 @@ struct CudaBackend::Impl {
         std::uint64_t attention_host_upload_bytes{};
         std::uint64_t attention_host_download_bytes{};
         std::uint64_t attention_score_bytes{};
+        float* gemma_workspace{};
+        float* gemma_scores{};
+        unsigned int* gemma_error{};
+        std::byte* gemma_host_staging{};
+        std::uint64_t gemma_workspace_bytes{};
+        std::uint64_t gemma_score_bytes{};
+        std::uint64_t gemma_host_staging_bytes{};
         std::byte* lightning_workspace{};
         std::uint64_t lightning_workspace_bytes{};
         float* moe_hidden{};
@@ -1447,6 +1747,18 @@ struct CudaBackend::Impl {
             }
             if (state.attention_scores != nullptr) {
                 static_cast<void>(cudaFree(state.attention_scores));
+            }
+            if (state.gemma_workspace != nullptr) {
+                static_cast<void>(cudaFree(state.gemma_workspace));
+            }
+            if (state.gemma_scores != nullptr) {
+                static_cast<void>(cudaFree(state.gemma_scores));
+            }
+            if (state.gemma_error != nullptr) {
+                static_cast<void>(cudaFree(state.gemma_error));
+            }
+            if (state.gemma_host_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.gemma_host_staging));
             }
             if (state.attention_host_upload != nullptr) {
                 static_cast<void>(cudaFreeHost(state.attention_host_upload));
@@ -1937,25 +2249,507 @@ ValidationResult CudaBackend::upload_buffer(
     return result;
 }
 
+ValidationResult CudaBackend::allocate_buffer(
+    int device, std::uint64_t bytes, CudaBuffer& output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() || bytes == 0U) {
+        result.errors.emplace_back("CUDA buffer allocation is invalid");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for buffer allocation");
+    }
+    auto target = std::make_shared<CudaBuffer::Impl>();
+    target->bytes = bytes;
+    target->device = device;
+    if (auto status = cudaMalloc(&target->data, static_cast<std::size_t>(bytes));
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate CUDA buffer");
+    }
+    output.impl_ = std::move(target);
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++stats.workspace_allocation_calls;
+        stats.workspace_allocation_bytes += bytes;
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::upload_gemma4_kv(
+    const CudaBuffer& cache, std::span<const std::uint16_t> keys,
+    std::span<const std::uint16_t> values, std::uint32_t start,
+    std::uint32_t capacity_rows, std::uint32_t columns) {
+    ValidationResult result;
+    if (!cache.valid() || capacity_rows == 0U || columns == 0U ||
+        keys.size() != values.size() || keys.size() % columns != 0U ||
+        keys.size() / columns > capacity_rows) {
+        result.errors.emplace_back("Gemma 4 CUDA KV upload shape is invalid");
+        return result;
+    }
+    std::uint64_t plane_bytes = 0U;
+    if (!checked_bytes(capacity_rows, columns, sizeof(std::uint16_t),
+                       plane_bytes) ||
+        plane_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
+        cache.device_bytes() != plane_bytes * 2U) {
+        result.errors.emplace_back("Gemma 4 CUDA KV cache capacity is invalid");
+        return result;
+    }
+    if (keys.empty()) return result;
+    auto& state = impl_->devices.at(cache.impl_->device);
+    if (auto status = cudaSetDevice(cache.impl_->device);
+        status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for Gemma 4 KV upload");
+    }
+    const auto rows = static_cast<std::uint32_t>(keys.size() / columns);
+    const auto physical = start % capacity_rows;
+    const auto first_rows = std::min(rows, capacity_rows - physical);
+    const auto first_elements = static_cast<std::size_t>(first_rows) * columns;
+    const auto second_elements = keys.size() - first_elements;
+    auto* device_keys = static_cast<std::uint16_t*>(cache.impl_->data);
+    auto* device_values = reinterpret_cast<std::uint16_t*>(
+        static_cast<std::byte*>(cache.impl_->data) + plane_bytes);
+    const auto copy_plane = [&](std::uint16_t* destination,
+                                std::span<const std::uint16_t> source) {
+        auto status = cudaMemcpyAsync(
+            destination + static_cast<std::size_t>(physical) * columns,
+            source.data(), first_elements * sizeof(std::uint16_t),
+            cudaMemcpyHostToDevice, state.stream);
+        if (status == cudaSuccess && second_elements != 0U) {
+            status = cudaMemcpyAsync(
+                destination, source.data() + first_elements,
+                second_elements * sizeof(std::uint16_t),
+                cudaMemcpyHostToDevice, state.stream);
+        }
+        return status;
+    };
+    if (auto status = copy_plane(device_keys, keys); status != cudaSuccess) {
+        return cuda_error(status, "upload Gemma 4 CUDA keys");
+    }
+    if (auto status = copy_plane(device_values, values); status != cudaSuccess) {
+        return cuda_error(status, "upload Gemma 4 CUDA values");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize Gemma 4 CUDA KV upload");
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::gemma4_decode_layers(
+    int device, std::span<const CudaGemma4DecodeLayer> layers,
+    std::span<const float> input, std::uint32_t position,
+    std::span<float> output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() || layers.empty() || input.empty() ||
+        output.size() != input.size() ||
+        input.size() > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back("Gemma 4 CUDA decode request is invalid");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "Gemma 4 CUDA decode cannot overlap an in-flight MoE command");
+        return result;
+    }
+    const auto hidden_columns = static_cast<std::uint32_t>(input.size());
+    std::uint64_t maximum_query_columns = 0U;
+    std::uint64_t maximum_kv_columns = 0U;
+    std::uint64_t maximum_intermediate = 0U;
+    std::uint64_t score_elements = 0U;
+    std::uint64_t next_kv_bytes = 0U;
+    std::uint64_t matmul_calls = 0U;
+    const auto valid_buffer = [device](const CudaBuffer* buffer,
+                                       std::uint64_t bytes) {
+        return buffer != nullptr && buffer->valid() &&
+               buffer->device() == device && buffer->device_bytes() == bytes;
+    };
+    const auto valid_weight = [device](const CudaWeight* weight) {
+        return weight != nullptr && weight->valid() && weight->device() == device &&
+               weight->impl_->descriptor.encoding ==
+                   CudaWeightEncoding::OffsetPackedInt8 &&
+               weight->impl_->descriptor.group_size == 32U &&
+               weight->impl_->descriptor.columns % 4U == 0U;
+    };
+    for (const auto& layer : layers) {
+        if (!valid_weight(layer.query) || !valid_weight(layer.key) ||
+            (layer.value != nullptr && !valid_weight(layer.value)) ||
+            !valid_weight(layer.output) || !valid_weight(layer.gate) ||
+            !valid_weight(layer.up) || !valid_weight(layer.down) ||
+            !std::isfinite(layer.scalar) || layer.cache_capacity_rows == 0U ||
+            layer.cached_rows > layer.cache_capacity_rows ||
+            static_cast<std::uint64_t>(layer.cache_start) + layer.cached_rows !=
+                position) {
+            result.errors.emplace_back("Gemma 4 CUDA decode layer contract is invalid");
+            return result;
+        }
+        const auto& query = layer.query->impl_->descriptor;
+        const auto& key = layer.key->impl_->descriptor;
+        const auto& projection = layer.output->impl_->descriptor;
+        const auto& gate = layer.gate->impl_->descriptor;
+        const auto& up = layer.up->impl_->descriptor;
+        const auto& down = layer.down->impl_->descriptor;
+        if (query.columns != hidden_columns || key.columns != hidden_columns ||
+            projection.rows != hidden_columns || projection.columns != query.rows ||
+            gate.columns != hidden_columns || up.columns != hidden_columns ||
+            gate.rows != up.rows || down.rows != hidden_columns ||
+            down.columns != gate.rows ||
+            (layer.value != nullptr &&
+             (layer.value->impl_->descriptor.columns != hidden_columns ||
+              layer.value->impl_->descriptor.rows != key.rows))) {
+            result.errors.emplace_back("Gemma 4 CUDA decode weight shapes are invalid");
+            return result;
+        }
+        if (layer.query_norm == nullptr || layer.key_norm == nullptr ||
+            layer.query_norm->device_bytes() != layer.key_norm->device_bytes() ||
+            layer.query_norm->device_bytes() == 0U ||
+            layer.query_norm->device_bytes() % sizeof(float) != 0U) {
+            result.errors.emplace_back("Gemma 4 CUDA attention norm shape is invalid");
+            return result;
+        }
+        const auto head_dim = static_cast<std::uint32_t>(
+            layer.query_norm->device_bytes() / sizeof(float));
+        if (!valid_buffer(layer.query_norm, head_dim * sizeof(float)) ||
+            !valid_buffer(layer.key_norm, head_dim * sizeof(float)) ||
+            query.rows % head_dim != 0U || key.rows % head_dim != 0U ||
+            query.rows / head_dim == 0U || key.rows / head_dim == 0U ||
+            (query.rows / head_dim) % (key.rows / head_dim) != 0U) {
+            result.errors.emplace_back("Gemma 4 CUDA attention head shape is invalid");
+            return result;
+        }
+        const std::uint64_t norm_bytes =
+            static_cast<std::uint64_t>(hidden_columns) * sizeof(float);
+        if (!valid_buffer(layer.input_norm, norm_bytes) ||
+            !valid_buffer(layer.post_attention_norm, norm_bytes) ||
+            !valid_buffer(layer.pre_feedforward_norm, norm_bytes) ||
+            !valid_buffer(layer.post_feedforward_norm, norm_bytes)) {
+            result.errors.emplace_back("Gemma 4 CUDA layer norm buffer is invalid");
+            return result;
+        }
+        std::uint64_t cache_plane_bytes = 0U;
+        if (!checked_bytes(layer.cache_capacity_rows, key.rows,
+                           sizeof(std::uint16_t), cache_plane_bytes) ||
+            cache_plane_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
+            !valid_buffer(layer.kv_cache, cache_plane_bytes * 2U) ||
+            layer.next_keys.size() != key.rows ||
+            layer.next_values.size() != key.rows) {
+            result.errors.emplace_back("Gemma 4 CUDA KV buffer is invalid");
+            return result;
+        }
+        maximum_query_columns = std::max(maximum_query_columns, query.rows);
+        maximum_kv_columns = std::max(maximum_kv_columns, key.rows);
+        maximum_intermediate = std::max(maximum_intermediate, gate.rows);
+        score_elements = std::max(
+            score_elements,
+            (query.rows / head_dim) * layer.cache_capacity_rows);
+        const auto layer_kv_bytes =
+            static_cast<std::uint64_t>(layer.next_keys.size_bytes()) * 2U;
+        if (layer_kv_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                 next_kv_bytes) {
+            result.errors.emplace_back("Gemma 4 CUDA decode staging overflows");
+            return result;
+        }
+        next_kv_bytes += layer_kv_bytes;
+        matmul_calls += layer.value == nullptr ? 6U : 7U;
+    }
+
+    const std::uint64_t workspace_elements =
+        static_cast<std::uint64_t>(hidden_columns) * 3U +
+        maximum_query_columns * 2U + maximum_kv_columns * 2U +
+        maximum_intermediate * 2U;
+    std::uint64_t workspace_bytes = 0U;
+    std::uint64_t score_bytes = 0U;
+    if (!checked_bytes(1U, workspace_elements, sizeof(float), workspace_bytes) ||
+        !checked_bytes(1U, score_elements, sizeof(float), score_bytes)) {
+        result.errors.emplace_back("Gemma 4 CUDA decode workspace overflows");
+        return result;
+    }
+    const auto hidden_bytes = static_cast<std::uint64_t>(input.size_bytes());
+    if (hidden_bytes > (std::numeric_limits<std::uint64_t>::max() -
+                        next_kv_bytes - sizeof(unsigned int)) / 2U) {
+        result.errors.emplace_back("Gemma 4 CUDA host staging overflows");
+        return result;
+    }
+    const auto host_bytes = hidden_bytes * 2U + next_kv_bytes +
+                            sizeof(unsigned int);
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for Gemma 4 decode");
+    }
+    const auto ensure_device = [&](auto*& pointer, std::uint64_t& capacity,
+                                   std::uint64_t required,
+                                   const char* operation) {
+        if (required <= capacity) return cudaSuccess;
+        using Pointer = std::remove_reference_t<decltype(pointer)>;
+        Pointer replacement = nullptr;
+        auto status = cudaMalloc(&replacement, static_cast<std::size_t>(required));
+        if (status != cudaSuccess) return status;
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = replacement;
+        capacity = required;
+        (void)operation;
+        return cudaSuccess;
+    };
+    if (auto status = ensure_device(
+            state.gemma_workspace, state.gemma_workspace_bytes,
+            workspace_bytes, "allocate Gemma 4 decode workspace");
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate Gemma 4 decode workspace");
+    }
+    if (auto status = ensure_device(
+            state.gemma_scores, state.gemma_score_bytes, score_bytes,
+            "allocate Gemma 4 attention scores"); status != cudaSuccess) {
+        return cuda_error(status, "allocate Gemma 4 attention scores");
+    }
+    if (state.gemma_error == nullptr) {
+        if (auto status = cudaMalloc(&state.gemma_error,
+                                     sizeof(*state.gemma_error));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate Gemma 4 decode status");
+        }
+    }
+    if (host_bytes > state.gemma_host_staging_bytes) {
+        void* replacement = nullptr;
+        if (auto status = cudaMallocHost(
+                &replacement, static_cast<std::size_t>(host_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate Gemma 4 pinned staging");
+        }
+        if (state.gemma_host_staging != nullptr) {
+            static_cast<void>(cudaFreeHost(state.gemma_host_staging));
+        }
+        state.gemma_host_staging = static_cast<std::byte*>(replacement);
+        state.gemma_host_staging_bytes = host_bytes;
+    }
+
+    auto* cursor = state.gemma_workspace;
+    auto* hidden = cursor;
+    cursor += hidden_columns;
+    auto* normalized = cursor;
+    cursor += hidden_columns;
+    auto* branch = cursor;
+    cursor += hidden_columns;
+    auto* queries = cursor;
+    cursor += maximum_query_columns;
+    auto* keys = cursor;
+    cursor += maximum_kv_columns;
+    auto* values = cursor;
+    cursor += maximum_kv_columns;
+    auto* context = cursor;
+    cursor += maximum_query_columns;
+    auto* gate_output = cursor;
+    cursor += maximum_intermediate;
+    auto* up_output = cursor;
+    std::memcpy(state.gemma_host_staging, input.data(), input.size_bytes());
+    if (auto status = cudaMemcpyAsync(
+            hidden, state.gemma_host_staging, input.size_bytes(),
+            cudaMemcpyHostToDevice, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "upload Gemma 4 hidden state");
+    }
+    if (auto status = cudaMemsetAsync(
+            state.gemma_error, 0, sizeof(*state.gemma_error), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear Gemma 4 decode status");
+    }
+    const auto launch_matvec = [&](const CudaWeight* weight,
+                                   const float* activation,
+                                   float* destination) {
+        const auto& descriptor = weight->impl_->descriptor;
+        constexpr unsigned int threads = 256U;
+        constexpr unsigned int warps = threads / 32U;
+        const auto blocks = static_cast<unsigned int>(
+            (descriptor.rows + warps - 1U) / warps);
+        packed_int8_group32_matvec_kernel<<<
+            blocks, threads, 0U, state.stream>>>(
+            destination, activation,
+            static_cast<const std::uint32_t*>(weight->impl_->weights),
+            static_cast<const __nv_bfloat16*>(weight->impl_->scales),
+            descriptor.packed_columns, descriptor.scale_columns,
+            descriptor.columns, descriptor.rows);
+    };
+    for (const auto& layer : layers) {
+        const auto& query = layer.query->impl_->descriptor;
+        const auto& key = layer.key->impl_->descriptor;
+        const auto& intermediate = layer.gate->impl_->descriptor;
+        const auto head_dim = static_cast<std::uint32_t>(
+            layer.query_norm->device_bytes() / sizeof(float));
+        const auto query_heads = static_cast<std::uint32_t>(query.rows / head_dim);
+        const auto kv_heads = static_cast<std::uint32_t>(key.rows / head_dim);
+        gemma4_rms_norm_kernel<<<1U, 256U, 0U, state.stream>>>(
+            normalized, hidden,
+            static_cast<const float*>(layer.input_norm->impl_->data),
+            hidden_columns, 1.0e-6F, state.gemma_error);
+        launch_matvec(layer.query, normalized, queries);
+        launch_matvec(layer.key, normalized, keys);
+        if (layer.value == nullptr) {
+            if (auto status = cudaMemcpyAsync(
+                    values, keys, key.rows * sizeof(float),
+                    cudaMemcpyDeviceToDevice, state.stream);
+                status != cudaSuccess) {
+                return cuda_error(status, "copy Gemma 4 shared K/V projection");
+            }
+        } else {
+            launch_matvec(layer.value, normalized, values);
+        }
+        const bool global = layer.value == nullptr;
+        const float theta = global ? 1'000'000.0F : 10'000.0F;
+        const float proportion = global ? 0.25F : 1.0F;
+        gemma4_norm_rope_kernel<<<query_heads, 1U, 0U, state.stream>>>(
+            queries, static_cast<const float*>(layer.query_norm->impl_->data),
+            query_heads, head_dim, position, theta, proportion,
+            state.gemma_error);
+        gemma4_norm_rope_kernel<<<kv_heads, 1U, 0U, state.stream>>>(
+            keys, static_cast<const float*>(layer.key_norm->impl_->data),
+            kv_heads, head_dim, position, theta, proportion,
+            state.gemma_error);
+        gemma4_norm_rope_kernel<<<kv_heads, 1U, 0U, state.stream>>>(
+            values, nullptr, kv_heads, head_dim, position, 0.0F, 1.0F,
+            state.gemma_error);
+        auto* cache = static_cast<__nv_bfloat16*>(layer.kv_cache->impl_->data);
+        gemma4_store_kv_kernel<<<
+            static_cast<unsigned int>((key.rows + 255U) / 256U), 256U, 0U,
+            state.stream>>>(cache, keys, values, position,
+                            layer.cache_capacity_rows,
+                            static_cast<std::uint32_t>(key.rows));
+        gemma4_attention_kernel<<<query_heads, 256U, 0U, state.stream>>>(
+            context, state.gemma_scores, queries, cache, position,
+            layer.cache_capacity_rows, query_heads, kv_heads, head_dim,
+            state.gemma_error);
+        launch_matvec(layer.output, context, branch);
+        gemma4_post_attention_kernel<<<1U, 256U, 0U, state.stream>>>(
+            hidden, normalized, branch,
+            static_cast<const float*>(layer.post_attention_norm->impl_->data),
+            static_cast<const float*>(layer.pre_feedforward_norm->impl_->data),
+            hidden_columns, state.gemma_error);
+        launch_matvec(layer.gate, normalized, gate_output);
+        launch_matvec(layer.up, normalized, up_output);
+        gemma4_geglu_kernel<<<
+            static_cast<unsigned int>((intermediate.rows + 255U) / 256U),
+            256U, 0U, state.stream>>>(
+            gate_output, up_output,
+            static_cast<std::uint32_t>(intermediate.rows), state.gemma_error);
+        launch_matvec(layer.down, gate_output, branch);
+        gemma4_post_feedforward_kernel<<<1U, 256U, 0U, state.stream>>>(
+            hidden, normalized, branch,
+            static_cast<const float*>(layer.post_feedforward_norm->impl_->data),
+            hidden_columns, layer.scalar, state.gemma_error);
+    }
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch Gemma 4 CUDA decode kernels");
+    }
+    const auto output_offset = hidden_bytes;
+    auto kv_offset = hidden_bytes * 2U;
+    if (auto status = cudaMemcpyAsync(
+            state.gemma_host_staging + output_offset, hidden,
+            static_cast<std::size_t>(hidden_bytes), cudaMemcpyDeviceToHost,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "download Gemma 4 hidden state");
+    }
+    for (const auto& layer : layers) {
+        const auto columns = static_cast<std::uint64_t>(layer.next_keys.size());
+        const auto bytes = columns * sizeof(std::uint16_t);
+        const auto physical = position % layer.cache_capacity_rows;
+        const auto plane = static_cast<std::uint64_t>(layer.cache_capacity_rows) *
+                           columns;
+        const auto* cache = static_cast<const std::uint16_t*>(
+            layer.kv_cache->impl_->data);
+        if (auto status = cudaMemcpyAsync(
+                state.gemma_host_staging + kv_offset,
+                cache + static_cast<std::uint64_t>(physical) * columns,
+                static_cast<std::size_t>(bytes), cudaMemcpyDeviceToHost,
+                state.stream); status != cudaSuccess) {
+            return cuda_error(status, "download Gemma 4 next keys");
+        }
+        kv_offset += bytes;
+        if (auto status = cudaMemcpyAsync(
+                state.gemma_host_staging + kv_offset,
+                cache + plane + static_cast<std::uint64_t>(physical) * columns,
+                static_cast<std::size_t>(bytes), cudaMemcpyDeviceToHost,
+                state.stream); status != cudaSuccess) {
+            return cuda_error(status, "download Gemma 4 next values");
+        }
+        kv_offset += bytes;
+    }
+    const auto error_offset = hidden_bytes * 2U + next_kv_bytes;
+    if (auto status = cudaMemcpyAsync(
+            state.gemma_host_staging + error_offset, state.gemma_error,
+            sizeof(*state.gemma_error), cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download Gemma 4 decode status");
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize Gemma 4 CUDA decode");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    std::memcpy(output.data(), state.gemma_host_staging + output_offset,
+                output.size_bytes());
+    kv_offset = hidden_bytes * 2U;
+    for (const auto& layer : layers) {
+        const auto bytes = layer.next_keys.size_bytes();
+        std::memcpy(layer.next_keys.data(),
+                    state.gemma_host_staging + kv_offset, bytes);
+        kv_offset += bytes;
+        std::memcpy(layer.next_values.data(),
+                    state.gemma_host_staging + kv_offset, bytes);
+        kv_offset += bytes;
+    }
+    unsigned int numerical_error = 0U;
+    std::memcpy(&numerical_error, state.gemma_host_staging + error_offset,
+                sizeof(numerical_error));
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += hidden_bytes;
+        stats.activation_d2h_bytes += hidden_bytes + next_kv_bytes;
+        stats.matmul_calls += matmul_calls;
+        stats.flash_attention_calls += layers.size();
+        stats.flash_attention_kernel_launches += layers.size();
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
+    }
+    if (numerical_error != 0U) {
+        result.errors.emplace_back("Gemma 4 CUDA decode produced a non-finite value");
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::span<const float> input,
                                      std::uint32_t rows,
                                      std::span<float> output) {
-    return matmul_impl(weight, input, rows, 0U, 0U, output);
+    return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F);
+}
+
+ValidationResult CudaBackend::matmul_softcap(
+    const CudaWeight& weight, std::span<const float> input,
+    float softcap, std::span<float> output) {
+    return matmul_impl(weight, input, 1U, 0U, 0U, output, softcap);
 }
 
 ValidationResult CudaBackend::matmul_grouped(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t groups, std::uint64_t rows_per_group,
     std::span<float> output) {
-    return matmul_impl(weight, input, 1U, groups, rows_per_group, output);
+    return matmul_impl(
+        weight, input, 1U, groups, rows_per_group, output, 0.0F);
 }
 
 ValidationResult CudaBackend::matmul_grouped_rows(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
     std::uint64_t rows_per_group, std::span<float> output) {
-    return matmul_impl(weight, input, rows, groups, rows_per_group, output);
+    return matmul_impl(
+        weight, input, rows, groups, rows_per_group, output, 0.0F);
 }
 
 ValidationResult CudaBackend::validate_flash_attention_device(int device) const {
@@ -3100,7 +3894,7 @@ ValidationResult CudaBackend::glm_absorbed_attention(
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
-    std::uint64_t rows_per_group, std::span<float> output) {
+    std::uint64_t rows_per_group, std::span<float> output, float softcap) {
     ValidationResult result;
     if (!weight.valid()) {
         result.errors.emplace_back("CUDA matmul received an invalid weight");
@@ -3114,7 +3908,9 @@ ValidationResult CudaBackend::matmul_impl(
         descriptor.rows == static_cast<std::uint64_t>(groups) * rows_per_group &&
         input.size() == descriptor.columns * groups * rows &&
         output.size() == descriptor.rows * rows;
-    if (rows == 0U || (!regular_shape && !grouped_shape)) {
+    if (rows == 0U || (!regular_shape && !grouped_shape) ||
+        !std::isfinite(softcap) || softcap < 0.0F ||
+        (softcap != 0.0F && (rows != 1U || groups != 0U))) {
         result.errors.emplace_back("CUDA matmul activation shapes are incompatible");
         return result;
     }
@@ -3170,6 +3966,10 @@ ValidationResult CudaBackend::matmul_impl(
     }
     const bool native = descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
                         descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
+    const bool w8_group32 =
+        descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
+        rows == 1U && groups == 0U && descriptor.group_size == 32U &&
+        descriptor.columns % 32U == 0U;
     if (native) {
         const auto input_rows = groups == 0U ? rows : rows * groups;
         const dim3 quantize_grid(
@@ -3180,11 +3980,32 @@ ValidationResult CudaBackend::matmul_impl(
     }
     const dim3 grid(static_cast<unsigned int>(descriptor.rows), rows, 1U);
     constexpr unsigned int threads = 256U;
-    if (descriptor.encoding == CudaWeightEncoding::Plain) {
+    if (descriptor.encoding == CudaWeightEncoding::Plain &&
+        descriptor.dtype == SafetensorsDtype::Bf16 && rows == 1U &&
+        groups == 0U) {
+        constexpr unsigned int warps_per_block = threads / 32U;
+        const auto blocks = static_cast<unsigned int>(
+            (descriptor.rows + warps_per_block - 1U) / warps_per_block);
+        bf16_matvec_kernel<<<blocks, threads, 0U, state.stream>>>(
+            state.output, state.input,
+            static_cast<const __nv_bfloat16*>(weight.impl_->weights),
+            descriptor.columns, descriptor.rows);
+    } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
         plain_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input, weight.impl_->weights,
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
             descriptor.rows, groups, rows_per_group);
+    } else if (w8_group32) {
+        constexpr unsigned int warps_per_block = threads / 32U;
+        const auto blocks = static_cast<unsigned int>(
+            (descriptor.rows + warps_per_block - 1U) / warps_per_block);
+        packed_int8_group32_matvec_kernel<<<
+            blocks, threads, 0U, state.stream>>>(
+            state.output, state.input,
+            static_cast<const std::uint32_t*>(weight.impl_->weights),
+            static_cast<const __nv_bfloat16*>(weight.impl_->scales),
+            descriptor.packed_columns, descriptor.scale_columns,
+            descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
                descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
         const auto bits = descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ? 4U : 8U;
@@ -3208,6 +4029,12 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const unsigned char*>(weight.impl_->scales),
             descriptor.packed_columns, descriptor.scale_columns, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    }
+    if (softcap > 0.0F) {
+        gemma4_softcap_logits_kernel<<<
+            static_cast<unsigned int>((output.size() + threads - 1U) / threads),
+            threads, 0U, state.stream>>>(
+            state.output, output.size(), softcap);
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch CUDA matmul");

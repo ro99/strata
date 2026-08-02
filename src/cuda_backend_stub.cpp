@@ -75,6 +75,11 @@ ValidationResult CudaBackend::matmul(const CudaWeight&, std::span<const float>,
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::matmul_softcap(
+    const CudaWeight&, std::span<const float>, float, std::span<float>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::matmul_grouped(
     const CudaWeight&, std::span<const float>, std::uint32_t,
     std::uint64_t, std::span<float>) {
@@ -136,7 +141,7 @@ ValidationResult CudaBackend::collect_moe(
 
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight&, std::span<const float>, std::uint32_t,
-    std::uint32_t, std::uint64_t, std::span<float>) {
+    std::uint32_t, std::uint64_t, std::span<float>, float) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

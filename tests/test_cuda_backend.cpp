@@ -840,6 +840,15 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
     REQUIRE(backend.matmul(plain_weight, plain_input, 1U, plain_output).ok());
     REQUIRE(plain_output[0] == 17.0F);
     REQUIRE(plain_output[1] == 39.0F);
+    std::array<float, 2> softcapped_output{};
+    REQUIRE(backend.matmul_softcap(
+        plain_weight, plain_input, 30.0F, softcapped_output).ok());
+    for (std::size_t index = 0U; index < softcapped_output.size(); ++index) {
+        auto expected = strata::bf16_round_f32(plain_output[index] / 30.0F);
+        expected = strata::bf16_round_f32(std::tanh(expected));
+        expected = strata::bf16_round_f32(expected * 30.0F);
+        REQUIRE(softcapped_output[index] == expected);
+    }
 
     std::array<std::byte, 4> packed_int8{};
     store_u32(packed_int8.data(), 0x7C83'7E81U);
@@ -859,6 +868,122 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
     std::array<float, 1> channel_output{};
     REQUIRE(backend.matmul(channel_weight, channel_input, 1U, channel_output).ok());
     REQUIRE(channel_output[0] == -4.0F);
+
+    descriptor = {};
+    descriptor.encoding = strata::CudaWeightEncoding::OffsetPackedInt8;
+    descriptor.dtype = strata::SafetensorsDtype::I32;
+    descriptor.rows = 16U;
+    descriptor.columns = 32U;
+    descriptor.packed_columns = 8U;
+    descriptor.scale_columns = 1U;
+    descriptor.group_size = 32U;
+    std::vector<std::byte> tensorcore_weights(16U * 32U, std::byte{0x81U});
+    std::vector<std::byte> tensorcore_scales(16U * 2U);
+    for (std::size_t offset = 0U; offset < tensorcore_scales.size(); offset += 2U) {
+        std::copy(one.begin(), one.end(), tensorcore_scales.begin() +
+                  static_cast<std::ptrdiff_t>(offset));
+    }
+    strata::CudaWeight tensorcore_weight;
+    REQUIRE(backend.upload(devices.front(), descriptor, tensorcore_weights,
+                           tensorcore_scales, tensorcore_weight).ok());
+    std::array<float, 32> tensorcore_input{};
+    tensorcore_input.fill(1.0F);
+    std::array<float, 16> tensorcore_output{};
+    REQUIRE(backend.matmul(tensorcore_weight, tensorcore_input, 1U,
+                           tensorcore_output).ok());
+    REQUIRE(std::all_of(tensorcore_output.begin(), tensorcore_output.end(),
+                        [](float value) { return value == 32.0F; }));
+}
+
+TEST_CASE("native CUDA backend keeps a Gemma 4 decode layer resident") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto zero_weight = [&](std::uint64_t rows, std::uint64_t columns) {
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::OffsetPackedInt8;
+        descriptor.dtype = strata::SafetensorsDtype::I32;
+        descriptor.rows = rows;
+        descriptor.columns = columns;
+        descriptor.packed_columns = columns / 4U;
+        descriptor.scale_columns = columns / 32U;
+        descriptor.group_size = 32U;
+        std::vector<std::byte> packed(
+            static_cast<std::size_t>(rows * descriptor.packed_columns * 4U),
+            std::byte{0x80U});
+        std::vector<std::byte> scales(
+            static_cast<std::size_t>(rows * descriptor.scale_columns * 2U));
+        const auto one = bf16(1.0F);
+        for (std::size_t offset = 0U; offset < scales.size(); offset += 2U) {
+            std::copy(one.begin(), one.end(), scales.begin() +
+                      static_cast<std::ptrdiff_t>(offset));
+        }
+        strata::CudaWeight output;
+        REQUIRE(backend.upload(device, descriptor, packed, scales, output).ok());
+        return output;
+    };
+    const auto upload_f32 = [&](std::span<const float> values) {
+        strata::CudaBuffer output;
+        REQUIRE(backend.upload_buffer(device, std::as_bytes(values), output).ok());
+        return output;
+    };
+
+    constexpr std::uint32_t hidden_columns = 32U;
+    constexpr std::uint32_t head_dim = 8U;
+    constexpr std::uint32_t query_columns = 32U;
+    constexpr std::uint32_t kv_columns = 8U;
+    constexpr std::uint32_t intermediate = 32U;
+    auto query = zero_weight(query_columns, hidden_columns);
+    auto key = zero_weight(kv_columns, hidden_columns);
+    auto value_projection = zero_weight(kv_columns, hidden_columns);
+    auto projection = zero_weight(hidden_columns, query_columns);
+    auto gate = zero_weight(intermediate, hidden_columns);
+    auto up = zero_weight(intermediate, hidden_columns);
+    auto down = zero_weight(hidden_columns, intermediate);
+    std::array<float, hidden_columns> norms{};
+    norms.fill(1.0F);
+    std::array<float, head_dim> head_norms{};
+    head_norms.fill(1.0F);
+    auto input_norm = upload_f32(norms);
+    auto post_attention_norm = upload_f32(norms);
+    auto pre_feedforward_norm = upload_f32(norms);
+    auto post_feedforward_norm = upload_f32(norms);
+    auto query_norm = upload_f32(head_norms);
+    auto key_norm = upload_f32(head_norms);
+    strata::CudaBuffer cache;
+    constexpr std::uint32_t cache_rows = 4U;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * cache_rows * kv_columns * sizeof(std::uint16_t),
+        cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        cache, {}, {}, 0U, cache_rows, kv_columns).ok());
+
+    std::array<std::uint16_t, kv_columns> next_keys{};
+    std::array<std::uint16_t, kv_columns> next_values{};
+    const std::array<strata::CudaGemma4DecodeLayer, 1> layers{{{
+        &query, &key, &value_projection, &projection, &gate, &up, &down,
+        &input_norm, &post_attention_norm, &pre_feedforward_norm,
+        &post_feedforward_norm, &query_norm, &key_norm, &cache,
+        next_keys, next_values, cache_rows, 0U, 0U, 1.0F,
+    }}};
+    std::array<float, hidden_columns> input{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index) - 16) / 16.0F;
+    }
+    std::array<float, hidden_columns> output{};
+    REQUIRE(backend.gemma4_decode_layers(
+        device, layers, input, 0U, output).ok());
+    for (std::size_t index = 0U; index < output.size(); ++index) {
+        REQUIRE(output[index] == strata::bf16_round_f32(input[index]));
+    }
+    REQUIRE(std::all_of(next_keys.begin(), next_keys.end(),
+                        [](auto item) { return item == 0U; }));
+    REQUIRE(std::all_of(next_values.begin(), next_values.end(),
+                        [](auto item) { return item == 0U; }));
 }
 
 TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections") {

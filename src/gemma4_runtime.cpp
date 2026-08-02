@@ -75,6 +75,12 @@ struct TextLayer {
     std::vector<float> post_feedforward_norm;
     std::vector<float> query_norm;
     std::vector<float> key_norm;
+    CudaBuffer input_norm_device;
+    CudaBuffer post_attention_norm_device;
+    CudaBuffer pre_feedforward_norm_device;
+    CudaBuffer post_feedforward_norm_device;
+    CudaBuffer query_norm_device;
+    CudaBuffer key_norm_device;
     float scalar{1.0F};
 };
 
@@ -107,6 +113,10 @@ struct VisionWeights {
 struct LayerKv {
     std::vector<std::uint16_t> keys;
     std::vector<std::uint16_t> values;
+    std::vector<std::uint16_t> next_keys;
+    std::vector<std::uint16_t> next_values;
+    CudaBuffer device;
+    std::uint32_t capacity_rows{};
     std::uint32_t start{};
 };
 
@@ -142,6 +152,7 @@ struct Gemma4Runtime::Impl {
     TokenLogprob last_sample;
     bool initialized{};
     bool reusable_sequence{};
+    bool device_kv_ready{};
 
     std::size_t layer_device(std::uint32_t layer) const {
         return schedule[layer % schedule.size()];
@@ -170,6 +181,13 @@ struct Gemma4Runtime::Impl {
             output.columns = columns;
         }
         return result;
+    }
+
+    ValidationResult upload_vector(std::size_t device,
+                                   std::span<const float> values,
+                                   CudaBuffer& output) {
+        return cuda.upload_buffer(
+            devices[device], std::as_bytes(values), output);
     }
 
     ValidationResult load_text_weights() {
@@ -229,6 +247,37 @@ struct Gemma4Runtime::Impl {
             std::vector<float> scalar;
             load_vector(prefix + "layer_scalar", 1U, scalar);
             if (result.ok()) weights.scalar = scalar.front();
+            if (result.ok()) result = upload_vector(
+                weights.device, weights.input_norm, weights.input_norm_device);
+            if (result.ok()) result = upload_vector(
+                weights.device, weights.post_attention_norm,
+                weights.post_attention_norm_device);
+            if (result.ok()) result = upload_vector(
+                weights.device, weights.pre_feedforward_norm,
+                weights.pre_feedforward_norm_device);
+            if (result.ok()) result = upload_vector(
+                weights.device, weights.post_feedforward_norm,
+                weights.post_feedforward_norm_device);
+            if (result.ok()) result = upload_vector(
+                weights.device, weights.query_norm, weights.query_norm_device);
+            if (result.ok()) result = upload_vector(
+                weights.device, weights.key_norm, weights.key_norm_device);
+            if (result.ok()) {
+                auto& cache = kv[layer];
+                cache.capacity_rows = global
+                    ? config.maximum_context_tokens
+                    : std::min(config.maximum_context_tokens,
+                               c.sliding_window);
+                const auto cache_elements =
+                    static_cast<std::uint64_t>(cache.capacity_rows) *
+                    kv_heads * head_dim * 2U;
+                result = cuda.allocate_buffer(
+                    devices[weights.device],
+                    cache_elements * sizeof(std::uint16_t), cache.device);
+                cache.next_keys.resize(
+                    static_cast<std::size_t>(kv_heads) * head_dim);
+                cache.next_values.resize(cache.next_keys.size());
+            }
             if ((config.verbose || config.load_progress) && result.ok()) {
                 std::cerr << "[load] Gemma 4 layer " << layer + 1U << '/'
                           << c.layer_count << '\n';
@@ -748,10 +797,94 @@ struct Gemma4Runtime::Impl {
         return linear(weights.down, gate, rows, output);
     }
 
+    ValidationResult sync_device_kv() {
+        ValidationResult result;
+        for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
+            auto& cache = kv[layer];
+            const bool global = gemma4_global_attention_layer(layer);
+            const auto columns =
+                (global ? c.global_key_value_heads * c.global_head_dim
+                        : c.local_key_value_heads * c.local_head_dim);
+            result = cuda.upload_gemma4_kv(
+                cache.device, cache.keys, cache.values, cache.start,
+                cache.capacity_rows, columns);
+            if (!result.ok()) return result;
+        }
+        device_kv_ready = true;
+        return result;
+    }
+
+    ValidationResult forward_decode_layers(std::span<float> hidden,
+                                           std::uint32_t position) {
+        ValidationResult result;
+        std::uint32_t begin = 0U;
+        while (begin < c.layer_count) {
+            const auto device = layers[begin].device;
+            auto end = begin + 1U;
+            while (end < c.layer_count && layers[end].device == device) ++end;
+            std::vector<CudaGemma4DecodeLayer> request;
+            request.reserve(end - begin);
+            for (auto layer = begin; layer < end; ++layer) {
+                auto& weights = layers[layer];
+                auto& cache = kv[layer];
+                request.push_back({
+                    &weights.query.weight,
+                    &weights.key.weight,
+                    weights.value.has_value() ? &weights.value->weight : nullptr,
+                    &weights.output.weight,
+                    &weights.gate.weight,
+                    &weights.up.weight,
+                    &weights.down.weight,
+                    &weights.input_norm_device,
+                    &weights.post_attention_norm_device,
+                    &weights.pre_feedforward_norm_device,
+                    &weights.post_feedforward_norm_device,
+                    &weights.query_norm_device,
+                    &weights.key_norm_device,
+                    &cache.device,
+                    cache.next_keys,
+                    cache.next_values,
+                    cache.capacity_rows,
+                    cache.start,
+                    static_cast<std::uint32_t>(
+                        cache.keys.size() / cache.next_keys.size()),
+                    weights.scalar,
+                });
+            }
+            result = cuda.gemma4_decode_layers(
+                devices[device], request, hidden, position, hidden);
+            if (!result.ok()) return result;
+            for (auto layer = begin; layer < end; ++layer) {
+                auto& cache = kv[layer];
+                cache.keys.insert(cache.keys.end(), cache.next_keys.begin(),
+                                  cache.next_keys.end());
+                cache.values.insert(cache.values.end(), cache.next_values.begin(),
+                                    cache.next_values.end());
+                const auto rows = cache.keys.size() / cache.next_keys.size();
+                if (rows > cache.capacity_rows) {
+                    const auto drop_rows = rows - cache.capacity_rows;
+                    const auto drop = drop_rows * cache.next_keys.size();
+                    cache.keys.erase(
+                        cache.keys.begin(),
+                        cache.keys.begin() + static_cast<std::ptrdiff_t>(drop));
+                    cache.values.erase(
+                        cache.values.begin(),
+                        cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
+                    cache.start += static_cast<std::uint32_t>(drop_rows);
+                }
+            }
+            begin = end;
+        }
+        return result;
+    }
+
     ValidationResult forward_layers(std::span<float> hidden,
                                     std::uint32_t rows,
                                     std::uint32_t position_base,
                                     std::span<const std::int32_t> multimodal_groups) {
+        if (rows == 1U && device_kv_ready && multimodal_groups.empty()) {
+            return forward_decode_layers(hidden, position_base);
+        }
         ValidationResult result;
         std::vector<float> normalized(hidden.size());
         std::vector<float> branch(hidden.size());
@@ -820,14 +953,8 @@ struct Gemma4Runtime::Impl {
             final_norm);
         if (!result.ok()) return result;
         logits.assign(c.vocabulary_size, 0.0F);
-        result = linear(output_head, normalized, 1U, logits);
-        if (!result.ok()) return result;
-        for (auto& value : logits) {
-            value = bf16_round_f32(value / c.final_logit_softcap);
-            value = bf16_round_f32(std::tanh(value));
-            value = bf16_round_f32(value * c.final_logit_softcap);
-        }
-        return result;
+        return cuda.matmul_softcap(
+            output_head.weight, normalized, c.final_logit_softcap, logits);
     }
 
     ParseResult<std::uint32_t> forward(std::span<const std::uint32_t> token_ids,
@@ -959,6 +1086,7 @@ struct Gemma4Runtime::Impl {
 
     void reset_sequence() {
         reusable_sequence = false;
+        device_kv_ready = false;
         cached_token_ids.clear();
         for (auto& cache : kv) {
             cache.keys.clear();
@@ -1010,12 +1138,19 @@ ValidationResult Gemma4Runtime::initialize(
             if (!result.ok()) return result;
         }
     }
-    const auto attention_reserve = std::max<std::uint64_t>(
-        kMinimumAttentionWorkspace,
-        static_cast<std::uint64_t>(config.maximum_context_tokens) *
-                c.global_key_value_heads * c.global_head_dim * 2U *
-                sizeof(float) +
-            (512ULL << 20U));
+    const auto local_rows = std::min(
+        config.maximum_context_tokens, c.sliding_window);
+    const auto local_kv_bytes =
+        50ULL * local_rows * c.local_key_value_heads * c.local_head_dim *
+        2U * sizeof(std::uint16_t);
+    const auto global_kv_bytes =
+        10ULL * config.maximum_context_tokens * c.global_key_value_heads *
+        c.global_head_dim * 2U * sizeof(std::uint16_t);
+    const auto kv_bytes_per_device =
+        (local_kv_bytes + global_kv_bytes + config.devices.size() - 1U) /
+        config.devices.size();
+    const auto attention_reserve =
+        kMinimumAttentionWorkspace + kv_bytes_per_device;
     auto plan = plan_runtime_devices(
         config.devices, config.vram_cache_fraction, attention_reserve,
         2ULL << 30U, "Gemma 4");
@@ -1023,10 +1158,15 @@ ValidationResult Gemma4Runtime::initialize(
         result.errors = std::move(plan.errors);
         return result;
     }
+    std::vector<std::size_t> layer_schedule(c.layer_count);
+    for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
+        layer_schedule[layer] = plan.value.weighted_schedule[
+            static_cast<std::size_t>(layer) *
+            plan.value.weighted_schedule.size() / c.layer_count];
+    }
     std::vector<std::uint64_t> planned(config.devices.size());
     for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
-        const auto device = plan.value.weighted_schedule[
-            layer % plan.value.weighted_schedule.size()];
+        const auto device = layer_schedule[layer];
         const bool global = gemma4_global_attention_layer(layer);
         const auto prefix = layer_prefix(layer);
         const auto attention = prefix + "self_attn.";
@@ -1045,8 +1185,7 @@ ValidationResult Gemma4Runtime::initialize(
         if (!global) planned[device] += linear_bytes(
             *checkpoint.value, attention + "v_proj");
     }
-    const auto output_device = plan.value.weighted_schedule[
-        (c.layer_count - 1U) % plan.value.weighted_schedule.size()];
+    const auto output_device = layer_schedule.back();
     planned[output_device] += linear_bytes(
         *checkpoint.value, "model.language_model.embed_tokens");
     const auto add_vision = [&](std::string_view base) {
@@ -1079,7 +1218,7 @@ ValidationResult Gemma4Runtime::initialize(
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
-    impl_->schedule = std::move(plan.value.weighted_schedule);
+    impl_->schedule = std::move(layer_schedule);
     impl_->sampler.seed(config.sampling_seed);
     try {
         for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
@@ -1253,6 +1392,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
     const auto prefill_started = std::chrono::steady_clock::now();
     const auto prefill = std::span<const std::uint32_t>(
         result.prompt_token_ids).subspan(reused);
+    impl_->device_kv_ready = false;
     auto next = impl_->forward(
         prefill, static_cast<std::uint32_t>(reused),
         replacements.empty() ? std::span<const float>{}
@@ -1261,6 +1401,10 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
         replacement_mask.empty() ? std::span<const std::uint8_t>{}
             : std::span<const std::uint8_t>(replacement_mask).subspan(reused),
         multimodal_groups);
+    if (next.ok()) {
+        auto synced = impl_->sync_device_kv();
+        if (!synced.ok()) next.errors = std::move(synced.errors);
+    }
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_started).count();
     result.metrics.prompt_tokens = result.prompt_token_ids.size();

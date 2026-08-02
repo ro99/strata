@@ -234,6 +234,31 @@ struct CudaMoeExpert {
     float coefficient{1.0F};
 };
 
+// One resident Gemma 4 decode layer. The backend queues the complete layer on
+// one stream, so hidden state and KV data stay on the device between kernels.
+struct CudaGemma4DecodeLayer {
+    const CudaWeight* query{};
+    const CudaWeight* key{};
+    const CudaWeight* value{};
+    const CudaWeight* output{};
+    const CudaWeight* gate{};
+    const CudaWeight* up{};
+    const CudaWeight* down{};
+    const CudaBuffer* input_norm{};
+    const CudaBuffer* post_attention_norm{};
+    const CudaBuffer* pre_feedforward_norm{};
+    const CudaBuffer* post_feedforward_norm{};
+    const CudaBuffer* query_norm{};
+    const CudaBuffer* key_norm{};
+    const CudaBuffer* kv_cache{};
+    std::span<std::uint16_t> next_keys;
+    std::span<std::uint16_t> next_values;
+    std::uint32_t cache_capacity_rows{};
+    std::uint32_t cache_start{};
+    std::uint32_t cached_rows{};
+    float scalar{1.0F};
+};
+
 class CudaBackend {
 public:
     CudaBackend();
@@ -271,9 +296,22 @@ public:
         CudaWeight& output);
     [[nodiscard]] ValidationResult upload_buffer(
         int device, std::span<const std::byte> bytes, CudaBuffer& output);
+    [[nodiscard]] ValidationResult allocate_buffer(
+        int device, std::uint64_t bytes, CudaBuffer& output);
+    [[nodiscard]] ValidationResult upload_gemma4_kv(
+        const CudaBuffer& cache, std::span<const std::uint16_t> keys,
+        std::span<const std::uint16_t> values, std::uint32_t start,
+        std::uint32_t capacity_rows, std::uint32_t columns);
+    [[nodiscard]] ValidationResult gemma4_decode_layers(
+        int device, std::span<const CudaGemma4DecodeLayer> layers,
+        std::span<const float> input, std::uint32_t position,
+        std::span<float> output);
     [[nodiscard]] ValidationResult matmul(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::span<float> output);
+    [[nodiscard]] ValidationResult matmul_softcap(
+        const CudaWeight& weight, std::span<const float> input,
+        float softcap, std::span<float> output);
     [[nodiscard]] ValidationResult matmul_grouped(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t groups, std::uint64_t rows_per_group,
@@ -341,7 +379,8 @@ private:
     [[nodiscard]] ValidationResult matmul_impl(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,
-        std::uint64_t rows_per_group, std::span<float> output);
+        std::uint64_t rows_per_group, std::span<float> output,
+        float softcap);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

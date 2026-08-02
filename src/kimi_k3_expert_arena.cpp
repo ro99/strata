@@ -137,6 +137,65 @@ ValidationResult kimi_apply_write_guard(const KimiWriteGuardConfig& config) {
     return result;
 }
 
+namespace {
+
+// One expert's six payloads sorted the way the shard stores them. `stage` reads
+// them in this order and `kimi_expert_slot_layout` reports where each landed,
+// so the writer and every reader of a slot share one ordering.
+struct OrderedModule {
+    std::string_view shard;
+    std::uint64_t offset{};
+    std::uint64_t bytes{};
+    // Which of the six this is, so the layout can be reported by name after the
+    // sort has shuffled them.
+    std::uint8_t role{};
+};
+
+[[nodiscard]] std::array<OrderedModule, 6U> ordered_modules(
+    const KimiExpertModules& modules) noexcept {
+    std::array<OrderedModule, 6U> ordered{
+        OrderedModule{modules.gate.shard, modules.gate.packed_offset,
+                      modules.gate.packed_bytes, 0U},
+        OrderedModule{modules.gate.shard, modules.gate.scale_offset,
+                      modules.gate.scale_bytes, 1U},
+        OrderedModule{modules.up.shard, modules.up.packed_offset,
+                      modules.up.packed_bytes, 2U},
+        OrderedModule{modules.up.shard, modules.up.scale_offset,
+                      modules.up.scale_bytes, 3U},
+        OrderedModule{modules.down.shard, modules.down.packed_offset,
+                      modules.down.packed_bytes, 4U},
+        OrderedModule{modules.down.shard, modules.down.scale_offset,
+                      modules.down.scale_bytes, 5U}};
+    std::sort(ordered.begin(), ordered.end(),
+              [](const OrderedModule& left, const OrderedModule& right) {
+                  if (left.shard != right.shard) return left.shard < right.shard;
+                  return left.offset < right.offset;
+              });
+    return ordered;
+}
+
+}  // namespace
+
+KimiExpertSlotLayout kimi_expert_slot_layout(
+    const KimiExpertModules& modules) noexcept {
+    const auto ordered = ordered_modules(modules);
+    KimiExpertSlotLayout layout;
+    std::uint64_t cursor = 0U;
+    for (const auto& entry : ordered) {
+        switch (entry.role) {
+            case 0U: layout.gate_packed = cursor; break;
+            case 1U: layout.gate_scale = cursor; break;
+            case 2U: layout.up_packed = cursor; break;
+            case 3U: layout.up_scale = cursor; break;
+            case 4U: layout.down_packed = cursor; break;
+            default: layout.down_scale = cursor; break;
+        }
+        cursor += entry.bytes;
+    }
+    layout.total_bytes = cursor;
+    return layout;
+}
+
 ParseResult<std::uint64_t> kimi_disk_sectors_written(const std::string& disk) {
     // `/sys/block/<disk>/stat` field 7 (zero-based index 6) is cumulative
     // sectors written. It is field 10 of a `/proc/diskstats` row, which carries
@@ -485,32 +544,9 @@ ValidationResult KimiExpertReader::stage(
         }
         reserved.emplace_back(request.layer, request.expert);
 
-        // The six modules in shard order. Sorting by source offset is what lets
-        // the merge below find the runs; the arena slot then mirrors the shard,
-        // so a merged run is a single contiguous copy.
-        struct Module {
-            std::string_view shard;
-            std::uint64_t offset{};
-            std::uint64_t bytes{};
-        };
-        std::array<Module, 6U> ordered{
-            Module{modules.gate.shard, modules.gate.packed_offset,
-                   modules.gate.packed_bytes},
-            Module{modules.gate.shard, modules.gate.scale_offset,
-                   modules.gate.scale_bytes},
-            Module{modules.up.shard, modules.up.packed_offset,
-                   modules.up.packed_bytes},
-            Module{modules.up.shard, modules.up.scale_offset,
-                   modules.up.scale_bytes},
-            Module{modules.down.shard, modules.down.packed_offset,
-                   modules.down.packed_bytes},
-            Module{modules.down.shard, modules.down.scale_offset,
-                   modules.down.scale_bytes}};
-        std::sort(ordered.begin(), ordered.end(),
-                  [](const Module& left, const Module& right) {
-                      if (left.shard != right.shard) return left.shard < right.shard;
-                      return left.offset < right.offset;
-                  });
+        // The six modules in shard order, from the same ordering `fetch` uses
+        // to find them again inside the slot.
+        const auto ordered = ordered_modules(modules);
 
         std::uint64_t cursor = 0U;
         for (std::size_t index = 0U; index < ordered.size();) {

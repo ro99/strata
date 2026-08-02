@@ -292,6 +292,111 @@ def emit_mla(reference, shards: ShardSet, config, layer: int, tokens: int,
     torch.cuda.empty_cache()
 
 
+def assign_parameter(root: torch.nn.Module, dotted: str, tensor: torch.Tensor,
+                     declared: torch.Tensor | None = None) -> None:
+    """Replace a parameter on a module built under the meta device.
+
+    A meta parameter cannot take `.data =` from a real tensor, so the Parameter
+    object itself is replaced. The declared shape is checked when it is known:
+    silently loading a mis-shaped tensor would leave the fixture encoding
+    something other than the model.
+    """
+    if declared is not None and tuple(declared.shape) != tuple(tensor.shape):
+        raise RuntimeError(
+            f"{dotted}: checkpoint {tuple(tensor.shape)} against module "
+            f"{tuple(declared.shape)}")
+    parts = dotted.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    setattr(parent, parts[-1],
+            torch.nn.Parameter(tensor, requires_grad=False))
+
+
+def dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor, rows: int,
+                     columns: int, device: torch.device,
+                     dtype: torch.dtype) -> torch.Tensor:
+    """Decode one MXFP4 module using compressed-tensors' own routines.
+
+    The nibble order, sign bit, magnitude table, and E8M0 bias all come from the
+    library rather than from a transcription of the format, for the same reason
+    the layer fixtures run the real modules.
+    """
+    from compressed_tensors.compressors.mx_utils import decompress_mx_scale
+    from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
+
+    values = unpack_fp4_from_uint8(packed.to(device), rows, columns,
+                                   dtype=torch.float32)
+    scale = decompress_mx_scale(scales.to(device)).to(torch.float32)
+    # One scale per group of 32 along the input axis.
+    grouped = values.reshape(rows, columns // 32, 32)
+    return (grouped * scale.reshape(rows, columns // 32, 1)).reshape(
+        rows, columns).to(dtype)
+
+
+def emit_moe(reference, shards: ShardSet, config, layer: int, tokens: int,
+             device: torch.device, dtype: torch.dtype,
+             writer: FixtureWriter) -> None:
+    """Run the real Stable LatentMoE block with real MXFP4 experts.
+
+    All 896 experts are built on the meta device so nothing is allocated for
+    them, the reference's own gate picks the top-k, and only the selected
+    experts are materialized. `moe_infer` never touches an expert with zero
+    assigned tokens, so the unselected meta modules are never read.
+    """
+    prefix = f"language_model.model.layers.{layer}.block_sparse_moe"
+    with torch.device("meta"):
+        block = reference.KimiSparseMoeBlock(config)
+    # The reference's gate asserts inference mode outright.
+    block.eval()
+
+    dense = {
+        "gate.weight": f"{prefix}.gate.weight",
+        "gate.e_score_correction_bias": f"{prefix}.gate.e_score_correction_bias",
+        "routed_expert_down_proj.weight": f"{prefix}.routed_expert_down_proj.weight",
+        "routed_expert_up_proj.weight": f"{prefix}.routed_expert_up_proj.weight",
+        "routed_expert_norm.weight": f"{prefix}.routed_expert_norm.weight",
+        "shared_experts.gate_proj.weight": f"{prefix}.shared_experts.gate_proj.weight",
+        "shared_experts.up_proj.weight": f"{prefix}.shared_experts.up_proj.weight",
+        "shared_experts.down_proj.weight": f"{prefix}.shared_experts.down_proj.weight",
+    }
+    parameters = dict(block.named_parameters())
+    for local, full in dense.items():
+        source = shards.get(full)
+        target = torch.float32 if source.dtype == torch.float32 else dtype
+        assign_parameter(block, local, source.to(device=device, dtype=target),
+                         parameters[local])
+
+    hidden = deterministic_input(tokens, config.hidden_size, 4805, device, dtype)
+    writer.add(f"moe.{layer}.input", hidden[0])
+
+    with torch.no_grad():
+        topk_idx, _ = block.gate(hidden)
+    selected = sorted({int(index) for index in topk_idx.reshape(-1).tolist()})
+    print(f"moe layer {layer}: {len(selected)} distinct experts over {tokens} tokens")
+
+    latent = config.routed_expert_hidden_size
+    inner = config.moe_intermediate_size
+    shapes = {"w1": (inner, latent), "w3": (inner, latent), "w2": (latent, inner)}
+    with torch.no_grad():
+        for expert in selected:
+            for module, (rows, columns) in shapes.items():
+                packed = shards.get(f"{prefix}.experts.{expert}.{module}.weight_packed")
+                scales = shards.get(f"{prefix}.experts.{expert}.{module}.weight_scale")
+                dense_weight = dequantize_mxfp4(packed, scales, rows, columns,
+                                                device, dtype)
+                assign_parameter(block, f"experts.{expert}.{module}.weight",
+                                 dense_weight)
+
+    with torch.no_grad():
+        output = block(hidden)
+    writer.add(f"moe.{layer}.output", output[0])
+    writer.add(f"moe.{layer}.experts",
+               torch.tensor(selected, dtype=torch.float32))
+    del block
+    torch.cuda.empty_cache()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="/data/kimi-k3", type=Path)
@@ -301,6 +406,8 @@ def main() -> int:
                         help="prefill length; the reference chunks at 64")
     parser.add_argument("--kda-layer", type=int, default=0)
     parser.add_argument("--mla-layer", type=int, default=3)
+    parser.add_argument("--moe-layer", type=int, default=1)
+    parser.add_argument("--moe-tokens", type=int, default=4)
     parser.add_argument("--device", default="cuda:1")
     arguments = parser.parse_args()
 
@@ -319,6 +426,12 @@ def main() -> int:
     emit_kda(reference, shards, config, arguments.kda_layer, arguments.tokens,
              device, dtype, writer)
     emit_mla(reference, shards, config, arguments.mla_layer, arguments.tokens,
+             device, dtype, writer)
+    # The MoE fixture uses fewer tokens on purpose: at 64 tokens the top-16
+    # router would select close to all 896 experts of the layer, and
+    # materializing them is 15 GiB. Four tokens keep it inside one card while
+    # still exercising several tokens sharing and not sharing experts.
+    emit_moe(reference, shards, config, arguments.moe_layer, arguments.moe_tokens,
              device, dtype, writer)
 
     destination = arguments.out / "kimi-k3-layers.fixture"

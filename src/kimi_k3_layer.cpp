@@ -1,5 +1,6 @@
 #include "strata/kimi_k3_layer.hpp"
 
+#include "strata/compressed_tensors.hpp"
 #include "strata/numerics.hpp"
 
 #include <algorithm>
@@ -76,6 +77,59 @@ ValidationResult kimi_bf16_matmul(std::span<float> output,
             }
             output[token * rows + row] = sum;
         }
+    });
+    return result;
+}
+
+bool KimiExpertModuleView::valid() const noexcept {
+    if (rows == 0U || columns == 0U || columns % 32U != 0U) return false;
+    const auto count = static_cast<std::size_t>(rows);
+    return packed.size() == count * (columns / 2U) &&
+           scales.size() == count * (columns / 32U);
+}
+
+ValidationResult kimi_mxfp4_matvec(std::span<float> output,
+                                   std::span<const float> input,
+                                   const KimiExpertModuleView& module,
+                                   HostWorkerPool* pool) {
+    ValidationResult result;
+    if (!module.valid() || input.size() != module.columns ||
+        output.size() != module.rows) {
+        result.errors.emplace_back(
+            "MXFP4 matvec operands disagree with the module shape");
+        return result;
+    }
+    const auto columns = static_cast<std::size_t>(module.columns);
+    const auto packed_stride = columns / 2U;
+    const auto scale_stride = columns / 32U;
+    run_rows(module.rows, pool, [&](std::size_t row) {
+        const auto* packed = module.packed.data() + row * packed_stride;
+        const auto* scales = module.scales.data() + row * scale_stride;
+        float sum = 0.0F;
+        for (std::size_t group = 0U; group < scale_stride; ++group) {
+            const auto scale = mxfp4_scale_from_e8m0(scales[group]);
+            const auto* bytes = packed + group * 16U;
+            const auto* source = input.data() + group * 32U;
+            float partial = 0.0F;
+            for (std::size_t index = 0U; index < 16U; ++index) {
+                const auto byte = bytes[index];
+                // Low nibble first, sign in bit 3, magnitude in bits 0-2.
+                const auto low = static_cast<std::uint8_t>(byte & 0x0FU);
+                const auto high = static_cast<std::uint8_t>(byte >> 4U);
+                const auto low_value =
+                    (low & 0x08U) != 0U ? -kMxfp4Magnitudes[low & 0x07U]
+                                        : kMxfp4Magnitudes[low & 0x07U];
+                const auto high_value =
+                    (high & 0x08U) != 0U ? -kMxfp4Magnitudes[high & 0x07U]
+                                         : kMxfp4Magnitudes[high & 0x07U];
+                partial += source[index * 2U] * low_value +
+                           source[index * 2U + 1U] * high_value;
+            }
+            // One multiply per group rather than per element: the scale is
+            // shared across all 32 and factors out of the partial sum.
+            sum += partial * scale;
+        }
+        output[row] = sum;
     });
     return result;
 }
@@ -644,9 +698,9 @@ ValidationResult kimi_latent_moe_layer(std::span<float> output,
         KimiExpertWeights modules;
         result = experts.fetch(layer, expert, modules);
         if (!result.ok()) return result;
-        if (modules.gate.size() != inner * latent_width ||
-            modules.up.size() != inner * latent_width ||
-            modules.down.size() != latent_width * inner) {
+        if (modules.gate.rows != inner || modules.gate.columns != latent_width ||
+            modules.up.rows != inner || modules.up.columns != latent_width ||
+            modules.down.rows != latent_width || modules.down.columns != inner) {
             result.errors.emplace_back(
                 "routed expert modules disagree with the latent shape");
             return result;
@@ -658,32 +712,18 @@ ValidationResult kimi_latent_moe_layer(std::span<float> output,
                 if (entry.expert == expert) { weight = entry.weight; break; }
             }
             if (weight == 0.0F) continue;
-            const auto* source = latent.data() + token * latent_width;
-            run_rows(static_cast<std::uint32_t>(inner), pool, [&](std::size_t row) {
-                const auto* gate_row = modules.gate.data() + row * latent_width;
-                const auto* up_row = modules.up.data() + row * latent_width;
-                float gate_sum = 0.0F;
-                float up_sum = 0.0F;
-                for (std::size_t column = 0U; column < latent_width; ++column) {
-                    gate_sum += source[column] * gate_row[column];
-                    up_sum += source[column] * up_row[column];
-                }
-                gate[row] = gate_sum;
-                up[row] = up_sum;
-            });
+            const auto source = std::span<const float>(latent).subspan(
+                token * latent_width, latent_width);
+            result = kimi_mxfp4_matvec(gate, source, modules.gate, pool);
+            if (!result.ok()) return result;
+            result = kimi_mxfp4_matvec(up, source, modules.up, pool);
+            if (!result.ok()) return result;
             result = kimi_situ_glu(activated, gate, up, kContract.situ_gate_beta,
                                    kContract.situ_linear_beta);
             if (!result.ok()) return result;
+            result = kimi_mxfp4_matvec(expert_output, activated, modules.down, pool);
+            if (!result.ok()) return result;
             auto* destination = mixed.data() + token * latent_width;
-            run_rows(static_cast<std::uint32_t>(latent_width), pool,
-                     [&](std::size_t row) {
-                         const auto* down_row = modules.down.data() + row * inner;
-                         float sum = 0.0F;
-                         for (std::size_t column = 0U; column < inner; ++column) {
-                             sum += activated[column] * down_row[column];
-                         }
-                         expert_output[row] = sum;
-                     });
             for (std::size_t index = 0U; index < latent_width; ++index) {
                 destination[index] += weight * expert_output[index];
             }

@@ -103,12 +103,34 @@ struct KimiLayerWeights {
     KimiDenseMlpWeights dense;
 };
 
-// One routed expert's three modules, already dequantized into the latent space.
-struct KimiExpertWeights {
-    std::span<const float> gate;  // [expert_intermediate, routed_expert_hidden]
-    std::span<const float> up;
-    std::span<const float> down;  // [routed_expert_hidden, expert_intermediate]
+// One routed expert module in its MXFP4 checkpoint encoding: two E2M1 elements
+// per packed byte, low nibble first, with one E8M0 scale per group of 32.
+//
+// The multiply reads this form directly. Dequantizing an expert into F32 first
+// would materialize 132 MiB per expert, and at sixteen experts across 92 MoE
+// layers that is 194 GiB of extra memory traffic per token — the same order as
+// the storage term the whole design is bounded by. Decoding a nibble inside the
+// inner loop costs a shift and a table lookup and moves nothing.
+struct KimiExpertModuleView {
+    std::span<const std::uint8_t> packed;  // [rows, columns / 2]
+    std::span<const std::uint8_t> scales;  // [rows, columns / 32]
+    std::uint32_t rows{};
+    std::uint32_t columns{};
+
+    [[nodiscard]] bool valid() const noexcept;
 };
+
+// One routed expert's three modules in the order the LatentMoE block uses them.
+struct KimiExpertWeights {
+    KimiExpertModuleView gate;  // [expert_intermediate, routed_expert_hidden]
+    KimiExpertModuleView up;
+    KimiExpertModuleView down;  // [routed_expert_hidden, expert_intermediate]
+};
+
+// `output[r] = sum_c input[c] * dequantize(module)[r, c]`, decoded in place.
+[[nodiscard]] ValidationResult kimi_mxfp4_matvec(
+    std::span<float> output, std::span<const float> input,
+    const KimiExpertModuleView& module, HostWorkerPool* pool = nullptr);
 
 // Supplies the experts one MoE block needs. The runtime implements this over
 // the arena and the reader; a fixture implements it over a small map. Selection

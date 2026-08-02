@@ -1,6 +1,7 @@
 #include "test.hpp"
 
 #include "strata/kimi_k3_checkpoint.hpp"
+#include "strata/kimi_k3_expert_arena.hpp"
 #include "strata/kimi_k3_layer.hpp"
 #include "strata/model_adapter.hpp"
 
@@ -180,6 +181,78 @@ bool read_f32(const strata::KimiCheckpointReader& reader, const std::string& nam
     out = std::move(raw.value);
     return true;
 }
+
+// Routed experts out of the real arena and the real coalescing reader, so the
+// MoE fixture below gates the slot layout and the MXFP4 decode as well as the
+// block's semantics. Mirrors `ArenaExpertSource` in the runtime; the duplication
+// is deliberate — a test that reused the runtime's private class could not
+// notice if the runtime and the arena disagreed on the slot layout.
+class ArenaExperts final : public strata::KimiExpertSource {
+public:
+    ArenaExperts(const strata::KimiCheckpointReader& checkpoint,
+                 strata::KimiExpertArena& arena,
+                 strata::KimiExpertReader& reader)
+        : checkpoint_(&checkpoint), arena_(&arena), reader_(&reader) {}
+
+    strata::ValidationResult prepare(
+        std::uint32_t layer, std::span<const std::uint32_t> experts) override {
+        requested_.assign(experts.begin(), experts.end());
+        std::vector<strata::KimiReadRequest> requests;
+        requests.reserve(experts.size());
+        for (const auto expert : experts) {
+            requests.push_back(strata::KimiReadRequest{layer, expert});
+        }
+        return reader_->stage(*checkpoint_, *arena_, requests);
+    }
+
+    strata::ValidationResult fetch(std::uint32_t layer, std::uint32_t expert,
+                                   strata::KimiExpertWeights& weights) override {
+        strata::ValidationResult result;
+        const auto slot = arena_->find(layer, expert);
+        if (slot.empty()) {
+            result.errors.emplace_back("expert is not resident after staging");
+            return result;
+        }
+        strata::KimiExpertModules modules{};
+        if (!checkpoint_->expert_modules(layer, expert, modules)) {
+            result.errors.emplace_back("expert is not in the checkpoint");
+            return result;
+        }
+        const auto layout = strata::kimi_expert_slot_layout(modules);
+        const auto& c = strata::kKimiK3ExecutionContract;
+        const auto* base = reinterpret_cast<const std::uint8_t*>(slot.data());
+        const auto view = [&](std::uint64_t packed, std::uint64_t scale,
+                              std::uint32_t rows, std::uint32_t columns) {
+            strata::KimiExpertModuleView module;
+            module.rows = rows;
+            module.columns = columns;
+            module.packed = std::span<const std::uint8_t>(
+                base + packed, static_cast<std::size_t>(rows) * (columns / 2U));
+            module.scales = std::span<const std::uint8_t>(
+                base + scale, static_cast<std::size_t>(rows) * (columns / 32U));
+            return module;
+        };
+        weights.gate = view(layout.gate_packed, layout.gate_scale,
+                            c.expert_intermediate_size,
+                            c.routed_expert_hidden_size);
+        weights.up = view(layout.up_packed, layout.up_scale,
+                          c.expert_intermediate_size, c.routed_expert_hidden_size);
+        weights.down = view(layout.down_packed, layout.down_scale,
+                            c.routed_expert_hidden_size,
+                            c.expert_intermediate_size);
+        return result;
+    }
+
+    [[nodiscard]] const std::vector<std::uint32_t>& requested() const noexcept {
+        return requested_;
+    }
+
+private:
+    const strata::KimiCheckpointReader* checkpoint_{};
+    strata::KimiExpertArena* arena_{};
+    strata::KimiExpertReader* reader_{};
+    std::vector<std::uint32_t> requested_;
+};
 
 // The MoE block is exercised by its own fixtures; a layer probe supplies no
 // experts and reports the fact rather than inventing weights.
@@ -407,6 +480,109 @@ TEST_CASE("Kimi-K3 gated MLA layer matches the reference for prefill and decode"
     report("MLA decode", decode);
     REQUIRE(decode.relative_l2 < kRelativeL2Gate);
     REQUIRE(decode.cosine > kCosineGate);
+}
+
+TEST_CASE("Kimi-K3 LatentMoE block matches the reference with real experts") {
+    if (!kimi_present()) SKIP("pinned Kimi-K3 checkpoint is absent");
+    Fixture fixture;
+    if (!fixture.load(fixture_path())) {
+        SKIP("layer fixture is absent; run scripts/run_kimi_k3_reference_fixture.sh");
+    }
+    const auto& c = strata::kKimiK3ExecutionContract;
+    const std::uint32_t layer = 1U;
+    REQUIRE(strata::kimi_k3_moe_layer(layer));
+    const auto prefix = "moe." + std::to_string(layer) + ".";
+
+    const auto* input = fixture.find(prefix + "input");
+    const auto* expected = fixture.find(prefix + "output");
+    const auto* chosen = fixture.find(prefix + "experts");
+    if (input == nullptr || expected == nullptr) {
+        SKIP("MoE fixture is absent; regenerate it");
+    }
+    REQUIRE(chosen != nullptr);
+    const auto tokens = static_cast<std::uint32_t>(input->shape.at(0));
+
+    const auto opened = strata::KimiCheckpointReader::open(kimi_directory());
+    REQUIRE(opened.ok());
+    const auto& reader = *opened.value;
+    const auto base = "language_model.model.layers." + std::to_string(layer) +
+                      ".block_sparse_moe.";
+    const auto shared_inner = c.expert_intermediate_size * c.shared_experts;
+
+    RawTensor router, latent_down, latent_up, shared_gate, shared_up, shared_down;
+    REQUIRE(read_bf16(reader, base + "gate.weight", c.routed_experts,
+                      c.hidden_size, router));
+    REQUIRE(read_bf16(reader, base + "routed_expert_down_proj.weight",
+                      c.routed_expert_hidden_size, c.hidden_size, latent_down));
+    REQUIRE(read_bf16(reader, base + "routed_expert_up_proj.weight", c.hidden_size,
+                      c.routed_expert_hidden_size, latent_up));
+    REQUIRE(read_bf16(reader, base + "shared_experts.gate_proj.weight",
+                      shared_inner, c.hidden_size, shared_gate));
+    REQUIRE(read_bf16(reader, base + "shared_experts.up_proj.weight", shared_inner,
+                      c.hidden_size, shared_up));
+    REQUIRE(read_bf16(reader, base + "shared_experts.down_proj.weight",
+                      c.hidden_size, shared_inner, shared_down));
+
+    std::vector<float> router_bias, latent_norm;
+    REQUIRE(read_f32(reader, base + "gate.e_score_correction_bias",
+                     c.routed_experts, router_bias));
+    REQUIRE(read_f32(reader, base + "routed_expert_norm.weight",
+                     c.routed_expert_hidden_size, latent_norm));
+
+    strata::KimiMoeWeights weights;
+    weights.router = router.matrix;
+    weights.router_bias = router_bias;
+    weights.latent_down = latent_down.matrix;
+    weights.latent_up = latent_up.matrix;
+    weights.latent_norm = latent_norm;
+    weights.shared_gate = shared_gate.matrix;
+    weights.shared_up = shared_up.matrix;
+    weights.shared_down = shared_down.matrix;
+
+    // The real arena and the real O_DIRECT reader, so this gates the MXFP4
+    // decode, the slot layout the coalescing reader writes, and the block's
+    // semantics together. An arena sized for the whole selection keeps every
+    // expert resident once staged.
+    strata::KimiArenaConfig arena_config;
+    arena_config.capacity_bytes =
+        strata::KimiCheckpointReader::expert_source_bytes() *
+        (static_cast<std::uint64_t>(chosen->values.size()) + 8U);
+    // Locking is a production requirement, not a test one: a test that demands
+    // it fails on a machine with a small RLIMIT_MEMLOCK for reasons unrelated
+    // to what is under test.
+    arena_config.lock_pages = false;
+    strata::KimiExpertArena arena;
+    REQUIRE(arena.reset(arena_config).ok());
+
+    strata::KimiReaderConfig reader_config;
+    reader_config.queue_depth = 4U;
+    reader_config.direct = true;
+    strata::KimiExpertReader expert_reader;
+    REQUIRE(expert_reader.open(reader, reader_config).ok());
+
+    ArenaExperts experts(reader, arena, expert_reader);
+    strata::KimiLayerScratch scratch;
+    std::vector<float> output(static_cast<std::size_t>(tokens) * c.hidden_size);
+    const auto ran = strata::kimi_latent_moe_layer(output, input->values, weights,
+                                                   experts, layer, tokens, scratch);
+    if (!ran.ok()) {
+        for (const auto& error : ran.errors) std::cout << "  " << error << '\n';
+    }
+    REQUIRE(ran.ok());
+
+    // The routed experts this run actually read, against the ones the
+    // reference's own gate selected. A routing difference would show up here as
+    // a set mismatch rather than as a numerical one further downstream.
+    REQUIRE(experts.requested().size() == chosen->values.size());
+    for (std::size_t index = 0U; index < chosen->values.size(); ++index) {
+        REQUIRE(experts.requested()[index] ==
+                static_cast<std::uint32_t>(chosen->values[index]));
+    }
+
+    const auto agreement = compare(output, expected->values);
+    report("LatentMoE block", agreement);
+    REQUIRE(agreement.relative_l2 < kRelativeL2Gate);
+    REQUIRE(agreement.cosine > kCosineGate);
 }
 
 TEST_CASE("Kimi-K3 residual stream reproduces the reference block schedule") {

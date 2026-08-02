@@ -123,6 +123,26 @@ private:
     std::vector<Entry> slots_;
 };
 
+// Where each of an expert's six payloads sits inside its arena slot.
+//
+// The slot mirrors the shard: `stage` sorts the six by (shard, offset) so a
+// contiguous run reads as one submission, and copies them in that order. A
+// reader of the slot has to apply the same order, so both sides call this
+// rather than each deriving it. On this checkpoint the six are one 16.73 MiB
+// extent and the slot is a byte-for-byte image of it.
+struct KimiExpertSlotLayout {
+    std::uint64_t gate_packed{};
+    std::uint64_t gate_scale{};
+    std::uint64_t up_packed{};
+    std::uint64_t up_scale{};
+    std::uint64_t down_packed{};
+    std::uint64_t down_scale{};
+    std::uint64_t total_bytes{};
+};
+
+[[nodiscard]] KimiExpertSlotLayout kimi_expert_slot_layout(
+    const KimiExpertModules& modules) noexcept;
+
 struct KimiReadRequest {
     std::uint32_t layer{};
     std::uint32_t expert{};

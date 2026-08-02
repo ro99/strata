@@ -51,6 +51,7 @@ add_library(strata_core STATIC
     src/kimi_k3_kv_cache.cpp
     src/kimi_k3_expert_arena.cpp
     src/kimi_k3_layer.cpp
+    src/kimi_k3_runtime.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
     src/deepseek_ops.cpp

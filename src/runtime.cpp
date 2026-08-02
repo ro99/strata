@@ -3,6 +3,7 @@
 #include "strata/deepseek_runtime.hpp"
 #include "strata/gemma4_runtime.hpp"
 #include "strata/glm_runtime.hpp"
+#include "strata/kimi_k3_runtime.hpp"
 
 #include <array>
 #include <algorithm>
@@ -13,8 +14,8 @@
 namespace strata {
 
 struct RuntimeSession::Impl {
-    std::variant<std::monostate, Glm52Runtime, DeepSeekV4Runtime,
-                 Gemma4Runtime> runtime;
+    std::variant<std::monostate, Glm52Runtime, DeepSeekV4Runtime, Gemma4Runtime,
+                 KimiK3Runtime> runtime;
     SamplingOptions sampling;
     PlacementPlan placement;
     bool placement_ready{};
@@ -132,12 +133,21 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     if (config.model == RuntimeModel::KimiK3) {
-        // Exact mode reports a failure rather than falling back to another
-        // runtime. Placement planning and `--dry-run` are complete; execution
-        // lands with the Kimi-K3 runtime.
-        result.errors.emplace_back(
-            "the Kimi-K3 runtime is not implemented yet; --dry-run reports its "
-            "placement plan");
+        if (config.deepseek_block_kv_cache) {
+            result.errors.emplace_back(
+                "DeepSeek block KV cache cannot be used by the Kimi-K3 runtime");
+            return result;
+        }
+        KimiK3Runtime runtime;
+        KimiK3RuntimeConfig concrete;
+        concrete.maximum_context_tokens = config.maximum_context_tokens;
+        concrete.sampling_temperature = config.sampling.temperature;
+        concrete.sampling_seed = config.sampling.seed;
+        concrete.verbose = config.verbose;
+        concrete.load_progress = config.load_progress;
+        concrete.placement = placement;
+        result = runtime.initialize(model_directory, concrete);
+        if (result.ok()) impl_->runtime.emplace<KimiK3Runtime>(std::move(runtime));
         return result;
     }
     if (config.model == RuntimeModel::Gemma4) {
@@ -258,6 +268,16 @@ GenerationResult RuntimeSession::generate_chat_stream(
             concrete.metrics.incremental_kv_continuation;
         result.errors = std::move(concrete.errors);
         result.stopped = concrete.stopped;
+        return result;
+    }
+    if (auto* runtime = std::get_if<KimiK3Runtime>(&impl_->runtime)) {
+        // Kimi-K3 has no tokenizer or chat template yet, so this reports the
+        // failure rather than substituting another model's. `evaluate` and
+        // `generate_from_tokens` are the working surface until stage 7.
+        auto concrete = runtime->generate_chat_stream(
+            messages, options.maximum_new_tokens, options.sampling,
+            options.stop, on_token);
+        result.errors = std::move(concrete.errors);
         return result;
     }
     if (auto* runtime = std::get_if<Gemma4Runtime>(&impl_->runtime)) {

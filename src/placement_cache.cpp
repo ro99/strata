@@ -189,6 +189,8 @@ std::string encode_placement_plan(const PlacementPlan& plan) {
     output << ", \"nvme\": " << (plan.hardware.storage.nvme ? "true" : "false")
            << ", \"rotational\": "
            << (plan.hardware.storage.rotational ? "true" : "false")
+           << ", \"memory_backed\": "
+           << (plan.hardware.storage.memory_backed ? "true" : "false")
            << ", \"resolved\": "
            << (plan.hardware.storage.resolved ? "true" : "false") << '}';
     output << ", \"devices\": [";
@@ -306,6 +308,8 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                                 storage.nvme = cursor.parse_bool();
                             } else if (entry == "rotational") {
                                 storage.rotational = cursor.parse_bool();
+                            } else if (entry == "memory_backed") {
+                                storage.memory_backed = cursor.parse_bool();
                             } else if (entry == "resolved") {
                                 storage.resolved = cursor.parse_bool();
                             } else {

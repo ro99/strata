@@ -49,6 +49,7 @@ add_library(strata_core STATIC
     src/kimi_k3_manifest.cpp
     src/kimi_k3_checkpoint.cpp
     src/kimi_k3_kv_cache.cpp
+    src/kimi_k3_expert_arena.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
     src/deepseek_ops.cpp
@@ -124,6 +125,9 @@ target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 
+add_executable(strata-kimi-expert-probe apps/strata_kimi_expert_probe.cpp)
+target_link_libraries(strata-kimi-expert-probe PRIVATE strata_core)
+
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
     add_executable(strata-topology-probe apps/strata_topology_probe.cu)
@@ -153,6 +157,7 @@ if(BUILD_TESTING)
         tests/test_kimi_k3_manifest.cpp
         tests/test_kimi_k3_checkpoint.cpp
         tests/test_kimi_k3_kv_cache.cpp
+        tests/test_kimi_k3_expert_arena.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
@@ -190,7 +195,7 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat strata-server
-        strata-host-expert-probe RUNTIME DESTINATION bin)
+        strata-host-expert-probe strata-kimi-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)
 endif()

@@ -272,6 +272,14 @@ PlacementStorage resolve_backing_storage(const std::string& path) {
     storage.path = path;
     struct stat status {};
     if (path.empty() || ::stat(path.c_str(), &status) != 0) return storage;
+    // Major zero is an anonymous device: tmpfs, ramfs, and friends have no
+    // block device behind them. That is a resolved answer, not an unknown one,
+    // and it is the safest target a run can pick for scratch.
+    if (major(status.st_dev) == 0U) {
+        storage.memory_backed = true;
+        storage.resolved = true;
+        return storage;
+    }
     // st_dev names the block device the file lives on; /sys/dev/block maps that
     // major:minor back to a kernel device name.
     std::array<char, 64> node{};
@@ -799,7 +807,9 @@ std::string render_placement_report(const PlacementPlan& plan) {
          << " available of " << format_bytes(plan.hardware.host_total_bytes)
          << '\n';
     text << "  storage       ";
-    if (plan.hardware.storage.resolved) {
+    if (plan.hardware.storage.memory_backed) {
+        text << "memory backed (no block device)";
+    } else if (plan.hardware.storage.resolved) {
         text << plan.hardware.storage.device << " on "
              << plan.hardware.storage.disk << " ("
              << (plan.hardware.storage.nvme ? "nvme" : "non-nvme") << ", "

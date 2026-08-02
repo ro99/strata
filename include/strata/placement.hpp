@@ -134,6 +134,10 @@ struct PlacementStorage {
     std::string disk;
     bool nvme{};
     bool rotational{};
+    // A tmpfs or ramfs has no block device behind it at all, which is a
+    // resolved answer and the safest one: nothing written there reaches a
+    // disk. `device` and `disk` stay empty.
+    bool memory_backed{};
     bool resolved{};
 };
 

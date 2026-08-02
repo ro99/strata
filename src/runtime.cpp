@@ -27,6 +27,7 @@ namespace {
         case RuntimeModel::Glm52: return PlacementModel::Glm52;
         case RuntimeModel::DeepSeekV4: return PlacementModel::DeepSeekV4;
         case RuntimeModel::Gemma4: return PlacementModel::Gemma4;
+        case RuntimeModel::KimiK3: return PlacementModel::KimiK3;
     }
     return PlacementModel::Gemma4;
 }
@@ -43,6 +44,10 @@ PlacementRequest placement_request_for(const std::string& model_directory,
     request.maximum_context_tokens = config.maximum_context_tokens;
     request.flash_attention = config.enable_flash_attention;
     request.block_kv_cache = config.deepseek_block_kv_cache;
+    // Kimi-K3 keeps its 1.3 TiB routed set in the checkpoint's own shards and
+    // reads it on demand, so where those shards live is part of the contract:
+    // sourcing them from NVMe is refused rather than merely discouraged.
+    request.forbid_nvme_residency = config.model == RuntimeModel::KimiK3;
     return request;
 }
 
@@ -124,6 +129,15 @@ ValidationResult RuntimeSession::initialize(
             config.enable_incremental_kv_continuation;
         result = runtime.initialize(model_directory, concrete);
         if (result.ok()) impl_->runtime.emplace<Glm52Runtime>(std::move(runtime));
+        return result;
+    }
+    if (config.model == RuntimeModel::KimiK3) {
+        // Exact mode reports a failure rather than falling back to another
+        // runtime. Placement planning and `--dry-run` are complete; execution
+        // lands with the Kimi-K3 runtime.
+        result.errors.emplace_back(
+            "the Kimi-K3 runtime is not implemented yet; --dry-run reports its "
+            "placement plan");
         return result;
     }
     if (config.model == RuntimeModel::Gemma4) {

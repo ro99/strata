@@ -95,7 +95,7 @@ void write_array(std::ostringstream& output, const std::vector<T>& values) {
                                         PlacementTier& tier) noexcept {
     if (text == "device") { tier = PlacementTier::Device; return true; }
     if (text == "host") { tier = PlacementTier::Host; return true; }
-    if (text == "nvme") { tier = PlacementTier::Nvme; return true; }
+    if (text == "storage") { tier = PlacementTier::Storage; return true; }
     return false;
 }
 
@@ -138,7 +138,8 @@ void read_object(detail::JsonCursor& cursor, Handler handler) {
          << '|' << std::fixed << std::setprecision(6) << request.vram_cache_fraction
          << '|' << request.maximum_context_tokens << '|'
          << (request.flash_attention ? 1 : 0) << '|'
-         << (request.block_kv_cache ? 1 : 0) << '|';
+         << (request.block_kv_cache ? 1 : 0) << '|'
+         << (request.forbid_nvme_residency ? 1 : 0) << '|';
     for (const int device : request.devices) text << device << ',';
     constexpr std::uint64_t offset = 1469598103934665603ULL;
     constexpr std::uint64_t prime = 1099511628211ULL;
@@ -174,10 +175,23 @@ std::string encode_placement_plan(const PlacementPlan& plan) {
            << ", \"flash_attention\": "
            << (plan.request.flash_attention ? "true" : "false")
            << ", \"block_kv_cache\": "
-           << (plan.request.block_kv_cache ? "true" : "false") << "}";
+           << (plan.request.block_kv_cache ? "true" : "false")
+           << ", \"forbid_nvme_residency\": "
+           << (plan.request.forbid_nvme_residency ? "true" : "false") << "}";
     output << ",\n  \"hardware\": {\"host_total_bytes\": "
            << plan.hardware.host_total_bytes << ", \"host_available_bytes\": "
-           << plan.hardware.host_available_bytes << ", \"devices\": [";
+           << plan.hardware.host_available_bytes << ", \"storage\": {\"path\": ";
+    escape(output, plan.hardware.storage.path);
+    output << ", \"device\": ";
+    escape(output, plan.hardware.storage.device);
+    output << ", \"disk\": ";
+    escape(output, plan.hardware.storage.disk);
+    output << ", \"nvme\": " << (plan.hardware.storage.nvme ? "true" : "false")
+           << ", \"rotational\": "
+           << (plan.hardware.storage.rotational ? "true" : "false")
+           << ", \"resolved\": "
+           << (plan.hardware.storage.resolved ? "true" : "false") << '}';
+    output << ", \"devices\": [";
     for (std::size_t index = 0U; index < plan.hardware.devices.size(); ++index) {
         const auto& device = plan.hardware.devices[index];
         if (index != 0U) output << ", ";
@@ -212,11 +226,12 @@ std::string encode_placement_plan(const PlacementPlan& plan) {
     output << ",\n  \"weighted_schedule\": ";
     write_array(output, plan.weighted_schedule);
     output << ",\n  \"host_resident_bytes\": " << plan.host_resident_bytes
-           << ",\n  \"nvme_streamed_bytes\": " << plan.nvme_streamed_bytes
+           << ",\n  \"storage_resident_bytes\": " << plan.storage_resident_bytes
            << ",\n  \"decode_device_read_bytes\": " << plan.decode_device_read_bytes
            << ",\n  \"decode_host_to_device_bytes\": "
            << plan.decode_host_to_device_bytes
-           << ",\n  \"decode_nvme_read_bytes\": " << plan.decode_nvme_read_bytes
+           << ",\n  \"decode_storage_read_bytes\": "
+           << plan.decode_storage_read_bytes
            << ",\n  \"maximum_context_tokens_that_fit\": "
            << plan.maximum_context_tokens_that_fit
            << ",\n  \"cross_device_activation_hops\": "
@@ -265,6 +280,8 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                         plan.request.flash_attention = cursor.parse_bool();
                     } else if (field == "block_kv_cache") {
                         plan.request.block_kv_cache = cursor.parse_bool();
+                    } else if (field == "forbid_nvme_residency") {
+                        plan.request.forbid_nvme_residency = cursor.parse_bool();
                     } else {
                         return false;
                     }
@@ -276,6 +293,26 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                         plan.hardware.host_total_bytes = cursor.parse_uint64();
                     } else if (field == "host_available_bytes") {
                         plan.hardware.host_available_bytes = cursor.parse_uint64();
+                    } else if (field == "storage") {
+                        read_object(cursor, [&](const std::string& entry) {
+                            auto& storage = plan.hardware.storage;
+                            if (entry == "path") {
+                                storage.path = cursor.parse_string();
+                            } else if (entry == "device") {
+                                storage.device = cursor.parse_string();
+                            } else if (entry == "disk") {
+                                storage.disk = cursor.parse_string();
+                            } else if (entry == "nvme") {
+                                storage.nvme = cursor.parse_bool();
+                            } else if (entry == "rotational") {
+                                storage.rotational = cursor.parse_bool();
+                            } else if (entry == "resolved") {
+                                storage.resolved = cursor.parse_bool();
+                            } else {
+                                return false;
+                            }
+                            return true;
+                        });
                     } else if (field == "devices") {
                         cursor.expect('[');
                         if (!cursor.consume(']')) {
@@ -352,14 +389,14 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                 plan.weighted_schedule = read_size_array(cursor);
             } else if (key == "host_resident_bytes") {
                 plan.host_resident_bytes = cursor.parse_uint64();
-            } else if (key == "nvme_streamed_bytes") {
-                plan.nvme_streamed_bytes = cursor.parse_uint64();
+            } else if (key == "storage_resident_bytes") {
+                plan.storage_resident_bytes = cursor.parse_uint64();
             } else if (key == "decode_device_read_bytes") {
                 plan.decode_device_read_bytes = cursor.parse_uint64();
             } else if (key == "decode_host_to_device_bytes") {
                 plan.decode_host_to_device_bytes = cursor.parse_uint64();
-            } else if (key == "decode_nvme_read_bytes") {
-                plan.decode_nvme_read_bytes = cursor.parse_uint64();
+            } else if (key == "decode_storage_read_bytes") {
+                plan.decode_storage_read_bytes = cursor.parse_uint64();
             } else if (key == "maximum_context_tokens_that_fit") {
                 plan.maximum_context_tokens_that_fit =
                     static_cast<std::uint32_t>(cursor.parse_uint64());
@@ -460,7 +497,8 @@ ParseResult<PlacementResolution> resolve_placement_plan(
     const PlacementRequest& request, std::string_view cache_directory,
     bool use_cache, bool refresh) {
     ParseResult<PlacementResolution> result;
-    auto hardware = probe_placement_hardware(request.devices);
+    auto hardware = probe_placement_hardware(request.devices,
+                                             request.model_directory);
     if (!hardware.ok()) {
         result.errors = std::move(hardware.errors);
         return result;
@@ -541,6 +579,9 @@ PlacementPlanResult load_placement_plan(const std::string& directory,
         plan.request.maximum_context_tokens != request.maximum_context_tokens ||
         plan.request.flash_attention != request.flash_attention ||
         plan.request.block_kv_cache != request.block_kv_cache ||
+        plan.request.forbid_nvme_residency != request.forbid_nvme_residency ||
+        plan.hardware.storage.disk != hardware.storage.disk ||
+        plan.hardware.storage.resolved != hardware.storage.resolved ||
         plan.hardware.devices.size() != hardware.devices.size()) {
         return result;
     }

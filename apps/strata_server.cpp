@@ -66,7 +66,7 @@ void stop_server(int) {
 
 void usage() {
     std::cerr
-        << "usage: strata-server --model DIR --model-type gemma4|deepseek|glm\n"
+        << "usage: strata-server --model DIR --model-type gemma4|deepseek|glm|kimi-k3\n"
         << "                     [--model-id ID] [--host ADDRESS] [--port N]\n"
         << "                     [--context-size N] [--max-new N]\n"
         << "                     [--devices 0,1,2] [--vram-fraction F]\n"
@@ -142,7 +142,7 @@ bool parse_options(int argc, char** argv, Options& options) {
     }
     return !options.model.empty() && !options.model_id.empty() &&
         (options.model_type == "glm" || options.model_type == "deepseek" ||
-         options.model_type == "gemma4");
+         options.model_type == "gemma4" || options.model_type == "kimi-k3");
 }
 
 std::string lower(std::string_view text) {
@@ -652,6 +652,8 @@ int main(int argc, char** argv) {
         ? strata::RuntimeModel::Glm52
         : options.model_type == "gemma4"
             ? strata::RuntimeModel::Gemma4
+        : options.model_type == "kimi-k3"
+            ? strata::RuntimeModel::KimiK3
             : strata::RuntimeModel::DeepSeekV4;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;

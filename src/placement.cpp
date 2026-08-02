@@ -10,9 +10,13 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <filesystem>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <system_error>
 #include <unordered_set>
 
 namespace strata {
@@ -191,6 +195,7 @@ std::string_view to_string(PlacementModel model) noexcept {
         case PlacementModel::Glm52: return "glm";
         case PlacementModel::DeepSeekV4: return "deepseek";
         case PlacementModel::Gemma4: return "gemma4";
+        case PlacementModel::KimiK3: return "kimi-k3";
     }
     return "unknown";
 }
@@ -199,7 +204,7 @@ std::string_view to_string(PlacementTier tier) noexcept {
     switch (tier) {
         case PlacementTier::Device: return "device";
         case PlacementTier::Host: return "host";
-        case PlacementTier::Nvme: return "nvme";
+        case PlacementTier::Storage: return "storage";
     }
     return "unknown";
 }
@@ -226,6 +231,7 @@ bool parse_placement_model(std::string_view text, PlacementModel& model) noexcep
     if (text == "glm") { model = PlacementModel::Glm52; return true; }
     if (text == "deepseek") { model = PlacementModel::DeepSeekV4; return true; }
     if (text == "gemma4") { model = PlacementModel::Gemma4; return true; }
+    if (text == "kimi-k3") { model = PlacementModel::KimiK3; return true; }
     return false;
 }
 
@@ -261,8 +267,39 @@ std::uint64_t PlacementPlan::total_device_bytes() const noexcept {
     return total;
 }
 
+PlacementStorage resolve_backing_storage(const std::string& path) {
+    PlacementStorage storage;
+    storage.path = path;
+    struct stat status {};
+    if (path.empty() || ::stat(path.c_str(), &status) != 0) return storage;
+    // st_dev names the block device the file lives on; /sys/dev/block maps that
+    // major:minor back to a kernel device name.
+    std::array<char, 64> node{};
+    std::snprintf(node.data(), node.size(), "/sys/dev/block/%u:%u",
+                  major(status.st_dev), minor(status.st_dev));
+    std::error_code code;
+    const auto resolved = std::filesystem::canonical(node.data(), code);
+    if (code) return storage;
+    storage.device = resolved.filename().string();
+
+    // A partition's sysfs node sits under its whole disk, so the parent
+    // directory names the disk whenever the leaf is a partition.
+    storage.disk = storage.device;
+    if (std::filesystem::exists(resolved / "partition", code) && !code) {
+        storage.disk = resolved.parent_path().filename().string();
+    }
+    storage.nvme = storage.disk.rfind("nvme", 0U) == 0U;
+    std::ifstream rotational(
+        (std::filesystem::path("/sys/block") / storage.disk / "queue/rotational")
+            .string());
+    int spinning = 0;
+    if (rotational >> spinning) storage.rotational = spinning != 0;
+    storage.resolved = true;
+    return storage;
+}
+
 ParseResult<PlacementHardware> probe_placement_hardware(
-    std::span<const int> devices) {
+    std::span<const int> devices, const std::string& model_directory) {
     ParseResult<PlacementHardware> result;
     if (devices.empty()) {
         result.errors.emplace_back(
@@ -292,6 +329,7 @@ ParseResult<PlacementHardware> probe_placement_hardware(
     result.value.host_total_bytes = read_meminfo_kilobytes("MemTotal") * kilobyte;
     result.value.host_available_bytes =
         read_meminfo_kilobytes("MemAvailable") * kilobyte;
+    result.value.storage = resolve_backing_storage(model_directory);
     return result;
 }
 
@@ -441,7 +479,7 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
             if (item.preferred_tier == PlacementTier::Host) {
                 plan.decode_host_to_device_bytes += item.decode_read_bytes;
             } else {
-                plan.decode_nvme_read_bytes += item.decode_read_bytes;
+                plan.decode_storage_read_bytes += item.decode_read_bytes;
             }
             continue;
         }
@@ -481,7 +519,20 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
     }
 
     // Spillable classes take what device capacity is left, then host memory.
-    // Anything beyond both is streamed from NVMe on every step that needs it.
+    // Anything beyond both is read from the checkpoint on every step that needs
+    // it. Shallower `deepest_tier` first: a class that may not reach storage has
+    // the harder constraint, and on the models that mix the two it is also the
+    // densely read one, so giving it VRAM ahead of a sparse class is strictly
+    // better under a max over resources.
+    std::vector<const PlacementItem*> spill_order;
+    for (const auto& item : inventory.items) {
+        if (item.spillable) spill_order.push_back(&item);
+    }
+    std::stable_sort(spill_order.begin(), spill_order.end(),
+                     [](const PlacementItem* left, const PlacementItem* right) {
+                         return static_cast<std::uint8_t>(left->deepest_tier) <
+                                static_cast<std::uint8_t>(right->deepest_tier);
+                     });
     std::uint64_t expert_capacity = 0U;
     for (const auto bytes : plan.device_expert_cache_bytes) {
         if (!add(expert_capacity, bytes)) {
@@ -507,8 +558,8 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
     } else {
         host_capacity -= plan.host_resident_bytes;
     }
-    for (const auto& item : inventory.items) {
-        if (!item.spillable) continue;
+    for (const auto* entry_item : spill_order) {
+        const auto& item = *entry_item;
         const auto total = item.device_bytes == 0U ? 1U : item.device_bytes;
         const auto device_share = std::min(item.device_bytes, expert_capacity);
         expert_capacity -= device_share;
@@ -519,6 +570,21 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
         const auto host_taken = std::min(outside, host_capacity);
         host_capacity -= host_taken;
         const auto nvme_share = outside - host_taken;
+        if (nvme_share != 0U && item.deepest_tier != PlacementTier::Storage) {
+            // A densely read class that will not fit device plus host is the
+            // charter's I/O-dependent case. Report it; do not absorb it by
+            // silently streaming it from the checkpoint on every step.
+            result.errors.emplace_back(
+                inventory.model_name + " " + std::string(to_string(item.component)) +
+                " needs " + format_bytes(outside) +
+                " outside VRAM but the host tier admits only " +
+                format_bytes(host_taken) + ", leaving " +
+                format_bytes(nvme_share) +
+                " with nowhere to go: this class is read on every decode step "
+                "and may not spill past the host tier, so the model is I/O "
+                "dependent at this operating point");
+            return result;
+        }
         // Per-step reads split by resident fraction. Routing decides the real
         // hit rate; this is a uniform-routing bound, flagged in the notes.
         const auto reads = item.decode_read_bytes;
@@ -535,9 +601,9 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
         const auto nvme_reads = streamed - host_reads;
         plan.decode_device_read_bytes += device_reads;
         plan.decode_host_to_device_bytes += host_reads;
-        plan.decode_nvme_read_bytes += nvme_reads;
+        plan.decode_storage_read_bytes += nvme_reads;
         if (!add(plan.host_resident_bytes, host_taken) ||
-            !add(plan.nvme_streamed_bytes, nvme_share)) {
+            !add(plan.storage_resident_bytes, nvme_share)) {
             result.errors.emplace_back("placement spill byte total overflows");
             return result;
         }
@@ -550,7 +616,7 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
             entry.bytes += outside;
             entry.tier_bytes[static_cast<std::size_t>(PlacementTier::Host)] +=
                 host_taken;
-            entry.tier_bytes[static_cast<std::size_t>(PlacementTier::Nvme)] +=
+            entry.tier_bytes[static_cast<std::size_t>(PlacementTier::Storage)] +=
                 nvme_share;
         } else {
             entry.bytes += item.device_bytes;
@@ -558,7 +624,7 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
                 device_share;
             entry.tier_bytes[static_cast<std::size_t>(PlacementTier::Host)] +=
                 host_taken;
-            entry.tier_bytes[static_cast<std::size_t>(PlacementTier::Nvme)] +=
+            entry.tier_bytes[static_cast<std::size_t>(PlacementTier::Storage)] +=
                 nvme_share;
         }
         // Spread the admitted cache over devices in proportion to the capacity
@@ -610,17 +676,47 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
             ++plan.cross_device_activation_hops;
         }
     }
-    plan.io_dependent = plan.nvme_streamed_bytes != 0U;
+    plan.io_dependent = plan.storage_resident_bytes != 0U;
     plan.fits = !plan.io_dependent;
+    // NVMe endurance is protected by refusal, not by preference: a plan that
+    // would source model bytes from an NVMe-backed path is an error even when
+    // it otherwise fits.
+    if (request.forbid_nvme_residency && plan.storage_resident_bytes != 0U) {
+        if (!hardware.storage.resolved) {
+            result.errors.emplace_back(
+                "cannot confirm the checkpoint's backing block device, and this "
+                "run forbids NVMe residency; resolve " +
+                request.model_directory + " or clear the restriction");
+            return result;
+        }
+        if (hardware.storage.nvme) {
+            result.errors.emplace_back(
+                "this run forbids NVMe residency but " + request.model_directory +
+                " is backed by " + hardware.storage.disk + ", so the " +
+                format_bytes(plan.storage_resident_bytes) +
+                " storage tier would read model bytes from NVMe");
+            return result;
+        }
+    }
     if (has_spill && inventory.host_reserve_bytes != 0U) {
         plan.notes.emplace_back(
             "host tier withholds " + format_bytes(inventory.host_reserve_bytes) +
             " for activations, worker stacks, and page cache");
     }
     if (plan.io_dependent) {
+        std::string where = "the checkpoint";
+        if (hardware.storage.resolved) {
+            where = hardware.storage.disk + " (" +
+                    (hardware.storage.nvme ? "nvme"
+                                           : hardware.storage.rotational
+                                                 ? "rotational"
+                                                 : "non-rotational, non-nvme") +
+                    ')';
+        }
         plan.notes.emplace_back(
-            "steady-state decode reads " + format_bytes(plan.decode_nvme_read_bytes) +
-            " from NVMe per step: this configuration is I/O dependent");
+            "steady-state decode reads " +
+            format_bytes(plan.decode_storage_read_bytes) + " per step from " +
+            where + ": this configuration is I/O dependent");
     }
     if (plan.decode_host_to_device_bytes != 0U) {
         plan.notes.emplace_back(
@@ -701,7 +797,19 @@ std::string render_placement_report(const PlacementPlan& plan) {
     }
     text << "\n  host          " << format_bytes(plan.hardware.host_available_bytes)
          << " available of " << format_bytes(plan.hardware.host_total_bytes)
-         << "\n\n";
+         << '\n';
+    text << "  storage       ";
+    if (plan.hardware.storage.resolved) {
+        text << plan.hardware.storage.device << " on "
+             << plan.hardware.storage.disk << " ("
+             << (plan.hardware.storage.nvme ? "nvme" : "non-nvme") << ", "
+             << (plan.hardware.storage.rotational ? "rotational"
+                                                  : "non-rotational")
+             << ')';
+    } else {
+        text << "unresolved";
+    }
+    text << "\n\n";
 
     constexpr int kNameWidth = 16;
     constexpr int kCellWidth = 12;
@@ -765,18 +873,18 @@ std::string render_placement_report(const PlacementPlan& plan) {
     text << "\n  hops          " << plan.cross_device_activation_hops
          << " cross-device activation transfers per decode step\n";
     text << "  host resident " << format_bytes(plan.host_resident_bytes) << '\n'
-         << "  nvme streamed " << format_bytes(plan.nvme_streamed_bytes) << '\n';
+         << "  storage resid " << format_bytes(plan.storage_resident_bytes) << '\n';
     text << "  decode reads  " << format_bytes(plan.decode_device_read_bytes)
          << " device, " << format_bytes(plan.decode_host_to_device_bytes)
-         << " host-to-device, " << format_bytes(plan.decode_nvme_read_bytes)
-         << " nvme  (bytes per step, not a duration)\n";
+         << " host-to-device, " << format_bytes(plan.decode_storage_read_bytes)
+         << " storage  (bytes per step, not a duration)\n";
     if (plan.maximum_context_tokens_that_fit != 0U) {
         text << "  max context   " << plan.maximum_context_tokens_that_fit
              << " tokens at this placement\n";
     }
     text << "  verdict       "
          << (plan.io_dependent
-                 ? "I/O dependent: steady-state decode reads NVMe"
+                 ? "I/O dependent: steady-state decode reads the checkpoint"
                  : plan.decode_host_to_device_bytes != 0U
                      ? "fits with a host tier: decode streams weights over PCIe"
                      : "fits: every weight, cache, and workspace is device resident")

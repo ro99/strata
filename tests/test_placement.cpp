@@ -98,7 +98,7 @@ TEST_CASE("placement keeps a dense model contiguous and inside every budget") {
     }
     REQUIRE(plan.decode_device_read_bytes == 12U * kGigabyte);
     REQUIRE(plan.decode_host_to_device_bytes == 0U);
-    REQUIRE(plan.decode_nvme_read_bytes == 0U);
+    REQUIRE(plan.decode_storage_read_bytes == 0U);
 }
 
 TEST_CASE("placement gives the larger GPU the larger share of layers") {
@@ -143,15 +143,15 @@ TEST_CASE("sparse experts spill to host and then to NVMe") {
     REQUIRE(roomy.ok());
     REQUIRE(!roomy.value.io_dependent);
     REQUIRE(roomy.value.host_resident_bytes > 0U);
-    REQUIRE(roomy.value.nvme_streamed_bytes == 0U);
+    REQUIRE(roomy.value.storage_resident_bytes == 0U);
 
     const auto cramped = solve_placement(inventory, make_hardware({16U, 16U}, 8U),
                                          make_request(2U));
     REQUIRE(cramped.ok());
     REQUIRE(cramped.value.io_dependent);
-    REQUIRE(cramped.value.nvme_streamed_bytes > 0U);
+    REQUIRE(cramped.value.storage_resident_bytes > 0U);
     REQUIRE(!cramped.value.fits);
-    REQUIRE(cramped.value.decode_nvme_read_bytes > 0U);
+    REQUIRE(cramped.value.decode_storage_read_bytes > 0U);
 }
 
 TEST_CASE("per-step read volume is conserved across tiers") {
@@ -168,7 +168,7 @@ TEST_CASE("per-step read volume is conserved across tiers") {
     REQUIRE(result.ok());
     const auto& plan = result.value;
     REQUIRE(plan.decode_device_read_bytes + plan.decode_host_to_device_bytes +
-                plan.decode_nvme_read_bytes ==
+                plan.decode_storage_read_bytes ==
             8U * kGigabyte);
 }
 
@@ -308,4 +308,181 @@ TEST_CASE("byte formatting is stable across magnitudes") {
     REQUIRE(strata::format_bytes(0U) == "0 B");
     REQUIRE(strata::format_bytes(1024U) == "1.00 KiB");
     REQUIRE(strata::format_bytes(kGigabyte * 35U / 10U) == "3.50 GiB");
+}
+
+// ------------------------------------------------------- storage tier (v2)
+
+namespace {
+
+// One densely read class that may not spill past the host tier, and one sparse
+// class that may reach storage. This is Kimi-K3's shape: a BF16 spine larger
+// than VRAM alongside a routed-expert set larger than host memory.
+strata::PlacementInventory make_tiered_inventory(
+    std::uint64_t dense_gigabytes, std::uint64_t sparse_gigabytes) {
+    strata::PlacementInventory inventory;
+    inventory.model = strata::PlacementModel::KimiK3;
+    inventory.model_name = "tiered-test";
+    inventory.layer_count = 4U;
+    inventory.maximum_context_tokens = 2048U;
+    inventory.per_device_workspace_bytes = kGigabyte / 2U;
+    inventory.minimum_device_budget_bytes = kGigabyte;
+    inventory.host_reserve_bytes = 0U;
+    inventory.contiguous_layer_blocks = false;
+
+    strata::PlacementItem dense;
+    dense.component = strata::PlacementClass::Attention;
+    dense.device_bytes = dense_gigabytes * kGigabyte;
+    dense.host_bytes = dense.device_bytes;
+    dense.source_bytes = dense.device_bytes;
+    dense.decode_read_bytes = dense.device_bytes;
+    dense.spillable = true;
+    dense.deepest_tier = strata::PlacementTier::Host;
+    inventory.items.push_back(dense);
+
+    strata::PlacementItem sparse;
+    sparse.component = strata::PlacementClass::RoutedExpert;
+    sparse.device_bytes = sparse_gigabytes * kGigabyte;
+    sparse.host_bytes = sparse.device_bytes;
+    sparse.source_bytes = sparse.device_bytes;
+    sparse.decode_read_bytes = kGigabyte;
+    sparse.spillable = true;
+    sparse.device_cache_only = true;
+    sparse.deepest_tier = strata::PlacementTier::Storage;
+    inventory.items.push_back(sparse);
+    return inventory;
+}
+
+}  // namespace
+
+TEST_CASE("a dense class spills to host but never to storage") {
+    // 20 GiB of dense weights against 13.4 GiB of admitted VRAM and a routed
+    // set larger than host memory: a third of the dense class must stream from
+    // host every step, which is a fit, not a defect.
+    const auto hardware = make_hardware({8U, 8U}, 64U);
+    auto request = make_request(2U);
+    request.model = strata::PlacementModel::KimiK3;
+    const auto planned = solve_placement(make_tiered_inventory(20U, 400U),
+                                         hardware, request);
+    REQUIRE(planned.ok());
+    const auto& plan = planned.value;
+    REQUIRE(plan.io_dependent);
+    REQUIRE(plan.storage_resident_bytes != 0U);
+
+    // The dense class claims VRAM ahead of the sparse one: under a max over
+    // resources, VRAM spent on a class read every step beats VRAM spent on a
+    // class read once per routed hit.
+    const auto attention = strata::placement_component_bytes(
+        plan, strata::PlacementClass::Attention, 0U);
+    REQUIRE(attention != 0U);
+    REQUIRE(strata::placement_component_bytes(
+                plan, strata::PlacementClass::RoutedExpert, 0U) == 0U);
+    // Only the sparse class reaches storage.
+    for (const auto& component : plan.components) {
+        if (component.component == strata::PlacementClass::Attention) {
+            REQUIRE(component.tier != strata::PlacementTier::Storage);
+        }
+    }
+}
+
+TEST_CASE("a dense class larger than device plus host is an error, not a spill") {
+    // 200 GiB of densely read weights against 16 GiB of VRAM and 64 GiB of
+    // host: the charter's I/O-dependent case, which must be reported.
+    const auto hardware = make_hardware({8U, 8U}, 64U);
+    auto request = make_request(2U);
+    request.model = strata::PlacementModel::KimiK3;
+    const auto planned = solve_placement(make_tiered_inventory(200U, 40U),
+                                         hardware, request);
+    REQUIRE(!planned.ok());
+    REQUIRE(planned.errors.front().find("may not spill past the host tier") !=
+            std::string::npos);
+    REQUIRE(planned.errors.front().find("I/O dependent") != std::string::npos);
+}
+
+TEST_CASE("a plan is refused when the storage tier is NVMe backed") {
+    auto hardware = make_hardware({8U, 8U}, 64U);
+    hardware.storage.path = "/models/test";
+    hardware.storage.device = "nvme0n1p2";
+    hardware.storage.disk = "nvme0n1";
+    hardware.storage.nvme = true;
+    hardware.storage.resolved = true;
+
+    auto request = make_request(2U);
+    request.model = strata::PlacementModel::KimiK3;
+    const auto inventory = make_tiered_inventory(12U, 400U);
+
+    // Permitted by default; refused when the run protects NVMe endurance.
+    REQUIRE(solve_placement(inventory, hardware, request).ok());
+    request.forbid_nvme_residency = true;
+    const auto refused = solve_placement(inventory, hardware, request);
+    REQUIRE(!refused.ok());
+    REQUIRE(refused.errors.front().find("nvme0n1") != std::string::npos);
+
+    // A SATA-backed checkpoint is admitted under the same restriction.
+    auto sata = hardware;
+    sata.storage.device = "sda1";
+    sata.storage.disk = "sda";
+    sata.storage.nvme = false;
+    REQUIRE(solve_placement(inventory, sata, request).ok());
+
+    // An unresolved backing device is refused rather than assumed safe.
+    auto unknown = hardware;
+    unknown.storage.resolved = false;
+    unknown.storage.nvme = false;
+    const auto unresolved = solve_placement(inventory, unknown, request);
+    REQUIRE(!unresolved.ok());
+    REQUIRE(unresolved.errors.front().find("cannot confirm") != std::string::npos);
+}
+
+TEST_CASE("the backing block device of a real path resolves") {
+    const auto storage = strata::resolve_backing_storage(STRATA_SOURCE_DIR);
+    REQUIRE(storage.resolved);
+    REQUIRE(!storage.device.empty());
+    REQUIRE(!storage.disk.empty());
+    // A partition resolves to its whole disk, and the disk name is a prefix of
+    // the partition name on every naming scheme this runs on.
+    REQUIRE(storage.device.rfind(storage.disk, 0U) == 0U);
+    REQUIRE(storage.nvme == (storage.disk.rfind("nvme", 0U) == 0U));
+
+    const auto missing = strata::resolve_backing_storage("/nonexistent/path");
+    REQUIRE(!missing.resolved);
+}
+
+TEST_CASE("the plan cache round-trips the storage tier and the NVMe restriction") {
+    auto hardware = make_hardware({8U, 8U}, 64U);
+    hardware.storage.path = "/models/test";
+    hardware.storage.device = "sda1";
+    hardware.storage.disk = "sda";
+    hardware.storage.resolved = true;
+    auto request = make_request(2U);
+    request.model = strata::PlacementModel::KimiK3;
+    request.forbid_nvme_residency = true;
+    auto planned = solve_placement(make_tiered_inventory(12U, 400U), hardware,
+                                   request);
+    REQUIRE(planned.ok());
+
+    const auto decoded = strata::decode_placement_plan(
+        strata::encode_placement_plan(planned.value));
+    REQUIRE(decoded.ok());
+    REQUIRE(decoded.value.version == 2U);
+    REQUIRE(decoded.value.request.model == strata::PlacementModel::KimiK3);
+    REQUIRE(decoded.value.request.forbid_nvme_residency);
+    REQUIRE(decoded.value.hardware.storage.disk == "sda");
+    REQUIRE(decoded.value.hardware.storage.resolved);
+    REQUIRE(!decoded.value.hardware.storage.nvme);
+    REQUIRE(decoded.value.storage_resident_bytes ==
+            planned.value.storage_resident_bytes);
+    REQUIRE(decoded.value.decode_storage_read_bytes ==
+            planned.value.decode_storage_read_bytes);
+}
+
+TEST_CASE("a v1 plan is discarded rather than reinterpreted") {
+    // v1 spelled the overflow tier `nvme` and named its fields for it. Reading
+    // those bytes as v2 storage figures would report them as coming from a
+    // device they were never measured on.
+    const auto v1 = R"({"version": 1, "model_type": "glm", "model_name": "x",
+        "model_identity": "abc", "model_directory": "/m",
+        "nvme_streamed_bytes": 123, "decode_nvme_read_bytes": 456})";
+    const auto decoded = strata::decode_placement_plan(v1);
+    REQUIRE(!decoded.ok());
+    REQUIRE(decoded.errors.front().find("schema version") != std::string::npos);
 }

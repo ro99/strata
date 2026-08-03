@@ -14,12 +14,15 @@ This is the machine the project is built and measured on. It's an ordinary works
 | RAM | 251 GiB DDR4 |
 | CPU | Xeon E5-2680 v4 |
 
-On this hardware Strata supports three checkpoints: Gemma 4 31B-IT W8A16
+On this hardware Strata supports four checkpoints: Gemma 4 31B-IT W8A16
 (35.1 GB, dense text and vision), resident across the three GPUs;
 DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into
-host RAM so decode does not touch storage after warm-up; and GLM-5.2 W4A16
+host RAM so decode does not touch storage after warm-up; GLM-5.2 W4A16
 (388 GB, 78 layers, 256 experts, top-8), which is larger than the machine's
-combined VRAM and RAM and therefore remains I/O-dependent.
+combined VRAM and RAM and therefore remains I/O-dependent; and Kimi-K3
+(1.45 TB, 93 hybrid KDA/MLA layers, 896 experts, top-16), which is larger still
+and is bring-up in progress — see [docs/kimi-k3-runtime.md](docs/kimi-k3-runtime.md)
+for which gates have been measured and which have not.
 
 ## What "exact" means here
 
@@ -302,13 +305,15 @@ It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`,
 | Gemma 4 31B-IT | 60 dense hybrid-attention layers; 27-layer vision tower | INT8 group-32 text linears, BF16 vision/embeddings and BF16 KV | Fully resident across GPU VRAM; text and OpenAI image-content generation |
 | DeepSeek-V4-Flash-0731 | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
 | GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 linears, BF16/F32 sensitive tensors; W4A16 execution | Larger than combined memory; I/O-dependent |
+| Kimi-K3 | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16, latent MoE | MXFP4 experts (92.7% of the payload), BF16 everywhere else | Bring-up: contract, codec, ops, layer graph, tokenizer measured green; full-model teacher forcing and generation blocked on an operator action; vision not implemented |
 
 Each runs its declared model semantics as-is: local/global grouped-query
 attention, proportional RoPE, GeGLU, soft-capped logits, and bidirectional
 image blocks for Gemma 4; hybrid compressed attention, manifold-constrained
-hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek; and
+hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek;
 MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for
-GLM.
+GLM; and Kimi Delta Attention with NoPE gated MLA, attention residuals over
+depth, SiTU-GLU, and a latent-space MoE for Kimi-K3.
 
 The current 0731 checkpoint has not yet been benchmarked. For context, the last
 validated DeepSeek measurement used the now-unsupported preview checkpoint:
@@ -347,7 +352,7 @@ The difference between the two rows is mostly explained by whether the checkpoin
 - **Instrumentation.** Every run reports checkpoint reads, H2D/D2H bytes, cache
   hits/misses/evictions, per-phase timings, RSS, and per-GPU VRAM as JSON.
 
-For more detail: [docs/current-architecture.md](docs/current-architecture.md) describes what's implemented, [docs/architecture.md](docs/architecture.md) describes the target scheduler design, and [docs/deepseek-v4-runtime.md](docs/deepseek-v4-runtime.md) covers the DeepSeek contract specifically.
+For more detail: [docs/current-architecture.md](docs/current-architecture.md) describes what's implemented, [docs/architecture.md](docs/architecture.md) describes the target scheduler design, and [docs/deepseek-v4-runtime.md](docs/deepseek-v4-runtime.md) and [docs/kimi-k3-runtime.md](docs/kimi-k3-runtime.md) cover the DeepSeek and Kimi-K3 contracts specifically.
 
 ## Roadmap
 

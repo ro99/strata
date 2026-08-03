@@ -253,18 +253,21 @@ int main(int argc, char** argv) {
     for (auto& value : source) value = values(engine);
     std::vector<float> gate(inner), up(inner), activated(inner), output(latent);
 
-    // Bring the machine to steady state before the first timed arm. Without
-    // this the first arm of a fresh process reads high -- 3.24 s/token against
-    // 1.78 for the same arm in a later run -- because the governor is still
-    // ramping from idle. The per-arm warm-up is far too short to cover it, and
-    // whichever arm happens to run first would otherwise be penalised, which is
-    // exactly the kind of ordering artefact that gets read as a result.
-    {
+    // Bring the machine to steady state before each timed arm.
+    //
+    // A fresh process reads high on whatever runs first -- 3.24 s/token against
+    // 1.78 for the same arm later -- because the governor is still ramping from
+    // idle. Arms also inherit state from the arm before them: the block arm,
+    // measured without this, read 1.20 alone and 1.43 in sequence. Whichever
+    // arm ran first was being penalised and whichever ran later was being
+    // flattered, which is exactly the ordering artefact that gets read as a
+    // result. Every sweep now starts from the same place.
+    const auto settle = [&]() {
         strata::HostWorkerPool warmup_pool(hardware_threads);
         std::mt19937_64 warmup_selector(options.seed);
         std::uniform_int_distribution<std::size_t> warmup_pick(0U, pool_count - 1U);
-        const auto until = std::chrono::steady_clock::now() +
-                           std::chrono::seconds(3);
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < until) {
             const auto& triple = pool[warmup_pick(warmup_selector)];
             (void)strata::kimi_mxfp4_matvec(gate, source, triple.gate.view(),
@@ -274,7 +277,8 @@ int main(int argc, char** argv) {
             (void)strata::kimi_mxfp4_matvec(output, activated, triple.down.view(),
                                             &warmup_pool);
         }
-    }
+    };
+    settle();
 
     std::cout << "\n"
               << std::setw(9) << "workers" << std::setw(14) << "ms/expert"
@@ -375,6 +379,7 @@ int main(int argc, char** argv) {
               << std::setw(16) << "routed s/token" << std::setw(12) << "spread"
               << std::setw(14) << "vs matvec" << "\n";
 
+    settle();
     double best_block_seconds = 0.0;
     std::size_t best_block_workers = 0U;
     for (const auto workers : options.worker_counts) {
@@ -483,6 +488,7 @@ int main(int argc, char** argv) {
                   << std::setw(14) << "GiB/s" << std::setw(16) << "spine s/token"
                   << std::setw(12) << "spread" << "\n";
 
+        settle();
         double best_dense_seconds = 0.0;
         std::size_t best_dense_workers = 0U;
         for (const auto workers : options.worker_counts) {

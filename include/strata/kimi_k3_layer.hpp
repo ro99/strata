@@ -139,6 +139,11 @@ struct KimiExpertWeights {
 class KimiExpertSource {
 public:
     virtual ~KimiExpertSource() = default;
+    // Reports the deduplicated routed set for one layer. `prepare` already
+    // receives exactly that set, so the default does nothing and only an
+    // implementation that wants to observe routing overrides it.
+    virtual void observe(std::uint32_t /*layer*/,
+                         std::span<const std::uint32_t> /*experts*/) {}
     // Called once per MoE block with every expert the block will read, so the
     // implementation can stage them together.
     [[nodiscard]] virtual ValidationResult prepare(

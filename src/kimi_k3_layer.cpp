@@ -840,6 +840,7 @@ ValidationResult kimi_latent_moe_layer(std::span<float> output,
     for (const auto& entry : selection) wanted.push_back(entry.expert);
     std::sort(wanted.begin(), wanted.end());
     wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    experts.observe(layer, wanted);
     result = experts.prepare(layer, wanted);
     if (!result.ok()) return result;
 

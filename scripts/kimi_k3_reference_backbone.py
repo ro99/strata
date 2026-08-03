@@ -238,6 +238,21 @@ def sweep(reference, shards: ShardSet, config, tail: Tail, cache, hidden,
                                             cache_position=cache_position,
                                             block_residual=block_residual)
         writer.add(f"{tag}.layer.{layer}", hidden[0])
+        # The routed set this layer actually selected, deduplicated and sorted.
+        #
+        # Gates 5 and 6 fail with per-layer error growing about 30x with depth
+        # against a prediction that it would be flat, and there are two live
+        # explanations: routing that diverges from the reference under top-16
+        # of 896, or a composition bug across 93 layers that the sublayer gates
+        # could not see. They are told apart by exactly this array. If the
+        # runtime selects the same experts and the error still grows, routing
+        # is not the cause; if it selects different ones, it is.
+        #
+        # It costs nothing to record -- the hook already collected it to decide
+        # which experts to materialize, and only the count was ever printed.
+        if selected:
+            writer.add(f"{tag}.routed.{layer}",
+                       torch.tensor(sorted(set(selected)), dtype=torch.int32))
         del module
         torch.cuda.empty_cache()
         print(f"{tag} layer {layer + 1:3d}/{config.num_hidden_layers}  "

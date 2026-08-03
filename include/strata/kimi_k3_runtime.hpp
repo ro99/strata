@@ -23,6 +23,13 @@ namespace strata {
 using KimiLayerObserver =
     std::function<void(std::uint32_t layer, std::span<const float> hidden)>;
 
+// Called after each MoE layer's router runs, with the deduplicated, sorted set
+// of experts that layer selected. The reference oracle records the same array,
+// so the two can be compared position by position -- which is what separates a
+// routing divergence from a composition bug when the backbone disagrees.
+using KimiRouteObserver =
+    std::function<void(std::uint32_t layer, std::span<const std::uint32_t> experts)>;
+
 struct KimiK3RuntimeConfig {
     std::uint32_t maximum_context_tokens{2048U};
     // Tokens per prefill page.
@@ -87,6 +94,9 @@ struct KimiK3RuntimeConfig {
     const PlacementPlan* placement{};
     // Unset on the serving path; the teacher-forcing oracle binds it.
     KimiLayerObserver layer_observer{};
+    // Unset on the serving path; the gate 5/6 discriminating experiment binds
+    // it. Advisory only -- it observes the routed set, it cannot change it.
+    KimiRouteObserver route_observer{};
 };
 
 struct KimiK3RunMetrics {

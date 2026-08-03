@@ -119,8 +119,15 @@ private:
 class ArenaExpertSource final : public KimiExpertSource {
 public:
     ArenaExpertSource(const KimiCheckpointReader& checkpoint,
-                      KimiExpertArena& arena, KimiExpertReader& reader)
-        : checkpoint_(&checkpoint), arena_(&arena), reader_(&reader) {}
+                      KimiExpertArena& arena, KimiExpertReader& reader,
+                      KimiRouteObserver observer = {})
+        : checkpoint_(&checkpoint), arena_(&arena), reader_(&reader),
+          observer_(std::move(observer)) {}
+
+    void observe(std::uint32_t layer,
+                 std::span<const std::uint32_t> experts) override {
+        if (observer_) observer_(layer, experts);
+    }
 
     ValidationResult prepare(std::uint32_t layer,
                              std::span<const std::uint32_t> experts) override {
@@ -186,6 +193,7 @@ private:
     KimiExpertArena* arena_{};
     KimiExpertReader* reader_{};
     std::vector<KimiReadRequest> requests_;
+    KimiRouteObserver observer_;
 };
 
 // `generation_config.json` is the file the reference's `generate` reads, and
@@ -646,7 +654,7 @@ ValidationResult KimiK3Runtime::initialize(const std::string& model_directory,
     result = impl_->reader.open(*impl_->checkpoint, reader);
     if (!result.ok()) return result;
     impl_->experts = std::make_unique<ArenaExpertSource>(
-        *impl_->checkpoint, impl_->arena, impl_->reader);
+        *impl_->checkpoint, impl_->arena, impl_->reader, config.route_observer);
 
     impl_->metrics = {};
     impl_->metrics.load_seconds = now_seconds() - started;

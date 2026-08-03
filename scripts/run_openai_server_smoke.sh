@@ -29,7 +29,7 @@ for repetition in 1 2 3; do
   curl -fsS -H 'Content-Type: application/json' -d "$request" \
     "http://127.0.0.1:$port/v1/chat/completions" \
     >"$result_dir/response-$repetition.json"
-  jq -e '.object == "chat.completion" and .choices[0].message.role == "assistant" and .usage.total_tokens > 0' \
+  jq -e '.object == "chat.completion" and .choices[0].message.role == "assistant" and .usage.total_tokens > 0 and .usage.prompt_tokens_details.cached_tokens >= 0 and .timings.prompt_n >= 0 and .timings.predicted_n >= 0' \
     "$result_dir/response-$repetition.json" >/dev/null
 done
 jq -e -s '.[0].choices[0].message.content == .[1].choices[0].message.content and .[1].choices[0].message.content == .[2].choices[0].message.content' \
@@ -39,6 +39,8 @@ curl -fsS -N -H 'Content-Type: application/json' \
   -d '{"model":"glm52","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_tokens":3,"stream":true}' \
   "http://127.0.0.1:$port/v1/chat/completions" >"$result_dir/stream.txt"
 grep -q '^data: \[DONE\]$' "$result_dir/stream.txt"
+grep -q 'cached_tokens' "$result_dir/stream.txt"
+grep -q '"timings"' "$result_dir/stream.txt"
 
 kill -TERM "$server_pid"
 wait "$server_pid"

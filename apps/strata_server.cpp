@@ -441,6 +441,7 @@ private:
             "Cache-Control: no-cache\r\nConnection: close\r\n"
             "Access-Control-Allow-Origin: *\r\n\r\n";
         if (!send_all(socket, header)) return;
+        strata::GenerationMetrics aggregated;
         for (std::uint32_t index = 0U; index < request.n; ++index) {
             auto options = request.generation;
             options.sampling.seed = request.has_seed
@@ -491,6 +492,12 @@ private:
                 send_all(socket, "data: [DONE]\n\n");
                 return;
             }
+            aggregated.prompt_tokens += result.metrics.prompt_tokens;
+            aggregated.prefill_tokens += result.metrics.prefill_tokens;
+            aggregated.prefill_seconds += result.metrics.prefill_seconds;
+            aggregated.decode_tokens += result.metrics.decode_tokens;
+            aggregated.decode_seconds += result.metrics.decode_seconds;
+            aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
             if (!connected || !utf8_pending.empty()) {
                 send_all(socket, "data: " + error_json(
                     "generated text is not valid UTF-8", "server_error") + "\n\n");
@@ -524,7 +531,15 @@ private:
             if (chat) final << "\"delta\":{}";
             else final << "\"text\":\"\"";
             final << ",\"logprobs\":null,\"finish_reason\":\""
-                  << finish_reason(result, options) << "\"}]}\n\n";
+                  << finish_reason(result, options) << "\"}]";
+            if (index + 1U == request.n) {
+                final << ",\"usage\":"
+                      << strata::render_openai_usage(
+                          aggregated.prompt_tokens, aggregated.decode_tokens,
+                          aggregated.reused_prompt_tokens)
+                      << ",\"timings\":" << strata::render_openai_timings(aggregated);
+            }
+            final << "}\n\n";
             if (!send_all(socket, final.str())) return;
         }
         send_all(socket, "data: [DONE]\n\n");
@@ -557,6 +572,7 @@ private:
             results.push_back(std::move(result));
         }
         std::uint64_t completion_tokens = 0U;
+        strata::GenerationMetrics aggregated;
         std::ostringstream response;
         response << "{\"id\":\"" << id << "\",\"object\":\""
                  << (chat ? "chat.completion" : "text_completion")
@@ -568,6 +584,12 @@ private:
             if (index != 0U) response << ',';
             const auto& result = results[index];
             completion_tokens += result.generated_token_ids.size();
+            aggregated.prompt_tokens += result.metrics.prompt_tokens;
+            aggregated.prefill_tokens += result.metrics.prefill_tokens;
+            aggregated.prefill_seconds += result.metrics.prefill_seconds;
+            aggregated.decode_tokens += result.metrics.decode_tokens;
+            aggregated.decode_seconds += result.metrics.decode_seconds;
+            aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
             response << "{\"index\":" << index << ',';
             if (chat) {
                 response << "\"message\":{\"role\":\"assistant\",\"content\":\""
@@ -582,11 +604,12 @@ private:
             response << ",\"finish_reason\":\""
                      << finish_reason(result, request.generation) << "\"}";
         }
-        const auto prompt_tokens = results.empty() ? 0U : results.front().metrics.prompt_tokens;
-        response << "],\"usage\":{\"prompt_tokens\":" << prompt_tokens
-                 << ",\"completion_tokens\":" << completion_tokens
-                 << ",\"total_tokens\":" << prompt_tokens + completion_tokens
-                 << "}}";
+        const auto prompt_tokens = aggregated.prompt_tokens;
+        response << "],\"usage\":"
+                 << strata::render_openai_usage(prompt_tokens, completion_tokens,
+                                                aggregated.reused_prompt_tokens)
+                 << ",\"timings\":" << strata::render_openai_timings(aggregated)
+                 << "}";
         double model_seconds = 0.0;
         double decode_seconds = 0.0;
         std::uint64_t decode_steps = 0U;

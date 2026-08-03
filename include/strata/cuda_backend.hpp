@@ -21,6 +21,12 @@ enum class CudaWeightEncoding : std::uint8_t {
     OffsetPackedInt8,
     Fp8E4m3Block128,
     Fp4E2m1Group32,
+    // compressed-tensors "nvfp4-pack-quantized": E2M1 nibble pairs with FP8
+    // E4M3 group scales and one FP32 per-tensor global scale. Weights
+    // dequantize to w = e2m1 * (e4m3_scale / global_scale) and the activation
+    // stays FP32; this is a W4A16 path, not the W4A4 form the checkpoint's
+    // input_global_scale tensors would allow.
+    Nvfp4Group16,
 };
 
 struct CudaWeightDescriptor {
@@ -31,6 +37,8 @@ struct CudaWeightDescriptor {
     std::uint64_t packed_columns{};
     std::uint64_t scale_columns{};
     std::uint32_t group_size{};
+    // Per-tensor divisor for Nvfp4Group16 group scales; unused otherwise.
+    float global_scale{1.0F};
 };
 
 struct CudaBackendStats {

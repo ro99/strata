@@ -95,7 +95,7 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
 
 void usage() {
     std::cerr
-        << "usage: strata-chat --model DIR --model-type gemma4|deepseek|glm\n"
+        << "usage: strata-chat --model DIR --model-type gemma4|deepseek|glm|laguna\n"
         << "                    [--context-size N] [--max-new N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention] [--full-reprefill]\n"
@@ -264,7 +264,7 @@ bool parse_options(int argc, char** argv, Options& options) {
     }
     return !options.model.empty() &&
            (options.model_type == "glm" || options.model_type == "deepseek" ||
-            options.model_type == "gemma4");
+            options.model_type == "gemma4" || options.model_type == "laguna");
 }
 
 // A run is reproducible when nothing stochastic is enabled. Temperature alone
@@ -646,6 +646,8 @@ int main(int argc, char** argv) {
                        ? strata::RuntimeModel::Glm52
                    : options.model_type == "gemma4"
                        ? strata::RuntimeModel::Gemma4
+                   : options.model_type == "laguna"
+                       ? strata::RuntimeModel::Laguna
                        : strata::RuntimeModel::DeepSeekV4;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;
@@ -653,8 +655,8 @@ int main(int argc, char** argv) {
     config.verbose = options.model_type == "deepseek";
     config.load_progress = options.model_type != "deepseek";
     config.sampling = options.sampling;
-    config.enable_flash_attention =
-        options.flash_attention || options.model_type == "gemma4";
+    config.enable_flash_attention = options.flash_attention ||
+        options.model_type == "gemma4" || options.model_type == "laguna";
     config.enable_incremental_kv_continuation =
         options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;
@@ -706,7 +708,8 @@ int main(int argc, char** argv) {
               << " seed=" << options.sampling.seed << '\n'
               << "[sampler] " << sampler_summary(options.sampling) << '\n'
               << "[attention] "
-              << ((options.flash_attention || options.model_type == "gemma4")
+              << ((options.flash_attention || options.model_type == "gemma4" ||
+                   options.model_type == "laguna")
                       ? "CUDA FlashAttention" : "scalar reference")
               << '\n'
               << "[contract] "

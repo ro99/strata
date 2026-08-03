@@ -191,6 +191,7 @@ std::string_view to_string(PlacementModel model) noexcept {
         case PlacementModel::Glm52: return "glm";
         case PlacementModel::DeepSeekV4: return "deepseek";
         case PlacementModel::Gemma4: return "gemma4";
+        case PlacementModel::Laguna: return "laguna";
     }
     return "unknown";
 }
@@ -226,6 +227,7 @@ bool parse_placement_model(std::string_view text, PlacementModel& model) noexcep
     if (text == "glm") { model = PlacementModel::Glm52; return true; }
     if (text == "deepseek") { model = PlacementModel::DeepSeekV4; return true; }
     if (text == "gemma4") { model = PlacementModel::Gemma4; return true; }
+    if (text == "laguna") { model = PlacementModel::Laguna; return true; }
     return false;
 }
 

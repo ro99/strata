@@ -5,6 +5,7 @@
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/gemma4_checkpoint.hpp"
+#include "strata/laguna_checkpoint.hpp"
 #include "strata/model_adapter.hpp"
 
 #include <algorithm>
@@ -328,6 +329,171 @@ struct Gemma4Linear {
     return result;
 }
 
+// ---------------------------------------------------------------- Laguna
+
+[[nodiscard]] ParseResult<PlacementInventory> build_laguna_inventory(
+    const LagunaCheckpointReader& checkpoint, std::uint32_t context_tokens) {
+    ParseResult<PlacementInventory> result;
+    constexpr auto& c = kLagunaExecutionContract;
+    auto& inventory = result.value;
+    inventory.model = PlacementModel::Laguna;
+    inventory.model_name = laguna_s21_nvfp4_spec().name;
+    inventory.layer_count = c.layer_count;
+    inventory.maximum_context_tokens = context_tokens;
+    inventory.per_device_workspace_bytes = kFlashAttentionWorkspaceReserve;
+    inventory.minimum_device_budget_bytes = kMinimumDeviceBudget;
+    // Like GLM, the Laguna runtime interleaves layers over a VRAM-weighted
+    // round robin and sizes its expert cache from what the spine leaves behind.
+    // Report that placement; do not re-place a validated runtime.
+    inventory.contiguous_layer_blocks = false;
+    inventory.prescriptive = false;
+
+    const auto add_linear = [&](PlacementClass component, std::int32_t layer,
+                                const std::string& base, std::uint64_t rows,
+                                std::uint64_t columns) {
+        auto module = checkpoint.linear(base, rows, columns);
+        if (!module.ok()) {
+            result.errors.push_back("Laguna checkpoint is missing " + base);
+            return;
+        }
+        ModuleSizes sizes;
+        sizes.layer = layer;
+        if (module.value.encoding == LagunaTensorEncoding::Plain) {
+            sizes.weight_bytes = module.value.weight->bytes;
+        } else {
+            sizes.weight_bytes = module.value.packed->bytes;
+            sizes.scale_bytes = module.value.scale->bytes;
+        }
+        const auto device = sizes.device_bytes();
+        inventory.items.push_back(
+            make_item(component, sizes, device, PlacementTier::Device, false));
+    };
+
+    const auto hidden = static_cast<std::uint64_t>(c.hidden_size);
+    const auto kv_columns =
+        static_cast<std::uint64_t>(c.key_value_heads) * c.head_dim;
+    ModuleSizes routed;
+    std::uint64_t routed_modules = 0U;
+    for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
+        const auto index = static_cast<std::int32_t>(layer);
+        const auto prefix = "model.layers." + std::to_string(layer) + ".";
+        const auto attention = prefix + "self_attn.";
+        const auto mlp = prefix + "mlp.";
+        const auto heads = static_cast<std::uint64_t>(laguna_attention_heads(layer));
+        add_linear(PlacementClass::Attention, index, attention + "q_proj",
+                   heads * c.head_dim, hidden);
+        add_linear(PlacementClass::Attention, index, attention + "k_proj",
+                   kv_columns, hidden);
+        add_linear(PlacementClass::Attention, index, attention + "v_proj",
+                   kv_columns, hidden);
+        add_linear(PlacementClass::Attention, index, attention + "o_proj",
+                   hidden, heads * c.head_dim);
+        add_linear(PlacementClass::Attention, index, attention + "g_proj",
+                   heads, hidden);
+        if (!laguna_sparse_layer(layer)) {
+            add_linear(PlacementClass::FeedForward, index, mlp + "gate_proj",
+                       c.dense_intermediate_size, hidden);
+            add_linear(PlacementClass::FeedForward, index, mlp + "up_proj",
+                       c.dense_intermediate_size, hidden);
+            add_linear(PlacementClass::FeedForward, index, mlp + "down_proj",
+                       hidden, c.dense_intermediate_size);
+        } else {
+            add_linear(PlacementClass::Router, index, mlp + "gate",
+                       c.routed_experts, hidden);
+            add_linear(PlacementClass::SharedExpert, index,
+                       mlp + "shared_expert.gate_proj",
+                       c.shared_expert_intermediate_size, hidden);
+            add_linear(PlacementClass::SharedExpert, index,
+                       mlp + "shared_expert.up_proj",
+                       c.shared_expert_intermediate_size, hidden);
+            add_linear(PlacementClass::SharedExpert, index,
+                       mlp + "shared_expert.down_proj", hidden,
+                       c.shared_expert_intermediate_size);
+            for (std::uint32_t expert = 0U; expert < c.routed_experts; ++expert) {
+                const auto base = mlp + "experts." + std::to_string(expert) + ".";
+                for (const auto& projection :
+                     {std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>{
+                          base + "gate_proj", {c.expert_intermediate_size, hidden}},
+                      {base + "up_proj", {c.expert_intermediate_size, hidden}},
+                      {base + "down_proj", {hidden, c.expert_intermediate_size}}}) {
+                    auto module = checkpoint.linear(projection.first,
+                                                    projection.second.first,
+                                                    projection.second.second);
+                    if (!module.ok()) {
+                        result.errors.push_back("Laguna checkpoint is missing " +
+                                                projection.first);
+                        return result;
+                    }
+                    if (module.value.encoding == LagunaTensorEncoding::Plain) {
+                        routed.weight_bytes += module.value.weight->bytes;
+                    } else {
+                        routed.weight_bytes += module.value.packed->bytes;
+                        routed.scale_bytes += module.value.scale->bytes;
+                    }
+                    ++routed_modules;
+                }
+            }
+        }
+        if (!result.ok()) return result;
+
+        // Two hidden-width norms, two head-width norms, and (on sparse layers)
+        // the routing correction bias, all kept as F32 host vectors.
+        ModuleSizes norms;
+        norms.layer = index;
+        norms.host_bytes = (2ULL * hidden + 2ULL * c.head_dim +
+                            (laguna_sparse_layer(layer) ? c.routed_experts : 0U)) *
+                           sizeof(float);
+        inventory.items.push_back(
+            make_item(PlacementClass::Norm, norms, 0U, PlacementTier::Host, false));
+
+        // Sliding layers retain at most one window of BF16 keys and values.
+        const auto rows = laguna_global_attention_layer(layer)
+            ? context_tokens
+            : std::min(context_tokens, c.sliding_window);
+        ModuleSizes cache;
+        cache.layer = index;
+        cache.host_bytes = static_cast<std::uint64_t>(rows) * kv_columns * 2ULL *
+                           sizeof(std::uint16_t);
+        inventory.items.push_back(make_item(PlacementClass::KvCache, cache, 0U,
+                                            PlacementTier::Host, false));
+    }
+
+    add_linear(PlacementClass::OutputHead,
+               static_cast<std::int32_t>(c.layer_count - 1U), "lm_head",
+               c.vocabulary_size, hidden);
+    if (!result.ok()) return result;
+    inventory.items.back().decode_read_bytes =
+        inventory.items.back().device_bytes;
+
+    // The embedding table is read one row per token from the host mapping and
+    // is never uploaded.
+    if (const auto* embedding = checkpoint.find("model.embed_tokens.weight");
+        embedding != nullptr) {
+        ModuleSizes sizes;
+        sizes.host_bytes = embedding->bytes;
+        inventory.items.push_back(make_item(PlacementClass::Embedding, sizes, 0U,
+                                            PlacementTier::Host, false));
+    }
+
+    if (routed.weight_bytes != 0U) {
+        const auto sparse_layers = c.layer_count - c.dense_prefix_layers;
+        const auto triplets = routed_modules == 0U ? 1U : routed_modules;
+        const auto per_module = (routed.weight_bytes + routed.scale_bytes) /
+                                triplets;
+        // Three projections per expert, top-k experts per sparse layer, once
+        // per decode step. Whether those reads hit VRAM or the host mapping is
+        // exactly what the cache size decides.
+        const auto reads = per_module * 3ULL * c.experts_per_token * sparse_layers;
+        auto item = make_item(PlacementClass::RoutedExpert, routed, reads,
+                              PlacementTier::Device, true);
+        item.device_bytes = routed.weight_bytes + routed.scale_bytes;
+        item.host_bytes = item.device_bytes;
+        item.device_cache_only = true;
+        inventory.items.push_back(item);
+    }
+    return result;
+}
+
 // -------------------------------------------------------------- DeepSeek
 
 [[nodiscard]] PlacementClass deepseek_component(Dsv4TensorRole role) noexcept {
@@ -466,6 +632,7 @@ struct OpenCheckpoints {
     std::unique_ptr<Gemma4CheckpointReader> gemma4;
     std::unique_ptr<GlmCheckpointReader> glm;
     std::unique_ptr<Dsv4CheckpointReader> deepseek;
+    std::unique_ptr<LagunaCheckpointReader> laguna;
 };
 
 [[nodiscard]] ParseResult<PlacementInventory> build_inventory(
@@ -480,6 +647,8 @@ struct OpenCheckpoints {
         case PlacementModel::Glm52:
             return build_glm_inventory(checkpoints.glm->manifest(), context_tokens,
                                        request.flash_attention);
+        case PlacementModel::Laguna:
+            return build_laguna_inventory(*checkpoints.laguna, context_tokens);
         case PlacementModel::DeepSeekV4:
             return build_deepseek_inventory(
                 checkpoints.deepseek->manifest(), scoped,
@@ -499,6 +668,8 @@ struct OpenCheckpoints {
             return kGemma4ExecutionContract.maximum_context_tokens;
         case PlacementModel::Glm52:
             return kGlm52ExecutionContract.maximum_context_tokens;
+        case PlacementModel::Laguna:
+            return kLagunaExecutionContract.maximum_context_tokens;
         case PlacementModel::DeepSeekV4:
             return kDeepSeekV4ExecutionContract.maximum_context_tokens;
     }
@@ -585,6 +756,15 @@ PlacementPlanResult plan_model_placement(const PlacementRequest& request,
                 return result;
             }
             checkpoints.glm = std::move(opened.value);
+            break;
+        }
+        case PlacementModel::Laguna: {
+            auto opened = LagunaCheckpointReader::open(request.model_directory);
+            if (!opened.ok()) {
+                result.errors = std::move(opened.errors);
+                return result;
+            }
+            checkpoints.laguna = std::move(opened.value);
             break;
         }
         case PlacementModel::DeepSeekV4: {

@@ -583,6 +583,43 @@ __global__ void native_fp4_matmul_kernel(
     }
 }
 
+// NVFP4 ("nvfp4-pack-quantized"): E2M1 nibble pairs with FP8 E4M3 group scales
+// and one FP32 per-tensor global scale. Unlike the DeepSeek FP4 path this does
+// not quantize the activation; the declared contract is W4A16 with FP32
+// accumulation, matching the reference implementation's dequantized BF16 GEMM.
+__global__ void nvfp4_group16_matmul_kernel(
+    float* output, const float* input, const unsigned char* weights,
+    const unsigned char* scales, float global_scale,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    std::uint32_t group_size, std::uint32_t batch, std::uint64_t columns,
+    std::uint64_t rows, std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    if (output_row >= rows || batch_row >= batch) return;
+    const std::uint64_t input_row = groups == 0U
+                                        ? batch_row
+                                        : static_cast<std::uint64_t>(batch_row) *
+                                              groups +
+                                              output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
+    const std::uint64_t weight_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned char packed = weights[weight_base + column / 2U];
+        const unsigned int encoded = column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        const float scale =
+            fp8_e4m3_value(scales[scale_base + column / group_size]) / global_scale;
+        sum += input[input_base + column] * fp4_e2m1_value(encoded) * scale;
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0) {
+        const std::uint64_t output_index =
+            static_cast<std::uint64_t>(batch_row) * rows + output_row;
+        output[output_index] = sum;
+    }
+}
+
 constexpr std::uint32_t kMaxDeepSeekRoutedExperts = 6U;
 constexpr std::uint32_t kMaxMoeExperts = 9U;
 
@@ -2075,6 +2112,27 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             !checked_bytes(descriptor.rows, descriptor.scale_columns, 1U,
                            expected_scales)) {
             result.errors.emplace_back("invalid native FP4 CUDA weight descriptor");
+            return result;
+        }
+    } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        const auto expected_packed_columns = (descriptor.columns + 1U) / 2U;
+        const auto expected_scale_columns =
+            descriptor.group_size == 0U
+                ? 0U
+                : (descriptor.columns + descriptor.group_size - 1U) /
+                      descriptor.group_size;
+        if (descriptor.dtype != SafetensorsDtype::U8 ||
+            descriptor.group_size == 0U || descriptor.columns % 2U != 0U ||
+            descriptor.columns % descriptor.group_size != 0U ||
+            descriptor.packed_columns != expected_packed_columns ||
+            descriptor.scale_columns != expected_scale_columns ||
+            !std::isfinite(descriptor.global_scale) ||
+            descriptor.global_scale <= 0.0F ||
+            !checked_bytes(descriptor.rows, descriptor.packed_columns, 1U,
+                           expected_weights) ||
+            !checked_bytes(descriptor.rows, descriptor.scale_columns, 1U,
+                           expected_scales)) {
+            result.errors.emplace_back("invalid NVFP4 CUDA weight descriptor");
             return result;
         }
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
@@ -4015,6 +4073,14 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.group_size, descriptor.packed_columns,
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
+    } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        nvfp4_group16_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+            state.output, state.input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.global_scale, descriptor.packed_columns,
+            descriptor.scale_columns, descriptor.group_size, rows,
+            descriptor.columns, descriptor.rows, groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,

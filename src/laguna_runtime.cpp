@@ -264,6 +264,79 @@ public:
         return result;
     }
 
+    // Makes one expert's three projections resident and leases them, so a
+    // batched device command can hold raw weight pointers across the enqueue
+    // and collect pair without an eviction pulling storage out from under it.
+    // Every successful acquire must be matched by one release.
+    ValidationResult acquire(std::size_t device_slot, std::uint32_t layer,
+                             const ExpertModules& modules,
+                             std::uint32_t expert, CudaMoeExpert& output) {
+        ValidationResult result;
+        if (device_slot >= states_.size()) {
+            result.errors.emplace_back("expert targets an invalid runtime device slot");
+            return result;
+        }
+        auto& state = *states_[device_slot];
+        std::scoped_lock lock(state.mutex);
+        const std::array<const LagunaLinear*, 3> sources{
+            &modules.gate, &modules.up, &modules.down};
+        const CudaWeight* resolved[3]{};
+        const auto stage_started = std::chrono::steady_clock::now();
+        for (std::uint32_t index = 0U; index < 3U; ++index) {
+            Entry* entry = nullptr;
+            const auto key = (static_cast<std::uint64_t>(layer) << 40U) |
+                             (static_cast<std::uint64_t>(expert) << 8U) | index;
+            result = ensure_locked(state, device_slot, key, *sources[index],
+                                   entry);
+            if (!result.ok()) {
+                // Unwind the leases already taken for this expert.
+                for (std::uint32_t taken = 0U; taken < index; ++taken) {
+                    const auto unwind_key =
+                        (static_cast<std::uint64_t>(layer) << 40U) |
+                        (static_cast<std::uint64_t>(expert) << 8U) | taken;
+                    auto found = state.entries.find(unwind_key);
+                    if (found != state.entries.end() &&
+                        found->second.leases != 0U) {
+                        --found->second.leases;
+                    }
+                }
+                state.stage_nanoseconds += elapsed_nanoseconds(stage_started);
+                return result;
+            }
+            ++entry->leases;
+            resolved[index] = &entry->weight;
+        }
+        state.stage_nanoseconds += elapsed_nanoseconds(stage_started);
+        output.gate = resolved[0];
+        output.up = resolved[1];
+        output.down = resolved[2];
+        output.coefficient = 1.0F;
+        return result;
+    }
+
+    void release(std::size_t device_slot, std::uint32_t layer,
+                 std::uint32_t expert) {
+        if (device_slot >= states_.size()) return;
+        auto& state = *states_[device_slot];
+        std::scoped_lock lock(state.mutex);
+        for (std::uint32_t index = 0U; index < 3U; ++index) {
+            const auto key = (static_cast<std::uint64_t>(layer) << 40U) |
+                             (static_cast<std::uint64_t>(expert) << 8U) | index;
+            auto found = state.entries.find(key);
+            if (found != state.entries.end() && found->second.leases != 0U) {
+                --found->second.leases;
+            }
+        }
+    }
+
+    void add_matmul_nanoseconds(std::size_t device_slot,
+                                std::uint64_t nanoseconds) {
+        if (device_slot >= states_.size()) return;
+        auto& state = *states_[device_slot];
+        std::scoped_lock lock(state.mutex);
+        state.matmul_nanoseconds += nanoseconds;
+    }
+
     [[nodiscard]] LagunaCacheStats stats(
         std::span<const std::uint64_t> pinned) const {
         LagunaCacheStats result;
@@ -830,6 +903,64 @@ struct LagunaRuntime::Impl {
         return result;
     }
 
+    // Runs every routed expert this device owns for one decode row as a single
+    // device command. Weights are leased across the enqueue/collect pair so an
+    // eviction cannot free storage the in-flight kernels still point at.
+    ValidationResult run_batched_experts(std::uint32_t layer,
+                                         std::size_t slot,
+                                         std::span<const float> input,
+                                         std::vector<ExpertJob>& jobs) {
+        ValidationResult result;
+        auto& weights = layers[layer];
+        std::vector<std::size_t> indices;
+        indices.reserve(kTopK);
+        for (std::size_t index = 0U; index < jobs.size(); ++index) {
+            if (jobs[index].device == slot) indices.push_back(index);
+        }
+        if (indices.empty()) return result;
+
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<CudaMoeExpert> batch(indices.size());
+        std::vector<std::uint32_t> acquired;
+        acquired.reserve(indices.size());
+        const auto release_all = [&]() {
+            for (const auto expert : acquired) experts->release(slot, layer, expert);
+        };
+        for (std::size_t position = 0U; position < indices.size(); ++position) {
+            const auto& job = jobs[indices[position]];
+            result = experts->acquire(slot, layer, weights.experts[job.expert],
+                                      job.expert, batch[position]);
+            if (!result.ok()) {
+                release_all();
+                return result;
+            }
+            acquired.push_back(job.expert);
+        }
+
+        const auto command_started = std::chrono::steady_clock::now();
+        result = cuda.enqueue_moe(devices[slot], input.first(kHidden), 1U, batch,
+                                  nullptr);
+        if (!result.ok()) {
+            release_all();
+            return result;
+        }
+        std::vector<float> collected(indices.size() * kHidden);
+        result = cuda.collect_moe(devices[slot], collected, {});
+        release_all();
+        experts->add_matmul_nanoseconds(slot, elapsed_nanoseconds(command_started));
+        if (!result.ok()) return result;
+
+        for (std::size_t position = 0U; position < indices.size(); ++position) {
+            auto& job = jobs[indices[position]];
+            job.output.assign(kHidden, 0.0F);
+            std::copy_n(collected.begin() +
+                            static_cast<std::ptrdiff_t>(position * kHidden),
+                        kHidden, job.output.begin());
+            job.expert_nanoseconds += elapsed_nanoseconds(started) / indices.size();
+        }
+        return result;
+    }
+
     bool write_route(std::uint32_t position, std::uint32_t layer,
                      const LagunaRoute& route, bool prefill) {
         if (!route_trace.is_open()) return true;
@@ -896,7 +1027,23 @@ struct LagunaRuntime::Impl {
 
         const auto routed_started = std::chrono::steady_clock::now();
         std::vector<std::vector<std::string>> device_errors(devices.size());
-        auto dispatched = device_workers->parallel_for(
+        // Batch decode. Every routed expert of a step sees the same single
+        // hidden row, so one device command covers all of a device's experts:
+        // one host-to-device copy of the row, two kernel launches, one copy
+        // back, instead of three synchronous round trips per expert. At
+        // rows > 1 the experts see disjoint row subsets, which this command
+        // shape cannot express, so prefill keeps the per-expert path.
+        // Layers 40-47 carry their routed experts as plain BF16, which the
+        // batched command's decode rule does not cover. Those modules are 18.87
+        // MiB against the NVFP4 layers' 1.69 MiB, so they are bandwidth-bound
+        // rather than round-trip-bound and gain least from batching anyway.
+        const bool batched = rows == 1U && laguna_quantized_expert_layer(layer);
+        auto dispatched = batched
+            ? device_workers->parallel_for(devices.size(), [&](std::size_t slot) {
+                  auto status = run_batched_experts(layer, slot, input, jobs);
+                  if (!status.ok()) move_errors(device_errors[slot], std::move(status));
+              })
+            : device_workers->parallel_for(
             devices.size(), [&](std::size_t slot) {
             for (auto& job : jobs) {
                 if (job.device != slot) continue;

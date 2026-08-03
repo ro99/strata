@@ -279,6 +279,95 @@ int main(int argc, char** argv) {
     std::cout << "\nbest routed-expert compute: " << std::setprecision(2)
               << best_routed_seconds << " s/token at " << best_workers
               << " workers\n";
+
+    // ------------------------------------------------------- dense spine
+    //
+    // The routed set is not the larger term. `docs/experiments/0048` measures
+    // the BF16 dense spine at 106.55 GiB, and batch-1 decode reads every one of
+    // those bytes once per token -- 4.4x the routed traffic. It had never been
+    // profiled, because at ~70 s/token nothing but storage was visible.
+    constexpr double kSpineGiB = 106.55;
+    {
+        const auto rows = static_cast<std::uint32_t>(kContract.hidden_size);
+        const auto columns = static_cast<std::uint32_t>(kContract.hidden_size);
+        const auto matrix_values = static_cast<std::size_t>(rows) * columns;
+        const auto matrix_bytes = matrix_values * sizeof(std::uint16_t);
+        const auto matrices = std::max<std::size_t>(
+            2U, static_cast<std::size_t>(options.pool_bytes / matrix_bytes));
+
+        std::cout << "\nstaging " << matrices << " synthetic BF16 matrices ("
+                  << std::setprecision(2)
+                  << static_cast<double>(matrices * matrix_bytes) /
+                         (1024.0 * 1024.0 * 1024.0)
+                  << " GiB, cold in RAM)...\n";
+        std::vector<std::vector<std::uint16_t>> dense(matrices);
+        for (auto& matrix : dense) {
+            matrix.resize(matrix_values);
+            // A BF16 exponent near the bias, so decoded values sit around unity
+            // and the multiply does the same work it does on real weights.
+            for (auto& value : matrix) {
+                value = static_cast<std::uint16_t>(0x3F00U | (engine() & 0x7FU));
+            }
+        }
+        std::vector<float> dense_input(columns, 0.5F);
+        std::vector<float> dense_output(rows, 0.0F);
+
+        std::cout << "\n"
+                  << std::setw(9) << "workers" << std::setw(14) << "ms/matrix"
+                  << std::setw(14) << "GiB/s" << std::setw(16) << "spine s/token"
+                  << "\n";
+
+        double best_dense_seconds = 0.0;
+        std::size_t best_dense_workers = 0U;
+        for (const auto workers : options.worker_counts) {
+            if (workers == 0U) continue;
+            strata::HostWorkerPool workers_pool(workers);
+            auto* worker_pool = workers > 1U ? &workers_pool : nullptr;
+            std::uniform_int_distribution<std::size_t> pick(0U, matrices - 1U);
+
+            for (std::size_t warm = 0U; warm < 2U; ++warm) {
+                const strata::KimiBf16Matrix matrix{dense[pick(engine)], rows,
+                                                    columns};
+                (void)strata::kimi_bf16_matmul(dense_output, dense_input, matrix, 1U,
+                                               worker_pool);
+            }
+            std::vector<double> samples;
+            constexpr std::size_t kMatricesPerSample = 8U;
+            for (std::uint32_t repetition = 0U; repetition < options.repetitions;
+                 ++repetition) {
+                const auto begin = std::chrono::steady_clock::now();
+                for (std::size_t step = 0U; step < kMatricesPerSample; ++step) {
+                    const strata::KimiBf16Matrix matrix{dense[pick(engine)], rows,
+                                                        columns};
+                    (void)strata::kimi_bf16_matmul(dense_output, dense_input, matrix,
+                                                   1U, worker_pool);
+                }
+                const std::chrono::duration<double> elapsed =
+                    std::chrono::steady_clock::now() - begin;
+                samples.push_back(elapsed.count() /
+                                  static_cast<double>(kMatricesPerSample));
+            }
+            const auto seconds = median(samples);
+            const auto gib_per_second = static_cast<double>(matrix_bytes) / seconds /
+                                        (1024.0 * 1024.0 * 1024.0);
+            const auto spine_seconds = kSpineGiB / gib_per_second;
+            if (best_dense_seconds == 0.0 || spine_seconds < best_dense_seconds) {
+                best_dense_seconds = spine_seconds;
+                best_dense_workers = workers;
+            }
+            std::cout << std::setw(9) << workers << std::setw(14)
+                      << std::setprecision(3) << seconds * 1000.0 << std::setw(14)
+                      << std::setprecision(2) << gib_per_second << std::setw(16)
+                      << std::setprecision(2) << spine_seconds << "\n";
+        }
+
+        std::cout << "\nbest dense-spine compute: " << std::setprecision(2)
+                  << best_dense_seconds << " s/token at " << best_dense_workers
+                  << " workers (" << kSpineGiB << " GiB read once per token)\n";
+        std::cout << "\nhost compute floor, both terms: " << std::setprecision(2)
+                  << best_routed_seconds + best_dense_seconds << " s/token\n";
+        best_routed_seconds += best_dense_seconds;
+    }
     std::cout << "\nThis is the compute term alone, with every weight already in\n"
                  "host RAM. Storage is not in it. Any storage upgrade leaves it\n"
                  "unchanged, so it is a floor on the step time.\n";

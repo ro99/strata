@@ -114,6 +114,32 @@ constexpr float kL2Epsilon = 1.0e-6F;
     return _mm_cvtss_f32(folded);
 }
 
+// One row of a BF16 matvec. BF16 to F32 is the identity on the top sixteen
+// bits, so the whole conversion is a widen and a shift and no table is needed.
+// The scalar path went through `decode_bf16`, which is a `memcpy` per element.
+[[gnu::target("avx2,fma")]] float bf16_row_dot_avx2(
+    const std::uint16_t* values, const float* source,
+    std::size_t columns) noexcept {
+    __m256 total = _mm256_setzero_ps();
+    std::size_t column = 0U;
+    for (; column + 8U <= columns; column += 8U) {
+        const __m128i raw =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(values + column));
+        const __m256 weight = _mm256_castsi256_ps(
+            _mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
+        total = _mm256_fmadd_ps(weight, _mm256_loadu_ps(source + column), total);
+    }
+    __m128 folded = _mm_add_ps(_mm256_castps256_ps128(total),
+                               _mm256_extractf128_ps(total, 1));
+    folded = _mm_add_ps(folded, _mm_movehl_ps(folded, folded));
+    folded = _mm_add_ss(folded, _mm_shuffle_ps(folded, folded, 1));
+    float sum = _mm_cvtss_f32(folded);
+    for (; column < columns; ++column) {
+        sum += source[column] * decode_bf16(values[column]);
+    }
+    return sum;
+}
+
 [[nodiscard]] bool mxfp4_avx2_available() noexcept {
     static const bool available =
         __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
@@ -170,6 +196,22 @@ ValidationResult kimi_bf16_matmul(std::span<float> output,
     // worker streams its slice of the weight exactly once per call regardless
     // of how many tokens the page carries: that is what makes a prefill page
     // cheaper per token than a decode step, and the reason to batch at all.
+#if defined(__x86_64__)
+    if (mxfp4_avx2_available()) {
+        const auto* weight_base = weight.values.data();
+        const auto* input_base = input.data();
+        auto* destination = output.data();
+        run_rows(weight.rows, pool, [&](std::size_t row) {
+            const auto* values = weight_base + row * columns;
+            for (std::size_t token = 0U; token < count; ++token) {
+                destination[token * rows + row] = bf16_row_dot_avx2(
+                    values, input_base + token * columns, columns);
+            }
+        });
+        return result;
+    }
+#endif
+
     run_rows(weight.rows, pool, [&](std::size_t row) {
         const auto* values = weight.values.data() + row * columns;
         for (std::size_t token = 0U; token < count; ++token) {

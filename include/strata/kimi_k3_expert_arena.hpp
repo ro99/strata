@@ -21,9 +21,17 @@ struct KimiWriteGuardConfig {
     // Paths the runtime may write to. Each is resolved to its backing disk and
     // refused if it lands on a forbidden one.
     std::vector<std::string> write_paths;
-    // Refuse to run while a swap file or partition sits on a forbidden disk: a
-    // locked arena is the fix, but an unlocked allocation elsewhere in the
-    // process would still page model-derived bytes out through the back door.
+    // Lock the whole address space, current and future, with `mlockall`. This
+    // is what actually closes the swap path: a locked page cannot be written to
+    // swap by definition, so no model byte can reach a protected disk that way,
+    // and an allocation that no longer fits fails with ENOMEM instead of paging
+    // — which is the memory ceiling the charter asks for. Needs RLIMIT_MEMLOCK
+    // to cover the resident set (`ulimit -l unlimited`), not root.
+    bool lock_address_space{true};
+    // Refuse to run while a swap file or partition sits on a forbidden disk.
+    // Only consulted when `lock_address_space` is off or its lock failed: with
+    // the address space locked the premise of this check — that a large
+    // anonymous allocation can be paged out — is false.
     bool require_no_forbidden_swap{true};
     // Set RLIMIT_CORE to zero. A crash at 200 GiB of RSS otherwise writes a
     // core file to the working directory.

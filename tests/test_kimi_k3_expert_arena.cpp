@@ -89,6 +89,10 @@ TEST_CASE("the write guard refuses paths on a protected disk") {
     guard.write_paths = {STRATA_SOURCE_DIR};
     guard.require_no_forbidden_swap = false;
     guard.disable_core_dumps = false;
+    // `mlockall` is process-wide and irreversible for the rest of the run, so
+    // the unit test leaves it off: locking the whole test binary would change
+    // how every later test allocates.
+    guard.lock_address_space = false;
     const auto refused = strata::kimi_apply_write_guard(guard);
     REQUIRE(!refused.ok());
     REQUIRE(refused.errors.front().find(here.disk) != std::string::npos);

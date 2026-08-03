@@ -20,3 +20,6 @@ docs/issues/
 # Generated Python bytecode from the test oracles under scripts/.
 __pycache__/
 *.pyc
+
+# Operator-specific hardware notes, not part of the project.
+hardware/

@@ -105,7 +105,20 @@ ValidationResult kimi_apply_write_guard(const KimiWriteGuardConfig& config) {
         }
     }
 
-    if (config.require_no_forbidden_swap) {
+    // Locking the address space is tried first, because it decides whether the
+    // swap check below has anything left to complain about. `MCL_FUTURE` covers
+    // the 106 GiB spine and the expert arena, neither of which exists yet.
+    bool locked = false;
+    std::string lock_failure;
+    if (config.lock_address_space) {
+        if (::mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+            locked = true;
+        } else {
+            lock_failure = std::strerror(errno);
+        }
+    }
+
+    if (config.require_no_forbidden_swap && !locked) {
         std::ifstream swaps("/proc/swaps");
         std::string line;
         std::getline(swaps, line);  // header
@@ -118,11 +131,24 @@ ValidationResult kimi_apply_write_guard(const KimiWriteGuardConfig& config) {
                 ? storage.disk
                 : std::filesystem::path(name).filename().string();
             if (!forbidden(disk)) continue;
-            result.errors.push_back(
+            auto message =
                 "swap is active on " + disk + " (" + name +
                 "): a large anonymous arena can be paged out to it, which "
-                "writes model-derived bytes to a device this run protects. "
-                "Run `swapoff " + name + "` and remove it from /etc/fstab");
+                "writes model-derived bytes to a device this run protects.";
+            // The address-space lock is the fix that needs nothing from the
+            // operator, so say why it did not take before asking them to touch
+            // their swap configuration.
+            if (config.lock_address_space) {
+                message += " Locking the address space would have closed this "
+                           "without changing the system, but mlockall failed: " +
+                           lock_failure +
+                           ". Raise RLIMIT_MEMLOCK (`ulimit -l unlimited`)";
+            } else {
+                message += " Enable `lock_address_space`";
+            }
+            message += ", or run `swapoff " + name +
+                       "` and remove it from /etc/fstab";
+            result.errors.push_back(std::move(message));
         }
     }
 

@@ -27,11 +27,22 @@ struct HostWorkerPool::Impl {
 
     std::mutex mutex;
     std::condition_variable ready;
-    std::deque<std::function<void()>> queue;
+    // One queue per worker rather than one shared between them.
+    //
+    // With a shared queue, a dispatch narrower than the pool is a free-for-all:
+    // any thread can win a task. Workers 0-27 are pinned to this host's 28
+    // physical cores and 28-55 to their SMT siblings, so a sixteen-lane
+    // dispatch onto a fifty-six thread pool could land two lanes on one
+    // physical core while another sat idle. Measured, that cost exactly 2.0x
+    // -- 2.89 s/token against 1.43 -- which is what sixteen lanes sharing
+    // eight cores predicts. Addressing task i to worker i makes a narrow
+    // dispatch use the low-indexed workers, which are the physical ones.
+    std::vector<std::deque<std::function<void()>>> queues;
     std::vector<std::thread> workers;
     bool stopping{};
 
     explicit Impl(std::size_t count) {
+        queues.resize(count);
         workers.reserve(count);
         for (std::size_t index = 0; index < count; ++index) {
             workers.emplace_back([this, index] {
@@ -56,10 +67,12 @@ struct HostWorkerPool::Impl {
                     std::function<void()> task;
                     {
                         std::unique_lock lock(mutex);
-                        ready.wait(lock, [this] { return stopping || !queue.empty(); });
-                        if (stopping && queue.empty()) return;
-                        task = std::move(queue.front());
-                        queue.pop_front();
+                        ready.wait(lock, [this, index] {
+                            return stopping || !queues[index].empty();
+                        });
+                        if (stopping && queues[index].empty()) return;
+                        task = std::move(queues[index].front());
+                        queues[index].pop_front();
                     }
                     task();
                 }
@@ -106,8 +119,7 @@ ValidationResult HostWorkerPool::parallel_for(
             return result;
         }
         for (std::size_t runner = 0; runner < runners; ++runner) {
-            static_cast<void>(runner);
-            impl_->queue.emplace_back([completion, &operation] {
+            impl_->queues[runner].emplace_back([completion, &operation] {
                 try {
                     for (;;) {
                         const auto index = completion->next.fetch_add(
@@ -129,28 +141,13 @@ ValidationResult HostWorkerPool::parallel_for(
             });
         }
     }
-    // Wake only as many workers as there are runners. `notify_all` woke every
-    // thread in the pool for a dispatch that queued `runners` tasks, so a
-    // sixteen-expert block on a fifty-six thread pool woke forty threads to
-    // find an empty queue -- thousands of times per token, across two sockets.
-    //
-    // Losing a notification is safe here: the worker loop waits on a predicate
-    // and re-checks the queue before sleeping, so a worker still returning
-    // from its previous task picks the work up without being told.
-    //
-    // Only when the runners are a strict subset, though: waking every worker
-    // is one futex operation, and issuing `runners` of them instead costs more
-    // than the spurious wakeups save once the dispatch already uses the whole
-    // pool. Measured on a sixteen-expert block: 0.91 s/token with `notify_all`
-    // on a sixteen-thread pool against 1.69 with the loop, and 1.61 against
-    // 1.76 with the loop on a twenty-eight thread pool.
-    if (runners >= impl_->workers.size()) {
-        impl_->ready.notify_all();
-    } else {
-        for (std::size_t runner = 0; runner < runners; ++runner) {
-            impl_->ready.notify_one();
-        }
-    }
+    // Every worker is woken and each checks only its own queue, so the ones
+    // without work sleep again immediately. A targeted wake-up was measured
+    // here and lost: issuing `runners` notifications costs more than one
+    // broadcast, and the cost this dispatch actually pays is core placement,
+    // not wake-ups.
+    impl_->ready.notify_all();
+
     {
         std::unique_lock lock(completion->mutex);
         completion->ready.wait(lock, [&completion] {

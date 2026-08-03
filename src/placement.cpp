@@ -686,26 +686,12 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
     }
     plan.io_dependent = plan.storage_resident_bytes != 0U;
     plan.fits = !plan.io_dependent;
-    // NVMe endurance is protected by refusal, not by preference: a plan that
-    // would source model bytes from an NVMe-backed path is an error even when
-    // it otherwise fits.
-    if (request.forbid_nvme_residency && plan.storage_resident_bytes != 0U) {
-        if (!hardware.storage.resolved) {
-            result.errors.emplace_back(
-                "cannot confirm the checkpoint's backing block device, and this "
-                "run forbids NVMe residency; resolve " +
-                request.model_directory + " or clear the restriction");
-            return result;
-        }
-        if (hardware.storage.nvme) {
-            result.errors.emplace_back(
-                "this run forbids NVMe residency but " + request.model_directory +
-                " is backed by " + hardware.storage.disk + ", so the " +
-                format_bytes(plan.storage_resident_bytes) +
-                " storage tier would read model bytes from NVMe");
-            return result;
-        }
-    }
+    // A storage tier is admitted wherever it lives. Which block device backs
+    // the checkpoint changes `B_storage` and therefore the reported cost, not
+    // whether the plan is legal: reading is what the tier is for, and refusing
+    // the fast device to protect its endurance only forces the slow one. The
+    // endurance property the runtime does owe the operator is that it never
+    // *writes* a derived copy of the checkpoint — see `kimi_apply_write_guard`.
     if (has_spill && inventory.host_reserve_bytes != 0U) {
         plan.notes.emplace_back(
             "host tier withholds " + format_bytes(inventory.host_reserve_bytes) +

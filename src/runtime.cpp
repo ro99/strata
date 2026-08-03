@@ -45,10 +45,6 @@ PlacementRequest placement_request_for(const std::string& model_directory,
     request.maximum_context_tokens = config.maximum_context_tokens;
     request.flash_attention = config.enable_flash_attention;
     request.block_kv_cache = config.deepseek_block_kv_cache;
-    // Kimi-K3 keeps its 1.3 TiB routed set in the checkpoint's own shards and
-    // reads it on demand, so where those shards live is part of the contract:
-    // sourcing them from NVMe is refused rather than merely discouraged.
-    request.forbid_nvme_residency = config.model == RuntimeModel::KimiK3;
     return request;
 }
 

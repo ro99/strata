@@ -37,10 +37,13 @@ struct KimiK3RuntimeConfig {
     std::uint32_t expert_queue_depth{4U};
     bool direct_expert_reads{true};
     bool lock_expert_arena{true};
-    // Disks that may not receive a byte derived from model weights. The guard
-    // refuses to run rather than degrading quietly, because an unlocked arena
-    // or an enabled swap file reintroduces the write path silently.
-    std::vector<std::string> forbidden_disks{"nvme0n1", "sdb"};
+    // Disks that may not receive a byte derived from model weights. Empty by
+    // default: the runtime already writes no derived copy of the checkpoint on
+    // any device, which is the property that makes a storage -> storage repack
+    // impossible, and a device name in a runtime default is operator policy
+    // rather than a contract. Populate it to have the guard refuse a run whose
+    // incidental write paths (results, traces) land on a protected disk.
+    std::vector<std::string> forbidden_disks{};
     bool apply_write_guard{true};
     std::size_t host_workers{};  // zero uses the hardware concurrency
     double sampling_temperature{};

@@ -159,10 +159,6 @@ struct PlacementRequest {
     std::uint32_t maximum_context_tokens{2048U};
     bool flash_attention{};
     bool block_kv_cache{};
-    // Refuse any plan that would source model bytes from an NVMe-backed path.
-    // NVMe endurance is a resource the operator protects explicitly, so this is
-    // a hard refusal rather than a preference the solver may trade away.
-    bool forbid_nvme_residency{};
 };
 
 struct PlacementComponentTotals {

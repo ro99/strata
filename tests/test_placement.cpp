@@ -398,7 +398,7 @@ TEST_CASE("a dense class larger than device plus host is an error, not a spill")
     REQUIRE(planned.errors.front().find("I/O dependent") != std::string::npos);
 }
 
-TEST_CASE("a plan is refused when the storage tier is NVMe backed") {
+TEST_CASE("the storage tier is admitted wherever the checkpoint lives") {
     auto hardware = make_hardware({8U, 8U}, 64U);
     hardware.storage.path = "/models/test";
     hardware.storage.device = "nvme0n1p2";
@@ -410,27 +410,32 @@ TEST_CASE("a plan is refused when the storage tier is NVMe backed") {
     request.model = strata::PlacementModel::KimiK3;
     const auto inventory = make_tiered_inventory(12U, 400U);
 
-    // Permitted by default; refused when the run protects NVMe endurance.
-    REQUIRE(solve_placement(inventory, hardware, request).ok());
-    request.forbid_nvme_residency = true;
-    const auto refused = solve_placement(inventory, hardware, request);
-    REQUIRE(!refused.ok());
-    REQUIRE(refused.errors.front().find("nvme0n1") != std::string::npos);
+    // Which block device backs the checkpoint sets `B_storage`, so it changes
+    // the cost the plan reports and not whether the plan is legal. Refusing the
+    // fast device to spare its endurance only forces the run onto the slow one,
+    // which is the regression this contract exists to prevent.
+    const auto nvme = solve_placement(inventory, hardware, request);
+    REQUIRE(nvme.ok());
+    REQUIRE(nvme.value.io_dependent);
+    REQUIRE(nvme.value.storage_resident_bytes != 0U);
 
-    // A SATA-backed checkpoint is admitted under the same restriction.
     auto sata = hardware;
     sata.storage.device = "sda1";
     sata.storage.disk = "sda";
     sata.storage.nvme = false;
-    REQUIRE(solve_placement(inventory, sata, request).ok());
+    const auto spinning = solve_placement(inventory, sata, request);
+    REQUIRE(spinning.ok());
+    REQUIRE(spinning.value.io_dependent);
+    REQUIRE(spinning.value.storage_resident_bytes ==
+            nvme.value.storage_resident_bytes);
 
-    // An unresolved backing device is refused rather than assumed safe.
+    // An unresolved backing device no longer decides admission either: the plan
+    // still reports the tier, and the guard that protects a disk from writes is
+    // the one that needs the device resolved.
     auto unknown = hardware;
     unknown.storage.resolved = false;
     unknown.storage.nvme = false;
-    const auto unresolved = solve_placement(inventory, unknown, request);
-    REQUIRE(!unresolved.ok());
-    REQUIRE(unresolved.errors.front().find("cannot confirm") != std::string::npos);
+    REQUIRE(solve_placement(inventory, unknown, request).ok());
 }
 
 TEST_CASE("the backing block device of a real path resolves") {
@@ -447,7 +452,7 @@ TEST_CASE("the backing block device of a real path resolves") {
     REQUIRE(!missing.resolved);
 }
 
-TEST_CASE("the plan cache round-trips the storage tier and the NVMe restriction") {
+TEST_CASE("the plan cache round-trips the storage tier") {
     auto hardware = make_hardware({8U, 8U}, 64U);
     hardware.storage.path = "/models/test";
     hardware.storage.device = "sda1";
@@ -455,7 +460,6 @@ TEST_CASE("the plan cache round-trips the storage tier and the NVMe restriction"
     hardware.storage.resolved = true;
     auto request = make_request(2U);
     request.model = strata::PlacementModel::KimiK3;
-    request.forbid_nvme_residency = true;
     auto planned = solve_placement(make_tiered_inventory(12U, 400U), hardware,
                                    request);
     REQUIRE(planned.ok());
@@ -465,7 +469,6 @@ TEST_CASE("the plan cache round-trips the storage tier and the NVMe restriction"
     REQUIRE(decoded.ok());
     REQUIRE(decoded.value.version == 2U);
     REQUIRE(decoded.value.request.model == strata::PlacementModel::KimiK3);
-    REQUIRE(decoded.value.request.forbid_nvme_residency);
     REQUIRE(decoded.value.hardware.storage.disk == "sda");
     REQUIRE(decoded.value.hardware.storage.resolved);
     REQUIRE(!decoded.value.hardware.storage.nvme);

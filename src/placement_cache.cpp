@@ -138,8 +138,7 @@ void read_object(detail::JsonCursor& cursor, Handler handler) {
          << '|' << std::fixed << std::setprecision(6) << request.vram_cache_fraction
          << '|' << request.maximum_context_tokens << '|'
          << (request.flash_attention ? 1 : 0) << '|'
-         << (request.block_kv_cache ? 1 : 0) << '|'
-         << (request.forbid_nvme_residency ? 1 : 0) << '|';
+         << (request.block_kv_cache ? 1 : 0) << '|';
     for (const int device : request.devices) text << device << ',';
     constexpr std::uint64_t offset = 1469598103934665603ULL;
     constexpr std::uint64_t prime = 1099511628211ULL;
@@ -176,8 +175,7 @@ std::string encode_placement_plan(const PlacementPlan& plan) {
            << (plan.request.flash_attention ? "true" : "false")
            << ", \"block_kv_cache\": "
            << (plan.request.block_kv_cache ? "true" : "false")
-           << ", \"forbid_nvme_residency\": "
-           << (plan.request.forbid_nvme_residency ? "true" : "false") << "}";
+           << "}";
     output << ",\n  \"hardware\": {\"host_total_bytes\": "
            << plan.hardware.host_total_bytes << ", \"host_available_bytes\": "
            << plan.hardware.host_available_bytes << ", \"storage\": {\"path\": ";
@@ -282,8 +280,6 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                         plan.request.flash_attention = cursor.parse_bool();
                     } else if (field == "block_kv_cache") {
                         plan.request.block_kv_cache = cursor.parse_bool();
-                    } else if (field == "forbid_nvme_residency") {
-                        plan.request.forbid_nvme_residency = cursor.parse_bool();
                     } else {
                         return false;
                     }
@@ -583,7 +579,6 @@ PlacementPlanResult load_placement_plan(const std::string& directory,
         plan.request.maximum_context_tokens != request.maximum_context_tokens ||
         plan.request.flash_attention != request.flash_attention ||
         plan.request.block_kv_cache != request.block_kv_cache ||
-        plan.request.forbid_nvme_residency != request.forbid_nvme_residency ||
         plan.hardware.storage.disk != hardware.storage.disk ||
         plan.hardware.storage.resolved != hardware.storage.resolved ||
         plan.hardware.devices.size() != hardware.devices.size()) {

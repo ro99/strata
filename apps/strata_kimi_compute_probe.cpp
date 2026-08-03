@@ -451,6 +451,62 @@ int main(int argc, char** argv) {
               << std::setprecision(2) << best_block_seconds << " s/token at "
               << best_block_workers << " workers\n";
 
+    // --------------------------------------------- prefill token batching
+    //
+    // The MoE block runs one matvec per (expert, token). A page of P tokens
+    // selects each expert about P*16/896 times, so at the current page of 64
+    // that is ~1.1 tokens per expert and nothing is re-read -- but at P=512 it
+    // is ~9, and each of those nine matvecs walks the same 16.73 MiB again.
+    //
+    // Whether that costs anything is a cache question, not an arithmetic one,
+    // and it decides whether batching an expert's tokens into one pass is worth
+    // building. Measured here as cost per (expert, token) against one expert as
+    // the token count rises: flat means the re-reads are free and batching buys
+    // nothing; falling means the first read dominates and batching converts
+    // every later token to the cheap case.
+    std::cout << "\n"
+              << std::setw(12) << "tokens/expert" << std::setw(16)
+              << "ms/expert-token" << std::setw(14) << "GiB/s" << std::setw(14)
+              << "vs 1 token" << std::setw(12) << "spread" << "\n";
+
+    settle();
+    double single_token_cost = 0.0;
+    for (const std::size_t tokens : {1U, 4U, 16U, 64U}) {
+        strata::HostWorkerPool batch_pool(hardware_threads);
+        std::mt19937_64 selector(options.seed);
+        std::uniform_int_distribution<std::size_t> pick(0U, pool_count - 1U);
+        std::vector<double> samples;
+        for (std::uint32_t repetition = 0U; repetition < options.repetitions;
+             ++repetition) {
+            const auto& triple = pool[pick(selector)];
+            const auto begin = std::chrono::steady_clock::now();
+            for (std::size_t token = 0U; token < tokens; ++token) {
+                (void)strata::kimi_mxfp4_matvec(gate, source, triple.gate.view(),
+                                                &batch_pool);
+                (void)strata::kimi_mxfp4_matvec(up, source, triple.up.view(),
+                                                &batch_pool);
+                (void)strata::kimi_situ_glu(activated, gate, up,
+                                            kContract.situ_gate_beta,
+                                            kContract.situ_linear_beta);
+                (void)strata::kimi_mxfp4_matvec(output, activated,
+                                                triple.down.view(), &batch_pool);
+            }
+            const std::chrono::duration<double> elapsed =
+                std::chrono::steady_clock::now() - begin;
+            samples.push_back(elapsed.count() / static_cast<double>(tokens));
+        }
+        const auto stats = summarize(samples);
+        if (tokens == 1U) single_token_cost = stats.median;
+        std::cout << std::setw(12) << tokens << std::setw(16)
+                  << std::setprecision(3) << stats.median * 1000.0 << std::setw(14)
+                  << std::setprecision(2)
+                  << static_cast<double>(triple_bytes) / stats.median /
+                         (1024.0 * 1024.0 * 1024.0)
+                  << std::setw(13) << std::setprecision(2)
+                  << single_token_cost / stats.median << "x" << std::setw(11)
+                  << std::setprecision(2) << stats.spread() << "x" << "\n";
+    }
+
     // ------------------------------------------------------- dense spine
     //
     // The routed set is not the larger term. `docs/experiments/0048` measures

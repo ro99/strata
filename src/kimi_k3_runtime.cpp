@@ -1,10 +1,13 @@
 #include "strata/kimi_k3_runtime.hpp"
 
+#include "json_cursor.hpp"
+
 #include "strata/kimi_k3_checkpoint.hpp"
 #include "strata/kimi_k3_kv_cache.hpp"
 #include "strata/kimi_k3_layer.hpp"
 #include "strata/kimi_k3_ops.hpp"
 #include "strata/model_adapter.hpp"
+#include "strata/tokenizer.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
@@ -185,6 +188,48 @@ private:
     std::vector<KimiReadRequest> requests_;
 };
 
+// `generation_config.json` is the file the reference's `generate` reads, and
+// it is the only place the stop token is stated for generation.
+[[nodiscard]] ValidationResult read_generation_eos(
+    const std::string& model_directory, std::uint32_t& eos) {
+    ValidationResult result;
+    const auto text = load_bounded_text_file(
+        model_directory + "/generation_config.json", 1ULL << 20U);
+    if (!text.ok()) {
+        result.errors = text.errors;
+        return result;
+    }
+    try {
+        detail::JsonCursor cursor(text.value);
+        bool found = false;
+        cursor.expect('{');
+        if (!cursor.consume('}')) {
+            for (;;) {
+                const auto key = cursor.parse_string();
+                cursor.expect(':');
+                if (key == "eos_token_id") {
+                    const auto parsed = cursor.parse_uint64();
+                    if (parsed >= kContract.vocabulary_size) {
+                        throw std::runtime_error(
+                            "eos_token_id is outside the vocabulary");
+                    }
+                    eos = static_cast<std::uint32_t>(parsed);
+                    found = true;
+                } else {
+                    cursor.skip_value();
+                }
+                if (cursor.consume('}')) break;
+                cursor.expect(',');
+            }
+        }
+        if (!found) throw std::runtime_error("no eos_token_id");
+    } catch (const std::exception& error) {
+        result.errors.emplace_back(std::string("generation_config.json: ") +
+                                   error.what());
+    }
+    return result;
+}
+
 }  // namespace
 
 struct KimiK3Runtime::Impl {
@@ -205,6 +250,8 @@ struct KimiK3Runtime::Impl {
     KimiExpertReader reader;
     std::unique_ptr<ArenaExpertSource> experts;
 
+    ModelTokenizer tokenizer;
+    std::uint32_t eos_token{};
     KimiK3RunMetrics metrics;
     std::uint32_t length{};
     bool ready{};
@@ -501,6 +548,22 @@ ValidationResult KimiK3Runtime::initialize(const std::string& model_directory,
     }
     impl_->checkpoint = std::move(opened.value);
 
+    // Before the 106 GiB read, not after: a malformed vocabulary should cost a
+    // second rather than five minutes.
+    auto tokenizer = ModelTokenizer::load_kimi_k3(model_directory);
+    if (!tokenizer.ok()) {
+        result.errors = std::move(tokenizer.errors);
+        return result;
+    }
+    impl_->tokenizer = std::move(tokenizer.value);
+
+    // Read rather than assumed. `config.json` also carries an `eos_token_id`,
+    // but `generation_config.json` is what the reference generates against and
+    // the two disagree here: 163586 (`<|end_of_msg|>`) against the tokenizer's
+    // `[EOS]` at 163585. Hard-coding either would be a silent contract change.
+    result = read_generation_eos(model_directory, impl_->eos_token);
+    if (!result.ok()) return result;
+
     const auto workers = config.host_workers != 0U
         ? config.host_workers
         : std::max<std::size_t>(1U, std::thread::hardware_concurrency());
@@ -697,6 +760,10 @@ KimiK3GenerationResult KimiK3Runtime::generate_from_tokens(
             result.errors = std::move(drawn.errors);
             return result;
         }
+        if (drawn.token == impl_->eos_token) {
+            result.stopped = true;
+            break;
+        }
         result.generated_token_ids.push_back(drawn.token);
         result.logprobs.push_back(drawn);
         ++sampled_counts[drawn.token];
@@ -726,25 +793,82 @@ KimiK3GenerationResult KimiK3Runtime::generate_from_tokens(
 }
 
 KimiK3GenerationResult KimiK3Runtime::generate_stream(
-    std::string_view, std::uint32_t, const TokenStreamCallback&) {
-    KimiK3GenerationResult result;
-    // Exact mode reports a failure rather than substituting another tokenizer.
-    // Kimi-K3 ships a tiktoken vocabulary and an XTML chat template that no
-    // other adapter in the tree implements; `generate_from_tokens` is the
-    // surface until they land.
-    result.errors.emplace_back(
-        "the Kimi-K3 tiktoken tokenizer is not implemented yet; drive the "
-        "runtime with generate_from_tokens or evaluate");
-    return result;
+    std::string_view prompt, std::uint32_t maximum_new_tokens,
+    const TokenStreamCallback& on_token) {
+    const std::array messages{ChatMessage{ChatRole::User, std::string(prompt)}};
+    SamplingOptions sampling;
+    sampling.temperature = impl_->config.sampling_temperature;
+    sampling.seed = impl_->config.sampling_seed;
+    return generate_chat_stream(messages, maximum_new_tokens, sampling, {},
+                                on_token);
 }
 
 KimiK3GenerationResult KimiK3Runtime::generate_chat_stream(
-    std::span<const ChatMessage>, std::uint32_t, const SamplingOptions&,
-    std::span<const std::string>, const TokenStreamCallback&) {
+    std::span<const ChatMessage> messages, std::uint32_t maximum_new_tokens,
+    const SamplingOptions& sampling, std::span<const std::string> stop,
+    const TokenStreamCallback& on_token) {
     KimiK3GenerationResult result;
-    result.errors.emplace_back(
-        "the Kimi-K3 tiktoken tokenizer and XTML chat rendering are not "
-        "implemented yet; drive the runtime with generate_from_tokens");
+    if (!impl_->ready) {
+        result.errors.emplace_back("Kimi-K3 runtime is not initialized");
+        return result;
+    }
+    std::string error;
+    if (!validate_chat_messages(messages, error)) {
+        result.errors.push_back(std::move(error));
+        return result;
+    }
+    // Vision is not implemented. A message carrying an image must fail rather
+    // than be rendered as text with the image dropped, which would answer a
+    // question the caller did not ask. See ro99/strata#21.
+    for (const auto& message : messages) {
+        for (const auto& part : message.parts) {
+            if (part.kind != ChatContentKind::Text) {
+                result.errors.emplace_back(
+                    "Kimi-K3 image input needs the MoonViT-V2 path, which is not "
+                    "implemented; text-only messages are supported");
+                return result;
+            }
+        }
+    }
+
+    auto encoded = impl_->tokenizer.encode(
+        render_kimi_k3_chat_prompt(messages, true));
+    if (!encoded.ok()) {
+        result.errors = std::move(encoded.errors);
+        return result;
+    }
+    if (encoded.value.size() + maximum_new_tokens >
+        impl_->config.maximum_context_tokens) {
+        result.errors.emplace_back(
+            "prompt and requested generation exceed the context ceiling");
+        return result;
+    }
+
+    // The decoded text is assembled from the ids the sampler drew, so a stop
+    // string that straddles two tokens is still found.
+    auto generated = generate_from_tokens(encoded.value, maximum_new_tokens,
+                                          sampling, on_token);
+    result.errors = std::move(generated.errors);
+    result.prompt_token_ids = std::move(generated.prompt_token_ids);
+    result.generated_token_ids = std::move(generated.generated_token_ids);
+    result.logprobs = std::move(generated.logprobs);
+    result.metrics = generated.metrics;
+    result.stopped = generated.stopped;
+    if (!result.ok()) return result;
+
+    auto text = impl_->tokenizer.decode(result.generated_token_ids);
+    if (!text.ok()) {
+        result.errors = std::move(text.errors);
+        return result;
+    }
+    result.text = std::move(text.value);
+    for (const auto& marker : stop) {
+        if (marker.empty()) continue;
+        if (const auto at = result.text.find(marker); at != std::string::npos) {
+            result.text.resize(at);
+            result.stopped = true;
+        }
+    }
     return result;
 }
 

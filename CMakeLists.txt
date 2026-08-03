@@ -162,6 +162,7 @@ if(BUILD_TESTING)
         tests/test_kimi_k3_expert_arena.cpp
         tests/test_kimi_k3_backbone.cpp
         tests/test_kimi_k3_layer.cpp
+        tests/test_kimi_k3_tokenizer.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp

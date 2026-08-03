@@ -271,13 +271,20 @@ GenerationResult RuntimeSession::generate_chat_stream(
         return result;
     }
     if (auto* runtime = std::get_if<KimiK3Runtime>(&impl_->runtime)) {
-        // Kimi-K3 has no tokenizer or chat template yet, so this reports the
-        // failure rather than substituting another model's. `evaluate` and
-        // `generate_from_tokens` are the working surface until stage 7.
         auto concrete = runtime->generate_chat_stream(
             messages, options.maximum_new_tokens, options.sampling,
             options.stop, on_token);
+        result.text = std::move(concrete.text);
+        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
+        result.generated_token_ids = std::move(concrete.generated_token_ids);
+        result.logprobs = std::move(concrete.logprobs);
+        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
+        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
+        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
+        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
+        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
         result.errors = std::move(concrete.errors);
+        result.stopped = concrete.stopped;
         return result;
     }
     if (auto* runtime = std::get_if<Gemma4Runtime>(&impl_->runtime)) {

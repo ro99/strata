@@ -21,6 +21,12 @@ enum class CudaWeightEncoding : std::uint8_t {
     OffsetPackedInt8,
     Fp8E4m3Block128,
     Fp4E2m1Group32,
+    // compressed-tensors "nvfp4-pack-quantized": E2M1 nibble pairs with FP8
+    // E4M3 group scales and one FP32 per-tensor global scale. Weights
+    // dequantize to w = e2m1 * (e4m3_scale / global_scale) and the activation
+    // stays FP32; this is a W4A16 path, not the W4A4 form the checkpoint's
+    // input_global_scale tensors would allow.
+    Nvfp4Group16,
 };
 
 struct CudaWeightDescriptor {
@@ -31,6 +37,8 @@ struct CudaWeightDescriptor {
     std::uint64_t packed_columns{};
     std::uint64_t scale_columns{};
     std::uint32_t group_size{};
+    // Per-tensor divisor for Nvfp4Group16 group scales; unused otherwise.
+    float global_scale{1.0F};
 };
 
 struct CudaBackendStats {
@@ -49,6 +57,12 @@ struct CudaBackendStats {
         std::uint64_t synchronization_calls{};
         std::uint64_t synchronization_nanoseconds{};
         std::uint64_t upload_wait_nanoseconds{};
+        // upload() partitioned. A pageable source makes cudaMemcpyAsync
+        // synchronous inside the call, so its cost lands in
+        // weight_copy_nanoseconds and not in upload_wait_nanoseconds; reading
+        // only the wait counter reports an impossible H2D rate.
+        std::uint64_t weight_allocation_nanoseconds{};
+        std::uint64_t weight_copy_nanoseconds{};
         std::uint64_t activation_h2d_nanoseconds{};
         std::uint64_t kernel_nanoseconds{};
         std::uint64_t activation_d2h_nanoseconds{};
@@ -100,6 +114,8 @@ struct CudaBackendStats {
     std::uint64_t synchronization_calls{};
     std::uint64_t synchronization_nanoseconds{};
     std::uint64_t upload_wait_nanoseconds{};
+    std::uint64_t weight_allocation_nanoseconds{};
+    std::uint64_t weight_copy_nanoseconds{};
     std::uint64_t activation_h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
     std::uint64_t activation_d2h_nanoseconds{};

@@ -17,6 +17,7 @@ enum class TokenizerContract : std::uint8_t {
     Glm52,
     DeepSeekV4,
     Gemma4,
+    Laguna,
 };
 
 [[nodiscard]] ParseResult<std::vector<std::string>> pretokenize(
@@ -76,5 +77,11 @@ private:
     std::string_view user_text, bool enable_thinking = false);
 [[nodiscard]] std::string render_gemma4_chat_prompt(
     std::span<const ChatMessage> messages, bool enable_thinking = false);
+[[nodiscard]] std::string render_laguna_user_prompt(
+    std::string_view user_text, bool enable_thinking = true);
+// Reproduces the checkpoint's chat template. The leading BOS is part of the
+// template, so the caller must encode without adding special tokens.
+[[nodiscard]] std::string render_laguna_chat_prompt(
+    std::span<const ChatMessage> messages, bool enable_thinking = true);
 
 }  // namespace strata

@@ -45,6 +45,9 @@ add_library(strata_core STATIC
     src/gemma4_runtime.cpp
     src/glm_runtime.cpp
     src/glm_manifest.cpp
+    src/laguna_ops.cpp
+    src/laguna_checkpoint.cpp
+    src/laguna_runtime.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
     src/deepseek_ops.cpp
@@ -120,6 +123,12 @@ target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 
+add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
+target_link_libraries(strata-laguna-profile PRIVATE strata_core)
+
+add_executable(strata-laguna-stage-probe apps/strata_laguna_stage_probe.cpp)
+target_link_libraries(strata-laguna-stage-probe PRIVATE strata_core)
+
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
     add_executable(strata-topology-probe apps/strata_topology_probe.cu)
@@ -145,6 +154,8 @@ if(BUILD_TESTING)
         tests/test_gemma4_checkpoint.cpp
         tests/test_gemma4_image.cpp
         tests/test_glm_int4.cpp
+        tests/test_laguna_ops.cpp
+        tests/test_laguna_checkpoint.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp

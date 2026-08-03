@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_manifest.hpp"
 #include "strata/gemma4_checkpoint.hpp"
+#include "strata/laguna_checkpoint.hpp"
 #include "strata/model.hpp"
 #include "strata/safetensors.hpp"
 
@@ -386,6 +387,72 @@ int main(int argc, char** argv) {
                       << "shards=" << parsed.value.shards.size() << '\n'
                       << "quantized_modules=" << quantized_modules << '\n'
                       << "int8_group32_modules=" << quantized_modules << '\n'
+                      << "scanned_shards="
+                      << (headers ? parsed.value.shards.size() : 0U) << '\n';
+        }
+        return 0;
+    }
+    // Laguna is the only supported architecture with a per-head attention gate.
+    const bool laguna = std::any_of(
+        parsed.value.entries.begin(), parsed.value.entries.end(), [](const auto& entry) {
+            return entry.name == "model.layers.0.self_attn.g_proj.weight";
+        });
+    if (laguna) {
+        const auto spec = strata::laguna_s21_nvfp4_spec();
+        const auto nvfp4_modules = std::count_if(
+            parsed.value.entries.begin(), parsed.value.entries.end(),
+            [](const auto& entry) {
+                return entry.name.ends_with(".weight_packed");
+            });
+        const auto& contract = strata::kLagunaExecutionContract;
+        const auto expected_nvfp4 =
+            static_cast<std::ptrdiff_t>(contract.quantized_expert_layers -
+                                        contract.dense_prefix_layers) *
+            contract.routed_experts * 3;
+        if (parsed.value.total_size != spec.source.indexed_tensor_bytes ||
+            parsed.value.entries.size() != spec.source.tensor_count ||
+            parsed.value.shards.size() != spec.source.main_shards ||
+            nvfp4_modules != expected_nvfp4) {
+            std::cerr << "error: index does not match the pinned Laguna S 2.1-NVFP4 checkpoint\n";
+            return 1;
+        }
+        if (headers) {
+            if (model_directory.empty()) {
+                std::cerr << "error: --headers requires --model DIR\n";
+                return 2;
+            }
+            if (allow_incomplete) {
+                std::cerr << "error: Laguna exact validation requires all shards\n";
+                return 2;
+            }
+            const auto checkpoint = strata::LagunaCheckpointReader::open(
+                model_directory);
+            if (!checkpoint.ok()) {
+                for (const auto& error : checkpoint.errors) {
+                    std::cerr << "error: " << error << '\n';
+                }
+                return 1;
+            }
+        }
+        if (json) {
+            std::cout << "{\n"
+                      << "  \"status\": \"ok\",\n"
+                      << "  \"architecture\": \"laguna_s_2_1_nvfp4\",\n"
+                      << "  \"tensor_count\": " << parsed.value.entries.size() << ",\n"
+                      << "  \"indexed_tensor_bytes\": " << parsed.value.total_size << ",\n"
+                      << "  \"shards\": " << parsed.value.shards.size() << ",\n"
+                      << "  \"quantized_modules\": " << nvfp4_modules << ",\n"
+                      << "  \"nvfp4_group16_modules\": " << nvfp4_modules << ",\n"
+                      << "  \"scanned_shards\": "
+                      << (headers ? parsed.value.shards.size() : 0U) << "\n}\n";
+        } else {
+            std::cout << "status=ok\n"
+                      << "architecture=laguna_s_2_1_nvfp4\n"
+                      << "tensor_count=" << parsed.value.entries.size() << '\n'
+                      << "indexed_tensor_bytes=" << parsed.value.total_size << '\n'
+                      << "shards=" << parsed.value.shards.size() << '\n'
+                      << "quantized_modules=" << nvfp4_modules << '\n'
+                      << "nvfp4_group16_modules=" << nvfp4_modules << '\n'
                       << "scanned_shards="
                       << (headers ? parsed.value.shards.size() : 0U) << '\n';
         }

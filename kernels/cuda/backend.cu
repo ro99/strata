@@ -23,6 +23,13 @@ namespace strata {
 
 namespace {
 
+std::uint64_t elapsed_nanoseconds_since(
+    std::chrono::steady_clock::time_point started) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
 ValidationResult cuda_error(cudaError_t status, const char* operation) {
     ValidationResult result;
     if (status != cudaSuccess) {
@@ -583,8 +590,48 @@ __global__ void native_fp4_matmul_kernel(
     }
 }
 
+// NVFP4 ("nvfp4-pack-quantized"): E2M1 nibble pairs with FP8 E4M3 group scales
+// and one FP32 per-tensor global scale. Unlike the DeepSeek FP4 path this does
+// not quantize the activation; the declared contract is W4A16 with FP32
+// accumulation, matching the reference implementation's dequantized BF16 GEMM.
+__global__ void nvfp4_group16_matmul_kernel(
+    float* output, const float* input, const unsigned char* weights,
+    const unsigned char* scales, float global_scale,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    std::uint32_t group_size, std::uint32_t batch, std::uint64_t columns,
+    std::uint64_t rows, std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    if (output_row >= rows || batch_row >= batch) return;
+    const std::uint64_t input_row = groups == 0U
+                                        ? batch_row
+                                        : static_cast<std::uint64_t>(batch_row) *
+                                              groups +
+                                              output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
+    const std::uint64_t weight_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned char packed = weights[weight_base + column / 2U];
+        const unsigned int encoded = column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        const float scale =
+            fp8_e4m3_value(scales[scale_base + column / group_size]) / global_scale;
+        sum += input[input_base + column] * fp4_e2m1_value(encoded) * scale;
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0) {
+        const std::uint64_t output_index =
+            static_cast<std::uint64_t>(batch_row) * rows + output_row;
+        output[output_index] = sum;
+    }
+}
+
 constexpr std::uint32_t kMaxDeepSeekRoutedExperts = 6U;
-constexpr std::uint32_t kMaxMoeExperts = 9U;
+// Laguna routes top-10 of 256 and all ten can hash to one device, so a batch
+// must hold ten routed experts plus an optional shared one.
+constexpr std::uint32_t kMaxMoeExperts = 11U;
+constexpr std::uint32_t kMaxRoutedMoeExperts = 10U;
 
 struct DeepSeekFp4Batch {
     const unsigned char* w1_weights[kMaxDeepSeekRoutedExperts]{};
@@ -605,6 +652,32 @@ struct PackedInt4MoeBatch {
     const std::uint32_t* down_weights[kMaxMoeExperts]{};
     const __nv_bfloat16* down_scales[kMaxMoeExperts]{};
     float coefficients[kMaxMoeExperts]{};
+    std::uint32_t count{};
+    std::uint32_t rows{};
+};
+
+// compressed-tensors "nvfp4-pack-quantized": E2M1 nibble pairs, FP8 E4M3 group
+// scales, one FP32 per-tensor divisor. The divisor is per weight tensor, so it
+// travels per expert and per projection rather than per batch.
+struct Nvfp4MoeBatch {
+    const unsigned char* gate_weights[kMaxMoeExperts]{};
+    const unsigned char* gate_scales[kMaxMoeExperts]{};
+    const unsigned char* up_weights[kMaxMoeExperts]{};
+    const unsigned char* up_scales[kMaxMoeExperts]{};
+    const unsigned char* down_weights[kMaxMoeExperts]{};
+    const unsigned char* down_scales[kMaxMoeExperts]{};
+    float gate_global_scales[kMaxMoeExperts]{};
+    float up_global_scales[kMaxMoeExperts]{};
+    float down_global_scales[kMaxMoeExperts]{};
+    std::uint32_t count{};
+    std::uint32_t rows{};
+};
+
+// Laguna carries the routed experts of layers 40-47 as plain BF16.
+struct PlainBf16MoeBatch {
+    const __nv_bfloat16* gate_weights[kMaxMoeExperts]{};
+    const __nv_bfloat16* up_weights[kMaxMoeExperts]{};
+    const __nv_bfloat16* down_weights[kMaxMoeExperts]{};
     std::uint32_t count{};
     std::uint32_t rows{};
 };
@@ -883,6 +956,189 @@ __global__ void packed_int4_moe_down_kernel(
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0U) {
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
+               output_row] = sum;
+    }
+}
+
+// NVFP4 group-16 counterparts of the INT4 pair above. The per-column decode is
+// character for character the one in nvfp4_group16_matmul_kernel, and the block
+// reduction is the same, so a batched expert produces the same value the
+// per-expert matmul path produced. The routing coefficient is deliberately not
+// folded into the activation here: Laguna's reference scales the expert output
+// after the down projection, and down(act * c) is not float-equal to
+// c * down(act).
+__global__ void nvfp4_moe_gate_up_kernel(
+    float* activations, const float* hidden, Nvfp4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    std::uint32_t group_size, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto* gate_weights = batch.gate_weights[expert];
+    const auto* gate_scales = batch.gate_scales[expert];
+    const auto* up_weights = batch.up_weights[expert];
+    const auto* up_scales = batch.up_scales[expert];
+    const float gate_global = batch.gate_global_scales[expert];
+    const float up_global = batch.up_global_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base = static_cast<std::uint64_t>(row) * columns;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const auto packed_index = weight_base + column / 2U;
+        const auto scale_index = scale_base + column / group_size;
+        const unsigned char gate_packed = gate_weights[packed_index];
+        const unsigned char up_packed = up_weights[packed_index];
+        const unsigned int gate_encoded =
+            column % 2U == 0U ? gate_packed & 0x0FU : gate_packed >> 4U;
+        const unsigned int up_encoded =
+            column % 2U == 0U ? up_packed & 0x0FU : up_packed >> 4U;
+        const float input = hidden[input_base + column];
+        gate += input * fp4_e2m1_value(gate_encoded) *
+                (fp8_e4m3_value(gate_scales[scale_index]) / gate_global);
+        up += input * fp4_e2m1_value(up_encoded) *
+              (fp8_e4m3_value(up_scales[scale_index]) / up_global);
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F
+                                  ? 1.0F / (1.0F + exponential)
+                                  : exponential / (1.0F + exponential);
+        const auto activation =
+            (static_cast<std::uint64_t>(expert) * batch.rows + row) *
+                intermediate + output_row;
+        activations[activation] = gate * sigmoid * up;
+    }
+}
+
+__global__ void nvfp4_moe_down_kernel(
+    float* output, const float* activations, Nvfp4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    std::uint32_t group_size, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= rows || expert >= batch.count) return;
+
+    const auto* weights = batch.down_weights[expert];
+    const auto* scales = batch.down_scales[expert];
+    const float global_scale = batch.down_global_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base =
+        (static_cast<std::uint64_t>(expert) * batch.rows + row) * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const unsigned char packed = weights[weight_base + column / 2U];
+        const unsigned int encoded =
+            column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        sum += activations[input_base + column] * fp4_e2m1_value(encoded) *
+               (fp8_e4m3_value(scales[scale_base + column / group_size]) /
+                global_scale);
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
+               output_row] = sum;
+    }
+}
+
+// Plain BF16 counterparts. These keep bf16_matvec_kernel's one-warp-per-output-
+// row layout and its __fadd_rn/__shfl_down_sync reduction rather than the
+// block reduction the quantized batches use, so the dot product is summed in
+// the same order the per-expert path summed it.
+__global__ void plain_bf16_moe_gate_up_kernel(
+    float* activations, const float* hidden, PlainBf16MoeBatch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    unsigned int* error_flag) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row =
+        static_cast<std::uint64_t>(blockIdx.x) * warps_per_block + warp;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto base = output_row * columns;
+    const auto input_base = static_cast<std::uint64_t>(row) * columns;
+    const auto* gate_weights = batch.gate_weights[expert];
+    const auto* up_weights = batch.up_weights[expert];
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t column = lane; column < columns; column += warpSize) {
+        const float input = hidden[input_base + column];
+        gate = __fadd_rn(
+            gate,
+            __fmul_rn(input, __bfloat162float(gate_weights[base + column])));
+        up = __fadd_rn(
+            up, __fmul_rn(input, __bfloat162float(up_weights[base + column])));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gate = __fadd_rn(gate, __shfl_down_sync(0xFFFF'FFFFU, gate, offset));
+        up = __fadd_rn(up, __shfl_down_sync(0xFFFF'FFFFU, up, offset));
+    }
+    if (lane == 0U) {
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F
+                                  ? 1.0F / (1.0F + exponential)
+                                  : exponential / (1.0F + exponential);
+        activations[(static_cast<std::uint64_t>(expert) * batch.rows + row) *
+                        intermediate + output_row] = gate * sigmoid * up;
+    }
+}
+
+__global__ void plain_bf16_moe_down_kernel(
+    float* output, const float* activations, PlainBf16MoeBatch batch,
+    std::uint64_t columns, std::uint64_t rows, unsigned int* error_flag) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row =
+        static_cast<std::uint64_t>(blockIdx.x) * warps_per_block + warp;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= rows || expert >= batch.count) return;
+
+    const auto base = output_row * columns;
+    const auto input_base =
+        (static_cast<std::uint64_t>(expert) * batch.rows + row) * columns;
+    const auto* weights = batch.down_weights[expert];
+    float sum = 0.0F;
+    for (std::uint64_t column = lane; column < columns; column += warpSize) {
+        sum = __fadd_rn(
+            sum, __fmul_rn(activations[input_base + column],
+                           __bfloat162float(weights[base + column])));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum = __fadd_rn(sum, __shfl_down_sync(0xFFFF'FFFFU, sum, offset));
+    }
+    if (lane == 0U) {
         if (!isfinite(sum)) atomicExch(error_flag, 1U);
         output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
                output_row] = sum;
@@ -2077,6 +2333,27 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid native FP4 CUDA weight descriptor");
             return result;
         }
+    } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        const auto expected_packed_columns = (descriptor.columns + 1U) / 2U;
+        const auto expected_scale_columns =
+            descriptor.group_size == 0U
+                ? 0U
+                : (descriptor.columns + descriptor.group_size - 1U) /
+                      descriptor.group_size;
+        if (descriptor.dtype != SafetensorsDtype::U8 ||
+            descriptor.group_size == 0U || descriptor.columns % 2U != 0U ||
+            descriptor.columns % descriptor.group_size != 0U ||
+            descriptor.packed_columns != expected_packed_columns ||
+            descriptor.scale_columns != expected_scale_columns ||
+            !std::isfinite(descriptor.global_scale) ||
+            descriptor.global_scale <= 0.0F ||
+            !checked_bytes(descriptor.rows, descriptor.packed_columns, 1U,
+                           expected_weights) ||
+            !checked_bytes(descriptor.rows, descriptor.scale_columns, 1U,
+                           expected_scales)) {
+            result.errors.emplace_back("invalid NVFP4 CUDA weight descriptor");
+            return result;
+        }
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
         const auto expected_scale_columns = (descriptor.columns + 127U) / 128U;
         const auto expected_scale_rows = (descriptor.rows + 127U) / 128U;
@@ -2108,6 +2385,9 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     const auto payload_bytes = expected_weights + expected_scales;
     auto& state = found->second;
     std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_nanoseconds = 0U;
+    std::uint64_t copy_nanoseconds = 0U;
+    const auto allocation_started = std::chrono::steady_clock::now();
     if (state.weight_arena != nullptr) {
         target->bytes = weight_storage_bytes(expected_weights, expected_scales);
         WeightArena::Allocation allocation;
@@ -2135,6 +2415,7 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         ++allocation_calls;
     }
+    allocation_nanoseconds += elapsed_nanoseconds_since(allocation_started);
     // This stream is nonblocking with respect to the legacy default stream.
     // Keep uploads on the execution stream and finish them before the caller's
     // host payload is released or the cache publishes the weight.
@@ -2145,25 +2426,32 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         return cuda_error(status, operation);
     };
+    auto copy_started = std::chrono::steady_clock::now();
     if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
                                       cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
         return upload_error(status, "upload CUDA weights");
     }
+    copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     if (expected_scales != 0U) {
         if (state.weight_arena == nullptr) {
+            const auto scale_allocation_started = std::chrono::steady_clock::now();
             if (auto status = cudaMalloc(
                     &target->scales, static_cast<std::size_t>(expected_scales));
                 status != cudaSuccess) {
                 return cuda_error(status, "allocate CUDA scales");
             }
             ++allocation_calls;
+            allocation_nanoseconds +=
+                elapsed_nanoseconds_since(scale_allocation_started);
         }
+        copy_started = std::chrono::steady_clock::now();
         if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
                                           cudaMemcpyHostToDevice, state.stream);
             status != cudaSuccess) {
             return upload_error(status, "upload CUDA scales");
         }
+        copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     }
     const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
@@ -2186,6 +2474,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         ++device_stats.synchronization_calls;
         device_stats.synchronization_nanoseconds += wait_nanoseconds;
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
+        device_stats.weight_allocation_nanoseconds += allocation_nanoseconds;
+        device_stats.weight_copy_nanoseconds += copy_nanoseconds;
     }
     output.impl_ = std::move(target);
     return result;
@@ -4015,6 +4305,14 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.group_size, descriptor.packed_columns,
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
+    } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        nvfp4_group16_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+            state.output, state.input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.global_scale, descriptor.packed_columns,
+            descriptor.scale_columns, descriptor.group_size, rows,
+            descriptor.columns, descriptor.rows, groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
@@ -4540,8 +4838,27 @@ ValidationResult CudaBackend::enqueue_moe(
     }
     const auto expert_count = routed.size() + (shared == nullptr ? 0U : 1U);
     if (rows == 0U || expert_count == 0U || expert_count > kMaxMoeExperts ||
-        routed.size() > 8U) {
+        routed.size() > kMaxRoutedMoeExperts) {
         result.errors.emplace_back("MoE command has an unsupported row or expert count");
+        return result;
+    }
+
+    // The batch is single-encoding. The first expert's gate fixes it and every
+    // other weight must agree, so a mixed batch is rejected rather than
+    // silently dispatched to the wrong decode rule.
+    const auto* first_gate = routed.empty() ? (shared == nullptr ? nullptr
+                                                                 : shared->gate)
+                                            : routed.front().gate;
+    if (first_gate == nullptr || !first_gate->valid()) {
+        result.errors.emplace_back("MoE command has no valid leading expert");
+        return result;
+    }
+    const auto batch_encoding = first_gate->impl_->descriptor.encoding;
+    const bool nvfp4_batch = batch_encoding == CudaWeightEncoding::Nvfp4Group16;
+    const bool plain_batch = batch_encoding == CudaWeightEncoding::Plain;
+    if (!nvfp4_batch && !plain_batch &&
+        batch_encoding != CudaWeightEncoding::OffsetPackedInt4) {
+        result.errors.emplace_back("MoE command has an unsupported weight encoding");
         return result;
     }
 
@@ -4552,32 +4869,50 @@ ValidationResult CudaBackend::enqueue_moe(
         const std::array<const CudaWeight*, 3> weights{
             expert.gate, expert.up, expert.down};
         for (const auto* weight : weights) {
-            if (weight == nullptr || !weight->valid() ||
-                weight->impl_->device != device ||
-                weight->impl_->descriptor.encoding !=
-                    CudaWeightEncoding::OffsetPackedInt4 ||
-                weight->impl_->descriptor.dtype != SafetensorsDtype::I32 ||
-                weight->impl_->descriptor.group_size != 128U) {
+            const bool compatible =
+                weight != nullptr && weight->valid() &&
+                weight->impl_->device == device &&
+                weight->impl_->descriptor.encoding == batch_encoding &&
+                (nvfp4_batch
+                     ? (weight->impl_->descriptor.dtype == SafetensorsDtype::U8 &&
+                        weight->impl_->descriptor.group_size == 16U &&
+                        std::isfinite(weight->impl_->descriptor.global_scale) &&
+                        weight->impl_->descriptor.global_scale > 0.0F)
+                 : plain_batch
+                     ? weight->impl_->descriptor.dtype == SafetensorsDtype::Bf16
+                     : (weight->impl_->descriptor.dtype == SafetensorsDtype::I32 &&
+                        weight->impl_->descriptor.group_size == 128U));
+            if (!compatible) {
                 result.errors.emplace_back(
-                    "MoE command contains an incompatible INT4 CUDA weight");
+                    "MoE command contains an incompatible CUDA weight");
                 return false;
             }
         }
         const auto& gate = expert.gate->impl_->descriptor;
         const auto& up = expert.up->impl_->descriptor;
         const auto& down = expert.down->impl_->descriptor;
+        const auto expected_down_packed = nvfp4_batch
+            ? (down.columns + 1U) / 2U : (down.columns + 7U) / 8U;
+        const auto expected_down_scales = nvfp4_batch
+            ? (down.columns + 15U) / 16U : (down.columns + 127U) / 128U;
+        const bool packing_valid = plain_batch ||
+            (gate.packed_columns == up.packed_columns &&
+             gate.scale_columns == up.scale_columns &&
+             down.packed_columns == expected_down_packed &&
+             down.scale_columns == expected_down_scales);
         if (gate.rows == 0U || gate.columns == 0U ||
             up.rows != gate.rows || up.columns != gate.columns ||
             down.rows != gate.columns || down.columns != gate.rows ||
-            gate.packed_columns != up.packed_columns ||
-            gate.scale_columns != up.scale_columns ||
-            down.packed_columns != (down.columns + 7U) / 8U ||
-            down.scale_columns != (down.columns + 127U) / 128U) {
+            !packing_valid) {
             result.errors.emplace_back("MoE gate/up/down shapes are incompatible");
             return false;
         }
+        // The NVFP4 kernels leave the routing coefficient to the caller,
+        // because scaling before the down projection is not float-equal to
+        // scaling after it and Laguna's reference scales after.
         if (!std::isfinite(expert.coefficient) ||
-            (shared_expert && expert.coefficient != 1.0F)) {
+            ((shared_expert || nvfp4_batch || plain_batch) &&
+             expert.coefficient != 1.0F)) {
             result.errors.emplace_back("MoE expert coefficient is invalid");
             return false;
         }
@@ -4687,23 +5022,53 @@ ValidationResult CudaBackend::enqueue_moe(
     }
 
     PackedInt4MoeBatch batch;
+    Nvfp4MoeBatch nvfp4_batch_data;
+    PlainBf16MoeBatch plain_batch_data;
     state.moe_weights.clear();
     state.moe_weights.reserve(expert_count * 3U);
     const auto append_expert = [&](const CudaMoeExpert& expert,
                                    std::size_t index) {
-        batch.gate_weights[index] = static_cast<const std::uint32_t*>(
-            expert.gate->impl_->weights);
-        batch.gate_scales[index] = static_cast<const __nv_bfloat16*>(
-            expert.gate->impl_->scales);
-        batch.up_weights[index] = static_cast<const std::uint32_t*>(
-            expert.up->impl_->weights);
-        batch.up_scales[index] = static_cast<const __nv_bfloat16*>(
-            expert.up->impl_->scales);
-        batch.down_weights[index] = static_cast<const std::uint32_t*>(
-            expert.down->impl_->weights);
-        batch.down_scales[index] = static_cast<const __nv_bfloat16*>(
-            expert.down->impl_->scales);
-        batch.coefficients[index] = expert.coefficient;
+        if (plain_batch) {
+            plain_batch_data.gate_weights[index] =
+                static_cast<const __nv_bfloat16*>(expert.gate->impl_->weights);
+            plain_batch_data.up_weights[index] =
+                static_cast<const __nv_bfloat16*>(expert.up->impl_->weights);
+            plain_batch_data.down_weights[index] =
+                static_cast<const __nv_bfloat16*>(expert.down->impl_->weights);
+        } else if (nvfp4_batch) {
+            nvfp4_batch_data.gate_weights[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->weights);
+            nvfp4_batch_data.gate_scales[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->scales);
+            nvfp4_batch_data.up_weights[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->weights);
+            nvfp4_batch_data.up_scales[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->scales);
+            nvfp4_batch_data.down_weights[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->weights);
+            nvfp4_batch_data.down_scales[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->scales);
+            nvfp4_batch_data.gate_global_scales[index] =
+                expert.gate->impl_->descriptor.global_scale;
+            nvfp4_batch_data.up_global_scales[index] =
+                expert.up->impl_->descriptor.global_scale;
+            nvfp4_batch_data.down_global_scales[index] =
+                expert.down->impl_->descriptor.global_scale;
+        } else {
+            batch.gate_weights[index] = static_cast<const std::uint32_t*>(
+                expert.gate->impl_->weights);
+            batch.gate_scales[index] = static_cast<const __nv_bfloat16*>(
+                expert.gate->impl_->scales);
+            batch.up_weights[index] = static_cast<const std::uint32_t*>(
+                expert.up->impl_->weights);
+            batch.up_scales[index] = static_cast<const __nv_bfloat16*>(
+                expert.up->impl_->scales);
+            batch.down_weights[index] = static_cast<const std::uint32_t*>(
+                expert.down->impl_->weights);
+            batch.down_scales[index] = static_cast<const __nv_bfloat16*>(
+                expert.down->impl_->scales);
+            batch.coefficients[index] = expert.coefficient;
+        }
         state.moe_weights.push_back(expert.gate->impl_);
         state.moe_weights.push_back(expert.up->impl_);
         state.moe_weights.push_back(expert.down->impl_);
@@ -4714,6 +5079,10 @@ ValidationResult CudaBackend::enqueue_moe(
     if (shared != nullptr) append_expert(*shared, routed.size());
     batch.count = static_cast<std::uint32_t>(expert_count);
     batch.rows = rows;
+    nvfp4_batch_data.count = batch.count;
+    nvfp4_batch_data.rows = rows;
+    plain_batch_data.count = batch.count;
+    plain_batch_data.rows = rows;
 
     state.moe_hidden_columns = hidden_columns;
     state.moe_intermediate_columns = intermediate_columns;
@@ -4768,24 +5137,55 @@ ValidationResult CudaBackend::enqueue_moe(
     constexpr unsigned int threads = 256U;
     const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
                          static_cast<unsigned int>(activation_rows), 1U);
-    packed_int4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
-        state.moe_activations, state.moe_hidden, batch, hidden_columns,
-        intermediate_columns, gate.packed_columns, gate.scale_columns,
-        gate.group_size, state.moe_error);
+    constexpr unsigned int warps_per_block = 8U;
+    const dim3 plain_gate_grid(
+        static_cast<unsigned int>((intermediate_columns + warps_per_block - 1U) /
+                                  warps_per_block),
+        static_cast<unsigned int>(activation_rows), 1U);
+    if (plain_batch) {
+        plain_bf16_moe_gate_up_kernel<<<plain_gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, plain_batch_data,
+            hidden_columns, intermediate_columns, state.moe_error);
+    } else if (nvfp4_batch) {
+        nvfp4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, nvfp4_batch_data,
+            hidden_columns, intermediate_columns, gate.packed_columns,
+            gate.scale_columns, gate.group_size, state.moe_error);
+    } else {
+        packed_int4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, batch, hidden_columns,
+            intermediate_columns, gate.packed_columns, gate.scale_columns,
+            gate.group_size, state.moe_error);
+    }
     ++state.moe_kernel_launches;
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
-        abort_enqueue(status, "launch INT4 MoE gate/up SwiGLU");
+        abort_enqueue(status, "launch MoE gate/up SwiGLU");
         return result;
     }
     const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
                          static_cast<unsigned int>(activation_rows), 1U);
-    packed_int4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
-        state.moe_output, state.moe_activations, batch, intermediate_columns,
-        hidden_columns, down.packed_columns, down.scale_columns,
-        down.group_size, state.moe_error);
+    const dim3 plain_down_grid(
+        static_cast<unsigned int>((hidden_columns + warps_per_block - 1U) /
+                                  warps_per_block),
+        static_cast<unsigned int>(activation_rows), 1U);
+    if (plain_batch) {
+        plain_bf16_moe_down_kernel<<<plain_down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, plain_batch_data,
+            intermediate_columns, hidden_columns, state.moe_error);
+    } else if (nvfp4_batch) {
+        nvfp4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, nvfp4_batch_data,
+            intermediate_columns, hidden_columns, down.packed_columns,
+            down.scale_columns, down.group_size, state.moe_error);
+    } else {
+        packed_int4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, batch, intermediate_columns,
+            hidden_columns, down.packed_columns, down.scale_columns,
+            down.group_size, state.moe_error);
+    }
     ++state.moe_kernel_launches;
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
-        abort_enqueue(status, "launch INT4 MoE down projection");
+        abort_enqueue(status, "launch MoE down projection");
         return result;
     }
     if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
@@ -5069,6 +5469,11 @@ CudaBackendStats CudaBackend::stats() const noexcept {
             result.synchronization_nanoseconds, device.synchronization_nanoseconds);
         result.upload_wait_nanoseconds = std::max(
             result.upload_wait_nanoseconds, device.upload_wait_nanoseconds);
+        result.weight_allocation_nanoseconds = std::max(
+            result.weight_allocation_nanoseconds,
+            device.weight_allocation_nanoseconds);
+        result.weight_copy_nanoseconds = std::max(
+            result.weight_copy_nanoseconds, device.weight_copy_nanoseconds);
         result.activation_h2d_nanoseconds = std::max(
             result.activation_h2d_nanoseconds, device.activation_h2d_nanoseconds);
         result.kernel_nanoseconds = std::max(

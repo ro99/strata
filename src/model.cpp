@@ -43,7 +43,9 @@ ValidationResult validate_model(const ModelSpec& spec) {
     }
 
     if (spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW4A16 ||
-        spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW8A16) {
+        spec.mixed_quantization.kind == QuantizationKind::CompressedTensorsW8A16 ||
+        spec.mixed_quantization.kind ==
+            QuantizationKind::CompressedTensorsNvfp4W4A16) {
         const auto validate_quantized_role = [&result](const QuantizedWeightSpec& role,
                                                         std::string_view name) {
             if (!quantization_allowed(role.bits)) {
@@ -171,6 +173,47 @@ ValidationResult validate_model(const ModelSpec& spec) {
         }
         if (spec.glm_moe_dsa.mtp_layers == 0) {
             result.errors.emplace_back("GLM MoE DSA adapter requires explicit MTP layers");
+        }
+    }
+
+    if (spec.architecture == ArchitectureKind::Laguna) {
+        if (spec.attention != AttentionKind::HybridLocalGlobal) {
+            result.errors.emplace_back(
+                "Laguna adapter requires hybrid local/global attention");
+        }
+        if (spec.shared_experts == 0) {
+            result.errors.emplace_back("Laguna adapter requires explicit shared experts");
+        }
+        // The router scores with sigmoid and selects on score + correction bias.
+        // Any other selection or scoring rule is a different model.
+        if (spec.router.selection != RouterSelectionKind::TopK ||
+            spec.router.scoring != RouterScoreKind::Sigmoid ||
+            !spec.router.selection_bias || !spec.router.normalize_topk) {
+            result.errors.emplace_back("unsupported Laguna router semantics");
+        }
+        const auto& laguna = spec.laguna;
+        if (laguna.head_dim == 0U || laguna.key_value_heads == 0U ||
+            laguna.global_attention_heads % laguna.key_value_heads != 0U ||
+            laguna.sliding_attention_heads % laguna.key_value_heads != 0U) {
+            result.errors.emplace_back("Laguna head counts are not a valid GQA layout");
+        }
+        if (laguna.sliding_window == 0U || laguna.global_attention_stride == 0U) {
+            result.errors.emplace_back(
+                "Laguna adapter requires a sliding window and a global stride");
+        }
+        if (laguna.quantized_expert_layers > spec.layer_count) {
+            result.errors.emplace_back(
+                "Laguna quantized expert layers exceed layer_count");
+        }
+        if (!laguna.per_head_output_gating || !laguna.query_key_norm) {
+            result.errors.emplace_back(
+                "Laguna adapter requires per-head output gating and QK normalization");
+        }
+        if (laguna.global_rope_partial <= 0.0F || laguna.global_rope_partial > 1.0F ||
+            laguna.sliding_rope_partial <= 0.0F || laguna.sliding_rope_partial > 1.0F ||
+            laguna.global_rope_original_context == 0U ||
+            !(laguna.global_rope_factor >= 1.0F)) {
+            result.errors.emplace_back("Laguna rotary parameters are out of range");
         }
     }
     return result;
@@ -547,6 +590,153 @@ ValidationResult validate_gemma4_31b_it_w8a16(const ModelSpec& spec) {
                 quantization.linears.group_size == 32U &&
                 quantization.linears.symmetric && spec.quant_bits == 8U,
             "unexpected Gemma 4 W8A16 quantization semantics");
+    return result;
+}
+
+ModelSpec laguna_s21_nvfp4_spec() {
+    ModelSpec spec;
+    const auto& contract = kLagunaExecutionContract;
+    spec.name = "poolside/Laguna-S-2.1-NVFP4";
+    spec.architecture = ArchitectureKind::Laguna;
+    spec.attention = AttentionKind::HybridLocalGlobal;
+    spec.router.selection = RouterSelectionKind::TopK;
+    spec.router.scoring = RouterScoreKind::Sigmoid;
+    spec.router.routed_experts = contract.routed_experts;
+    spec.router.experts_per_token = contract.experts_per_token;
+    spec.router.groups = 1U;
+    spec.router.selected_groups = 1U;
+    spec.router.normalize_topk = true;
+    spec.router.selection_bias = true;
+    spec.router.routed_scale = contract.routed_scale;
+
+    // Weights are NVFP4 for the routed experts of layers 1..39 and BF16
+    // everywhere else. Activations stay at 16 bits: the checkpoint ships
+    // input_global_scale tensors for a W4A4 kernel, but the reference
+    // implementation dequantizes and runs the linear in BF16, and that is the
+    // oracle this runtime matches.
+    spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsNvfp4W4A16;
+    spec.mixed_quantization.activation_bits = 16U;
+    spec.mixed_quantization.quantized_linear_start_layer = contract.layer_count;
+    spec.mixed_quantization.quantized_expert_start_layer =
+        contract.dense_prefix_layers;
+    spec.mixed_quantization.mtp_layer_index = contract.layer_count;
+    spec.mixed_quantization.routed_experts = {
+        4U, QuantizationGranularity::Group, contract.nvfp4_group_size, true};
+    spec.mixed_quantization.linears = {
+        16U, QuantizationGranularity::Channel, 0U, true};
+    spec.mixed_quantization.mtp = spec.mixed_quantization.linears;
+    spec.source.repository = "poolside/Laguna-S-2.1-NVFP4";
+    spec.source.index_sha256 =
+        "d21d362ea5b85abc642a721b208834fe1d66a07dfa1c43a70f28a9932f568902";
+    spec.source.tensor_count = 126'625U;
+    spec.source.indexed_tensor_bytes = 99'697'287'856ULL;
+    spec.source.shard_file_bytes = 99'697'277'984ULL;
+    spec.source.main_shards = 49U;
+    spec.quant_bits = 4U;
+    spec.hidden_size = contract.hidden_size;
+    spec.layer_count = contract.layer_count;
+    spec.max_context_tokens = contract.maximum_context_tokens;
+    spec.dense_prefix_layers = contract.dense_prefix_layers;
+    spec.shared_experts = 1U;
+    spec.expert_intermediate_size = contract.expert_intermediate_size;
+    spec.laguna = {
+        contract.global_attention_heads,
+        contract.sliding_attention_heads,
+        contract.key_value_heads,
+        contract.head_dim,
+        contract.sliding_window,
+        contract.global_attention_stride,
+        contract.dense_intermediate_size,
+        contract.shared_expert_intermediate_size,
+        contract.quantized_expert_layers,
+        contract.rms_epsilon,
+        contract.router_logit_softcapping,
+        contract.global_rope_theta,
+        contract.global_rope_factor,
+        contract.global_rope_attention_factor,
+        contract.global_rope_beta_fast,
+        contract.global_rope_beta_slow,
+        contract.global_rope_partial,
+        contract.global_rope_original_context,
+        contract.sliding_rope_theta,
+        contract.sliding_rope_partial,
+        true,
+        true,
+    };
+    return spec;
+}
+
+ValidationResult validate_laguna_s21_nvfp4(const ModelSpec& spec) {
+    auto result = validate_model(spec);
+    const auto expected = laguna_s21_nvfp4_spec();
+    const auto require = [&result](bool condition, std::string_view message) {
+        if (!condition) result.errors.emplace_back(message);
+    };
+    require(spec.source.repository == expected.source.repository &&
+                spec.source.index_sha256 == expected.source.index_sha256,
+            "unexpected Laguna S 2.1 source identity");
+    require(spec.source.tensor_count == expected.source.tensor_count &&
+                spec.source.indexed_tensor_bytes ==
+                    expected.source.indexed_tensor_bytes &&
+                spec.source.shard_file_bytes == expected.source.shard_file_bytes &&
+                spec.source.main_shards == expected.source.main_shards,
+            "unexpected Laguna S 2.1 checkpoint extent");
+    require(spec.architecture == expected.architecture &&
+                spec.attention == expected.attention &&
+                spec.hidden_size == expected.hidden_size &&
+                spec.layer_count == expected.layer_count &&
+                spec.dense_prefix_layers == expected.dense_prefix_layers &&
+                spec.shared_experts == expected.shared_experts &&
+                spec.expert_intermediate_size == expected.expert_intermediate_size &&
+                spec.max_context_tokens == expected.max_context_tokens,
+            "unexpected Laguna S 2.1 architecture dimensions");
+    require(spec.router.selection == expected.router.selection &&
+                spec.router.scoring == expected.router.scoring &&
+                spec.router.routed_experts == expected.router.routed_experts &&
+                spec.router.experts_per_token == expected.router.experts_per_token &&
+                spec.router.normalize_topk == expected.router.normalize_topk &&
+                spec.router.selection_bias == expected.router.selection_bias &&
+                spec.router.routed_scale == expected.router.routed_scale,
+            "unexpected Laguna S 2.1 router semantics");
+    const auto& actual = spec.laguna;
+    const auto& wanted = expected.laguna;
+    require(actual.global_attention_heads == wanted.global_attention_heads &&
+                actual.sliding_attention_heads == wanted.sliding_attention_heads &&
+                actual.key_value_heads == wanted.key_value_heads &&
+                actual.head_dim == wanted.head_dim &&
+                actual.sliding_window == wanted.sliding_window &&
+                actual.global_attention_stride == wanted.global_attention_stride &&
+                actual.dense_intermediate_size == wanted.dense_intermediate_size &&
+                actual.shared_expert_intermediate_size ==
+                    wanted.shared_expert_intermediate_size &&
+                actual.quantized_expert_layers == wanted.quantized_expert_layers &&
+                actual.rms_epsilon == wanted.rms_epsilon &&
+                actual.router_logit_softcapping == wanted.router_logit_softcapping &&
+                actual.per_head_output_gating == wanted.per_head_output_gating &&
+                actual.query_key_norm == wanted.query_key_norm,
+            "unexpected Laguna S 2.1 attention or MoE contract");
+    require(actual.global_rope_theta == wanted.global_rope_theta &&
+                actual.global_rope_factor == wanted.global_rope_factor &&
+                actual.global_rope_attention_factor ==
+                    wanted.global_rope_attention_factor &&
+                actual.global_rope_beta_fast == wanted.global_rope_beta_fast &&
+                actual.global_rope_beta_slow == wanted.global_rope_beta_slow &&
+                actual.global_rope_partial == wanted.global_rope_partial &&
+                actual.global_rope_original_context ==
+                    wanted.global_rope_original_context &&
+                actual.sliding_rope_theta == wanted.sliding_rope_theta &&
+                actual.sliding_rope_partial == wanted.sliding_rope_partial,
+            "unexpected Laguna S 2.1 rotary contract");
+    const auto& quantization = spec.mixed_quantization;
+    require(quantization.kind == QuantizationKind::CompressedTensorsNvfp4W4A16 &&
+                quantization.activation_bits == 16U &&
+                quantization.routed_experts.bits == 4U &&
+                quantization.routed_experts.granularity ==
+                    QuantizationGranularity::Group &&
+                quantization.routed_experts.group_size ==
+                    kLagunaExecutionContract.nvfp4_group_size &&
+                quantization.routed_experts.symmetric && spec.quant_bits == 4U,
+            "unexpected Laguna S 2.1 NVFP4 quantization semantics");
     return result;
 }
 

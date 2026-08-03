@@ -3,6 +3,7 @@
 #include "strata/deepseek_runtime.hpp"
 #include "strata/gemma4_runtime.hpp"
 #include "strata/glm_runtime.hpp"
+#include "strata/laguna_runtime.hpp"
 
 #include <array>
 #include <algorithm>
@@ -14,7 +15,7 @@ namespace strata {
 
 struct RuntimeSession::Impl {
     std::variant<std::monostate, Glm52Runtime, DeepSeekV4Runtime,
-                 Gemma4Runtime> runtime;
+                 Gemma4Runtime, LagunaRuntime> runtime;
     SamplingOptions sampling;
     PlacementPlan placement;
     bool placement_ready{};
@@ -27,6 +28,7 @@ namespace {
         case RuntimeModel::Glm52: return PlacementModel::Glm52;
         case RuntimeModel::DeepSeekV4: return PlacementModel::DeepSeekV4;
         case RuntimeModel::Gemma4: return PlacementModel::Gemma4;
+        case RuntimeModel::Laguna: return PlacementModel::Laguna;
     }
     return PlacementModel::Gemma4;
 }
@@ -149,6 +151,28 @@ ValidationResult RuntimeSession::initialize(
         if (result.ok()) impl_->runtime.emplace<Gemma4Runtime>(std::move(runtime));
         return result;
     }
+    if (config.model == RuntimeModel::Laguna) {
+        if (config.deepseek_block_kv_cache) {
+            result.errors.emplace_back(
+                "DeepSeek block KV cache cannot be used by the Laguna runtime");
+            return result;
+        }
+        LagunaRuntime runtime;
+        LagunaRuntimeConfig concrete;
+        concrete.devices = config.devices;
+        concrete.vram_cache_fraction = config.vram_cache_fraction;
+        concrete.maximum_context_tokens = config.maximum_context_tokens;
+        concrete.sampling_temperature = config.sampling.temperature;
+        concrete.sampling_seed = config.sampling.seed;
+        concrete.verbose = config.verbose;
+        concrete.load_progress = config.load_progress;
+        concrete.enable_flash_attention = config.enable_flash_attention;
+        concrete.enable_incremental_kv_continuation =
+            config.enable_incremental_kv_continuation;
+        result = runtime.initialize(model_directory, concrete);
+        if (result.ok()) impl_->runtime.emplace<LagunaRuntime>(std::move(runtime));
+        return result;
+    }
     DeepSeekV4Runtime runtime;
     Dsv4RuntimeConfig concrete;
     concrete.devices = config.devices;
@@ -226,6 +250,27 @@ GenerationResult RuntimeSession::generate_chat_stream(
         return result;
     }
     if (auto* runtime = std::get_if<DeepSeekV4Runtime>(&impl_->runtime)) {
+        auto concrete = runtime->generate_chat_stream(
+            messages, options.maximum_new_tokens, options.sampling,
+            options.stop, on_token);
+        result.text = std::move(concrete.text);
+        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
+        result.generated_token_ids = std::move(concrete.generated_token_ids);
+        result.logprobs = std::move(concrete.logprobs);
+        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
+        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
+        result.metrics.reused_prompt_tokens =
+            concrete.metrics.reused_prompt_tokens;
+        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
+        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
+        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
+        result.metrics.incremental_kv_continuation =
+            concrete.metrics.incremental_kv_continuation;
+        result.errors = std::move(concrete.errors);
+        result.stopped = concrete.stopped;
+        return result;
+    }
+    if (auto* runtime = std::get_if<LagunaRuntime>(&impl_->runtime)) {
         auto concrete = runtime->generate_chat_stream(
             messages, options.maximum_new_tokens, options.sampling,
             options.stop, on_token);

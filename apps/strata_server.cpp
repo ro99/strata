@@ -66,7 +66,7 @@ void stop_server(int) {
 
 void usage() {
     std::cerr
-        << "usage: strata-server --model DIR --model-type gemma4|deepseek|glm\n"
+        << "usage: strata-server --model DIR --model-type gemma4|deepseek|glm|laguna\n"
         << "                     [--model-id ID] [--host ADDRESS] [--port N]\n"
         << "                     [--context-size N] [--max-new N]\n"
         << "                     [--devices 0,1,2] [--vram-fraction F]\n"
@@ -142,7 +142,7 @@ bool parse_options(int argc, char** argv, Options& options) {
     }
     return !options.model.empty() && !options.model_id.empty() &&
         (options.model_type == "glm" || options.model_type == "deepseek" ||
-         options.model_type == "gemma4");
+         options.model_type == "gemma4" || options.model_type == "laguna");
 }
 
 std::string lower(std::string_view text) {
@@ -652,12 +652,15 @@ int main(int argc, char** argv) {
         ? strata::RuntimeModel::Glm52
         : options.model_type == "gemma4"
             ? strata::RuntimeModel::Gemma4
+        : options.model_type == "laguna"
+            ? strata::RuntimeModel::Laguna
             : strata::RuntimeModel::DeepSeekV4;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;
     config.vram_cache_fraction = options.vram_fraction;
     config.enable_flash_attention =
-        options.flash_attention || options.model_type == "gemma4";
+        options.flash_attention || options.model_type == "gemma4" ||
+        options.model_type == "laguna";
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.pin_resident_arena = options.pin_resident_arena;
     config.verbose = options.model_type == "deepseek";

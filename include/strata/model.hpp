@@ -15,6 +15,7 @@ enum class ArchitectureKind : std::uint8_t {
     DeepSeek,
     GlmMoeDsa,
     Gemma4,
+    Laguna,
 };
 
 enum class AttentionKind : std::uint8_t {
@@ -56,6 +57,7 @@ enum class QuantizationKind : std::uint8_t {
     Uniform,
     CompressedTensorsW4A16,
     CompressedTensorsW8A16,
+    CompressedTensorsNvfp4W4A16,
     NativeFp4Fp8,
 };
 
@@ -164,6 +166,34 @@ struct Gemma4Spec {
     bool vision_bidirectional{};
 };
 
+struct LagunaSpec {
+    std::uint32_t global_attention_heads{};
+    std::uint32_t sliding_attention_heads{};
+    std::uint32_t key_value_heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t sliding_window{};
+    std::uint32_t global_attention_stride{};
+    std::uint32_t dense_intermediate_size{};
+    std::uint32_t shared_expert_intermediate_size{};
+    // Routed experts below this layer are NVFP4; the rest ship plain BF16.
+    std::uint32_t quantized_expert_layers{};
+    float rms_epsilon{};
+    float router_logit_softcapping{};
+    float global_rope_theta{};
+    float global_rope_factor{};
+    float global_rope_attention_factor{};
+    float global_rope_beta_fast{};
+    float global_rope_beta_slow{};
+    float global_rope_partial{};
+    std::uint32_t global_rope_original_context{};
+    float sliding_rope_theta{};
+    float sliding_rope_partial{};
+    // softplus(g_proj(x)) broadcast across head_dim, applied before o_proj.
+    bool per_head_output_gating{};
+    // QK RMSNorm applied per head after reshape and before RoPE.
+    bool query_key_norm{};
+};
+
 struct ModelSpec {
     std::string name;
     ArchitectureKind architecture{ArchitectureKind::Dense};
@@ -175,6 +205,7 @@ struct ModelSpec {
     GlmMoeDsaSpec glm_moe_dsa;
     DeepSeekV4Spec deepseek_v4;
     Gemma4Spec gemma4;
+    LagunaSpec laguna;
     std::uint32_t quant_bits{kMinimumQuantBits};
     std::uint32_t hidden_size{};
     std::uint32_t layer_count{};
@@ -193,6 +224,9 @@ struct ModelSpec {
     const ModelSpec& spec);
 [[nodiscard]] ModelSpec gemma4_31b_it_w8a16_spec();
 [[nodiscard]] ValidationResult validate_gemma4_31b_it_w8a16(
+    const ModelSpec& spec);
+[[nodiscard]] ModelSpec laguna_s21_nvfp4_spec();
+[[nodiscard]] ValidationResult validate_laguna_s21_nvfp4(
     const ModelSpec& spec);
 
 }  // namespace strata

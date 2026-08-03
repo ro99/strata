@@ -1033,11 +1033,7 @@ struct LagunaRuntime::Impl {
         // back, instead of three synchronous round trips per expert. At
         // rows > 1 the experts see disjoint row subsets, which this command
         // shape cannot express, so prefill keeps the per-expert path.
-        // Layers 40-47 carry their routed experts as plain BF16, which the
-        // batched command's decode rule does not cover. Those modules are 18.87
-        // MiB against the NVFP4 layers' 1.69 MiB, so they are bandwidth-bound
-        // rather than round-trip-bound and gain least from batching anyway.
-        const bool batched = rows == 1U && laguna_quantized_expert_layer(layer);
+        const bool batched = rows == 1U;
         auto dispatched = batched
             ? device_workers->parallel_for(devices.size(), [&](std::size_t slot) {
                   auto status = run_batched_experts(layer, slot, input, jobs);

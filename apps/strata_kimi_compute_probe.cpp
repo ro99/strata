@@ -359,6 +359,93 @@ int main(int argc, char** argv) {
               << best_routed_seconds << " s/token at " << best_workers
               << " workers\n";
 
+    // ------------------------------------------------------- expert grain
+    //
+    // The same routed work at the grain the MoE block uses: one whole layer's
+    // sixteen experts spread across workers, each expert's three matvecs run
+    // single-threaded on the worker that owns it. One barrier per layer instead
+    // of forty-eight.
+    //
+    // Two signatures, not one. If the barrier hypothesis is right this should
+    // cut the median *and* the spread, because spread is what dispatch noise
+    // produces. A mean that moves while the spread does not would be the same
+    // lucky run that got this branch parked the first time.
+    std::cout << "\n"
+              << std::setw(9) << "workers" << std::setw(14) << "ms/block"
+              << std::setw(16) << "routed s/token" << std::setw(12) << "spread"
+              << std::setw(14) << "vs matvec" << "\n";
+
+    double best_block_seconds = 0.0;
+    std::size_t best_block_workers = 0U;
+    for (const auto workers : options.worker_counts) {
+        if (workers == 0U) continue;
+        strata::HostWorkerPool block_pool(workers);
+        const auto lanes = std::min<std::size_t>(workers, top_k);
+        const auto span = (top_k + lanes - 1U) / lanes;
+        std::vector<std::vector<float>> lane_gate(lanes), lane_up(lanes),
+            lane_activated(lanes), lane_output(lanes);
+        for (std::size_t lane = 0U; lane < lanes; ++lane) {
+            lane_gate[lane].assign(inner, 0.0F);
+            lane_up[lane].assign(inner, 0.0F);
+            lane_activated[lane].assign(inner, 0.0F);
+            lane_output[lane].assign(latent, 0.0F);
+        }
+        std::mt19937_64 selector(options.seed);
+        std::uniform_int_distribution<std::size_t> pick(0U, pool_count - 1U);
+        std::vector<std::size_t> chosen(top_k);
+        const auto run_block = [&](std::size_t lane) {
+            const auto begin = lane * span;
+            const auto end = std::min(begin + span, top_k);
+            for (std::size_t slot = begin; slot < end; ++slot) {
+                const auto& triple = pool[chosen[slot]];
+                (void)strata::kimi_mxfp4_matvec(lane_gate[lane], source,
+                                                triple.gate.view());
+                (void)strata::kimi_mxfp4_matvec(lane_up[lane], source,
+                                                triple.up.view());
+                (void)strata::kimi_situ_glu(lane_activated[lane], lane_gate[lane],
+                                            lane_up[lane], kContract.situ_gate_beta,
+                                            kContract.situ_linear_beta);
+                (void)strata::kimi_mxfp4_matvec(lane_output[lane],
+                                                lane_activated[lane],
+                                                triple.down.view());
+            }
+        };
+        for (std::size_t warm = 0U; warm < 4U; ++warm) {
+            for (auto& value : chosen) value = pick(selector);
+            (void)block_pool.parallel_for(lanes, run_block);
+        }
+        std::vector<double> samples;
+        constexpr std::size_t kBlocksPerSample = 4U;
+        for (std::uint32_t repetition = 0U; repetition < options.repetitions;
+             ++repetition) {
+            const auto begin = std::chrono::steady_clock::now();
+            for (std::size_t step = 0U; step < kBlocksPerSample; ++step) {
+                for (auto& value : chosen) value = pick(selector);
+                (void)block_pool.parallel_for(lanes, run_block);
+            }
+            const std::chrono::duration<double> elapsed =
+                std::chrono::steady_clock::now() - begin;
+            samples.push_back(elapsed.count() /
+                              static_cast<double>(kBlocksPerSample));
+        }
+        const auto block_stats = summarize(samples);
+        const auto routed_seconds =
+            block_stats.median * static_cast<double>(moe_layers);
+        if (best_block_seconds == 0.0 || routed_seconds < best_block_seconds) {
+            best_block_seconds = routed_seconds;
+            best_block_workers = workers;
+        }
+        std::cout << std::setw(9) << workers << std::setw(14)
+                  << std::setprecision(3) << block_stats.median * 1000.0
+                  << std::setw(16) << std::setprecision(2) << routed_seconds
+                  << std::setw(11) << std::setprecision(2) << block_stats.spread()
+                  << "x" << std::setw(13) << std::setprecision(2)
+                  << best_routed_seconds / routed_seconds << "x" << "\n";
+    }
+    std::cout << "\nbest routed-expert compute (expert grain): "
+              << std::setprecision(2) << best_block_seconds << " s/token at "
+              << best_block_workers << " workers\n";
+
     // ------------------------------------------------------- dense spine
     //
     // The routed set is not the larger term. `docs/experiments/0048` measures

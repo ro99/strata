@@ -25,11 +25,44 @@ using KimiLayerObserver =
 
 struct KimiK3RuntimeConfig {
     std::uint32_t maximum_context_tokens{2048U};
-    // Tokens per prefill page. A page amortizes every dense weight read across
-    // its rows, but the routed set does not amortize: past roughly 256 tokens a
-    // page touches essentially all 896 experts of every layer, so the page cost
-    // stops falling. See `docs/experiments/0048`.
-    std::uint32_t prefill_page_tokens{64U};
+    // Tokens per prefill page.
+    //
+    // The previous value of 64 was justified by observing that past roughly 256
+    // tokens a page touches essentially all 896 experts of every layer, "so the
+    // page cost stops falling". That inverts the conclusion. Once a page
+    // saturates the routed set its *total* cost stops rising -- it is capped at
+    // the whole 1347 GiB -- so cost per token is `saturated_set / P` and keeps
+    // falling as 1/P. The fact cited as the reason to keep pages small is the
+    // reason to make them large.
+    //
+    // Exact, from the contract: a page of P tokens draws 16P experts per layer
+    // from 896, so it touches `896 * (1 - (1 - 1/896)^(16P))` distinct ones.
+    //
+    //     page   distinct/layer   GiB/token   vs decode   residual stream
+    //       64              610       14.34        1.7x            15 MB
+    //      256              887        5.21        4.6x            59 MB
+    //      512              896        2.63        9.1x           117 MB
+    //     2048              896        0.66       36.6x           470 MB
+    //
+    // Batch-1 decode is 24.06 GiB/token. At 64 tokens a page was therefore only
+    // 1.7x cheaper per token than decode, which is the shape the charter names
+    // as a defect: a page exists to amortize weight reads across its rows, and
+    // 1.7x is not amortization.
+    //
+    // 512 buys 9.1x for 117 MB of residual stream, plus about 205 MB of
+    // per-worker MoE accumulator at 28 workers -- together under half a
+    // gigabyte against a 238 GiB host budget. Past 512 the routed set is fully
+    // saturated and the return is linear in page size, so the ceiling is
+    // activation memory rather than anything about routing.
+    //
+    // Real routing is skewed rather than uniform, which touches *fewer* distinct
+    // experts at a given P. That lowers the cost at every page size and moves
+    // saturation later; it does not change the 1/P scaling this rests on.
+    //
+    // Still owed: an end-to-end prefill measurement. The arithmetic above is
+    // exact but it is storage volume, not wall time, and no Kimi-K3 prefill has
+    // been profiled at any page size.
+    std::uint32_t prefill_page_tokens{512U};
     // Host bytes for the routed-expert cache. Zero derives it from what is left
     // after the dense spine, against `host_budget_bytes`.
     std::uint64_t expert_arena_bytes{};

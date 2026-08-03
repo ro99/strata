@@ -112,12 +112,21 @@ struct LayerWeights {
 };
 
 struct LayerKv {
-    // BF16 storage matches the reference cache dtype. Sliding layers keep at
-    // most `sliding_window` rows and advance `start`; global layers keep all.
-    std::vector<std::uint16_t> keys;
-    std::vector<std::uint16_t> values;
+    // Rows are stored already rounded through BF16, which is the reference
+    // cache dtype, but held as F32 so the attention request can point straight
+    // at them. Holding BF16 and decoding on use cost a full O(context) decode
+    // of the whole cache per layer per token to add one row; the values are
+    // identical either way because decode(encode(x)) is a fixed point.
+    // Sliding layers keep at most `sliding_window` rows and advance `start`;
+    // global layers keep all.
+    std::vector<float> keys;
+    std::vector<float> values;
     std::uint32_t start{};
 };
+
+float bf16_round(float value) noexcept {
+    return decode_bf16(bf16_encode(value));
+}
 
 struct ExpertJob {
     std::uint32_t expert{};
@@ -689,18 +698,16 @@ struct LagunaRuntime::Impl {
                                        std::to_string(layer));
             return result;
         }
-        std::vector<float> keys((cached_rows + rows) * kKvColumns);
-        std::vector<float> values(keys.size());
-        for (std::size_t index = 0U; index < cache.keys.size(); ++index) {
-            keys[index] = decode_bf16(cache.keys[index]);
-            values[index] = decode_bf16(cache.values[index]);
-        }
-        std::copy(new_keys.begin(), new_keys.end(),
-                  keys.begin() + static_cast<std::ptrdiff_t>(cache.keys.size()));
-        std::copy(new_values.begin(), new_values.end(),
-                  values.begin() + static_cast<std::ptrdiff_t>(cache.values.size()));
+        // Append this step's rows to the cache and attend over the cache
+        // itself. The rows are rounded through BF16 on the way in, so the
+        // arithmetic is what a BF16 cache would produce.
+        cache.keys.reserve(cache.keys.size() + new_keys.size());
+        cache.values.reserve(cache.values.size() + new_values.size());
+        for (const auto value : new_keys) cache.keys.push_back(bf16_round(value));
+        for (const auto value : new_values) cache.values.push_back(bf16_round(value));
 
-        const std::array<FlashAttentionSegment, 1> segments{{{keys, values, {}}}};
+        const std::array<FlashAttentionSegment, 1> segments{
+            {{cache.keys, cache.values, {}}}};
         FlashAttentionRequest request;
         request.queries = queries;
         request.segments = segments;
@@ -760,10 +767,6 @@ struct LagunaRuntime::Impl {
         result = spine_matmul(weights.output, context, rows, output);
         if (!result.ok()) return result;
 
-        cache.keys.reserve(cache.keys.size() + new_keys.size());
-        cache.values.reserve(cache.values.size() + new_values.size());
-        for (const auto value : new_keys) cache.keys.push_back(bf16_encode(value));
-        for (const auto value : new_values) cache.values.push_back(bf16_encode(value));
         if (!weights.global && cached_rows + rows > kSlidingWindow) {
             const auto drop_rows = cached_rows + rows - kSlidingWindow;
             const auto drop = drop_rows * kKvColumns;

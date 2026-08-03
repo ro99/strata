@@ -86,6 +86,71 @@ Measured production average is 2.27 MiB/miss, so the probe under-represents the
 large transfers. The A-vs-D ordering is unaffected and larger transfers favour
 D further, but the absolute ms/module here is not the production constant.
 
+## Results
+
+Interleaved A/B, 3 repetitions per arm, identical instrumentation, 512 context,
+greedy, 47-token prompt.
+
+| arm | reps (tok/s) | median | ms/step |
+| --- | --- | ---: | ---: |
+| baseline | 1.743 / 1.746 / 1.751 | 1.746 | 572.8 |
+| stage 1 (zero-copy + arena) | 2.608 / 2.566 / 2.591 | 2.591 | 389.7 |
+| stage 2 (incremental F32 KV) | 2.634 / 2.658 / 2.669 | 2.658 | 376.2 |
+
+**1.52x end to end.** Greedy output is token-identical in every run of every arm.
+`make check` passes 169/169 and ctest 2/2 after each stage.
+
+Time to first token, same operating point: load 8.18 -> 2.87 s and prefill
+13.98 -> 10.02 s, so **1.72x** (22.2 s -> 12.9 s). The load win is the same
+mechanism: the spine no longer copies through the heap either.
+
+Stage 2 removed 13.3 ms/step of KV restage at 512 context. That term is
+`O(context)` per layer per token, so it grows with context; it was measured only
+at 512 and no larger-context figure is claimed here.
+
+## Pinning is unavailable, not merely unhelpful
+
+Arm F tried to `cudaHostRegister` the shard mapping so the zero-copy source
+would DMA without the driver's staging copy. It fails with `invalid argument`:
+CUDA cannot page-lock a `MAP_SHARED` file-backed mapping. With arm E already
+rejected, **there is no pinning path for this staging design**. Measured
+pageable transfer from a mapped shard is 5.30 GB/s, which is close to what the
+runtime now achieves, so staging is at its mechanism bound. Any further gain on
+that term has to come from moving fewer bytes, not from moving them faster.
+
+## What remains, measured
+
+At 376.2 ms/step the breakdown is:
+
+| term | ms/step |
+| --- | ---: |
+| MoE routed | ~271 |
+| ...miss staging, busiest device | ~126 |
+| ...expert matmul, busiest device | ~49 |
+| ...per-layer barrier imbalance | ~100 |
+| attention | 70.9 |
+| shared expert / router / head / dense | ~17 |
+
+Reaching 5 tok/s (200 ms/step) needs roughly another 175 ms. The three candidate
+mechanisms, each sized from the table above, are:
+
+1. **Device-resident activations (~150 ms).** 1842 synchronous matmuls per step,
+   each a pageable H2D, kernel, D2H and a full `cudaStreamSynchronize`. Measured
+   per-call cost is ~85-104 us against ~19 us of kernel. Keeping the hidden
+   state on the device across the graph removes nearly all of it. There is
+   precedent in `exp/dsv4-device-activations`.
+2. **Asynchronous weight staging (~100 ms).** The per-device chain is
+   strictly stage, matmul, stage, matmul. A copy stream would overlap staging
+   with compute and collapse it toward `max` instead of the sum, which also
+   shrinks the barrier tax. Requires publishing a weight only after its transfer
+   completes, so it touches shared backend infrastructure.
+3. **Batched routed-expert kernel (~40 ms).** One fused launch per device per
+   layer instead of 3 launches per expert, in the shape of the existing
+   `enqueue_deepseek_moe` command but for NVFP4 group-16.
+
+None of these trade transfer for recompute, which the measurement forbids:
+matmul kernels total 35 ms/step, so compute is nowhere near the bottleneck.
+
 ## Stage 1 decision
 
 Build D: zero-copy `view()` upload plus a per-device weight arena. It reduces

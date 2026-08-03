@@ -11,7 +11,13 @@
 #include "strata/laguna_checkpoint.hpp"
 #include "strata/model_adapter.hpp"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <filesystem>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -195,7 +201,7 @@ int main(int argc, char** argv) {
     }
     }
 
-    if (!run_de) return 0;
+    if (!run_de && options.arms.find('f') == std::string::npos) return 0;
     // The remaining arms need an arena so no arm pays cudaMalloc per weight.
     if (auto status = backend.reserve_weight_arena(options.device,
                                                    options.arena_bytes);
@@ -286,6 +292,91 @@ int main(int argc, char** argv) {
         report("E view()+arena+pinned bounce", seconds_since(started),
                total_bytes, static_cast<std::uint32_t>(targets.size()));
         backend.unregister_host_memory(bounce.data());
+    }
+
+    // Arm F: the same zero-copy source, but with the mapping page-locked so the
+    // transfer is a real DMA rather than a driver staging copy. Arm E rejected
+    // a bounce buffer because of its extra memcpy; registering the mapping has
+    // no extra copy at all. Registration is a one-time cost and is timed
+    // separately. A shard is mapped directly here so the probe owns the region
+    // it registers.
+    reader.release_mapped_views();
+    if (options.arms.find('f') != std::string::npos) {
+        const auto shard_path =
+            (std::filesystem::path(options.model) /
+             "model-00020-of-00049.safetensors").string();
+        const int descriptor = ::open(shard_path.c_str(), O_RDONLY);
+        if (descriptor < 0) {
+            std::cerr << "error: cannot open " << shard_path << '\n';
+            return 1;
+        }
+        struct stat status {};
+        if (fstat(descriptor, &status) != 0 || status.st_size <= 0) return 1;
+        const auto shard_bytes = static_cast<std::uint64_t>(status.st_size);
+        void* base = mmap(nullptr, static_cast<std::size_t>(shard_bytes),
+                          PROT_READ, MAP_SHARED, descriptor, 0);
+        if (base == MAP_FAILED) return 1;
+
+        // Fault the pages in first so registration and transfer are not paying
+        // for first-touch major faults.
+        std::uint64_t sink = 0U;
+        for (std::uint64_t offset = 0U; offset < shard_bytes; offset += 4096U) {
+            sink += static_cast<std::uint64_t>(
+                static_cast<const std::byte*>(base)[offset]);
+        }
+
+        constexpr std::uint64_t kSliceBytes = 1536U * 1024U;
+        const auto slices = std::min<std::uint64_t>(
+            options.modules, shard_bytes / kSliceBytes);
+        std::uniform_int_distribution<std::uint64_t> slice_pick(
+            0U, shard_bytes / kSliceBytes - 1U);
+
+        const auto time_slices = [&](std::string_view label) {
+            std::mt19937_64 local(options.seed);
+            const auto started = std::chrono::steady_clock::now();
+            for (std::uint64_t index = 0U; index < slices; ++index) {
+                const auto offset = slice_pick(local) * kSliceBytes;
+                strata::CudaWeightDescriptor descriptor_plain;
+                descriptor_plain.encoding = strata::CudaWeightEncoding::Plain;
+                descriptor_plain.dtype = strata::SafetensorsDtype::Bf16;
+                descriptor_plain.rows = kSliceBytes / 2U / 1024U;
+                descriptor_plain.columns = 1024U;
+                strata::CudaWeight weight;
+                auto span = std::span<const std::byte>(
+                    static_cast<const std::byte*>(base) + offset, kSliceBytes);
+                if (auto upload = backend.upload(options.device, descriptor_plain,
+                                                 span, {}, weight);
+                    !upload.ok()) {
+                    for (const auto& error : upload.errors) std::cerr << "error: " << error << '\n';
+                    return false;
+                }
+            }
+            report(label, seconds_since(started), slices * kSliceBytes,
+                   static_cast<std::uint32_t>(slices));
+            return true;
+        };
+
+        if (!time_slices("F1 mapped shard, unregistered  [pageable]")) return 1;
+
+        const auto registration_started = std::chrono::steady_clock::now();
+        if (auto status = backend.register_host_memory(base, shard_bytes);
+            !status.ok()) {
+            for (const auto& error : status.errors) std::cerr << "error: " << error << '\n';
+            return 1;
+        }
+        const auto registration_seconds = seconds_since(registration_started);
+        std::cout << "  registration of " << std::setprecision(2)
+                  << static_cast<double>(shard_bytes) / 1073741824.0
+                  << " GiB took " << (1000.0 * registration_seconds)
+                  << " ms  (" << (static_cast<double>(shard_bytes) /
+                                  (registration_seconds * 1.0e9))
+                  << " GB/s)\n";
+
+        if (!time_slices("F2 mapped shard, registered  [pinned DMA]")) return 1;
+        backend.unregister_host_memory(base);
+        static_cast<void>(munmap(base, static_cast<std::size_t>(shard_bytes)));
+        static_cast<void>(::close(descriptor));
+        if (sink == 0xFFFF'FFFF'FFFF'FFFFULL) std::cout << "";
     }
 
     std::cout << "\nB and C bound the host side; A minus (B or C) is the device"

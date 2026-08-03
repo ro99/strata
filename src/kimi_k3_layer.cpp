@@ -850,19 +850,18 @@ ValidationResult kimi_latent_moe_layer(std::span<float> output,
 
     auto& mixed = scratch.latent_mix;
     mixed.assign(rows * latent_width, 0.0F);
-    auto& gate = scratch.expert_gate;
-    auto& up = scratch.expert_up;
-    auto& activated = scratch.expert_out;
-    gate.assign(inner, 0.0F);
-    up.assign(inner, 0.0F);
-    activated.assign(inner, 0.0F);
-    std::vector<float> expert_output(latent_width);
-    // Expert-major so each expert's weights are read once per block even when
-    // several tokens of a page select it.
-    for (const auto expert : wanted) {
-        KimiExpertWeights modules;
-        result = experts.fetch(layer, expert, modules);
+    // Resolve every expert's views before anything runs in parallel. `fetch`
+    // reaches the arena's LRU clock and its hit counters, none of which are
+    // synchronised, while the views it hands back stay valid for as long as
+    // `prepare` keeps the set admitted. Resolving up front is therefore what
+    // makes the compute below safe to spread across workers without reaching
+    // into the arena's internals at all.
+    const auto slots = wanted.size();
+    std::vector<KimiExpertWeights> resolved(slots);
+    for (std::size_t slot = 0U; slot < slots; ++slot) {
+        result = experts.fetch(layer, wanted[slot], resolved[slot]);
         if (!result.ok()) return result;
+        const auto& modules = resolved[slot];
         if (modules.gate.rows != inner || modules.gate.columns != latent_width ||
             modules.up.rows != inner || modules.up.columns != latent_width ||
             modules.down.rows != latent_width || modules.down.columns != inner) {
@@ -870,28 +869,99 @@ ValidationResult kimi_latent_moe_layer(std::span<float> output,
                 "routed expert modules disagree with the latent shape");
             return result;
         }
-        for (std::size_t token = 0U; token < rows; ++token) {
-            float weight = 0.0F;
-            for (std::size_t slot = 0U; slot < top_k; ++slot) {
-                const auto& entry = selection[token * top_k + slot];
-                if (entry.expert == expert) { weight = entry.weight; break; }
+    }
+
+    // One parallel region per MoE block instead of one per matvec. The block
+    // dispatched forty-eight of them -- three matvecs for each of sixteen
+    // experts -- and each paid a barrier across every worker for about a
+    // millisecond of arithmetic. On two sockets that barrier is what stopped
+    // the second socket from paying for itself: 14 cores on one socket beat 28
+    // across two in every arm, and spreading the pages with `numactl
+    // --interleave` did not recover it. Experts are independent, so the block
+    // is the natural grain -- one barrier per layer, and each worker keeps a
+    // whole expert's 16.73 MiB to itself.
+    //
+    // Work is chunked by worker rather than dispatched per expert so the
+    // accumulator and scratch can be sized by worker count. A prefill page
+    // deduplicates to hundreds of experts, and a buffer per expert would run
+    // to hundreds of megabytes.
+    const auto width = rows * latent_width;
+    const auto workers = (pool != nullptr && pool->size() > 1U && slots > 1U)
+                             ? std::min<std::size_t>(pool->size(), slots)
+                             : 1U;
+    const auto chunk = (slots + workers - 1U) / workers;
+    const auto stride = inner * 3U + latent_width;
+    auto& workspace = scratch.worker_workspace;
+    auto& mixture = scratch.worker_mixture;
+    workspace.assign(workers * stride, 0.0F);
+    mixture.assign(workers * width, 0.0F);
+    std::vector<std::uint8_t> failed(workers, 0U);
+
+    const auto run_chunk = [&](std::size_t index) {
+        auto* scratch_base = workspace.data() + index * stride;
+        const auto gate = std::span<float>(scratch_base, inner);
+        const auto up = std::span<float>(scratch_base + inner, inner);
+        const auto activated = std::span<float>(scratch_base + inner * 2U, inner);
+        const auto expert_output =
+            std::span<float>(scratch_base + inner * 3U, latent_width);
+        auto* accumulator = mixture.data() + index * width;
+        const auto begin = index * chunk;
+        const auto end = std::min(begin + chunk, slots);
+        for (std::size_t slot = begin; slot < end; ++slot) {
+            const auto& modules = resolved[slot];
+            const auto expert = wanted[slot];
+            for (std::size_t token = 0U; token < rows; ++token) {
+                float weight = 0.0F;
+                for (std::size_t entry = 0U; entry < top_k; ++entry) {
+                    const auto& candidate = selection[token * top_k + entry];
+                    if (candidate.expert == expert) {
+                        weight = candidate.weight;
+                        break;
+                    }
+                }
+                if (weight == 0.0F) continue;
+                const auto source = std::span<const float>(latent).subspan(
+                    token * latent_width, latent_width);
+                // No pool: a nested parallel region would put back the barrier
+                // this grain exists to remove. The matvecs run on whichever
+                // worker owns the expert.
+                if (!kimi_mxfp4_matvec(gate, source, modules.gate).ok() ||
+                    !kimi_mxfp4_matvec(up, source, modules.up).ok() ||
+                    !kimi_situ_glu(activated, gate, up, kContract.situ_gate_beta,
+                                   kContract.situ_linear_beta)
+                         .ok() ||
+                    !kimi_mxfp4_matvec(expert_output, activated, modules.down)
+                         .ok()) {
+                    failed[index] = 1U;
+                    return;
+                }
+                auto* destination = accumulator + token * latent_width;
+                for (std::size_t position = 0U; position < latent_width;
+                     ++position) {
+                    destination[position] += weight * expert_output[position];
+                }
             }
-            if (weight == 0.0F) continue;
-            const auto source = std::span<const float>(latent).subspan(
-                token * latent_width, latent_width);
-            result = kimi_mxfp4_matvec(gate, source, modules.gate, pool);
-            if (!result.ok()) return result;
-            result = kimi_mxfp4_matvec(up, source, modules.up, pool);
-            if (!result.ok()) return result;
-            result = kimi_situ_glu(activated, gate, up, kContract.situ_gate_beta,
-                                   kContract.situ_linear_beta);
-            if (!result.ok()) return result;
-            result = kimi_mxfp4_matvec(expert_output, activated, modules.down, pool);
-            if (!result.ok()) return result;
-            auto* destination = mixed.data() + token * latent_width;
-            for (std::size_t index = 0U; index < latent_width; ++index) {
-                destination[index] += weight * expert_output[index];
-            }
+        }
+    };
+
+    if (workers > 1U) {
+        (void)pool->parallel_for(workers, run_chunk);
+    } else {
+        run_chunk(0U);
+    }
+
+    if (std::find(failed.begin(), failed.end(), 1U) != failed.end()) {
+        result.errors.emplace_back(
+            "a routed expert failed to evaluate in the LatentMoE block");
+        return result;
+    }
+
+    // Reduced in worker order, so the sum does not depend on the order the
+    // pool happened to finish them in.
+    for (std::size_t index = 0U; index < workers; ++index) {
+        const auto* source = mixture.data() + index * width;
+        for (std::size_t position = 0U; position < width; ++position) {
+            mixed[position] += source[position];
         }
     }
 

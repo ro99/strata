@@ -208,6 +208,15 @@ struct KimiLayerScratch {
     std::vector<float> expert_out;
     std::vector<float> router_logits;
     std::vector<KimiRoutedExpert> selection;
+    // One gate/up/activated/output block per worker, so the experts a worker
+    // owns do not share scratch with any other worker's.
+    std::vector<float> worker_workspace;
+    // One `[tokens, routed_expert_hidden]` accumulator per worker. Routed
+    // experts are summed into the same latent mixture, so each worker
+    // accumulates its own share and the shares are reduced in worker order
+    // afterwards -- which keeps the result independent of how the pool
+    // happened to schedule them.
+    std::vector<float> worker_mixture;
 };
 
 // Kimi Delta Attention over `tokens` positions starting at `position`.

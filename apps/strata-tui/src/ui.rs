@@ -162,7 +162,7 @@ fn render_setup(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "Tab navigate  ·  Ctrl+Enter launch",
+                "Tab/↑↓ navigate  ·  Ctrl+Enter launch",
                 theme::muted(),
             )),
         ]
@@ -173,7 +173,7 @@ fn render_setup(frame: &mut Frame, area: Rect, app: &App) {
                 theme::muted(),
             )),
             Line::from(Span::styled(
-                "Tab navigate  ·  ←/→ choose  ·  Space toggle  ·  Ctrl+Enter launch",
+                "Tab/↑↓ navigate  ·  ←/→ choose  ·  Space toggle  ·  Enter/Ctrl+Enter launch",
                 theme::muted(),
             )),
         ]

@@ -1,4 +1,4 @@
-use crate::config::{Cli, ModelType, RunConfig, ValidatedConfig};
+use crate::config::{Cli, LastModelPaths, ModelType, RunConfig, ValidatedConfig};
 use crate::process::{ProcessEvent, RuntimeProcess};
 use crate::protocol::Envelope;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -167,10 +167,15 @@ pub struct App {
     prompt_history: VecDeque<String>,
     history_position: Option<usize>,
     draft_input: String,
+    last_paths: LastModelPaths,
 }
 
 impl App {
     pub fn new(cli: Cli) -> Self {
+        Self::build(cli, LastModelPaths::load())
+    }
+
+    fn build(cli: Cli, last_paths: LastModelPaths) -> Self {
         let mut app = Self {
             screen: Screen::Setup,
             phase: RuntimePhase::Offline,
@@ -196,7 +201,17 @@ impl App {
             prompt_history: VecDeque::new(),
             history_position: None,
             draft_input: String::new(),
+            last_paths,
         };
+        // Restore the last folder used for this architecture unless the
+        // operator asked for a specific checkpoint on the command line.
+        if !cli.supplied_model
+            && app.setup.model_path.trim().is_empty()
+            && let Some(remembered) = app.last_paths.get(app.setup.model_type)
+        {
+            app.setup.model_path = remembered.to_string();
+            app.setup_cursor = app.setup.model_path.len();
+        }
         if cli.launch_immediately {
             app.launch();
         }
@@ -205,10 +220,14 @@ impl App {
 
     #[cfg(test)]
     pub fn for_test() -> Self {
-        Self::new(Cli {
-            config: RunConfig::default(),
-            launch_immediately: false,
-        })
+        Self::build(
+            Cli {
+                config: RunConfig::default(),
+                launch_immediately: false,
+                supplied_model: false,
+            },
+            LastModelPaths::default(),
+        )
     }
 
     pub fn launch(&mut self) {
@@ -221,6 +240,11 @@ impl App {
         };
         match RuntimeProcess::spawn(&config) {
             Ok(process) => {
+                // Persist only a successful launch; a folder that never loaded
+                // is not the "last used" folder for this architecture.
+                self.last_paths
+                    .set(self.setup.model_type, &self.setup.model_path);
+                self.last_paths.save();
                 self.process = Some(process);
                 self.config = Some(config);
                 self.screen = Screen::Session;
@@ -416,14 +440,18 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Tab | KeyCode::Down | KeyCode::Enter => {
+            // Tab and the arrow keys only move focus. The launch row is the
+            // last field, so stepping onto it from below must wrap around
+            // instead of starting the runtime.
+            KeyCode::Tab | KeyCode::Down => self.move_setup(1),
+            KeyCode::BackTab | KeyCode::Up => self.move_setup(-1),
+            KeyCode::Enter => {
                 if self.current_setup_field() == SetupField::Launch {
                     self.launch();
                 } else {
                     self.move_setup(1);
                 }
             }
-            KeyCode::BackTab | KeyCode::Up => self.move_setup(-1),
             KeyCode::Left | KeyCode::Right
                 if self.current_setup_field() == SetupField::ModelType =>
             {
@@ -662,6 +690,13 @@ impl App {
 
     fn toggle_model(&mut self) {
         self.setup.model_type = self.setup.model_type.toggled();
+        // The architecture usually maps to a single checkpoint folder. Restore
+        // the last one used for the newly chosen model so the operator does
+        // not have to retype a path they already gave in a prior session.
+        if let Some(remembered) = self.last_paths.get(self.setup.model_type) {
+            self.setup.model_path = remembered.to_string();
+            self.setup_cursor = remembered.len();
+        }
         let limit = self.setup.model_type.context_limit();
         if self
             .setup
@@ -951,5 +986,59 @@ mod tests {
             completed_history(&messages),
             [("user", "one"), ("assistant", "two")]
         );
+    }
+
+    #[test]
+    fn down_arrow_navigates_without_starting_the_runtime() {
+        let mut app = App::for_test();
+        app.screen = Screen::Setup;
+        app.setup_field = SetupField::ALL.len() - 1;
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.screen, Screen::Setup, "down arrow must not launch");
+        assert_eq!(
+            app.setup_field, 0,
+            "down from the launch row wraps to the top field"
+        );
+        assert!(app.notice.is_none(), "down arrow must not set a notice");
+    }
+
+    #[test]
+    fn picking_a_model_restores_its_last_used_folder() {
+        let mut remembered = LastModelPaths::default();
+        remembered.set(ModelType::DeepSeek, "models/dsv4f");
+        let mut app = App::build(
+            Cli {
+                config: RunConfig {
+                    model_type: ModelType::Glm,
+                    ..RunConfig::default()
+                },
+                launch_immediately: false,
+                supplied_model: false,
+            },
+            remembered,
+        );
+        assert_eq!(app.setup.model_type, ModelType::Glm);
+        app.toggle_model();
+        assert_eq!(app.setup.model_type, ModelType::DeepSeek);
+        assert_eq!(app.setup.model_path, "models/dsv4f");
+    }
+
+    #[test]
+    fn explicit_cli_model_wins_over_remembered_folder() {
+        let mut last_paths = LastModelPaths::default();
+        last_paths.set(ModelType::Glm, "remembered/glm");
+        let app = App::build(
+            Cli {
+                config: RunConfig {
+                    model_type: ModelType::Glm,
+                    model_path: "typed/glm".into(),
+                    ..RunConfig::default()
+                },
+                launch_immediately: false,
+                supplied_model: true,
+            },
+            last_paths,
+        );
+        assert_eq!(app.setup.model_path, "typed/glm");
     }
 }

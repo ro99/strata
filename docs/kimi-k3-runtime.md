@@ -74,16 +74,17 @@ than warning, when it finds a vector open. It closes core dumps (`RLIMIT_CORE`
 0), points scratch at tmpfs, disables the CUDA JIT cache, checks that the arena
 can be locked, and checks that swap is not on a protected disk.
 
-**One operator action is outstanding.** `/swapfile` is active on `nvme0n1`, so
-the guard refuses to initialize the runtime: a 106 GiB unlockable dense spine can
-be paged out to it. Clearing it is
+The swap path is closed by `mlockall(MCL_CURRENT | MCL_FUTURE)`, not by asking
+the operator to change their system: a locked page cannot be written to swap by
+definition, and `MCL_FUTURE` covers the spine and the arena, neither of which
+exists at guard time. It needs `RLIMIT_MEMLOCK` to cover the resident set
+(`ulimit -l unlimited`), not root. Verified on the target with a swapfile still
+active on `nvme0n1`: 235.7 GiB resident, `VmLck` covering it, `VmSwap` zero.
 
-```bash
-sudo swapoff /swapfile         # and remove the line from /etc/fstab
-```
-
-The runtime cannot do this itself and does not work around it. Gates 5 and 6 are
-blocked on it.
+Two things the operator should know. Locking this much creates memory pressure
+that pushes *other* processes toward swap — that is not a model byte reaching
+the disk, but it is a real effect. And if the lock fails, the guard falls back
+to refusing while swap sits on a protected disk, naming the lock failure first.
 
 Verification is measured, not asserted: `/sys/block/<disk>/stat` **field 7** is
 cumulative sectors written (field 10 is `io_ticks` — that numbering belongs to
@@ -99,8 +100,8 @@ so the ≈0.1 KiB/s figure an earlier handover recorded would fail every run.
 | 2 | MXFP4 codec against `compressed-tensors` on real expert tensors | **green** |
 | 3 | Exact operations from real tensors; chunkwise KDA ≡ the token recurrence | **green** |
 | 4 | KDA, gated MLA, and the LatentMoE block against `modeling_kimi_linear.py` | **green** |
-| 5 | Full-model teacher forcing, every layer | **blocked** — fixture emitted, runtime refuses to start while swap is on the NVMe |
-| 6 | Greedy generation against the reference's own continuation | **blocked**, same cause |
+| 5 | Full-model teacher forcing, every layer | **FAILED** — see below |
+| 6 | Greedy generation against the reference's own continuation | **FAILED on the second token**; the first is exact |
 | 7 | Tokenizer and XTML chat rendering against the checkpoint's tokenizer | **green** |
 
 Gate 4, measured (tolerance stated before the run: ≈5e-3 predicted from six BF16
@@ -117,6 +118,29 @@ LatentMoE block      relative L2 0.0045   cosine 0.99999
 
 Gate 7, measured: 33/33 tokenizer cases encode *and* decode exactly, 4/4 XTML
 conversations render and tokenize exactly. No tolerance — ids are exact or wrong.
+
+Gate 5 and 6, measured — **negative**:
+
+```
+prompt layer 0    relative L2 0.0046
+prompt layer 65   relative L2 0.176    <- worst
+prompt logits     relative L2 0.134,   first greedy token 488 == reference   PASS
+decode layer 49   relative L2 0.477    <- worst
+decode logits     relative L2 0.088,   second greedy token 810 != 6534       FAIL
+83/93 prompt and 90/93 decode layers outside the predicted 2e-2 band
+```
+
+The prediction written before the run said per-layer error would be flat in
+depth, because the attention-residual stream is additive. It grows about 30x
+from layer 0 to layer 65 instead. That contradicts the shape the design
+predicts, so it is recorded as an open defect rather than as a tolerance to
+widen. The first greedy token being exact out of 163,840 says the graph is
+broadly right; decode being three times worse than prefill, with a wrong argmax,
+points at either router boundary flips under top-16-of-896 or at the
+93-layer composition that gate 4 could not see. The discriminating experiment —
+compare the runtime's selected expert ids against the reference's, which the
+oracle already knows — has not been run. **This model is not verified
+end-to-end.**
 
 ## Running it
 

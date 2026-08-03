@@ -42,6 +42,17 @@ struct CompressedTensorLayout {
 inline constexpr std::array<float, 8> kMxfp4Magnitudes{
     0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
 
+// The same sixteen values with the sign bit folded in, indexed by the whole
+// nibble. Every entry equals what negating `kMxfp4Magnitudes[bits 0..2]` on
+// bit 3 produces, so a decoder that indexes this table is bit-identical to one
+// that branches. What changes is that it does not branch: weight nibbles are
+// effectively random, so a predicate on the sign bit mispredicts about half the
+// time, and on a decode loop this small the misprediction costs more than the
+// arithmetic it guards.
+inline constexpr std::array<float, 16> kMxfp4Values{
+    0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F,  6.0F,
+    -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+
 // One E8M0 byte to its power-of-two scale. The encoding is the float32
 // exponent field: `2^(bits - 127)`, with 0 meaning zero. This is a bit shift,
 // not an arithmetic conversion; keeping it exact is what makes the codec

@@ -113,17 +113,11 @@ ValidationResult kimi_mxfp4_matvec(std::span<float> output,
             float partial = 0.0F;
             for (std::size_t index = 0U; index < 16U; ++index) {
                 const auto byte = bytes[index];
-                // Low nibble first, sign in bit 3, magnitude in bits 0-2.
-                const auto low = static_cast<std::uint8_t>(byte & 0x0FU);
-                const auto high = static_cast<std::uint8_t>(byte >> 4U);
-                const auto low_value =
-                    (low & 0x08U) != 0U ? -kMxfp4Magnitudes[low & 0x07U]
-                                        : kMxfp4Magnitudes[low & 0x07U];
-                const auto high_value =
-                    (high & 0x08U) != 0U ? -kMxfp4Magnitudes[high & 0x07U]
-                                         : kMxfp4Magnitudes[high & 0x07U];
-                partial += source[index * 2U] * low_value +
-                           source[index * 2U + 1U] * high_value;
+                // Low nibble first. The sign is bit 3, and `kMxfp4Values` has
+                // it folded in, so this indexes once instead of branching on
+                // it. Same values, same order, same result.
+                partial += source[index * 2U] * kMxfp4Values[byte & 0x0FU] +
+                           source[index * 2U + 1U] * kMxfp4Values[byte >> 4U];
             }
             // One multiply per group rather than per element: the scale is
             // shared across all 32 and factors out of the partial sum.

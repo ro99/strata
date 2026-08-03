@@ -44,7 +44,7 @@ constexpr auto& kContract = strata::kKimiK3ExecutionContract;
 
 struct Options {
     std::vector<std::size_t> worker_counts;
-    std::uint32_t repetitions = 5U;
+    std::uint32_t repetitions = 15U;
     std::uint64_t pool_bytes = 4ULL << 30U;  // past any cache, so reads are cold
     std::uint64_t seed = 20260803U;
     double target_seconds = 5.0;  // 0.2 tok/s
@@ -82,18 +82,27 @@ std::vector<std::size_t> parse_list(const std::string& text) {
 // comparable to the difference under test has not measured anything.
 struct Stats {
     double median{};
-    double low{};
-    double high{};
+    double lower{};
+    double upper{};
 
+    // Quartile ratio rather than min/max. The cost here is heavy-tailed: a
+    // sample is dozens of barriers and one descheduled thread poisons the whole
+    // sample, so the extremes describe the worst scheduling accident rather
+    // than the work. The quartiles describe the work.
     [[nodiscard]] double spread() const noexcept {
-        return low > 0.0 ? high / low : 0.0;
+        return lower > 0.0 ? upper / lower : 0.0;
     }
 };
 
 Stats summarize(std::vector<double> samples) {
     if (samples.empty()) return {};
     std::sort(samples.begin(), samples.end());
-    return {samples[samples.size() / 2U], samples.front(), samples.back()};
+    const auto at = [&samples](double quantile) {
+        const auto index = static_cast<std::size_t>(
+            quantile * static_cast<double>(samples.size() - 1U) + 0.5);
+        return samples[std::min(index, samples.size() - 1U)];
+    };
+    return {at(0.5), at(0.25), at(0.75)};
 }
 
 // One MXFP4 module of `rows x columns`, laid out exactly as the arena holds it:
@@ -244,6 +253,29 @@ int main(int argc, char** argv) {
     for (auto& value : source) value = values(engine);
     std::vector<float> gate(inner), up(inner), activated(inner), output(latent);
 
+    // Bring the machine to steady state before the first timed arm. Without
+    // this the first arm of a fresh process reads high -- 3.24 s/token against
+    // 1.78 for the same arm in a later run -- because the governor is still
+    // ramping from idle. The per-arm warm-up is far too short to cover it, and
+    // whichever arm happens to run first would otherwise be penalised, which is
+    // exactly the kind of ordering artefact that gets read as a result.
+    {
+        strata::HostWorkerPool warmup_pool(hardware_threads);
+        std::mt19937_64 warmup_selector(options.seed);
+        std::uniform_int_distribution<std::size_t> warmup_pick(0U, pool_count - 1U);
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < until) {
+            const auto& triple = pool[warmup_pick(warmup_selector)];
+            (void)strata::kimi_mxfp4_matvec(gate, source, triple.gate.view(),
+                                            &warmup_pool);
+            (void)strata::kimi_mxfp4_matvec(up, source, triple.up.view(),
+                                            &warmup_pool);
+            (void)strata::kimi_mxfp4_matvec(output, activated, triple.down.view(),
+                                            &warmup_pool);
+        }
+    }
+
     std::cout << "\n"
               << std::setw(9) << "workers" << std::setw(14) << "ms/expert"
               << std::setw(14) << "GiB/s" << std::setw(16) << "routed s/token"
@@ -278,7 +310,10 @@ int main(int argc, char** argv) {
         }
 
         std::vector<double> samples;
-        constexpr std::size_t kExpertsPerSample = 32U;
+        // A full MoE layer is sixteen experts. Timing four layers per sample
+        // keeps the unit the production one while giving the barrier tail
+        // enough draws to average out.
+        const std::size_t kExpertsPerSample = top_k * 4U;
         for (std::uint32_t repetition = 0U; repetition < options.repetitions;
              ++repetition) {
             const auto begin = std::chrono::steady_clock::now();

@@ -7,6 +7,7 @@
 #include "strata/types.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -14,6 +15,13 @@
 #include <vector>
 
 namespace strata {
+
+// Called after each decoder layer with the running attention-residual prefix —
+// the same `[tokens, hidden]` tensor `KimiDecoderLayer` returns. Full-model
+// teacher forcing needs it: one end-to-end comparison across 93 layers says
+// only whether the backbone agrees, not where it stopped agreeing.
+using KimiLayerObserver =
+    std::function<void(std::uint32_t layer, std::span<const float> hidden)>;
 
 struct KimiK3RuntimeConfig {
     std::uint32_t maximum_context_tokens{2048U};
@@ -41,6 +49,8 @@ struct KimiK3RuntimeConfig {
     bool load_progress{};
     // Optional pre-solved placement, borrowed for the duration of initialize.
     const PlacementPlan* placement{};
+    // Unset on the serving path; the teacher-forcing oracle binds it.
+    KimiLayerObserver layer_observer{};
 };
 
 struct KimiK3RunMetrics {

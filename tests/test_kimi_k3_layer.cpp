@@ -1,3 +1,4 @@
+#include "kimi_fixture.hpp"
 #include "test.hpp"
 
 #include "strata/kimi_k3_checkpoint.hpp"
@@ -5,14 +6,8 @@
 #include "strata/kimi_k3_layer.hpp"
 #include "strata/model_adapter.hpp"
 
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -40,110 +35,17 @@
 
 namespace {
 
+using kimi_test::Agreement;
+using kimi_test::compare;
+using kimi_test::Fixture;
+using kimi_test::kimi_directory;
+using kimi_test::kimi_present;
+
 constexpr float kRelativeL2Gate = 2.0e-2F;
 constexpr float kCosineGate = 0.999F;
 
-std::string kimi_directory() {
-    return (std::filesystem::path(STRATA_SOURCE_DIR) / "models/kimi-k3").string();
-}
-
-bool kimi_present() {
-    return std::filesystem::exists(
-        std::filesystem::path(kimi_directory()) / "model.safetensors.index.json");
-}
-
 std::string fixture_path() {
-    if (const auto* override_ = std::getenv("STRATA_KIMI_FIXTURE_DIR")) {
-        return (std::filesystem::path(override_) / "kimi-k3-layers.fixture").string();
-    }
-    // `results/` in the working tree is on the NVMe, and reference activations
-    // are derived from model weights, so the default lives on the SATA disk
-    // beside the checkpoint. See `docs/experiments/0048`.
-    return "/data/strata-results/kimi-k3-fixtures/kimi-k3-layers.fixture";
-}
-
-struct FixtureArray {
-    std::vector<std::uint64_t> shape;
-    std::vector<float> values;
-};
-
-// The flat format `scripts/kimi_k3_reference_fixture.py` writes: a magic, a
-// version, then one length-prefixed name, shape, and F32 payload per array.
-class Fixture {
-public:
-    [[nodiscard]] bool load(const std::string& path) {
-        std::ifstream stream(path, std::ios::binary);
-        if (!stream) return false;
-        char magic[4] = {};
-        stream.read(magic, 4);
-        if (std::memcmp(magic, "KMFX", 4) != 0) return false;
-        std::uint32_t version = 0U;
-        std::uint32_t count = 0U;
-        read_raw(stream, version);
-        read_raw(stream, count);
-        if (version != 1U) return false;
-        for (std::uint32_t index = 0U; index < count; ++index) {
-            std::uint32_t name_length = 0U;
-            read_raw(stream, name_length);
-            std::string name(name_length, '\0');
-            stream.read(name.data(), name_length);
-            std::uint32_t rank = 0U;
-            read_raw(stream, rank);
-            FixtureArray array;
-            array.shape.resize(rank);
-            for (std::uint32_t axis = 0U; axis < rank; ++axis) {
-                read_raw(stream, array.shape[axis]);
-            }
-            std::uint64_t elements = 0U;
-            read_raw(stream, elements);
-            array.values.resize(elements);
-            stream.read(reinterpret_cast<char*>(array.values.data()),
-                        static_cast<std::streamsize>(elements * sizeof(float)));
-            if (!stream) return false;
-            arrays_.emplace(std::move(name), std::move(array));
-        }
-        return true;
-    }
-
-    [[nodiscard]] const FixtureArray* find(const std::string& name) const {
-        const auto entry = arrays_.find(name);
-        return entry == arrays_.end() ? nullptr : &entry->second;
-    }
-
-private:
-    template <typename T>
-    static void read_raw(std::istream& stream, T& value) {
-        stream.read(reinterpret_cast<char*>(&value), sizeof(T));
-    }
-
-    std::map<std::string, FixtureArray> arrays_;
-};
-
-struct Agreement {
-    float relative_l2{};
-    float cosine{};
-};
-
-Agreement compare(std::span<const float> measured, std::span<const float> reference) {
-    double difference = 0.0;
-    double magnitude = 0.0;
-    double dot = 0.0;
-    double left = 0.0;
-    double right = 0.0;
-    for (std::size_t index = 0U; index < measured.size(); ++index) {
-        const double a = measured[index];
-        const double b = reference[index];
-        difference += (a - b) * (a - b);
-        magnitude += b * b;
-        dot += a * b;
-        left += a * a;
-        right += b * b;
-    }
-    Agreement agreement;
-    agreement.relative_l2 = static_cast<float>(std::sqrt(difference) /
-                                               (std::sqrt(magnitude) + 1.0e-30));
-    agreement.cosine = static_cast<float>(dot / (std::sqrt(left * right) + 1.0e-30));
-    return agreement;
+    return kimi_test::fixture_path("kimi-k3-layers.fixture");
 }
 
 // The measured agreement is printed, not only gated: a number inside the gate

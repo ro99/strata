@@ -436,6 +436,7 @@ ValidationResult KimiK3Runtime::Impl::forward(
         result = kimi_decoder_layer(stream, layers[layer], cache, *experts, layer,
                                     position, count, scratch, pool.get());
         if (!result.ok()) return result;
+        if (config.layer_observer) config.layer_observer(layer, stream.prefix());
         if (config.load_progress && (layer + 1U) % 16U == 0U) {
             std::cerr << "\r[kimi-k3] layer " << (layer + 1U) << '/'
                       << kContract.layer_count << std::flush;

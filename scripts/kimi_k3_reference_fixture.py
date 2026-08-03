@@ -28,6 +28,7 @@ import os
 import struct
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -119,14 +120,34 @@ def load_reference(model_directory: Path):
     return importlib.import_module(module_name)
 
 
+DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16,
+          "U8": torch.uint8, "I32": torch.int32, "I64": torch.int64}
+
+
+class Entry(NamedTuple):
+    shard: str
+    begin: int   # absolute byte offset in the shard file
+    end: int
+    dtype: str
+    shape: list[int]
+
+
 class ShardSet:
-    """Positional reads out of the sharded checkpoint, one tensor at a time."""
+    """Positional reads out of the sharded checkpoint.
+
+    File descriptors are cached and reads go through `os.pread`, so a caller can
+    issue several from a thread pool: `pread` drops the GIL, and this disk needs
+    queue depth to reach its rated throughput. One descriptor per shard, opened
+    once, also removes an open/close pair per tensor — the backbone oracle asks
+    for roughly four hundred tensors per layer.
+    """
 
     def __init__(self, model_directory: Path) -> None:
         self.directory = model_directory
         index = json.loads((model_directory / "model.safetensors.index.json").read_text())
         self.weight_map = index["weight_map"]
         self._headers: dict[str, dict] = {}
+        self._descriptors: dict[str, int] = {}
 
     def _header(self, shard: str) -> dict:
         cached = self._headers.get(shard)
@@ -139,19 +160,64 @@ class ShardSet:
         self._headers[shard] = header
         return header
 
-    def get(self, name: str) -> torch.Tensor:
+    def _descriptor(self, shard: str) -> int:
+        cached = self._descriptors.get(shard)
+        if cached is None:
+            cached = os.open(self.directory / shard, os.O_RDONLY)
+            self._descriptors[shard] = cached
+        return cached
+
+    def entry(self, name: str) -> Entry:
         shard = self.weight_map[name]
         header = self._header(shard)
-        entry = header[name]
-        begin, end = entry["data_offsets"]
+        record = header[name]
         base = header["__data_offset__"]
-        with (self.directory / shard).open("rb") as handle:
-            handle.seek(base + begin)
-            raw = handle.read(end - begin)
-        dtype = {"BF16": torch.bfloat16, "F32": torch.float32,
-                 "F16": torch.float16, "U8": torch.uint8,
-                 "I32": torch.int32, "I64": torch.int64}[entry["dtype"]]
-        return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(entry["shape"])
+        begin, end = record["data_offsets"]
+        return Entry(shard, base + begin, base + end, record["dtype"],
+                     record["shape"])
+
+    def span(self, shard: str, begin: int, end: int) -> bytearray:
+        """One read of a byte range. Safe to call from several threads."""
+        buffer = bytearray(end - begin)
+        view = memoryview(buffer)
+        offset = 0
+        descriptor = self._descriptor(shard)
+        while offset < len(buffer):
+            chunk = os.preadv(descriptor, [view[offset:]], begin + offset)
+            if chunk == 0:
+                raise RuntimeError(f"{shard}: short read at {begin + offset}")
+            offset += chunk
+        return buffer
+
+    def get(self, name: str) -> torch.Tensor:
+        record = self.entry(name)
+        raw = self.span(record.shard, record.begin, record.end)
+        return torch.frombuffer(raw, dtype=DTYPES[record.dtype]).reshape(record.shape)
+
+    def coalesced(self, names: list[str]) -> dict[str, torch.Tensor]:
+        """Read several tensors in one `pread` when they are contiguous.
+
+        An expert's six tensors occupy one unbroken 17,547,264-byte run, so this
+        turns six reads into one. Contiguity is checked rather than assumed: if
+        the layout ever changes, the fallback is correct and merely slow, which
+        is the right way round.
+        """
+        entries = [self.entry(name) for name in names]
+        shard = entries[0].shard
+        begin = min(record.begin for record in entries)
+        end = max(record.end for record in entries)
+        contiguous = (all(record.shard == shard for record in entries) and
+                      end - begin == sum(record.end - record.begin
+                                         for record in entries))
+        if not contiguous:
+            return {name: self.get(name) for name in names}
+        blob = memoryview(self.span(shard, begin, end))
+        tensors = {}
+        for name, record in zip(names, entries):
+            piece = blob[record.begin - begin:record.end - begin]
+            tensors[name] = torch.frombuffer(
+                piece, dtype=DTYPES[record.dtype]).reshape(record.shape)
+        return tensors
 
 
 def narrow_padded(name: str, tensor: torch.Tensor,

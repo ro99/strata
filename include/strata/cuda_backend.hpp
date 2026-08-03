@@ -57,6 +57,12 @@ struct CudaBackendStats {
         std::uint64_t synchronization_calls{};
         std::uint64_t synchronization_nanoseconds{};
         std::uint64_t upload_wait_nanoseconds{};
+        // upload() partitioned. A pageable source makes cudaMemcpyAsync
+        // synchronous inside the call, so its cost lands in
+        // weight_copy_nanoseconds and not in upload_wait_nanoseconds; reading
+        // only the wait counter reports an impossible H2D rate.
+        std::uint64_t weight_allocation_nanoseconds{};
+        std::uint64_t weight_copy_nanoseconds{};
         std::uint64_t activation_h2d_nanoseconds{};
         std::uint64_t kernel_nanoseconds{};
         std::uint64_t activation_d2h_nanoseconds{};
@@ -108,6 +114,8 @@ struct CudaBackendStats {
     std::uint64_t synchronization_calls{};
     std::uint64_t synchronization_nanoseconds{};
     std::uint64_t upload_wait_nanoseconds{};
+    std::uint64_t weight_allocation_nanoseconds{};
+    std::uint64_t weight_copy_nanoseconds{};
     std::uint64_t activation_h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
     std::uint64_t activation_d2h_nanoseconds{};

@@ -126,6 +126,9 @@ struct ExpertJob {
     std::vector<float> weights;
     std::vector<float> output;
     std::vector<std::string> errors;
+    std::uint64_t gather_nanoseconds{};
+    std::uint64_t expert_nanoseconds{};
+    std::uint64_t cache_nanoseconds{};
 };
 
 CheckpointReadStats checkpoint_delta(const CheckpointReadStats& after,
@@ -155,6 +158,12 @@ LagunaCacheStats cache_delta(const LagunaCacheStats& after,
     result.device_misses = counter_delta(after.device_misses, before.device_misses);
     result.device_evictions =
         counter_delta(after.device_evictions, before.device_evictions);
+    result.device_lock_nanoseconds =
+        counter_delta(after.device_lock_nanoseconds, before.device_lock_nanoseconds);
+    result.device_stage_nanoseconds =
+        counter_delta(after.device_stage_nanoseconds, before.device_stage_nanoseconds);
+    result.device_matmul_nanoseconds =
+        counter_delta(after.device_matmul_nanoseconds, before.device_matmul_nanoseconds);
     return result;
 }
 
@@ -169,6 +178,17 @@ LagunaGraphStats graph_delta(const LagunaGraphStats& after,
         after.moe_routed_nanoseconds - before.moe_routed_nanoseconds,
         after.moe_shared_nanoseconds - before.moe_shared_nanoseconds,
         after.output_head_nanoseconds - before.output_head_nanoseconds,
+        after.attention_projection_nanoseconds -
+            before.attention_projection_nanoseconds,
+        after.attention_rope_nanoseconds - before.attention_rope_nanoseconds,
+        after.attention_kv_stage_nanoseconds -
+            before.attention_kv_stage_nanoseconds,
+        after.attention_flash_nanoseconds - before.attention_flash_nanoseconds,
+        after.attention_output_nanoseconds - before.attention_output_nanoseconds,
+        after.moe_gather_nanoseconds - before.moe_gather_nanoseconds,
+        after.moe_expert_nanoseconds - before.moe_expert_nanoseconds,
+        after.moe_expert_cache_nanoseconds - before.moe_expert_cache_nanoseconds,
+        after.moe_accumulate_nanoseconds - before.moe_accumulate_nanoseconds,
     };
 }
 
@@ -192,6 +212,9 @@ class ExpertCache {
         std::uint64_t hits{};
         std::uint64_t misses{};
         std::uint64_t evictions{};
+        std::uint64_t stage_nanoseconds{};
+        std::uint64_t matmul_nanoseconds{};
+        std::uint64_t lock_nanoseconds{};
     };
 
 public:
@@ -217,11 +240,19 @@ public:
             return result;
         }
         auto& state = *states_[device_slot];
+        const auto lock_started = std::chrono::steady_clock::now();
         std::scoped_lock lock(state.mutex);
+        const auto lock_nanoseconds = elapsed_nanoseconds(lock_started);
+        state.lock_nanoseconds += lock_nanoseconds;
         Entry* entry = nullptr;
+        const auto stage_started = std::chrono::steady_clock::now();
         result = ensure_locked(state, device_slot, key, module, entry);
+        state.stage_nanoseconds += elapsed_nanoseconds(stage_started);
         if (!result.ok()) return result;
-        return backend_.matmul(entry->weight, input, rows, output);
+        const auto matmul_started = std::chrono::steady_clock::now();
+        result = backend_.matmul(entry->weight, input, rows, output);
+        state.matmul_nanoseconds += elapsed_nanoseconds(matmul_started);
+        return result;
     }
 
     [[nodiscard]] LagunaCacheStats stats(
@@ -242,11 +273,34 @@ public:
             result.device_hits.push_back(state.hits);
             result.device_misses.push_back(state.misses);
             result.device_evictions.push_back(state.evictions);
+            result.device_lock_nanoseconds.push_back(state.lock_nanoseconds);
+            result.device_stage_nanoseconds.push_back(state.stage_nanoseconds);
+            result.device_matmul_nanoseconds.push_back(state.matmul_nanoseconds);
         }
         return result;
     }
 
 private:
+    // Drops the least recently used unleased entry. Returns false when nothing
+    // is evictable, which is the only condition that can fail a lookup.
+    bool evict_one_locked(State& state) {
+        auto victim = state.entries.end();
+        for (auto candidate = state.entries.begin();
+             candidate != state.entries.end(); ++candidate) {
+            if (candidate->second.leases != 0U) continue;
+            if (victim == state.entries.end() ||
+                candidate->second.last_use < victim->second.last_use) {
+                victim = candidate;
+            }
+        }
+        if (victim == state.entries.end()) return false;
+        state.used -= victim->second.weight.device_bytes();
+        state.entries.erase(victim);
+        ++state.evictions;
+        evictions_.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+
     ValidationResult ensure_locked(State& state, std::size_t device_slot,
                                    std::uint64_t key,
                                    const LagunaLinear& module, Entry*& output) {
@@ -272,30 +326,28 @@ private:
             return result;
         }
         while (state.used + needed > state.capacity) {
-            auto victim = state.entries.end();
-            for (auto candidate = state.entries.begin();
-                 candidate != state.entries.end(); ++candidate) {
-                if (candidate->second.leases != 0U) continue;
-                if (victim == state.entries.end() ||
-                    candidate->second.last_use < victim->second.last_use) {
-                    victim = candidate;
-                }
-            }
-            if (victim == state.entries.end()) {
+            if (!evict_one_locked(state)) {
                 result.errors.emplace_back(
                     "in-flight routed experts exceed VRAM cache capacity on device " +
                     std::to_string(devices_[device_slot]));
                 return result;
             }
-            state.used -= victim->second.weight.device_bytes();
-            state.entries.erase(victim);
-            ++state.evictions;
-            evictions_.fetch_add(1U, std::memory_order_relaxed);
         }
+        // Logical capacity accounting is not sufficient on its own: the arena
+        // is a free list and routed experts come in two sizes (1.69 MiB NVFP4
+        // and 18.87 MiB plain BF16), so a request can fail against a fragmented
+        // arena that still has enough total free bytes. Evict the next LRU
+        // victim and retry rather than failing the token. This changes only
+        // which weights are resident, never the arithmetic.
         Entry entry;
-        auto loaded = load_laguna_cuda_linear(
-            checkpoint_, module, devices_[device_slot], backend_, entry.weight);
-        if (!loaded.ok()) return loaded;
+        ValidationResult loaded;
+        for (;;) {
+            loaded = load_laguna_cuda_linear(
+                checkpoint_, module, devices_[device_slot], backend_,
+                entry.weight);
+            if (loaded.ok()) break;
+            if (!evict_one_locked(state)) return loaded;
+        }
         entry.last_use = state.clock;
         state.used += entry.weight.device_bytes();
         state.peak = std::max(state.peak, state.used);
@@ -589,6 +641,7 @@ struct LagunaRuntime::Impl {
         std::vector<float> new_keys(static_cast<std::size_t>(rows) * kKvColumns);
         std::vector<float> new_values(new_keys.size());
         std::vector<float> gates(static_cast<std::size_t>(rows) * heads);
+        auto stage_started = std::chrono::steady_clock::now();
         result = spine_matmul(weights.query, input, rows, queries);
         if (!result.ok()) return result;
         result = spine_matmul(weights.key, input, rows, new_keys);
@@ -597,6 +650,9 @@ struct LagunaRuntime::Impl {
         if (!result.ok()) return result;
         result = spine_matmul(weights.output_gate, input, rows, gates);
         if (!result.ok()) return result;
+        graph_stats.attention_projection_nanoseconds +=
+            elapsed_nanoseconds(stage_started);
+        stage_started = std::chrono::steady_clock::now();
 
         // QK RMSNorm runs per head before RoPE; values are not normalized.
         for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -621,6 +677,10 @@ struct LagunaRuntime::Impl {
                 if (!result.ok()) return result;
             }
         }
+
+        graph_stats.attention_rope_nanoseconds +=
+            elapsed_nanoseconds(stage_started);
+        stage_started = std::chrono::steady_clock::now();
 
         const auto cached_rows = cache.keys.size() / kKvColumns;
         if (cache.values.size() != cache.keys.size() ||
@@ -674,10 +734,16 @@ struct LagunaRuntime::Impl {
             request.query_key_mask = mask;
         }
         std::vector<float> context(static_cast<std::size_t>(rows) * query_columns);
+        graph_stats.attention_kv_stage_nanoseconds +=
+            elapsed_nanoseconds(stage_started);
+        stage_started = std::chrono::steady_clock::now();
         result = config.enable_flash_attention
             ? cuda.flash_attention(devices[weights.device], request, context)
             : flash_attention_reference_f32(request, context);
+        graph_stats.attention_flash_nanoseconds +=
+            elapsed_nanoseconds(stage_started);
         if (!result.ok()) return result;
+        stage_started = std::chrono::steady_clock::now();
 
         // Laguna gates the attention output before o_proj: one softplus gate
         // per head, broadcast across head_dim.
@@ -708,6 +774,8 @@ struct LagunaRuntime::Impl {
                 cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
             cache.start += static_cast<std::uint32_t>(drop_rows);
         }
+        graph_stats.attention_output_nanoseconds +=
+            elapsed_nanoseconds(stage_started);
         return result;
     }
 
@@ -734,10 +802,15 @@ struct LagunaRuntime::Impl {
     ValidationResult run_expert(std::uint32_t layer, const ExpertModules& modules,
                                 std::uint32_t expert,
                                 std::span<const float> input, std::uint32_t rows,
-                                std::span<float> output) {
+                                std::span<float> output,
+                                std::uint64_t& cache_nanoseconds) {
         ValidationResult result;
+        const auto allocation_started = std::chrono::steady_clock::now();
         std::vector<float> gate(static_cast<std::size_t>(rows) * kExpertIntermediate);
         std::vector<float> up(gate.size());
+        const auto allocation_nanoseconds =
+            elapsed_nanoseconds(allocation_started);
+        const auto cache_started = std::chrono::steady_clock::now();
         result = experts->matmul(modules.device, expert_key(layer, expert, 0U),
                                  modules.gate, input, rows, gate);
         if (!result.ok()) return result;
@@ -747,8 +820,11 @@ struct LagunaRuntime::Impl {
         for (std::size_t index = 0U; index < gate.size(); ++index) {
             gate[index] = silu_f32(gate[index]) * up[index];
         }
-        return experts->matmul(modules.device, expert_key(layer, expert, 2U),
-                               modules.down, gate, rows, output);
+        result = experts->matmul(modules.device, expert_key(layer, expert, 2U),
+                                 modules.down, gate, rows, output);
+        cache_nanoseconds +=
+            elapsed_nanoseconds(cache_started) + allocation_nanoseconds;
+        return result;
     }
 
     bool write_route(std::uint32_t position, std::uint32_t layer,
@@ -822,6 +898,7 @@ struct LagunaRuntime::Impl {
             for (auto& job : jobs) {
                 if (job.device != slot) continue;
                 const auto job_rows = static_cast<std::uint32_t>(job.rows.size());
+                const auto gather_started = std::chrono::steady_clock::now();
                 std::vector<float> gathered(
                     static_cast<std::size_t>(job_rows) * kHidden);
                 for (std::size_t row = 0U; row < job.rows.size(); ++row) {
@@ -832,9 +909,12 @@ struct LagunaRuntime::Impl {
                                   static_cast<std::ptrdiff_t>(row * kHidden));
                 }
                 job.output.assign(gathered.size(), 0.0F);
+                job.gather_nanoseconds += elapsed_nanoseconds(gather_started);
+                const auto expert_started = std::chrono::steady_clock::now();
                 auto status = run_expert(layer, weights.experts[job.expert],
                                          job.expert, gathered, job_rows,
-                                         job.output);
+                                         job.output, job.cache_nanoseconds);
+                job.expert_nanoseconds += elapsed_nanoseconds(expert_started);
                 if (!status.ok()) {
                     move_errors(device_errors[slot], std::move(status));
                     return;
@@ -849,7 +929,24 @@ struct LagunaRuntime::Impl {
                                  std::make_move_iterator(errors.end()));
         }
         if (!result.ok()) return result;
+        // Per-device work runs concurrently, so the wall cost of a sub-phase is
+        // the slowest device's share of it, not the sum across devices.
+        std::vector<std::uint64_t> device_gather(devices.size());
+        std::vector<std::uint64_t> device_expert(devices.size());
+        std::vector<std::uint64_t> device_cache(devices.size());
+        for (const auto& job : jobs) {
+            device_gather[job.device] += job.gather_nanoseconds;
+            device_expert[job.device] += job.expert_nanoseconds;
+            device_cache[job.device] += job.cache_nanoseconds;
+        }
+        graph_stats.moe_expert_cache_nanoseconds +=
+            *std::max_element(device_cache.begin(), device_cache.end());
+        graph_stats.moe_gather_nanoseconds +=
+            *std::max_element(device_gather.begin(), device_gather.end());
+        graph_stats.moe_expert_nanoseconds +=
+            *std::max_element(device_expert.begin(), device_expert.end());
 
+        const auto accumulate_started = std::chrono::steady_clock::now();
         std::fill(output.begin(), output.end(), 0.0F);
         for (const auto& job : jobs) {
             for (std::size_t local = 0U; local < job.rows.size(); ++local) {
@@ -864,6 +961,8 @@ struct LagunaRuntime::Impl {
         // The reference scales the summed routed output, not the individual
         // routing weights, and only the routed branch is scaled.
         for (auto& value : output) value *= kContract.routed_scale;
+        graph_stats.moe_accumulate_nanoseconds +=
+            elapsed_nanoseconds(accumulate_started);
 
         const auto shared_started = std::chrono::steady_clock::now();
         std::vector<float> shared(output.size());
@@ -1032,7 +1131,7 @@ ValidationResult LagunaRuntime::initialize(const std::string& model_directory,
         result.errors = std::move(tokenizer.errors);
         return result;
     }
-    result = impl_->cuda.initialize(config.devices);
+    result = impl_->cuda.initialize(config.devices, config.detailed_cuda_timing);
     if (!result.ok()) return result;
     if (config.enable_flash_attention) {
         for (const int device : config.devices) {
@@ -1066,11 +1165,26 @@ ValidationResult LagunaRuntime::initialize(const std::string& model_directory,
     impl_->device_workers =
         std::make_unique<HostWorkerPool>(config.devices.size());
 
+    // One arena per device covers the spine and the expert cache together.
+    // Routed experts are allocated and freed on every miss, so the per-weight
+    // cudaMalloc/cudaFree path costs measured driver time and fragments the
+    // device until an upload fails outright with "out of memory". The arena is
+    // a coalescing free list, so eviction still returns space.
+    auto capacities = device_plan.value.weight_capacities;
+    for (std::size_t slot = 0U; slot < config.devices.size(); ++slot) {
+        result = impl_->cuda.reserve_weight_arena(config.devices[slot],
+                                                  capacities[slot]);
+        if (!result.ok()) return result;
+        if (config.verbose || config.load_progress) {
+            std::cerr << "[hardware] cuda=" << config.devices[slot]
+                      << " weight_arena_bytes=" << capacities[slot] << '\n';
+        }
+    }
+
     // The resident spine is uploaded first; the expert cache then receives only
     // what each device has left, so a routed expert can never evict attention.
     result = impl_->warmup();
     if (!result.ok()) return result;
-    auto capacities = std::move(device_plan.value.weight_capacities);
     for (std::size_t slot = 0U; slot < capacities.size(); ++slot) {
         if (impl_->pinned_bytes[slot] >= capacities[slot]) {
             result.errors.emplace_back(

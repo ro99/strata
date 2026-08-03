@@ -26,6 +26,10 @@ struct LagunaRuntimeConfig {
     bool enable_flash_attention{true};
     bool enable_incremental_kv_continuation{true};
     bool enable_thinking{true};
+    // Records CUDA events around every activation upload, kernel, and download
+    // so the per-phase cost model can be instantiated. Off by default: it adds
+    // event records and elapsed-time queries to every matmul.
+    bool detailed_cuda_timing{};
     std::string route_trace_path;
     std::uint64_t request_id{};
 };
@@ -42,6 +46,12 @@ struct LagunaCacheStats {
     std::vector<std::uint64_t> device_hits;
     std::vector<std::uint64_t> device_misses;
     std::vector<std::uint64_t> device_evictions;
+    // Host wall time inside the cache, split into the miss path (checkpoint
+    // read plus device upload) and the matmul call itself, so a residual is
+    // attributed rather than inferred by subtraction.
+    std::vector<std::uint64_t> device_lock_nanoseconds;
+    std::vector<std::uint64_t> device_stage_nanoseconds;
+    std::vector<std::uint64_t> device_matmul_nanoseconds;
 };
 
 struct LagunaGraphStats {
@@ -53,6 +63,18 @@ struct LagunaGraphStats {
     std::uint64_t moe_routed_nanoseconds{};
     std::uint64_t moe_shared_nanoseconds{};
     std::uint64_t output_head_nanoseconds{};
+    // Sub-phases. The attention counters partition attention_nanoseconds and
+    // the MoE counters are contained in moe_routed_nanoseconds; they exist to
+    // separate transfer volume from serialization inside a phase.
+    std::uint64_t attention_projection_nanoseconds{};
+    std::uint64_t attention_rope_nanoseconds{};
+    std::uint64_t attention_kv_stage_nanoseconds{};
+    std::uint64_t attention_flash_nanoseconds{};
+    std::uint64_t attention_output_nanoseconds{};
+    std::uint64_t moe_gather_nanoseconds{};
+    std::uint64_t moe_expert_nanoseconds{};
+    std::uint64_t moe_expert_cache_nanoseconds{};
+    std::uint64_t moe_accumulate_nanoseconds{};
 };
 
 struct LagunaPhaseMetrics {

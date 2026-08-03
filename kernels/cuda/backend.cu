@@ -23,6 +23,13 @@ namespace strata {
 
 namespace {
 
+std::uint64_t elapsed_nanoseconds_since(
+    std::chrono::steady_clock::time_point started) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
 ValidationResult cuda_error(cudaError_t status, const char* operation) {
     ValidationResult result;
     if (status != cudaSuccess) {
@@ -2166,6 +2173,9 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     const auto payload_bytes = expected_weights + expected_scales;
     auto& state = found->second;
     std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_nanoseconds = 0U;
+    std::uint64_t copy_nanoseconds = 0U;
+    const auto allocation_started = std::chrono::steady_clock::now();
     if (state.weight_arena != nullptr) {
         target->bytes = weight_storage_bytes(expected_weights, expected_scales);
         WeightArena::Allocation allocation;
@@ -2193,6 +2203,7 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         ++allocation_calls;
     }
+    allocation_nanoseconds += elapsed_nanoseconds_since(allocation_started);
     // This stream is nonblocking with respect to the legacy default stream.
     // Keep uploads on the execution stream and finish them before the caller's
     // host payload is released or the cache publishes the weight.
@@ -2203,25 +2214,32 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         return cuda_error(status, operation);
     };
+    auto copy_started = std::chrono::steady_clock::now();
     if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
                                       cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
         return upload_error(status, "upload CUDA weights");
     }
+    copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     if (expected_scales != 0U) {
         if (state.weight_arena == nullptr) {
+            const auto scale_allocation_started = std::chrono::steady_clock::now();
             if (auto status = cudaMalloc(
                     &target->scales, static_cast<std::size_t>(expected_scales));
                 status != cudaSuccess) {
                 return cuda_error(status, "allocate CUDA scales");
             }
             ++allocation_calls;
+            allocation_nanoseconds +=
+                elapsed_nanoseconds_since(scale_allocation_started);
         }
+        copy_started = std::chrono::steady_clock::now();
         if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
                                           cudaMemcpyHostToDevice, state.stream);
             status != cudaSuccess) {
             return upload_error(status, "upload CUDA scales");
         }
+        copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     }
     const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
@@ -2244,6 +2262,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         ++device_stats.synchronization_calls;
         device_stats.synchronization_nanoseconds += wait_nanoseconds;
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
+        device_stats.weight_allocation_nanoseconds += allocation_nanoseconds;
+        device_stats.weight_copy_nanoseconds += copy_nanoseconds;
     }
     output.impl_ = std::move(target);
     return result;
@@ -5135,6 +5155,11 @@ CudaBackendStats CudaBackend::stats() const noexcept {
             result.synchronization_nanoseconds, device.synchronization_nanoseconds);
         result.upload_wait_nanoseconds = std::max(
             result.upload_wait_nanoseconds, device.upload_wait_nanoseconds);
+        result.weight_allocation_nanoseconds = std::max(
+            result.weight_allocation_nanoseconds,
+            device.weight_allocation_nanoseconds);
+        result.weight_copy_nanoseconds = std::max(
+            result.weight_copy_nanoseconds, device.weight_copy_nanoseconds);
         result.activation_h2d_nanoseconds = std::max(
             result.activation_h2d_nanoseconds, device.activation_h2d_nanoseconds);
         result.kernel_nanoseconds = std::max(

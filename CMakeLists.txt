@@ -123,6 +123,12 @@ target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 
+add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
+target_link_libraries(strata-laguna-profile PRIVATE strata_core)
+
+add_executable(strata-laguna-stage-probe apps/strata_laguna_stage_probe.cpp)
+target_link_libraries(strata-laguna-stage-probe PRIVATE strata_core)
+
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
     add_executable(strata-topology-probe apps/strata_topology_probe.cu)

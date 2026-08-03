@@ -22,6 +22,8 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(synchronization_calls);
     STRATA_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(weight_allocation_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(weight_copy_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
@@ -78,6 +80,8 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(synchronization_calls);
     STRATA_CUDA_DELTA(synchronization_nanoseconds);
     STRATA_CUDA_DELTA(upload_wait_nanoseconds);
+    STRATA_CUDA_DELTA(weight_allocation_nanoseconds);
+    STRATA_CUDA_DELTA(weight_copy_nanoseconds);
     STRATA_CUDA_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DELTA(kernel_nanoseconds);
     STRATA_CUDA_DELTA(activation_d2h_nanoseconds);
@@ -122,6 +126,8 @@ inline void assign_cuda_delta(CudaBackendStats& result,
 inline void clear_cuda_critical_path(CudaBackendStats& result) noexcept {
     result.synchronization_nanoseconds = 0U;
     result.upload_wait_nanoseconds = 0U;
+    result.weight_allocation_nanoseconds = 0U;
+    result.weight_copy_nanoseconds = 0U;
     result.activation_h2d_nanoseconds = 0U;
     result.kernel_nanoseconds = 0U;
     result.activation_d2h_nanoseconds = 0U;
@@ -141,6 +147,10 @@ inline void accumulate_cuda_critical_path(CudaBackendStats& result,
         result.synchronization_nanoseconds, delta.synchronization_nanoseconds);
     result.upload_wait_nanoseconds = std::max(
         result.upload_wait_nanoseconds, delta.upload_wait_nanoseconds);
+    result.weight_allocation_nanoseconds = std::max(
+        result.weight_allocation_nanoseconds, delta.weight_allocation_nanoseconds);
+    result.weight_copy_nanoseconds = std::max(
+        result.weight_copy_nanoseconds, delta.weight_copy_nanoseconds);
     result.activation_h2d_nanoseconds = std::max(
         result.activation_h2d_nanoseconds, delta.activation_h2d_nanoseconds);
     result.kernel_nanoseconds = std::max(

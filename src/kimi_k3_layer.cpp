@@ -7,6 +7,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace strata {
 namespace {
@@ -37,10 +42,108 @@ constexpr float kL2Epsilon = 1.0e-6F;
     return matrix.valid() && matrix.rows == rows && matrix.columns == columns;
 }
 
-void run_rows(std::uint32_t rows, HostWorkerPool* pool,
-              const std::function<void(std::size_t)>& body) {
+#if defined(__x86_64__)
+
+// One row of an MXFP4 matvec, eight elements at a time.
+//
+// The scalar path spends its time decoding nibbles one at a time; the decode is
+// a sixteen-entry lookup, which is what an in-register permute does natively.
+// `permutevar8x32_ps` selects the E2M1 magnitude by the nibble's low three
+// bits, and bit 3 becomes the float's sign bit by a shift and an XOR, so no
+// value is branched on and no table leaves a register.
+//
+// `even` and `odd` are the input already split by parity, because a byte holds
+// two consecutive elements and the vector wants them in separate lanes. The
+// split is done once per matvec by the caller and reused across every row,
+// which is where it costs nothing: one pass over `columns` floats against
+// `rows` passes over the weights.
+//
+// Summation order differs from the scalar path: eight lanes accumulate in
+// parallel and reduce at the end. That is a different order, not a different
+// value set, and a wider tree reduction is if anything better conditioned than
+// a single serial chain. `kimi_mxfp4_matvec agrees with its scalar path`
+// pins the agreement.
+[[gnu::target("avx2,fma")]] float mxfp4_row_dot_avx2(
+    const std::uint8_t* packed, const std::uint8_t* scales, const float* even,
+    const float* odd, std::size_t groups) noexcept {
+    const __m256 table = _mm256_loadu_ps(kMxfp4Magnitudes.data());
+    const __m256i nibble_mask = _mm256_set1_epi32(0x0F);
+    const __m256i magnitude_mask = _mm256_set1_epi32(0x07);
+    const __m256i sign_mask = _mm256_set1_epi32(0x08);
+    __m256 total = _mm256_setzero_ps();
+
+    for (std::size_t group = 0U; group < groups; ++group) {
+        const auto* bytes = packed + group * 16U;
+        const auto* even_source = even + group * 16U;
+        const auto* odd_source = odd + group * 16U;
+        __m256 accumulator = _mm256_setzero_ps();
+        for (std::size_t half = 0U; half < 2U; ++half) {
+            const __m128i raw = _mm_loadl_epi64(
+                reinterpret_cast<const __m128i*>(bytes + half * 8U));
+            const __m256i wide = _mm256_cvtepu8_epi32(raw);
+            const __m256i low = _mm256_and_si256(wide, nibble_mask);
+            const __m256i high =
+                _mm256_and_si256(_mm256_srli_epi32(wide, 4), nibble_mask);
+            const __m256 low_value = _mm256_xor_ps(
+                _mm256_permutevar8x32_ps(
+                    table, _mm256_and_si256(low, magnitude_mask)),
+                _mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_and_si256(low, sign_mask), 28)));
+            const __m256 high_value = _mm256_xor_ps(
+                _mm256_permutevar8x32_ps(
+                    table, _mm256_and_si256(high, magnitude_mask)),
+                _mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_and_si256(high, sign_mask), 28)));
+            accumulator = _mm256_fmadd_ps(
+                low_value, _mm256_loadu_ps(even_source + half * 8U), accumulator);
+            accumulator = _mm256_fmadd_ps(
+                high_value, _mm256_loadu_ps(odd_source + half * 8U), accumulator);
+        }
+        // The group's shared scale factors out of its 32 products, so it is one
+        // multiply per group rather than per element, exactly as in the scalar
+        // path.
+        total = _mm256_fmadd_ps(
+            accumulator, _mm256_set1_ps(mxfp4_scale_from_e8m0(scales[group])),
+            total);
+    }
+
+    __m128 folded = _mm_add_ps(_mm256_castps256_ps128(total),
+                               _mm256_extractf128_ps(total, 1));
+    folded = _mm_add_ps(folded, _mm_movehl_ps(folded, folded));
+    folded = _mm_add_ss(folded, _mm_shuffle_ps(folded, folded, 1));
+    return _mm_cvtss_f32(folded);
+}
+
+[[nodiscard]] bool mxfp4_avx2_available() noexcept {
+    static const bool available =
+        __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return available;
+}
+
+#endif  // __x86_64__
+
+// One task per worker over a contiguous row range, not one task per row.
+//
+// A row of an expert module is about a microsecond of work. Dispatching it as
+// its own task pays an indirect call through `std::function` and a share of the
+// barrier for each one, and at 3072 rows across 4416 matvecs per token that
+// dispatch becomes the measured cost: throughput fell going from 14 workers to
+// 56 because the extra threads added barrier traffic rather than arithmetic.
+// Chunking also keeps each worker on a contiguous slice of the weight matrix,
+// which is what the hardware prefetcher wants.
+//
+// `body` is a template parameter so the inner call inlines. Taking it by
+// `const std::function&` put an indirect call on the innermost loop.
+template <typename Body>
+void run_rows(std::uint32_t rows, HostWorkerPool* pool, Body&& body) {
     if (pool != nullptr && pool->size() > 1U && rows > 1U) {
-        (void)pool->parallel_for(rows, body);
+        const auto workers = std::min<std::size_t>(pool->size(), rows);
+        const auto chunk = (static_cast<std::size_t>(rows) + workers - 1U) / workers;
+        (void)pool->parallel_for(workers, [&](std::size_t index) {
+            const auto begin = index * chunk;
+            const auto end = std::min<std::size_t>(begin + chunk, rows);
+            for (std::size_t row = begin; row < end; ++row) body(row);
+        });
         return;
     }
     for (std::uint32_t row = 0U; row < rows; ++row) body(row);
@@ -102,6 +205,32 @@ ValidationResult kimi_mxfp4_matvec(std::span<float> output,
     const auto columns = static_cast<std::size_t>(module.columns);
     const auto packed_stride = columns / 2U;
     const auto scale_stride = columns / 32U;
+
+#if defined(__x86_64__)
+    if (mxfp4_avx2_available() && columns % 32U == 0U) {
+        // Split the input by parity once and let every row read it. The buffer
+        // belongs to the calling thread and is only read while `run_rows` is
+        // inside its synchronous parallel_for, so the workers may share it.
+        thread_local std::vector<float> split;
+        split.resize(columns);
+        float* even = split.data();
+        float* odd = split.data() + packed_stride;
+        for (std::size_t index = 0U; index < packed_stride; ++index) {
+            even[index] = input[index * 2U];
+            odd[index] = input[index * 2U + 1U];
+        }
+        const auto* packed_base = module.packed.data();
+        const auto* scale_base = module.scales.data();
+        auto* destination = output.data();
+        run_rows(module.rows, pool, [&](std::size_t row) {
+            destination[row] = mxfp4_row_dot_avx2(packed_base + row * packed_stride,
+                                                  scale_base + row * scale_stride,
+                                                  even, odd, scale_stride);
+        });
+        return result;
+    }
+#endif
+
     run_rows(module.rows, pool, [&](std::size_t row) {
         const auto* packed = module.packed.data() + row * packed_stride;
         const auto* scales = module.scales.data() + row * scale_stride;

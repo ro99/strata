@@ -1,12 +1,17 @@
 #include "kimi_fixture.hpp"
 #include "test.hpp"
 
+#include "strata/compressed_tensors.hpp"
 #include "strata/kimi_k3_checkpoint.hpp"
 #include "strata/kimi_k3_expert_arena.hpp"
 #include "strata/kimi_k3_layer.hpp"
 #include "strata/model_adapter.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string>
@@ -585,4 +590,107 @@ TEST_CASE("Kimi-K3 matmul reads BF16 rows and accumulates in F32") {
 
     std::vector<float> wrong(3U);
     REQUIRE(!strata::kimi_bf16_matmul(wrong, input, weight, 2U).ok());
+}
+
+// The AVX2 MXFP4 path accumulates eight lanes in parallel and reduces at the
+// end, so its summation order differs from the scalar path's single chain.
+// That is a reordering, not a different value set.
+//
+// Testing it at one tolerance would confuse two different things: a decode
+// defect (a wrong magnitude, a dropped sign, a misapplied group scale) and the
+// conditioning of a 3584-term float sum. They separate by sweeping how far the
+// per-group scales spread within a row. Reassociation error grows with the
+// dynamic range of the summands; a decode defect does not care about it and
+// stays put. So the narrow-spread bound is the sensitive detector, and the wide
+// one only records what reassociation costs.
+//
+// Measured here: 5.96e-7 at one octave, rising monotonically to 1.18e-5 at
+// fifteen. Fifteen octaves inside a single row is far wider than a real
+// checkpoint -- the codec exists to make each group's scale track its own
+// magnitude -- so it is included as a bound, not as the operating point.
+TEST_CASE("kimi_mxfp4_matvec agrees with its scalar path") {
+    constexpr std::uint32_t kRows = 256U;
+    constexpr std::uint32_t kColumns = 3584U;  // routed_expert_hidden_size
+    constexpr std::uint32_t kScaleBase = 120U;
+    constexpr auto& contract = strata::kKimiK3ExecutionContract;
+    REQUIRE(kColumns == contract.routed_expert_hidden_size);
+
+    struct Arm {
+        std::uint32_t spread;
+        double gate;
+    };
+    // One octave is the decode-defect detector: with every group sharing a
+    // scale there is nothing left for reassociation to lose, so the two paths
+    // must agree to a handful of ulp.
+    const std::array<Arm, 4U> arms{Arm{1U, 2.0e-6}, Arm{3U, 4.0e-6},
+                                   Arm{7U, 1.2e-5}, Arm{15U, 2.0e-5}};
+
+    double previous = 0.0;
+    for (const auto& arm : arms) {
+        std::vector<std::uint8_t> packed(
+            static_cast<std::size_t>(kRows) * kColumns / 2U);
+        std::vector<std::uint8_t> scales(
+            static_cast<std::size_t>(kRows) * kColumns / 32U);
+        std::vector<float> input(kColumns);
+
+        // A fixed linear congruential sequence, so a failure is reproducible
+        // without depending on any standard library's generator.
+        std::uint64_t state = 0x9E3779B97F4A7C15ULL;
+        const auto next = [&state]() {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            return static_cast<std::uint32_t>(state >> 33U);
+        };
+        for (auto& byte : packed) byte = static_cast<std::uint8_t>(next() & 0xFFU);
+        for (auto& byte : scales) {
+            byte = static_cast<std::uint8_t>(kScaleBase + (next() % arm.spread));
+        }
+        for (auto& value : input) {
+            value =
+                static_cast<float>(static_cast<std::int32_t>(next() % 2000U) - 1000) /
+                1000.0F;
+        }
+
+        strata::KimiExpertModuleView module{packed, scales, kRows, kColumns};
+        REQUIRE(module.valid());
+
+        std::vector<float> produced(kRows, 0.0F);
+        const auto result = strata::kimi_mxfp4_matvec(produced, input, module);
+        REQUIRE(result.ok());
+
+        // The scalar reference is written out here rather than reached through
+        // the dispatch, so the test still compares two implementations on a
+        // machine where the vector path is the one that runs.
+        const auto scale_stride = static_cast<std::size_t>(kColumns) / 32U;
+        const auto packed_stride = static_cast<std::size_t>(kColumns) / 2U;
+        double worst = 0.0;
+        for (std::uint32_t row = 0U; row < kRows; ++row) {
+            const auto* row_packed = packed.data() + row * packed_stride;
+            const auto* row_scales = scales.data() + row * scale_stride;
+            float sum = 0.0F;
+            for (std::size_t group = 0U; group < scale_stride; ++group) {
+                const auto scale = strata::mxfp4_scale_from_e8m0(row_scales[group]);
+                const auto* bytes = row_packed + group * 16U;
+                const auto* source = input.data() + group * 32U;
+                float partial = 0.0F;
+                for (std::size_t index = 0U; index < 16U; ++index) {
+                    const auto byte = bytes[index];
+                    partial +=
+                        source[index * 2U] * strata::kMxfp4Values[byte & 0x0FU] +
+                        source[index * 2U + 1U] * strata::kMxfp4Values[byte >> 4U];
+                }
+                sum += partial * scale;
+            }
+            const auto magnitude = std::max(std::abs(sum), 1.0F);
+            worst = std::max(worst,
+                             static_cast<double>(std::abs(produced[row] - sum)) /
+                                 static_cast<double>(magnitude));
+        }
+        std::cout << "  mxfp4 scalar/vector gap at " << arm.spread
+                  << " octaves: " << worst << '\n';
+        REQUIRE(worst < arm.gate);
+        // The shape is the evidence. If the gap stopped tracking the dynamic
+        // range, the difference would not be reassociation any more.
+        REQUIRE(worst >= previous);
+        previous = worst;
+    }
 }

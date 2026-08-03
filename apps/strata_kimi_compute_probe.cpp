@@ -36,6 +36,8 @@
 #include <thread>
 #include <vector>
 
+#include <numa.h>
+
 namespace {
 
 constexpr auto& kContract = strata::kKimiK3ExecutionContract;
@@ -73,10 +75,25 @@ std::vector<std::size_t> parse_list(const std::string& text) {
     return values;
 }
 
-double median(std::vector<double> samples) {
-    if (samples.empty()) return 0.0;
+// A measurement and how much it moved. The probe reports the spread because
+// without it a 1.5x run-to-run swing reads exactly like a 1.5x optimisation:
+// three runs of one binary at identical settings once gave 2.32, 2.32 and 1.51
+// s/token here, and that was mistaken for a result. Any arm whose spread is
+// comparable to the difference under test has not measured anything.
+struct Stats {
+    double median{};
+    double low{};
+    double high{};
+
+    [[nodiscard]] double spread() const noexcept {
+        return low > 0.0 ? high / low : 0.0;
+    }
+};
+
+Stats summarize(std::vector<double> samples) {
+    if (samples.empty()) return {};
     std::sort(samples.begin(), samples.end());
-    return samples[samples.size() / 2U];
+    return {samples[samples.size() / 2U], samples.front(), samples.back()};
 }
 
 // One MXFP4 module of `rows x columns`, laid out exactly as the arena holds it:
@@ -158,6 +175,18 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Interleave every allocation across the NUMA nodes before anything is
+    // allocated. Left to first-touch, the synthetic pool lands wherever the
+    // staging thread happened to run, so the same binary measured a different
+    // machine on each run -- which is what made this probe unable to resolve
+    // its own effects. Interleaving is not the fastest policy for every arm; it
+    // is the reproducible one, which is what a probe needs.
+    bool interleaved = false;
+    if (numa_available() != -1) {
+        numa_set_interleave_mask(numa_all_nodes_ptr);
+        interleaved = true;
+    }
+
     const auto hardware_threads =
         static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
     if (options.worker_counts.empty()) {
@@ -200,7 +229,11 @@ int main(int argc, char** argv) {
               << "  target step time       " << std::setprecision(2)
               << options.target_seconds << " s ("
               << 1.0 / options.target_seconds << " tok/s)\n"
-              << "  hardware threads       " << hardware_threads << "\n\n";
+              << "  hardware threads       " << hardware_threads << "\n"
+              << "  NUMA policy            "
+              << (interleaved ? "interleaved across all nodes"
+                              : "default (first touch) -- results will drift")
+              << "\n\n";
 
     std::cout << "staging " << pool_count << " synthetic experts...\n";
     std::vector<ExpertTriple> pool(pool_count);
@@ -214,7 +247,8 @@ int main(int argc, char** argv) {
     std::cout << "\n"
               << std::setw(9) << "workers" << std::setw(14) << "ms/expert"
               << std::setw(14) << "GiB/s" << std::setw(16) << "routed s/token"
-              << std::setw(14) << "vs target" << "\n";
+              << std::setw(12) << "vs target" << std::setw(12) << "spread"
+              << "\n";
 
     double best_routed_seconds = 0.0;
     std::size_t best_workers = 0U;
@@ -225,9 +259,16 @@ int main(int argc, char** argv) {
 
         // One untimed pass so the pool's threads are up and the first-touch
         // page faults on the output buffers are already paid.
+        //
+        // The selector is re-seeded per arm rather than drawn from the shared
+        // engine. Sharing it meant each arm walked a different set of experts,
+        // so a worker-count comparison was also comparing two different memory
+        // access patterns -- which is most of why this arm would not reproduce
+        // while the dense arm did.
+        std::mt19937_64 selector(options.seed);
         std::uniform_int_distribution<std::size_t> pick(0U, pool_count - 1U);
         for (std::size_t warm = 0U; warm < 4U; ++warm) {
-            const auto& triple = pool[pick(engine)];
+            const auto& triple = pool[pick(selector)];
             (void)strata::kimi_mxfp4_matvec(gate, source, triple.gate.view(), worker_pool);
             (void)strata::kimi_mxfp4_matvec(up, source, triple.up.view(), worker_pool);
             (void)strata::kimi_situ_glu(activated, gate, up, kContract.situ_gate_beta,
@@ -242,7 +283,7 @@ int main(int argc, char** argv) {
              ++repetition) {
             const auto begin = std::chrono::steady_clock::now();
             for (std::size_t step = 0U; step < kExpertsPerSample; ++step) {
-                const auto& triple = pool[pick(engine)];
+                const auto& triple = pool[pick(selector)];
                 (void)strata::kimi_mxfp4_matvec(gate, source, triple.gate.view(),
                                         worker_pool);
                 (void)strata::kimi_mxfp4_matvec(up, source, triple.up.view(), worker_pool);
@@ -257,7 +298,8 @@ int main(int argc, char** argv) {
                               static_cast<double>(kExpertsPerSample));
         }
 
-        const auto seconds_per_expert = median(samples);
+        const auto expert_stats = summarize(samples);
+        const auto seconds_per_expert = expert_stats.median;
         const auto gib_per_second =
             static_cast<double>(triple_bytes) / seconds_per_expert /
             (1024.0 * 1024.0 * 1024.0);
@@ -272,8 +314,10 @@ int main(int argc, char** argv) {
                   << std::setprecision(3) << seconds_per_expert * 1000.0
                   << std::setw(14) << std::setprecision(2) << gib_per_second
                   << std::setw(16) << std::setprecision(2) << routed_seconds
-                  << std::setw(13) << std::setprecision(2)
-                  << routed_seconds / options.target_seconds << "x" << "\n";
+                  << std::setw(11) << std::setprecision(2)
+                  << routed_seconds / options.target_seconds << "x"
+                  << std::setw(11) << std::setprecision(2) << expert_stats.spread()
+                  << "x" << "\n";
     }
 
     std::cout << "\nbest routed-expert compute: " << std::setprecision(2)
@@ -315,7 +359,7 @@ int main(int argc, char** argv) {
         std::cout << "\n"
                   << std::setw(9) << "workers" << std::setw(14) << "ms/matrix"
                   << std::setw(14) << "GiB/s" << std::setw(16) << "spine s/token"
-                  << "\n";
+                  << std::setw(12) << "spread" << "\n";
 
         double best_dense_seconds = 0.0;
         std::size_t best_dense_workers = 0U;
@@ -323,10 +367,11 @@ int main(int argc, char** argv) {
             if (workers == 0U) continue;
             strata::HostWorkerPool workers_pool(workers);
             auto* worker_pool = workers > 1U ? &workers_pool : nullptr;
+            std::mt19937_64 selector(options.seed);
             std::uniform_int_distribution<std::size_t> pick(0U, matrices - 1U);
 
             for (std::size_t warm = 0U; warm < 2U; ++warm) {
-                const strata::KimiBf16Matrix matrix{dense[pick(engine)], rows,
+                const strata::KimiBf16Matrix matrix{dense[pick(selector)], rows,
                                                     columns};
                 (void)strata::kimi_bf16_matmul(dense_output, dense_input, matrix, 1U,
                                                worker_pool);
@@ -337,7 +382,7 @@ int main(int argc, char** argv) {
                  ++repetition) {
                 const auto begin = std::chrono::steady_clock::now();
                 for (std::size_t step = 0U; step < kMatricesPerSample; ++step) {
-                    const strata::KimiBf16Matrix matrix{dense[pick(engine)], rows,
+                    const strata::KimiBf16Matrix matrix{dense[pick(selector)], rows,
                                                         columns};
                     (void)strata::kimi_bf16_matmul(dense_output, dense_input, matrix,
                                                    1U, worker_pool);
@@ -347,7 +392,8 @@ int main(int argc, char** argv) {
                 samples.push_back(elapsed.count() /
                                   static_cast<double>(kMatricesPerSample));
             }
-            const auto seconds = median(samples);
+            const auto dense_stats = summarize(samples);
+            const auto seconds = dense_stats.median;
             const auto gib_per_second = static_cast<double>(matrix_bytes) / seconds /
                                         (1024.0 * 1024.0 * 1024.0);
             const auto spine_seconds = kSpineGiB / gib_per_second;
@@ -358,7 +404,9 @@ int main(int argc, char** argv) {
             std::cout << std::setw(9) << workers << std::setw(14)
                       << std::setprecision(3) << seconds * 1000.0 << std::setw(14)
                       << std::setprecision(2) << gib_per_second << std::setw(16)
-                      << std::setprecision(2) << spine_seconds << "\n";
+                      << std::setprecision(2) << spine_seconds << std::setw(11)
+                      << std::setprecision(2) << dense_stats.spread() << "x"
+                      << "\n";
         }
 
         std::cout << "\nbest dense-spine compute: " << std::setprecision(2)

@@ -184,6 +184,7 @@ if(BUILD_TESTING)
         tests/test_sampling.cpp
         tests/test_safetensors.cpp
         tests/test_tokenizer.cpp
+        tests/test_worker_pool.cpp
     )
     target_link_libraries(strata-tests PRIVATE strata_core)
     target_compile_definitions(strata-tests PRIVATE

@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
     config.host_workers = workers;
     config.maximum_context_tokens = 256U;
     config.load_progress = true;
+    config.verbose = true;  // emits the per-phase breakdown of every pass
 
     std::cout << "loading " << model << " (dense spine 106.55 GiB)...\n" << std::flush;
     const auto load_begin = std::chrono::steady_clock::now();

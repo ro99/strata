@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -1024,8 +1025,12 @@ ValidationResult kimi_decoder_layer(KimiResidualStream& stream,
     // The attention site selects over prior depth, then this layer may open a
     // block from the *incoming* prefix — the value before the mix, which is
     // what the reference stores.
+    const auto mix_begin = std::chrono::steady_clock::now();
     result = stream.mix(normalized, weights.attention_res_proj,
                         weights.attention_res_norm, kContract.rms_epsilon, pool);
+    scratch.residual_mix_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - mix_begin).count());
     if (!result.ok()) return result;
     if (layer % kContract.attention_residual_block_size == 0U) {
         result = stream.open_block();
@@ -1042,6 +1047,7 @@ ValidationResult kimi_decoder_layer(KimiResidualStream& stream,
         }
     }
 
+    const auto attention_begin = std::chrono::steady_clock::now();
     if (kimi_k3_kda_layer(layer)) {
         result = kimi_kda_layer(attention, normalized, weights.kda, cache, layer,
                                 tokens, scratch, pool);
@@ -1049,6 +1055,9 @@ ValidationResult kimi_decoder_layer(KimiResidualStream& stream,
         result = kimi_mla_layer(attention, normalized, weights.mla, cache, layer,
                                 position, tokens, scratch, pool);
     }
+    scratch.attention_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - attention_begin).count());
     if (!result.ok()) return result;
     result = stream.add(attention);
     if (!result.ok()) return result;
@@ -1067,6 +1076,7 @@ ValidationResult kimi_decoder_layer(KimiResidualStream& stream,
         }
     }
 
+    const auto feedforward_begin = std::chrono::steady_clock::now();
     if (kimi_k3_moe_layer(layer)) {
         result = kimi_latent_moe_layer(feedforward, normalized, weights.moe,
                                        experts, layer, tokens, scratch, pool);
@@ -1074,6 +1084,9 @@ ValidationResult kimi_decoder_layer(KimiResidualStream& stream,
         result = kimi_dense_mlp_layer(feedforward, normalized, weights.dense,
                                       tokens, scratch, pool);
     }
+    scratch.feedforward_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - feedforward_begin).count());
     if (!result.ok()) return result;
     return stream.add(feedforward);
 }

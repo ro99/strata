@@ -222,6 +222,17 @@ struct KimiLayerScratch {
     // afterwards -- which keeps the result independent of how the pool
     // happened to schedule them.
     std::vector<float> worker_mixture;
+
+    // Per-phase nanoseconds, accumulated across layers and pages.
+    //
+    // The charter's first step is to emit the per-phase breakdown of a step and
+    // name `argmax_r`. That was done for the routed and dense matvecs in
+    // isolation and skipped for the step itself, and the two disagreed by 7.5x:
+    // a measured 38.6 s step against a 5.2 s sum of the two components anyone
+    // had profiled. These say where the rest is.
+    std::uint64_t residual_mix_ns{};
+    std::uint64_t attention_ns{};
+    std::uint64_t feedforward_ns{};
 };
 
 // Kimi Delta Attention over `tokens` positions starting at `position`.

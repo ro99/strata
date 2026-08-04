@@ -539,9 +539,31 @@ ValidationResult KimiK3Runtime::Impl::forward(
     }
     // The head is [163840, 7168] at 2.19 GiB and is read once per call whatever
     // `rows` is, so this is where a batch pays for itself rather than costing.
-    return kimi_bf16_matmul(logits.subspan(0U, rows * vocabulary), normalized,
-                            output_head, static_cast<std::uint32_t>(rows),
-                            pool.get());
+    const auto head_begin = std::chrono::steady_clock::now();
+    result = kimi_bf16_matmul(logits.subspan(0U, rows * vocabulary), normalized,
+                              output_head, static_cast<std::uint32_t>(rows),
+                              pool.get());
+    const auto head_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - head_begin).count();
+
+    if (config.verbose) {
+        // The per-phase breakdown of one pass, which is step 1 of the charter's
+        // decision procedure and had been skipped for decode. Naming argmax_r is
+        // the point: a mechanism that does not reduce it cannot improve the step.
+        const auto ms = [](std::uint64_t nanoseconds) {
+            return static_cast<double>(nanoseconds) / 1.0e6;
+        };
+        const auto total = ms(scratch.attention_ns + scratch.feedforward_ns +
+                              scratch.residual_mix_ns) +
+                           static_cast<double>(head_ns) / 1.0e6;
+        std::cerr << "[phase] tokens " << count
+                  << "  attention " << ms(scratch.attention_ns) << " ms"
+                  << "  feedforward " << ms(scratch.feedforward_ns) << " ms"
+                  << "  residual-mix " << ms(scratch.residual_mix_ns) << " ms"
+                  << "  head " << static_cast<double>(head_ns) / 1.0e6 << " ms"
+                  << "  accounted " << total << " ms\n";
+    }
+    return result;
 }
 
 KimiK3Runtime::KimiK3Runtime() : impl_(std::make_unique<Impl>()) {}

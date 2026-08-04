@@ -593,6 +593,46 @@ int main(int argc, char** argv) {
                       << "\n";
         }
 
+        // Does the spine amortize across a batch? `kimi_bf16_matmul` takes a
+        // token count, and the weight is read once per call regardless of it.
+        // If cost per token falls with batch the spine is bandwidth bound and
+        // speculation amortizes it by K; if it is flat the spine is arithmetic
+        // bound like the routed path and speculation buys nothing there either.
+        // This is the term that decides the draft model, and it was never
+        // measured at more than one token.
+        std::cout << "\n" << std::setw(12) << "tokens" << std::setw(18)
+                  << "ms/matrix-token" << std::setw(16) << "spine s/token"
+                  << std::setw(14) << "vs 1 token" << "\n";
+        double one_token = 0.0;
+        for (const std::size_t batch : {1U, 2U, 4U, 8U}) {
+            strata::HostWorkerPool spine_pool(28U);
+            std::mt19937_64 sel(options.seed);
+            std::uniform_int_distribution<std::size_t> pk(0U, matrices - 1U);
+            std::vector<float> bin(columns * batch, 0.5F);
+            std::vector<float> bout(rows * batch, 0.0F);
+            std::vector<double> samples;
+            for (std::uint32_t r = 0U; r < options.repetitions; ++r) {
+                const strata::KimiBf16Matrix m{dense[pk(sel)], rows, columns};
+                const auto t0 = std::chrono::steady_clock::now();
+                (void)strata::kimi_bf16_matmul(bout, bin, m,
+                                               static_cast<std::uint32_t>(batch),
+                                               &spine_pool);
+                const std::chrono::duration<double> dt =
+                    std::chrono::steady_clock::now() - t0;
+                samples.push_back(dt.count() / static_cast<double>(batch));
+            }
+            const auto st = summarize(samples);
+            if (batch == 1U) one_token = st.median;
+            const auto gib = static_cast<double>(matrix_bytes) /
+                             (1024.0 * 1024.0 * 1024.0);
+            std::cout << std::setw(12) << batch << std::setw(18)
+                      << std::setprecision(3) << st.median * 1000.0
+                      << std::setw(16) << std::setprecision(2)
+                      << kSpineGiB / (gib / st.median) << std::setw(13)
+                      << std::setprecision(2) << one_token / st.median << "x"
+                      << "\n";
+        }
+
         std::cout << "\nbest dense-spine compute: " << std::setprecision(2)
                   << best_dense_seconds << " s/token at " << best_dense_workers
                   << " workers (" << kSpineGiB << " GiB read once per token)\n";

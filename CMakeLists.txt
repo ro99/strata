@@ -130,6 +130,9 @@ target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 add_executable(strata-kimi-expert-probe apps/strata_kimi_expert_probe.cpp)
 target_link_libraries(strata-kimi-expert-probe PRIVATE strata_core)
 
+add_executable(strata-kimi-decode-probe apps/strata_kimi_decode_probe.cpp)
+target_link_libraries(strata-kimi-decode-probe PRIVATE strata_core)
+
 add_executable(strata-kimi-compute-probe apps/strata_kimi_compute_probe.cpp)
 find_library(NUMA_LIBRARY_PROBE numa REQUIRED)
 target_link_libraries(strata-kimi-compute-probe PRIVATE strata_core ${NUMA_LIBRARY_PROBE})

@@ -440,6 +440,61 @@ public:
         Entry* entry_{};
     };
 
+    // A layer's routed experts are spread over every device, and each device
+    // owns an independent PCIe link. Waiting out each upload where it is issued
+    // drives those links one at a time: measured, the per-device demand wait
+    // sums to 99.1 ms/step against a per-device maximum of 40.2 ms/step, so
+    // about 59 ms of a 245 ms step is serialization rather than transfer.
+    // Inside a batch the copies are left in flight and waited out once per
+    // device at close() -- the same bytes over concurrent links. Priced in
+    // isolation at the production byte mix and slice size: 105.4 ms serial
+    // against 55.4 ms overlapped, 1.90x.
+    class UploadBatch {
+    public:
+        UploadBatch() = default;
+        // Best-effort. A batch must never leave copies in flight past the scope
+        // that owns their host source; callers that need the error close()
+        // explicitly.
+        ~UploadBatch() { static_cast<void>(close()); }
+        UploadBatch(const UploadBatch&) = delete;
+        UploadBatch& operator=(const UploadBatch&) = delete;
+
+        UploadBatch(UploadBatch&& other) noexcept
+            : owner_(other.owner_), demand_(std::move(other.demand_)) {
+            other.owner_ = nullptr;
+        }
+
+        UploadBatch& operator=(UploadBatch&& other) noexcept {
+            if (this == &other) return *this;
+            static_cast<void>(close());
+            owner_ = other.owner_;
+            demand_ = std::move(other.demand_);
+            other.owner_ = nullptr;
+            return *this;
+        }
+
+        ValidationResult close() {
+            ValidationResult result;
+            if (owner_ == nullptr) return result;
+            auto* owner = owner_;
+            owner_ = nullptr;
+            result = owner->finish_upload_batch();
+            // Released only after the wait: a prefetch admitted while copies
+            // are in flight would issue on the same stream.
+            demand_ = {};
+            return result;
+        }
+
+    private:
+        friend class Dsv4WeightCache;
+
+        UploadBatch(Dsv4WeightCache* owner, DemandGuard demand)
+            : owner_(owner), demand_(std::move(demand)) {}
+
+        Dsv4WeightCache* owner_{};
+        DemandGuard demand_;
+    };
+
     Dsv4WeightCache(Dsv4CheckpointReader& checkpoint,
                     Dsv4ResidentWeightStore& resident, CudaBackend& backend,
                     std::vector<int> devices,
@@ -453,6 +508,7 @@ public:
           prefetch_queue_depth_(prefetch_queue_depth),
           prefetch_lease_ticks_(prefetch_lease_ticks) {
         for (const auto capacity : capacities) states_.push_back(State{{}, capacity});
+        deferred_upload_slots_.assign(states_.size(), 0U);
         if (prefetch_byte_budget_ != 0U && prefetch_queue_depth_ != 0U) {
             prefetch_worker_ = std::thread([this] { prefetch_loop(); });
         }
@@ -473,6 +529,18 @@ public:
         if (!prefetch_worker_.joinable()) return {};
         begin_demand(keys);
         return DemandGuard(this);
+    }
+
+    // Opens a scope in which demand loads may leave their H2D copies in flight
+    // so transfers to different devices overlap. Only one may be open, and only
+    // on the thread that opened it: deferral is decided by a plain member flag,
+    // and the prefetch worker's loads are excluded by kind rather than by it.
+    [[nodiscard]] UploadBatch begin_upload_batch(
+        std::span<const ExpertKey> keys = {}) {
+        if (upload_batch_open_) return {};
+        auto guard = demand(keys);
+        upload_batch_open_ = true;
+        return UploadBatch(this, std::move(guard));
     }
 
     ValidationResult preload(std::size_t slot, std::string_view base,
@@ -773,12 +841,19 @@ private:
             return result;
         }
         Entry entry;
+        // Only demand loads inside an open batch may defer. Prefetch runs on
+        // its own thread and must not leave copies in flight that no one on
+        // this thread will wait for; preload reads the checkpoint into a
+        // temporary, which the loader refuses to defer anyway.
+        const bool defer = upload_batch_open_ && kind == LoadKind::Demand;
         const auto load_started = std::chrono::steady_clock::now();
         result = load_dsv4_cuda_linear(checkpoint_,
                                         kind == LoadKind::Preload ? nullptr : &resident_,
                                         base, rows, columns,
-                                        devices_[slot], backend_, entry.weight);
+                                        devices_[slot], backend_, entry.weight,
+                                        defer);
         if (!result.ok()) return result;
+        if (defer) deferred_upload_slots_[slot] = 1U;
         entry.last_use = state.clock;
         entry.pinned = pin;
         entry.prefetched = kind == LoadKind::Prefetch;
@@ -804,6 +879,28 @@ private:
             }
         }
         output = &found->second;
+        return result;
+    }
+
+    // Waits out every device the batch deferred to. The wait the individual
+    // loads no longer pay is charged here instead, so demand_wait_seconds
+    // stays the cost of getting the weights onto the devices and the phase
+    // timers keep summing to the step.
+    ValidationResult finish_upload_batch() {
+        ValidationResult result;
+        upload_batch_open_ = false;
+        const auto wait_started = std::chrono::steady_clock::now();
+        bool waited = false;
+        for (std::size_t slot = 0U; slot < deferred_upload_slots_.size(); ++slot) {
+            if (deferred_upload_slots_[slot] == 0U) continue;
+            deferred_upload_slots_[slot] = 0U;
+            waited = true;
+            auto synchronized = backend_.synchronize_uploads(devices_[slot]);
+            if (!synchronized.ok()) {
+                append_errors(result, std::move(synchronized.errors));
+            }
+        }
+        if (waited) demand_wait_nanoseconds_ += elapsed_nanoseconds(wait_started);
         return result;
     }
 
@@ -1002,6 +1099,10 @@ private:
     std::thread prefetch_worker_;
     std::size_t active_demands_{};
     std::size_t waiting_demands_{};
+    // Touched only by the thread that opened the batch. std::uint8_t rather
+    // than bool because this is a per-slot flag array, not a bitset.
+    std::vector<std::uint8_t> deferred_upload_slots_;
+    bool upload_batch_open_{};
     bool prefetch_active_{};
     bool active_prefetch_late_{};
     bool stop_prefetch_{};
@@ -2773,6 +2874,14 @@ ValidationResult DeepSeekV4Runtime::Impl::device_moe(
                        kExpertIntermediate, descriptor.w2);
     };
 
+    // Every acquire below is a candidate demand transfer, and this layer's
+    // experts are spread over all three devices. Batching lets those copies
+    // run on their links concurrently instead of one at a time; the batch is
+    // closed before the first MoE command is enqueued.
+    auto upload_batch = config.serial_expert_upload
+        ? Dsv4WeightCache::UploadBatch{}
+        : weights->begin_upload_batch();
+
     const auto routed_prefix = layer_prefix(layer) + "ffn.experts.";
     for (std::size_t rank = 0U; rank < kTopK; ++rank) {
         const auto expert_id = route.experts[rank];
@@ -2801,6 +2910,15 @@ ValidationResult DeepSeekV4Runtime::Impl::device_moe(
         return result;
     }
     shared_device.has_shared = true;
+
+    // Waits out the deferred copies, so every weight below is on its device
+    // before any command reads it, and the wait is inside moe_prepare where
+    // the serial version paid it.
+    if (auto closed = upload_batch.close(); !closed.ok()) {
+        append_errors(result, std::move(closed.errors),
+                      "DeepSeek routed expert upload");
+        return result;
+    }
 
     graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
     const auto execution_started = std::chrono::steady_clock::now();

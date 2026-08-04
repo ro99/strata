@@ -1,8 +1,8 @@
 # Inkling-Small-NVFP4 bring-up
 
 Status: text backbone and MTP heads implemented and gated against the pinned
-checkpoint. Vision and audio towers are validated by the reader but not
-executed. This is a correctness runtime; no throughput claim is made from it.
+checkpoint, executing on three GPUs with the routed expert set in host RAM.
+Vision and audio towers are validated by the reader but not executed.
 
 ## Pinned source facts
 
@@ -103,35 +103,76 @@ Two further storage facts were established by measurement rather than assumed:
 
 ## Measured operating point
 
-Six forward tokens on a five-token prompt, 3 GPUs idle, host execution:
+All figures decode-only; a cold prefill otherwise sets every share. Median of
+three interleaved repetitions on a 5-token prompt.
+
+### Host baseline
 
 ```
-  moe routed experts   15901 ms  71.9%   <- argmax_r
-  attention             2540 ms  11.5%
-  moe shared experts    2531 ms  11.4%
-  output head            540 ms   2.4%
-  dense mlp              417 ms   1.9%
-  short conv              66 ms   0.3%
-  embedding                3 ms   0.0%
+  moe routed experts   1646 ms/token  79.4%   <- argmax_r
+  attention             165 ms/token   7.9%
+  moe shared experts    163 ms/token   7.8%
+  output head            55 ms/token   2.6%
+  dense mlp              29 ms/token   1.4%
 ```
 
-Decode 0.84 tok/s, prefill 0.25 tok/s, RSS 23 GiB, 3.37 GiB of routed-expert
-weights touched per token against 154 GiB resident on disk.
+0.58 tok/s. Three identical repeats of a deterministic prompt took 12.27,
+11.94 and 12.17 s wall. Greedy decoding routes to the same experts and reads
+the same bytes every time, so a repeat that does not get faster rules out
+page-cache misses: the term is host compute at 2.05 GiB/s of scalar
+dequantize-and-multiply, not storage.
 
-Reading this against the cost model in
-`research/moe-tiered-memory-decode-optimization.md`:
+### Three GPUs plus host RAM
 
-- `argmax_r` is **host compute**, not I/O. The checkpoint sits in page cache on
-  a 251 GiB machine, so `W_nvme` is zero in steady state and the expert term is
-  scalar dequantize-and-multiply.
-- The top-6 selection means a token touches 2.2% of the routed set. That ratio
-  is what makes the set cacheable at all, and it is measured, not assumed.
-- The 64 GiB of idle VRAM across three devices is the obvious next term to
-  attack, but that is a separate hypothesis with its own gate: it reduces the
-  compute term, which is the current bottleneck, so the sign is right, but the
-  transfer cost of streaming 3.37 GiB/token over PCIe has to be measured before
-  any design is committed to. Do not carry these constants to a different
-  context length or batch shape.
+```
+  moe routed experts     90 ms/token  67.9%   <- still argmax_r
+  attention              23 ms/token  17.0%
+  moe shared experts      9 ms/token   6.8%
+  short conv              5 ms/token   3.5%
+  output head             3 ms/token   2.0%
+```
+
+**9.19 tok/s, 15.9x over the host baseline.** RSS 153.6 GiB, page cache
+165 GiB, expert cache hit rate 83.0%, H2D 9.3 GiB/s.
+
+Design: the ~12 GiB spine is uploaded once and round-robins over the devices;
+the 154 GiB NVFP4 routed set stays in host RAM behind a per-device LRU sized
+from what the spine leaves (16.1 + 17.4 + 10.9 = 44.4 GiB, 28% of the set).
+Routed experts and sinks each go up as one batched device command. They cannot
+share a command because a batch is single-encoding and the sinks are BF16.
+
+Two reuses avoid new kernels. The shared NVFP4 kernel divides by its global
+scale where Inkling's ModelOpt scale multiplies, so the descriptor carries the
+reciprocal. Gate and up are de-interleaved during staging because the device
+MoE wants them separate.
+
+### Two defects the profile named
+
+Neither was predicted by the design; both came out of attributing a number
+that did not match the shape the mechanism should have.
+
+- **Staging appeared to run at 2.2 GiB/s** against a link rated far higher,
+  which the cost model calls a serialization bug rather than a bandwidth
+  limit. Splitting the upload showed only 2.06 s of 6.95 s was CUDA at all
+  (alloc 0.36, copy 0.86, wait 0.84). The true H2D rate was 9.3 GiB/s and the
+  other 70% was the host faulting cold pages of a 160 GiB mapping. Host memory
+  exceeds the model, so the expert set is now faulted in at load and
+  steady-state decode does not touch NVMe. That one change is most of the
+  15.9x; without it the device waits on storage, not on PCIe.
+- **Dense MLP and the output head were uploaded but never called.** They were
+  still running on the host at 86 ms and 172 ms per token. Now 5 ms and 9 ms.
+
+### What the remaining bottleneck is
+
+Routed experts are still `argmax_r` at 67.9% of a 108 ms step, and staging
+misses are the larger part of that. Raising the hit rate is the next term.
+
+The 83% hit rate is measured on a 5-token prompt repeated three times and is
+flattered by that reuse; the cache never evicted once during it. A long,
+diverse workload will sit nearer the 28% capacity ratio. **Do not carry this
+number to another operating point** — re-measure on a decode trace of the
+workload actually being optimized, which is what the placement simulator is
+for.
 
 ## What is not done
 
@@ -143,6 +184,12 @@ Reading this against the cost model in
   requires KV and convolution rollback on rejection, and the acceptance rate
   this path measures is the gate for deciding whether that is worth building.
   Enabling `enable_mtp_speculation` today costs time and changes nothing.
-- **Device execution.** Everything runs on the host. The CUDA backend, expert
-  cache and placement plan that the GLM and Laguna runtimes use are wired for
-  inventory purposes but not for execution.
+- **Prefill batching.** Prefill dispatches one token at a time, so it pays a
+  device round trip per token and per layer instead of amortizing weight reads
+  across rows. Prefill at 7.9 tok/s against decode at 9.2 tok/s is the ratio
+  the design says should be far apart, which makes it a defect rather than a
+  cost; it has its own branch.
+- **Expert prefetch.** Routing for layer N+1 is known once layer N's router
+  runs, so a miss could be staged while the current layer computes. Today the
+  stage is serial with the command that needs it.
+- **MTP on device.** The depth blocks still run on the host path.

@@ -1,6 +1,7 @@
 #include "strata/inkling_runtime.hpp"
 
 #include "strata/inkling_checkpoint.hpp"
+#include "strata/inkling_device.hpp"
 #include "strata/inkling_ops.hpp"
 #include "strata/model.hpp"
 #include "strata/model_adapter.hpp"
@@ -85,6 +86,26 @@ struct AttentionWeights {
     std::uint32_t relative_extent{};
 };
 
+// The spine projections of one layer, resident on a device. Uploading them
+// once removes them from the host term permanently; they are 12 GiB in total
+// against the routed set's 154 GiB, so they always fit.
+struct DeviceLayer {
+    std::size_t slot{};
+    CudaWeight query;
+    CudaWeight key;
+    CudaWeight value;
+    CudaWeight relative;
+    CudaWeight output;
+    CudaWeight dense_gate;
+    CudaWeight dense_up;
+    CudaWeight dense_down;
+    CudaWeight gate;
+    std::array<CudaWeight, 2U> shared_gate;
+    std::array<CudaWeight, 2U> shared_up;
+    std::array<CudaWeight, 2U> shared_down;
+    bool resident{};
+};
+
 struct LayerWeights {
     AttentionWeights attention;
     bool sparse{};
@@ -156,6 +177,13 @@ struct InklingRuntime::Impl {
     std::vector<LayerState> state{kLayers};
     std::vector<LayerState> mtp_state;
     RouterSpec router;
+    CudaBackend cuda;
+    std::vector<int> devices;
+    std::vector<DeviceLayer> device_layers;
+    std::unique_ptr<InklingExpertCache> expert_cache;
+    CudaWeight device_unembed;
+    std::vector<std::uint64_t> resident_spine_bytes;
+    bool cuda_enabled{};
     std::uint64_t position{};
     InklingGraphStats graph;
     std::mt19937_64 sampler;
@@ -205,6 +233,19 @@ struct InklingRuntime::Impl {
             return result;
         }
         return workers->parallel_for(static_cast<std::size_t>(blocks), body);
+    }
+
+    // Runs a resident device projection, falling back to the host matvec when
+    // the weight was never uploaded. Every call site passes both so a partial
+    // upload degrades in speed rather than in correctness.
+    ValidationResult spine_matvec(const CudaWeight& resident,
+                                  const MappedMatrix& host,
+                                  std::span<const float> input,
+                                  std::span<float> output) {
+        if (cuda_enabled && resident.valid()) {
+            return cuda.matmul(resident, input, 1U, output);
+        }
+        return matvec(host, input, output);
     }
 
     // The NVFP4 equivalent, over one expert slice of a stacked projection.
@@ -318,6 +359,7 @@ struct InklingRuntime::Impl {
     // ---- attention ---------------------------------------------------------
 
     ValidationResult attention(const AttentionWeights& weights,
+                               const DeviceLayer& device,
                                LayerState& layer_state,
                                std::span<const float> input,
                                std::uint64_t token_position,
@@ -326,13 +368,13 @@ struct InklingRuntime::Impl {
         std::vector<float> key(kKvWidth);
         std::vector<float> value(kKvWidth);
         std::vector<float> relative(kRelWidth);
-        auto result = matvec(weights.query, input, query);
+        auto result = spine_matvec(device.query, weights.query, input, query);
         if (!result.ok()) return result;
-        result = matvec(weights.key, input, key);
+        result = spine_matvec(device.key, weights.key, input, key);
         if (!result.ok()) return result;
-        result = matvec(weights.value, input, value);
+        result = spine_matvec(device.value, weights.value, input, value);
         if (!result.ok()) return result;
-        result = matvec(weights.relative, input, relative);
+        result = spine_matvec(device.relative, weights.relative, input, relative);
         if (!result.ok()) return result;
 
         // K and V are convolved after projection and before their norm.
@@ -427,7 +469,7 @@ struct InklingRuntime::Impl {
             }
         }
 
-        result = matvec(weights.output, context, output);
+        result = spine_matvec(device.output, weights.output, context, output);
         if (!result.ok()) return result;
         return short_conv(layer_state, weights, kConvAttn, output);
     }
@@ -436,12 +478,32 @@ struct InklingRuntime::Impl {
 
     ValidationResult dense_mlp(const MappedMatrix& gate_up,
                                const MappedMatrix& down, float global_scale,
+                               const DeviceLayer* device,
                                std::span<const float> input,
                                std::span<float> output) {
+        ValidationResult result;
+        const auto half = gate_up.rows / 2U;
+        std::vector<float> activated(half);
+        if (cuda_enabled && device != nullptr && device->dense_gate.valid()) {
+            // The device holds gate and up already de-interleaved, so the
+            // strided read the host path needs disappears here.
+            std::vector<float> gate(half);
+            std::vector<float> up(half);
+            result = cuda.matmul(device->dense_gate, input, 1U, gate);
+            if (!result.ok()) return result;
+            result = cuda.matmul(device->dense_up, input, 1U, up);
+            if (!result.ok()) return result;
+            for (std::uint64_t index = 0U; index < half; ++index) {
+                activated[index] = silu_f32(gate[index]) * up[index];
+            }
+            result = cuda.matmul(device->dense_down, activated, 1U, output);
+            if (!result.ok()) return result;
+            for (auto& element : output) element *= global_scale;
+            return result;
+        }
         std::vector<float> fused(gate_up.rows);
-        auto result = matvec(gate_up, input, fused);
+        result = matvec(gate_up, input, fused);
         if (!result.ok()) return result;
-        std::vector<float> activated(gate_up.rows / 2U);
         result = inkling_interleaved_swiglu_f32(activated, fused);
         if (!result.ok()) return result;
         result = matvec(down, activated, output);
@@ -450,12 +512,12 @@ struct InklingRuntime::Impl {
         return result;
     }
 
-    ValidationResult moe(const LayerWeights& layer, std::uint32_t index,
-                         std::span<const float> input,
+    ValidationResult moe(const LayerWeights& layer, const DeviceLayer& device,
+                         std::uint32_t index, std::span<const float> input,
                          std::span<float> output) {
         auto started = std::chrono::steady_clock::now();
         std::vector<float> logits(layer.gate.rows);
-        auto result = matvec(layer.gate, input, logits);
+        auto result = spine_matvec(device.gate, layer.gate, input, logits);
         if (!result.ok()) return result;
         auto route = inkling_route_sigmoid_sink(logits, layer.gate_bias, router,
                                                 kShared,
@@ -465,6 +527,10 @@ struct InklingRuntime::Impl {
             return result;
         }
         graph.moe_router_nanoseconds += elapsed_since(started);
+
+        if (cuda_enabled && device.resident) {
+            return device_moe(layer, device, index, route.value, input, output);
+        }
 
         std::fill(output.begin(), output.end(), 0.0F);
         std::vector<float> fused(kExpertUp);
@@ -510,6 +576,92 @@ struct InklingRuntime::Impl {
             }
         }
         graph.moe_shared_nanoseconds += elapsed_since(started);
+        return result;
+    }
+
+    // Two device commands per layer: one batch for the six routed experts and
+    // one for both sinks. They cannot share a command because a batch is
+    // single-encoding and the routed experts are NVFP4 while the sinks are
+    // BF16. Two batched launches still beat eight separate matmuls, whose
+    // serial launch overhead is an overlap defect rather than a volume one.
+    ValidationResult device_moe(const LayerWeights& layer,
+                                const DeviceLayer& device, std::uint32_t index,
+                                const InklingRoute& route,
+                                std::span<const float> input,
+                                std::span<float> output) {
+        ValidationResult result;
+        std::fill(output.begin(), output.end(), 0.0F);
+
+        // The NVFP4 batch requires unit coefficients: scaling before the down
+        // projection is not float-equal to scaling after it, and the reference
+        // scales after. Weights are applied on collection.
+        const auto accumulate = [&](std::span<const float> collected,
+                                    std::size_t experts, std::size_t offset) {
+            for (std::size_t position = 0U; position < experts; ++position) {
+                const float weight = route.weights[offset + position];
+                const auto* block = collected.data() + position * kHidden;
+                for (std::uint32_t element = 0U; element < kHidden; ++element) {
+                    output[element] += weight * block[element];
+                }
+            }
+        };
+
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<CudaMoeExpert> routed;
+        routed.reserve(kTopK);
+        std::vector<std::uint32_t> leased;
+        leased.reserve(kTopK);
+        const auto release_all = [&]() {
+            for (const auto expert : leased) {
+                expert_cache->release(device.slot, index, expert);
+            }
+            leased.clear();
+        };
+        for (std::uint32_t choice = 0U; choice < kTopK; ++choice) {
+            const auto expert = route.experts[choice];
+            auto staged = expert_cache->acquire(device.slot, index, expert,
+                                                layer.expert_gate_up,
+                                                layer.expert_down);
+            if (!staged.ok()) {
+                release_all();
+                result.errors = std::move(staged.errors);
+                return result;
+            }
+            leased.push_back(expert);
+            routed.push_back(CudaMoeExpert{&staged.value->gate,
+                                           &staged.value->up,
+                                           &staged.value->down, 1.0F});
+            graph.routed_expert_bytes += staged.value->device_bytes();
+        }
+        result = cuda.enqueue_moe(devices[device.slot], input, 1U, routed,
+                                  nullptr);
+        if (!result.ok()) {
+            release_all();
+            return result;
+        }
+        std::vector<float> collected(routed.size() * kHidden);
+        result = cuda.collect_moe(devices[device.slot], collected, {});
+        release_all();
+        if (!result.ok()) return result;
+        accumulate(collected, routed.size(), 0U);
+        graph.moe_routed_nanoseconds += elapsed_since(started);
+
+        const auto shared_started = std::chrono::steady_clock::now();
+        std::vector<CudaMoeExpert> sinks;
+        sinks.reserve(kShared);
+        for (std::uint32_t shared = 0U; shared < kShared; ++shared) {
+            sinks.push_back(CudaMoeExpert{&device.shared_gate[shared],
+                                          &device.shared_up[shared],
+                                          &device.shared_down[shared], 1.0F});
+        }
+        result = cuda.enqueue_moe(devices[device.slot], input, 1U, sinks,
+                                  nullptr);
+        if (!result.ok()) return result;
+        std::vector<float> shared_collected(sinks.size() * kHidden);
+        result = cuda.collect_moe(devices[device.slot], shared_collected, {});
+        if (!result.ok()) return result;
+        accumulate(shared_collected, sinks.size(), kTopK);
+        graph.moe_shared_nanoseconds += elapsed_since(shared_started);
         return result;
     }
 
@@ -575,6 +727,7 @@ struct InklingRuntime::Impl {
                                                        std::span<float>)>;
 
     ValidationResult run_block(const AttentionWeights& weights,
+                               const DeviceLayer& device,
                                LayerState& layer_state, std::span<float> hidden,
                                std::uint64_t token_position,
                                const FeedForward& feed_forward) {
@@ -583,8 +736,8 @@ struct InklingRuntime::Impl {
 
         auto started = std::chrono::steady_clock::now();
         rms_norm(normalized, hidden, weights.attention_norm);
-        auto result =
-            attention(weights, layer_state, normalized, token_position, delta);
+        auto result = attention(weights, device, layer_state, normalized,
+                                token_position, delta);
         if (!result.ok()) return result;
         graph.attention_nanoseconds += elapsed_since(started);
         for (std::uint32_t index = 0U; index < kHidden; ++index) {
@@ -613,19 +766,22 @@ struct InklingRuntime::Impl {
         for (std::uint32_t index = 0U; index < kLayers; ++index) {
             const auto& layer = layers[index];
             result = run_block(
-                layer.attention, state[index], hidden, token_position,
+                layer.attention, device_layers[index], state[index], hidden,
+                token_position,
                 [&](std::span<const float> input, std::span<float> output) {
                     if (!layer.sparse) {
                         const auto dense_started =
                             std::chrono::steady_clock::now();
-                        auto status =
-                            dense_mlp(layer.dense_gate_up, layer.dense_down,
-                                      layer.dense_global_scale, input, output);
+                        auto status = dense_mlp(
+                            layer.dense_gate_up, layer.dense_down,
+                            layer.dense_global_scale, &device_layers[index],
+                            input, output);
                         graph.dense_mlp_nanoseconds +=
                             elapsed_since(dense_started);
                         return status;
                     }
-                    return moe(layer, index, input, output);
+                    return moe(layer, device_layers[index], index, input,
+                               output);
                 });
             if (!result.ok()) return result;
         }
@@ -663,11 +819,14 @@ struct InklingRuntime::Impl {
         hidden.assign(kHidden, 0.0F);
         result = matvec(weights.input_projection, combined, hidden);
         if (!result.ok()) return result;
+        static const DeviceLayer kHostOnly;
         return run_block(
-            weights.attention, mtp_state[depth], hidden, token_position,
+            weights.attention, kHostOnly, mtp_state[depth], hidden,
+            token_position,
             [&](std::span<const float> input, std::span<float> output) {
                 return dense_mlp(weights.dense_gate_up, weights.dense_down,
-                                 weights.dense_global_scale, input, output);
+                                 weights.dense_global_scale, nullptr, input,
+                                 output);
             });
     }
 
@@ -677,7 +836,7 @@ struct InklingRuntime::Impl {
         std::vector<float> normalized(kHidden);
         rms_norm(normalized, hidden, final_norm);
         std::vector<float> full(unembedding.rows);
-        auto result = matvec(unembedding, normalized, full);
+        auto result = spine_matvec(device_unembed, unembedding, normalized, full);
         if (!result.ok()) return result;
         // muP divides the logits; the padded rows are then discarded.
         const float scale = 1.0F / kContract.logits_width_multiplier;
@@ -947,6 +1106,194 @@ struct InklingRuntime::Impl {
                                      std::span<const std::string> stop,
                                      const TokenStreamCallback& on_token);
 
+    // Faults every routed expert tensor into page cache. Touching one byte per
+    // page is enough; the kernel reads ahead, so this runs at sequential NVMe
+    // speed rather than at random-read speed.
+    ValidationResult warm_expert_pages() {
+        ValidationResult result;
+        std::uint64_t warmed = 0U;
+        volatile std::uint8_t sink = 0U;
+        for (std::uint32_t index = 0U; index < kLayers; ++index) {
+            if (!inkling_sparse_layer(index)) continue;
+            const auto mlp = inkling_layer_prefix(index) + "mlp.";
+            for (const auto& suffix :
+                 {std::string("experts.w13_weight"),
+                  std::string("experts.w13_weight.scale"),
+                  std::string("experts.w2_weight"),
+                  std::string("experts.w2_weight.scale")}) {
+                const auto* tensor = checkpoint->find(mlp + suffix);
+                if (tensor == nullptr) continue;
+                auto mapped = checkpoint->view(mlp + suffix);
+                if (!mapped.ok()) continue;
+                const auto* bytes =
+                    reinterpret_cast<const std::uint8_t*>(mapped.value.data());
+                for (std::size_t offset = 0U; offset < mapped.value.size();
+                     offset += 4096U) {
+                    sink = static_cast<std::uint8_t>(sink ^ bytes[offset]);
+                }
+                warmed += mapped.value.size();
+            }
+            if (config.load_progress) {
+                std::fprintf(stderr, "\rwarming experts %.1f GiB",
+                             static_cast<double>(warmed) /
+                                 (1024.0 * 1024.0 * 1024.0));
+            }
+        }
+        static_cast<void>(sink);
+        if (config.load_progress) std::fprintf(stderr, "\n");
+        return result;
+    }
+
+    // Uploads the resident spine and sizes the routed-expert cache from what
+    // it leaves behind. Layers round-robin over the devices, so a 16 GiB card
+    // and a 24 GiB card carry the same layer count but different cache shares.
+    ValidationResult initialize_devices() {
+        ValidationResult result;
+        device_layers.clear();
+        device_layers.resize(kLayers);
+        if (!config.enable_cuda) return result;
+        auto available = CudaBackend::available_devices();
+        if (available.empty()) return result;
+        devices.clear();
+        for (const auto device : config.devices) {
+            if (std::find(available.begin(), available.end(), device) !=
+                available.end()) {
+                devices.push_back(device);
+            }
+        }
+        if (devices.empty()) return result;
+        result = cuda.initialize(devices, config.vram_cache_fraction);
+        if (!result.ok()) return result;
+        resident_spine_bytes.assign(devices.size(), 0U);
+
+        const auto upload_linear = [&](std::size_t slot, const std::string& name,
+                                       std::uint64_t rows, std::uint64_t columns,
+                                       CudaWeight& target) {
+            auto module = checkpoint->linear(name, rows, columns);
+            if (!module.ok()) {
+                result.errors = std::move(module.errors);
+                return;
+            }
+            auto status = load_inkling_cuda_linear(*checkpoint, module.value,
+                                                   devices[slot], cuda, target);
+            if (!status.ok()) {
+                result.errors = std::move(status.errors);
+                return;
+            }
+            resident_spine_bytes[slot] += target.device_bytes();
+        };
+        const auto upload_half = [&](std::size_t slot, const std::string& name,
+                                     std::uint64_t slice, std::uint64_t rows,
+                                     std::uint64_t columns, bool up,
+                                     CudaWeight& target) {
+            auto status = load_inkling_cuda_interleaved_half(
+                *checkpoint, name, slice, rows, columns, up, devices[slot], cuda,
+                target);
+            if (!status.ok()) {
+                result.errors = std::move(status.errors);
+                return;
+            }
+            resident_spine_bytes[slot] += target.device_bytes();
+        };
+
+        for (std::uint32_t index = 0U; index < kLayers; ++index) {
+            auto& device = device_layers[index];
+            device.slot = index % devices.size();
+            const auto prefix = inkling_layer_prefix(index);
+            const auto attention = prefix + "attn.";
+            const auto mlp = prefix + "mlp.";
+            upload_linear(device.slot, attention + "wq_du.weight", kQueryWidth,
+                          kHidden, device.query);
+            upload_linear(device.slot, attention + "wk_dv.weight", kKvWidth,
+                          kHidden, device.key);
+            upload_linear(device.slot, attention + "wv_dv.weight", kKvWidth,
+                          kHidden, device.value);
+            upload_linear(device.slot, attention + "wr_du.weight", kRelWidth,
+                          kHidden, device.relative);
+            upload_linear(device.slot, attention + "wo_ud.weight", kHidden,
+                          kQueryWidth, device.output);
+            if (!inkling_sparse_layer(index)) {
+                upload_half(device.slot, mlp + "w13_dn.weight", 0U, kDenseUp,
+                            kHidden, false, device.dense_gate);
+                upload_half(device.slot, mlp + "w13_dn.weight", 0U, kDenseUp,
+                            kHidden, true, device.dense_up);
+                upload_linear(device.slot, mlp + "w2_md.weight", kHidden,
+                              kDenseInner, device.dense_down);
+            } else {
+                upload_linear(device.slot, mlp + "gate.weight",
+                              kExperts + kShared, kHidden, device.gate);
+                for (std::uint32_t shared = 0U; shared < kShared; ++shared) {
+                    upload_half(device.slot,
+                                mlp + "shared_experts.shared_w13_weight", shared,
+                                kExpertUp, kHidden, false,
+                                device.shared_gate[shared]);
+                    upload_half(device.slot,
+                                mlp + "shared_experts.shared_w13_weight", shared,
+                                kExpertUp, kHidden, true,
+                                device.shared_up[shared]);
+                    auto stack = checkpoint->view(
+                        mlp + "shared_experts.shared_w2_weight");
+                    if (!stack.ok()) {
+                        result.errors = std::move(stack.errors);
+                        return result;
+                    }
+                    const auto block = static_cast<std::size_t>(
+                        kHidden * kExpertInner * sizeof(std::uint16_t));
+                    CudaWeightDescriptor descriptor;
+                    descriptor.encoding = CudaWeightEncoding::Plain;
+                    descriptor.dtype = SafetensorsDtype::Bf16;
+                    descriptor.rows = kHidden;
+                    descriptor.columns = kExpertInner;
+                    auto status = cuda.upload(
+                        devices[device.slot], descriptor,
+                        stack.value.subspan(shared * block, block), {},
+                        device.shared_down[shared]);
+                    if (!status.ok()) {
+                        result.errors = std::move(status.errors);
+                        return result;
+                    }
+                    resident_spine_bytes[device.slot] +=
+                        device.shared_down[shared].device_bytes();
+                }
+            }
+            if (!result.ok()) return result;
+            device.resident = inkling_sparse_layer(index);
+        }
+
+        // The output head is the single largest spine tensor; it lands on the
+        // device with the most headroom rather than following the layer schedule.
+        std::size_t widest = 0U;
+        std::uint64_t widest_free = 0U;
+        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+            auto memory = CudaBackend::device_memory(devices[slot]);
+            if (!memory.ok()) continue;
+            if (memory.value.free_bytes > widest_free) {
+                widest_free = memory.value.free_bytes;
+                widest = slot;
+            }
+        }
+        upload_linear(widest, "model.llm.unembed.weight",
+                      kContract.padded_vocabulary_size, kHidden, device_unembed);
+        if (!result.ok()) return result;
+
+        // Whatever the spine left is expert cache. A device that cannot hold
+        // several experts is worse than useless, so it is reported rather than
+        // quietly configured to thrash.
+        std::vector<std::uint64_t> capacities;
+        capacities.reserve(devices.size());
+        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+            auto memory = CudaBackend::device_memory(devices[slot]);
+            const auto free_bytes = memory.ok() ? memory.value.free_bytes : 0U;
+            const auto budget = static_cast<std::uint64_t>(
+                static_cast<double>(free_bytes) * config.vram_cache_fraction);
+            capacities.push_back(budget);
+        }
+        expert_cache = std::make_unique<InklingExpertCache>(
+            *checkpoint, cuda, devices, capacities);
+        cuda_enabled = true;
+        return result;
+    }
+
     ValidationResult load_mtp(std::uint32_t depth) {
         auto& weights = mtp[depth];
         const auto prefix = inkling_mtp_prefix(depth);
@@ -1069,6 +1416,13 @@ ValidationResult InklingRuntime::initialize(const std::string& model_directory,
     }
     if (config.load_progress) std::fprintf(stderr, "\n");
     static_cast<void>(reader);
+
+    result = impl_->initialize_devices();
+    if (!result.ok()) return result;
+    if (config.warm_expert_pages && impl_->cuda_enabled) {
+        result = impl_->warm_expert_pages();
+        if (!result.ok()) return result;
+    }
 
     impl_->reset_sequence();
     impl_->initialized = true;
@@ -1222,6 +1576,7 @@ InklingGenerationResult InklingRuntime::Impl::generate(
     result.metrics.prefill_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
             .count();
+    result.metrics.prefill_graph = impl.graph;
 
     const auto end_of_text = impl.tokenizer.token_id("<|end_message|>");
     const auto end_of_stream = impl.tokenizer.token_id("<|endoftext|>");
@@ -1317,6 +1672,19 @@ InklingGenerationResult InklingRuntime::Impl::generate(
     result.metrics.decode_tokens = result.generated_token_ids.size();
     result.metrics.graph = impl.graph;
     result.metrics.checkpoint_reads = impl.checkpoint->stats();
+    result.metrics.cuda = impl.cuda.stats();
+    result.metrics.device.enabled = impl.cuda_enabled;
+    result.metrics.device.resident_spine_bytes = impl.resident_spine_bytes;
+    if (impl.expert_cache != nullptr) {
+        const auto cache = impl.expert_cache->stats();
+        result.metrics.device.expert_hits = cache.hits;
+        result.metrics.device.expert_misses = cache.misses;
+        result.metrics.device.expert_evictions = cache.evictions;
+        result.metrics.device.expert_stage_nanoseconds = cache.stage_nanoseconds;
+        result.metrics.device.expert_staged_bytes = cache.staged_bytes;
+        result.metrics.device.cache_capacity_bytes = cache.capacity_bytes;
+        result.metrics.device.cache_peak_bytes = cache.peak_bytes;
+    }
     result.metrics.rss_bytes = process_resident_set_bytes();
     result.text = std::move(text);
     impl.position = next_position;

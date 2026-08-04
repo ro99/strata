@@ -50,6 +50,7 @@ add_library(strata_core STATIC
     src/laguna_runtime.cpp
     src/inkling_ops.cpp
     src/inkling_checkpoint.cpp
+    src/inkling_device.cpp
     src/inkling_runtime.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp

@@ -2,6 +2,7 @@
 
 #include "strata/chat_protocol.hpp"
 #include "strata/checkpoint.hpp"
+#include "strata/cuda_backend.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
@@ -15,6 +16,18 @@
 namespace strata {
 
 struct InklingRuntimeConfig {
+    std::vector<int> devices{0, 1, 2};
+    // Fraction of each device's free VRAM the runtime may claim. What the
+    // resident spine does not use becomes routed-expert cache.
+    double vram_cache_fraction{0.85};
+    // Runs the experts and the resident spine on the devices. Off falls back
+    // to the host reference path, which is the correctness oracle.
+    bool enable_cuda{true};
+    // Faults the routed expert set into page cache at load. The set is 154 GiB
+    // and host memory is larger, so steady-state decode should never touch
+    // NVMe; without this the VRAM cache misses fault cold pages and the device
+    // waits on storage instead of on PCIe.
+    bool warm_expert_pages{true};
     std::uint32_t maximum_context_tokens{2048U};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
@@ -43,6 +56,25 @@ struct InklingGraphStats {
     std::uint64_t routed_expert_bytes{};
 };
 
+struct InklingDeviceStats {
+    std::uint64_t expert_hits{};
+    std::uint64_t expert_misses{};
+    std::uint64_t expert_evictions{};
+    std::uint64_t expert_stage_nanoseconds{};
+    std::uint64_t expert_staged_bytes{};
+    std::vector<std::uint64_t> cache_capacity_bytes;
+    std::vector<std::uint64_t> cache_peak_bytes;
+    std::vector<std::uint64_t> resident_spine_bytes;
+    bool enabled{};
+
+    [[nodiscard]] double hit_rate() const noexcept {
+        const auto total = expert_hits + expert_misses;
+        return total == 0U ? 0.0
+                           : static_cast<double>(expert_hits) /
+                                 static_cast<double>(total);
+    }
+};
+
 struct InklingSpeculationStats {
     std::uint64_t proposed{};
     std::uint64_t accepted{};
@@ -62,7 +94,13 @@ struct InklingRunMetrics {
     double decode_seconds{};
     CheckpointReadStats checkpoint_reads;
     InklingGraphStats graph;
+    // Snapshot taken at the end of prefill. Decode-only cost is the difference
+    // against `graph`; the charter requires the two phases be separated, and a
+    // cold prefill otherwise dominates every per-phase share.
+    InklingGraphStats prefill_graph;
     InklingSpeculationStats speculation;
+    InklingDeviceStats device;
+    CudaBackendStats cuda;
     std::uint64_t rss_bytes{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {

@@ -3,6 +3,7 @@
 #include "strata/chat_protocol.hpp"
 #include "strata/inkling_runtime.hpp"
 #include "strata/model_adapter.hpp"
+#include "strata/cuda_backend.hpp"
 #include "strata/tokenizer.hpp"
 
 #include <algorithm>
@@ -79,6 +80,9 @@ TEST_CASE("Inkling runtime generates the expected continuation") {
     }
     strata::InklingRuntimeConfig config;
     config.maximum_context_tokens = 64U;
+    // Faulting 154 GiB into page cache is a production load-time cost, not a
+    // test cost; the device path is exercised either way.
+    config.warm_expert_pages = false;
     strata::InklingRuntime runtime;
     const auto initialized =
         runtime.initialize(inkling_model_path().string(), config);
@@ -113,6 +117,9 @@ TEST_CASE("Inkling teacher forcing is deterministic and ranks the known token") 
     }
     strata::InklingRuntimeConfig config;
     config.maximum_context_tokens = 64U;
+    // Faulting 154 GiB into page cache is a production load-time cost, not a
+    // test cost; the device path is exercised either way.
+    config.warm_expert_pages = false;
     strata::InklingRuntime runtime;
     REQUIRE(runtime.initialize(inkling_model_path().string(), config).ok());
 
@@ -156,4 +163,74 @@ TEST_CASE("Inkling teacher forcing is deterministic and ranks the known token") 
     // An inverted NVFP4 scale or a lost softmax shift surfaces as a non-finite
     // logit long before it surfaces as bad text.
     for (const auto& value : first.back()) REQUIRE(std::isfinite(value));
+}
+
+TEST_CASE("Inkling device logits match the host oracle") {
+    if (!inkling_checkpoint_present()) {
+        SKIP("pinned Inkling-Small-NVFP4 checkpoint is absent");
+    }
+    if (strata::CudaBackend::available_devices().empty()) {
+        SKIP("no CUDA device is available");
+    }
+    auto tokenizer = strata::ModelTokenizer::load(
+        (inkling_model_path() / "tokenizer.json").string());
+    REQUIRE(tokenizer.ok());
+    const auto prompt = tokenizer.value.encode("The capital of France is");
+    REQUIRE(prompt.ok());
+
+    const auto run = [&](bool cuda, std::vector<std::vector<float>>& logits) {
+        strata::InklingRuntimeConfig config;
+        config.maximum_context_tokens = 64U;
+        config.warm_expert_pages = false;
+        config.enable_cuda = cuda;
+        strata::InklingRuntime runtime;
+        const auto initialized =
+            runtime.initialize(inkling_model_path().string(), config);
+        for (const auto& error : initialized.errors) {
+            std::cerr << "initialize: " << error << '\n';
+        }
+        REQUIRE(initialized.ok());
+        const auto status = runtime.forward_logits(prompt.value, logits);
+        for (const auto& error : status.errors) {
+            std::cerr << "forward: " << error << '\n';
+        }
+        REQUIRE(status.ok());
+    };
+
+    std::vector<std::vector<float>> host;
+    std::vector<std::vector<float>> device;
+    run(false, host);
+    run(true, device);
+    REQUIRE(host.size() == device.size());
+
+    // The device path reassociates every reduction and the NVFP4 kernel
+    // accumulates in a different order, so the contract is agreement on the
+    // decision and a bounded relative deviation, not bit equality.
+    for (std::size_t row = 0U; row < host.size(); ++row) {
+        REQUIRE(host[row].size() == device[row].size());
+        const auto host_best = static_cast<std::uint32_t>(std::distance(
+            host[row].begin(),
+            std::max_element(host[row].begin(), host[row].end())));
+        const auto device_best = static_cast<std::uint32_t>(std::distance(
+            device[row].begin(),
+            std::max_element(device[row].begin(), device[row].end())));
+        REQUIRE(host_best == device_best);
+
+        double squared = 0.0;
+        double reference = 0.0;
+        for (std::size_t index = 0U; index < host[row].size(); ++index) {
+            REQUIRE(std::isfinite(device[row][index]));
+            const double delta = static_cast<double>(device[row][index]) -
+                                 host[row][index];
+            squared += delta * delta;
+            reference += static_cast<double>(host[row][index]) * host[row][index];
+        }
+        const double relative =
+            reference > 0.0 ? std::sqrt(squared / reference) : 0.0;
+        if (relative > 2.0e-2) {
+            std::cerr << "row " << row << " relative deviation " << relative
+                      << '\n';
+        }
+        REQUIRE(relative <= 2.0e-2);
+    }
 }

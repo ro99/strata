@@ -7,10 +7,10 @@ standalone (28.62 under `numactl --interleave=all`) in its *most favourable*
 decomposition. The ceiling is below the floor, so the mechanism cannot win at
 this operating point and the planned microbenchmark cannot change the answer.
 
-Predecessor documents live on other branches:
-`git show infra/dsv4-external-stack-teardown:docs/experiments/0050-dsv4-external-stack-teardown-2026-08-04.md`,
-`...:docs/experiments/0051-dsv4-host-expert-kernel-2026-08-04.md`, and
-`git show perf/dsv4-device-attention-chain:docs/experiments/0053-dsv4-device-attention-chain-2026-08-04.md`.
+Predecessors 0050, 0051 and 0053 are alongside this file. They were written on
+three separate task branches and landed together with this record; the gate
+table this experiment corrects was built while they were not mutually
+reachable.
 
 ## The mechanism under examination
 

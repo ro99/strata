@@ -1,6 +1,7 @@
 #include "strata/tokenizer.hpp"
 
 #include "json_cursor.hpp"
+#include "inkling_unicode.hpp"
 #include "laguna_unicode.hpp"
 
 #include <algorithm>
@@ -638,6 +639,132 @@ void pretokenize_laguna_chunk(std::string_view text,
     return result;
 }
 
+// Length in runes of the contraction suffix at `cursor`, or zero. Inkling
+// attaches it to the letter run rather than matching it as its own
+// alternative, so it is a suffix test, not a leading one.
+[[nodiscard]] std::size_t inkling_contraction(const std::vector<Rune>& runes,
+                                              std::size_t cursor) noexcept {
+    if (cursor >= runes.size() || runes[cursor].codepoint != '\'') return 0U;
+    std::string tail;
+    for (std::size_t index = cursor + 1U;
+         index < runes.size() && index < cursor + 3U; ++index) {
+        if (runes[index].codepoint >= 0x80U) break;
+        tail.push_back(static_cast<char>(
+            ascii_lower(static_cast<unsigned char>(runes[index].codepoint))));
+    }
+    if (tail.starts_with("re") || tail.starts_with("ve") ||
+        tail.starts_with("ll")) {
+        return 3U;
+    }
+    if (!tail.empty() &&
+        std::string_view("stmd").find(tail[0]) != std::string_view::npos) {
+        return 2U;
+    }
+    return 0U;
+}
+
+// Inkling's pre-tokenizer, applied with Isolated behavior so the alternatives
+// are tried in order at each position:
+//   [^\r\n\p{L}\p{N}]?[Upper]*[Lower]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//   |[^\r\n\p{L}\p{N}]?[Upper]+[Lower]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//   |\p{N}{1,3}
+//   | ?[^\s\p{L}\p{N}]+[\r\n/]*
+//   |\s*[\r\n]+ |\s+(?!\S) |\s+
+// where Upper is Lu|Lt|Lm|Lo|M and Lower is Ll|Lm|Lo|M. Two properties
+// distinguish it from the Laguna pattern: digits group in runs of up to three
+// rather than one at a time, and the punctuation tail absorbs '/' alongside
+// line breaks.
+[[nodiscard]] ParseResult<std::vector<std::string>> pretokenize_inkling(
+    std::string_view text, const std::vector<Rune>& runes) {
+    ParseResult<std::vector<std::string>> result;
+    const auto upper = [&](std::size_t index) {
+        return index < runes.size() &&
+               detail::inkling_upper_letter(runes[index].codepoint);
+    };
+    const auto lower = [&](std::size_t index) {
+        return index < runes.size() &&
+               detail::inkling_lower_letter(runes[index].codepoint);
+    };
+    const auto letter = [&](std::size_t index) {
+        return index < runes.size() &&
+               detail::laguna_letter(runes[index].codepoint);
+    };
+    const auto number = [&](std::size_t index) {
+        return index < runes.size() &&
+               detail::laguna_number(runes[index].codepoint);
+    };
+    const auto space = [&](std::size_t index) {
+        return index < runes.size() &&
+               detail::laguna_space(runes[index].codepoint);
+    };
+
+    std::size_t cursor = 0U;
+    while (cursor < runes.size()) {
+        const auto begin = cursor;
+
+        // Both letter alternatives share the optional single-character prefix,
+        // which is any non-letter, non-digit that is not a line break.
+        std::size_t scan = cursor;
+        const bool prefixed = !letter(scan) && !number(scan) &&
+                              !newline(runes[scan]) && (upper(scan + 1U) ||
+                                                        lower(scan + 1U));
+        if (prefixed) ++scan;
+        const auto run_start = scan;
+        while (upper(scan) && !lower(scan)) ++scan;
+        const auto after_upper = scan;
+        while (lower(scan)) ++scan;
+        // Caseless letters satisfy both classes, so a run that consumed
+        // nothing under the strict-upper test still advances here.
+        if (scan == run_start) {
+            while (upper(scan) || lower(scan)) ++scan;
+        }
+        if (scan > run_start && (after_upper > run_start || scan > run_start)) {
+            scan += inkling_contraction(runes, scan);
+            cursor = scan;
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+
+        if (number(cursor)) {
+            while (cursor < runes.size() && cursor - begin < 3U &&
+                   number(cursor)) {
+                ++cursor;
+            }
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+
+        //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+        scan = cursor;
+        const auto symbol = [&](std::size_t index) {
+            return index < runes.size() && !space(index) && !letter(index) &&
+                   !number(index);
+        };
+        if (runes[scan].codepoint == ' ' && symbol(scan + 1U)) ++scan;
+        if (symbol(scan)) {
+            while (symbol(scan)) ++scan;
+            while (scan < runes.size() &&
+                   (newline(runes[scan]) || runes[scan].codepoint == '/')) {
+                ++scan;
+            }
+            cursor = scan;
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+
+        if (space(cursor)) {
+            cursor = laguna_whitespace_end(runes, cursor);
+            if (cursor == begin) ++cursor;
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+
+        ++cursor;
+        emit_pretoken(text, runes, begin, cursor, result.value);
+    }
+    return result;
+}
+
 }  // namespace
 
 ParseResult<std::vector<std::string>> pretokenize(
@@ -656,6 +783,9 @@ ParseResult<std::vector<std::string>> pretokenize(
     }
     if (contract == TokenizerContract::Laguna) {
         return pretokenize_laguna(text, runes.value);
+    }
+    if (contract == TokenizerContract::Inkling) {
+        return pretokenize_inkling(text, runes.value);
     }
     ParseResult<std::vector<std::string>> result;
     result.value.emplace_back(text);
@@ -727,14 +857,19 @@ ParseResult<ModelTokenizer> ModelTokenizer::load(const std::string& path) {
             result.value.vocabulary_.size() == 100352U &&
             result.value.merge_ranks_.size() == 100026U &&
             added_tokens.size() == 70U && !result.value.ignore_merges_;
-        if (!glm52 && !deepseek_v4 && !gemma4 && !laguna) {
+        const bool inkling = saw_added && saw_model &&
+            result.value.vocabulary_.size() == 199998U &&
+            result.value.merge_ranks_.size() == 446189U &&
+            added_tokens.size() == 60U && result.value.ignore_merges_;
+        if (!glm52 && !deepseek_v4 && !gemma4 && !laguna && !inkling) {
             throw std::runtime_error(
                 "tokenizer does not match a pinned GLM-5.2, DeepSeek-V4, Gemma-4, "
-                "or Laguna contract");
+                "Laguna, or Inkling contract");
         }
         result.value.contract_ = gemma4 ? TokenizerContract::Gemma4
             : deepseek_v4 ? TokenizerContract::DeepSeekV4
             : laguna      ? TokenizerContract::Laguna
+            : inkling     ? TokenizerContract::Inkling
                           : TokenizerContract::Glm52;
         result.value.sentencepiece_bpe_ = gemma4;
         result.value.added_tokens_.reserve(added_tokens.size());

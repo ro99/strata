@@ -18,6 +18,7 @@ enum class TokenizerContract : std::uint8_t {
     DeepSeekV4,
     Gemma4,
     Laguna,
+    Inkling,
 };
 
 [[nodiscard]] ParseResult<std::vector<std::string>> pretokenize(

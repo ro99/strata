@@ -4,6 +4,7 @@
 #include "strata/inkling_ops.hpp"
 #include "strata/model.hpp"
 #include "strata/model_adapter.hpp"
+#include "strata/tokenizer.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -240,4 +241,50 @@ TEST_CASE("real Inkling-Small NVFP4 experts dequantize to the BF16 scale") {
     // inverted convention lands near 10^5.
     REQUIRE(rms > 1.0e-3);
     REQUIRE(rms < 1.0);
+}
+
+TEST_CASE("real Inkling-Small tokenizer round-trips through the pinned contract") {
+    const auto path = inkling_model_path() / "tokenizer.json";
+    if (!std::filesystem::exists(path)) {
+        SKIP("pinned Inkling-Small tokenizer is absent");
+    }
+    auto tokenizer = strata::ModelTokenizer::load(path.string());
+    for (const auto& error : tokenizer.errors) {
+        std::cerr << "tokenizer error: " << error << '\n';
+    }
+    REQUIRE(tokenizer.ok());
+
+    const std::vector<std::string> samples{
+        "Hello, world!",
+        "The quick brown fox jumps over 1234 lazy dogs.",
+        "  leading and trailing whitespace  ",
+        "CamelCaseIdentifier and snake_case_name",
+        "path/to/file.txt\nsecond line\n\n third",
+        "don't can't we've they'll I'd it's",
+        "unicode: caf\xC3\xA9 na\xC3\xAFve \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E",
+        "numbers 1 12 123 1234 12345 end",
+    };
+    for (const auto& sample : samples) {
+        const auto encoded = tokenizer.value.encode(sample);
+        REQUIRE(encoded.ok());
+        REQUIRE(!encoded.value.empty());
+        const auto decoded = tokenizer.value.decode(encoded.value);
+        REQUIRE(decoded.ok());
+        if (decoded.value != sample) {
+            std::cerr << "round trip mismatch: [" << sample << "] -> ["
+                      << decoded.value << "]\n";
+        }
+        REQUIRE(decoded.value == sample);
+    }
+
+    // Digits group in runs of at most three, which is what separates this
+    // pattern from Laguna's one-digit-at-a-time rule.
+    const auto grouped = tokenizer.value.encode("12345");
+    REQUIRE(grouped.ok());
+    REQUIRE(grouped.value.size() == 2U);
+
+    // The control tokens the chat template depends on must resolve.
+    REQUIRE(tokenizer.value.token_id("<|message_user|>") >= 0);
+    REQUIRE(tokenizer.value.token_id("<|message_model|>") >= 0);
+    REQUIRE(tokenizer.value.token_id("<|end_message|>") >= 0);
 }

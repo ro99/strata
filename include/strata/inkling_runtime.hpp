@@ -1,4 +1,124 @@
 #pragma once
 
+#include "strata/chat_protocol.hpp"
+#include "strata/checkpoint.hpp"
+#include "strata/sampling.hpp"
+#include "strata/types.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
 namespace strata {
+
+struct InklingRuntimeConfig {
+    std::uint32_t maximum_context_tokens{2048U};
+    double sampling_temperature{};
+    std::uint64_t sampling_seed{33'377'335U};
+    bool verbose{};
+    bool load_progress{};
+    // Runs the MTP depth blocks to propose tokens the backbone then verifies.
+    // Off by default: acceptance has not been measured on this checkpoint, and
+    // an unmeasured draft adds compute to every step.
+    bool enable_mtp_speculation{};
+    std::uint32_t speculation_depth{};
+    std::uint64_t request_id{};
+};
+
+struct InklingGraphStats {
+    std::uint64_t forward_tokens{};
+    std::uint64_t embedding_nanoseconds{};
+    std::uint64_t attention_nanoseconds{};
+    std::uint64_t short_conv_nanoseconds{};
+    std::uint64_t dense_mlp_nanoseconds{};
+    std::uint64_t moe_router_nanoseconds{};
+    std::uint64_t moe_routed_nanoseconds{};
+    std::uint64_t moe_shared_nanoseconds{};
+    std::uint64_t output_head_nanoseconds{};
+    // Routed-expert weight bytes actually touched, which is the term the
+    // tiered-memory cost model is built around.
+    std::uint64_t routed_expert_bytes{};
+};
+
+struct InklingSpeculationStats {
+    std::uint64_t proposed{};
+    std::uint64_t accepted{};
+
+    [[nodiscard]] double acceptance_rate() const noexcept {
+        return proposed > 0U ? static_cast<double>(accepted) /
+                                   static_cast<double>(proposed)
+                             : 0.0;
+    }
+};
+
+struct InklingRunMetrics {
+    std::uint64_t prompt_tokens{};
+    std::uint64_t prefill_tokens{};
+    std::uint64_t decode_tokens{};
+    double prefill_seconds{};
+    double decode_seconds{};
+    CheckpointReadStats checkpoint_reads;
+    InklingGraphStats graph;
+    InklingSpeculationStats speculation;
+    std::uint64_t rss_bytes{};
+
+    [[nodiscard]] double prefill_tokens_per_second() const noexcept {
+        return prefill_seconds > 0.0
+            ? static_cast<double>(prefill_tokens) / prefill_seconds : 0.0;
+    }
+    [[nodiscard]] double decode_tokens_per_second() const noexcept {
+        return decode_seconds > 0.0
+            ? static_cast<double>(decode_tokens) / decode_seconds : 0.0;
+    }
+};
+
+struct InklingGenerationResult {
+    std::string text;
+    std::vector<std::uint32_t> prompt_token_ids;
+    std::vector<std::uint32_t> generated_token_ids;
+    std::vector<TokenLogprob> logprobs;
+    InklingRunMetrics metrics;
+    std::vector<std::string> errors;
+    bool stopped{};
+
+    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
+};
+
+class InklingRuntime {
+public:
+    InklingRuntime();
+    ~InklingRuntime();
+    InklingRuntime(InklingRuntime&&) noexcept;
+    InklingRuntime& operator=(InklingRuntime&&) noexcept;
+    InklingRuntime(const InklingRuntime&) = delete;
+    InklingRuntime& operator=(const InklingRuntime&) = delete;
+
+    [[nodiscard]] ValidationResult initialize(
+        const std::string& model_directory,
+        const InklingRuntimeConfig& config = {});
+    [[nodiscard]] InklingGenerationResult generate_stream(
+        std::string_view prompt, std::uint32_t maximum_new_tokens,
+        const TokenStreamCallback& on_token = {});
+    [[nodiscard]] InklingGenerationResult generate_chat_stream(
+        std::span<const ChatMessage> messages,
+        std::uint32_t maximum_new_tokens, const SamplingOptions& sampling,
+        std::span<const std::string> stop,
+        const TokenStreamCallback& on_token = {});
+
+    // Teacher-forcing oracle: resets the sequence, runs the backbone over
+    // `tokens`, and returns the next-token logits at each position. This is the
+    // surface the correctness gates use, so it is exact and carries no
+    // sampling state.
+    [[nodiscard]] ValidationResult forward_logits(
+        std::span<const std::uint32_t> tokens,
+        std::vector<std::vector<float>>& logits);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace strata

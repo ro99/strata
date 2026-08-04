@@ -1352,4 +1352,72 @@ std::string render_laguna_chat_prompt(std::span<const ChatMessage> messages,
     return output;
 }
 
+std::string render_inkling_user_prompt(std::string_view user_text,
+                                       double reasoning_effort) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(user_text)}};
+    return render_inkling_chat_prompt(messages, reasoning_effort);
+}
+
+std::string render_inkling_chat_prompt(std::span<const ChatMessage> messages,
+                                       double reasoning_effort) {
+    // The template emits the thinking-effort system message exactly once,
+    // immediately before the first non-system message, and again at the end if
+    // no such message ever appeared. Emitting it twice, or in the wrong place,
+    // changes the token sequence the model was trained on.
+    const auto role_token = [](ChatRole role) -> std::string_view {
+        switch (role) {
+            case ChatRole::User: return "<|message_user|>";
+            case ChatRole::Assistant: return "<|message_model|>";
+            case ChatRole::System: return "<|message_system|>";
+            case ChatRole::Tool: return "<|message_tool|>";
+        }
+        return "<|message_user|>";
+    };
+    const auto effort_block = [&]() {
+        std::string block = "<|message_system|><|content_text|>Thinking effort level: ";
+        const double clamped = std::clamp(reasoning_effort, 0.0, 0.99);
+        if (clamped == 0.0) {
+            block += "0";
+        } else {
+            // Jinja renders the float with Python's repr, which drops trailing
+            // zeros; 0.9 must not become "0.900000".
+            std::string rendered = std::to_string(clamped);
+            while (rendered.size() > 1U && rendered.back() == '0') rendered.pop_back();
+            if (!rendered.empty() && rendered.back() == '.') rendered.pop_back();
+            block += rendered;
+        }
+        block += "<|end_message|>";
+        return block;
+    };
+
+    std::string output;
+    bool effort_emitted = false;
+    for (const auto& message : messages) {
+        if (!effort_emitted && message.role != ChatRole::System) {
+            output += effort_block();
+            effort_emitted = true;
+        }
+        const auto token = role_token(message.role);
+        if (message.role == ChatRole::Tool) {
+            output += token;
+            output += message.name;
+            output += "<|content_text|>";
+            output += message.content;
+            output += "<|end_message|>";
+            continue;
+        }
+        output += token;
+        output += "<|content_text|>";
+        output += message.content;
+        output += "<|end_message|>";
+        if (message.role == ChatRole::Assistant) {
+            output += "<|content_model_end_sampling|>";
+        }
+    }
+    if (!effort_emitted) output += effort_block();
+    output += "<|message_model|>";
+    return output;
+}
+
 }  // namespace strata

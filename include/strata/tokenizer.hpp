@@ -84,5 +84,12 @@ private:
 // template, so the caller must encode without adding special tokens.
 [[nodiscard]] std::string render_laguna_chat_prompt(
     std::span<const ChatMessage> messages, bool enable_thinking = true);
+[[nodiscard]] std::string render_inkling_user_prompt(
+    std::string_view user_text, double reasoning_effort = 0.9);
+// Reproduces the checkpoint's chat template. The thinking-effort system
+// message is emitted once, before the first non-system message, and the
+// template has no BOS of its own.
+[[nodiscard]] std::string render_inkling_chat_prompt(
+    std::span<const ChatMessage> messages, double reasoning_effort = 0.9);
 
 }  // namespace strata

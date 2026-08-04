@@ -126,6 +126,9 @@ target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 
+add_executable(strata-inkling-probe apps/strata_inkling_probe.cpp)
+target_link_libraries(strata-inkling-probe PRIVATE strata_core)
+
 add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
 target_link_libraries(strata-laguna-profile PRIVATE strata_core)
 

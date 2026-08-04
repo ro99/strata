@@ -16,6 +16,7 @@ enum class ArchitectureKind : std::uint8_t {
     GlmMoeDsa,
     Gemma4,
     Laguna,
+    Inkling,
 };
 
 enum class AttentionKind : std::uint8_t {
@@ -25,6 +26,10 @@ enum class AttentionKind : std::uint8_t {
     Mla,
     HybridCompressedSparse,
     HybridLocalGlobal,
+    // Interleaved sliding/full attention whose position signal is a learned
+    // per-head relative bias on the pre-softmax logits, with no rotary
+    // embedding anywhere in the model.
+    HybridLocalGlobalRelative,
 };
 
 enum class RouterSelectionKind : std::uint8_t {
@@ -194,6 +199,45 @@ struct LagunaSpec {
     bool query_key_norm{};
 };
 
+struct InklingSpec {
+    std::uint32_t attention_heads{};
+    std::uint32_t key_value_heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t relative_dim{};
+    std::uint32_t global_relative_extent{};
+    std::uint32_t local_relative_extent{};
+    std::uint32_t sliding_window{};
+    std::uint32_t global_attention_period{};
+    std::uint32_t short_conv_kernel{};
+    std::uint32_t dense_intermediate_size{};
+    // Routed experts below this layer are plain BF16; from it on they are NVFP4.
+    std::uint32_t quantized_expert_start_layer{};
+    std::uint32_t padded_vocabulary_size{};
+    std::uint32_t mtp_layers{};
+    std::uint32_t log_scaling_position_floor{};
+    float log_scaling_alpha{};
+    float rms_epsilon{};
+    float attention_scale{};
+    float logits_width_multiplier{};
+    // Four depthwise causal convolutions per layer: K, V, attention output and
+    // MLP output. Without them the residual stream is wrong from layer 0.
+    bool short_conv_streams{};
+    // The two shared experts contribute router logits and absorb probability
+    // mass but are never top-k candidates.
+    bool shared_expert_sink{};
+    // Selected routed logits and both shared logits are renormalized together
+    // by log-sigmoid followed by a softmax over the joint set.
+    bool log_sigmoid_renormalization{};
+    // Gate rows are followed by a learned scalar multiplying the routed weights.
+    bool router_global_scale{};
+    // Checkpoint w13 rows interleave gate and up as [g0, u0, g1, u1, ...].
+    bool interleaved_gate_up{};
+    // RMSNorm applied to the embedding rows before the first layer.
+    bool embedding_norm{};
+    // Per-head RMSNorm on Q and K, which is why attention_scale is 1/head_dim.
+    bool query_key_norm{};
+};
+
 struct ModelSpec {
     std::string name;
     ArchitectureKind architecture{ArchitectureKind::Dense};
@@ -206,6 +250,7 @@ struct ModelSpec {
     DeepSeekV4Spec deepseek_v4;
     Gemma4Spec gemma4;
     LagunaSpec laguna;
+    InklingSpec inkling;
     std::uint32_t quant_bits{kMinimumQuantBits};
     std::uint32_t hidden_size{};
     std::uint32_t layer_count{};
@@ -227,6 +272,9 @@ struct ModelSpec {
     const ModelSpec& spec);
 [[nodiscard]] ModelSpec laguna_s21_nvfp4_spec();
 [[nodiscard]] ValidationResult validate_laguna_s21_nvfp4(
+    const ModelSpec& spec);
+[[nodiscard]] ModelSpec inkling_small_nvfp4_spec();
+[[nodiscard]] ValidationResult validate_inkling_small_nvfp4(
     const ModelSpec& spec);
 
 }  // namespace strata

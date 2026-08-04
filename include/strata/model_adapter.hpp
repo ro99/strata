@@ -183,4 +183,105 @@ inline constexpr LagunaExecutionContract kLagunaExecutionContract{
            layer < kLagunaExecutionContract.layer_count;
 }
 
+// Inkling-Small-NVFP4 (Thinking Machines). A 42-layer decoder with no rotary
+// embedding at all: position enters through a learned per-head relative bias
+// added to the pre-softmax logits. Every layer carries four depthwise causal
+// short convolutions (K, V, attention output, MLP output). Layers 0 and 1 are
+// dense; layers 2..41 are a 256-expert top-6 MoE with two shared "sink"
+// experts that score in the router but are never selection candidates. Routed
+// experts are NVFP4 (E2M1 pairs, group-16 E4M3 scales, per-expert FP32 global
+// scale) for layers 3..41; layer 2 ships plain BF16 experts and every other
+// module in the checkpoint is BF16.
+struct InklingExecutionContract {
+    std::uint32_t hidden_size;
+    std::uint32_t layer_count;
+    std::uint32_t attention_heads;
+    std::uint32_t key_value_heads;
+    std::uint32_t head_dim;
+    // Width of the per-head relative branch `r`, and the number of distance
+    // buckets its projection spans. Local layers span exactly their window.
+    std::uint32_t relative_dim;
+    std::uint32_t global_relative_extent;
+    std::uint32_t local_relative_extent;
+    std::uint32_t sliding_window;
+    std::uint32_t global_attention_period;
+    std::uint32_t short_conv_kernel;
+    std::uint32_t dense_intermediate_size;
+    std::uint32_t expert_intermediate_size;
+    std::uint32_t routed_experts;
+    std::uint32_t experts_per_token;
+    std::uint32_t shared_experts;
+    std::uint32_t dense_prefix_layers;
+    // Routed experts below this layer ship plain BF16; from it on they are
+    // NVFP4. Only layer 2 is unquantized.
+    std::uint32_t quantized_expert_start_layer;
+    std::uint32_t padded_vocabulary_size;
+    // Logits are computed over the padded table and truncated to this width.
+    std::uint32_t vocabulary_size;
+    std::uint32_t maximum_context_tokens;
+    std::uint32_t nvfp4_group_size;
+    std::uint32_t mtp_layers;
+    // Long-context temperature: tau = 1 + alpha*log(max(1, (pos+1)/n_floor)),
+    // applied to normalized queries and relative logits on global layers only.
+    std::uint32_t log_scaling_position_floor;
+    float log_scaling_alpha;
+    float rms_epsilon;
+    float routed_scale;
+    // Q and K are per-head RMS-normed to unit norm, so the reference divides
+    // logits by head_dim rather than its square root.
+    float attention_scale;
+    // Final logits are divided by this muP width multiplier.
+    float logits_width_multiplier;
+};
+
+inline constexpr InklingExecutionContract kInklingExecutionContract{
+    4096U, 42U, 32U, 8U, 128U,
+    16U, 1024U, 512U, 512U, 6U, 4U,
+    16384U, 2048U, 256U, 6U, 2U, 2U, 3U,
+    201024U, 200058U, 1'048'576U, 16U, 8U,
+    128000U, 0.1F, 1.0e-6F, 8.0F, 1.0F / 128.0F, 16.0F};
+
+// Layers 5, 11, 17, 23, 29, 35 and 41 use full causal attention; the other 35
+// use a 512-token sliding window. Head counts are identical either way, so the
+// pattern only changes masking and relative extent.
+[[nodiscard]] constexpr bool inkling_global_attention_layer(
+    std::uint32_t layer) noexcept {
+    return layer < kInklingExecutionContract.layer_count &&
+           (layer + 1U) % kInklingExecutionContract.global_attention_period == 0U;
+}
+
+[[nodiscard]] constexpr std::uint32_t inkling_relative_extent(
+    std::uint32_t layer) noexcept {
+    return inkling_global_attention_layer(layer)
+        ? kInklingExecutionContract.global_relative_extent
+        : kInklingExecutionContract.local_relative_extent;
+}
+
+[[nodiscard]] constexpr bool inkling_sparse_layer(std::uint32_t layer) noexcept {
+    return layer >= kInklingExecutionContract.dense_prefix_layers &&
+           layer < kInklingExecutionContract.layer_count;
+}
+
+[[nodiscard]] constexpr bool inkling_quantized_expert_layer(
+    std::uint32_t layer) noexcept {
+    return layer >= kInklingExecutionContract.quantized_expert_start_layer &&
+           layer < kInklingExecutionContract.layer_count;
+}
+
+// MTP depths 1 and 3 are full-attention; depths 0, 2, 4, 5, 6 and 7 slide.
+// The checkpoint declares this as mtp_config.local_layer_ids, which is not a
+// stride, so it is pinned as a mask.
+[[nodiscard]] constexpr bool inkling_mtp_global_attention_depth(
+    std::uint32_t depth) noexcept {
+    return depth < kInklingExecutionContract.mtp_layers &&
+           (depth == 1U || depth == 3U);
+}
+
+[[nodiscard]] constexpr std::uint32_t inkling_mtp_relative_extent(
+    std::uint32_t depth) noexcept {
+    return inkling_mtp_global_attention_depth(depth)
+        ? kInklingExecutionContract.global_relative_extent
+        : kInklingExecutionContract.local_relative_extent;
+}
+
 }  // namespace strata

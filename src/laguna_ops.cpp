@@ -12,12 +12,6 @@ namespace {
 
 constexpr auto& kContract = kLagunaExecutionContract;
 
-// E2M1 has sixteen exact values, so a table is both the fastest and the least
-// error-prone decoder. The sign bit is the high nibble bit.
-constexpr std::array<float, 16> kFp4E2m1{
-    0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
-    -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
-
 double correction_dimension(double rotations, double dimensions, double base,
                             double original_context) noexcept {
     constexpr double two_pi = 6.283185307179586476925286766559;
@@ -29,23 +23,11 @@ double correction_dimension(double rotations, double dimensions, double base,
 }  // namespace
 
 float laguna_fp8_e4m3_f32(std::uint8_t encoded) noexcept {
-    const bool negative = (encoded & 0x80U) != 0U;
-    const std::uint32_t exponent = (encoded >> 3U) & 0x0FU;
-    const std::uint32_t mantissa = encoded & 0x07U;
-    float value = 0.0F;
-    if (exponent == 0U) {
-        value = std::ldexp(static_cast<float>(mantissa) / 8.0F, -6);
-    } else if (exponent == 0x0FU && mantissa == 0x07U) {
-        return std::numeric_limits<float>::quiet_NaN();
-    } else {
-        value = std::ldexp(1.0F + static_cast<float>(mantissa) / 8.0F,
-                           static_cast<int>(exponent) - 7);
-    }
-    return negative ? -value : value;
+    return fp8_e4m3_f32(encoded);
 }
 
 float laguna_fp4_e2m1_f32(std::uint8_t nibble) noexcept {
-    return kFp4E2m1[nibble & 0x0FU];
+    return fp4_e2m1_f32(nibble);
 }
 
 float laguna_softplus_f32(float value) noexcept {

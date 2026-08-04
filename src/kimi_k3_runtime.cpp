@@ -514,13 +514,34 @@ ValidationResult KimiK3Runtime::Impl::forward(
                         kContract.rms_epsilon, pool.get());
     if (!result.ok()) return result;
 
+    // One row, or every row. A prefill page only needs its last row, because a
+    // page exists to build cache state and only its final token predicts
+    // anything. Speculative verification needs all of them: accepting the
+    // longest correct prefix means comparing the draft's token at position i
+    // against this model's argmax at i, for every i.
+    //
+    // Selected by the span the caller passed rather than by a flag, so every
+    // existing caller keeps the single-row behaviour without changing.
+    const auto vocabulary = static_cast<std::size_t>(kContract.vocabulary_size);
+    const auto rows = logits.size() >= static_cast<std::size_t>(count) * vocabulary
+                          ? static_cast<std::size_t>(count)
+                          : std::size_t{1U};
     const auto last = static_cast<std::size_t>(count - 1U) * hidden;
-    std::vector<float> normalized(hidden);
-    result = kimi_rms_norm(normalized,
-                           std::span<const float>(mixed).subspan(last, hidden),
-                           final_norm, kContract.rms_epsilon);
-    if (!result.ok()) return result;
-    return kimi_bf16_matmul(logits, normalized, output_head, 1U, pool.get());
+
+    std::vector<float> normalized(rows * hidden);
+    for (std::size_t row = 0U; row < rows; ++row) {
+        const auto source = rows == 1U ? last : row * hidden;
+        result = kimi_rms_norm(
+            std::span<float>(normalized).subspan(row * hidden, hidden),
+            std::span<const float>(mixed).subspan(source, hidden), final_norm,
+            kContract.rms_epsilon);
+        if (!result.ok()) return result;
+    }
+    // The head is [163840, 7168] at 2.19 GiB and is read once per call whatever
+    // `rows` is, so this is where a batch pays for itself rather than costing.
+    return kimi_bf16_matmul(logits.subspan(0U, rows * vocabulary), normalized,
+                            output_head, static_cast<std::uint32_t>(rows),
+                            pool.get());
 }
 
 KimiK3Runtime::KimiK3Runtime() : impl_(std::make_unique<Impl>()) {}

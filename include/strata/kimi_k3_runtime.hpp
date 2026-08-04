@@ -145,9 +145,22 @@ public:
     // rewound, so a new sequence resets rather than truncates.
     [[nodiscard]] ValidationResult reset_sequence();
 
-    // Runs `tokens` through the backbone at `position` and writes the final
-    // token's logits. This is the surface the teacher-forcing and generation
-    // oracles drive: it needs no tokenizer, so gates 5 and 6 do not wait on one.
+    // Runs `tokens` through the backbone at `position` and writes logits.
+    //
+    // The span decides how many rows come back. Pass one vocabulary and get the
+    // final token's logits, which is what a prefill page and single-token decode
+    // want. Pass `tokens.size()` vocabularies and get every row, which is what
+    // speculative verification needs -- accepting the longest correct prefix
+    // means comparing a draft's token at position i against this model's argmax
+    // at i, for every i.
+    //
+    // All rows come from one pass over the backbone. The dense spine is 106.55
+    // GiB read once per pass regardless of how many tokens it carries, measured
+    // to amortize 3.63x at four tokens, so a batch is where that term stops
+    // dominating.
+    //
+    // This is the surface the teacher-forcing and generation oracles drive: it
+    // needs no tokenizer, so gates 5 and 6 do not wait on one.
     [[nodiscard]] ValidationResult evaluate(
         std::span<const std::uint32_t> tokens, std::uint32_t position,
         std::span<float> logits);

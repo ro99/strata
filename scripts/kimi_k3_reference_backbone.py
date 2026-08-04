@@ -282,6 +282,14 @@ def main() -> int:
     # keeping the routed set inside one card. Every extra token widens the set
     # the reference must read and dequantize, which is the whole cost of the run.
     parser.add_argument("--tokens", type=int, default=4)
+    # The runtime carries activations in F32 while the reference rounds to BF16
+    # at every op boundary. That difference is ~0.4% at layer 0, and a discrete
+    # top-16-of-896 router amplifies it instead of attenuating it: 77 of 92
+    # layers selected a different routed set. Running the reference at F32
+    # removes the only known cause of that divergence, so if the routed sets
+    # then agree the runtime is exonerated end to end.
+    parser.add_argument("--activation-dtype", choices=("bf16", "f32"),
+                        default="bf16")
     parser.add_argument("--device", default="cuda:1")
     # Smoke-test knobs. A truncated backbone is not a gate fixture, so a
     # truncated run refuses to write one rather than leaving a plausible file
@@ -302,7 +310,8 @@ def main() -> int:
 
     shards = ShardSet(arguments.model)
     device = torch.device(arguments.device)
-    dtype = torch.bfloat16
+    dtype = (torch.float32 if arguments.activation_dtype == "f32"
+             else torch.bfloat16)
     writer = FixtureWriter()
     depth = arguments.layers or config.num_hidden_layers
     truncated = depth != config.num_hidden_layers

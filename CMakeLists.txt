@@ -78,6 +78,7 @@ add_library(strata_core STATIC
     src/simulator.cpp
     kernels/cpu/q4_reference.cpp
     kernels/cpu/glm_int4.cpp
+    kernels/cpu/dsv4_fp4_expert.cpp
 )
 
 target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -169,6 +170,7 @@ if(BUILD_TESTING)
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
+        tests/test_deepseek_host_expert.cpp
         tests/test_deepseek_diagnostics.cpp
         tests/test_deepseek_runtime.cpp
         tests/test_model.cpp

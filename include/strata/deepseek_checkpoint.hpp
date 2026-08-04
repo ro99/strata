@@ -123,11 +123,18 @@ private:
     bool complete_{};
 };
 
+// `allow_deferred_upload` only permits deferral; whether the upload actually
+// defers is decided here, by where the payload came from. A tensor served out
+// of the resident arena is copied straight from storage that outlives the
+// call, so its transfer may stay in flight. One decoded into a local buffer --
+// a checkpoint read, or the wo_a FP8-to-BF16 conversion -- must not, because
+// that buffer dies at return. The caller owes
+// CudaBackend::synchronize_uploads() on every device it deferred to.
 [[nodiscard]] ValidationResult load_dsv4_cuda_linear(
     const Dsv4CheckpointReader& checkpoint,
     const Dsv4ResidentWeightStore* resident_weights,
     std::string_view base_name, std::uint64_t expected_rows,
     std::uint64_t expected_columns, int device, CudaBackend& backend,
-    CudaWeight& output);
+    CudaWeight& output, bool allow_deferred_upload = false);
 
 }  // namespace strata

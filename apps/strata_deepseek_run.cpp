@@ -35,6 +35,7 @@ struct Options {
     std::uint64_t host_memory_bytes{216ULL << 30U};
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     bool pin_resident_arena{};
+    bool serial_expert_upload{};
     bool prepack_mhc{true};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
@@ -65,7 +66,8 @@ void usage() {
         << "       [--expert-prefetch N] [--expert-prefetch-bytes 1G]\n"
         << "       [--expert-prefetch-queue N] [--expert-prefetch-lease N]\n"
         << "       [--expert-prefetch-confidence P]\n"
-        << "       [--pin-resident-arena] [--prepack-mhc|--no-prepack-mhc]\n"
+        << "       [--pin-resident-arena] [--serial-expert-upload]\n"
+        << "       [--prepack-mhc|--no-prepack-mhc]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe]\n"
@@ -194,6 +196,8 @@ bool parse_options(int argc, char** argv, Options& options) {
                     0.0, 1.0)) return false;
         } else if (argument == "--pin-resident-arena") {
             options.pin_resident_arena = true;
+        } else if (argument == "--serial-expert-upload") {
+            options.serial_expert_upload = true;
         } else if (argument == "--prepack-mhc") {
             options.prepack_mhc = true;
         } else if (argument == "--no-prepack-mhc") {
@@ -848,6 +852,7 @@ int main(int argc, char** argv) {
     config.resident_read_workers = options.resident_read_workers;
     config.spine_warmup_workers = options.spine_warmup_workers;
     config.pin_resident_arena = options.pin_resident_arena;
+    config.serial_expert_upload = options.serial_expert_upload;
     config.prepack_mhc_projection = options.prepack_mhc;
     config.expert_prefetch_predictions = options.expert_prefetch_predictions;
     config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
@@ -913,6 +918,8 @@ int main(int argc, char** argv) {
                   << (metrics.resident_arena_pinned ? "true" : "false")
                   << ",\"prepack_mhc\":"
                   << (options.prepack_mhc ? "true" : "false")
+                  << ",\"serial_expert_upload\":"
+                  << (options.serial_expert_upload ? "true" : "false")
                   << ",\"resident_pin_seconds\":" << metrics.resident_pin_seconds
                   << ",\"expert_prefetch_predictions\":"
                   << metrics.expert_prefetch_predictions

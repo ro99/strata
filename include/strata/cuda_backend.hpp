@@ -306,10 +306,30 @@ public:
     [[nodiscard]] ValidationResult register_host_memory(const void* base,
                                                        std::uint64_t bytes);
     void unregister_host_memory(const void* base) noexcept;
+    // Deferred completion leaves the upload's copies in flight on the device
+    // stream instead of waiting for them. Every consumer of a weight is issued
+    // on that same stream, so the device side is already ordered; what the wait
+    // actually protects is the host source buffer, which must outlive the copy.
+    // Deferring is therefore legal only when the payload spans point at
+    // storage that outlives the batch -- in practice the pinned resident
+    // arena, never a temporary decoded into by the caller.
+    //
+    // The caller must call synchronize_uploads() for every device it touched
+    // before the batch's source buffers can go away, and to collect the wait.
+    // Until then the transfer is unaccounted: upload_wait_nanoseconds is
+    // attributed at the synchronize, not here.
+    enum class UploadCompletion : std::uint8_t {
+        Synchronous,
+        Deferred,
+    };
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,
-        CudaWeight& output);
+        CudaWeight& output,
+        UploadCompletion completion = UploadCompletion::Synchronous);
+    // Waits out any deferred uploads issued on this device and attributes the
+    // wait. Idempotent, and free when nothing was deferred.
+    [[nodiscard]] ValidationResult synchronize_uploads(int device);
     [[nodiscard]] ValidationResult upload_buffer(
         int device, std::span<const std::byte> bytes, CudaBuffer& output);
     [[nodiscard]] ValidationResult allocate_buffer(

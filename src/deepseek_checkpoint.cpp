@@ -416,7 +416,7 @@ ValidationResult load_dsv4_cuda_linear(
     const Dsv4ResidentWeightStore* resident_weights,
     std::string_view base_name, std::uint64_t expected_rows,
     std::uint64_t expected_columns, int device, CudaBackend& backend,
-    CudaWeight& output) {
+    CudaWeight& output, bool allow_deferred_upload) {
     ValidationResult result;
     const std::string weight_name = std::string(base_name) + ".weight";
     const auto* weight = checkpoint.find(weight_name);
@@ -505,7 +505,15 @@ ValidationResult load_dsv4_cuda_linear(
             descriptor.group_size = 128U;
         }
     }
-    return backend.upload(device, descriptor, weight_data, scale_data, output);
+    // Both payloads have to be arena-backed. A miss on either one fell back to
+    // a checkpoint read into `owned_weight`/`owned_scale`, which the copy would
+    // outlive.
+    const bool arena_backed = owned_weight.empty() && owned_scale.empty();
+    const auto completion = allow_deferred_upload && arena_backed
+        ? CudaBackend::UploadCompletion::Deferred
+        : CudaBackend::UploadCompletion::Synchronous;
+    return backend.upload(device, descriptor, weight_data, scale_data, output,
+                          completion);
 }
 
 }  // namespace strata

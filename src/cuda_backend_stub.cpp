@@ -61,7 +61,12 @@ void CudaBackend::unregister_host_memory(const void*) noexcept {}
 
 ValidationResult CudaBackend::upload(int, const CudaWeightDescriptor&,
                                      std::span<const std::byte>,
-                                     std::span<const std::byte>, CudaWeight&) {
+                                     std::span<const std::byte>, CudaWeight&,
+                                     UploadCompletion) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::synchronize_uploads(int) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

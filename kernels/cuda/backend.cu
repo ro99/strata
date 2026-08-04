@@ -1974,6 +1974,10 @@ struct CudaBackend::Impl {
         std::uint32_t moe_rows{1U};
         std::uint32_t moe_routed_count{};
         std::uint64_t moe_kernel_launches{};
+        // Set while a deferred upload's copies are still in flight on `stream`.
+        // Cleared by synchronize_uploads(), which the caller owes before the
+        // upload's host source may be released.
+        bool pending_uploads{};
         std::vector<std::shared_ptr<CudaWeight::Impl>> moe_weights;
         std::vector<std::shared_ptr<CudaWeight::Impl>> quarantined_weights;
         std::vector<std::shared_ptr<CudaBuffer::Impl>> quarantined_buffers;
@@ -2274,7 +2278,8 @@ ValidationResult CudaBackend::reserve_weight_arena(int device,
 ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& descriptor,
                                      std::span<const std::byte> weights,
                                      std::span<const std::byte> scales,
-                                     CudaWeight& output) {
+                                     CudaWeight& output,
+                                     UploadCompletion completion) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -2453,14 +2458,24 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     }
-    const auto wait_started = std::chrono::steady_clock::now();
-    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
-        state.quarantined_weights.push_back(std::move(target));
-        return cuda_error(status, "synchronize CUDA weight upload");
+    std::uint64_t wait_nanoseconds = 0U;
+    std::uint64_t synchronizations = 0U;
+    if (completion == UploadCompletion::Deferred) {
+        // The copies stay in flight so the next device's can start immediately.
+        // Nothing on this device can observe the weight out of order -- there
+        // is one stream per device and every consumer is issued on it.
+        state.pending_uploads = true;
+    } else {
+        const auto wait_started = std::chrono::steady_clock::now();
+        if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+            state.quarantined_weights.push_back(std::move(target));
+            return cuda_error(status, "synchronize CUDA weight upload");
+        }
+        wait_nanoseconds = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_started).count());
+        synchronizations = 1U;
     }
-    const auto wait_nanoseconds = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - wait_started).count());
     {
         std::scoped_lock lock(impl_->mutex);
         auto& device_stats = *std::find_if(
@@ -2471,13 +2486,46 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         if (allocation_calls != 0U) {
             device_stats.weight_allocation_bytes += payload_bytes;
         }
-        ++device_stats.synchronization_calls;
+        device_stats.synchronization_calls += synchronizations;
         device_stats.synchronization_nanoseconds += wait_nanoseconds;
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
         device_stats.weight_allocation_nanoseconds += allocation_nanoseconds;
         device_stats.weight_copy_nanoseconds += copy_nanoseconds;
     }
     output.impl_ = std::move(target);
+    return result;
+}
+
+ValidationResult CudaBackend::synchronize_uploads(int device) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "upload synchronization targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.pending_uploads) return result;
+    state.pending_uploads = false;
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for upload synchronization");
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize deferred CUDA weight uploads");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++device_stats.synchronization_calls;
+        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        device_stats.upload_wait_nanoseconds += wait_nanoseconds;
+    }
     return result;
 }
 

@@ -187,3 +187,33 @@ TEST_CASE("Gemma 4 chat rendering and SentencePiece BPE match the target tokeniz
     REQUIRE(decoded.ok());
     REQUIRE(decoded.value == " hello olá 日本語");
 }
+
+TEST_CASE("non-ASCII letters are not pretokenized as digit runs") {
+    // `unicode_number` narrowed the codepoint to `unsigned char` before the
+    // ASCII digit test, so every codepoint whose low byte landed in 0x30-0x39
+    // classified as a number. Cyrillic а-й is U+0430-U+0439, so `Привет мир`
+    // split into six pretokens instead of two, and every contract sharing the
+    // classifier carried it. See docs/experiments/0048.
+    const auto cyrillic = strata::pretokenize(strata::TokenizerContract::Glm52,
+                                              "Привет мир");
+    REQUIRE(cyrillic.ok());
+    REQUIRE(cyrillic.value == std::vector<std::string>({"Привет", " мир"}));
+
+    const auto deepseek = strata::pretokenize(
+        strata::TokenizerContract::DeepSeekV4, "Привет мир");
+    REQUIRE(deepseek.ok());
+    REQUIRE(deepseek.value == std::vector<std::string>({"Привет", " мир"}));
+
+    // Armenian ա-ի (U+0561-U+056A) shares the low byte range with 0x30-0x39
+    // one block up, and the digit runs the classifier does own must still split
+    // from the letters around them.
+    const auto armenian = strata::pretokenize(strata::TokenizerContract::Glm52,
+                                              "աբգ");
+    REQUIRE(armenian.ok());
+    REQUIRE(armenian.value == std::vector<std::string>({"աբգ"}));
+
+    const auto digits = strata::pretokenize(strata::TokenizerContract::Glm52,
+                                            "abc123");
+    REQUIRE(digits.ok());
+    REQUIRE(digits.value == std::vector<std::string>({"abc", "123"}));
+}

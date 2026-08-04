@@ -236,7 +236,14 @@ struct Rune {
 }
 
 [[nodiscard]] bool unicode_number(std::uint32_t value) noexcept {
-    if (ascii_number(static_cast<unsigned char>(value))) return true;
+    // The `unsigned char` narrowing has to be guarded: without it every
+    // codepoint whose low byte lands in 0x30-0x39 reads as an ASCII digit, so
+    // Cyrillic а-й (U+0430-U+0439), Armenian, and a long tail of others were
+    // classified as numbers and pretokenized as digit runs. Found by the
+    // Kimi-K3 tokenizer gate on `Привет мир`, which the reference splits into
+    // two words and this split into six pieces; it affected every contract
+    // sharing this classifier.
+    if (value < 0x80U) return ascii_number(static_cast<unsigned char>(value));
     constexpr std::array<std::uint32_t, 21> starts{
         0x0660U, 0x06F0U, 0x07C0U, 0x0966U, 0x09E6U, 0x0A66U, 0x0AE6U,
         0x0B66U, 0x0BE6U, 0x0C66U, 0x0CE6U, 0x0D66U, 0x0E50U, 0x0ED0U,

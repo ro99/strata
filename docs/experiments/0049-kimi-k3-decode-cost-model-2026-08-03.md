@@ -2,8 +2,11 @@
 
 **Date:** 2026-08-03
 **Branch:** `feat/kimi-k3-storage-agnostic-and-gpu`
-**Status:** closed. Decode is storage bound at ~80% of the step. The dominant
-lever is hardware, not software.
+**Status:** closed with one large item left open. Decode is storage bound at
+~80% of the step. A faster drive is the biggest single step, but storage and
+compute never overlap, and closing that is worth 18% today and 50% once the drive
+lands. See "storage and compute never overlap" at the end, which corrects the
+ordering given in the body.
 
 ## Summary
 
@@ -144,10 +147,12 @@ conclusion was a first-touch artifact read through the noisy arm.
 ## What to do next, in order
 
 1. **Buy the NVMe.** 24.06 GiB/token at ~3.5 GB/s is 6.9 s against 30, taking the
-   step from 38.6 to about 15 s before anything else changes. Nothing in software
-   on this machine competes. See `hardware/nvme-upgrade.md`; note that the
-   one-drive-versus-two arithmetic there assumed uniform routing and should be
-   re-derived against the captured trace.
+   step from 38.6 to about 15 s before anything else changes. It is the largest
+   single step; it is *not* the only one, and the claim originally written here
+   that nothing in software competes was wrong — see the overlap section at the
+   end of this document. `hardware/nvme-upgrade.md`'s one-drive-versus-two
+   arithmetic assumed uniform routing and should be re-derived against the
+   captured trace.
 2. **Arena replacement policy.** Worth something for the first time: 24.06
    GiB/token against 129 GiB resident means a policy anticipating the next
    step's selection converts misses to hits. The route trace now exists and the

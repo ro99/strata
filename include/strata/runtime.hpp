@@ -19,6 +19,7 @@ enum class RuntimeModel : std::uint8_t {
     DeepSeekV4,
     Gemma4,
     Laguna,
+    Inkling,
 };
 
 struct RuntimeConfig {

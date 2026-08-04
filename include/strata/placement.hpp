@@ -19,6 +19,7 @@ enum class PlacementModel : std::uint8_t {
     DeepSeekV4,
     Gemma4,
     Laguna,
+    Inkling,
 };
 
 enum class PlacementTier : std::uint8_t {

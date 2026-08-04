@@ -5,6 +5,7 @@
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/gemma4_checkpoint.hpp"
+#include "strata/inkling_checkpoint.hpp"
 #include "strata/laguna_checkpoint.hpp"
 #include "strata/model_adapter.hpp"
 
@@ -329,6 +330,176 @@ struct Gemma4Linear {
     return result;
 }
 
+
+// --------------------------------------------------------------- Inkling
+
+[[nodiscard]] ParseResult<PlacementInventory> build_inkling_inventory(
+    const InklingCheckpointReader& checkpoint, std::uint32_t context_tokens) {
+    ParseResult<PlacementInventory> result;
+    constexpr auto& c = kInklingExecutionContract;
+    auto& inventory = result.value;
+    inventory.model = PlacementModel::Inkling;
+    inventory.model_name = inkling_small_nvfp4_spec().name;
+    inventory.layer_count = c.layer_count;
+    inventory.maximum_context_tokens = context_tokens;
+    inventory.per_device_workspace_bytes = kFlashAttentionWorkspaceReserve;
+    inventory.minimum_device_budget_bytes = kMinimumDeviceBudget;
+    inventory.contiguous_layer_blocks = false;
+    inventory.prescriptive = false;
+
+    const auto add_linear = [&](PlacementClass component, std::int32_t layer,
+                                const std::string& name, std::uint64_t rows,
+                                std::uint64_t columns) {
+        auto module = checkpoint.linear(name, rows, columns);
+        if (!module.ok()) {
+            result.errors.push_back("Inkling checkpoint is missing " + name);
+            return;
+        }
+        ModuleSizes sizes;
+        sizes.layer = layer;
+        sizes.weight_bytes = module.value.weight->bytes;
+        inventory.items.push_back(make_item(component, sizes,
+                                            sizes.device_bytes(),
+                                            PlacementTier::Device, false));
+    };
+
+    const auto hidden = static_cast<std::uint64_t>(c.hidden_size);
+    const auto query_columns =
+        static_cast<std::uint64_t>(c.attention_heads) * c.head_dim;
+    const auto kv_columns =
+        static_cast<std::uint64_t>(c.key_value_heads) * c.head_dim;
+    ModuleSizes routed;
+    std::uint64_t routed_modules = 0U;
+    for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
+        const auto index = static_cast<std::int32_t>(layer);
+        const auto prefix = inkling_layer_prefix(layer);
+        const auto attention = prefix + "attn.";
+        const auto mlp = prefix + "mlp.";
+        add_linear(PlacementClass::Attention, index, attention + "wq_du.weight",
+                   query_columns, hidden);
+        add_linear(PlacementClass::Attention, index, attention + "wk_dv.weight",
+                   kv_columns, hidden);
+        add_linear(PlacementClass::Attention, index, attention + "wv_dv.weight",
+                   kv_columns, hidden);
+        add_linear(PlacementClass::Attention, index, attention + "wo_ud.weight",
+                   hidden, query_columns);
+        // The relative branch is a fourth projection, not an optional extra:
+        // without it the layer has no position signal at all.
+        add_linear(PlacementClass::Attention, index, attention + "wr_du.weight",
+                   static_cast<std::uint64_t>(c.attention_heads) * c.relative_dim,
+                   hidden);
+        if (!inkling_sparse_layer(layer)) {
+            add_linear(PlacementClass::FeedForward, index, mlp + "w13_dn.weight",
+                       2ULL * c.dense_intermediate_size, hidden);
+            add_linear(PlacementClass::FeedForward, index, mlp + "w2_md.weight",
+                       hidden, c.dense_intermediate_size);
+        } else {
+            add_linear(PlacementClass::Router, index, mlp + "gate.weight",
+                       static_cast<std::uint64_t>(c.routed_experts) +
+                           c.shared_experts,
+                       hidden);
+            // Both sinks run on every token, so they are resident like a
+            // shared expert rather than cached like a routed one.
+            for (const auto& name :
+                 {mlp + "shared_experts.shared_w13_weight",
+                  mlp + "shared_experts.shared_w2_weight"}) {
+                const auto* tensor = checkpoint.find(name);
+                if (tensor == nullptr) {
+                    result.errors.push_back("Inkling checkpoint is missing " + name);
+                    return result;
+                }
+                ModuleSizes shared;
+                shared.layer = index;
+                shared.weight_bytes = tensor->bytes;
+                inventory.items.push_back(
+                    make_item(PlacementClass::SharedExpert, shared,
+                              shared.device_bytes(), PlacementTier::Device, false));
+            }
+            for (const auto& projection :
+                 {std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>{
+                      mlp + "experts.w13_weight",
+                      {2ULL * c.expert_intermediate_size, hidden}},
+                  {mlp + "experts.w2_weight",
+                   {hidden, c.expert_intermediate_size}}}) {
+                auto stack = checkpoint.expert_stack(
+                    projection.first, layer, c.routed_experts,
+                    projection.second.first, projection.second.second);
+                if (!stack.ok()) {
+                    result.errors.push_back("Inkling checkpoint is missing " +
+                                            projection.first);
+                    return result;
+                }
+                if (stack.value.encoding == InklingTensorEncoding::Plain) {
+                    routed.weight_bytes += stack.value.weight->bytes;
+                } else {
+                    routed.weight_bytes += stack.value.packed->bytes;
+                    routed.scale_bytes += stack.value.scale->bytes;
+                }
+                routed_modules += c.routed_experts;
+            }
+        }
+        if (!result.ok()) return result;
+
+        // Two hidden-width norms, two head-width norms, four convolution
+        // kernels, and on sparse layers the routing correction bias.
+        ModuleSizes norms;
+        norms.layer = index;
+        norms.host_bytes =
+            (2ULL * hidden + 2ULL * c.head_dim +
+             2ULL * kv_columns * c.short_conv_kernel +
+             2ULL * hidden * c.short_conv_kernel +
+             (inkling_sparse_layer(layer) ? c.routed_experts : 0U)) *
+            sizeof(float);
+        inventory.items.push_back(
+            make_item(PlacementClass::Norm, norms, 0U, PlacementTier::Host, false));
+
+        const auto rows = inkling_global_attention_layer(layer)
+            ? context_tokens
+            : std::min(context_tokens, c.sliding_window);
+        ModuleSizes cache;
+        cache.layer = index;
+        cache.host_bytes = static_cast<std::uint64_t>(rows) * kv_columns * 2ULL *
+                           sizeof(std::uint16_t);
+        inventory.items.push_back(make_item(PlacementClass::KvCache, cache, 0U,
+                                            PlacementTier::Host, false));
+    }
+
+    add_linear(PlacementClass::OutputHead,
+               static_cast<std::int32_t>(c.layer_count - 1U),
+               "model.llm.unembed.weight", c.padded_vocabulary_size, hidden);
+    if (!result.ok()) return result;
+    inventory.items.back().decode_read_bytes =
+        inventory.items.back().device_bytes;
+
+    // The embedding table is read one row per token from the host mapping and
+    // is never uploaded.
+    if (const auto* embedding = checkpoint.find("model.llm.embed.weight");
+        embedding != nullptr) {
+        ModuleSizes table;
+        table.layer = -1;
+        table.host_bytes = embedding->bytes;
+        inventory.items.push_back(make_item(PlacementClass::Embedding, table, 0U,
+                                            PlacementTier::Host, false));
+    }
+
+    if (routed_modules != 0U) {
+        ModuleSizes experts;
+        experts.layer = -1;
+        experts.weight_bytes = routed.weight_bytes;
+        experts.scale_bytes = routed.scale_bytes;
+        // Six of 256 experts per sparse layer are read per token, over two
+        // projections; that ratio is the whole reason the set is cacheable.
+        const auto per_module = experts.device_bytes() / routed_modules;
+        inventory.items.push_back(make_item(PlacementClass::RoutedExpert, experts,
+                                            per_module * c.experts_per_token *
+                                                2ULL *
+                                                (c.layer_count -
+                                                 c.dense_prefix_layers),
+                                            PlacementTier::Host, true));
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------- Laguna
 
 [[nodiscard]] ParseResult<PlacementInventory> build_laguna_inventory(
@@ -633,6 +804,7 @@ struct OpenCheckpoints {
     std::unique_ptr<GlmCheckpointReader> glm;
     std::unique_ptr<Dsv4CheckpointReader> deepseek;
     std::unique_ptr<LagunaCheckpointReader> laguna;
+    std::unique_ptr<InklingCheckpointReader> inkling;
 };
 
 [[nodiscard]] ParseResult<PlacementInventory> build_inventory(
@@ -649,6 +821,8 @@ struct OpenCheckpoints {
                                        request.flash_attention);
         case PlacementModel::Laguna:
             return build_laguna_inventory(*checkpoints.laguna, context_tokens);
+        case PlacementModel::Inkling:
+            return build_inkling_inventory(*checkpoints.inkling, context_tokens);
         case PlacementModel::DeepSeekV4:
             return build_deepseek_inventory(
                 checkpoints.deepseek->manifest(), scoped,
@@ -670,6 +844,8 @@ struct OpenCheckpoints {
             return kGlm52ExecutionContract.maximum_context_tokens;
         case PlacementModel::Laguna:
             return kLagunaExecutionContract.maximum_context_tokens;
+        case PlacementModel::Inkling:
+            return kInklingExecutionContract.maximum_context_tokens;
         case PlacementModel::DeepSeekV4:
             return kDeepSeekV4ExecutionContract.maximum_context_tokens;
     }
@@ -765,6 +941,15 @@ PlacementPlanResult plan_model_placement(const PlacementRequest& request,
                 return result;
             }
             checkpoints.laguna = std::move(opened.value);
+            break;
+        }
+        case PlacementModel::Inkling: {
+            auto opened = InklingCheckpointReader::open(request.model_directory);
+            if (!opened.ok()) {
+                result.errors = std::move(opened.errors);
+                return result;
+            }
+            checkpoints.inkling = std::move(opened.value);
             break;
         }
         case PlacementModel::DeepSeekV4: {

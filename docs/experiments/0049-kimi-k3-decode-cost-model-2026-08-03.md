@@ -177,3 +177,93 @@ retraction. Two conclusions were reversed in public and one of those reversals
 was itself wrong. Every one of those costs traces to the same omission: a step
 was never profiled, so components were used as proxies for it, and a proxy
 covering 6% of a step will mislead about the other 94%.
+
+## OPEN, and larger than it looks: storage and compute never overlap
+
+Recorded after the conclusions above, because those conclusions understated it.
+The claim "nothing in software on this machine competes with the drive" was
+wrong, and the data contradicting it is in this document.
+
+### The defect
+
+```
+attention      6.0 s
+feedforward   30.9 s
+step          38.6 s      <- 36.9 s accounted, additive
+```
+
+They add. If storage and compute overlapped at all the step would be
+`max(30, 7) ~ 30 s`, not 37. They do not overlap.
+
+`ArenaExpertSource::prepare()` in `src/kimi_k3_runtime.cpp` calls
+`reader_->stage(...)` **synchronously**. `kimi_latent_moe_layer` calls it and
+then enters the compute loop, so every one of the 92 MoE layers is
+read-then-compute: the disk is idle while the layer computes, and the cores are
+idle while the next layer's experts are read. That is `Sigma_serial` in the
+charter's model, and the charter's rule 4 says to fix overlap before volume
+because it is cheaper and usually strictly larger. It was skipped here in favour
+of a hardware recommendation.
+
+### Why it is worth more *after* the NVMe, not less
+
+| | storage | compute | step |
+|---|---|---|---|
+| SATA, serial (measured) | 30 | 7 | **37 s** |
+| SATA, overlapped | 30 | 7 | **30 s** (-18%) |
+| NVMe, serial | 6.9 | 7 | **14 s** |
+| NVMe, overlapped | 6.9 | 7 | **7 s** (-50%) |
+
+On SATA the storage term buries everything and overlap is worth 18%. On NVMe the
+two terms are balanced — 6.9 against 7.0 — which is exactly the regime where
+hiding one behind the other doubles throughput. **Do not treat the drive as a
+substitute for this work; it is what makes this work decisive.**
+
+### Three tiers, cheapest first
+
+1. **Within a layer, no prediction needed.** All 16 experts are known before any
+   of them is read — that is why `prepare` takes the whole set. Today the block
+   waits for all 16 to stage, then computes all 16. Streaming instead — compute
+   expert *i* while expert *i+1* is in flight — requires no oracle and cannot
+   change results. Bounded by `min(read, compute)` per layer, about 27 ms against
+   326 ms, so ~2.5 s of the step. Small, but it is free correctness-wise and it
+   is the scaffolding the next tier needs.
+
+2. **Across layers, prefetch on a predictor.** Layer L+1's routed set depends on
+   layer L's output, so it cannot be known exactly. It does not need to be:
+   the charter permits prediction that only drives prefetch ("*a predictor is
+   advisory; prediction may affect scheduling or prefetch only*"), Strata already
+   has `src/route_predictor.cpp`, and a miss costs exactly what today costs. Load
+   a predicted top-32 for L+1 while computing L. This is where the full 7 s is
+   won, and after the NVMe it is where the step halves.
+
+3. **Volume, which is the only thing that attacks the 30 s itself.** Overlap
+   hides compute; it cannot hide 24.06 GiB of transfer. The arena holds 129 GiB
+   of 1347 GiB, 9.6% of experts. If routing is skewed — MoE routing usually is —
+   those 9.6% may capture far more than 9.6% of selections, and every 10% of
+   converted misses is 3 s today and 0.7 s on NVMe.
+
+### What does *not* work, so nobody rebuilds it
+
+**The DSpark draft model cannot be the routing oracle.** The idea is well formed
+— prediction driving prefetch is exactly what the charter allows — but the draft
+is 5 layers predicting the next *token*, and what prefetch needs is layer 47's
+expert set for the *current* token, which depends on layer 46's hidden state. A
+5-layer model has no representation of layer 47. The draft was screened and
+rejected three times in this document on separate grounds; this is a fourth, and
+it is structural rather than economic.
+
+### The measurement that gates all three, and needs no run
+
+Hot-expert skew is computable from the route trace already written to
+`/data/strata-results/kimi-k3-fixtures/kimi-k3-backbone.fixture`, in the
+`{prompt,decode}.routed.{layer}` arrays. It sizes tier 3 directly, tells tier 2
+how large a predicted set must be to cover the true 16, and re-derives the
+one-drive-versus-two arithmetic in `hardware/nvme-upgrade.md`, which currently
+assumes uniform routing. Minutes, no model load. **Do this first.**
+
+### Corrected ordering
+
+1. Hot-expert skew from the captured trace. No run.
+2. Overlap `prepare()` with compute — tier 1, then tier 2.
+3. The NVMe upgrade. Still the largest single step, but not the only one.
+4. Attention, 6.0 s, never profiled internally.

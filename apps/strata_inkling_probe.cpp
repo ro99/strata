@@ -2,7 +2,10 @@
 // breakdown the tiered-memory cost model is instantiated from, so the
 // bottleneck resource is named from measurement rather than assumed.
 #include "strata/inkling_runtime.hpp"
+#include "strata/chat_protocol.hpp"
 #include "strata/tokenizer.hpp"
+
+#include <array>
 
 #include <chrono>
 #include <cstdint>
@@ -28,6 +31,7 @@ int main(int argc, char** argv) {
     std::uint32_t new_tokens = 4U;
     std::uint32_t repeats = 1U;
     bool host_only = false;
+    bool chat = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--model" && index + 1 < argc) {
@@ -36,6 +40,8 @@ int main(int argc, char** argv) {
             prompt = argv[++index];
         } else if (argument == "--tokens" && index + 1 < argc) {
             new_tokens = static_cast<std::uint32_t>(std::stoul(argv[++index]));
+        } else if (argument == "--chat") {
+            chat = true;
         } else if (argument == "--host") {
             host_only = true;
         } else if (argument == "--repeat" && index + 1 < argc) {
@@ -48,6 +54,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (chat) {
+        const std::array<strata::ChatMessage, 1> messages{
+            strata::ChatMessage{strata::ChatRole::User, prompt}};
+        prompt = strata::render_inkling_chat_prompt(messages);
+    }
     strata::InklingRuntimeConfig config;
     config.enable_cuda = !host_only;
     config.maximum_context_tokens = 512U;
@@ -182,6 +193,12 @@ int main(int argc, char** argv) {
     std::printf("rss %.2f GiB\n",
                 static_cast<double>(result.metrics.rss_bytes) /
                     (1024.0 * 1024.0 * 1024.0));
-    std::printf("text: %s\n", result.text.c_str());
+    // Print the prompt and the continuation delimited. The continuation alone
+    // reads as a standalone claim: a truncated enumeration such as
+    // " Paris. The capital of Germany" looks like an error when it is a
+    // correct answer followed by the start of the next sentence.
+    std::printf("prompt: %s\n", prompt.c_str());
+    std::printf("continuation: <<%s>>\n", result.text.c_str());
+    std::printf("full: %s%s\n", prompt.c_str(), result.text.c_str());
     return 0;
 }

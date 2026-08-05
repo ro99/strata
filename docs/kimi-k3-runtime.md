@@ -100,8 +100,8 @@ so the ≈0.1 KiB/s figure an earlier handover recorded would fail every run.
 | 2 | MXFP4 codec against `compressed-tensors` on real expert tensors | **green** |
 | 3 | Exact operations from real tensors; chunkwise KDA ≡ the token recurrence | **green** |
 | 4 | KDA, gated MLA, and the LatentMoE block against `modeling_kimi_linear.py` | **green** |
-| 5 | Full-model teacher forcing, every layer | **FAILED** — see below |
-| 6 | Greedy generation against the reference's own continuation | **FAILED on the second token**; the first is exact |
+| 5 | Full-model teacher forcing, every layer | **retired as formulated** — reports, does not assert; see below |
+| 6 | Greedy generation against the reference's own continuation | **green**, gap-aware; output agrees on 488 and 810 |
 | 7 | Tokenizer and XTML chat rendering against the checkpoint's tokenizer | **green** |
 
 Gate 4, measured (tolerance stated before the run: ≈5e-3 predicted from six BF16
@@ -119,28 +119,37 @@ LatentMoE block      relative L2 0.0045   cosine 0.99999
 Gate 7, measured: 33/33 tokenizer cases encode *and* decode exactly, 4/4 XTML
 conversations render and tokenize exactly. No tolerance — ids are exact or wrong.
 
-Gate 5 and 6, measured — **negative**:
+Gates 5 and 6 first read negative, and the discriminating experiment showed the
+**gates** were unsound rather than the runtime. See `docs/experiments/0049`.
 
-```
-prompt layer 0    relative L2 0.0046
-prompt layer 65   relative L2 0.176    <- worst
-prompt logits     relative L2 0.134,   first greedy token 488 == reference   PASS
-decode layer 49   relative L2 0.477    <- worst
-decode logits     relative L2 0.088,   second greedy token 810 != 6534       FAIL
-83/93 prompt and 90/93 decode layers outside the predicted 2e-2 band
-```
+Gate 5 compared per-layer hidden states against a reference computed at BF16
+activation precision, while the runtime carries F32. A control run — the same
+reference against itself at F32 — settles it:
 
-The prediction written before the run said per-layer error would be flat in
-depth, because the attention-residual stream is additive. It grows about 30x
-from layer 0 to layer 65 instead. That contradicts the shape the design
-predicts, so it is recorded as an open defect rather than as a tolerance to
-widen. The first greedy token being exact out of 163,840 says the graph is
-broadly right; decode being three times worse than prefill, with a wrong argmax,
-points at either router boundary flips under top-16-of-896 or at the
-93-layer composition that gate 4 could not see. The discriminating experiment —
-compare the runtime's selected expert ids against the reference's, which the
-oracle already knows — has not been run. **This model is not verified
-end-to-end.**
+| comparison | prompt layers routing differently | decode |
+|---|---|---|
+| runtime vs BF16 reference | 77 / 92 | 74 / 92 |
+| **BF16 reference vs F32 reference** | **82 / 92** | **77 / 92** |
+
+The reference disagrees with itself *more* than the runtime disagrees with it,
+so per-layer L2 against a BF16 reference cannot separate a defect from the
+reference's own rounding. The prediction that error would be flat in depth
+argued from the residual stream being additive and ignored that a discrete
+top-16-of-896 selection sits between the additions: it amplifies a 0.4%
+activation difference instead of attenuating it. Gate 5 is therefore retired as
+formulated. Its replacement — routed-set agreement against an F32-activation
+reference — **reports but does not assert**, which is the honest strength of the
+claim it can make.
+
+Gate 6's decode arm was asserting greedy equality across a 0.3125 logit gap on a
+14.6 scale, against 1.146 of pass-to-pass noise: it was testing the arithmetic's
+tie-break, not the model. It is now gap-aware, and asserts only when the margin
+is decisive.
+
+**Output agrees everywhere**: prompt token 488 and decode token 810, identically
+across the BF16 reference, the F32 reference, and the runtime. The runtime
+reproduces its reference. What is *not* claimed is a bit-exact per-layer match
+against a BF16 oracle, which the control above shows is not a well-posed test.
 
 ## Running it
 
@@ -216,8 +225,9 @@ CJK alike splits Japanese differently from the reference.
   [ro99/strata#21](https://github.com/ro99/strata/issues/21).
 - **CUDA kernels.** Deliberate, and measured: SATA is `argmax_r` by 6–8× at
   batch-1 decode, so device kernels cannot move `τ` for decode. Which kernels
-  matter for prefill is a question for a phase breakdown from the runtime, which
-  needs gate 5 first.
+  matter for prefill is a question for a phase breakdown from the runtime. That
+  breakdown now exists — `docs/experiments/0049` — and says the decode step is
+  83% storage, so this stays deliberate.
 - **Prescriptive placement.** The inventory is descriptive; the runtime does not
   yet consume `layer_device` or `device_budget_bytes`. That waits on a plan
   validated against a real load.

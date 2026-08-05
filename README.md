@@ -14,15 +14,19 @@ This is the machine the project is built and measured on. It's an ordinary works
 | RAM | 251 GiB DDR4 |
 | CPU | Xeon E5-2680 v4 |
 
-On this hardware Strata supports four checkpoints: Gemma 4 31B-IT W8A16
-(35.1 GB, dense text and vision), resident across the three GPUs;
-DeepSeek-V4-Flash-0731 (167 GB, 43 layers, 256 experts, top-6), staged into
-host RAM so decode does not touch storage after warm-up; GLM-5.2 W4A16
-(388 GB, 78 layers, 256 experts, top-8), which is larger than the machine's
-combined VRAM and RAM and therefore remains I/O-dependent; and Kimi-K3
-(1.45 TB, 93 hybrid KDA/MLA layers, 896 experts, top-16), which is larger still
-and is bring-up in progress — see [docs/kimi-k3-runtime.md](docs/kimi-k3-runtime.md)
-for which gates have been measured and which have not.
+On this hardware Strata supports five checkpoints: Gemma 4 31B-IT W8A16
+(35.1 GB, dense text and vision), resident across the three GPUs; Laguna S
+2.1-NVFP4 (99.7 GB, 48 layers, 256 experts, top-10), whose routed experts
+exceed combined VRAM but fit in host RAM, so decode streams them over PCIe
+without touching storage after warm-up; DeepSeek-V4-Flash-0731 (167 GB, 43
+layers, 256 experts, top-6), staged into host RAM so decode does not touch
+storage after warm-up; GLM-5.2 W4A16 (388 GB, 78 layers, 256 experts, top-8),
+which is larger than the machine's combined VRAM and RAM and therefore remains
+I/O-dependent; and Kimi-K3 (1.45 TB, 93 hybrid KDA/MLA layers, 896 experts,
+top-16), which is larger still — its routed experts alone are 1.35 TB against
+251 GiB of RAM, so every decode step reads them from storage and the measured
+step is 38.6 s. See [docs/kimi-k3-runtime.md](docs/kimi-k3-runtime.md) for which
+gates have been measured and which have not.
 
 ## What "exact" means here
 
@@ -69,6 +73,15 @@ Gemma 4 uses its native W8A16 checkpoint directly and enables CUDA attention:
 ```bash
 ./build/strata-chat \
   --model models/gemma4 --model-type gemma4 \
+  --context-size 2048 --max-new 256 --devices 0,1,2
+```
+
+Laguna S 2.1 runs its NVFP4 experts as shipped; the resident spine is pinned
+first and the routed experts fill whatever VRAM is left:
+
+```bash
+./build/strata-chat \
+  --model models/laguna-s-21 --model-type laguna \
   --context-size 2048 --max-new 256 --devices 0,1,2
 ```
 
@@ -304,8 +317,9 @@ It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`,
 |---|---|---|---|
 | Gemma 4 31B-IT | 60 dense hybrid-attention layers; 27-layer vision tower | INT8 group-32 text linears, BF16 vision/embeddings and BF16 KV | Fully resident across GPU VRAM; text and OpenAI image-content generation |
 | DeepSeek-V4-Flash-0731 | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
+| Laguna S 2.1-NVFP4 | 48 layers in a 1:3 global/sliding attention pattern, 256 experts + 1 shared, top-10 | NVFP4 (E2M1 pairs, group-16 E4M3 scales, FP32 per-tensor global scale) routed experts in layers 1-39, BF16 everywhere else; W4A16 execution | Spine resident across GPU VRAM; routed experts exceed VRAM and stream from host RAM |
 | GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 linears, BF16/F32 sensitive tensors; W4A16 execution | Larger than combined memory; I/O-dependent |
-| Kimi-K3 | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16, latent MoE | MXFP4 experts (92.7% of the payload), BF16 everywhere else | Bring-up: contract, codec, ops, layer graph, tokenizer measured green; full-model teacher forcing and generation blocked on an operator action; vision not implemented |
+| Kimi-K3 | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16, latent MoE | MXFP4 experts (92.7% of the payload), BF16 everywhere else | Larger than combined memory; I/O-dependent, 38.6 s/step measured. Contract, codec, ops, layer graph and tokenizer green; output agrees with the reference across 488 prompt and 810 decode tokens; vision not implemented |
 
 Each runs its declared model semantics as-is: local/global grouped-query
 attention, proportional RoPE, GeGLU, soft-capped logits, and bidirectional
@@ -314,6 +328,10 @@ hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek;
 MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for
 GLM; and Kimi Delta Attention with NoPE gated MLA, attention residuals over
 depth, SiTU-GLU, and a latent-space MoE for Kimi-K3.
+GLM; and per-layer head counts, QK RMSNorm, per-head softplus output gating,
+YaRN rotary on the global layers against plain rotary on the sliding ones, and
+sigmoid top-10 routing with a correction bias and a 2.5x routed scale for
+Laguna.
 
 The current 0731 checkpoint has not yet been benchmarked. For context, the last
 validated DeepSeek measurement used the now-unsupported preview checkpoint:

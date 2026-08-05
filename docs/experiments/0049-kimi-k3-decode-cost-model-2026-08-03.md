@@ -150,9 +150,30 @@ conclusion was a first-touch artifact read through the noisy arm.
    step from 38.6 to about 15 s before anything else changes. It is the largest
    single step; it is *not* the only one, and the claim originally written here
    that nothing in software competes was wrong — see the overlap section at the
-   end of this document. `hardware/nvme-upgrade.md`'s one-drive-versus-two
-   arithmetic assumed uniform routing and should be re-derived against the
-   captured trace.
+   end of this document.
+
+   The drive arithmetic, inlined because the operator note it came from is not
+   in the repository. This board is **PCIe 3.0**, so every M.2 slot tops out at
+   ~3.5 GB/s regardless of the drive's rating; more throughput means more links,
+   not a faster drive. Against a batch-1 step reading 15.6–20.7 GiB from storage:
+
+   | Storage | Bandwidth | s/token | tok/s | vs today |
+   |---|---|---|---|---|
+   | **today** — Netac SATA SSD | ~0.4 GB/s | 42–56 | ~0.02 | 1x |
+   | 1 x M.2, PCIe 3.0 x4 | ~3.5 GB/s | 4.8–6.3 | 0.16–0.21 | ~9x |
+   | 2 x M.2, separate links | ~7 GB/s | 2.4–3.2 | 0.31–0.42 | ~18x |
+   | 4 x M.2, x16 bifurcated | ~14 GB/s | 1.2–1.6 | 0.63–0.83 | ~35x |
+
+   Two drives is the sweet spot, because the next wall is host memory: every
+   token streams the whole 106.55 GiB BF16 dense spine out of RAM, and ~100 GB/s
+   realistic across the pair is ~1.3 s/token — a ~0.75 tok/s ceiling before
+   storage is considered at all. Three drives lands at 1.6–2.1 s against that
+   1.3 s floor.
+
+   **That band assumes uniform routing** (13.8% cache hit rate, or ~35% under
+   assumed popularity skew) and should be re-derived against the captured trace
+   before anything is bought. See the hot-expert skew measurement below, which
+   needs no run.
 2. **Arena replacement policy.** Worth something for the first time: 24.06
    GiB/token against 129 GiB resident means a policy anticipating the next
    step's selection converts misses to hits. The route trace now exists and the
@@ -263,8 +284,8 @@ Hot-expert skew is computable from the route trace already written to
 `/data/strata-results/kimi-k3-fixtures/kimi-k3-backbone.fixture`, in the
 `{prompt,decode}.routed.{layer}` arrays. It sizes tier 3 directly, tells tier 2
 how large a predicted set must be to cover the true 16, and re-derives the
-one-drive-versus-two arithmetic in `hardware/nvme-upgrade.md`, which currently
-assumes uniform routing. Minutes, no model load. **Do this first.**
+one-drive-versus-two arithmetic inlined under "what to do next" above, which
+currently assumes uniform routing. Minutes, no model load. **Do this first.**
 
 ### Corrected ordering
 

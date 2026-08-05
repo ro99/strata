@@ -30,4 +30,14 @@ struct OpenAiChatRequest {
     std::string& error);
 [[nodiscard]] bool is_json_object(std::string_view json) noexcept;
 
+// Serialize the completion-metadata fragments llama-swap and other proxies
+// read from the response body to populate their activity/metrics views. These
+// mirror the llama.cpp `usage` and `timings` shapes so proxies that parse
+// llama.cpp responses report the same columns for Strata.
+[[nodiscard]] std::string render_openai_usage(std::uint64_t prompt_tokens,
+                                              std::uint64_t completion_tokens,
+                                              std::uint64_t cached_tokens);
+[[nodiscard]] std::string render_openai_timings(
+    const GenerationMetrics& metrics);
+
 }  // namespace strata

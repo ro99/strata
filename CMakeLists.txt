@@ -52,6 +52,13 @@ add_library(strata_core STATIC
     src/kimi_k3_expert_arena.cpp
     src/kimi_k3_layer.cpp
     src/kimi_k3_runtime.cpp
+    src/laguna_ops.cpp
+    src/laguna_checkpoint.cpp
+    src/laguna_runtime.cpp
+    src/inkling_ops.cpp
+    src/inkling_checkpoint.cpp
+    src/inkling_device.cpp
+    src/inkling_runtime.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
     src/deepseek_ops.cpp
@@ -78,6 +85,7 @@ add_library(strata_core STATIC
     src/simulator.cpp
     kernels/cpu/q4_reference.cpp
     kernels/cpu/glm_int4.cpp
+    kernels/cpu/dsv4_fp4_expert.cpp
 )
 
 target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -136,6 +144,14 @@ target_link_libraries(strata-kimi-decode-probe PRIVATE strata_core)
 add_executable(strata-kimi-compute-probe apps/strata_kimi_compute_probe.cpp)
 find_library(NUMA_LIBRARY_PROBE numa REQUIRED)
 target_link_libraries(strata-kimi-compute-probe PRIVATE strata_core ${NUMA_LIBRARY_PROBE})
+add_executable(strata-inkling-probe apps/strata_inkling_probe.cpp)
+target_link_libraries(strata-inkling-probe PRIVATE strata_core)
+
+add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
+target_link_libraries(strata-laguna-profile PRIVATE strata_core)
+
+add_executable(strata-laguna-stage-probe apps/strata_laguna_stage_probe.cpp)
+target_link_libraries(strata-laguna-stage-probe PRIVATE strata_core)
 
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
@@ -170,9 +186,15 @@ if(BUILD_TESTING)
         tests/test_kimi_k3_backbone.cpp
         tests/test_kimi_k3_layer.cpp
         tests/test_kimi_k3_tokenizer.cpp
+        tests/test_laguna_ops.cpp
+        tests/test_laguna_checkpoint.cpp
+        tests/test_inkling_ops.cpp
+        tests/test_inkling_checkpoint.cpp
+        tests/test_inkling_runtime.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
+        tests/test_deepseek_host_expert.cpp
         tests/test_deepseek_diagnostics.cpp
         tests/test_deepseek_runtime.cpp
         tests/test_model.cpp
@@ -186,6 +208,7 @@ if(BUILD_TESTING)
         tests/test_sampling.cpp
         tests/test_safetensors.cpp
         tests/test_tokenizer.cpp
+        tests/test_worker_pool.cpp
     )
     target_link_libraries(strata-tests PRIVATE strata_core)
     target_compile_definitions(strata-tests PRIVATE

@@ -119,6 +119,41 @@ TEST_CASE("OpenAI protocol preserves base64 image parts for Gemma 4") {
     REQUIRE(request.messages.front().parts.back().data.size() == 4U);
 }
 
+TEST_CASE("OpenAI usage and timings render llama-swap-compatible metrics") {
+    const auto usage = strata::render_openai_usage(120U, 40U, 80U);
+    REQUIRE(strata::is_json_object(usage));
+    REQUIRE(usage.find("\"prompt_tokens\":120") != std::string::npos);
+    REQUIRE(usage.find("\"completion_tokens\":40") != std::string::npos);
+    REQUIRE(usage.find("\"total_tokens\":160") != std::string::npos);
+    REQUIRE(usage.find("\"cached_tokens\":80") != std::string::npos);
+
+    strata::GenerationMetrics metrics;
+    metrics.prompt_tokens = 120U;
+    metrics.prefill_tokens = 40U;
+    metrics.reused_prompt_tokens = 80U;
+    metrics.decode_tokens = 30U;
+    metrics.prefill_seconds = 2.0;
+    metrics.decode_seconds = 3.0;
+    const auto timings = strata::render_openai_timings(metrics);
+    REQUIRE(strata::is_json_object(timings));
+    REQUIRE(timings.find("\"prompt_n\":40") != std::string::npos);
+    REQUIRE(timings.find("\"cache_n\":80") != std::string::npos);
+    REQUIRE(timings.find("\"predicted_n\":30") != std::string::npos);
+    REQUIRE(timings.find("\"prompt_per_second\":20") != std::string::npos);
+    REQUIRE(timings.find("\"predicted_per_second\":10") != std::string::npos);
+    REQUIRE(timings.find("\"prompt_per_token_ms\":50") != std::string::npos);
+    REQUIRE(timings.find("\"predicted_per_token_ms\":100") != std::string::npos);
+}
+
+TEST_CASE("usage and timings are finite when no phase ran") {
+    const auto timings = strata::render_openai_timings(strata::GenerationMetrics{});
+    REQUIRE(strata::is_json_object(timings));
+    REQUIRE(timings.find("nan") == std::string::npos);
+    REQUIRE(timings.find("inf") == std::string::npos);
+    REQUIRE(timings.find("\"prompt_n\":0") != std::string::npos);
+    REQUIRE(timings.find("\"prompt_per_second\":0") != std::string::npos);
+}
+
 TEST_CASE("legacy completions and tokenize requests parse") {
     strata::OpenAiChatRequest completion;
     std::string error;

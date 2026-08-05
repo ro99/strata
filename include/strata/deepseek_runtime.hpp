@@ -52,6 +52,14 @@ struct Dsv4RuntimeConfig {
     // pinned for one 4.46 MB projection. Costs about 2.7 GB/s of one-time
     // registration at load and locks the arena's pages for the process.
     bool pin_resident_arena{};
+    // Waits out each routed-expert demand upload where it is issued, instead of
+    // letting a layer's uploads to different devices run concurrently and
+    // waiting once per device. This is the pre-0052 behaviour and is a
+    // diagnostic and rollback switch only: it drives three independent PCIe
+    // links one at a time, which measured 105.4 ms against 55.4 ms for the same
+    // bytes. Nothing about the result changes -- the transfers are identical
+    // and so is every byte of output.
+    bool serial_expert_upload{};
     bool prepack_mhc_projection{true};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};

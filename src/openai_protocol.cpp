@@ -8,6 +8,7 @@
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <sstream>
 
 namespace strata {
 namespace {
@@ -588,6 +589,40 @@ bool is_json_object(std::string_view json) noexcept {
     } catch (...) {
         return false;
     }
+}
+
+std::string render_openai_usage(std::uint64_t prompt_tokens,
+                                std::uint64_t completion_tokens,
+                                std::uint64_t cached_tokens) {
+    std::ostringstream output;
+    output << "{\"prompt_tokens\":" << prompt_tokens
+           << ",\"completion_tokens\":" << completion_tokens
+           << ",\"total_tokens\":" << prompt_tokens + completion_tokens
+           << ",\"prompt_tokens_details\":{\"cached_tokens\":"
+           << cached_tokens << "}}";
+    return output.str();
+}
+
+std::string render_openai_timings(const GenerationMetrics& metrics) {
+    std::ostringstream output;
+    const double prompt_per_token_ms = metrics.prefill_tokens == 0U
+        ? 0.0 : metrics.prefill_seconds * 1000.0 / static_cast<double>(metrics.prefill_tokens);
+    const double predicted_per_token_ms = metrics.decode_tokens == 0U
+        ? 0.0 : metrics.decode_seconds * 1000.0 / static_cast<double>(metrics.decode_tokens);
+    const double prompt_per_second = metrics.prefill_seconds > 0.0
+        ? static_cast<double>(metrics.prefill_tokens) / metrics.prefill_seconds : 0.0;
+    const double predicted_per_second = metrics.decode_seconds > 0.0
+        ? static_cast<double>(metrics.decode_tokens) / metrics.decode_seconds : 0.0;
+    output << "{\"prompt_n\":" << metrics.prefill_tokens
+           << ",\"prompt_ms\":" << metrics.prefill_seconds * 1000.0
+           << ",\"prompt_per_token_ms\":" << prompt_per_token_ms
+           << ",\"prompt_per_second\":" << prompt_per_second
+           << ",\"predicted_n\":" << metrics.decode_tokens
+           << ",\"predicted_ms\":" << metrics.decode_seconds * 1000.0
+           << ",\"predicted_per_token_ms\":" << predicted_per_token_ms
+           << ",\"predicted_per_second\":" << predicted_per_second
+           << ",\"cache_n\":" << metrics.reused_prompt_tokens << '}';
+    return output.str();
 }
 
 }  // namespace strata

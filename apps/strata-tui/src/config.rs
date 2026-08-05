@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -264,10 +265,75 @@ impl ValidatedConfig {
     }
 }
 
+/// Remembers the last checkpoint folder used for each architecture, so
+/// choosing a model on the launch form can fill in its directory instead of
+/// asking the operator to type the same path again. The relation is usually
+/// one-to-one; the map only exists for the rare cases where one architecture
+/// has several checkpoints.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LastModelPaths {
+    paths: HashMap<String, String>,
+}
+
+impl LastModelPaths {
+    pub fn load() -> Self {
+        let Some(path) = model_paths_file() else {
+            return Self::default();
+        };
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn get(&self, model_type: ModelType) -> Option<&str> {
+        self.paths.get(model_type.as_arg()).map(String::as_str)
+    }
+
+    pub fn set(&mut self, model_type: ModelType, path: &str) {
+        let path = path.trim();
+        if !path.is_empty() {
+            self.paths
+                .insert(model_type.as_arg().to_string(), path.into());
+        }
+    }
+
+    /// Best-effort: a read-only home directory or unwritable cache must never
+    /// block a launch.
+    pub fn save(&self) {
+        let Some(path) = model_paths_file() else {
+            return;
+        };
+        if let Some(directory) = path.parent() {
+            let _ = std::fs::create_dir_all(directory);
+        }
+        let _ = std::fs::write(path, serde_json::to_string_pretty(self).unwrap_or_default());
+    }
+}
+
+fn model_paths_file() -> Option<PathBuf> {
+    if let Ok(value) = env::var("STRATA_TUI_STATE")
+        && !value.trim().is_empty()
+    {
+        return Some(PathBuf::from(value));
+    }
+    let base = if let Ok(value) = env::var("XDG_CONFIG_HOME")
+        && !value.trim().is_empty()
+    {
+        PathBuf::from(value)
+    } else {
+        PathBuf::from(env::var_os("HOME")?).join(".config")
+    };
+    Some(base.join("strata").join("model-paths.json"))
+}
+
 #[derive(Debug)]
 pub struct Cli {
     pub config: RunConfig,
     pub launch_immediately: bool,
+    /// Whether `--model` was given explicitly; an explicit path must win over
+    /// the remembered folder for the chosen architecture.
+    pub supplied_model: bool,
 }
 
 pub fn parse_cli() -> Result<Cli, String> {
@@ -322,6 +388,7 @@ pub fn parse_cli() -> Result<Cli, String> {
     Ok(Cli {
         config,
         launch_immediately: supplied_model && supplied_type && !force_setup,
+        supplied_model,
     })
 }
 
@@ -515,5 +582,14 @@ mod tests {
                 .command_args()
                 .contains(&"--pin-resident-arena".into())
         );
+    }
+
+    #[test]
+    fn last_model_paths_round_trip_through_storage() {
+        let mut stored = LastModelPaths::default();
+        stored.set(ModelType::DeepSeek, "  models/dsv4f  ");
+        assert_eq!(stored.get(ModelType::DeepSeek), Some("models/dsv4f"));
+        assert_eq!(stored.get(ModelType::Glm), None);
+        assert!(!stored.get(ModelType::DeepSeek).unwrap().contains(' '));
     }
 }

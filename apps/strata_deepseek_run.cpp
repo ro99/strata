@@ -376,6 +376,10 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.synchronization_nanoseconds) / 1.0e9
                << ",\"upload_wait_seconds\":"
                << static_cast<double>(device.upload_wait_nanoseconds) / 1.0e9
+               << ",\"matmul_issue_seconds\":"
+               << static_cast<double>(device.matmul_issue_nanoseconds) / 1.0e9
+               << ",\"matmul_finish_seconds\":"
+               << static_cast<double>(device.matmul_finish_nanoseconds) / 1.0e9
                << ",\"activation_h2d_seconds\":"
                << static_cast<double>(device.activation_h2d_nanoseconds) / 1.0e9
                << ",\"kernel_seconds\":"

@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <list>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -332,12 +333,25 @@ class Dsv4WeightCache {
         CudaWeight weight;
         std::uint64_t last_use{};
         std::uint64_t prefetch_lease_until{};
+        // Position of this entry's key in the recency list it belongs to.
+        // Front is least recently used, so eviction reads the front instead of
+        // ranking every entry. A full device holds about 5,300 entries and
+        // decode evicts ~127 times a step, so the scan this replaces walked
+        // roughly 670,000 hash nodes a step -- measured at 14.3 ms/step, the
+        // gap between moe_prepare and the demand wait it contains.
+        std::list<std::string>::iterator recency{};
         std::uint32_t leases{};
+        bool linked{};
         bool pinned{};
         bool prefetched{};
     };
     struct State {
         std::unordered_map<std::string, Entry> entries;
+        // Ordered by last_use ascending, exactly the key the ranking scan used.
+        // Prefetched entries live in their own list because the scan preferred
+        // them over any demand entry regardless of recency.
+        std::list<std::string> recency;
+        std::list<std::string> prefetched_recency;
         std::uint64_t capacity{};
         std::uint64_t used{};
         std::uint64_t pinned{};
@@ -507,7 +521,10 @@ public:
           prefetch_byte_budget_(prefetch_byte_budget),
           prefetch_queue_depth_(prefetch_queue_depth),
           prefetch_lease_ticks_(prefetch_lease_ticks) {
-        for (const auto capacity : capacities) states_.push_back(State{{}, capacity});
+        for (const auto capacity : capacities) {
+            states_.emplace_back();
+            states_.back().capacity = capacity;
+        }
         deferred_upload_slots_.assign(states_.size(), 0U);
         if (prefetch_byte_budget_ != 0U && prefetch_queue_depth_ != 0U) {
             prefetch_worker_ = std::thread([this] { prefetch_loop(); });
@@ -765,13 +782,77 @@ public:
                     continue;
                 }
                 state.used -= entry->second.weight.device_bytes();
-                discard_prefetched(entry->second, false);
+                discard_prefetched(state, entry->second, false);
+                unlink_recency(state, entry->second);
                 entry = state.entries.erase(entry);
             }
         }
     }
 
 private:
+    // Recency bookkeeping. The list an entry sits in is decided by
+    // `prefetched`, and its position inside that list by `last_use`; both
+    // mirror the keys the ranking scan used, so the victim these pick is the
+    // victim the scan picked.
+    static std::list<std::string>& recency_list(State& state,
+                                                bool prefetched) noexcept {
+        return prefetched ? state.prefetched_recency : state.recency;
+    }
+
+    // Pinned entries are never candidates, so they are kept out of the lists
+    // entirely rather than stepped over on every walk. The resident spine is
+    // 500-900 entries a device.
+    static void link_recency(State& state, const std::string& key,
+                             Entry& entry) {
+        if (entry.pinned) return;
+        auto& list = recency_list(state, entry.prefetched);
+        list.push_back(key);
+        entry.recency = std::prev(list.end());
+        entry.linked = true;
+    }
+
+    static void touch_recency(State& state, Entry& entry) noexcept {
+        if (!entry.linked) return;
+        auto& list = recency_list(state, entry.prefetched);
+        list.splice(list.end(), list, entry.recency);
+    }
+
+    // Moves an entry between the two lists without disturbing its position
+    // relative to the entries already there, which is what a prefetched entry
+    // promoted by a demand hit needs: the hit has already bumped `last_use`.
+    static void relink_recency(State& state, Entry& entry, bool was_prefetched) {
+        if (!entry.linked) return;
+        auto& source = recency_list(state, was_prefetched);
+        auto& destination = recency_list(state, entry.prefetched);
+        if (&source == &destination) return;
+        destination.splice(destination.end(), source, entry.recency);
+    }
+
+    static void unlink_recency(State& state, Entry& entry) noexcept {
+        if (!entry.linked) return;
+        recency_list(state, entry.prefetched).erase(entry.recency);
+        entry.linked = false;
+    }
+
+    // Least recently used first, prefetched entries ahead of demand ones.
+    // Pinned and leased entries stay listed and are stepped over: both are
+    // touched on the step that holds them, so they sit at the back and the
+    // walk does not reach them.
+    [[nodiscard]] std::unordered_map<std::string, Entry>::iterator select_victim(
+        State& state) {
+        for (auto* list : {&state.prefetched_recency, &state.recency}) {
+            for (const auto& key : *list) {
+                auto candidate = state.entries.find(key);
+                if (candidate == state.entries.end()) continue;
+                if (candidate->second.pinned || candidate->second.leases != 0U) {
+                    continue;
+                }
+                return candidate;
+            }
+        }
+        return state.entries.end();
+    }
+
     ValidationResult ensure(std::size_t slot, std::string_view base,
                             std::uint64_t rows, std::uint64_t columns,
                             LoadKind kind, Entry*& output) {
@@ -787,13 +868,15 @@ private:
         auto found = state.entries.find(key);
         if (found != state.entries.end()) {
             found->second.last_use = state.clock;
+            touch_recency(state, found->second);
             if (pin && !found->second.pinned) {
                 found->second.pinned = true;
                 state.pinned += found->second.weight.device_bytes();
+                unlink_recency(state, found->second);
             }
             if (kind == LoadKind::Demand) {
                 ++hits_;
-                mark_prefetch_useful(found->second);
+                mark_prefetch_useful(state, found->second);
             } else if (kind == LoadKind::Preload) {
                 ++hits_;
             } else {
@@ -809,17 +892,7 @@ private:
             return result;
         }
         while (kind != LoadKind::Prefetch && state.used + bytes > state.capacity) {
-            auto victim = state.entries.end();
-            for (auto candidate = state.entries.begin(); candidate != state.entries.end();
-                 ++candidate) {
-                if (candidate->second.pinned || candidate->second.leases != 0U) continue;
-                if (victim == state.entries.end() ||
-                    (candidate->second.prefetched && !victim->second.prefetched) ||
-                    (candidate->second.prefetched == victim->second.prefetched &&
-                     candidate->second.last_use < victim->second.last_use)) {
-                    victim = candidate;
-                }
-            }
+            auto victim = select_victim(state);
             if (victim == state.entries.end()) {
                 const bool in_flight = std::any_of(
                     state.entries.begin(), state.entries.end(),
@@ -832,7 +905,8 @@ private:
                 return result;
             }
             state.used -= victim->second.weight.device_bytes();
-            discard_prefetched(victim->second, true);
+            discard_prefetched(state, victim->second, true);
+            unlink_recency(state, victim->second);
             state.entries.erase(victim);
             ++evictions_;
         }
@@ -865,6 +939,7 @@ private:
         state.used += entry.weight.device_bytes();
         if (pin) state.pinned += entry.weight.device_bytes();
         found = state.entries.emplace(key, std::move(entry)).first;
+        link_recency(state, found->first, found->second);
         if (kind == LoadKind::Prefetch) {
             const auto loaded_bytes = found->second.weight.device_bytes();
             prefetched_bytes_ += loaded_bytes;
@@ -904,24 +979,26 @@ private:
         return result;
     }
 
-    void mark_prefetch_useful(Entry& entry) noexcept {
+    void mark_prefetch_useful(State& state, Entry& entry) {
         if (!entry.prefetched) return;
         const auto bytes = entry.weight.device_bytes();
         useful_prefetch_bytes_ += bytes;
         prefetched_bytes_ -= bytes;
         entry.prefetched = false;
         entry.prefetch_lease_until = 0U;
+        relink_recency(state, entry, true);
         ++prefetch_lease_releases_;
         --active_prefetch_leases_;
     }
 
-    void discard_prefetched(Entry& entry, bool evicted) noexcept {
+    void discard_prefetched(State& state, Entry& entry, bool evicted) {
         if (!entry.prefetched) return;
         const auto bytes = entry.weight.device_bytes();
         prefetched_bytes_ -= bytes;
         wasted_prefetch_bytes_ += bytes;
         if (evicted) evicted_prefetch_bytes_ += bytes;
         entry.prefetched = false;
+        relink_recency(state, entry, true);
         ++prefetch_lease_releases_;
         --active_prefetch_leases_;
     }
@@ -949,7 +1026,8 @@ private:
         if (selected_slot == states_.size()) return false;
         auto& state = states_[selected_slot];
         state.used -= selected->second.weight.device_bytes();
-        discard_prefetched(selected->second, true);
+        discard_prefetched(state, selected->second, true);
+        unlink_recency(state, selected->second);
         state.entries.erase(selected);
         ++evictions_;
         return true;
@@ -990,7 +1068,8 @@ private:
                 const auto found = state.entries.find(std::string(name));
                 if (found == state.entries.end() || !found->second.prefetched) continue;
                 state.used -= found->second.weight.device_bytes();
-                discard_prefetched(found->second, false);
+                discard_prefetched(state, found->second, false);
+                unlink_recency(state, found->second);
                 state.entries.erase(found);
             }
             return;
@@ -1383,12 +1462,16 @@ struct DeepSeekV4Runtime::Impl {
     }
 
     ValidationResult warmup();
+    // `parallel_projection` is for the one-row decode path only. A prefill
+    // page calls this once per row, where a per-row pool dispatch would cost
+    // more than the projection it splits; rows are the parallel axis there.
     ValidationResult mhc_pre(std::span<float> reduced, Dsv4MhcMix& mix,
                              std::span<const float> hidden,
                              const std::string& projection_name,
                              std::span<const float> projection,
                              std::span<const float> scale,
-                             std::span<const float> base);
+                             std::span<const float> base,
+                             bool parallel_projection = false);
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
     ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
@@ -1738,7 +1821,7 @@ ValidationResult DeepSeekV4Runtime::Impl::mhc_pre(
     std::span<float> reduced, Dsv4MhcMix& mix,
     std::span<const float> hidden, const std::string& projection_name,
     std::span<const float> projection, std::span<const float> scale,
-    std::span<const float> base) {
+    std::span<const float> base, bool parallel_projection) {
     if (!config.prepack_mhc_projection) {
         return dsv4_mhc_pre_f32(
             reduced, mix, hidden, projection, scale, base);
@@ -1752,8 +1835,18 @@ ValidationResult DeepSeekV4Runtime::Impl::mhc_pre(
         return result;
     }
     ++graph_stats.mhc_prepacked_calls;
+    Dsv4ParallelFor lanes;
+    if (parallel_projection && attention_workers != nullptr &&
+        attention_workers->size() > 1U) {
+        lanes = [this](std::size_t tasks,
+                       const std::function<void(std::size_t)>& body) {
+            return attention_workers->parallel_for(tasks, body);
+        };
+    }
     return dsv4_mhc_prepacked_f32(
-        reduced, mix, hidden, found->second, scale, base);
+        reduced, mix, hidden, found->second, scale, base,
+        kDsv4MhcMultiplier, kDsv4MhcSinkhornIterations, kDsv4NormEpsilon,
+        lanes);
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
@@ -3455,7 +3548,7 @@ ValidationResult DeepSeekV4Runtime::Impl::block(
         Dsv4MhcMix mix;
         auto phase_started = std::chrono::steady_clock::now();
         result = mhc_pre(reduced, mix, residual, projection_name,
-                         *projection.value, *scale.value, *base.value);
+                         *projection.value, *scale.value, *base.value, true);
         graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
         round_bf16(reduced);

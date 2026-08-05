@@ -56,6 +56,11 @@ struct CudaBackendStats {
         std::uint64_t workspace_allocation_bytes{};
         std::uint64_t synchronization_calls{};
         std::uint64_t synchronization_nanoseconds{};
+        // matmul_impl split on the host clock: everything before the stream
+        // synchronize, and everything after it. Separates driver submission
+        // cost from time genuinely spent waiting on the device.
+        std::uint64_t matmul_issue_nanoseconds{};
+        std::uint64_t matmul_finish_nanoseconds{};
         std::uint64_t upload_wait_nanoseconds{};
         // upload() partitioned. A pageable source makes cudaMemcpyAsync
         // synchronous inside the call, so its cost lands in
@@ -113,6 +118,8 @@ struct CudaBackendStats {
     std::uint64_t workspace_allocation_bytes{};
     std::uint64_t synchronization_calls{};
     std::uint64_t synchronization_nanoseconds{};
+    std::uint64_t matmul_issue_nanoseconds{};
+    std::uint64_t matmul_finish_nanoseconds{};
     std::uint64_t upload_wait_nanoseconds{};
     std::uint64_t weight_allocation_nanoseconds{};
     std::uint64_t weight_copy_nanoseconds{};

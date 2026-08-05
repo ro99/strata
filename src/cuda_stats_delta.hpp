@@ -21,6 +21,8 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(workspace_allocation_bytes);
     STRATA_CUDA_DEVICE_DELTA(synchronization_calls);
     STRATA_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(matmul_issue_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(matmul_finish_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(weight_allocation_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(weight_copy_nanoseconds);
@@ -79,6 +81,8 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(workspace_allocation_bytes);
     STRATA_CUDA_DELTA(synchronization_calls);
     STRATA_CUDA_DELTA(synchronization_nanoseconds);
+    STRATA_CUDA_DELTA(matmul_issue_nanoseconds);
+    STRATA_CUDA_DELTA(matmul_finish_nanoseconds);
     STRATA_CUDA_DELTA(upload_wait_nanoseconds);
     STRATA_CUDA_DELTA(weight_allocation_nanoseconds);
     STRATA_CUDA_DELTA(weight_copy_nanoseconds);

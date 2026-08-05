@@ -1761,9 +1761,13 @@ __global__ void flash_attention_reference_f32_kernel(
     std::uint32_t query_rows, std::uint32_t query_heads,
     std::uint32_t key_value_heads, std::uint32_t query_key_dim,
     std::uint32_t value_dim, std::uint32_t key_rows, float scale,
-    unsigned int* error_flag) {
+    unsigned int* error_flag, std::uint32_t exponential_capacity) {
     constexpr std::uint32_t threads = 256U;
     constexpr std::uint32_t values_per_thread = 4U;
+    // Softmax scratch for the block-parallel path below: one double per key
+    // row, holding exp(score - maximum) so the exponentials are evaluated once,
+    // by every thread, instead of twice by thread 0.
+    extern __shared__ double flash_attention_exponentials[];
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
     const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
     if (head >= query_heads || query_row >= query_rows) return;
@@ -1796,7 +1800,64 @@ __global__ void flash_attention_reference_f32_kernel(
     }
     __syncthreads();
 
-    if (threadIdx.x == 0U) {
+    // The softmax below is split so that only the one step whose result depends
+    // on evaluation order stays on a single thread. `fmaxf` ignores NaN from
+    // either side, so the maximum is order independent and reduces; `exp` and
+    // the final divide are per row. The denominator is a sequential
+    // `__dadd_rn` fold over rows and stays exactly that, reading exponentials
+    // the block already computed -- so every emitted float is unchanged, and
+    // thread 0's work drops from 2 * visible_rows double exponentials to
+    // visible_rows double adds.
+    const bool block_softmax = exponential_capacity >= visible_rows;
+    if (block_softmax) {
+        __shared__ float warp_maxima[threads / 32U];
+        float local = -INFINITY;
+        for (std::uint32_t row = threadIdx.x; row < visible_rows;
+             row += blockDim.x) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
+            local = fmaxf(local, scores[row]);
+        }
+#pragma unroll
+        for (std::uint32_t offset = 16U; offset != 0U; offset >>= 1U) {
+            local = fmaxf(local, __shfl_down_sync(0xFFFFFFFFU, local, offset));
+        }
+        if ((threadIdx.x & 31U) == 0U) warp_maxima[threadIdx.x >> 5U] = local;
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            float value = sinks == nullptr ? -INFINITY : sinks[head];
+#pragma unroll
+            for (std::uint32_t warp = 0U; warp < threads / 32U; ++warp) {
+                value = fmaxf(value, warp_maxima[warp]);
+            }
+            maximum = value;
+        }
+        __syncthreads();
+        for (std::uint32_t row = threadIdx.x; row < visible_rows;
+             row += blockDim.x) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
+            flash_attention_exponentials[row] = exp(static_cast<double>(
+                __fsub_rn(scores[row], maximum)));
+        }
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            double total = sinks == nullptr
+                ? 0.0
+                : exp(static_cast<double>(__fsub_rn(sinks[head], maximum)));
+            for (std::uint32_t row = 0U; row < visible_rows; ++row) {
+                if (key_mask != nullptr && key_mask[row] == 0U) continue;
+                total = __dadd_rn(total, flash_attention_exponentials[row]);
+            }
+            if (!isfinite(total) || total <= 0.0) atomicExch(error_flag, 2U);
+            denominator = total;
+        }
+        __syncthreads();
+        for (std::uint32_t row = threadIdx.x; row < visible_rows;
+             row += blockDim.x) {
+            if (key_mask != nullptr && key_mask[row] == 0U) continue;
+            scores[row] = static_cast<float>(
+                flash_attention_exponentials[row] / denominator);
+        }
+    } else if (threadIdx.x == 0U) {
         maximum = sinks == nullptr ? -INFINITY : sinks[head];
         for (std::uint32_t row = 0U; row < visible_rows; ++row) {
             if (key_mask != nullptr && key_mask[row] == 0U) continue;
@@ -2225,6 +2286,9 @@ struct CudaBuffer::Impl {
 struct CudaBackend::Impl {
     struct DeviceState {
         cudaStream_t stream{};
+        cudaStream_t upload_stream{};
+        cudaEvent_t upload_ready{};
+        bool upload_ordered{};
         cudaEvent_t activation_start{};
         cudaEvent_t activation_uploaded{};
         cudaEvent_t kernel_finished{};
@@ -2238,6 +2302,16 @@ struct CudaBackend::Impl {
         float* output{};
         std::uint64_t input_bytes{};
         std::uint64_t output_bytes{};
+        // Pinned staging for matmul activations. A cudaMemcpyAsync whose host
+        // side is pageable is not asynchronous: the driver stages it itself and
+        // blocks, which decode pays on both legs of every one of its ~430
+        // matmul round trips a step. FlashAttention and the MoE command already
+        // stage through pinned host memory; this is the same for the generic
+        // matmul.
+        std::byte* matmul_host_input{};
+        std::byte* matmul_host_output{};
+        std::uint64_t matmul_host_input_bytes{};
+        std::uint64_t matmul_host_output_bytes{};
         std::byte* attention_upload{};
         std::byte* attention_download{};
         std::byte* attention_host_upload{};
@@ -2335,6 +2409,12 @@ struct CudaBackend::Impl {
             if (state.gemma_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.gemma_host_staging));
             }
+            if (state.matmul_host_input != nullptr) {
+                static_cast<void>(cudaFreeHost(state.matmul_host_input));
+            }
+            if (state.matmul_host_output != nullptr) {
+                static_cast<void>(cudaFreeHost(state.matmul_host_output));
+            }
             if (state.attention_host_upload != nullptr) {
                 static_cast<void>(cudaFreeHost(state.attention_host_upload));
             }
@@ -2380,6 +2460,13 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaEventDestroy(state.moe_kernel_finished));
                 static_cast<void>(cudaEventDestroy(state.moe_download_started));
                 static_cast<void>(cudaEventDestroy(state.moe_completed));
+            }
+            if (state.upload_ready != nullptr) {
+                static_cast<void>(cudaEventDestroy(state.upload_ready));
+            }
+            if (state.upload_stream != nullptr) {
+                static_cast<void>(cudaStreamSynchronize(state.upload_stream));
+                static_cast<void>(cudaStreamDestroy(state.upload_stream));
             }
             if (state.stream != nullptr) static_cast<void>(cudaStreamDestroy(state.stream));
         }
@@ -2485,6 +2572,23 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         if (auto status = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
+        }
+        // Weight uploads get their own stream so the copy engine can run them
+        // while the SMs are still on the previous command. On the execution
+        // stream a demand expert transfer and the kernel that will read it are
+        // strictly ordered, so a decode layer pays transfer plus compute in
+        // series; the copy engine is idle for the compute half of that.
+        // Ordering is restored explicitly by upload_ready, which every consumer
+        // waits on before it reads a weight.
+        if (auto status = cudaStreamCreateWithFlags(&state.upload_stream,
+                                                    cudaStreamNonBlocking);
+            status != cudaSuccess) {
+            return cuda_error(status, "create CUDA upload stream");
+        }
+        if (auto status = cudaEventCreateWithFlags(&state.upload_ready,
+                                                   cudaEventDisableTiming);
+            status != cudaSuccess) {
+            return cuda_error(status, "create CUDA upload event");
         }
         if (detailed_timing) {
             for (auto* event : {&state.activation_start, &state.activation_uploaded,
@@ -2748,19 +2852,23 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         ++allocation_calls;
     }
     allocation_nanoseconds += elapsed_nanoseconds_since(allocation_started);
-    // This stream is nonblocking with respect to the legacy default stream.
-    // Keep uploads on the execution stream and finish them before the caller's
-    // host payload is released or the cache publishes the weight.
-    const auto upload_error = [&state, &target](cudaError_t status,
-                                                const char* operation) {
-        if (cudaStreamSynchronize(state.stream) != cudaSuccess) {
+    // A deferred upload runs on the copy stream so it overlaps whatever the
+    // execution stream is still doing; the execution stream is made to wait on
+    // upload_ready before anything reads the weight. A synchronous upload keeps
+    // the execution stream, because its caller's host payload dies at return
+    // and the wait below is what keeps it alive long enough.
+    const bool deferred = completion == UploadCompletion::Deferred;
+    auto* const upload_stream = deferred ? state.upload_stream : state.stream;
+    const auto upload_error = [&state, &target, upload_stream](
+        cudaError_t status, const char* operation) {
+        if (cudaStreamSynchronize(upload_stream) != cudaSuccess) {
             state.quarantined_weights.push_back(std::move(target));
         }
         return cuda_error(status, operation);
     };
     auto copy_started = std::chrono::steady_clock::now();
     if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
-                                      cudaMemcpyHostToDevice, state.stream);
+                                      cudaMemcpyHostToDevice, upload_stream);
         status != cudaSuccess) {
         return upload_error(status, "upload CUDA weights");
     }
@@ -2779,7 +2887,7 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         copy_started = std::chrono::steady_clock::now();
         if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
-                                          cudaMemcpyHostToDevice, state.stream);
+                                          cudaMemcpyHostToDevice, upload_stream);
             status != cudaSuccess) {
             return upload_error(status, "upload CUDA scales");
         }
@@ -2787,10 +2895,11 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     }
     std::uint64_t wait_nanoseconds = 0U;
     std::uint64_t synchronizations = 0U;
-    if (completion == UploadCompletion::Deferred) {
-        // The copies stay in flight so the next device's can start immediately.
-        // Nothing on this device can observe the weight out of order -- there
-        // is one stream per device and every consumer is issued on it.
+    if (deferred) {
+        // The copies stay in flight so the next device's can start immediately,
+        // and so this device's copy engine runs them against whatever the
+        // execution stream is doing. Ordering is re-established by
+        // synchronize_uploads(), which the caller owes before any consumer.
         state.pending_uploads = true;
     } else {
         const auto wait_started = std::chrono::steady_clock::now();
@@ -2837,10 +2946,23 @@ ValidationResult CudaBackend::synchronize_uploads(int device) {
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for upload synchronization");
     }
+    // The ordering the consumer needs is "the copies have landed before the
+    // kernel reads them", which is a device-side dependency, not a host one.
+    // Expressing it as an event the execution stream waits on lets the host
+    // return immediately and enqueue the command, so the copy engine finishes
+    // the transfer while the SMs start on work that does not depend on it.
+    // Blocking the host here instead cost a measured 64.5 ms of a 235 ms
+    // decode step, with both engines idle for most of it.
     const auto wait_started = std::chrono::steady_clock::now();
-    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
-        return cuda_error(status, "synchronize deferred CUDA weight uploads");
+    if (auto status = cudaEventRecord(state.upload_ready, state.upload_stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "record deferred CUDA weight upload");
     }
+    if (auto status = cudaStreamWaitEvent(state.stream, state.upload_ready, 0U);
+        status != cudaSuccess) {
+        return cuda_error(status, "order CUDA execution behind weight uploads");
+    }
+    state.upload_ordered = true;
     const auto wait_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wait_started).count());
@@ -4146,7 +4268,20 @@ ValidationResult CudaBackend::flash_attention(
             device_error);
     } else if (request.numerics ==
         FlashAttentionNumerics::f64_dot_f32_score_f32_accum) {
-        flash_attention_reference_f32_kernel<<<grid, threads, 0U, state.stream>>>(
+        // One double per key row lets the block evaluate the softmax
+        // exponentials in parallel and hand thread 0 a plain sequential add.
+        // Beyond the shared-memory budget the kernel keeps the single-thread
+        // fold, so a long context stays correct rather than failing to launch.
+        constexpr std::uint64_t exponential_shared_ceiling = 32U * 1024U;
+        const auto exponential_capacity =
+            shape.value.logical_rows * sizeof(double) <=
+                    exponential_shared_ceiling
+                ? static_cast<std::uint32_t>(shape.value.logical_rows)
+                : 0U;
+        const auto exponential_bytes =
+            static_cast<std::size_t>(exponential_capacity) * sizeof(double);
+        flash_attention_reference_f32_kernel<<<
+            grid, threads, exponential_bytes, state.stream>>>(
             device_output, device_queries, device_keys,
             device_values, state.attention_scores,
             request.head_sinks.empty() ? nullptr : device_sinks,
@@ -4156,7 +4291,7 @@ ValidationResult CudaBackend::flash_attention(
             request.query_rows, request.query_heads, request.key_value_heads,
             request.query_key_dim, request.value_dim,
             static_cast<std::uint32_t>(shape.value.logical_rows), request.scale,
-            device_error);
+            device_error, exponential_capacity);
     } else {
         flash_attention_forward_kernel<<<grid, threads, 0U, state.stream>>>(
             device_output, device_queries, device_keys,
@@ -4579,6 +4714,7 @@ ValidationResult CudaBackend::matmul_impl(
         result.errors.emplace_back("CUDA matmul activation shapes are incompatible");
         return result;
     }
+    const auto issue_started = std::chrono::steady_clock::now();
     auto& state = impl_->devices.at(weight.impl_->device);
     if (state.moe_in_flight) {
         result.errors.emplace_back(
@@ -4612,14 +4748,45 @@ ValidationResult CudaBackend::matmul_impl(
         ++workspace_allocation_calls;
         workspace_allocation_bytes += output_bytes;
     }
+    // Grown geometrically and kept, so a decode step that repeats the same
+    // shapes allocates nothing. Past the ceiling the copy falls back to the
+    // pageable path rather than reserving an unbounded pinned region.
+    constexpr std::uint64_t matmul_host_staging_ceiling = 64U * 1024U * 1024U;
+    const auto ensure_host_staging = [](std::byte*& pointer,
+                                        std::uint64_t& capacity,
+                                        std::uint64_t required) -> bool {
+        if (required <= capacity) return capacity != 0U;
+        if (required > matmul_host_staging_ceiling) return false;
+        const auto target = std::bit_ceil(required);
+        void* replacement = nullptr;
+        if (cudaMallocHost(&replacement, static_cast<std::size_t>(target)) !=
+            cudaSuccess) {
+            static_cast<void>(cudaGetLastError());
+            return false;
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFreeHost(pointer));
+        pointer = static_cast<std::byte*>(replacement);
+        capacity = target;
+        return true;
+    };
+    const bool stage_input = ensure_host_staging(
+        state.matmul_host_input, state.matmul_host_input_bytes, input_bytes);
+    const bool stage_output = ensure_host_staging(
+        state.matmul_host_output, state.matmul_host_output_bytes, output_bytes);
+    if (stage_input) {
+        std::memcpy(state.matmul_host_input, input.data(), input.size_bytes());
+    }
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.activation_start, state.stream);
             status != cudaSuccess) {
             return cuda_error(status, "record activation upload start");
         }
     }
-    if (auto status = cudaMemcpyAsync(state.input, input.data(), input.size_bytes(),
-                                      cudaMemcpyHostToDevice, state.stream);
+    if (auto status = cudaMemcpyAsync(
+            state.input,
+            stage_input ? static_cast<const void*>(state.matmul_host_input)
+                        : static_cast<const void*>(input.data()),
+            input.size_bytes(), cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "upload CUDA activation");
     }
@@ -4718,8 +4885,11 @@ ValidationResult CudaBackend::matmul_impl(
             return cuda_error(status, "record CUDA kernel completion");
         }
     }
-    if (auto status = cudaMemcpyAsync(output.data(), state.output, output.size_bytes(),
-                                      cudaMemcpyDeviceToHost, state.stream);
+    if (auto status = cudaMemcpyAsync(
+            stage_output ? static_cast<void*>(state.matmul_host_output)
+                         : static_cast<void*>(output.data()),
+            state.output, output.size_bytes(),
+            cudaMemcpyDeviceToHost, state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "download CUDA activation");
     }
@@ -4730,8 +4900,16 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     const auto wait_started = std::chrono::steady_clock::now();
+    const auto issue_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            wait_started - issue_started).count());
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA matmul");
+    }
+    const auto finish_started = std::chrono::steady_clock::now();
+    if (stage_output) {
+        std::memcpy(output.data(), state.matmul_host_output,
+                    output.size_bytes());
     }
     const auto wait_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -4777,6 +4955,10 @@ ValidationResult CudaBackend::matmul_impl(
         device_stats.workspace_allocation_bytes += workspace_allocation_bytes;
         ++device_stats.synchronization_calls;
         device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        device_stats.matmul_issue_nanoseconds += issue_nanoseconds;
+        device_stats.matmul_finish_nanoseconds += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - finish_started).count());
         device_stats.activation_h2d_nanoseconds += activation_h2d_nanoseconds;
         device_stats.kernel_nanoseconds += kernel_nanoseconds;
         device_stats.activation_d2h_nanoseconds += activation_d2h_nanoseconds;

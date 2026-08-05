@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -133,6 +134,17 @@ struct Dsv4IndexSelectionResult {
     std::span<float> output, std::span<const float> row_major,
     std::size_t rows, std::size_t columns);
 
+// `projection_lanes` optionally spreads the projection across host workers.
+// The projection reads the whole packed tensor -- 1.57 MB a call at the
+// DeepSeek-V4 shape, 135 MB a decode step -- and one core sustains about
+// 5.8 GB/s of it, so the term is bound by a single core's outstanding line
+// fills rather than by arithmetic. Each lane owns whole output rows and folds
+// its columns in the same order, so splitting moves no value. The callback
+// takes a task count and a body, matching HostWorkerPool::parallel_for; an
+// empty callback runs the projection inline.
+using Dsv4ParallelFor = std::function<ValidationResult(
+    std::size_t, const std::function<void(std::size_t)>&)>;
+
 [[nodiscard]] ValidationResult dsv4_mhc_prepacked_f32(
     std::span<float> reduced, Dsv4MhcMix& mix,
     std::span<const float> hidden_copies,
@@ -140,7 +152,8 @@ struct Dsv4IndexSelectionResult {
     std::span<const float> scale, std::span<const float> base,
     std::uint32_t multiplier = kDsv4MhcMultiplier,
     std::uint32_t iterations = kDsv4MhcSinkhornIterations,
-    float epsilon = kDsv4NormEpsilon);
+    float epsilon = kDsv4NormEpsilon,
+    const Dsv4ParallelFor& projection_lanes = {});
 
 [[nodiscard]] ValidationResult dsv4_mhc_post_f32(
     std::span<float> output_copies, std::span<const float> branch,

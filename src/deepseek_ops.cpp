@@ -620,27 +620,64 @@ ValidationResult dsv4_pack_mhc_projection_f32(
 }
 
 #if STRATA_MHC_AVX2
-STRATA_MHC_TARGET_AVX2
-static void dsv4_mhc_project_prepacked_avx2(
-    std::span<float> projected, std::span<const float> hidden,
-    std::span<const float> packed) {
+// One block of four output rows, carrying its own accumulator. Each lane still
+// folds columns in index order with the same mul and add, so the emitted floats
+// do not move.
+template <std::size_t Tile>
+STRATA_MHC_TARGET_AVX2 static void dsv4_mhc_project_prepacked_tile_avx2(
+    float* projected, const float* hidden, std::size_t columns,
+    const float* packed, std::size_t first_block) {
     constexpr std::size_t width = 4U;
-    const std::size_t blocks = projected.size() / width;
-    for (std::size_t block = 0U; block < blocks; ++block) {
-        __m256d sums = _mm256_setzero_pd();
-        for (std::size_t column = 0U; column < hidden.size(); ++column) {
-            const __m128 weights = _mm_loadu_ps(
-                packed.data() + (block * hidden.size() + column) * width);
-            const __m256d weights_f64 = _mm256_cvtps_pd(weights);
-            const __m256d value = _mm256_set1_pd(
-                static_cast<double>(hidden[column]));
-            sums = _mm256_add_pd(sums, _mm256_mul_pd(weights_f64, value));
+    std::array<__m256d, Tile> sums;
+    std::array<const float*, Tile> rows{};
+    for (std::size_t lane = 0U; lane < Tile; ++lane) {
+        sums[lane] = _mm256_setzero_pd();
+        rows[lane] = packed + (first_block + lane) * columns * width;
+    }
+    for (std::size_t column = 0U; column < columns; ++column) {
+        const __m256d value = _mm256_set1_pd(static_cast<double>(hidden[column]));
+        for (std::size_t lane = 0U; lane < Tile; ++lane) {
+            const __m256d weights = _mm256_cvtps_pd(
+                _mm_loadu_ps(rows[lane] + column * width));
+            sums[lane] = _mm256_add_pd(sums[lane],
+                                       _mm256_mul_pd(weights, value));
         }
-        std::array<double, width> lanes{};
-        _mm256_storeu_pd(lanes.data(), sums);
-        for (std::size_t lane = 0U; lane < width; ++lane) {
-            projected[block * width + lane] = static_cast<float>(lanes[lane]);
+    }
+    for (std::size_t lane = 0U; lane < Tile; ++lane) {
+        std::array<double, width> values{};
+        _mm256_storeu_pd(values.data(), sums[lane]);
+        for (std::size_t slot = 0U; slot < width; ++slot) {
+            projected[(first_block + lane) * width + slot] =
+                static_cast<float>(values[slot]);
         }
+    }
+}
+
+// The projection is 24 rows against a 16,384-wide mHC state, so one block is a
+// 16,384-long chain of dependent `vaddpd`. At the port's three-cycle latency
+// that chain, not the arithmetic, sets the cost: measured 321 us a call and 86
+// calls a decode step. Four blocks in flight cover the latency with issue slots
+// that were idle, and because the blocks are independent output rows no lane's
+// summation order changes.
+STRATA_MHC_TARGET_AVX2
+static void dsv4_mhc_project_prepacked_range_avx2(
+    std::span<float> projected, std::span<const float> hidden,
+    std::span<const float> packed, std::size_t first_block,
+    std::size_t block_count) {
+    const auto columns = hidden.size();
+    std::size_t block = first_block;
+    const std::size_t last = first_block + block_count;
+    for (; block + 4U <= last; block += 4U) {
+        dsv4_mhc_project_prepacked_tile_avx2<4U>(
+            projected.data(), hidden.data(), columns, packed.data(), block);
+    }
+    for (; block + 2U <= last; block += 2U) {
+        dsv4_mhc_project_prepacked_tile_avx2<2U>(
+            projected.data(), hidden.data(), columns, packed.data(), block);
+    }
+    for (; block < last; ++block) {
+        dsv4_mhc_project_prepacked_tile_avx2<1U>(
+            projected.data(), hidden.data(), columns, packed.data(), block);
     }
 }
 #endif
@@ -650,7 +687,8 @@ ValidationResult dsv4_mhc_prepacked_f32(
     std::span<const float> hidden_copies,
     std::span<const float> packed_projection,
     std::span<const float> scale, std::span<const float> base,
-    std::uint32_t multiplier, std::uint32_t iterations, float epsilon) {
+    std::uint32_t multiplier, std::uint32_t iterations, float epsilon,
+    const Dsv4ParallelFor& projection_lanes) {
     ValidationResult result;
     constexpr std::size_t width = 4U;
     if (!dsv4_mhc_prepacked_supported()) {
@@ -679,8 +717,22 @@ ValidationResult dsv4_mhc_prepacked_f32(
         epsilon);
     std::vector<float> projected(base.size());
 #if STRATA_MHC_AVX2
-    dsv4_mhc_project_prepacked_avx2(projected, hidden_copies,
-                                    packed_projection);
+    const std::size_t blocks = projected.size() / width;
+    const std::size_t lanes = projection_lanes && blocks > 1U ? blocks : 1U;
+    if (lanes > 1U) {
+        auto dispatched = projection_lanes(lanes, [&](std::size_t lane) {
+            const auto first = blocks * lane / lanes;
+            const auto last = blocks * (lane + 1U) / lanes;
+            if (last <= first) return;
+            dsv4_mhc_project_prepacked_range_avx2(
+                projected, hidden_copies, packed_projection, first,
+                last - first);
+        });
+        if (!dispatched.ok()) return dispatched;
+    } else {
+        dsv4_mhc_project_prepacked_range_avx2(
+            projected, hidden_copies, packed_projection, 0U, blocks);
+    }
 #endif
     for (auto& value : projected) value *= reciprocal;
     auto split = dsv4_mhc_split_sinkhorn_f32(

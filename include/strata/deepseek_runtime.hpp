@@ -60,6 +60,12 @@ struct Dsv4RuntimeConfig {
     // bytes. Nothing about the result changes -- the transfers are identical
     // and so is every byte of output.
     bool serial_expert_upload{};
+    // Prefill pages execute their MoE expert-major by default: each distinct
+    // expert of the page is acquired and read once and applied to every row
+    // that selected it. Setting this restores the row-major nest, which reads
+    // one expert triplet per row, and exists so the two can be A/B'd from one
+    // build. Per-row arithmetic is identical either way.
+    bool row_major_moe_page{};
     bool prepack_mhc_projection{true};
     std::uint32_t resident_read_workers{8U};
     std::uint32_t spine_warmup_workers{3U};

@@ -1439,6 +1439,10 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult route_moe(std::uint32_t layer, std::uint32_t token,
                                std::span<const float> logits,
                                std::uint32_t position, Dsv4Route& route);
+    ValidationResult execute_moe_page(std::uint32_t layer,
+                                      std::span<const Dsv4Route> routes,
+                                      std::span<const float> input,
+                                      std::span<float> output);
     ValidationResult execute_moe(std::uint32_t layer, const Dsv4Route& route,
                                  std::span<const float> input,
                                  std::span<float> output);
@@ -3174,13 +3178,255 @@ ValidationResult DeepSeekV4Runtime::Impl::moe_page(
         if (!result.ok()) return result;
     }
     graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
-    for (std::uint32_t row = 0U; row < rows; ++row) {
-        result = execute_moe(
-            layer, routes[row],
-            input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
-            output.subspan(static_cast<std::size_t>(row) * kHidden, kHidden));
-        if (!result.ok()) return result;
+    if (rows == 1U || config.row_major_moe_page) {
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = execute_moe(
+                layer, routes[row],
+                input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
+                output.subspan(static_cast<std::size_t>(row) * kHidden, kHidden));
+            if (!result.ok()) return result;
+        }
+        return result;
     }
+    return execute_moe_page(layer, routes, input, output);
+}
+
+// Row-grouped MoE for a prefill page. The single-row path reads a 13.37 MB
+// expert triplet from HBM to serve one row, so a page of R rows reads a hot
+// expert once for every row that chose it. Here each distinct expert is
+// acquired and read once and applied to all its rows at once, which is the
+// only structural difference between this engine's prefill and a CPU-hybrid
+// stack that batches the same page 30x faster (experiment 0055).
+//
+// Per-row arithmetic is unchanged: every row still visits its own six experts
+// with its own coefficients, and the final accumulation still runs in rank
+// order, so output is bit-identical to looping execute_moe over the rows.
+ValidationResult DeepSeekV4Runtime::Impl::execute_moe_page(
+    std::uint32_t layer, std::span<const Dsv4Route> routes,
+    std::span<const float> input, std::span<float> output) {
+    ValidationResult result;
+    const auto rows = static_cast<std::uint32_t>(routes.size());
+    if (rows == 0U || input.size() != static_cast<std::size_t>(rows) * kHidden ||
+        output.size() != input.size()) {
+        result.errors.emplace_back("DeepSeek MoE page shape is invalid");
+        return result;
+    }
+
+    const auto prepare_started = std::chrono::steady_clock::now();
+    struct PendingDevice {
+        std::vector<Dsv4WeightCache::Lease> leases;
+        std::vector<CudaDeepSeekMoeRowGroup> groups;
+        std::deque<std::vector<std::uint32_t>> group_rows;
+        std::deque<std::vector<float>> group_coefficients;
+        std::vector<std::uint32_t> group_offsets;
+        std::unordered_map<std::uint32_t, std::size_t> expert_slot;
+        CudaDeepSeekMoeExpert shared;
+        std::vector<std::uint32_t> shared_rows;
+        std::vector<float> routed_output;
+        std::vector<float> shared_output;
+        std::uint32_t work_count{};
+        bool has_shared{};
+        bool enqueued{};
+    };
+    struct Placement {
+        std::uint32_t slot{};
+        std::uint32_t group{};
+        std::uint32_t position{};
+    };
+
+    std::vector<PendingDevice> pending(devices.size());
+    std::vector<Placement> placements(
+        static_cast<std::size_t>(rows) * kTopK);
+
+    const auto acquire_triplet = [this, &result](
+        std::size_t slot, std::string_view prefix,
+        PendingDevice& pending_device, CudaDeepSeekMoeExpert& descriptor) {
+        descriptor.coefficient = 1.0F;
+        const auto acquire = [this, &result, slot, &pending_device](
+            std::string name, std::uint64_t weight_rows,
+            std::uint64_t weight_columns, const CudaWeight*& weight) {
+            pending_device.leases.emplace_back();
+            auto loaded = weights->acquire(slot, name, weight_rows,
+                                           weight_columns,
+                                           pending_device.leases.back());
+            if (!loaded.ok()) {
+                append_errors(result, std::move(loaded.errors), name);
+                pending_device.leases.pop_back();
+                return false;
+            }
+            weight = &pending_device.leases.back().weight();
+            return true;
+        };
+        return acquire(std::string(prefix) + "w1", kExpertIntermediate,
+                       kHidden, descriptor.w1) &&
+               acquire(std::string(prefix) + "w3", kExpertIntermediate,
+                       kHidden, descriptor.w3) &&
+               acquire(std::string(prefix) + "w2", kHidden,
+                       kExpertIntermediate, descriptor.w2);
+    };
+
+    auto upload_batch = config.serial_expert_upload
+        ? Dsv4WeightCache::UploadBatch{}
+        : weights->begin_upload_batch();
+
+    const auto routed_prefix = layer_prefix(layer) + "ffn.experts.";
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        const auto& route = routes[row];
+        if (route.experts.size() != kTopK || route.weights.size() != kTopK) {
+            result.errors.emplace_back("DeepSeek MoE page route shape is invalid");
+            return result;
+        }
+        for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+            const auto expert_id = route.experts[rank];
+            if (expert_id >= kExperts || !std::isfinite(route.weights[rank])) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page expert id or coefficient is invalid");
+                return result;
+            }
+            const auto slot = expert_device(expert_id);
+            auto& pending_device = pending[slot];
+            auto found = pending_device.expert_slot.find(expert_id);
+            if (found == pending_device.expert_slot.end()) {
+                CudaDeepSeekMoeExpert descriptor;
+                const auto prefix =
+                    routed_prefix + std::to_string(expert_id) + ".";
+                if (!acquire_triplet(slot, prefix, pending_device, descriptor)) {
+                    return result;
+                }
+                const auto group_index = pending_device.groups.size();
+                pending_device.group_rows.emplace_back();
+                pending_device.group_coefficients.emplace_back();
+                CudaDeepSeekMoeRowGroup group;
+                group.w1 = descriptor.w1;
+                group.w3 = descriptor.w3;
+                group.w2 = descriptor.w2;
+                pending_device.groups.push_back(group);
+                found = pending_device.expert_slot
+                            .emplace(expert_id, group_index).first;
+            }
+            auto& group_rows = pending_device.group_rows[found->second];
+            auto& group_coefficients =
+                pending_device.group_coefficients[found->second];
+            placements[static_cast<std::size_t>(row) * kTopK + rank] = {
+                static_cast<std::uint32_t>(slot),
+                static_cast<std::uint32_t>(found->second),
+                static_cast<std::uint32_t>(group_rows.size())};
+            group_rows.push_back(row);
+            group_coefficients.push_back(route.weights[rank]);
+        }
+    }
+
+    const auto shared_slot = layer_device(layer);
+    auto& shared_device = pending[shared_slot];
+    const auto shared_prefix = layer_prefix(layer) + "ffn.shared_experts.";
+    if (!acquire_triplet(shared_slot, shared_prefix, shared_device,
+                         shared_device.shared)) {
+        return result;
+    }
+    shared_device.has_shared = true;
+    shared_device.shared_rows.resize(rows);
+    std::iota(shared_device.shared_rows.begin(),
+              shared_device.shared_rows.end(), 0U);
+
+    if (auto closed = upload_batch.close(); !closed.ok()) {
+        append_errors(result, std::move(closed.errors),
+                      "DeepSeek routed expert page upload");
+        return result;
+    }
+
+    graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
+    const auto execution_started = std::chrono::steady_clock::now();
+    std::uint64_t device_commands = 0U;
+    for (auto& pending_device : pending) {
+        if (pending_device.groups.empty() && !pending_device.has_shared) continue;
+        std::uint32_t offset = 0U;
+        pending_device.group_offsets.reserve(pending_device.groups.size());
+        for (std::size_t index = 0U; index < pending_device.groups.size();
+             ++index) {
+            pending_device.group_offsets.push_back(offset);
+            pending_device.groups[index].rows =
+                pending_device.group_rows[index];
+            pending_device.groups[index].coefficients =
+                pending_device.group_coefficients[index];
+            offset += static_cast<std::uint32_t>(
+                pending_device.group_rows[index].size());
+        }
+        pending_device.work_count = offset;
+        pending_device.routed_output.resize(
+            static_cast<std::size_t>(offset) * kHidden);
+        if (pending_device.has_shared) {
+            pending_device.shared_output.resize(
+                static_cast<std::size_t>(rows) * kHidden);
+        }
+        ++device_commands;
+    }
+
+    for (std::size_t slot = 0U; slot < pending.size(); ++slot) {
+        auto& pending_device = pending[slot];
+        if (pending_device.groups.empty() && !pending_device.has_shared) continue;
+        auto enqueued = cuda.enqueue_deepseek_moe_rows(
+            devices[slot], input, rows, pending_device.groups,
+            pending_device.has_shared ? &pending_device.shared : nullptr,
+            pending_device.shared_rows, 10.0F);
+        if (!enqueued.ok()) {
+            append_errors(result, std::move(enqueued.errors),
+                          "DeepSeek device MoE page enqueue");
+            break;
+        }
+        pending_device.enqueued = true;
+    }
+
+    for (std::size_t slot = 0U; slot < pending.size(); ++slot) {
+        auto& pending_device = pending[slot];
+        if (!pending_device.enqueued) continue;
+        auto collected = cuda.collect_deepseek_moe_rows(
+            devices[slot], pending_device.routed_output,
+            pending_device.shared_output);
+        pending_device.enqueued = false;
+        if (!collected.ok()) {
+            append_errors(result, std::move(collected.errors),
+                          "DeepSeek device MoE page collect");
+        }
+    }
+    if (!result.ok()) return result;
+
+    for (auto& pending_device : pending) {
+        round_bf16(pending_device.routed_output);
+        round_bf16(pending_device.shared_output);
+    }
+    std::fill(output.begin(), output.end(), 0.0F);
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        auto output_row = output.subspan(
+            static_cast<std::size_t>(row) * kHidden, kHidden);
+        for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+            const auto placement =
+                placements[static_cast<std::size_t>(row) * kTopK + rank];
+            const auto& pending_device = pending[placement.slot];
+            const auto work_index =
+                pending_device.group_offsets[placement.group] +
+                placement.position;
+            const auto routed = std::span<const float>(
+                pending_device.routed_output)
+                .subspan(static_cast<std::size_t>(work_index) * kHidden, kHidden);
+            for (std::uint32_t column = 0U; column < kHidden; ++column) {
+                output_row[column] += routed[column];
+            }
+        }
+        const auto shared = std::span<const float>(shared_device.shared_output)
+            .subspan(static_cast<std::size_t>(row) * kHidden, kHidden);
+        for (std::uint32_t column = 0U; column < kHidden; ++column) {
+            output_row[column] = round_bf16(output_row[column] + shared[column]);
+        }
+    }
+
+    ++device_moe_stats.batches;
+    device_moe_stats.device_commands += device_commands;
+    device_moe_stats.routed_experts +=
+        static_cast<std::uint64_t>(rows) * kTopK;
+    device_moe_stats.shared_experts += rows;
+    device_moe_stats.nanoseconds += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - execution_started).count());
     return result;
 }
 

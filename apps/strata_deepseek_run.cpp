@@ -36,6 +36,7 @@ struct Options {
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     bool pin_resident_arena{};
     bool serial_expert_upload{};
+    bool row_major_moe_page{};
     bool prepack_mhc{true};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
@@ -73,7 +74,7 @@ void usage() {
         << "       [--device-moe|--serial-device-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
-        << "       [--block-kv-cache|--scalar-kv-cache]\n"
+        << "       [--block-kv-cache|--scalar-kv-cache] [--row-major-moe-page]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -198,6 +199,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.pin_resident_arena = true;
         } else if (argument == "--serial-expert-upload") {
             options.serial_expert_upload = true;
+        } else if (argument == "--row-major-moe-page") {
+            options.row_major_moe_page = true;
         } else if (argument == "--prepack-mhc") {
             options.prepack_mhc = true;
         } else if (argument == "--no-prepack-mhc") {
@@ -853,6 +856,7 @@ int main(int argc, char** argv) {
     config.spine_warmup_workers = options.spine_warmup_workers;
     config.pin_resident_arena = options.pin_resident_arena;
     config.serial_expert_upload = options.serial_expert_upload;
+    config.row_major_moe_page = options.row_major_moe_page;
     config.prepack_mhc_projection = options.prepack_mhc;
     config.expert_prefetch_predictions = options.expert_prefetch_predictions;
     config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
@@ -920,6 +924,8 @@ int main(int argc, char** argv) {
                   << (options.prepack_mhc ? "true" : "false")
                   << ",\"serial_expert_upload\":"
                   << (options.serial_expert_upload ? "true" : "false")
+                  << ",\"row_major_moe_page\":"
+                  << (options.row_major_moe_page ? "true" : "false")
                   << ",\"resident_pin_seconds\":" << metrics.resident_pin_seconds
                   << ",\"expert_prefetch_predictions\":"
                   << metrics.expert_prefetch_predictions

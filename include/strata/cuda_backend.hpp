@@ -241,6 +241,22 @@ struct CudaDeepSeekMoeExpert {
     float coefficient{1.0F};
 };
 
+// One routed expert of a prefill page together with every page row that
+// selected it. The page path exists because the single-row command above reads
+// a 13.37 MB expert triplet from HBM to serve one row: at a 512-row page a hot
+// expert is read once per row that chose it, roughly twelve times over. Here
+// the weight read is hoisted out of the row loop, so one read serves the whole
+// group. `rows` indexes the page's hidden rows and `coefficients` carries that
+// row's router coefficient in the same order; both spans must have equal size
+// and stay alive until collection completes.
+struct CudaDeepSeekMoeRowGroup {
+    const CudaWeight* w1{};
+    const CudaWeight* w3{};
+    const CudaWeight* w2{};
+    std::span<const std::uint32_t> rows;
+    std::span<const float> coefficients;
+};
+
 // Model-neutral gate/up/down expert descriptor for the common device MoE
 // workspace. Weight objects must remain alive until collection completes.
 struct CudaMoeExpert {
@@ -398,6 +414,22 @@ public:
         std::span<const CudaDeepSeekMoeExpert> routed,
         const CudaDeepSeekMoeExpert* shared, float swiglu_limit);
     [[nodiscard]] ValidationResult collect_deepseek_moe(
+        int device, std::span<float> routed_output,
+        std::span<float> shared_output);
+    // Row-grouped form of the command above. `hidden` holds `hidden_rows`
+    // contiguous activation rows; each group names one expert and the rows it
+    // serves. Routed results are flattened group-major and, within a group, in
+    // the group's own row order, so the caller reconstructs a row's rank order
+    // from the offsets it built the groups with. When `shared` is present it
+    // runs over `shared_rows` and its results are flattened in that order.
+    // Per-row arithmetic is identical to issuing one single-row command per
+    // (expert, row): only the weight read is shared.
+    [[nodiscard]] ValidationResult enqueue_deepseek_moe_rows(
+        int device, std::span<const float> hidden, std::uint32_t hidden_rows,
+        std::span<const CudaDeepSeekMoeRowGroup> groups,
+        const CudaDeepSeekMoeExpert* shared,
+        std::span<const std::uint32_t> shared_rows, float swiglu_limit);
+    [[nodiscard]] ValidationResult collect_deepseek_moe_rows(
         int device, std::span<float> routed_output,
         std::span<float> shared_output);
     [[nodiscard]] ValidationResult enqueue_moe(

@@ -1252,6 +1252,175 @@ __global__ void deepseek_fp4_down_kernel(
     }
 }
 
+// Row tile of the page-batched FP4 path. Eight rows hold sixteen accumulators
+// per thread, which fits without spilling at 256 threads, and amortises each
+// 32-weight group's nibble and scale decode across eight rows instead of one.
+constexpr std::uint32_t kDeepSeekPageRowTile = 8U;
+
+// One routed expert of a page and the slice of the work list it owns. The work
+// list is flattened group-major; `row_offset` is where this group's rows begin
+// in `work_rows`/`work_coefficients` and is also where its outputs begin.
+struct DeepSeekFp4PageGroup {
+    const unsigned char* w1_weights{};
+    const unsigned char* w1_scales{};
+    const unsigned char* w3_weights{};
+    const unsigned char* w3_scales{};
+    const unsigned char* w2_weights{};
+    const unsigned char* w2_scales{};
+    std::uint32_t row_offset{};
+    std::uint32_t row_count{};
+};
+
+// Per (expert, output column, row tile). The group's weight row is decoded once
+// per 32-weight group and applied to every row in the tile, so a group serving
+// `n` rows reads its weights once instead of `n` times. Each row's accumulation
+// visits the same groups in the same order as the single-row kernel, so every
+// row's result is bit-identical to issuing that row on its own.
+__global__ void deepseek_fp4_page_gate_up_kernel(
+    float* activations, const float* hidden, const std::uint32_t* work_rows,
+    const float* work_coefficients, const DeepSeekFp4PageGroup* groups,
+    std::uint32_t group_count, std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    float swiglu_limit, const float* bf16_silu, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t group_index = blockIdx.y;
+    if (output_row >= intermediate || group_index >= group_count) return;
+    const DeepSeekFp4PageGroup group = groups[group_index];
+    const std::uint32_t tile_begin = blockIdx.z * kDeepSeekPageRowTile;
+    if (tile_begin >= group.row_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekPageRowTile, group.row_count - tile_begin);
+
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    float gate[kDeepSeekPageRowTile];
+    float up[kDeepSeekPageRowTile];
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        gate[index] = 0.0F;
+        up[index] = 0.0F;
+    }
+
+    for (std::uint64_t group_column = warp; group_column < scale_columns;
+         group_column += 8U) {
+        float gate_scale =
+            lane == 0U
+                ? fp8_e8m0_scale_bits(group.w1_scales[scale_base + group_column])
+                : 0.0F;
+        float up_scale =
+            lane == 0U
+                ? fp8_e8m0_scale_bits(group.w3_scales[scale_base + group_column])
+                : 0.0F;
+        gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
+        up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
+        const std::uint64_t column = group_column * 32U + lane;
+        if (column >= columns) continue;
+        const unsigned char gate_packed = group.w1_weights[packed_base + column / 2U];
+        const unsigned char up_packed = group.w3_weights[packed_base + column / 2U];
+        const unsigned int gate_encoded =
+            column % 2U == 0U ? gate_packed & 0x0FU : gate_packed >> 4U;
+        const unsigned int up_encoded =
+            column % 2U == 0U ? up_packed & 0x0FU : up_packed >> 4U;
+        const float gate_weight = fp4_e2m1_value(gate_encoded);
+        const float up_weight = fp4_e2m1_value(up_encoded);
+        // Fixed trip count with a clamped index: a runtime bound here would
+        // make `gate`/`up` dynamically indexed, which spills them out of
+        // registers into local memory and costs more than the tail it saves.
+        // Rows past `tile_rows` recompute row zero and are never written.
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const std::uint64_t row =
+                work_rows[group.row_offset + tile_begin + local];
+            const float input = hidden[row * columns + column];
+            gate[index] += input * gate_weight * gate_scale;
+            up[index] += input * up_weight * up_scale;
+        }
+    }
+
+#pragma unroll 1
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        __syncthreads();
+        const float reduced_gate = reduce_block(gate[index]);
+        __syncthreads();
+        const float reduced_up = reduce_block(up[index]);
+        if (threadIdx.x != 0U || index >= tile_rows) continue;
+        const std::uint32_t slot = group.row_offset + tile_begin + index;
+        const std::uint64_t destination =
+            static_cast<std::uint64_t>(slot) * intermediate + output_row;
+        const float rounded_gate = bf16_round(reduced_gate);
+        const float rounded_up = bf16_round(reduced_up);
+        if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+            atomicExch(error_flag, 1U);
+            activations[destination] = __uint_as_float(0x7FC0'0000U);
+            continue;
+        }
+        const float limited_gate = fminf(rounded_gate, swiglu_limit);
+        const float limited_up =
+            fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+        const auto gate_bits =
+            static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+        float activated = bf16_silu[gate_bits] * limited_up;
+        activated *= work_coefficients[slot];
+        activations[destination] = bf16_round(activated);
+    }
+}
+
+__global__ void deepseek_fp4_page_down_kernel(
+    float* output, const float* activations,
+    const DeepSeekFp4PageGroup* groups, std::uint32_t group_count,
+    std::uint64_t columns, std::uint64_t rows, std::uint64_t packed_columns,
+    std::uint64_t scale_columns) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t group_index = blockIdx.y;
+    if (output_row >= rows || group_index >= group_count) return;
+    const DeepSeekFp4PageGroup group = groups[group_index];
+    const std::uint32_t tile_begin = blockIdx.z * kDeepSeekPageRowTile;
+    if (tile_begin >= group.row_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekPageRowTile, group.row_count - tile_begin);
+
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    float sum[kDeepSeekPageRowTile];
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        sum[index] = 0.0F;
+    }
+
+    for (std::uint64_t group_column = warp; group_column < scale_columns;
+         group_column += 8U) {
+        float scale =
+            lane == 0U
+                ? fp8_e8m0_scale_bits(group.w2_scales[scale_base + group_column])
+                : 0.0F;
+        scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
+        const std::uint64_t column = group_column * 32U + lane;
+        if (column >= columns) continue;
+        const unsigned char packed = group.w2_weights[packed_base + column / 2U];
+        const unsigned int encoded =
+            column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        const float weight = fp4_e2m1_value(encoded);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const std::uint64_t slot = group.row_offset + tile_begin + local;
+            sum[index] += activations[slot * columns + column] * weight * scale;
+        }
+    }
+
+#pragma unroll 1
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        __syncthreads();
+        const float reduced = reduce_block(sum[index]);
+        if (threadIdx.x != 0U || index >= tile_rows) continue;
+        const std::uint64_t slot = group.row_offset + tile_begin + index;
+        output[slot * rows + output_row] = bf16_round(reduced);
+    }
+}
+
 __global__ void deepseek_fp8_gate_up_kernel(
     float* activation, const float* hidden,
     const unsigned char* w1, const unsigned char* w1_scales,
@@ -1334,6 +1503,135 @@ __global__ void deepseek_fp8_down_kernel(
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0U) output[output_row] = bf16_round(sum);
+}
+
+// Row-tiled shared expert, the FP8 counterpart of the routed page kernels
+// above. The shared expert fires for every row of a page, so its triplet is
+// read once per tile instead of once per row.
+__global__ void deepseek_fp8_page_gate_up_kernel(
+    float* activations, const float* hidden, const std::uint32_t* work_rows,
+    std::uint32_t work_count, const unsigned char* w1,
+    const unsigned char* w1_scales, const unsigned char* w3,
+    const unsigned char* w3_scales, std::uint64_t columns,
+    std::uint64_t intermediate, std::uint64_t scale_columns,
+    float swiglu_limit, const float* bf16_silu, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    if (output_row >= intermediate) return;
+    const std::uint32_t tile_begin = blockIdx.y * kDeepSeekPageRowTile;
+    if (tile_begin >= work_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekPageRowTile, work_count - tile_begin);
+
+    const std::uint64_t weight_base = output_row * columns;
+    const std::uint64_t scale_row = (output_row / 128U) * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint64_t groups = (columns + 31U) / 32U;
+    float gate[kDeepSeekPageRowTile];
+    float up[kDeepSeekPageRowTile];
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        gate[index] = 0.0F;
+        up[index] = 0.0F;
+    }
+
+    for (std::uint64_t group = warp; group < groups; group += 8U) {
+        const std::uint64_t column = group * 32U + lane;
+        float gate_scale =
+            lane == 0U ? fp8_e8m0_scale_bits(
+                             w1_scales[scale_row + (group * 32U) / 128U])
+                       : 0.0F;
+        float up_scale =
+            lane == 0U ? fp8_e8m0_scale_bits(
+                             w3_scales[scale_row + (group * 32U) / 128U])
+                       : 0.0F;
+        gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
+        up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
+        if (column >= columns) continue;
+        const float gate_weight = fp8_e4m3_value(w1[weight_base + column]);
+        const float up_weight = fp8_e4m3_value(w3[weight_base + column]);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const std::uint64_t row = work_rows[tile_begin + local];
+            const float input = hidden[row * columns + column];
+            gate[index] += input * gate_weight * gate_scale;
+            up[index] += input * up_weight * up_scale;
+        }
+    }
+
+#pragma unroll 1
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        __syncthreads();
+        const float reduced_gate = reduce_block(gate[index]);
+        __syncthreads();
+        const float reduced_up = reduce_block(up[index]);
+        if (threadIdx.x != 0U || index >= tile_rows) continue;
+        const std::uint64_t destination =
+            static_cast<std::uint64_t>(tile_begin + index) * intermediate +
+            output_row;
+        const float rounded_gate = bf16_round(reduced_gate);
+        const float rounded_up = bf16_round(reduced_up);
+        if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+            atomicExch(error_flag, 1U);
+            activations[destination] = __uint_as_float(0x7FC0'0000U);
+            continue;
+        }
+        const float limited_gate = fminf(rounded_gate, swiglu_limit);
+        const float limited_up =
+            fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+        const auto gate_bits =
+            static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+        activations[destination] =
+            bf16_round(bf16_silu[gate_bits] * limited_up);
+    }
+}
+
+__global__ void deepseek_fp8_page_down_kernel(
+    float* output, const float* activations, std::uint32_t work_count,
+    const unsigned char* weights, const unsigned char* scales,
+    std::uint64_t columns, std::uint64_t rows, std::uint64_t scale_columns) {
+    const std::uint64_t output_row = blockIdx.x;
+    if (output_row >= rows) return;
+    const std::uint32_t tile_begin = blockIdx.y * kDeepSeekPageRowTile;
+    if (tile_begin >= work_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekPageRowTile, work_count - tile_begin);
+
+    const std::uint64_t weight_base = output_row * columns;
+    const std::uint64_t scale_row = (output_row / 128U) * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint64_t groups = (columns + 31U) / 32U;
+    float sum[kDeepSeekPageRowTile];
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        sum[index] = 0.0F;
+    }
+
+    for (std::uint64_t group = warp; group < groups; group += 8U) {
+        const std::uint64_t column = group * 32U + lane;
+        float scale =
+            lane == 0U
+                ? fp8_e8m0_scale_bits(scales[scale_row + (group * 32U) / 128U])
+                : 0.0F;
+        scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
+        if (column >= columns) continue;
+        const float weight = fp8_e4m3_value(weights[weight_base + column]);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const std::uint64_t slot = tile_begin + local;
+            sum[index] += activations[slot * columns + column] * weight * scale;
+        }
+    }
+
+#pragma unroll 1
+    for (std::uint32_t index = 0U; index < kDeepSeekPageRowTile; ++index) {
+        __syncthreads();
+        const float reduced = reduce_block(sum[index]);
+        if (threadIdx.x != 0U || index >= tile_rows) continue;
+        output[static_cast<std::uint64_t>(tile_begin + index) * rows +
+               output_row] = bf16_round(reduced);
+    }
 }
 
 // Decode-oriented FlashAttention-2 forward specialization. One CTA owns one
@@ -1974,6 +2272,23 @@ struct CudaBackend::Impl {
         std::uint32_t moe_rows{1U};
         std::uint32_t moe_routed_count{};
         std::uint64_t moe_kernel_launches{};
+        // Page-path work list: row indices, per-row coefficients, and the group
+        // table, all device-side. Sized to the largest page seen so far and
+        // reused, because a prefill visits every layer with the same shape.
+        std::uint32_t* moe_page_rows{};
+        float* moe_page_coefficients{};
+        void* moe_page_groups{};
+        std::uint32_t* moe_page_shared_rows{};
+        std::uint64_t moe_page_rows_bytes{};
+        std::uint64_t moe_page_coefficient_bytes{};
+        std::uint64_t moe_page_group_bytes{};
+        std::uint64_t moe_page_shared_row_bytes{};
+        std::uint32_t moe_page_work_count{};
+        std::uint32_t moe_page_shared_count{};
+        // Rows the shared expert produced. One for the single-row command; the
+        // page command sets it to the page's shared row count so collection
+        // sizes the download from the command that actually ran.
+        std::uint32_t moe_shared_rows{1U};
         // Set while a deferred upload's copies are still in flight on `stream`.
         // Cleared by synchronize_uploads(), which the caller owes before the
         // upload's host source may be released.
@@ -2038,6 +2353,18 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaFree(state.moe_bf16_silu));
             }
             if (state.moe_error != nullptr) static_cast<void>(cudaFree(state.moe_error));
+            if (state.moe_page_rows != nullptr) {
+                static_cast<void>(cudaFree(state.moe_page_rows));
+            }
+            if (state.moe_page_coefficients != nullptr) {
+                static_cast<void>(cudaFree(state.moe_page_coefficients));
+            }
+            if (state.moe_page_groups != nullptr) {
+                static_cast<void>(cudaFree(state.moe_page_groups));
+            }
+            if (state.moe_page_shared_rows != nullptr) {
+                static_cast<void>(cudaFree(state.moe_page_shared_rows));
+            }
             if (state.moe_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.moe_host_staging));
             }
@@ -4708,6 +5035,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     state.moe_hidden_columns = hidden_columns;
     state.moe_intermediate_columns = intermediate_columns;
     state.moe_rows = 1U;
+    state.moe_shared_rows = 1U;
     state.moe_routed_count = routed_batch.count;
     state.moe_has_shared = shared != nullptr;
     state.moe_kernel_launches = 0U;
@@ -4868,6 +5196,554 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
     }
     return result;
+}
+
+ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
+    int device, std::span<const float> hidden, std::uint32_t hidden_rows,
+    std::span<const CudaDeepSeekMoeRowGroup> groups,
+    const CudaDeepSeekMoeExpert* shared,
+    std::span<const std::uint32_t> shared_rows, float swiglu_limit) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE page command targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "DeepSeek MoE workspace already has an in-flight command");
+        return result;
+    }
+    if (hidden_rows == 0U || (groups.empty() && shared == nullptr)) {
+        result.errors.emplace_back(
+            "DeepSeek MoE page command requires rows and at least one expert");
+        return result;
+    }
+    if (!std::isfinite(swiglu_limit) || swiglu_limit <= 0.0F) {
+        result.errors.emplace_back(
+            "DeepSeek MoE SwiGLU limit must be finite and positive");
+        return result;
+    }
+
+    std::uint64_t hidden_columns = 0U;
+    std::uint64_t intermediate_columns = 0U;
+    const auto validate_triplet = [&](const CudaWeight* w1_weight,
+                                      const CudaWeight* w3_weight,
+                                      const CudaWeight* w2_weight,
+                                      CudaWeightEncoding encoding) {
+        for (const auto* weight : {w1_weight, w3_weight, w2_weight}) {
+            if (weight == nullptr || !weight->valid()) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page command contains an invalid CUDA weight");
+                return false;
+            }
+            if (weight->impl_->device != device) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page weights do not belong to the command device");
+                return false;
+            }
+            if (weight->impl_->descriptor.encoding != encoding) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page weight encoding is incompatible with the expert kind");
+                return false;
+            }
+        }
+        const auto& w1 = w1_weight->impl_->descriptor;
+        const auto& w3 = w3_weight->impl_->descriptor;
+        const auto& w2 = w2_weight->impl_->descriptor;
+        const auto expected_dtype = encoding == CudaWeightEncoding::Fp4E2m1Group32
+                                        ? SafetensorsDtype::I8
+                                        : SafetensorsDtype::F8E4M3;
+        const auto expected_group =
+            encoding == CudaWeightEncoding::Fp4E2m1Group32 ? 32U : 128U;
+        if (w1.dtype != expected_dtype || w3.dtype != expected_dtype ||
+            w2.dtype != expected_dtype || w1.group_size != expected_group ||
+            w3.group_size != expected_group || w2.group_size != expected_group ||
+            w1.rows == 0U || w1.columns == 0U ||
+            w3.rows != w1.rows || w3.columns != w1.columns ||
+            w2.rows != w1.columns || w2.columns != w1.rows) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page W1/W3/W2 shapes or native encoding metadata are invalid");
+            return false;
+        }
+        if (hidden_columns == 0U) {
+            hidden_columns = w1.columns;
+            intermediate_columns = w1.rows;
+        } else if (hidden_columns != w1.columns ||
+                   intermediate_columns != w1.rows) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page experts do not share one exact activation shape");
+            return false;
+        }
+        return true;
+    };
+
+    std::uint64_t work_count = 0U;
+    for (const auto& group : groups) {
+        if (!validate_triplet(group.w1, group.w3, group.w2,
+                              CudaWeightEncoding::Fp4E2m1Group32)) {
+            return result;
+        }
+        if (group.rows.empty() || group.rows.size() != group.coefficients.size()) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page group rows and coefficients must be non-empty and equal in size");
+            return result;
+        }
+        for (const auto row : group.rows) {
+            if (row >= hidden_rows) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page group row index is out of range");
+                return result;
+            }
+        }
+        for (const auto coefficient : group.coefficients) {
+            if (!std::isfinite(coefficient)) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page group coefficient is invalid");
+                return result;
+            }
+        }
+        work_count += group.rows.size();
+    }
+    if (shared != nullptr) {
+        if (!validate_triplet(shared->w1, shared->w3, shared->w2,
+                              CudaWeightEncoding::Fp8E4m3Block128) ||
+            shared->coefficient != 1.0F) {
+            if (result.ok()) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page shared expert coefficient is invalid");
+            }
+            return result;
+        }
+        if (shared_rows.empty()) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page shared expert requires at least one row");
+            return result;
+        }
+        for (const auto row : shared_rows) {
+            if (row >= hidden_rows) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page shared row index is out of range");
+                return result;
+            }
+        }
+    } else if (!shared_rows.empty()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE page shared rows were supplied without a shared expert");
+        return result;
+    }
+    const auto shared_count =
+        static_cast<std::uint64_t>(shared == nullptr ? 0U : shared_rows.size());
+    if (work_count == 0U && shared_count == 0U) {
+        result.errors.emplace_back("DeepSeek MoE page command has no work");
+        return result;
+    }
+    if (hidden.size() !=
+            static_cast<std::size_t>(hidden_rows) * hidden_columns ||
+        hidden_columns > std::numeric_limits<unsigned int>::max() ||
+        intermediate_columns > std::numeric_limits<unsigned int>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE page hidden rows or expert dimensions are incompatible");
+        return result;
+    }
+    if (!std::all_of(hidden.begin(), hidden.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "DeepSeek MoE page hidden rows contain a non-finite value");
+        return result;
+    }
+
+    const auto activation_slots = work_count + shared_count;
+    std::uint64_t hidden_bytes = 0U;
+    std::uint64_t activation_bytes = 0U;
+    std::uint64_t output_bytes = 0U;
+    std::uint64_t row_bytes = 0U;
+    std::uint64_t coefficient_bytes = 0U;
+    std::uint64_t group_bytes = 0U;
+    std::uint64_t shared_row_bytes = 0U;
+    if (!checked_bytes(hidden_rows, hidden_columns, sizeof(float), hidden_bytes) ||
+        !checked_bytes(activation_slots, intermediate_columns, sizeof(float),
+                       activation_bytes) ||
+        !checked_bytes(activation_slots, hidden_columns, sizeof(float),
+                       output_bytes) ||
+        !checked_bytes(work_count, 1U, sizeof(std::uint32_t), row_bytes) ||
+        !checked_bytes(work_count, 1U, sizeof(float), coefficient_bytes) ||
+        !checked_bytes(groups.size(), 1U, sizeof(DeepSeekFp4PageGroup),
+                       group_bytes) ||
+        !checked_bytes(std::max<std::uint64_t>(shared_count, 1U), 1U,
+                       sizeof(std::uint32_t), shared_row_bytes) ||
+        hidden_bytes > std::numeric_limits<std::size_t>::max() ||
+        activation_bytes > std::numeric_limits<std::size_t>::max() ||
+        output_bytes > std::numeric_limits<std::size_t>::max() ||
+        output_bytes > std::numeric_limits<std::uint64_t>::max() -
+                           sizeof(unsigned int)) {
+        result.errors.emplace_back("DeepSeek MoE page workspace size overflows");
+        return result;
+    }
+    const auto host_staging_bytes = output_bytes + sizeof(unsigned int);
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for DeepSeek MoE page");
+    }
+
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    const auto ensure_bytes = [&](void*& pointer, std::uint64_t& capacity,
+                                  std::uint64_t required,
+                                  const char* operation) {
+        if (required <= capacity) return true;
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = nullptr;
+        capacity = 0U;
+        if (const auto status =
+                cudaMalloc(&pointer, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return true;
+    };
+    const auto ensure_floats = [&](float*& pointer, std::uint64_t& capacity,
+                                   std::uint64_t required,
+                                   const char* operation) {
+        auto* raw = static_cast<void*>(pointer);
+        const auto ok = ensure_bytes(raw, capacity, required, operation);
+        pointer = static_cast<float*>(raw);
+        return ok;
+    };
+    const auto ensure_indices = [&](std::uint32_t*& pointer,
+                                    std::uint64_t& capacity,
+                                    std::uint64_t required,
+                                    const char* operation) {
+        auto* raw = static_cast<void*>(pointer);
+        const auto ok = ensure_bytes(raw, capacity, required, operation);
+        pointer = static_cast<std::uint32_t*>(raw);
+        return ok;
+    };
+    if (!ensure_floats(state.moe_hidden, state.moe_hidden_bytes, hidden_bytes,
+                       "allocate DeepSeek MoE page hidden workspace") ||
+        !ensure_floats(state.moe_activations, state.moe_activation_bytes,
+                       activation_bytes,
+                       "allocate DeepSeek MoE page activation workspace") ||
+        !ensure_floats(state.moe_output, state.moe_output_bytes, output_bytes,
+                       "allocate DeepSeek MoE page output workspace") ||
+        !ensure_indices(state.moe_page_rows, state.moe_page_rows_bytes,
+                        row_bytes, "allocate DeepSeek MoE page row list") ||
+        !ensure_floats(state.moe_page_coefficients,
+                       state.moe_page_coefficient_bytes, coefficient_bytes,
+                       "allocate DeepSeek MoE page coefficient list") ||
+        !ensure_bytes(state.moe_page_groups, state.moe_page_group_bytes,
+                      group_bytes, "allocate DeepSeek MoE page group table") ||
+        !ensure_indices(state.moe_page_shared_rows,
+                        state.moe_page_shared_row_bytes, shared_row_bytes,
+                        "allocate DeepSeek MoE page shared row list")) {
+        return result;
+    }
+    if (state.moe_bf16_silu == nullptr) {
+        // Same table as the single-row command builds. Held in a vector rather
+        // than a function-local static array because a second
+        // `static const std::array<float, N>` in this translation unit does not
+        // survive nvcc's host pass.
+        constexpr std::size_t silu_entries = 1U << 16U;
+        const std::size_t silu_bytes = silu_entries * sizeof(float);
+        std::vector<float> silu_table(silu_entries);
+        for (std::size_t index = 0U; index < silu_entries; ++index) {
+            const auto bits = static_cast<std::uint32_t>(index) << 16U;
+            const float value = std::bit_cast<float>(bits);
+            silu_table[index] = std::isfinite(value) ? silu_f32(value) : value;
+        }
+        if (const auto status = cudaMalloc(&state.moe_bf16_silu, silu_bytes);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek BF16 SiLU page table");
+        }
+        if (const auto status = cudaMemcpy(state.moe_bf16_silu,
+                                           silu_table.data(), silu_bytes,
+                                           cudaMemcpyHostToDevice);
+            status != cudaSuccess) {
+            static_cast<void>(cudaFree(state.moe_bf16_silu));
+            state.moe_bf16_silu = nullptr;
+            return cuda_error(status, "upload DeepSeek BF16 SiLU page table");
+        }
+        ++allocation_calls;
+        allocation_bytes += silu_bytes;
+    }
+    if (state.moe_error == nullptr) {
+        if (const auto status = cudaMalloc(&state.moe_error, sizeof(unsigned int));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek MoE page error flag");
+        }
+        ++allocation_calls;
+        allocation_bytes += sizeof(unsigned int);
+    }
+    if (host_staging_bytes > state.moe_host_staging_bytes) {
+        if (state.moe_host_staging != nullptr) {
+            static_cast<void>(cudaFreeHost(state.moe_host_staging));
+        }
+        state.moe_host_staging = nullptr;
+        state.moe_host_staging_bytes = 0U;
+        if (const auto status = cudaMallocHost(
+                &state.moe_host_staging,
+                static_cast<std::size_t>(host_staging_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek MoE page host staging");
+        }
+        state.moe_host_staging_bytes = host_staging_bytes;
+        ++allocation_calls;
+        allocation_bytes += host_staging_bytes;
+    }
+
+    std::vector<std::uint32_t> host_rows;
+    std::vector<float> host_coefficients;
+    std::vector<DeepSeekFp4PageGroup> host_groups;
+    host_rows.reserve(static_cast<std::size_t>(work_count));
+    host_coefficients.reserve(static_cast<std::size_t>(work_count));
+    host_groups.reserve(groups.size());
+    std::uint32_t maximum_group_rows = 0U;
+    for (const auto& group : groups) {
+        DeepSeekFp4PageGroup entry;
+        entry.w1_weights = static_cast<const unsigned char*>(group.w1->impl_->weights);
+        entry.w1_scales = static_cast<const unsigned char*>(group.w1->impl_->scales);
+        entry.w3_weights = static_cast<const unsigned char*>(group.w3->impl_->weights);
+        entry.w3_scales = static_cast<const unsigned char*>(group.w3->impl_->scales);
+        entry.w2_weights = static_cast<const unsigned char*>(group.w2->impl_->weights);
+        entry.w2_scales = static_cast<const unsigned char*>(group.w2->impl_->scales);
+        entry.row_offset = static_cast<std::uint32_t>(host_rows.size());
+        entry.row_count = static_cast<std::uint32_t>(group.rows.size());
+        maximum_group_rows = std::max(maximum_group_rows, entry.row_count);
+        host_rows.insert(host_rows.end(), group.rows.begin(), group.rows.end());
+        host_coefficients.insert(host_coefficients.end(),
+                                 group.coefficients.begin(),
+                                 group.coefficients.end());
+        host_groups.push_back(entry);
+    }
+
+    state.moe_weights.clear();
+    state.moe_weights.reserve((groups.size() + 1U) * 3U);
+    for (const auto& group : groups) {
+        state.moe_weights.push_back(group.w1->impl_);
+        state.moe_weights.push_back(group.w3->impl_);
+        state.moe_weights.push_back(group.w2->impl_);
+    }
+    if (shared != nullptr) {
+        state.moe_weights.push_back(shared->w1->impl_);
+        state.moe_weights.push_back(shared->w3->impl_);
+        state.moe_weights.push_back(shared->w2->impl_);
+    }
+
+    state.moe_hidden_columns = hidden_columns;
+    state.moe_intermediate_columns = intermediate_columns;
+    state.moe_rows = 1U;
+    state.moe_routed_count = static_cast<std::uint32_t>(work_count);
+    state.moe_shared_rows = static_cast<std::uint32_t>(shared_count);
+    state.moe_page_work_count = static_cast<std::uint32_t>(work_count);
+    state.moe_page_shared_count = static_cast<std::uint32_t>(shared_count);
+    state.moe_has_shared = shared != nullptr;
+    state.moe_kernel_launches = 0U;
+    state.moe_in_flight = true;
+    state.moe_poisoned = false;
+    auto abort_enqueue = [&](cudaError_t status, const char* operation) {
+        result = cuda_error(status, operation);
+        const auto drain_status = cudaStreamSynchronize(state.stream);
+        if (drain_status != cudaSuccess) {
+            result.errors.emplace_back(
+                std::string("drain failed DeepSeek MoE page enqueue: ") +
+                cudaGetErrorString(drain_status));
+            state.moe_poisoned = true;
+        } else {
+            state.moe_in_flight = false;
+            state.moe_weights.clear();
+        }
+    };
+
+    if (auto status = cudaEventRecord(state.moe_start, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek MoE page start");
+        return result;
+    }
+    if (auto status = cudaMemsetAsync(state.moe_error, 0, sizeof(unsigned int),
+                                      state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "reset DeepSeek MoE page error flag");
+        return result;
+    }
+    const auto upload = [&](void* destination, const void* source,
+                            std::uint64_t bytes, const char* operation) {
+        if (bytes == 0U) return true;
+        if (auto status = cudaMemcpyAsync(destination, source,
+                                          static_cast<std::size_t>(bytes),
+                                          cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, operation);
+            return false;
+        }
+        return true;
+    };
+    if (!upload(state.moe_hidden, hidden.data(), hidden_bytes,
+                "upload DeepSeek MoE page hidden rows") ||
+        !upload(state.moe_page_rows, host_rows.data(), row_bytes,
+                "upload DeepSeek MoE page row list") ||
+        !upload(state.moe_page_coefficients, host_coefficients.data(),
+                coefficient_bytes,
+                "upload DeepSeek MoE page coefficient list") ||
+        !upload(state.moe_page_groups, host_groups.data(), group_bytes,
+                "upload DeepSeek MoE page group table") ||
+        (shared != nullptr &&
+         !upload(state.moe_page_shared_rows, shared_rows.data(),
+                 static_cast<std::uint64_t>(shared_rows.size()) *
+                     sizeof(std::uint32_t),
+                 "upload DeepSeek MoE page shared row list"))) {
+        return result;
+    }
+    if (auto status = cudaEventRecord(state.moe_hidden_uploaded, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek MoE page hidden upload");
+        return result;
+    }
+
+    constexpr unsigned int threads = 256U;
+    // The quantizer takes its row from blockIdx.y, so grid.y is the row count.
+    const dim3 hidden_quantize_grid(
+        static_cast<unsigned int>((hidden_columns + 127U) / 128U), hidden_rows,
+        1U);
+    quantize_activation_e4m3_kernel<<<hidden_quantize_grid, 128U, 0U,
+                                      state.stream>>>(
+        state.moe_hidden, hidden_columns, hidden_rows);
+    ++state.moe_kernel_launches;
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        abort_enqueue(status, "launch DeepSeek MoE page hidden quantization");
+        return result;
+    }
+
+    const auto* device_groups =
+        static_cast<const DeepSeekFp4PageGroup*>(state.moe_page_groups);
+    if (!groups.empty()) {
+        const auto& w1 = groups.front().w1->impl_->descriptor;
+        const auto& w2 = groups.front().w2->impl_->descriptor;
+        const auto row_tiles = static_cast<unsigned int>(
+            (maximum_group_rows + kDeepSeekPageRowTile - 1U) /
+            kDeepSeekPageRowTile);
+        const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
+                             static_cast<unsigned int>(groups.size()), row_tiles);
+        deepseek_fp4_page_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, state.moe_page_rows,
+            state.moe_page_coefficients, device_groups,
+            static_cast<std::uint32_t>(groups.size()), hidden_columns,
+            intermediate_columns, w1.packed_columns, w1.scale_columns,
+            swiglu_limit, state.moe_bf16_silu, state.moe_error);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek FP4 page W1/W3 SwiGLU");
+            return result;
+        }
+        const dim3 activation_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            static_cast<unsigned int>(work_count), 1U);
+        quantize_activation_e4m3_kernel<<<activation_grid, 128U, 0U,
+                                          state.stream>>>(
+            state.moe_activations, intermediate_columns,
+            static_cast<std::uint32_t>(work_count));
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status,
+                          "launch DeepSeek page routed activation quantization");
+            return result;
+        }
+        const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
+                             static_cast<unsigned int>(groups.size()), row_tiles);
+        deepseek_fp4_page_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, device_groups,
+            static_cast<std::uint32_t>(groups.size()), intermediate_columns,
+            hidden_columns, w2.packed_columns, w2.scale_columns);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek FP4 page W2");
+            return result;
+        }
+    }
+
+    if (shared != nullptr) {
+        const auto& w1 = shared->w1->impl_->descriptor;
+        const auto& w2 = shared->w2->impl_->descriptor;
+        float* shared_activations =
+            state.moe_activations + work_count * intermediate_columns;
+        float* shared_output = state.moe_output + work_count * hidden_columns;
+        const auto shared_tiles = static_cast<unsigned int>(
+            (shared_count + kDeepSeekPageRowTile - 1U) / kDeepSeekPageRowTile);
+        const dim3 shared_gate_grid(
+            static_cast<unsigned int>(intermediate_columns), shared_tiles, 1U);
+        deepseek_fp8_page_gate_up_kernel<<<shared_gate_grid, threads, 0U,
+                                           state.stream>>>(
+            shared_activations, state.moe_hidden, state.moe_page_shared_rows,
+            static_cast<std::uint32_t>(shared_count),
+            static_cast<const unsigned char*>(shared->w1->impl_->weights),
+            static_cast<const unsigned char*>(shared->w1->impl_->scales),
+            static_cast<const unsigned char*>(shared->w3->impl_->weights),
+            static_cast<const unsigned char*>(shared->w3->impl_->scales),
+            hidden_columns, intermediate_columns, w1.scale_columns,
+            swiglu_limit, state.moe_bf16_silu, state.moe_error);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek shared FP8 page W1/W3 SwiGLU");
+            return result;
+        }
+        const dim3 shared_activation_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            static_cast<unsigned int>(shared_count), 1U);
+        quantize_activation_e4m3_kernel<<<shared_activation_grid, 128U, 0U,
+                                          state.stream>>>(
+            shared_activations, intermediate_columns,
+            static_cast<std::uint32_t>(shared_count));
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status,
+                          "launch DeepSeek page shared activation quantization");
+            return result;
+        }
+        const dim3 shared_down_grid(static_cast<unsigned int>(hidden_columns),
+                                    shared_tiles, 1U);
+        deepseek_fp8_page_down_kernel<<<shared_down_grid, threads, 0U,
+                                        state.stream>>>(
+            shared_output, shared_activations,
+            static_cast<std::uint32_t>(shared_count),
+            static_cast<const unsigned char*>(shared->w2->impl_->weights),
+            static_cast<const unsigned char*>(shared->w2->impl_->scales),
+            intermediate_columns, hidden_columns, w2.scale_columns);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek shared FP8 page W2");
+            return result;
+        }
+    }
+
+    if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek MoE page kernel completion");
+        return result;
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        device_stats.activation_h2d_bytes += hidden_bytes;
+        device_stats.matmul_calls += 3U * (groups.size() + (shared ? 1U : 0U));
+        device_stats.workspace_allocation_calls += allocation_calls;
+        device_stats.workspace_allocation_bytes += allocation_bytes;
+        ++device_stats.deepseek_moe_calls;
+        device_stats.deepseek_moe_kernel_launches += state.moe_kernel_launches;
+        ++device_stats.deepseek_moe_h2d_transfers;
+        device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::collect_deepseek_moe_rows(
+    int device, std::span<float> routed_output, std::span<float> shared_output) {
+    return collect_deepseek_moe(device, routed_output, shared_output);
 }
 
 ValidationResult CudaBackend::enqueue_moe(
@@ -5135,6 +6011,9 @@ ValidationResult CudaBackend::enqueue_moe(
     state.moe_hidden_columns = hidden_columns;
     state.moe_intermediate_columns = intermediate_columns;
     state.moe_rows = rows;
+    // The generic command's shared expert produces one row per input row, so
+    // collection sizes its download from the same count.
+    state.moe_shared_rows = rows;
     state.moe_routed_count = static_cast<std::uint32_t>(routed.size());
     state.moe_has_shared = shared != nullptr;
     state.moe_kernel_launches = 0U;
@@ -5320,7 +6199,7 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                        routed_rows) ||
         !checked_bytes(routed_rows, state.moe_hidden_columns, 1U,
                        routed_elements) ||
-        !checked_bytes(state.moe_rows, state.moe_hidden_columns, 1U,
+        !checked_bytes(state.moe_shared_rows, state.moe_hidden_columns, 1U,
                        shared_elements) ||
         routed_output.size() != routed_elements ||
         (state.moe_has_shared

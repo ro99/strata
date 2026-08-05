@@ -69,6 +69,7 @@ add_library(strata_core STATIC
     src/json_cursor.cpp
     src/model.cpp
     src/numerics.cpp
+    src/numa_topology.cpp
     src/openai_protocol.cpp
     src/placement.cpp
     src/placement_cache.cpp
@@ -131,6 +132,12 @@ target_link_libraries(strata-server PRIVATE strata_core)
 
 add_executable(strata-host-expert-probe apps/strata_host_expert_probe.cpp)
 target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
+
+add_executable(strata-numa-probe apps/strata_numa_probe.cpp)
+target_link_libraries(strata-numa-probe PRIVATE strata_core)
+
+add_executable(strata-dsv4-host-expert-probe apps/strata_dsv4_host_expert_probe.cpp)
+target_link_libraries(strata-dsv4-host-expert-probe PRIVATE strata_core)
 
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)

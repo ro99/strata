@@ -121,6 +121,56 @@ std::size_t HostWorkerPool::size() const noexcept {
     return impl_ == nullptr ? 0U : impl_->workers.size();
 }
 
+ValidationResult HostWorkerPool::parallel_for_addressed(
+    std::size_t tasks, const std::function<void(std::size_t)>& operation) {
+    ValidationResult result;
+    if (tasks == 0U) return result;
+    if (impl_ == nullptr || impl_->workers.empty() || !operation ||
+        tasks > impl_->workers.size()) {
+        result.errors.emplace_back(
+            "host worker pool cannot address this dispatch");
+        return result;
+    }
+    auto completion = std::make_shared<Impl::Completion>();
+    completion->remaining = tasks;
+    completion->tasks = tasks;
+    {
+        std::scoped_lock queue_lock(impl_->mutex);
+        if (impl_->stopping) {
+            result.errors.emplace_back("host worker pool is stopping");
+            return result;
+        }
+        for (std::size_t task = 0; task < tasks; ++task) {
+            impl_->queues[task].emplace_back([completion, &operation, task] {
+                try {
+                    operation(task);
+                } catch (...) {
+                    std::scoped_lock error_lock(completion->mutex);
+                    if (completion->error == nullptr) {
+                        completion->error = std::current_exception();
+                    }
+                }
+                {
+                    std::scoped_lock completion_lock(completion->mutex);
+                    --completion->remaining;
+                }
+                completion->ready.notify_one();
+            });
+        }
+    }
+    impl_->ready.notify_all();
+    {
+        std::unique_lock lock(completion->mutex);
+        completion->ready.wait(lock, [&completion] {
+            return completion->remaining == 0U;
+        });
+    }
+    if (completion->error != nullptr) {
+        result.errors.emplace_back("host worker task raised an exception");
+    }
+    return result;
+}
+
 ValidationResult HostWorkerPool::parallel_for(
     std::size_t tasks, const std::function<void(std::size_t)>& operation) {
     ValidationResult result;

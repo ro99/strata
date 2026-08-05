@@ -324,6 +324,92 @@ struct Rune {
            in_range(rune.codepoint, 0x30A0U, 0x30FFU);
 }
 
+// `\p{Han}` proper, which is narrower than `cjk` above: kana are letters but not
+// Han, and Kimi-K3's pattern gives Han its own alternative while kana fall
+// through to the letter ones. Conflating them splits Japanese differently from
+// the reference.
+[[nodiscard]] bool han(const Rune& rune) noexcept {
+    return in_range(rune.codepoint, 0x4E00U, 0x9FFFU) ||
+           in_range(rune.codepoint, 0x3400U, 0x4DBFU) ||
+           in_range(rune.codepoint, 0xF900U, 0xFAFFU) ||
+           in_range(rune.codepoint, 0x2E80U, 0x2EFFU) ||
+           in_range(rune.codepoint, 0x2F00U, 0x2FDFU) ||
+           in_range(rune.codepoint, 0x3005U, 0x3005U) ||
+           in_range(rune.codepoint, 0x3007U, 0x3007U) ||
+           in_range(rune.codepoint, 0x20000U, 0x2FA1FU);
+}
+
+// Kimi-K3's two letter alternatives are built from `\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}`
+// and `\p{Ll}\p{Lm}\p{Lo}\p{M}`, both with Han removed. `\p{Lm}`, `\p{Lo}`, and
+// `\p{M}` are in both, so only the cased letters tell the two apart, and it is
+// exactly that difference that splits `CamelCase` into `Camel` and `Case`.
+[[nodiscard]] bool uppercase(std::uint32_t value) noexcept {
+    if (value < 0x80U) return value >= 'A' && value <= 'Z';
+    if (in_range(value, 0xC0U, 0xDEU) && value != 0xD7U) return true;
+    if (in_range(value, 0x100U, 0x17FU)) return (value % 2U) == 0U;
+    if (in_range(value, 0x391U, 0x3A9U)) return true;   // Greek capitals
+    if (in_range(value, 0x400U, 0x42FU)) return true;   // Cyrillic capitals
+    if (in_range(value, 0x1E00U, 0x1EFFU)) return (value % 2U) == 0U;
+    if (in_range(value, 0x1F08U, 0x1F0FU)) return true;
+    return false;
+}
+
+[[nodiscard]] bool lowercase(std::uint32_t value) noexcept {
+    if (value < 0x80U) return value >= 'a' && value <= 'z';
+    if (value == 0xDFU || in_range(value, 0xDFU, 0xFFU)) return value != 0xF7U;
+    if (in_range(value, 0x100U, 0x17FU)) return (value % 2U) == 1U;
+    if (in_range(value, 0x3B1U, 0x3C9U)) return true;
+    if (in_range(value, 0x430U, 0x45FU)) return true;
+    if (in_range(value, 0x1E00U, 0x1EFFU)) return (value % 2U) == 1U;
+    if (in_range(value, 0x1F00U, 0x1F07U)) return true;
+    return false;
+}
+
+// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`: an uncased letter or a mark
+// belongs to both classes, which is why this is not the complement of `lower`.
+[[nodiscard]] bool upper_class(const Rune& rune) noexcept {
+    if (han(rune)) return false;
+    if (rune.kind == RuneKind::Mark) return true;
+    if (rune.kind != RuneKind::Letter) return false;
+    return !lowercase(rune.codepoint);
+}
+
+// `[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]`
+[[nodiscard]] bool lower_class(const Rune& rune) noexcept {
+    if (han(rune)) return false;
+    if (rune.kind == RuneKind::Mark) return true;
+    if (rune.kind != RuneKind::Letter) return false;
+    return !uppercase(rune.codepoint);
+}
+
+// `[^\r\n\p{L}\p{N}]?` — the optional single rune both letter alternatives may
+// start with. A leading space enters a word this way, which is what makes
+// " hello" one piece rather than two.
+[[nodiscard]] bool word_prefix(const Rune& rune) noexcept {
+    return !newline(rune) && rune.kind != RuneKind::Letter &&
+           rune.kind != RuneKind::Number;
+}
+
+// `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` after a letter run. ASCII apostrophe only:
+// the pattern spells a literal `'`, so a typographic quote is not a contraction.
+[[nodiscard]] std::size_t contraction_length(const std::vector<Rune>& runes,
+                                             std::size_t cursor) noexcept {
+    if (cursor >= runes.size() || runes[cursor].codepoint != '\'') return 0U;
+    const auto lower = [&](std::size_t offset) -> std::uint32_t {
+        if (cursor + offset >= runes.size()) return 0U;
+        const auto value = runes[cursor + offset].codepoint;
+        return (value >= 'A' && value <= 'Z') ? value + 32U : value;
+    };
+    const auto first = lower(1U);
+    const auto second = lower(2U);
+    if (first == 's' || first == 't' || first == 'm' || first == 'd') return 2U;
+    if ((first == 'r' && second == 'e') || (first == 'v' && second == 'e') ||
+        (first == 'l' && second == 'l')) {
+        return 3U;
+    }
+    return 0U;
+}
+
 void emit_pretoken(std::string_view text, const std::vector<Rune>& runes,
                    std::size_t begin, std::size_t end,
                    std::vector<std::string>& output) {
@@ -343,6 +429,93 @@ void emit_pretoken(std::string_view text, const std::vector<Rune>& runes,
     if (run_end == runes.size()) return run_end;
     if (run_end - begin > 1U) return run_end - 1U;
     return run_end;
+}
+
+// Kimi-K3's `pat_str`, one alternative per block, in the order the reference
+// lists them — `fancy-regex` is leftmost-first, so the order is semantics.
+[[nodiscard]] ParseResult<std::vector<std::string>> pretokenize_kimi(
+    std::string_view text, const std::vector<Rune>& runes) {
+    ParseResult<std::vector<std::string>> result;
+    const auto count = runes.size();
+
+    // `[^\r\n\p{L}\p{N}]? [upper]* [lower]+ contraction?` and, when that fails,
+    // `[^\r\n\p{L}\p{N}]? [upper]+ [lower]* contraction?`. The `?` and `*` are
+    // greedy with backtracking, so the first form tries the longest run of
+    // upper-class runes that still leaves a lower-class rune behind it.
+    const auto letter_run = [&](std::size_t begin) -> std::size_t {
+        for (const bool prefix : {true, false}) {
+            auto cursor = begin;
+            if (prefix) {
+                if (cursor >= count || !word_prefix(runes[cursor])) continue;
+                ++cursor;
+            }
+            auto upper_end = cursor;
+            while (upper_end < count && upper_class(runes[upper_end])) ++upper_end;
+
+            // First alternative: back off the upper run until a lower-class rune
+            // starts the mandatory `[lower]+`.
+            for (auto split = upper_end + 1U; split-- > cursor;) {
+                if (split >= count || !lower_class(runes[split])) continue;
+                auto end = split;
+                while (end < count && lower_class(runes[end])) ++end;
+                return end + contraction_length(runes, end);
+            }
+            // Second alternative: at least one upper-class rune, then any
+            // number of lower-class ones.
+            if (upper_end > cursor) {
+                auto end = upper_end;
+                while (end < count && lower_class(runes[end])) ++end;
+                return end + contraction_length(runes, end);
+            }
+        }
+        return begin;
+    };
+
+    std::size_t cursor = 0U;
+    while (cursor < count) {
+        const auto begin = cursor;
+        if (han(runes[cursor])) {
+            while (cursor < count && han(runes[cursor])) ++cursor;
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+        if (const auto end = letter_run(cursor); end > cursor) {
+            cursor = end;
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+        if (runes[cursor].kind == RuneKind::Number) {
+            while (cursor < count && cursor - begin < 3U &&
+                   runes[cursor].kind == RuneKind::Number) ++cursor;
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+        // ` ?[^\s\p{L}\p{N}]+[\r\n]*` — a literal space, not `\s`.
+        {
+            auto scan = cursor;
+            if (runes[scan].codepoint == ' ') ++scan;
+            const auto body = scan;
+            while (scan < count && runes[scan].kind != RuneKind::Space &&
+                   runes[scan].kind != RuneKind::Letter &&
+                   runes[scan].kind != RuneKind::Number) {
+                ++scan;
+            }
+            if (scan > body) {
+                while (scan < count && newline(runes[scan])) ++scan;
+                cursor = scan;
+                emit_pretoken(text, runes, begin, cursor, result.value);
+                continue;
+            }
+        }
+        if (runes[cursor].kind == RuneKind::Space) {
+            cursor = whitespace_token_end(runes, cursor);
+            emit_pretoken(text, runes, begin, cursor, result.value);
+            continue;
+        }
+        ++cursor;
+        emit_pretoken(text, runes, begin, cursor, result.value);
+    }
+    return result;
 }
 
 [[nodiscard]] ParseResult<std::vector<std::string>> pretokenize_glm(
@@ -794,6 +967,9 @@ ParseResult<std::vector<std::string>> pretokenize(
     if (contract == TokenizerContract::Inkling) {
         return pretokenize_inkling(text, runes.value);
     }
+    if (contract == TokenizerContract::KimiK3) {
+        return pretokenize_kimi(text, runes.value);
+    }
     ParseResult<std::vector<std::string>> result;
     result.value.emplace_back(text);
     return result;
@@ -811,6 +987,167 @@ ModelTokenizer::ModelTokenizer() {
         byte_to_piece_[value] = utf8(codepoint);
         codepoint_to_byte_[codepoint] = static_cast<std::int16_t>(value);
     }
+}
+
+namespace {
+
+[[nodiscard]] bool decode_base64(std::string_view encoded, std::string& out) {
+    static constexpr std::string_view kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::uint32_t accumulator = 0U;
+    std::uint32_t bits = 0U;
+    out.clear();
+    for (const char symbol : encoded) {
+        if (symbol == '=') break;
+        const auto position = kAlphabet.find(symbol);
+        if (position == std::string_view::npos) return false;
+        accumulator = (accumulator << 6U) | static_cast<std::uint32_t>(position);
+        bits += 6U;
+        if (bits >= 8U) {
+            bits -= 8U;
+            out.push_back(static_cast<char>((accumulator >> bits) & 0xFFU));
+        }
+    }
+    return true;
+}
+
+// The named reserved ids come from `tokenizer_config.json`; the rest of the 256
+// reserved slots are `<|reserved_token_N|>`, exactly as the reference builds
+// them. Parsed with the same cursor as everything else rather than by pattern
+// matching, so a change in that file is an error and not a silent misread.
+void parse_added_tokens_decoder(
+    JsonCursor& cursor, std::vector<std::pair<std::string, std::uint32_t>>& out) {
+    cursor.expect('{');
+    if (cursor.consume('}')) return;
+    for (;;) {
+        const auto key = cursor.parse_string();
+        cursor.expect(':');
+        const auto id = static_cast<std::uint32_t>(std::stoul(key));
+        std::string content;
+        cursor.expect('{');
+        if (!cursor.consume('}')) {
+            for (;;) {
+                const auto field = cursor.parse_string();
+                cursor.expect(':');
+                if (field == "content") {
+                    content = cursor.parse_string();
+                } else {
+                    cursor.skip_value();
+                }
+                if (cursor.consume('}')) break;
+                cursor.expect(',');
+            }
+        }
+        if (!content.empty()) out.emplace_back(std::move(content), id);
+        if (cursor.consume('}')) break;
+        cursor.expect(',');
+    }
+}
+
+}  // namespace
+
+ParseResult<ModelTokenizer> ModelTokenizer::load_kimi_k3(
+    const std::string& model_directory) {
+    ParseResult<ModelTokenizer> result;
+    const auto vocabulary = load_bounded_text_file(
+        model_directory + "/tiktoken.model", 64ULL << 20U);
+    if (!vocabulary.ok()) {
+        result.errors = vocabulary.errors;
+        return result;
+    }
+    const auto configuration = load_bounded_text_file(
+        model_directory + "/tokenizer_config.json", 8ULL << 20U);
+    if (!configuration.ok()) {
+        result.errors = configuration.errors;
+        return result;
+    }
+    try {
+        // One `base64(piece) rank` per line, ranks dense from zero. The rank is
+        // the token id, so the file is both the vocabulary and the merge order:
+        // tiktoken has no separate merge table.
+        result.value.vocabulary_.reserve(170000U);
+        std::string_view remaining(vocabulary.value);
+        std::string piece;
+        std::uint32_t expected = 0U;
+        while (!remaining.empty()) {
+            const auto line_end = remaining.find('\n');
+            const auto line = remaining.substr(0U, line_end);
+            remaining = line_end == std::string_view::npos
+                            ? std::string_view{}
+                            : remaining.substr(line_end + 1U);
+            if (line.empty()) continue;
+            const auto space = line.find(' ');
+            if (space == std::string_view::npos) {
+                throw std::runtime_error("tiktoken line has no rank");
+            }
+            if (!decode_base64(line.substr(0U, space), piece)) {
+                throw std::runtime_error("tiktoken piece is not base64");
+            }
+            const auto rank = static_cast<std::uint32_t>(
+                std::stoul(std::string(line.substr(space + 1U))));
+            if (rank != expected) {
+                throw std::runtime_error("tiktoken ranks are not dense");
+            }
+            ++expected;
+            result.value.vocabulary_.emplace(piece, rank);
+            result.value.id_to_piece_.push_back(piece);
+        }
+
+        std::vector<std::pair<std::string, std::uint32_t>> named;
+        JsonCursor cursor(configuration.value);
+        cursor.expect('{');
+        if (!cursor.consume('}')) {
+            for (;;) {
+                const auto key = cursor.parse_string();
+                cursor.expect(':');
+                if (key == "added_tokens_decoder") {
+                    parse_added_tokens_decoder(cursor, named);
+                } else {
+                    cursor.skip_value();
+                }
+                if (cursor.consume('}')) break;
+                cursor.expect(',');
+            }
+        }
+
+        const auto base = static_cast<std::uint32_t>(result.value.id_to_piece_.size());
+        constexpr std::uint32_t kReservedSpecialTokens = 256U;
+        if (base != 163584U || named.size() != 16U) {
+            throw std::runtime_error(
+                "tokenizer does not match the pinned Kimi-K3 contract");
+        }
+        std::unordered_map<std::uint32_t, std::string> by_id;
+        for (auto& [content, id] : named) by_id.emplace(id, std::move(content));
+        result.value.id_to_piece_.resize(base + kReservedSpecialTokens);
+        result.value.added_tokens_.reserve(kReservedSpecialTokens);
+        for (std::uint32_t offset = 0U; offset < kReservedSpecialTokens; ++offset) {
+            const auto id = base + offset;
+            const auto found = by_id.find(id);
+            auto content = found != by_id.end()
+                               ? found->second
+                               : "<|reserved_token_" + std::to_string(id) + "|>";
+            result.value.id_to_piece_[id] = content;
+            result.value.added_tokens_.push_back({std::move(content), id});
+        }
+        result.value.added_id_.assign(result.value.id_to_piece_.size(), false);
+        for (const auto& token : result.value.added_tokens_) {
+            result.value.added_id_[token.id] = true;
+        }
+        std::sort(result.value.added_tokens_.begin(),
+                  result.value.added_tokens_.end(),
+                  [](const auto& left, const auto& right) {
+                      if (left.content.size() != right.content.size()) {
+                          return left.content.size() > right.content.size();
+                      }
+                      return left.content < right.content;
+                  });
+        result.value.contract_ = TokenizerContract::KimiK3;
+        result.value.tiktoken_bpe_ = true;
+    } catch (const std::exception& error) {
+        result.errors.emplace_back(std::string("Kimi-K3 tokenizer: ") + error.what());
+        result.value = ModelTokenizer{};
+    }
+    return result;
 }
 
 ParseResult<ModelTokenizer> ModelTokenizer::load(const std::string& path) {
@@ -922,6 +1259,64 @@ std::int32_t ModelTokenizer::token_id(std::string_view piece) const noexcept {
 ParseResult<std::vector<std::uint32_t>> ModelTokenizer::encode_piece(
     std::string_view bytes) const {
     ParseResult<std::vector<std::uint32_t>> result;
+    if (tiktoken_bpe_) {
+        // tiktoken has no merge table: the rank of a merge *is* the id of the
+        // piece it produces, so the loop repeatedly joins the adjacent pair
+        // whose concatenation has the lowest id in the vocabulary. Raw bytes,
+        // not the GPT-2 byte alphabet — the vocabulary is byte strings.
+        if (bytes.empty()) return result;
+        if (const auto whole = vocabulary_.find(std::string(bytes));
+            whole != vocabulary_.end()) {
+            result.value.push_back(whole->second);
+            return result;
+        }
+        std::vector<std::size_t> boundaries(bytes.size() + 1U);
+        for (std::size_t index = 0U; index <= bytes.size(); ++index) {
+            boundaries[index] = index;
+        }
+        const auto rank_of = [&](std::size_t part) -> std::uint32_t {
+            if (part + 2U >= boundaries.size()) {
+                return std::numeric_limits<std::uint32_t>::max();
+            }
+            const auto begin = boundaries[part];
+            const auto end = boundaries[part + 2U];
+            const auto found = vocabulary_.find(
+                std::string(bytes.substr(begin, end - begin)));
+            return found == vocabulary_.end()
+                       ? std::numeric_limits<std::uint32_t>::max()
+                       : found->second;
+        };
+        for (;;) {
+            auto best = std::numeric_limits<std::uint32_t>::max();
+            std::size_t chosen = boundaries.size();
+            for (std::size_t part = 0U; part + 2U < boundaries.size(); ++part) {
+                if (const auto rank = rank_of(part); rank < best) {
+                    best = rank;
+                    chosen = part;
+                }
+            }
+            if (chosen == boundaries.size()) break;
+            boundaries.erase(boundaries.begin() +
+                             static_cast<std::ptrdiff_t>(chosen) + 1);
+        }
+        for (std::size_t part = 0U; part + 1U < boundaries.size(); ++part) {
+            const auto begin = boundaries[part];
+            const auto end = boundaries[part + 1U];
+            const auto found = vocabulary_.find(
+                std::string(bytes.substr(begin, end - begin)));
+            if (found == vocabulary_.end()) {
+                // Every single byte is in a tiktoken vocabulary, so this cannot
+                // happen for well-formed input; reporting beats emitting an
+                // unknown-token id the model never saw.
+                result.errors.emplace_back(
+                    "byte sequence is outside the pinned Kimi-K3 vocabulary");
+                result.value.clear();
+                return result;
+            }
+            result.value.push_back(found->second);
+        }
+        return result;
+    }
     if (sentencepiece_bpe_) {
         std::string normalized;
         normalized.reserve(bytes.size());
@@ -1118,6 +1513,13 @@ ParseResult<std::string> ModelTokenizer::decode_token(std::uint32_t token) const
     }
     const auto& piece = id_to_piece_[token];
     if (added_id_[token]) {
+        result.value = piece;
+        return result;
+    }
+    if (tiktoken_bpe_) {
+        // The vocabulary is raw byte strings, so a piece decodes to itself. A
+        // multi-byte character split across two tokens therefore comes back
+        // whole only after concatenation, which `decode` does.
         result.value = piece;
         return result;
     }
@@ -1424,6 +1826,134 @@ std::string render_inkling_chat_prompt(std::span<const ChatMessage> messages,
     }
     if (!effort_emitted) output += effort_block();
     output += "<|message_model|>";
+    return output;
+}
+
+namespace {
+
+// XTML, as `encoding_k3.py` builds it. `<|open|>`, `<|close|>`, `<|sep|>`, and
+// `<|end_of_msg|>` are single special tokens; the tag names and attributes are
+// ordinary text, so they go through BPE exactly as the reference's `_text`
+// segments do.
+constexpr std::string_view kXtmlOpen = "<|open|>";
+constexpr std::string_view kXtmlClose = "<|close|>";
+constexpr std::string_view kXtmlSeparator = "<|sep|>";
+constexpr std::string_view kXtmlEndOfMessage = "<|end_of_msg|>";
+
+// `_escape_attr_value`: only `&` and `"`, and `&` first so an escaped quote is
+// not double-escaped.
+[[nodiscard]] std::string escape_attribute(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char character : value) {
+        if (character == '&') {
+            escaped += "&amp;";
+        } else if (character == '"') {
+            escaped += "&quot;";
+        } else {
+            escaped.push_back(character);
+        }
+    }
+    return escaped;
+}
+
+void open_xtml_tag(std::string& output, std::string_view tag,
+                   std::span<const std::pair<std::string_view, std::string_view>>
+                       attributes = {}) {
+    output += kXtmlOpen;
+    output += tag;
+    for (const auto& [key, value] : attributes) {
+        output += ' ';
+        output += key;
+        output += "=\"";
+        output += escape_attribute(value);
+        output += '"';
+    }
+    output += kXtmlSeparator;
+}
+
+void close_xtml_tag(std::string& output, std::string_view tag) {
+    output += kXtmlClose;
+    output += tag;
+    output += kXtmlSeparator;
+}
+
+}  // namespace
+
+std::string render_kimi_k3_user_prompt(std::string_view user_text,
+                                       bool enable_thinking) {
+    const std::array messages{ChatMessage{ChatRole::User, std::string(user_text)}};
+    return render_kimi_k3_chat_prompt(messages, enable_thinking);
+}
+
+std::string render_kimi_k3_chat_prompt(std::span<const ChatMessage> messages,
+                                       bool enable_thinking) {
+    std::string output;
+    // `apply_chat_template` does `kwargs.setdefault("thinking_effort", "max")`,
+    // so a thinking conversation opens with this internal system message. It is
+    // part of the prompt the model was tuned on, not decoration: dropping it
+    // changes the distribution.
+    if (enable_thinking) {
+        const std::array<std::pair<std::string_view, std::string_view>, 2U> attributes{
+            std::pair<std::string_view, std::string_view>{"role", "system"},
+            std::pair<std::string_view, std::string_view>{"type", "thinking-effort"}};
+        open_xtml_tag(output, "message", attributes);
+        output +=
+            "`thinking_effort` guides on how much to think in your thinking "
+            "channel (not including the response channel), supported values "
+            "include `low`, `medium`, `high`, and `max`.\n"
+            "Now the system is invoked with `thinking_effort=max`.";
+        close_xtml_tag(output, "message");
+        output += kXtmlEndOfMessage;
+    }
+    // `build_chat_segments` numbers tool results from one and resets the counter
+    // at every assistant message, because the index refers to that message's
+    // tool calls.
+    std::uint32_t tool_index = 0U;
+    for (const auto& message : messages) {
+        std::string_view role;
+        switch (message.role) {
+            case ChatRole::System: role = "system"; break;
+            case ChatRole::User: role = "user"; break;
+            case ChatRole::Assistant: role = "assistant"; break;
+            // A tool result carries its tool name and a one-based index. Strata's
+            // `ChatMessage` has no ordinal, so the position among tool messages
+            // is the index, which is what `build_chat_segments` counts.
+            case ChatRole::Tool: role = "tool"; break;
+        }
+        std::vector<std::pair<std::string_view, std::string_view>> attributes;
+        attributes.emplace_back("role", role);
+        std::string index_text;
+        if (message.role == ChatRole::Tool) {
+            index_text = std::to_string(++tool_index);
+            attributes.emplace_back("tool", message.name);
+            attributes.emplace_back("index", index_text);
+        } else if (!message.name.empty()) {
+            attributes.emplace_back("name", message.name);
+        }
+        if (message.role == ChatRole::Assistant) tool_index = 0U;
+        open_xtml_tag(output, "message", attributes);
+        if (message.role == ChatRole::Assistant) {
+            // The think channel is structural: in thinking mode every assistant
+            // message carries the tags even with nothing in them, and in
+            // non-thinking mode the channel is absent entirely.
+            if (enable_thinking) {
+                open_xtml_tag(output, "think");
+                close_xtml_tag(output, "think");
+            }
+            open_xtml_tag(output, "response");
+            output += message.content;
+            close_xtml_tag(output, "response");
+        } else {
+            output += message.content;
+        }
+        close_xtml_tag(output, "message");
+        output += kXtmlEndOfMessage;
+    }
+    const std::array<std::pair<std::string_view, std::string_view>, 1U> assistant{
+        std::pair<std::string_view, std::string_view>{"role", "assistant"}};
+    open_xtml_tag(output, "message", assistant);
+    open_xtml_tag(output, enable_thinking ? "think" : "response");
     return output;
 }
 

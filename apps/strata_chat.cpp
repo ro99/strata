@@ -95,7 +95,8 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
 
 void usage() {
     std::cerr
-        << "usage: strata-chat --model DIR --model-type gemma4|deepseek|glm|laguna|inkling\n"
+        << "usage: strata-chat --model DIR --model-type "
+           "gemma4|deepseek|glm|laguna|inkling|kimi-k3\n"
         << "                    [--context-size N] [--max-new N]\n"
         << "                    [--devices 0,1,2] [--vram-fraction F]\n"
         << "                    [--flash-attention] [--full-reprefill]\n"
@@ -265,7 +266,7 @@ bool parse_options(int argc, char** argv, Options& options) {
     return !options.model.empty() &&
            (options.model_type == "glm" || options.model_type == "deepseek" ||
             options.model_type == "gemma4" || options.model_type == "laguna" ||
-            options.model_type == "inkling");
+            options.model_type == "inkling" || options.model_type == "kimi-k3");
 }
 
 // A run is reproducible when nothing stochastic is enabled. Temperature alone
@@ -647,6 +648,8 @@ int main(int argc, char** argv) {
                        ? strata::RuntimeModel::Glm52
                    : options.model_type == "gemma4"
                        ? strata::RuntimeModel::Gemma4
+                   : options.model_type == "kimi-k3"
+                       ? strata::RuntimeModel::KimiK3
                    : options.model_type == "laguna"
                        ? strata::RuntimeModel::Laguna
                    : options.model_type == "inkling"

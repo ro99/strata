@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace strata {
 
@@ -38,10 +39,149 @@ float read_le_bf16(const std::byte* bytes) {
     return std::bit_cast<float>(high << 16U);
 }
 
+// Byte count a validated layout requires of each payload. Only called after
+// `validate_compressed_tensor_layout` has agreed the shapes are consistent.
+struct PayloadExtent {
+    std::uint64_t packed_bytes{};
+    std::uint64_t scale_bytes{};
+    bool ok{};
+};
+
+PayloadExtent payload_extent(const CompressedTensorLayout& layout) {
+    PayloadExtent extent;
+    std::uint64_t packed_elements = 0;
+    std::uint64_t scale_elements = 0;
+    if (!detail::checked_product(layout.packed_rows, layout.packed_columns,
+                                 packed_elements) ||
+        !detail::checked_product(layout.scale_rows, layout.scale_columns,
+                                 scale_elements)) {
+        return extent;
+    }
+    const std::uint64_t packed_width =
+        safetensors_dtype_bytes(layout.packed_dtype);
+    const std::uint64_t scale_width = safetensors_dtype_bytes(layout.scale_dtype);
+    if (packed_width == 0U || scale_width == 0U ||
+        !detail::checked_product(packed_elements, packed_width,
+                                 extent.packed_bytes) ||
+        !detail::checked_product(scale_elements, scale_width, extent.scale_bytes)) {
+        return extent;
+    }
+    extent.ok = true;
+    return extent;
+}
+
+ValidationResult validate_mxfp4_layout(const CompressedTensorLayout& layout,
+                                       const QuantizedWeightSpec& quantization) {
+    ValidationResult result;
+    if (layout.packed_dtype != SafetensorsDtype::U8) {
+        result.errors.emplace_back("mxfp4 weight_packed must use Safetensors U8");
+    }
+    if (layout.scale_dtype != SafetensorsDtype::U8) {
+        result.errors.emplace_back(
+            "mxfp4 weight_scale must use Safetensors U8 holding E8M0 exponents");
+    }
+    if (layout.shape_elements != 0U) {
+        result.errors.emplace_back(
+            "mxfp4-pack-quantized ships no weight_shape tensor");
+    }
+    if (layout.logical_rows == 0U || layout.logical_columns == 0U) {
+        result.errors.emplace_back(
+            "logical weight shape must be two-dimensional and positive");
+        return result;
+    }
+    // Four bits is the charter floor, and mxfp4 sits exactly on it: an E2M1
+    // element plus a shared 8-bit block exponent. Anything narrower is
+    // forbidden everywhere, so this is a hard reject rather than a warning.
+    if (quantization.bits != 4U) {
+        result.errors.emplace_back("mxfp4 weights must declare four bits");
+        return result;
+    }
+    if (!quantization.symmetric) {
+        result.errors.emplace_back("mxfp4 weights must be symmetric");
+    }
+    if (quantization.granularity != QuantizationGranularity::Group ||
+        quantization.group_size == 0U) {
+        result.errors.emplace_back("mxfp4 weights must be group quantized");
+        return result;
+    }
+    if (layout.logical_columns % 2U != 0U) {
+        result.errors.emplace_back(
+            "mxfp4 packs two elements per byte, so the input dimension must be even");
+    }
+    if (layout.packed_rows != layout.logical_rows ||
+        layout.packed_columns != layout.logical_columns / 2U) {
+        result.errors.emplace_back(
+            "mxfp4 weight_packed shape does not match logical weight shape");
+    }
+    if (layout.scale_rows != layout.logical_rows ||
+        layout.scale_columns !=
+            divide_round_up(layout.logical_columns, quantization.group_size)) {
+        result.errors.emplace_back(
+            "mxfp4 weight_scale shape does not match quantization granularity");
+    }
+    return result;
+}
+
 }  // namespace
+
+float mxfp4_scale_from_e8m0(std::uint8_t bits) noexcept {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 23U);
+}
+
+ValidationResult mxfp4_dequantize_row(std::span<float> output,
+                                      std::span<const std::byte> packed,
+                                      std::span<const std::byte> scales,
+                                      const CompressedTensorLayout& layout,
+                                      const QuantizedWeightSpec& quantization,
+                                      std::uint64_t row) {
+    auto result = validate_mxfp4_layout(layout, quantization);
+    if (!result.ok()) return result;
+    if (output.size() != layout.logical_columns) {
+        result.errors.emplace_back("mxfp4 row buffer disagrees with logical width");
+        return result;
+    }
+    if (row >= layout.logical_rows) {
+        result.errors.emplace_back("mxfp4 row index is out of range");
+        return result;
+    }
+    const auto extent = payload_extent(layout);
+    if (!extent.ok || packed.size() != extent.packed_bytes ||
+        scales.size() != extent.scale_bytes) {
+        result.errors.emplace_back("mxfp4 payload byte count is invalid");
+        return result;
+    }
+
+    const auto* packed_row = packed.data() + row * layout.packed_columns;
+    const auto* scale_row = scales.data() + row * layout.scale_columns;
+    for (std::uint64_t column = 0U; column < layout.logical_columns; ++column) {
+        const auto byte = std::to_integer<std::uint8_t>(packed_row[column / 2U]);
+        // Low nibble carries the even element, high nibble the odd one. This
+        // ordering is the compressed-tensors convention and is checked against
+        // the reference dequantizer by a real-tensor fixture.
+        const auto nibble = static_cast<std::uint8_t>(
+            column % 2U == 0U ? (byte & 0x0FU) : (byte >> 4U));
+        const auto magnitude = kMxfp4Magnitudes[nibble & 0x07U];
+        const auto scale = mxfp4_scale_from_e8m0(std::to_integer<std::uint8_t>(
+            scale_row[column / quantization.group_size]));
+        // 0xFF is the encoding's reserved slot; the bit shift renders it as
+        // infinity rather than NaN, so guard on finiteness and not on NaN.
+        if (!std::isfinite(scale)) {
+            result.errors.emplace_back(
+                "mxfp4 tensor contains a reserved (0xFF) block scale");
+            return result;
+        }
+        const auto value = magnitude * scale;
+        output[static_cast<std::size_t>(column)] =
+            (nibble & 0x08U) != 0U ? -value : value;
+    }
+    return result;
+}
 
 ValidationResult validate_compressed_tensor_layout(
     const CompressedTensorLayout& layout, const QuantizedWeightSpec& quantization) {
+    if (layout.codec == CompressedTensorCodec::Mxfp4E2m1) {
+        return validate_mxfp4_layout(layout, quantization);
+    }
     ValidationResult result;
     if (layout.packed_dtype != SafetensorsDtype::I32) {
         result.errors.emplace_back("weight_packed must use Safetensors I32");
@@ -115,6 +255,22 @@ ValidationResult compressed_tensor_matvec_f32(
     if (!result.ok()) return result;
     if (output.size() != layout.logical_rows || input.size() != layout.logical_columns) {
         result.errors.emplace_back("matvec vectors disagree with logical weight shape");
+        return result;
+    }
+    if (layout.codec == CompressedTensorCodec::Mxfp4E2m1) {
+        // Accumulating group by group keeps the reduction order equal to the
+        // decode order, so a matvec and a dequantize-then-dot agree exactly.
+        std::vector<float> row(static_cast<std::size_t>(layout.logical_columns));
+        for (std::uint64_t index = 0U; index < layout.logical_rows; ++index) {
+            auto decoded = mxfp4_dequantize_row(row, packed, scales, layout,
+                                                quantization, index);
+            if (!decoded.ok()) return decoded;
+            float sum = 0.0F;
+            for (std::size_t column = 0U; column < row.size(); ++column) {
+                sum += row[column] * input[column];
+            }
+            output[static_cast<std::size_t>(index)] = sum;
+        }
         return result;
     }
     std::uint64_t packed_words = 0;

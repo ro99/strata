@@ -13,7 +13,7 @@ Strata has four dependency layers:
    trace contract.
 2. **Model adapters** own immutable pinned execution contracts, tokenizer and
    chat-template behavior, tensor classification, router semantics, and exact
-   GLM-5.2, DeepSeek-V4, or Gemma 4 operations.
+   GLM-5.2, DeepSeek-V4, Gemma 4, or Kimi-K3 operations.
 3. **Execution** owns device admission and placement, runtime initialization,
    request/session state, generation, cache policy, and metrics. Applications
    use `RuntimeSession`; research tools may use the concrete model runtimes for
@@ -47,7 +47,11 @@ Gemma 4 places its dense text graph and vision tower resident across the
 capacity-weighted GPU schedule. GLM uses a per-device LRU weight cache with a pinned dense spine and optional
 host execution for cold routed experts. DeepSeek stages canonical routed expert
 weights in host RAM, pins its dense/shared spine in VRAM, and leases exact
-top-k expert triplets during device execution. Device assignment is a shared,
+top-k expert triplets during device execution. Kimi-K3 holds its 106.55 GiB BF16
+dense spine resident in host RAM and streams MXFP4 routed experts from SATA
+through a locked, coalescing O_DIRECT arena; its placement inventory is
+descriptive, not yet prescriptive, and no byte derived from its weights may
+reach the NVMe. See `docs/kimi-k3-runtime.md`. Device assignment is a shared,
 capacity-weighted schedule; see "Placement planning" for how it is sized,
 reported, and cached. Its opt-in past-only predictor can queue bounded
 host-to-VRAM expert prefetch without changing exact routes or coefficients;

@@ -14,15 +14,19 @@ This is the machine the project is built and measured on. It's an ordinary works
 | RAM | 251 GiB DDR4 |
 | CPU | Xeon E5-2680 v4 |
 
-On this hardware Strata supports four checkpoints: Gemma 4 31B-IT W8A16
-(35.1 GB, dense text and vision), resident across the three GPUs;
-Laguna S 2.1-NVFP4 (99.7 GB, 48 layers, 256 experts, top-10), whose routed
-experts exceed combined VRAM but fit in host RAM, so decode streams them over
-PCIe without touching storage after warm-up; DeepSeek-V4-Flash-0731 (167 GB,
-43 layers, 256 experts, top-6), staged into host RAM so decode does not touch
-storage after warm-up; and GLM-5.2 W4A16 (388 GB, 78 layers, 256 experts,
-top-8), which is larger than the machine's combined VRAM and RAM and therefore
-remains I/O-dependent.
+On this hardware Strata supports five checkpoints: Gemma 4 31B-IT W8A16
+(35.1 GB, dense text and vision), resident across the three GPUs; Laguna S
+2.1-NVFP4 (99.7 GB, 48 layers, 256 experts, top-10), whose routed experts
+exceed combined VRAM but fit in host RAM, so decode streams them over PCIe
+without touching storage after warm-up; DeepSeek-V4-Flash-0731 (167 GB, 43
+layers, 256 experts, top-6), staged into host RAM so decode does not touch
+storage after warm-up; GLM-5.2 W4A16 (388 GB, 78 layers, 256 experts, top-8),
+which is larger than the machine's combined VRAM and RAM and therefore remains
+I/O-dependent; and Kimi-K3 (1.45 TB, 93 hybrid KDA/MLA layers, 896 experts,
+top-16), which is larger still — its routed experts alone are 1.35 TB against
+251 GiB of RAM, so every decode step reads them from storage and the measured
+step is 38.6 s. See [docs/kimi-k3-runtime.md](docs/kimi-k3-runtime.md) for which
+gates have been measured and which have not.
 
 ## What "exact" means here
 
@@ -315,12 +319,15 @@ It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`,
 | DeepSeek-V4-Flash-0731 | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine, BF16/F32 | Resident in RAM; zero checkpoint reads during decode |
 | Laguna S 2.1-NVFP4 | 48 layers in a 1:3 global/sliding attention pattern, 256 experts + 1 shared, top-10 | NVFP4 (E2M1 pairs, group-16 E4M3 scales, FP32 per-tensor global scale) routed experts in layers 1-39, BF16 everywhere else; W4A16 execution | Spine resident across GPU VRAM; routed experts exceed VRAM and stream from host RAM |
 | GLM-5.2 | 78 layers, 256 experts, top-8 | INT4 group-128 linears, BF16/F32 sensitive tensors; W4A16 execution | Larger than combined memory; I/O-dependent |
+| Kimi-K3 | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16, latent MoE | MXFP4 experts (92.7% of the payload), BF16 everywhere else | Larger than combined memory; I/O-dependent, 38.6 s/step measured. Contract, codec, ops, layer graph and tokenizer green; output agrees with the reference across 488 prompt and 810 decode tokens; vision not implemented |
 
 Each runs its declared model semantics as-is: local/global grouped-query
 attention, proportional RoPE, GeGLU, soft-capped logits, and bidirectional
 image blocks for Gemma 4; hybrid compressed attention, manifold-constrained
 hyper-connections, and `sqrtsoftplus`/`noaux_tc` routing for DeepSeek;
 MLA-style projections, compressed KV, and sigmoid/`noaux_tc` top-8 routing for
+GLM; and Kimi Delta Attention with NoPE gated MLA, attention residuals over
+depth, SiTU-GLU, and a latent-space MoE for Kimi-K3.
 GLM; and per-layer head counts, QK RMSNorm, per-head softplus output gating,
 YaRN rotary on the global layers against plain rotary on the sliding ones, and
 sigmoid top-10 routing with a correction bias and a 2.5x routed scale for
@@ -363,7 +370,7 @@ The difference between the two rows is mostly explained by whether the checkpoin
 - **Instrumentation.** Every run reports checkpoint reads, H2D/D2H bytes, cache
   hits/misses/evictions, per-phase timings, RSS, and per-GPU VRAM as JSON.
 
-For more detail: [docs/current-architecture.md](docs/current-architecture.md) describes what's implemented, [docs/architecture.md](docs/architecture.md) describes the target scheduler design, and [docs/deepseek-v4-runtime.md](docs/deepseek-v4-runtime.md) covers the DeepSeek contract specifically.
+For more detail: [docs/current-architecture.md](docs/current-architecture.md) describes what's implemented, [docs/architecture.md](docs/architecture.md) describes the target scheduler design, and [docs/deepseek-v4-runtime.md](docs/deepseek-v4-runtime.md) and [docs/kimi-k3-runtime.md](docs/kimi-k3-runtime.md) cover the DeepSeek and Kimi-K3 contracts specifically.
 
 ## Roadmap
 

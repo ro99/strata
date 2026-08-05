@@ -12,12 +12,18 @@ namespace strata {
 
 // Bump when the on-disk plan schema changes. A cached plan whose version does
 // not match is discarded rather than reinterpreted.
-inline constexpr std::uint32_t kPlacementPlanVersion = 1U;
+//
+// v2 renamed the overflow tier from `nvme` to `storage` and added the backing
+// block device, because the tier is the read-only source file and its device is
+// not necessarily an NVMe: on the Kimi-K3 target it is a SATA SSD, and calling
+// it NVMe reported bytes as coming from somewhere they do not.
+inline constexpr std::uint32_t kPlacementPlanVersion = 2U;
 
 enum class PlacementModel : std::uint8_t {
     Glm52,
     DeepSeekV4,
     Gemma4,
+    KimiK3,
     Laguna,
     Inkling,
 };
@@ -25,7 +31,9 @@ enum class PlacementModel : std::uint8_t {
 enum class PlacementTier : std::uint8_t {
     Device,
     Host,
-    Nvme,
+    // The checkpoint's own shards, wherever they live. Named for what it is
+    // rather than for one machine's device class.
+    Storage,
 };
 
 enum class PlacementClass : std::uint8_t {
@@ -61,8 +69,18 @@ struct PlacementItem {
     // measures no bandwidth and converts nothing to milliseconds.
     std::uint64_t decode_read_bytes{};
     PlacementTier preferred_tier{PlacementTier::Device};
-    // A spillable item may leave VRAM without changing any result. Only sparse
-    // classes qualify; spilling a densely read class buys nothing under a max.
+    // How far down the cascade this item may go. A densely read class can be
+    // forced out of VRAM by capacity — Kimi-K3's BF16 spine is 103 GiB against
+    // 64 GiB of VRAM, so roughly half of it must stream over PCIe every step —
+    // but pushing it to storage would put the checkpoint's slowest resource on
+    // the critical path of every token. A plan that would need to is an error,
+    // not a spill: that is the charter's "dense larger than aggregate resident
+    // memory is I/O dependent" case, which must be reported rather than
+    // absorbed.
+    PlacementTier deepest_tier{PlacementTier::Storage};
+    // A spillable item may leave VRAM without changing any result. Sparse
+    // classes qualify freely; a dense class only qualifies with a `deepest_tier`
+    // of `Host`, because spilling it past that buys nothing under a max.
     bool spillable{};
     // The canonical copy lives outside VRAM and any device share is a cache on
     // top of it, not a move: MoE runtimes stage the whole expert set in host
@@ -108,10 +126,29 @@ struct PlacementDevice {
     std::uint64_t free_bytes{};
 };
 
+// The block device a path actually resolves to. The overflow tier is a file on
+// a disk, and which disk it is decides both the bandwidth the run will see and
+// whether the run is allowed at all.
+struct PlacementStorage {
+    std::string path;
+    // Leaf device, e.g. `sda1`, and the whole disk it belongs to, e.g. `sda`.
+    std::string device;
+    std::string disk;
+    bool nvme{};
+    bool rotational{};
+    // A tmpfs or ramfs has no block device behind it at all, which is a
+    // resolved answer and the safest one: nothing written there reaches a
+    // disk. `device` and `disk` stay empty.
+    bool memory_backed{};
+    bool resolved{};
+};
+
 struct PlacementHardware {
     std::vector<PlacementDevice> devices;
     std::uint64_t host_total_bytes{};
     std::uint64_t host_available_bytes{};
+    // Where the checkpoint's shards live. Empty when the probe did not run.
+    PlacementStorage storage;
 };
 
 // Everything about a run that changes the answer. Two requests with equal
@@ -149,10 +186,11 @@ struct PlacementPlan {
     std::vector<std::size_t> layer_device;
     std::vector<std::size_t> weighted_schedule;
     std::uint64_t host_resident_bytes{};
-    std::uint64_t nvme_streamed_bytes{};
+    // Bytes that stay in the checkpoint's shards and are read on demand.
+    std::uint64_t storage_resident_bytes{};
     std::uint64_t decode_device_read_bytes{};
     std::uint64_t decode_host_to_device_bytes{};
-    std::uint64_t decode_nvme_read_bytes{};
+    std::uint64_t decode_storage_read_bytes{};
     // Largest context the same placement admits. Zero when the search did not
     // run, which is every path except a full model plan.
     std::uint32_t maximum_context_tokens_that_fit{};
@@ -180,9 +218,16 @@ using PlacementPlanResult = ParseResult<PlacementPlan>;
                                          PlacementModel& model) noexcept;
 [[nodiscard]] std::string format_bytes(std::uint64_t bytes);
 
+// Resolves the block device backing `path` through `/sys/dev/block`. Reads no
+// payload and writes nothing; a path that cannot be resolved comes back with
+// `resolved == false` rather than a guess.
+[[nodiscard]] PlacementStorage resolve_backing_storage(const std::string& path);
+
 // Reads free and total VRAM per device plus host memory. Allocates nothing.
+// `model_directory` resolves the storage tier's backing device; pass empty to
+// skip that probe.
 [[nodiscard]] ParseResult<PlacementHardware> probe_placement_hardware(
-    std::span<const int> devices);
+    std::span<const int> devices, const std::string& model_directory = {});
 
 // Pure solver over an inventory. No file or device access, so tests drive it
 // directly with synthetic inventories.

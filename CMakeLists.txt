@@ -45,6 +45,13 @@ add_library(strata_core STATIC
     src/gemma4_runtime.cpp
     src/glm_runtime.cpp
     src/glm_manifest.cpp
+    src/kimi_k3_ops.cpp
+    src/kimi_k3_manifest.cpp
+    src/kimi_k3_checkpoint.cpp
+    src/kimi_k3_kv_cache.cpp
+    src/kimi_k3_expert_arena.cpp
+    src/kimi_k3_layer.cpp
+    src/kimi_k3_runtime.cpp
     src/laguna_ops.cpp
     src/laguna_checkpoint.cpp
     src/laguna_runtime.cpp
@@ -128,6 +135,15 @@ target_link_libraries(strata-host-expert-probe PRIVATE strata_core)
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 
+add_executable(strata-kimi-expert-probe apps/strata_kimi_expert_probe.cpp)
+target_link_libraries(strata-kimi-expert-probe PRIVATE strata_core)
+
+add_executable(strata-kimi-decode-probe apps/strata_kimi_decode_probe.cpp)
+target_link_libraries(strata-kimi-decode-probe PRIVATE strata_core)
+
+add_executable(strata-kimi-compute-probe apps/strata_kimi_compute_probe.cpp)
+find_library(NUMA_LIBRARY_PROBE numa REQUIRED)
+target_link_libraries(strata-kimi-compute-probe PRIVATE strata_core ${NUMA_LIBRARY_PROBE})
 add_executable(strata-inkling-probe apps/strata_inkling_probe.cpp)
 target_link_libraries(strata-inkling-probe PRIVATE strata_core)
 
@@ -162,6 +178,14 @@ if(BUILD_TESTING)
         tests/test_gemma4_checkpoint.cpp
         tests/test_gemma4_image.cpp
         tests/test_glm_int4.cpp
+        tests/test_kimi_k3_ops.cpp
+        tests/test_kimi_k3_manifest.cpp
+        tests/test_kimi_k3_checkpoint.cpp
+        tests/test_kimi_k3_kv_cache.cpp
+        tests/test_kimi_k3_expert_arena.cpp
+        tests/test_kimi_k3_backbone.cpp
+        tests/test_kimi_k3_layer.cpp
+        tests/test_kimi_k3_tokenizer.cpp
         tests/test_laguna_ops.cpp
         tests/test_laguna_checkpoint.cpp
         tests/test_inkling_ops.cpp
@@ -206,7 +230,7 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat strata-server
-        strata-host-expert-probe RUNTIME DESTINATION bin)
+        strata-host-expert-probe strata-kimi-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)
 endif()

@@ -13,6 +13,9 @@ benchmark must not be used as evidence of current behavior.
   `--dry-run`.
 - `deepseek-v4-runtime.md` — current DeepSeek contract plus clearly labeled
   historical bring-up evidence.
+- `kimi-k3-runtime.md` — Kimi-K3's pinned contract, cost model, NVMe write
+  constraint, chat format, and a per-gate status table that says which gates
+  have been measured and which have not.
 - Gemma 4's pinned checkpoint, tokenizer, text/vision graph, and public runtime
   contract are described in the root README and `current-architecture.md`.
 - `tui.md` — Ratatui build, operator controls, memory bounds, and the versioned

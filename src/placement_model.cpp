@@ -5,6 +5,7 @@
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/gemma4_checkpoint.hpp"
+#include "strata/kimi_k3_checkpoint.hpp"
 #include "strata/inkling_checkpoint.hpp"
 #include "strata/laguna_checkpoint.hpp"
 #include "strata/model_adapter.hpp"
@@ -22,6 +23,9 @@ namespace {
 
 constexpr std::uint64_t kFlashAttentionWorkspaceReserve = 768ULL << 20U;
 constexpr std::uint64_t kDeepSeekDeviceWorkspaceReserve = 256ULL << 20U;
+// Kimi-K3 stages one routed expert triple (16.7 MiB) per admitted slot
+// alongside 7168- and 3584-wide activations and the 96-head KDA state.
+constexpr std::uint64_t kKimiDeviceWorkspaceReserve = 1536ULL << 20U;
 constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // Mirrors Dsv4RuntimeConfig::host_memory_limit_bytes, the ceiling strata-chat
 // and strata-server run DeepSeek under. Planning against all free host memory
@@ -665,6 +669,140 @@ struct Gemma4Linear {
     return result;
 }
 
+// -------------------------------------------------------------- Kimi-K3
+
+[[nodiscard]] PlacementClass kimi_component(KimiTensorRole role) noexcept {
+    switch (role) {
+        case KimiTensorRole::Embedding: return PlacementClass::Embedding;
+        case KimiTensorRole::OutputHead: return PlacementClass::OutputHead;
+        case KimiTensorRole::Norm:
+        case KimiTensorRole::AttentionResidual: return PlacementClass::Norm;
+        case KimiTensorRole::MlaAttention:
+        case KimiTensorRole::KdaAttention: return PlacementClass::Attention;
+        case KimiTensorRole::DenseMlp: return PlacementClass::FeedForward;
+        case KimiTensorRole::Router: return PlacementClass::Router;
+        case KimiTensorRole::SharedExpert:
+        // The latent down/up projections are read on every token like the
+        // shared experts are, not once per routed hit, so they belong with the
+        // dense spine rather than with the routed set.
+        case KimiTensorRole::LatentMoeProjection: return PlacementClass::SharedExpert;
+        case KimiTensorRole::RoutedExpert: return PlacementClass::RoutedExpert;
+        case KimiTensorRole::Vision:
+        case KimiTensorRole::VisionProjector: return PlacementClass::Vision;
+        case KimiTensorRole::Count: break;
+    }
+    return PlacementClass::Norm;
+}
+
+[[nodiscard]] ParseResult<PlacementInventory> build_kimi_k3_inventory(
+    const KimiIndexManifest& manifest, std::uint32_t context_tokens) {
+    ParseResult<PlacementInventory> result;
+    constexpr auto& c = kKimiK3ExecutionContract;
+    auto& inventory = result.value;
+    inventory.model = PlacementModel::KimiK3;
+    inventory.model_name = kimi_k3_mxfp4_spec().name;
+    inventory.layer_count = c.layer_count;
+    inventory.maximum_context_tokens = context_tokens;
+    inventory.per_device_workspace_bytes = kKimiDeviceWorkspaceReserve;
+    inventory.minimum_device_budget_bytes = kMinimumDeviceBudget;
+    inventory.contiguous_layer_blocks = false;
+    // Descriptive until stage 4's runtime consumes the assignment and a real
+    // load validates it. Promoting it before then would have the planner
+    // prescribe a placement nothing has executed.
+    inventory.prescriptive = false;
+
+    // The dense spine is plain BF16 and 103 GiB of it, against 64 GiB of VRAM.
+    // Half of it must live in host memory and stream over PCIe every step, so
+    // it is spillable — but only as far as the host tier.
+    std::map<std::string, ModuleSizes> modules;
+    std::map<std::string, PlacementClass> module_class;
+    ModuleSizes routed;
+    std::uint64_t routed_modules = 0U;
+    for (const auto& tensor : manifest.tensors) {
+        if (tensor.role == KimiTensorRole::RoutedExpert) {
+            if (tensor.component == KimiTensorComponent::Scale) {
+                routed.scale_bytes += tensor.source_bytes;
+            } else {
+                routed.weight_bytes += tensor.source_bytes;
+                ++routed_modules;
+            }
+            continue;
+        }
+        const auto base = module_base(tensor.name);
+        auto& sizes = modules[base];
+        sizes.layer = tensor.layer;
+        module_class[base] = kimi_component(tensor.role);
+        // Norms, the attention-residual pseudo-queries, and the KDA scalar
+        // state are decoded to F32 host vectors and mirrored to the device.
+        const bool host_parameter = tensor.role == KimiTensorRole::Norm ||
+            tensor.role == KimiTensorRole::AttentionResidual;
+        if (host_parameter) {
+            auto bytes = tensor.source_bytes;
+            if (tensor.source_dtype == SafetensorsDtype::Bf16) bytes *= 2U;
+            sizes.host_bytes += bytes;
+        } else {
+            sizes.weight_bytes += tensor.source_bytes;
+        }
+    }
+    for (const auto& [base, sizes] : modules) {
+        const auto component = module_class.at(base);
+        auto item_sizes = sizes;
+        if (component == PlacementClass::OutputHead && sizes.layer < 0) {
+            item_sizes.layer = static_cast<std::int32_t>(c.layer_count - 1U);
+        }
+        const bool host_only = item_sizes.weight_bytes == 0U;
+        if (host_only) {
+            inventory.items.push_back(make_item(component, item_sizes, 0U,
+                                                PlacementTier::Host, false));
+            continue;
+        }
+        auto item = make_item(component, item_sizes, item_sizes.device_bytes(),
+                              PlacementTier::Device, true);
+        // The vision tower is not read during text decode and is small enough
+        // to pin, so it stays where the runtime puts it.
+        if (component == PlacementClass::Vision) {
+            item.spillable = false;
+            item.fixed_device_slot = 0;
+            item.decode_read_bytes = 0U;
+        }
+        item.deepest_tier = PlacementTier::Host;
+        item.host_bytes = item_sizes.source_bytes();
+        inventory.items.push_back(std::move(item));
+    }
+
+    if (routed.weight_bytes != 0U) {
+        const auto triplets = routed_modules == 0U ? 1U : routed_modules;
+        const auto per_module = (routed.weight_bytes + routed.scale_bytes) / triplets;
+        // Three modules per expert, top-k experts per MoE layer, once per step.
+        const auto reads = per_module * 3ULL * c.experts_per_token *
+                           (c.layer_count - c.dense_prefix_layers);
+        auto item = make_item(PlacementClass::RoutedExpert, routed, reads,
+                              PlacementTier::Device, true);
+        item.device_bytes = routed.weight_bytes + routed.scale_bytes;
+        item.host_bytes = item.device_bytes;
+        item.device_cache_only = true;
+        item.deepest_tier = PlacementTier::Storage;
+        inventory.items.push_back(item);
+    }
+
+    // KV is cheap here and the recurrent state does not grow with context at
+    // all. 24 gated MLA layers hold a 512-wide latent plus a 64-wide shared
+    // rope row per token; the 69 KDA layers hold a fixed [heads, d_k, d_v]
+    // state each. That is why a 1M-token context is not the constraint the
+    // layer count suggests.
+    ModuleSizes cache;
+    cache.host_bytes = static_cast<std::uint64_t>(context_tokens) *
+        (c.kv_lora_rank + c.rope_head_dim) * sizeof(float) * 24ULL;
+    const auto kda_state_bytes = static_cast<std::uint64_t>(c.linear_attention_heads) *
+        c.linear_head_dim * c.value_head_dim * sizeof(float);
+    const auto kda_conv_bytes = static_cast<std::uint64_t>(c.linear_attention_heads) *
+        c.linear_head_dim * c.short_conv_kernel * 3ULL * sizeof(float);
+    cache.host_bytes += (kda_state_bytes + kda_conv_bytes) * 69ULL;
+    inventory.items.push_back(make_item(PlacementClass::KvCache, cache, 0U,
+                                        PlacementTier::Host, false));
+    return result;
+}
+
 // -------------------------------------------------------------- DeepSeek
 
 [[nodiscard]] PlacementClass deepseek_component(Dsv4TensorRole role) noexcept {
@@ -803,6 +941,7 @@ struct OpenCheckpoints {
     std::unique_ptr<Gemma4CheckpointReader> gemma4;
     std::unique_ptr<GlmCheckpointReader> glm;
     std::unique_ptr<Dsv4CheckpointReader> deepseek;
+    std::unique_ptr<KimiCheckpointReader> kimi;
     std::unique_ptr<LagunaCheckpointReader> laguna;
     std::unique_ptr<InklingCheckpointReader> inkling;
 };
@@ -830,6 +969,9 @@ struct OpenCheckpoints {
                 std::min(hardware.host_available_bytes,
                          kDeepSeekHostMemoryLimit),
                 admission_notes);
+        case PlacementModel::KimiK3:
+            return build_kimi_k3_inventory(checkpoints.kimi->manifest(),
+                                           context_tokens);
     }
     ParseResult<PlacementInventory> result;
     result.errors.emplace_back("unknown placement model");
@@ -848,6 +990,8 @@ struct OpenCheckpoints {
             return kInklingExecutionContract.maximum_context_tokens;
         case PlacementModel::DeepSeekV4:
             return kDeepSeekV4ExecutionContract.maximum_context_tokens;
+        case PlacementModel::KimiK3:
+            return kKimiK3ExecutionContract.maximum_context_tokens;
     }
     return 0U;
 }
@@ -959,6 +1103,15 @@ PlacementPlanResult plan_model_placement(const PlacementRequest& request,
                 return result;
             }
             checkpoints.deepseek = std::move(opened.value);
+            break;
+        }
+        case PlacementModel::KimiK3: {
+            auto opened = KimiCheckpointReader::open(request.model_directory);
+            if (!opened.ok()) {
+                result.errors = std::move(opened.errors);
+                return result;
+            }
+            checkpoints.kimi = std::move(opened.value);
             break;
         }
     }

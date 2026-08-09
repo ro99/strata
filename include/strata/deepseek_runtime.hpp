@@ -81,6 +81,10 @@ struct Dsv4RuntimeConfig {
     bool require_zero_nvme_decode{true};
     bool enable_dspark{};
     bool enable_device_moe{true};
+    // Reproduces the device-resident decode placement: routed experts use two
+    // output-tiled NUMA-local CPU shards while the shared expert stays on GPU.
+    // Prefill remains on the existing grouped device path.
+    bool enable_host_routed_moe{};
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};
@@ -118,9 +122,18 @@ struct Dsv4CacheStats {
 
 struct Dsv4DeviceMoeStats {
     std::uint64_t batches{};
+    std::uint64_t host_callback_batches{};
+    std::uint64_t host_callback_failures{};
+    std::uint64_t device_join_batches{};
     std::uint64_t device_commands{};
     std::uint64_t routed_experts{};
     std::uint64_t shared_experts{};
+    std::uint64_t routed_gate_up_nanoseconds{};
+    std::uint64_t routed_down_nanoseconds{};
+    std::uint64_t routed_reduce_nanoseconds{};
+    std::uint64_t routed_cpu_nanoseconds{};
+    std::uint64_t shared_collect_nanoseconds{};
+    std::uint64_t combine_nanoseconds{};
     std::uint64_t nanoseconds{};
 };
 
@@ -197,6 +210,7 @@ struct Dsv4GenerationMetrics {
     bool detailed_timing{};
     bool dspark_enabled{};
     bool device_moe_enabled{};
+    bool host_routed_moe_enabled{};
     bool resident_warmup_overlapped{};
     bool block_kv_cache_enabled{};
     bool incremental_kv_continuation{};

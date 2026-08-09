@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <numeric>
 #include <stdexcept>
@@ -53,6 +54,17 @@ TEST_CASE("worker pool leaves no task queued between dispatches") {
     }
     REQUIRE(total.load() == 16 * static_cast<int>(kWorkers) +
                             16 * static_cast<int>(kWorkers - 3U));
+}
+
+TEST_CASE("worker pool remains reusable while workers idle-spin") {
+    strata::HostWorkerPool pool(kWorkers, std::chrono::milliseconds(1));
+    std::atomic<int> total{0};
+    for (int round = 0; round < 32; ++round) {
+        const auto result = pool.parallel_for_addressed(
+            kWorkers, [&total](std::size_t) { total.fetch_add(1); });
+        REQUIRE(result.ok());
+    }
+    REQUIRE(total.load() == 32 * static_cast<int>(kWorkers));
 }
 
 TEST_CASE("worker pool spreads a full-width dispatch across distinct threads") {

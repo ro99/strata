@@ -79,6 +79,37 @@ struct Dsv4HostExpertWeights {
     std::span<const std::byte> w2_scales;
 };
 
+// One intermediate-dimension TP shard in host expert's decode layout: output rows
+// are blocked by 32, and each group-32 scale is duplicated for the two
+// group-16 inner loops. This replaces the canonical expert bytes; it is not a
+// second cache.
+struct Dsv4TiledExpertWeights {
+    std::span<const std::byte> w13_packed;
+    std::span<const std::byte> w13_scales;
+    std::span<const std::byte> w2_packed;
+    std::span<const std::byte> w2_scales;
+};
+
+[[nodiscard]] std::uint64_t dsv4_tiled_expert_shard_bytes(
+    std::uint64_t hidden, std::uint64_t intermediate,
+    std::uint64_t shards = 2U) noexcept;
+
+[[nodiscard]] ParseResult<Dsv4TiledExpertWeights> dsv4_tiled_expert_weights(
+    std::span<const std::byte> storage, std::uint64_t hidden,
+    std::uint64_t intermediate, std::uint64_t shards = 2U);
+
+[[nodiscard]] ValidationResult dsv4_transform_tiled_expert_shard(
+    std::span<std::byte> destination, const Dsv4HostExpertWeights& canonical,
+    std::uint64_t hidden, std::uint64_t intermediate, std::uint64_t shard,
+    std::uint64_t shards = 2U);
+
+// Computes 16 adjacent outputs from one transformed matrix tile. Shapes are
+// validated when the view is created, outside this decode inner loop.
+void dsv4_tiled_expert_matvec16(
+    std::span<float, 16U> output, std::span<const float> input,
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    std::uint64_t outputs, std::uint64_t output_begin) noexcept;
+
 // Runs gate/up, the clamped SwiGLU, the routed coefficient and the down
 // projection for one expert. `scratch` must hold `intermediate` floats and is
 // overwritten. `output` receives `hidden` floats and is overwritten, not

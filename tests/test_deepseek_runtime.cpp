@@ -8,6 +8,7 @@
 TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     const strata::Dsv4RuntimeConfig config;
     REQUIRE(config.enable_device_moe);
+    REQUIRE(!config.enable_host_routed_moe);
     REQUIRE(!config.enable_flash_attention);
     REQUIRE(!config.enable_gpu_lightning_indexer);
     REQUIRE(config.flash_attention_minimum_rows == 0U);
@@ -79,6 +80,19 @@ TEST_CASE("DeepSeek runtime validates block KV cache configuration") {
     REQUIRE(std::any_of(devices.errors.begin(), devices.errors.end(),
                         [](const std::string& error) {
                             return error.find("KV device budget count") !=
+                                   std::string::npos;
+                        }));
+}
+
+TEST_CASE("DeepSeek device-resident runtime requires physical page geometry") {
+    strata::DeepSeekV4Runtime runtime;
+    strata::Dsv4RuntimeConfig config;
+    config.kv_cache_mode = strata::Dsv4KvCacheMode::PhysicalDevice;
+    const auto initialized = runtime.initialize("not-used", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("256-source-token") !=
                                    std::string::npos;
                         }));
 }

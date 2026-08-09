@@ -1,6 +1,7 @@
 #include "strata/deepseek_kv_cache.hpp"
 
 #include "strata/deepseek_ops.hpp"
+#include "strata/dsv4_attention_kv.hpp"
 #include "strata/model_adapter.hpp"
 
 #include <algorithm>
@@ -138,11 +139,25 @@ struct TableKeyHash {
 }  // namespace
 
 Dsv4KvFormat dsv4_kv_format(Dsv4KvBlockKind kind,
-                            bool f32_oracle) noexcept {
+                            bool f32_oracle,
+                            bool physical_layout) noexcept {
     if (f32_oracle) return Dsv4KvFormat::F32;
+    if (physical_layout) {
+        return kind == Dsv4KvBlockKind::LearnedIndex
+            ? Dsv4KvFormat::PhysicalFp8E4m3PerTensor
+            : Dsv4KvFormat::PhysicalFp8E4m3Group64Bf16Rope;
+    }
     return kind == Dsv4KvBlockKind::LearnedIndex
         ? Dsv4KvFormat::Fp4E2m1Group32
         : Dsv4KvFormat::Fp8E4m3Group64Bf16Rope;
+}
+
+std::uint32_t dsv4_kv_block_rows(Dsv4KvBlockKind kind,
+                                 std::uint32_t compression_ratio,
+                                 bool physical_layout) noexcept {
+    if (!physical_layout) return kDsv4KvBlockRows;
+    if (compression_ratio != required_ratio(kind)) return 0U;
+    return kDsv4PhysicalKvBlockRows / compression_ratio;
 }
 
 std::uint64_t dsv4_kv_row_bytes(Dsv4KvBlockKind kind,
@@ -159,6 +174,14 @@ std::uint64_t dsv4_kv_row_bytes(Dsv4KvBlockKind kind,
     if (format == Dsv4KvFormat::Fp4E2m1Group32 &&
         kind == Dsv4KvBlockKind::LearnedIndex) {
         return width / 2U + width / 32U;
+    }
+    if (format == Dsv4KvFormat::PhysicalFp8E4m3Group64Bf16Rope &&
+        kind != Dsv4KvBlockKind::LearnedIndex) {
+        return 584U;
+    }
+    if (format == Dsv4KvFormat::PhysicalFp8E4m3PerTensor &&
+        kind == Dsv4KvBlockKind::LearnedIndex) {
+        return 132U;
     }
     return 0U;
 }
@@ -191,6 +214,12 @@ ValidationResult dsv4_encode_kv_row(
     }
     if (format == Dsv4KvFormat::F32) {
         std::memcpy(output.data(), values.data(), output.size());
+        return result;
+    }
+    if (format == Dsv4KvFormat::PhysicalFp8E4m3Group64Bf16Rope ||
+        format == Dsv4KvFormat::PhysicalFp8E4m3PerTensor) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV rows require a block-major page encoder");
         return result;
     }
     if (format == Dsv4KvFormat::Fp8E4m3Group64Bf16Rope) {
@@ -320,7 +349,7 @@ ValidationResult dsv4_decode_kv_row(
                         sizeof(value));
             output[nope + column] = decode_bf16(value);
         }
-    } else {
+    } else if (format == Dsv4KvFormat::Fp4E2m1Group32) {
         const auto packed = output.size() / 2U;
         const auto groups = output.size() / 32U;
         for (std::size_t group = 0U; group < groups; ++group) {
@@ -340,6 +369,10 @@ ValidationResult dsv4_decode_kv_row(
                     dsv4_fp4_e2m1_f32(values >> 4U) * scale));
             }
         }
+    } else {
+        result.errors.emplace_back(
+            "DeepSeek physical KV rows require a block-major page decoder");
+        return result;
     }
     if (std::any_of(output.begin(), output.end(),
                     [](float value) { return !std::isfinite(value); })) {
@@ -382,6 +415,15 @@ struct Dsv4KvCacheState {
         if (config.block_rows == 0U || config.sliding_window_rows == 0U) {
             result.errors.emplace_back(
                 "DeepSeek KV block rows and sliding window must be positive");
+        }
+        if (config.physical_layout && config.f32_oracle) {
+            result.errors.emplace_back(
+                "DeepSeek physical KV and the F32 oracle are mutually exclusive");
+        }
+        if (config.physical_layout &&
+            config.block_rows != kDsv4PhysicalKvBlockRows) {
+            result.errors.emplace_back(
+                "DeepSeek physical KV requires 256-source-token blocks");
         }
         if (config.host_capacity_bytes == 0U) {
             result.errors.emplace_back(
@@ -475,7 +517,7 @@ struct Dsv4KvCacheState {
         blocks.erase(found);
     }
 
-    void release_reference(std::uint64_t id) noexcept {
+    void release_block(std::uint64_t id) noexcept {
         const auto found = blocks.find(id);
         if (found == blocks.end() || found->second.info.refcount == 0U) return;
         --found->second.info.refcount;
@@ -485,7 +527,7 @@ struct Dsv4KvCacheState {
     void release_tables(Sequence& target) noexcept {
         for (auto& [key, table] : target.tables) {
             static_cast<void>(key);
-            for (const auto id : table.blocks) release_reference(id);
+            for (const auto id : table.blocks) release_block(id);
         }
         target.tables.clear();
         target.tokens = 0U;
@@ -497,12 +539,17 @@ struct Dsv4KvCacheState {
         const Block* source, std::uint64_t& output) {
         ValidationResult result;
         const auto width = required_width(kind);
-        const auto format = dsv4_kv_format(kind, config.f32_oracle);
+        const auto format = dsv4_kv_format(
+            kind, config.f32_oracle, config.physical_layout);
+        const auto capacity_rows = config.physical_layout
+            ? dsv4_kv_block_rows(kind, ratio, true) : config.block_rows;
         const auto row_bytes = dsv4_kv_row_bytes(kind, format);
-        const auto payload_bytes = row_bytes * config.block_rows;
-        const auto bytes = dsv4_kv_block_bytes(kind, format, config.block_rows);
+        const auto payload_bytes = row_bytes * capacity_rows;
+        const auto bytes = dsv4_kv_block_bytes(
+            kind, format, capacity_rows);
         if (row_bytes == 0U || bytes == 0U ||
-            payload_bytes / config.block_rows != row_bytes) {
+            capacity_rows == 0U ||
+            payload_bytes / capacity_rows != row_bytes) {
             result.errors.emplace_back("DeepSeek KV block byte count overflows");
             return result;
         }
@@ -525,7 +572,7 @@ struct Dsv4KvCacheState {
             block.info.owner_sequence = owner;
             block.info.logical_begin = start_row * ratio;
             block.info.used_rows = source == nullptr ? 0U : source->info.used_rows;
-            block.info.capacity_rows = config.block_rows;
+            block.info.capacity_rows = capacity_rows;
             block.info.row_width = width;
             block.info.layer = layer;
             block.info.compression_ratio = ratio;
@@ -543,7 +590,7 @@ struct Dsv4KvCacheState {
             header.format = static_cast<std::uint8_t>(format);
             header.kind = static_cast<std::uint8_t>(kind);
             header.row_width = width;
-            header.capacity_rows = config.block_rows;
+            header.capacity_rows = capacity_rows;
             header.layer = layer;
             header.compression_ratio = ratio;
             header.payload_bytes = payload_bytes;
@@ -675,6 +722,104 @@ const CudaBuffer* Dsv4KvDeviceLease::buffer() const noexcept {
     return &found->second.devices[device_slot_];
 }
 
+Dsv4KvPhysicalAppend::Dsv4KvPhysicalAppend() = default;
+Dsv4KvPhysicalAppend::~Dsv4KvPhysicalAppend() = default;
+Dsv4KvPhysicalAppend::Dsv4KvPhysicalAppend(
+    Dsv4KvPhysicalAppend&&) noexcept = default;
+Dsv4KvPhysicalAppend& Dsv4KvPhysicalAppend::operator=(
+    Dsv4KvPhysicalAppend&&) noexcept = default;
+
+Dsv4KvPhysicalAppend::Dsv4KvPhysicalAppend(
+    std::shared_ptr<Dsv4KvCacheState> state, Dsv4KvDeviceLease lease,
+    std::uint64_t block_id, std::uint32_t physical_row,
+    std::uint64_t data_offset, std::uint64_t scale_offset,
+    std::uint32_t data_bytes, std::uint32_t scale_bytes,
+    std::byte* payload, std::uint64_t payload_bytes,
+    std::uint32_t row_width, Dsv4KvBlockKind kind,
+    Dsv4KvFormat format)
+    : state_(std::move(state)), lease_(std::move(lease)),
+      block_id_(block_id), physical_row_(physical_row),
+      data_offset_(data_offset), scale_offset_(scale_offset),
+      data_bytes_(data_bytes), scale_bytes_(scale_bytes),
+      payload_(payload), payload_bytes_(payload_bytes),
+      row_width_(row_width), kind_(kind), format_(format) {}
+
+bool Dsv4KvPhysicalAppend::valid() const noexcept {
+    return state_ != nullptr && block_id_ != 0U && lease_.valid() &&
+           data_bytes_ != 0U && scale_bytes_ != 0U && payload_ != nullptr &&
+           payload_bytes_ != 0U && row_width_ != 0U;
+}
+
+const CudaBuffer* Dsv4KvPhysicalAppend::buffer() const noexcept {
+    return lease_.buffer();
+}
+
+std::uint64_t Dsv4KvPhysicalAppend::data_offset() const noexcept {
+    return data_offset_;
+}
+
+std::uint64_t Dsv4KvPhysicalAppend::scale_offset() const noexcept {
+    return scale_offset_;
+}
+
+std::uint32_t Dsv4KvPhysicalAppend::data_bytes() const noexcept {
+    return data_bytes_;
+}
+
+std::uint32_t Dsv4KvPhysicalAppend::scale_bytes() const noexcept {
+    return scale_bytes_;
+}
+
+std::uint64_t Dsv4KvPhysicalAppend::patch_bytes() const noexcept {
+    return static_cast<std::uint64_t>(data_bytes_) + scale_bytes_;
+}
+
+ValidationResult Dsv4KvPhysicalAppend::commit(
+    std::span<const float> values, std::span<std::byte> patch) {
+    ValidationResult result;
+    if (!valid() || committed_ || patch.size() != patch_bytes()) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV append commit is invalid");
+        return result;
+    }
+    if (values.size() != row_width_ ||
+        std::any_of(values.begin(), values.end(), [](float value) {
+            return !std::isfinite(value) ||
+                   !std::isfinite(decode_bf16(encode_bf16(value)));
+        })) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV append values are invalid");
+        return result;
+    }
+    auto payload = std::span<std::byte>(
+        payload_, static_cast<std::size_t>(payload_bytes_));
+    result = dsv4_physical_encode_kv_row(
+        kind_, values, physical_row_, payload);
+    if (!result.ok()) return result;
+    std::copy_n(
+        payload.begin() + static_cast<std::ptrdiff_t>(data_offset_),
+        data_bytes_, patch.begin());
+    std::copy_n(
+        payload.begin() + static_cast<std::ptrdiff_t>(scale_offset_),
+        scale_bytes_,
+        patch.begin() + static_cast<std::ptrdiff_t>(data_bytes_));
+    committed_ = true;
+    return result;
+}
+
+ValidationResult Dsv4KvPhysicalAppend::account() {
+    ValidationResult result;
+    if (!valid() || !committed_ || accounted_) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV append accounting is invalid");
+        return result;
+    }
+    state_->metrics.host_write_bytes += dsv4_kv_row_bytes(kind_, format_);
+    state_->metrics.host_to_device_bytes += patch_bytes();
+    accounted_ = true;
+    return result;
+}
+
 Dsv4KvCache::Dsv4KvCache(Dsv4KvCacheConfig config, CudaBackend* cuda)
     : state_(std::make_shared<Dsv4KvCacheState>(std::move(config), cuda)) {}
 
@@ -793,7 +938,7 @@ ValidationResult Dsv4KvCache::truncate_sequence(
                                block.info.compression_ratio;
             if (begin < table.end_row) break;
             table.blocks.pop_back();
-            state_->release_reference(id);
+            state_->release_block(id);
         }
         table.minimum_row = std::min(table.minimum_row, table.end_row);
     }
@@ -827,21 +972,33 @@ ValidationResult Dsv4KvCache::append(
     }
     const auto wanted_ratio = required_ratio(kind);
     const auto width = required_width(kind);
+    const auto format = dsv4_kv_format(
+        kind, state_->config.f32_oracle,
+        state_->config.physical_layout);
+    const auto capacity_rows = state_->config.physical_layout
+        ? dsv4_kv_block_rows(kind, compression_ratio, true)
+        : state_->config.block_rows;
     if (layer >= kDeepSeekV4ExecutionContract.layer_count ||
-        compression_ratio != wanted_ratio || values.size() != width) {
+        compression_ratio != wanted_ratio || values.size() != width ||
+        capacity_rows == 0U ||
+        std::any_of(values.begin(), values.end(), [](float value) {
+            return !std::isfinite(value) ||
+                   !std::isfinite(decode_bf16(encode_bf16(value)));
+        })) {
         result.errors.emplace_back(
-            "DeepSeek KV block kind, layer, ratio, or row width is invalid");
+            "DeepSeek KV block kind, layer, ratio, row width, or values are invalid");
         return result;
     }
     std::array<std::byte,
                kDeepSeekV4ExecutionContract.head_dim * sizeof(float)>
         encoded_storage{};
-    const auto encoded = std::span<std::byte>(encoded_storage).first(
+    auto encoded = std::span<std::byte>(encoded_storage).first(
         static_cast<std::size_t>(dsv4_kv_row_bytes(
-            kind, dsv4_kv_format(kind, state_->config.f32_oracle))));
-    result = dsv4_encode_kv_row(
-        kind, dsv4_kv_format(kind, state_->config.f32_oracle), values, encoded);
-    if (!result.ok()) return result;
+            kind, format)));
+    if (!state_->config.physical_layout) {
+        result = dsv4_encode_kv_row(kind, format, values, encoded);
+        if (!result.ok()) return result;
+    }
     if (logical_row == std::numeric_limits<std::uint64_t>::max() ||
         logical_row + 1U > std::numeric_limits<std::uint64_t>::max() /
                                compression_ratio) {
@@ -874,7 +1031,7 @@ ValidationResult Dsv4KvCache::append(
         return result;
     }
     const auto block_begin =
-        logical_row / state_->config.block_rows * state_->config.block_rows;
+        logical_row / capacity_rows * capacity_rows;
     auto* block = state_->find_block(table, logical_row);
     if (block != nullptr && block->info.refcount > 1U) {
         const auto old_id = block->info.id;
@@ -885,7 +1042,7 @@ ValidationResult Dsv4KvCache::append(
         if (!result.ok()) return result;
         const auto id = std::find(table.blocks.begin(), table.blocks.end(), old_id);
         *id = replacement;
-        state_->release_reference(old_id);
+        state_->release_block(old_id);
         block = &state_->blocks.at(replacement);
         ++state_->metrics.copy_on_write_blocks;
     } else if (block == nullptr) {
@@ -897,7 +1054,7 @@ ValidationResult Dsv4KvCache::append(
         try {
             table.blocks.push_back(id);
         } catch (const std::bad_alloc&) {
-            state_->release_reference(id);
+            state_->release_block(id);
             result.errors.emplace_back(
                 "cannot grow DeepSeek KV block-table metadata");
             return result;
@@ -911,15 +1068,52 @@ ValidationResult Dsv4KvCache::append(
             "DeepSeek KV cannot mutate an in-flight device block");
         return result;
     }
-    for (std::size_t slot = 0U; slot < block->devices.size(); ++slot) {
-        if (!block->devices[slot].valid()) continue;
-        state_->metrics.device_used_bytes[slot] -=
-            block->devices[slot].device_bytes();
-        block->devices[slot] = {};
+    if (state_->config.physical_layout) {
+        auto payload = std::span<std::byte>(block->host).subspan(
+            kBlockHeaderBytes,
+            static_cast<std::size_t>(block->info.payload_bytes));
+        const auto row = static_cast<std::uint32_t>(logical_row - block_begin);
+        result = dsv4_physical_encode_kv_row(
+            kind, values, row, payload);
+        if (!result.ok()) return result;
+        const auto layout = dsv4_physical_kv_layout(kind, capacity_rows);
+        if (!layout.ok()) return {layout.errors};
+        const auto data_offset =
+            static_cast<std::uint64_t>(row) * layout.value.token_data_bytes;
+        const auto scale_offset =
+            static_cast<std::uint64_t>(capacity_rows) *
+                layout.value.token_data_bytes +
+            static_cast<std::uint64_t>(row) *
+                layout.value.token_scale_bytes;
+        const std::array<CudaBufferPatch, 2U> patches{{
+            {data_offset,
+             std::span<const std::byte>(payload).subspan(
+                 static_cast<std::size_t>(data_offset),
+                 layout.value.token_data_bytes)},
+            {scale_offset,
+             std::span<const std::byte>(payload).subspan(
+                 static_cast<std::size_t>(scale_offset),
+                 layout.value.token_scale_bytes)},
+        }};
+        for (std::size_t slot = 0U; slot < block->devices.size(); ++slot) {
+            if (!block->devices[slot].valid()) continue;
+            result = state_->cuda->update_buffer(block->devices[slot], patches);
+            if (!result.ok()) return result;
+            state_->metrics.host_to_device_bytes +=
+                layout.value.token_data_bytes +
+                layout.value.token_scale_bytes;
+        }
+    } else {
+        for (std::size_t slot = 0U; slot < block->devices.size(); ++slot) {
+            if (!block->devices[slot].valid()) continue;
+            state_->metrics.device_used_bytes[slot] -=
+                block->devices[slot].device_bytes();
+            block->devices[slot] = {};
+        }
+        const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
+            static_cast<std::size_t>(logical_row - block_begin) * encoded.size();
+        std::copy(encoded.begin(), encoded.end(), block->host.begin() + offset);
     }
-    const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
-        static_cast<std::size_t>(logical_row - block_begin) * encoded.size();
-    std::copy(encoded.begin(), encoded.end(), block->host.begin() + offset);
     state_->metrics.host_write_bytes += encoded.size();
     block->info.used_rows = std::max(
         block->info.used_rows,
@@ -936,9 +1130,154 @@ ValidationResult Dsv4KvCache::append(
             const auto begin = first.info.logical_begin;
             if (begin + first.info.capacity_rows > table.minimum_row) break;
             table.blocks.erase(table.blocks.begin());
-            state_->release_reference(id);
+            state_->release_block(id);
         }
     }
+    return result;
+}
+
+ParseResult<Dsv4KvPhysicalAppend>
+Dsv4KvCache::reserve_physical_append(
+    Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
+    std::uint32_t layer, std::uint32_t compression_ratio,
+    std::uint64_t logical_row, std::size_t device_slot) {
+    ParseResult<Dsv4KvPhysicalAppend> result;
+    auto* target = state_->sequence(sequence);
+    const auto wanted_ratio = required_ratio(kind);
+    const auto width = required_width(kind);
+    const auto capacity_rows = dsv4_kv_block_rows(
+        kind, compression_ratio, true);
+    if (target == nullptr || !state_->config.physical_layout ||
+        state_->cuda == nullptr || layer >= kDeepSeekV4ExecutionContract.layer_count ||
+        compression_ratio != wanted_ratio || capacity_rows == 0U ||
+        width == 0U || device_slot >= state_->config.devices.size() ||
+        state_->config.device_capacity_bytes[device_slot] == 0U ||
+        logical_row == std::numeric_limits<std::uint64_t>::max() ||
+        logical_row + 1U > std::numeric_limits<std::uint64_t>::max() /
+                               compression_ratio) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV append reservation is invalid");
+        return result;
+    }
+
+    const TableKey key{kind, layer};
+    auto table_found = target->tables.find(key);
+    if (table_found == target->tables.end()) {
+        if (logical_row != 0U) {
+            result.errors.emplace_back(
+                "DeepSeek KV first reserved row must start at zero");
+            return result;
+        }
+        try {
+            table_found = target->tables.emplace(
+                key, Dsv4KvCacheState::Table{
+                         {}, 0U, 0U, compression_ratio}).first;
+        } catch (const std::bad_alloc&) {
+            result.errors.emplace_back(
+                "cannot allocate DeepSeek reserved KV metadata");
+            return result;
+        }
+    }
+    auto& table = table_found->second;
+    if (table.compression_ratio != compression_ratio ||
+        logical_row != table.end_row) {
+        result.errors.emplace_back(
+            "DeepSeek reserved KV append position is not contiguous");
+        return result;
+    }
+    const auto block_begin = logical_row / capacity_rows * capacity_rows;
+    auto* block = state_->find_block(table, logical_row);
+    if (block != nullptr && block->info.refcount > 1U) {
+        const auto old_id = block->info.id;
+        std::uint64_t replacement = 0U;
+        auto status = state_->allocate_block(
+            sequence, kind, layer, compression_ratio, block_begin,
+            block, replacement);
+        if (!status.ok()) {
+            result.errors = std::move(status.errors);
+            return result;
+        }
+        const auto id = std::find(
+            table.blocks.begin(), table.blocks.end(), old_id);
+        *id = replacement;
+        state_->release_block(old_id);
+        block = &state_->blocks.at(replacement);
+        ++state_->metrics.copy_on_write_blocks;
+    } else if (block == nullptr) {
+        std::uint64_t id = 0U;
+        auto status = state_->allocate_block(
+            sequence, kind, layer, compression_ratio, block_begin,
+            nullptr, id);
+        if (!status.ok()) {
+            result.errors = std::move(status.errors);
+            return result;
+        }
+        try {
+            table.blocks.push_back(id);
+        } catch (const std::bad_alloc&) {
+            state_->release_block(id);
+            result.errors.emplace_back(
+                "cannot grow DeepSeek reserved KV block table");
+            return result;
+        }
+        block = &state_->blocks.at(id);
+    }
+    auto checked = state_->validate_block(*block);
+    if (!checked.ok() || state_->total_leases(*block) != 0U) {
+        result.errors = std::move(checked.errors);
+        if (result.ok()) {
+            result.errors.emplace_back(
+                "DeepSeek KV cannot reserve an in-flight device block");
+        }
+        return result;
+    }
+
+    const auto physical_row = static_cast<std::uint32_t>(
+        logical_row - block_begin);
+    block->info.used_rows = std::max(
+        block->info.used_rows, physical_row + 1U);
+    ++table.end_row;
+    target->tokens = std::max(
+        target->tokens, table.end_row * compression_ratio);
+    if (kind == Dsv4KvBlockKind::Sliding) {
+        table.minimum_row = table.end_row > state_->config.sliding_window_rows
+            ? table.end_row - state_->config.sliding_window_rows : 0U;
+        while (!table.blocks.empty()) {
+            const auto id = table.blocks.front();
+            const auto& first = state_->blocks.at(id);
+            const auto begin = first.info.logical_begin;
+            if (begin + first.info.capacity_rows > table.minimum_row) break;
+            table.blocks.erase(table.blocks.begin());
+            state_->release_block(id);
+        }
+    }
+
+    auto lease = acquire_device(
+        sequence, kind, layer, logical_row, device_slot);
+    if (!lease.ok()) {
+        result.errors = std::move(lease.errors);
+        return result;
+    }
+    const auto layout = dsv4_physical_kv_layout(kind, capacity_rows);
+    if (!layout.ok()) {
+        result.errors = layout.errors;
+        return result;
+    }
+    const auto data_offset =
+        static_cast<std::uint64_t>(physical_row) *
+        layout.value.token_data_bytes;
+    const auto scale_offset =
+        static_cast<std::uint64_t>(capacity_rows) *
+            layout.value.token_data_bytes +
+        static_cast<std::uint64_t>(physical_row) *
+            layout.value.token_scale_bytes;
+    result.value = Dsv4KvPhysicalAppend(
+        state_, std::move(lease.value), block->info.id, physical_row,
+        data_offset, scale_offset, layout.value.token_data_bytes,
+        layout.value.token_scale_bytes,
+        block->host.data() + kBlockHeaderBytes,
+        block->info.payload_bytes, block->info.row_width,
+        block->info.kind, block->info.format);
     return result;
 }
 
@@ -975,8 +1314,6 @@ ParseResult<std::vector<float>> Dsv4KvCache::row(
                              block->info.compression_ratio;
     const auto row_bytes = dsv4_kv_row_bytes(block->info.kind,
                                              block->info.format);
-    const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
-        static_cast<std::size_t>(logical_row - block_begin) * row_bytes;
     try {
         result.value.resize(block->info.row_width);
     } catch (const std::bad_alloc&) {
@@ -984,10 +1321,24 @@ ParseResult<std::vector<float>> Dsv4KvCache::row(
         ++state_->metrics.misses;
         return result;
     }
-    result.errors = dsv4_decode_kv_row(
-        block->info.kind, block->info.format,
-        std::span<const std::byte>(block->host).subspan(offset, row_bytes),
-        result.value).errors;
+    if (block->info.format ==
+            Dsv4KvFormat::PhysicalFp8E4m3Group64Bf16Rope ||
+        block->info.format == Dsv4KvFormat::PhysicalFp8E4m3PerTensor) {
+        const auto payload = std::span<const std::byte>(block->host).subspan(
+            kBlockHeaderBytes,
+            static_cast<std::size_t>(block->info.payload_bytes));
+        result.errors = dsv4_physical_decode_kv_row(
+            block->info.kind, payload,
+            static_cast<std::uint32_t>(logical_row - block_begin),
+            result.value).errors;
+    } else {
+        const auto offset = static_cast<std::size_t>(kBlockHeaderBytes) +
+            static_cast<std::size_t>(logical_row - block_begin) * row_bytes;
+        result.errors = dsv4_decode_kv_row(
+            block->info.kind, block->info.format,
+            std::span<const std::byte>(block->host).subspan(offset, row_bytes),
+            result.value).errors;
+    }
     if (!result.ok()) {
         result.value.clear();
         ++state_->metrics.misses;
@@ -1122,7 +1473,17 @@ ParseResult<Dsv4KvDeviceLease> Dsv4KvCache::acquire_device(
         }
         result.errors = state_->validate_block(*block).errors;
         if (!result.ok()) return result;
-        const auto bytes = static_cast<std::uint64_t>(block->host.size());
+        const bool physical_page =
+            block->info.format ==
+                Dsv4KvFormat::PhysicalFp8E4m3Group64Bf16Rope ||
+            block->info.format ==
+                Dsv4KvFormat::PhysicalFp8E4m3PerTensor;
+        const auto upload = physical_page
+            ? std::span<const std::byte>(block->host).subspan(
+                  kBlockHeaderBytes,
+                  static_cast<std::size_t>(block->info.payload_bytes))
+            : std::span<const std::byte>(block->host);
+        const auto bytes = static_cast<std::uint64_t>(upload.size());
         const auto capacity = state_->config.device_capacity_bytes[device_slot];
         if (bytes > capacity) {
             result.errors.emplace_back(
@@ -1159,7 +1520,7 @@ ParseResult<Dsv4KvDeviceLease> Dsv4KvCache::acquire_device(
         const auto promotion_started = std::chrono::steady_clock::now();
         const auto uploaded_result = state_->cuda->upload_buffer(
             state_->config.devices[device_slot],
-            std::span<const std::byte>(block->host), uploaded);
+            upload, uploaded);
         if (!uploaded_result.ok()) {
             result.errors = uploaded_result.errors;
             return result;

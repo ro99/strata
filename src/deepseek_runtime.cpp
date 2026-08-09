@@ -3,7 +3,10 @@
 #include "cuda_stats_delta.hpp"
 
 #include "strata/deepseek_ops.hpp"
+#include "strata/deepseek_host_expert.hpp"
+#include "strata/dsv4_attention_kv.hpp"
 #include "strata/model_adapter.hpp"
+#include "strata/numa_topology.hpp"
 #include "strata/numerics.hpp"
 #include "strata/route_predictor.hpp"
 #include "strata/sampling.hpp"
@@ -19,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <list>
@@ -36,6 +40,7 @@
 #include <optional>
 #include <span>
 #include <random>
+#include <sched.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +61,7 @@ constexpr std::uint32_t kWindow = kDeepSeekV4ExecutionContract.sliding_window;
 constexpr std::uint32_t kIndexHeads = kDeepSeekV4ExecutionContract.index_heads;
 constexpr std::uint32_t kIndexHeadDim = kDeepSeekV4ExecutionContract.index_head_dim;
 constexpr std::uint32_t kIndexTopK = kDeepSeekV4ExecutionContract.index_topk;
+constexpr std::uint32_t kPhysicalPagedHeads = 32U;
 constexpr std::uint32_t kExperts = kDeepSeekV4ExecutionContract.routed_experts;
 constexpr std::uint32_t kTopK = kDeepSeekV4ExecutionContract.experts_per_token;
 constexpr std::uint32_t kExpertIntermediate =
@@ -67,6 +73,7 @@ constexpr std::uint64_t kDeviceWorkspaceReserve = 256ULL << 20U;
 constexpr std::uint32_t kMaximumPrefillPageTokens = 512U;
 constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+static_assert(kHeads == 2U * kPhysicalPagedHeads);
 constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
 constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
 
@@ -255,11 +262,31 @@ void apply_rope(std::span<float> values, std::uint64_t position,
 [[nodiscard]] Dsv4DeviceMoeStats device_moe_delta(
     const Dsv4DeviceMoeStats& after,
     const Dsv4DeviceMoeStats& before) noexcept {
-    return {after.batches - before.batches,
-            after.device_commands - before.device_commands,
-            after.routed_experts - before.routed_experts,
-            after.shared_experts - before.shared_experts,
-            after.nanoseconds - before.nanoseconds};
+    Dsv4DeviceMoeStats result;
+    result.batches = after.batches - before.batches;
+    result.host_callback_batches = after.host_callback_batches -
+                                   before.host_callback_batches;
+    result.host_callback_failures = after.host_callback_failures -
+                                    before.host_callback_failures;
+    result.device_join_batches = after.device_join_batches -
+                                 before.device_join_batches;
+    result.device_commands = after.device_commands - before.device_commands;
+    result.routed_experts = after.routed_experts - before.routed_experts;
+    result.shared_experts = after.shared_experts - before.shared_experts;
+    result.routed_gate_up_nanoseconds = after.routed_gate_up_nanoseconds -
+                                        before.routed_gate_up_nanoseconds;
+    result.routed_down_nanoseconds = after.routed_down_nanoseconds -
+                                     before.routed_down_nanoseconds;
+    result.routed_reduce_nanoseconds = after.routed_reduce_nanoseconds -
+                                       before.routed_reduce_nanoseconds;
+    result.routed_cpu_nanoseconds = after.routed_cpu_nanoseconds -
+                                    before.routed_cpu_nanoseconds;
+    result.shared_collect_nanoseconds = after.shared_collect_nanoseconds -
+                                        before.shared_collect_nanoseconds;
+    result.combine_nanoseconds = after.combine_nanoseconds -
+                                 before.combine_nanoseconds;
+    result.nanoseconds = after.nanoseconds - before.nanoseconds;
+    return result;
 }
 
 [[nodiscard]] Dsv4GraphStats graph_delta(
@@ -1301,6 +1328,47 @@ struct SpeculativeState {
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
+    struct PhysicalAttentionContext {
+        Impl* owner{};
+        std::uint32_t layer{};
+        std::uint32_t position{};
+        ValidationResult result;
+        bool invoked{};
+        std::vector<float> query_rank;
+        std::vector<float> key_value;
+        std::vector<float> compressor_values;
+        std::vector<float> compressor_scores;
+        std::vector<float> index_compressor_values;
+        std::vector<float> index_compressor_scores;
+        std::optional<Dsv4KvPhysicalAppend> sliding_append;
+        std::optional<Dsv4KvPhysicalAppend> compressed_append;
+        std::optional<Dsv4KvPhysicalAppend> index_append;
+    };
+
+    struct HostMoeContext {
+        Impl* owner{};
+        std::uint32_t layer{};
+        std::uint32_t token{};
+        std::uint32_t position{};
+        ValidationResult result;
+        bool invoked{};
+        bool accepted{};
+        std::chrono::steady_clock::time_point execution_started{};
+        std::chrono::steady_clock::time_point callback_finished{};
+        std::vector<float> input;
+        Dsv4Route route;
+        std::array<std::array<Dsv4TiledExpertWeights, kTopK>, 2U> tiled{};
+        std::array<Dsv4WeightCache::Lease, 3U> shared_leases;
+        CudaDeepSeekMoeExpert shared;
+    };
+
+    struct DeviceHeadContext {
+        Impl* owner{};
+        ValidationResult result;
+        bool invoked{};
+        std::array<float, static_cast<std::size_t>(kMhc) * kHidden> hidden{};
+    };
+
     Dsv4RuntimeConfig config;
     Dsv4MemoryPlan memory;
     Dsv4GenerationMetrics initialization_metrics;
@@ -1311,15 +1379,40 @@ struct DeepSeekV4Runtime::Impl {
     std::unique_ptr<Dsv4WeightCache> weights;
     std::unique_ptr<Dsv4KvCache> kv_cache;
     Dsv4SequenceHandle active_sequence{};
+    std::array<PhysicalAttentionContext, kLayers>
+        physical_attention_contexts{};
+    std::array<HostMoeContext, kLayers> host_moe_contexts{};
+    std::uint32_t host_moe_pending{};
+    std::uint64_t host_moe_routed_cpu_before{};
+    DeviceHeadContext device_head_context{};
+    std::vector<Dsv4KvDeviceLease> pending_attention_leases;
+    std::vector<Dsv4WeightCache::Lease> pending_attention_weights;
     std::unique_ptr<HostWorkerPool> attention_workers;
+    std::unique_ptr<HostWorkerPool> expert_workers;
+    std::vector<int> expert_lane_nodes;
+    std::vector<std::size_t> expert_lane_positions;
+    std::array<std::vector<std::size_t>, 2U> expert_node_lanes;
+    std::vector<float> tiled_activation;
+    std::vector<float> tiled_routed;
+    std::array<std::atomic<std::uint64_t>, 48U> tiled_lane_next{};
+    std::array<std::uint64_t, 48U> tiled_lane_end{};
     Dsv4DiagnosticTrace diagnostics;
     Dsv4DeviceMoeStats device_moe_stats;
     Dsv4GraphStats graph_stats;
     std::vector<int> devices;
     std::vector<std::uint64_t> capacities;
     std::vector<std::size_t> schedule;
+    std::size_t mhc_slot{};
     std::unordered_map<std::string, std::vector<float>> host_tensors;
     std::unordered_map<std::string, std::vector<float>> prepacked_mhc;
+    std::array<std::array<CudaDsv4MhcWeights, 2U>, kLayers>
+        device_mhc_weights;
+    bool pending_mhc_attention_transition{};
+    std::array<float, kHidden> combined_attention_mhc_input{};
+    bool completed_attention_mhc_transition{};
+    std::array<float, kExperts> combined_router_logits{};
+    bool completed_router_projection{};
+    bool deferred_attention_moe_input{};
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
     std::vector<std::uint32_t> cached_token_ids;
@@ -1486,25 +1579,47 @@ struct DeepSeekV4Runtime::Impl {
                        std::uint32_t selected, std::span<const float> logits);
     ValidationResult embed(std::uint32_t token, std::span<float> output);
     ValidationResult compressor(std::uint32_t layer, std::span<const float> input,
-                                std::uint32_t position);
+                                std::uint32_t position,
+                                std::span<const float> prepared_values = {},
+                                std::span<const float> prepared_scores = {});
     ValidationResult compress_state(std::uint32_t layer,
                                     CompressorState& state,
                                     const std::string& prefix,
                                     std::span<const float> input,
                                     std::uint32_t position,
-                                    std::span<const float> frequencies);
+                                    std::span<const float> frequencies,
+                                    std::span<const float> prepared_values = {},
+                                    std::span<const float> prepared_scores = {},
+                                    Dsv4KvPhysicalAppend* prepared_append = nullptr,
+                                    std::span<std::byte> prepared_patch = {});
+    static bool physical_attention_prepare_callback(
+        void* opaque, const CudaDsv4AttentionPrepareHostView& view);
+    bool complete_physical_attention_prepare(
+        PhysicalAttentionContext& context,
+        const CudaDsv4AttentionPrepareHostView& view);
     ValidationResult index_positions(std::uint32_t layer,
                                      std::span<const float> input,
                                      std::span<const float> query_rank,
                                      std::uint32_t position,
-                                     std::vector<std::uint32_t>& selected);
+                                     std::vector<std::uint32_t>& selected,
+                                     std::span<const float> prepared_values = {},
+                                     std::span<const float> prepared_scores = {});
     ValidationResult attention(std::uint32_t layer, std::span<const float> input,
                                std::uint32_t position, std::span<float> output);
+    ValidationResult physical_paged_attention(
+        std::uint32_t layer, std::span<const float> queries,
+        std::span<const float> sinks, std::uint32_t position,
+        std::span<const std::uint32_t> indexed_positions,
+        std::span<float> diagnostic_branch);
     ValidationResult attention_prepared(
         std::uint32_t layer, std::span<const float> input,
         std::span<const float> query_rank, std::span<const float> queries,
         std::span<const float> kv, std::uint32_t position,
-        std::span<float> output);
+        std::span<float> output,
+        std::span<const float> compressor_values = {},
+        std::span<const float> compressor_scores = {},
+        std::span<const float> index_compressor_values = {},
+        std::span<const float> index_compressor_scores = {});
     ValidationResult attention_page(std::uint32_t layer,
                                     std::span<const float> input,
                                     std::uint32_t position_base,
@@ -1516,6 +1631,30 @@ struct DeepSeekV4Runtime::Impl {
                                 const Dsv4Route& route,
                                 std::span<const float> input,
                                 std::span<float> output);
+    ValidationResult host_routed_moe(std::uint32_t layer,
+                                    const Dsv4Route& route,
+                                    std::span<const float> input,
+                                    std::span<float> output);
+    ValidationResult host_routed_moe_from_device_input(
+        std::uint32_t layer, std::uint32_t token, std::uint32_t position,
+        std::span<float> output);
+    ValidationResult enqueue_host_routed_moe(
+        std::uint32_t layer, std::uint32_t token,
+        std::uint32_t position);
+    static bool host_routed_moe_callback(
+        void* opaque, std::span<const std::uint16_t> encoded_hidden,
+        std::span<const float> router_logits,
+        std::span<float> rank_partials);
+    bool execute_host_routed_moe_callback(
+        HostMoeContext& context,
+        std::span<const std::uint16_t> encoded_hidden,
+        std::span<const float> router_logits,
+        std::span<float> rank_partials);
+    ValidationResult collect_host_routed_moe_chain();
+    ValidationResult host_routed_moe_impl(
+        std::uint32_t layer, const Dsv4Route* route,
+        std::span<const float> input, std::span<float> output,
+        std::uint32_t token, std::uint32_t token_position);
     ValidationResult moe(std::uint32_t layer, std::uint32_t token,
                          std::span<const float> input, std::span<float> output,
                          std::uint32_t position);
@@ -1541,12 +1680,25 @@ struct DeepSeekV4Runtime::Impl {
                                 std::span<float> hidden,
                                 std::uint32_t position_base);
     ValidationResult forward_hidden(std::uint32_t token, std::uint32_t position,
-                                    std::span<float> hidden);
+                                    std::span<float> hidden,
+                                    std::vector<float>* fused_logits = nullptr);
+    ValidationResult device_mhc_forward_hidden(
+        std::uint32_t token, std::uint32_t position,
+        std::span<float> hidden, std::vector<float>* fused_logits);
+    static bool device_head_callback(
+        void* opaque, std::span<const std::uint16_t> encoded_hidden,
+        std::span<float> reduced);
+    bool execute_device_head_callback(
+        DeviceHeadContext& context,
+        std::span<const std::uint16_t> encoded_hidden,
+        std::span<float> reduced);
     ValidationResult head_logits(std::span<const float> hidden,
                                  std::vector<float>& logits);
     ParseResult<std::uint32_t> sample_hidden(std::uint32_t token,
                                              std::uint32_t position,
-                                             std::span<const float> hidden);
+                                             std::span<const float> hidden,
+                                             const std::vector<float>*
+                                                 prepared_logits = nullptr);
     ParseResult<std::uint32_t> forward_prefill(
         std::span<const std::uint32_t> tokens,
         std::uint32_t position_base);
@@ -1667,7 +1819,10 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
             append_errors(target, std::move(loaded.errors));
             return;
         }
-        if (!config.prepack_mhc_projection) return;
+        if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice ||
+            !config.prepack_mhc_projection) {
+            return;
+        }
         try {
             std::vector<float> packed(loaded.value->size());
             auto status = dsv4_pack_mhc_projection_f32(
@@ -1729,10 +1884,40 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
         load_host(target, attention + "attn_sink", kHeads);
         load_host(target, prefix + "attn_norm.weight", kHidden);
         load_host(target, prefix + "ffn_norm.weight", kHidden);
-        for (const auto* branch : {"attn", "ffn"}) {
-            load_mhc(target, prefix + "hc_" + branch + "_fn");
-            load_host(target, prefix + "hc_" + branch + "_scale", 3U);
-            load_host(target, prefix + "hc_" + branch + "_base", kMix);
+        constexpr std::array<const char*, 2U> branches{"attn", "ffn"};
+        for (std::size_t branch_index = 0U;
+             branch_index < branches.size(); ++branch_index) {
+            const std::string branch(branches[branch_index]);
+            const auto projection_name = prefix + "hc_" + branch + "_fn";
+            const auto scale_name = prefix + "hc_" + branch + "_scale";
+            const auto base_name = prefix + "hc_" + branch + "_base";
+            const auto norm_name = prefix + branch + "_norm.weight";
+            load_mhc(target, projection_name);
+            load_host(target, scale_name, 3U);
+            load_host(target, base_name, kMix);
+            if (!target.ok() ||
+                config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
+                continue;
+            }
+            auto projection = host_tensor(
+                projection_name, kMix * kMhc * kHidden);
+            auto scale = host_tensor(scale_name, 3U);
+            auto base = host_tensor(base_name, kMix);
+            auto norm_weight = host_tensor(norm_name, kHidden);
+            if (!projection.ok()) {
+                append_errors(target, std::move(projection.errors));
+            }
+            if (!scale.ok()) append_errors(target, std::move(scale.errors));
+            if (!base.ok()) append_errors(target, std::move(base.errors));
+            if (!norm_weight.ok()) {
+                append_errors(target, std::move(norm_weight.errors));
+            }
+            if (!target.ok()) continue;
+            target = cuda.upload_dsv4_mhc_weights(
+                devices[mhc_slot], *projection.value, *scale.value,
+                *base.value, *norm_weight.value,
+                device_mhc_weights[layer][branch_index]);
+            if (target.ok()) host_tensors.erase(projection_name);
         }
         if (layer < 3U) {
             load_raw(target, prefix + "ffn.gate.tid2eid",
@@ -1776,6 +1961,11 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
         if (result.ok()) {
             preload_head(result);
             load_host_head(result);
+            if (result.ok() &&
+                config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+                result = cuda.reserve_dsv4_mhc_head(
+                    devices[mhc_slot], kVocabulary);
+            }
         }
         return result;
     }
@@ -1814,6 +2004,10 @@ ValidationResult DeepSeekV4Runtime::Impl::warmup() {
         }
     }
     if (result.ok()) load_host_head(result);
+    if (result.ok() &&
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        result = cuda.reserve_dsv4_mhc_head(devices[mhc_slot], kVocabulary);
+    }
     return result;
 }
 
@@ -1901,7 +2095,8 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
             indexer.kind = Dsv4KvBlockKind::LearnedIndex;
             indexer.coefficient = 2U;
             indexer.head_dim = kIndexHeadDim;
-            indexer.rotate_fp4 = true;
+            indexer.rotate_fp4 =
+                config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice;
             const auto indexer_rows = static_cast<std::size_t>(indexer.coefficient) *
                                       indexer.ratio;
             const auto indexer_dimensions =
@@ -1976,27 +2171,132 @@ ValidationResult DeepSeekV4Runtime::Impl::embed(std::uint32_t token,
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::compressor(
-    std::uint32_t layer, std::span<const float> input, std::uint32_t position) {
+    std::uint32_t layer, std::span<const float> input, std::uint32_t position,
+    std::span<const float> prepared_values,
+    std::span<const float> prepared_scores) {
     return compress_state(layer, attention_state[layer].compressor,
                           layer_prefix(layer) + "attn.compressor.", input,
-                          position, attention_state[layer].frequencies);
+                          position, attention_state[layer].frequencies,
+                          prepared_values, prepared_scores);
+}
+
+bool DeepSeekV4Runtime::Impl::physical_attention_prepare_callback(
+    void* opaque, const CudaDsv4AttentionPrepareHostView& view) {
+    if (opaque == nullptr) return false;
+    auto& context = *static_cast<PhysicalAttentionContext*>(opaque);
+    if (context.owner == nullptr) return false;
+    return context.owner->complete_physical_attention_prepare(context, view);
+}
+
+bool DeepSeekV4Runtime::Impl::complete_physical_attention_prepare(
+    PhysicalAttentionContext& context,
+    const CudaDsv4AttentionPrepareHostView& view) {
+    context.invoked = true;
+    context.result = {};
+    if (context.layer >= kLayers || view.key_value.size() != kHeadDim ||
+        !context.sliding_append.has_value()) {
+        context.result.errors.emplace_back(
+            "DeepSeek deferred attention preparation shape is invalid");
+        return false;
+    }
+    const auto decode = [](std::span<const std::uint16_t> source,
+                           std::span<float> destination) {
+        for (std::size_t index = 0U; index < source.size(); ++index) {
+            destination[index] = std::bit_cast<float>(
+                static_cast<std::uint32_t>(source[index]) << 16U);
+        }
+    };
+    decode(view.key_value, context.key_value);
+    std::size_t patch_cursor = 0U;
+    const auto commit = [&](Dsv4KvPhysicalAppend& append,
+                            std::span<const float> values) {
+        const auto bytes = static_cast<std::size_t>(append.patch_bytes());
+        if (bytes > view.page_patches.size() - patch_cursor) {
+            context.result.errors.emplace_back(
+                "DeepSeek deferred page-patch staging is truncated");
+            return false;
+        }
+        auto committed = append.commit(
+            values, view.page_patches.subspan(patch_cursor, bytes));
+        patch_cursor += bytes;
+        if (!committed.ok()) {
+            append_errors(context.result, std::move(committed.errors));
+            return false;
+        }
+        return true;
+    };
+    if (!commit(*context.sliding_append, context.key_value)) return false;
+
+    auto& layer_state = attention_state[context.layer];
+    auto* compressed_append = context.compressed_append.has_value()
+        ? &*context.compressed_append : nullptr;
+    std::span<std::byte> compressed_patch;
+    if (compressed_append != nullptr) {
+        const auto bytes = static_cast<std::size_t>(
+            compressed_append->patch_bytes());
+        if (bytes > view.page_patches.size() - patch_cursor) {
+            context.result.errors.emplace_back(
+                "DeepSeek deferred compressed-page staging is truncated");
+            return false;
+        }
+        compressed_patch = view.page_patches.subspan(patch_cursor, bytes);
+        patch_cursor += bytes;
+    }
+    context.result = compress_state(
+        context.layer, layer_state.compressor,
+        layer_prefix(context.layer) + "attn.compressor.", {},
+        context.position, layer_state.frequencies,
+        view.compressor_values, view.compressor_scores,
+        compressed_append, compressed_patch);
+    if (!context.result.ok()) return false;
+    if (layer_state.indexer_compressor.ratio != 0U ||
+        !view.index_compressor_values.empty() ||
+        !view.index_compressor_scores.empty() ||
+        context.index_append.has_value()) {
+        context.result.errors.emplace_back(
+            "DeepSeek deferred sparse-index preparation is not admitted");
+        return false;
+    }
+    if (patch_cursor != view.page_patches.size()) {
+        context.result.errors.emplace_back(
+            "DeepSeek deferred page-patch staging has unused bytes");
+        return false;
+    }
+    return true;
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::compress_state(
     std::uint32_t layer, CompressorState& state, const std::string& prefix,
     std::span<const float> input, std::uint32_t position,
-    std::span<const float> frequencies) {
+    std::span<const float> frequencies,
+    std::span<const float> prepared_values,
+    std::span<const float> prepared_scores,
+    Dsv4KvPhysicalAppend* prepared_append,
+    std::span<std::byte> prepared_patch) {
     ValidationResult result;
     if (state.ratio == 0U) return result;
     const auto dimensions = static_cast<std::size_t>(state.coefficient) *
                             state.head_dim;
     std::vector<float> values(dimensions);
     std::vector<float> scores(dimensions);
-    const auto slot = layer_device(layer);
-    result = linear(slot, prefix + "wkv", dimensions, kHidden, input, values, false);
-    if (!result.ok()) return result;
-    result = linear(slot, prefix + "wgate", dimensions, kHidden, input, scores, false);
-    if (!result.ok()) return result;
+    if (!prepared_values.empty() || !prepared_scores.empty()) {
+        if (prepared_values.size() != dimensions ||
+            prepared_scores.size() != dimensions) {
+            result.errors.emplace_back(
+                "DeepSeek prepared compressor spans have incompatible sizes");
+            return result;
+        }
+        std::copy(prepared_values.begin(), prepared_values.end(), values.begin());
+        std::copy(prepared_scores.begin(), prepared_scores.end(), scores.begin());
+    } else {
+        const auto slot = layer_device(layer);
+        result = linear(slot, prefix + "wkv", dimensions, kHidden, input,
+                        values, false);
+        if (!result.ok()) return result;
+        result = linear(slot, prefix + "wgate", dimensions, kHidden, input,
+                        scores, false);
+        if (!result.ok()) return result;
+    }
     auto ape = host_tensor(prefix + "ape",
                            static_cast<std::uint64_t>(state.ratio) * dimensions);
     if (!ape.ok()) {
@@ -2063,7 +2363,10 @@ ValidationResult DeepSeekV4Runtime::Impl::compress_state(
     apply_rope(std::span<float>(pooled).last(kRopeDim),
                position + 1U - state.ratio, frequencies);
     round_bf16(pooled);
-    if (state.rotate_fp4) {
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        // The live physical page encoder owns the accepted BF16-boundary,
+        // power-of-two scale, and half-up E4M3 conversion.
+    } else if (state.rotate_fp4) {
         result = dsv4_hadamard_rotate_f32(pooled);
         if (!result.ok()) return result;
         result = dsv4_fp4_e2m1_simulate_f32(pooled, 32U);
@@ -2073,7 +2376,10 @@ ValidationResult DeepSeekV4Runtime::Impl::compress_state(
             std::span<float>(pooled).first(state.head_dim - kRopeDim), 64U);
     }
     const auto compressed_row = position / state.ratio;
-    if (kv_cache != nullptr) {
+    if (prepared_append != nullptr) {
+        result = prepared_append->commit(pooled, prepared_patch);
+        if (!result.ok()) return result;
+    } else if (kv_cache != nullptr) {
         result = kv_cache->append(active_sequence, state.kind, layer,
                                   state.ratio, compressed_row, pooled);
         if (!result.ok()) return result;
@@ -2091,7 +2397,9 @@ ValidationResult DeepSeekV4Runtime::Impl::compress_state(
 ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     std::uint32_t layer, std::span<const float> input,
     std::span<const float> query_rank, std::uint32_t position,
-    std::vector<std::uint32_t>& selected) {
+    std::vector<std::uint32_t>& selected,
+    std::span<const float> prepared_values,
+    std::span<const float> prepared_scores) {
     ValidationResult result;
     selected.clear();
     const auto record_selection = [&] {
@@ -2114,7 +2422,8 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     }
     const auto prefix = layer_prefix(layer) + "attn.indexer.";
     result = compress_state(layer, state, prefix + "compressor.", input,
-                            position, attention_state[layer].frequencies);
+                            position, attention_state[layer].frequencies,
+                            prepared_values, prepared_scores);
     if (!result.ok()) return result;
 
     const auto compressed_count = (position + 1U) / state.ratio;
@@ -2140,7 +2449,10 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
         apply_rope(query.last(kRopeDim), position,
                    attention_state[layer].frequencies);
         round_bf16(query.last(kRopeDim));
-        if (!config.enable_gpu_lightning_indexer) {
+        if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+            result = dsv4_physical_quantize_query_e4m3_f32(query);
+            if (!result.ok()) return result;
+        } else if (!config.enable_gpu_lightning_indexer) {
             result = dsv4_hadamard_rotate_f32(query);
             if (!result.ok()) return result;
             result = dsv4_fp4_e2m1_simulate_f32(query, 32U);
@@ -2285,12 +2597,221 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     std::uint32_t layer, std::span<const float> input, std::uint32_t position,
     std::span<float> output) {
     ValidationResult result;
-    if (input.size() != kHidden || output.size() != kHidden) {
+    if (input.size() != kHidden ||
+        (output.size() != kHidden &&
+         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+           output.empty()))) {
         result.errors.emplace_back("DeepSeek attention spans have incompatible sizes");
         return result;
     }
     const auto slot = layer_device(layer);
     const auto prefix = layer_prefix(layer) + "attn.";
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        auto cuda_demand = weights->demand();
+        const bool deferred_page_update =
+            !config.enable_layer_hash_trace && kv_cache != nullptr &&
+            attention_state[layer].indexer_compressor.ratio == 0U;
+        Dsv4WeightCache::Lease query_a;
+        Dsv4WeightCache::Lease query_b;
+        Dsv4WeightCache::Lease key_value_weight;
+        Dsv4WeightCache::Lease compressor_value_weight;
+        Dsv4WeightCache::Lease compressor_gate_weight;
+        Dsv4WeightCache::Lease index_compressor_value_weight;
+        Dsv4WeightCache::Lease index_compressor_gate_weight;
+        result = weights->acquire(
+            slot, prefix + "wq_a", kQueryRank, kHidden, query_a);
+        if (!result.ok()) return result;
+        result = weights->acquire(
+            slot, prefix + "wq_b", kHeads * kHeadDim, kQueryRank,
+            query_b);
+        if (!result.ok()) return result;
+        result = weights->acquire(
+            slot, prefix + "wkv", kHeadDim, kHidden, key_value_weight);
+        if (!result.ok()) return result;
+        const auto compressor_dimensions =
+            static_cast<std::size_t>(
+                attention_state[layer].compressor.coefficient) *
+            attention_state[layer].compressor.head_dim;
+        std::vector<float> compressor_values;
+        std::vector<float> compressor_scores;
+        if (attention_state[layer].compressor.ratio != 0U) {
+            result = weights->acquire(
+                slot, prefix + "compressor.wkv", compressor_dimensions,
+                kHidden, compressor_value_weight);
+            if (!result.ok()) return result;
+            result = weights->acquire(
+                slot, prefix + "compressor.wgate", compressor_dimensions,
+                kHidden, compressor_gate_weight);
+            if (!result.ok()) return result;
+            compressor_values.resize(compressor_dimensions);
+            compressor_scores.resize(compressor_dimensions);
+        }
+        const auto index_compressor_dimensions =
+            static_cast<std::size_t>(
+                attention_state[layer].indexer_compressor.coefficient) *
+            attention_state[layer].indexer_compressor.head_dim;
+        std::vector<float> index_compressor_values;
+        std::vector<float> index_compressor_scores;
+        if (attention_state[layer].indexer_compressor.ratio != 0U) {
+            result = weights->acquire(
+                slot, prefix + "indexer.compressor.wkv",
+                index_compressor_dimensions, kHidden,
+                index_compressor_value_weight);
+            if (!result.ok()) return result;
+            result = weights->acquire(
+                slot, prefix + "indexer.compressor.wgate",
+                index_compressor_dimensions, kHidden,
+                index_compressor_gate_weight);
+            if (!result.ok()) return result;
+            index_compressor_values.resize(index_compressor_dimensions);
+            index_compressor_scores.resize(index_compressor_dimensions);
+        }
+        auto query_norm = host_tensor(prefix + "q_norm.weight", kQueryRank);
+        if (!query_norm.ok()) {
+            append_errors(result, std::move(query_norm.errors));
+            return result;
+        }
+        auto key_value_norm = host_tensor(
+            prefix + "kv_norm.weight", kHeadDim);
+        if (!key_value_norm.ok()) {
+            append_errors(result, std::move(key_value_norm.errors));
+            return result;
+        }
+        std::array<float, kRopeDim / 2U> cosines{};
+        std::array<float, kRopeDim / 2U> sines{};
+        for (std::size_t index = 0U; index < cosines.size(); ++index) {
+            const float angle = static_cast<float>(position) *
+                                attention_state[layer].frequencies[index];
+            cosines[index] = std::cos(angle);
+            sines[index] = std::sin(angle);
+        }
+        std::vector<float> query_rank(kQueryRank);
+        std::vector<float> kv(kHeadDim);
+        auto& deferred_context = physical_attention_contexts[layer];
+        std::vector<CudaDsv4AttentionPageWrite> page_writes;
+        if (deferred_page_update) {
+            deferred_context.owner = this;
+            deferred_context.layer = layer;
+            deferred_context.position = position;
+            deferred_context.result = {};
+            deferred_context.invoked = false;
+            deferred_context.key_value.resize(kHeadDim);
+            deferred_context.sliding_append.reset();
+            deferred_context.compressed_append.reset();
+            deferred_context.index_append.reset();
+            auto sliding = kv_cache->reserve_physical_append(
+                active_sequence, Dsv4KvBlockKind::Sliding, layer, 1U,
+                position, slot);
+            if (!sliding.ok()) {
+                append_errors(result, std::move(sliding.errors));
+                return result;
+            }
+            deferred_context.sliding_append.emplace(
+                std::move(sliding.value));
+            const auto ratio = attention_state[layer].compressor.ratio;
+            if (ratio != 0U && (position + 1U) % ratio == 0U) {
+                auto compressed = kv_cache->reserve_physical_append(
+                    active_sequence,
+                    attention_state[layer].compressor.kind, layer, ratio,
+                    position / ratio, slot);
+                if (!compressed.ok()) {
+                    append_errors(result, std::move(compressed.errors));
+                    return result;
+                }
+                deferred_context.compressed_append.emplace(
+                    std::move(compressed.value));
+            }
+            const auto add_write = [&](const Dsv4KvPhysicalAppend& append) {
+                page_writes.push_back(CudaDsv4AttentionPageWrite{
+                    append.buffer(), append.data_offset(),
+                    append.scale_offset(), append.data_bytes(),
+                    append.scale_bytes()});
+            };
+            add_write(*deferred_context.sliding_append);
+            if (deferred_context.compressed_append.has_value()) {
+                add_write(*deferred_context.compressed_append);
+            }
+        }
+        CudaDsv4AttentionPrepareRequest request;
+        request.query_a = &query_a.weight();
+        request.query_b = &query_b.weight();
+        request.key_value = &key_value_weight.weight();
+        if (pending_mhc_attention_transition) {
+            request.mhc_transition = &device_mhc_weights[layer][0U];
+        }
+        if (!compressor_values.empty()) {
+            request.compressor_value = &compressor_value_weight.weight();
+            request.compressor_gate = &compressor_gate_weight.weight();
+        }
+        if (!index_compressor_values.empty()) {
+            request.index_compressor_value =
+                &index_compressor_value_weight.weight();
+            request.index_compressor_gate =
+                &index_compressor_gate_weight.weight();
+        }
+        request.query_norm = *query_norm.value;
+        request.key_value_norm = *key_value_norm.value;
+        request.rope_cosines = cosines;
+        request.rope_sines = sines;
+        request.mhc_device = devices[mhc_slot];
+        if (devices[slot] != devices[mhc_slot] &&
+            !pending_mhc_attention_transition &&
+            (layer != 0U || config.enable_layer_hash_trace)) {
+            request.cross_device_input = input;
+        }
+        if (deferred_page_update) {
+            request.host_callback = physical_attention_prepare_callback;
+            request.host_callback_context = &deferred_context;
+            request.page_writes = page_writes;
+        }
+        request.maximum_workspace_bytes = 1ULL << 20U;
+        auto subphase_started = std::chrono::steady_clock::now();
+        const auto prepared_compressor_matmuls =
+            static_cast<std::uint64_t>(!compressor_values.empty()) * 2U +
+            static_cast<std::uint64_t>(!index_compressor_values.empty()) * 2U;
+        graph_stats.attention_projection_matmul_calls +=
+            3U + prepared_compressor_matmuls;
+        graph_stats.attention_projection_matmul_rows +=
+            3U + prepared_compressor_matmuls;
+        result = cuda.dsv4_prepare_attention(
+            devices[slot], request, query_rank, kv,
+            compressor_values, compressor_scores,
+            index_compressor_values, index_compressor_scores);
+        graph_stats.attention_query_nanoseconds +=
+            elapsed_nanoseconds(subphase_started);
+        if (!result.ok()) return result;
+        pending_mhc_attention_transition = false;
+        if (deferred_page_update) {
+            pending_attention_weights.push_back(std::move(query_a));
+            pending_attention_weights.push_back(std::move(query_b));
+            pending_attention_weights.push_back(
+                std::move(key_value_weight));
+            if (!compressor_values.empty()) {
+                pending_attention_weights.push_back(
+                    std::move(compressor_value_weight));
+                pending_attention_weights.push_back(
+                    std::move(compressor_gate_weight));
+            }
+            if (!index_compressor_values.empty()) {
+                pending_attention_weights.push_back(
+                    std::move(index_compressor_value_weight));
+                pending_attention_weights.push_back(
+                    std::move(index_compressor_gate_weight));
+            }
+            auto sink = host_tensor(prefix + "attn_sink", kHeads);
+            if (!sink.ok()) {
+                append_errors(result, std::move(sink.errors));
+                return result;
+            }
+            return physical_paged_attention(
+                layer, {}, *sink.value, position, {}, output);
+        }
+        std::span<const float> resident_queries;
+        return attention_prepared(
+            layer, input, query_rank, resident_queries, kv, position, output,
+            compressor_values, compressor_scores,
+            index_compressor_values, index_compressor_scores);
+    }
     auto subphase_started = std::chrono::steady_clock::now();
     std::vector<float> query_rank(kQueryRank);
     ++graph_stats.attention_projection_matmul_calls;
@@ -2343,22 +2864,194 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     apply_rope(std::span<float>(kv).last(kRopeDim), position,
                attention_state[layer].frequencies);
     round_bf16(std::span<float>(kv).last(kRopeDim));
-    quantize_activation_in_place(std::span<float>(kv).first(kHeadDim - kRopeDim),
-                                 64U);
+    if (config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
+        quantize_activation_in_place(
+            std::span<float>(kv).first(kHeadDim - kRopeDim), 64U);
+    }
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
     return attention_prepared(layer, input, query_rank, queries, kv, position,
                               output);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
+    std::uint32_t layer, std::span<const float> queries,
+    std::span<const float> sinks, std::uint32_t position,
+    std::span<const std::uint32_t> indexed_positions,
+    std::span<float> diagnostic_branch) {
+    ValidationResult result;
+    if (kv_cache == nullptr ||
+        config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
+        result.errors.emplace_back(
+            "DeepSeek physical paged attention requires its physical cache");
+        return result;
+    }
+    const auto slot = layer_device(layer);
+    auto sliding = kv_cache->block_table(
+        active_sequence, Dsv4KvBlockKind::Sliding, layer);
+    if (!sliding.ok()) {
+        append_errors(result, std::move(sliding.errors));
+        return result;
+    }
+    const auto ratio = attention_state[layer].compressor.ratio;
+    ParseResult<std::vector<Dsv4KvBlockInfo>> compressed;
+    if (ratio != 0U) {
+        compressed = kv_cache->block_table(
+            active_sequence, attention_state[layer].compressor.kind, layer);
+        if (!compressed.ok()) {
+            append_errors(result, std::move(compressed.errors));
+            return result;
+        }
+    }
+
+    std::vector<Dsv4KvDeviceLease> leases;
+    std::vector<CudaDsv4PhysicalPage> pages;
+    std::unordered_map<std::uint64_t, std::uint32_t> page_indices;
+    const auto locate = [&](Dsv4KvBlockKind kind,
+                            const std::vector<Dsv4KvBlockInfo>& table,
+                            std::uint32_t logical_row,
+                            CudaDsv4AttentionCandidate& candidate) {
+        const auto found = std::find_if(
+            table.begin(), table.end(), [&](const Dsv4KvBlockInfo& block) {
+                const auto begin = block.logical_begin /
+                                   block.compression_ratio;
+                return logical_row >= begin &&
+                       logical_row < begin + block.used_rows;
+            });
+        if (found == table.end()) {
+            result.errors.emplace_back(
+                "DeepSeek physical attention candidate page is unavailable");
+            return;
+        }
+        const auto begin = found->logical_begin / found->compression_ratio;
+        auto page = page_indices.find(found->id);
+        if (page == page_indices.end()) {
+            auto lease = kv_cache->acquire_device(
+                active_sequence, kind, layer, logical_row, slot);
+            if (!lease.ok()) {
+                append_errors(result, std::move(lease.errors));
+                return;
+            }
+            const auto index = static_cast<std::uint32_t>(pages.size());
+            leases.push_back(std::move(lease.value));
+            pages.push_back({leases.back().buffer(), found->capacity_rows});
+            page = page_indices.emplace(found->id, index).first;
+        }
+        candidate.page = page->second;
+        candidate.row = static_cast<std::uint32_t>(logical_row - begin);
+        candidate.valid = true;
+    };
+
+    const auto compressed_count = ratio == 0U
+        ? 0U : (position + 1U) / ratio;
+    const bool sparse = ratio == 4U &&
+        attention_state[layer].indexer_compressor.ratio == 4U;
+    const auto compressed_width = ratio == 0U ? 0U : ratio == 4U
+        ? kIndexTopK
+        : ((std::max(1U, compressed_count) + 127U) / 128U) * 128U;
+    constexpr std::uint32_t sliding_width = kWindow;
+    std::vector<CudaDsv4AttentionCandidate> candidates(
+        static_cast<std::size_t>(compressed_width) + sliding_width);
+    const auto attended_compressed = sparse
+        ? static_cast<std::uint32_t>(indexed_positions.size())
+        : compressed_count;
+    if (attended_compressed > compressed_width) {
+        result.errors.emplace_back(
+            "DeepSeek physical attention compressed candidates exceed their fixed region");
+        return result;
+    }
+    for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
+        const auto logical_row = sparse ? indexed_positions[item] : item;
+        locate(attention_state[layer].compressor.kind, compressed.value,
+               logical_row, candidates[item]);
+        if (!result.ok()) return result;
+    }
+    const auto window_count = std::min(position + 1U, kWindow);
+    for (std::uint32_t item = 0U; item < window_count; ++item) {
+        const auto logical_row = position + 1U - window_count + item;
+        locate(Dsv4KvBlockKind::Sliding, sliding.value, logical_row,
+               candidates[static_cast<std::size_t>(compressed_width) + item]);
+        if (!result.ok()) return result;
+    }
+
+    const auto prefix = layer_prefix(layer) + "attn.";
+    Dsv4WeightCache::Lease output_a;
+    Dsv4WeightCache::Lease output_b;
+    Dsv4WeightCache::Lease router;
+    result = weights->acquire(
+        slot, prefix + "wo_a", kOutputGroups * kOutputRank,
+        kHeads * kHeadDim / kOutputGroups, output_a);
+    if (!result.ok()) return result;
+    result = weights->acquire(
+        slot, prefix + "wo_b", kHidden,
+        kOutputGroups * kOutputRank, output_b);
+    if (!result.ok()) return result;
+    std::array<float, kRopeDim / 2U> cosines{};
+    std::array<float, kRopeDim / 2U> sines{};
+    for (std::size_t index = 0U; index < cosines.size(); ++index) {
+        const float angle = static_cast<float>(position) *
+                            attention_state[layer].frequencies[index] * -1.0F;
+        cosines[index] = std::cos(angle);
+        sines[index] = std::sin(angle);
+    }
+    CudaDsv4PagedAttentionMhcRequest request;
+    request.attention.queries = queries;
+    request.attention.head_sinks = sinks;
+    request.attention.pages = pages;
+    request.attention.candidates = candidates;
+    request.attention.scale = kAttentionScale;
+    request.attention.maximum_workspace_bytes = 4ULL << 20U;
+    request.inverse_rope_cosines = cosines;
+    request.inverse_rope_sines = sines;
+    request.output_a = &output_a.weight();
+    request.output_b = &output_b.weight();
+    request.mhc_device = devices[mhc_slot];
+    const bool combine_mhc_transition = diagnostic_branch.empty();
+    if (combine_mhc_transition) {
+        result = weights->acquire(
+            mhc_slot, layer_prefix(layer) + "ffn.gate", kExperts, kHidden,
+            router);
+        if (!result.ok()) return result;
+        request.mhc_transition = &device_mhc_weights[layer][1U];
+        request.router = &router.weight();
+        request.defer_host_moe_input = true;
+    }
+    result = cuda.dsv4_paged_attention_to_mhc(
+        devices[slot], request, diagnostic_branch);
+    if (result.ok()) {
+        completed_attention_mhc_transition = combine_mhc_transition;
+        completed_router_projection = combine_mhc_transition;
+        deferred_attention_moe_input = combine_mhc_transition;
+        if (combine_mhc_transition) {
+            pending_attention_leases.insert(
+                pending_attention_leases.end(),
+                std::make_move_iterator(leases.begin()),
+                std::make_move_iterator(leases.end()));
+            pending_attention_weights.push_back(std::move(output_a));
+            pending_attention_weights.push_back(std::move(output_b));
+            pending_attention_weights.push_back(std::move(router));
+        }
+    }
+    return result;
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     std::uint32_t layer, std::span<const float> input,
     std::span<const float> query_rank, std::span<const float> queries,
     std::span<const float> kv, std::uint32_t position,
-    std::span<float> output) {
+    std::span<float> output,
+    std::span<const float> compressor_values,
+    std::span<const float> compressor_scores,
+    std::span<const float> index_compressor_values,
+    std::span<const float> index_compressor_scores) {
     ValidationResult result;
     if (input.size() != kHidden || query_rank.size() != kQueryRank ||
-        queries.size() != static_cast<std::size_t>(kHeads) * kHeadDim ||
-        kv.size() != kHeadDim || output.size() != kHidden) {
+        (queries.size() != static_cast<std::size_t>(kHeads) * kHeadDim &&
+         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+           queries.empty())) ||
+        kv.size() != kHeadDim ||
+        (output.size() != kHidden &&
+         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+           output.empty()))) {
         result.errors.emplace_back(
             "DeepSeek prepared attention spans have incompatible sizes");
         return result;
@@ -2377,7 +3070,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                   layer_state.sliding.begin() +
                       static_cast<std::size_t>(position % kWindow) * kHeadDim);
     }
-    result = compressor(layer, input, position);
+    result = compressor(layer, input, position,
+                        compressor_values, compressor_scores);
     if (!result.ok()) return result;
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
     std::vector<std::uint32_t> indexed_positions;
@@ -2387,7 +3081,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     if (use_sparse_indexer) {
         subphase_started = std::chrono::steady_clock::now();
         result = index_positions(layer, input, query_rank, position,
-                                 indexed_positions);
+                                 indexed_positions,
+                                 index_compressor_values,
+                                 index_compressor_scores);
         if (!result.ok()) return result;
         graph_stats.attention_index_nanoseconds +=
             elapsed_nanoseconds(subphase_started);
@@ -2398,7 +3094,10 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         append_errors(result, std::move(sink.errors));
         return result;
     }
-    std::vector<float> attended(static_cast<std::size_t>(kHeads) * kHeadDim, 0.0F);
+    std::vector<float> attended(
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice
+            ? 0U : static_cast<std::size_t>(kHeads) * kHeadDim,
+        0.0F);
     const auto window_count = std::min<std::uint32_t>(position + 1U, kWindow);
     const auto ratio = layer_state.compressor.ratio;
     const auto compressed_count = ratio == 0U ? 0U : (position + 1U) / ratio;
@@ -2408,7 +3107,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     const auto score_stride = static_cast<std::size_t>(window_count) +
                               attended_compressed_count;
     std::vector<std::vector<float>> block_rows;
-    if (kv_cache != nullptr) {
+    if (kv_cache != nullptr &&
+        config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
         block_rows.reserve(score_stride);
         for (std::uint32_t item = 0U; item < window_count; ++item) {
             const auto absolute = position + 1U - window_count + item;
@@ -2434,7 +3134,14 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
         config.enable_flash_attention, score_stride,
         config.flash_attention_minimum_rows);
     subphase_started = std::chrono::steady_clock::now();
-    if (use_cuda_attention) {
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        auto cuda_demand = weights->demand();
+        ++graph_stats.attention_cuda_dispatches;
+        result = physical_paged_attention(
+            layer, queries, *sink.value, position, indexed_positions,
+            output);
+        if (!result.ok()) return result;
+    } else if (use_cuda_attention) {
         auto cuda_demand = weights->demand();
         ++graph_stats.attention_cuda_dispatches;
         std::vector<std::uint32_t> sliding_rows(window_count);
@@ -2602,6 +3309,10 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     }
     graph_stats.attention_score_nanoseconds += elapsed_nanoseconds(subphase_started);
 
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        return result;
+    }
+
     subphase_started = std::chrono::steady_clock::now();
     std::vector<float> output_rank(static_cast<std::size_t>(kOutputGroups) *
                                    kOutputRank);
@@ -2702,7 +3413,10 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
                    position_base + static_cast<std::uint32_t>(row),
                    attention_state[layer].frequencies);
         round_bf16(kv_row.last(kRopeDim));
-        quantize_activation_in_place(kv_row.first(kHeadDim - kRopeDim), 64U);
+        if (config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
+            quantize_activation_in_place(
+                kv_row.first(kHeadDim - kRopeDim), 64U);
+        }
     };
     if (attention_workers != nullptr && rows > 1U) {
         result = attention_workers->parallel_for(rows, finish_kv);
@@ -2720,7 +3434,9 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     const auto maximum_score_rows =
         std::min(last_position + 1U, kWindow) +
         (ratio == 0U ? 0U : (last_position + 1U) / ratio);
-    const bool batch_cuda = rows > 1U && kv_cache != nullptr &&
+    const bool batch_cuda =
+        config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice &&
+        rows > 1U && kv_cache != nullptr &&
         !use_sparse_indexer && should_dispatch_flash_attention_cuda(
             config.enable_flash_attention, maximum_score_rows,
             config.flash_attention_minimum_rows);
@@ -2911,6 +3627,741 @@ ValidationResult DeepSeekV4Runtime::Impl::expert(
     round_bf16(activated);
     return linear(slot, prefix + "w2", kHidden, kExpertIntermediate,
                   activated, output);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe(
+    std::uint32_t layer, const Dsv4Route& route,
+    std::span<const float> input, std::span<float> output) {
+    return host_routed_moe_impl(layer, &route, input, output, 0U, 0U);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_from_device_input(
+    std::uint32_t layer, std::uint32_t token, std::uint32_t position,
+    std::span<float> output) {
+    if (!output.empty()) {
+        return {{"DeepSeek deferred CPU-MoE output must remain device-owned"}};
+    }
+    return enqueue_host_routed_moe(layer, token, position);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::enqueue_host_routed_moe(
+    std::uint32_t layer, std::uint32_t token, std::uint32_t position) {
+    ValidationResult result;
+    if (layer >= kLayers || host_moe_pending != layer ||
+        expert_workers == nullptr) {
+        result.errors.emplace_back(
+            "DeepSeek fixed CPU-MoE command order is invalid");
+        return result;
+    }
+    if (host_moe_pending == 0U) {
+        host_moe_routed_cpu_before =
+            device_moe_stats.routed_cpu_nanoseconds;
+    }
+    auto& context = host_moe_contexts[layer];
+    context.owner = this;
+    context.layer = layer;
+    context.token = token;
+    context.position = position;
+    context.result = {};
+    context.invoked = false;
+    context.accepted = false;
+    context.callback_finished = {};
+    context.execution_started = std::chrono::steady_clock::now();
+    if (context.input.size() != kHidden) context.input.resize(kHidden);
+
+    if (context.shared.w1 == nullptr) {
+        const auto shared_slot = mhc_slot;
+        context.shared.coefficient = 1.0F;
+        const auto prefix = layer_prefix(layer) + "ffn.shared_experts.";
+        const std::array<std::string, 3U> names{
+            prefix + "w1", prefix + "w3", prefix + "w2"};
+        constexpr std::array<std::pair<std::uint64_t, std::uint64_t>, 3U>
+            shapes{{{kExpertIntermediate, kHidden},
+                    {kExpertIntermediate, kHidden},
+                    {kHidden, kExpertIntermediate}}};
+        const CudaWeight** outputs[]{
+            &context.shared.w1, &context.shared.w3, &context.shared.w2};
+        for (std::size_t index = 0U; index < names.size(); ++index) {
+            auto acquired = weights->acquire(
+                shared_slot, names[index], shapes[index].first,
+                shapes[index].second, context.shared_leases[index]);
+            if (!acquired.ok()) {
+                append_errors(result, std::move(acquired.errors),
+                              names[index]);
+                return result;
+            }
+            *outputs[index] = &context.shared_leases[index].weight();
+        }
+    }
+    graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(
+        context.execution_started);
+    auto enqueued = cuda.enqueue_dsv4_host_moe_from_device_input(
+        devices[mhc_slot], context.shared,
+        kDeepSeekV4ExecutionContract.swiglu_limit,
+        host_routed_moe_callback, &context);
+    if (!enqueued.ok()) {
+        append_errors(result, std::move(enqueued.errors),
+                      "DeepSeek fixed CPU/shared MoE enqueue");
+        return result;
+    }
+    ++host_moe_pending;
+    return result;
+}
+
+bool DeepSeekV4Runtime::Impl::host_routed_moe_callback(
+    void* opaque, std::span<const std::uint16_t> encoded_hidden,
+    std::span<const float> router_logits,
+    std::span<float> rank_partials) {
+    if (opaque == nullptr) return false;
+    auto& context = *static_cast<HostMoeContext*>(opaque);
+    if (context.owner == nullptr) return false;
+    return context.owner->execute_host_routed_moe_callback(
+        context, encoded_hidden, router_logits, rank_partials);
+}
+
+bool DeepSeekV4Runtime::Impl::execute_host_routed_moe_callback(
+    HostMoeContext& context,
+    std::span<const std::uint16_t> encoded_hidden,
+    std::span<const float> router_logits,
+    std::span<float> rank_partials) {
+    constexpr std::size_t shards = 2U;
+    constexpr std::size_t shard_intermediate =
+        kExpertIntermediate / shards;
+    context.invoked = true;
+    context.result = {};
+    const auto routed_started = std::chrono::steady_clock::now();
+    if (encoded_hidden.size() != kHidden ||
+        router_logits.size() != kExperts ||
+        rank_partials.size() != shards * kHidden) {
+        context.result.errors.emplace_back(
+            "DeepSeek fixed CPU-MoE callback shape is invalid");
+        context.callback_finished = std::chrono::steady_clock::now();
+        return false;
+    }
+    for (std::size_t index = 0U; index < encoded_hidden.size(); ++index) {
+        context.input[index] = std::bit_cast<float>(
+            static_cast<std::uint32_t>(encoded_hidden[index]) << 16U);
+        if (!std::isfinite(context.input[index])) {
+            context.result.errors.emplace_back(
+                "DeepSeek fixed CPU-MoE hidden row is non-finite");
+            context.callback_finished = std::chrono::steady_clock::now();
+            return false;
+        }
+    }
+    const auto route_started = std::chrono::steady_clock::now();
+    context.result = route_moe(
+        context.layer, context.token, router_logits, context.position,
+        context.route);
+    graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(route_started);
+    if (!context.result.ok()) {
+        context.callback_finished = std::chrono::steady_clock::now();
+        return false;
+    }
+    for (std::size_t shard = 0U; shard < shards; ++shard) {
+        for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+            auto viewed = dsv4_tiled_expert_weights(
+                resident.find_tiled_expert(
+                    context.layer, context.route.experts[rank],
+                    static_cast<std::uint32_t>(shard)),
+                kHidden, kExpertIntermediate, shards);
+            if (!viewed.ok()) {
+                append_errors(context.result, std::move(viewed.errors));
+                context.callback_finished = std::chrono::steady_clock::now();
+                return false;
+            }
+            context.tiled[shard][rank] = viewed.value;
+        }
+    }
+
+    const auto lanes = expert_workers->size();
+    const auto run_ranges = [&]<typename Operation>(
+        std::uint64_t tasks, Operation&& operation, bool steal) {
+        if (steal) {
+            for (std::size_t lane = 0U; lane < lanes; ++lane) {
+                const auto shard = static_cast<std::size_t>(
+                    expert_lane_nodes[lane]);
+                const auto position = expert_lane_positions[lane];
+                const auto workers = expert_node_lanes[shard].size();
+                tiled_lane_next[lane].store(
+                    tasks * position / workers, std::memory_order_relaxed);
+                tiled_lane_end[lane] = tasks * (position + 1U) / workers;
+            }
+        }
+        auto dispatched = expert_workers->parallel_for_addressed(
+            lanes, [&](std::size_t lane) {
+                const auto shard = static_cast<std::size_t>(
+                    expert_lane_nodes[lane]);
+                if (shard >= shards || expert_node_lanes[shard].empty()) return;
+                const auto position = expert_lane_positions[lane];
+                const auto& node_lanes = expert_node_lanes[shard];
+                if (!steal) {
+                    const auto begin = tasks * position / node_lanes.size();
+                    const auto end = tasks * (position + 1U) /
+                                     node_lanes.size();
+                    for (auto task = begin; task < end; ++task) {
+                        operation(shard, task);
+                    }
+                    return;
+                }
+                const auto claim = [&](std::size_t owner) {
+                    const auto task = tiled_lane_next[owner].fetch_add(
+                        1U, std::memory_order_relaxed);
+                    if (task >= tiled_lane_end[owner]) return false;
+                    operation(shard, task);
+                    return true;
+                };
+                while (claim(lane)) {}
+                for (;;) {
+                    bool stole = false;
+                    for (std::size_t offset = 1U;
+                         offset < node_lanes.size(); ++offset) {
+                        const auto owner = node_lanes[
+                            (position + offset) % node_lanes.size()];
+                        if (claim(owner)) {
+                            stole = true;
+                            break;
+                        }
+                    }
+                    if (!stole) break;
+                }
+            });
+        if (dispatched.ok() && steal) {
+            for (std::size_t lane = 0U; lane < lanes; ++lane) {
+                if (tiled_lane_next[lane].load(std::memory_order_relaxed) <
+                    tiled_lane_end[lane]) {
+                    dispatched.errors.emplace_back(
+                        "DeepSeek host-routed MoE left a lane range unfinished");
+                    break;
+                }
+            }
+        }
+        return dispatched;
+    };
+
+    constexpr std::size_t block = 32U;
+    constexpr auto intermediate_blocks = shard_intermediate / block;
+    auto phase_started = std::chrono::steady_clock::now();
+    context.result = run_ranges(
+        kTopK * intermediate_blocks,
+        [&](std::size_t shard, std::uint64_t task) {
+            const auto rank = static_cast<std::size_t>(
+                task / intermediate_blocks);
+            const auto offset = (task % intermediate_blocks) * block;
+            std::array<float, block> gate{};
+            std::array<float, block> up{};
+            for (std::size_t half = 0U; half < 2U; ++half) {
+                dsv4_tiled_expert_matvec16(
+                    std::span<float, 16U>(
+                        gate.data() + half * 16U, 16U),
+                    context.input,
+                    context.tiled[shard][rank].w13_packed,
+                    context.tiled[shard][rank].w13_scales,
+                    2U * shard_intermediate,
+                    offset + half * 16U);
+                dsv4_tiled_expert_matvec16(
+                    std::span<float, 16U>(
+                        up.data() + half * 16U, 16U),
+                    context.input,
+                    context.tiled[shard][rank].w13_packed,
+                    context.tiled[shard][rank].w13_scales,
+                    2U * shard_intermediate,
+                    shard_intermediate + offset + half * 16U);
+            }
+            auto* destination = tiled_activation.data() +
+                (shard * kTopK + rank) * shard_intermediate + offset;
+            for (std::size_t index = 0U; index < block; ++index) {
+                destination[index] = gate[index] /
+                    (1.0F + std::exp(-gate[index])) * up[index];
+            }
+        }, true);
+    device_moe_stats.routed_gate_up_nanoseconds +=
+        elapsed_nanoseconds(phase_started);
+
+    phase_started = std::chrono::steady_clock::now();
+    if (context.result.ok()) {
+        constexpr auto hidden_blocks = kHidden / block;
+        context.result = run_ranges(
+            kTopK * hidden_blocks,
+            [&](std::size_t shard, std::uint64_t task) {
+                const auto rank = static_cast<std::size_t>(
+                    task / hidden_blocks);
+                const auto offset = (task % hidden_blocks) * block;
+                const auto source = std::span<const float>(tiled_activation)
+                    .subspan((shard * kTopK + rank) * shard_intermediate,
+                             shard_intermediate);
+                for (std::size_t half = 0U; half < 2U; ++half) {
+                    auto destination = std::span<float, 16U>(
+                        tiled_routed.data() +
+                            (shard * kTopK + rank) * kHidden +
+                            offset + half * 16U,
+                        16U);
+                    dsv4_tiled_expert_matvec16(
+                        destination, source,
+                        context.tiled[shard][rank].w2_packed,
+                        context.tiled[shard][rank].w2_scales,
+                        kHidden, offset + half * 16U);
+                }
+            }, true);
+    }
+    device_moe_stats.routed_down_nanoseconds +=
+        elapsed_nanoseconds(phase_started);
+
+    phase_started = std::chrono::steady_clock::now();
+    if (context.result.ok()) {
+        constexpr auto hidden_blocks = kHidden / block;
+        context.result = run_ranges(
+            hidden_blocks,
+            [&](std::size_t shard, std::uint64_t task) {
+                const auto offset = task * block;
+                auto* destination =
+                    rank_partials.data() + shard * kHidden + offset;
+                for (std::size_t index = 0U; index < block; ++index) {
+                    destination[index] = tiled_routed[
+                        (shard * kTopK) * kHidden + offset + index] *
+                        context.route.weights[0];
+                }
+                for (std::size_t rank = 1U; rank < kTopK; ++rank) {
+                    const auto* source = tiled_routed.data() +
+                        (shard * kTopK + rank) * kHidden + offset;
+                    for (std::size_t index = 0U; index < block; ++index) {
+                        destination[index] = std::fma(
+                            source[index], context.route.weights[rank],
+                            destination[index]);
+                    }
+                }
+            }, false);
+    }
+    device_moe_stats.routed_reduce_nanoseconds +=
+        elapsed_nanoseconds(phase_started);
+    device_moe_stats.routed_cpu_nanoseconds +=
+        elapsed_nanoseconds(routed_started);
+    context.callback_finished = std::chrono::steady_clock::now();
+    context.accepted = context.result.ok();
+    return context.accepted;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
+    ValidationResult result;
+    if (host_moe_pending == 0U) return result;
+    const auto collect_started = std::chrono::steady_clock::now();
+    auto collected = cuda.collect_deepseek_moe(
+        devices[mhc_slot], {}, {});
+    if (!collected.ok()) {
+        append_errors(result, std::move(collected.errors),
+                      "DeepSeek fixed CPU/shared MoE collect");
+    }
+    for (std::uint32_t layer = 0U; layer < host_moe_pending; ++layer) {
+        auto& context = host_moe_contexts[layer];
+        if (context.invoked) ++device_moe_stats.host_callback_batches;
+        if (!context.invoked || !context.accepted) {
+            ++device_moe_stats.host_callback_failures;
+        }
+        if (!context.result.ok()) {
+            append_errors(result, std::move(context.result.errors));
+        }
+        ++device_moe_stats.batches;
+        ++device_moe_stats.device_join_batches;
+        ++device_moe_stats.device_commands;
+        device_moe_stats.routed_experts += kTopK;
+        ++device_moe_stats.shared_experts;
+    }
+    device_moe_stats.shared_collect_nanoseconds +=
+        elapsed_nanoseconds(collect_started);
+    device_moe_stats.nanoseconds += elapsed_nanoseconds(collect_started) +
+        (device_moe_stats.routed_cpu_nanoseconds -
+         host_moe_routed_cpu_before);
+    host_moe_pending = 0U;
+    host_moe_routed_cpu_before = 0U;
+    pending_attention_leases.clear();
+    pending_attention_weights.clear();
+    for (auto& context : host_moe_contexts) {
+        context.shared = {};
+        for (auto& lease : context.shared_leases) {
+            lease = Dsv4WeightCache::Lease{};
+        }
+    }
+    for (auto& context : physical_attention_contexts) {
+        const auto account = [&](auto& append) {
+            if (!append.has_value()) return;
+            auto accounted = append->account();
+            if (!accounted.ok()) {
+                append_errors(result, std::move(accounted.errors));
+            }
+        };
+        account(context.sliding_append);
+        account(context.compressed_append);
+        account(context.index_append);
+        context.sliding_append.reset();
+        context.compressed_append.reset();
+        context.index_append.reset();
+    }
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
+    std::uint32_t layer, const Dsv4Route* route,
+    std::span<const float> input, std::span<float> output,
+    std::uint32_t token, std::uint32_t token_position) {
+    ValidationResult result;
+    constexpr std::size_t shards = 2U;
+    constexpr std::size_t shard_intermediate = kExpertIntermediate / shards;
+    const bool persistent_device_branch =
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice;
+    const bool device_input = route == nullptr;
+    if (layer >= kLayers ||
+        (device_input ? !input.empty() : input.size() != kHidden) ||
+        (output.size() != kHidden &&
+         !(persistent_device_branch && output.empty())) ||
+        (!device_input &&
+         (route->experts.size() != kTopK ||
+          route->weights.size() != kTopK)) ||
+        (device_input && !persistent_device_branch) ||
+        expert_workers == nullptr || expert_lane_nodes.size() != expert_workers->size()) {
+        result.errors.emplace_back("DeepSeek host-routed MoE state is invalid");
+        return result;
+    }
+
+    const auto prepare_started = std::chrono::steady_clock::now();
+    std::array<std::array<Dsv4TiledExpertWeights, kTopK>, shards> tiled{};
+    const auto resolve_tiled = [&](const Dsv4Route& active_route) {
+        for (std::size_t shard = 0U; shard < shards; ++shard) {
+            for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+                if (active_route.experts[rank] >= kExperts ||
+                    !std::isfinite(active_route.weights[rank])) {
+                    result.errors.emplace_back(
+                        "DeepSeek host-routed MoE route is invalid");
+                    return false;
+                }
+                auto viewed = dsv4_tiled_expert_weights(
+                    resident.find_tiled_expert(
+                        layer, active_route.experts[rank],
+                        static_cast<std::uint32_t>(shard)),
+                    kHidden, kExpertIntermediate, shards);
+                if (!viewed.ok()) {
+                    append_errors(result, std::move(viewed.errors));
+                    return false;
+                }
+                tiled[shard][rank] = viewed.value;
+            }
+        }
+        return true;
+    };
+    if (!device_input && !resolve_tiled(*route)) {
+        if (result.ok()) {
+                result.errors.emplace_back(
+                    "DeepSeek host-routed MoE route is invalid");
+        }
+        return result;
+    }
+
+    const auto shared_slot = persistent_device_branch
+        ? mhc_slot : layer_device(layer);
+    std::array<Dsv4WeightCache::Lease, 3U> shared_leases;
+    CudaDeepSeekMoeExpert shared;
+    shared.coefficient = 1.0F;
+    const auto shared_prefix = layer_prefix(layer) + "ffn.shared_experts.";
+    const std::array<std::string, 3U> names{
+        shared_prefix + "w1", shared_prefix + "w3", shared_prefix + "w2"};
+    constexpr std::array<std::pair<std::uint64_t, std::uint64_t>, 3U> shapes{{
+        {kExpertIntermediate, kHidden}, {kExpertIntermediate, kHidden},
+        {kHidden, kExpertIntermediate}}};
+    const CudaWeight** shared_weights[]{&shared.w1, &shared.w3, &shared.w2};
+    for (std::size_t index = 0U; index < shared_leases.size(); ++index) {
+        auto acquired = weights->acquire(shared_slot, names[index],
+                                         shapes[index].first,
+                                         shapes[index].second,
+                                         shared_leases[index]);
+        if (!acquired.ok()) {
+            append_errors(result, std::move(acquired.errors), names[index]);
+            return result;
+        }
+        *shared_weights[index] = &shared_leases[index].weight();
+    }
+    graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
+    const auto execution_started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point callback_finished{};
+    bool callback_invoked = false;
+    bool callback_accepted = false;
+    std::vector<float> staged_input(device_input ? kHidden : 0U);
+    Dsv4Route staged_route;
+    auto active_input = input;
+    const Dsv4Route* active_route = route;
+    auto routed_callback = [&](std::span<float> rank_partials) {
+    callback_invoked = true;
+    const auto routed_started = std::chrono::steady_clock::now();
+    if (rank_partials.size() != shards * kHidden) {
+        result.errors.emplace_back(
+            "DeepSeek CPU-MoE callback rank-partial shape is invalid");
+        callback_finished = std::chrono::steady_clock::now();
+        return false;
+    }
+
+    const auto lanes = expert_workers->size();
+    const auto run_ranges = [&]<typename Operation>(
+        std::uint64_t tasks, Operation&& operation, bool steal) {
+        if (steal) {
+            for (std::size_t lane = 0U; lane < lanes; ++lane) {
+                const auto shard = static_cast<std::size_t>(
+                    expert_lane_nodes[lane]);
+                const auto position = expert_lane_positions[lane];
+                const auto workers = expert_node_lanes[shard].size();
+                tiled_lane_next[lane].store(
+                    tasks * position / workers, std::memory_order_relaxed);
+                tiled_lane_end[lane] = tasks * (position + 1U) / workers;
+            }
+        }
+        auto dispatched = expert_workers->parallel_for_addressed(
+            lanes, [&](std::size_t lane) {
+                const auto shard = static_cast<std::size_t>(
+                    expert_lane_nodes[lane]);
+                if (shard >= shards || expert_node_lanes[shard].empty()) return;
+                const auto position = expert_lane_positions[lane];
+                const auto& node_lanes = expert_node_lanes[shard];
+                if (!steal) {
+                    const auto begin = tasks * position / node_lanes.size();
+                    const auto end = tasks * (position + 1U) /
+                                     node_lanes.size();
+                    for (auto task = begin; task < end; ++task) {
+                        operation(shard, task);
+                    }
+                    return;
+                }
+                const auto claim = [&](std::size_t owner) {
+                    const auto task = tiled_lane_next[owner].fetch_add(
+                        1U, std::memory_order_relaxed);
+                    if (task >= tiled_lane_end[owner]) return false;
+                    operation(shard, task);
+                    return true;
+                };
+                while (claim(lane)) {}
+                for (;;) {
+                    bool stole = false;
+                    for (std::size_t offset = 1U; offset < node_lanes.size();
+                         ++offset) {
+                        const auto owner = node_lanes[
+                            (position + offset) % node_lanes.size()];
+                        if (claim(owner)) {
+                            stole = true;
+                            break;
+                        }
+                    }
+                    if (!stole) break;
+                }
+            });
+        if (dispatched.ok() && steal) {
+            for (std::size_t lane = 0U; lane < lanes; ++lane) {
+                if (tiled_lane_next[lane].load(std::memory_order_relaxed) <
+                    tiled_lane_end[lane]) {
+                    dispatched.errors.emplace_back(
+                        "DeepSeek host-routed MoE left a lane range unfinished");
+                    break;
+                }
+            }
+        }
+        return dispatched;
+    };
+    constexpr std::size_t block = 32U;
+    constexpr auto intermediate_blocks = shard_intermediate / block;
+    auto routed_phase_started = std::chrono::steady_clock::now();
+    result = run_ranges(kTopK * intermediate_blocks,
+                        [&](std::size_t shard, std::uint64_t task) {
+        const auto rank = static_cast<std::size_t>(task / intermediate_blocks);
+        const auto offset = (task % intermediate_blocks) * block;
+        std::array<float, block> gate{};
+        std::array<float, block> up{};
+        for (std::size_t half = 0U; half < 2U; ++half) {
+            dsv4_tiled_expert_matvec16(
+                std::span<float, 16U>(gate.data() + half * 16U, 16U),
+                active_input,
+                tiled[shard][rank].w13_packed,
+                tiled[shard][rank].w13_scales, 2U * shard_intermediate,
+                offset + half * 16U);
+            dsv4_tiled_expert_matvec16(
+                std::span<float, 16U>(up.data() + half * 16U, 16U),
+                active_input,
+                tiled[shard][rank].w13_packed,
+                tiled[shard][rank].w13_scales, 2U * shard_intermediate,
+                shard_intermediate + offset + half * 16U);
+        }
+        auto* destination = tiled_activation.data() +
+            (shard * kTopK + rank) * shard_intermediate + offset;
+        for (std::size_t index = 0U; index < block; ++index) {
+            destination[index] = gate[index] /
+                (1.0F + std::exp(-gate[index])) * up[index];
+        }
+    }, true);
+    device_moe_stats.routed_gate_up_nanoseconds +=
+        elapsed_nanoseconds(routed_phase_started);
+    routed_phase_started = std::chrono::steady_clock::now();
+    if (result.ok()) {
+        constexpr auto hidden_blocks = kHidden / block;
+        result = run_ranges(kTopK * hidden_blocks,
+                            [&](std::size_t shard, std::uint64_t task) {
+            const auto rank = static_cast<std::size_t>(task / hidden_blocks);
+            const auto offset = (task % hidden_blocks) * block;
+            const auto source = std::span<const float>(tiled_activation)
+                .subspan((shard * kTopK + rank) * shard_intermediate,
+                         shard_intermediate);
+            for (std::size_t half = 0U; half < 2U; ++half) {
+                auto destination = std::span<float, 16U>(
+                    tiled_routed.data() + (shard * kTopK + rank) * kHidden +
+                        offset + half * 16U,
+                    16U);
+                dsv4_tiled_expert_matvec16(
+                    destination, source, tiled[shard][rank].w2_packed,
+                    tiled[shard][rank].w2_scales, kHidden,
+                    offset + half * 16U);
+            }
+        }, true);
+    }
+    device_moe_stats.routed_down_nanoseconds +=
+        elapsed_nanoseconds(routed_phase_started);
+    routed_phase_started = std::chrono::steady_clock::now();
+    if (result.ok()) {
+        constexpr auto hidden_blocks = kHidden / block;
+        result = run_ranges(hidden_blocks,
+                            [&](std::size_t shard, std::uint64_t task) {
+            const auto offset = task * block;
+            auto* destination = rank_partials.data() + shard * kHidden + offset;
+            for (std::size_t index = 0U; index < block; ++index) {
+                destination[index] = tiled_routed[
+                    (shard * kTopK) * kHidden + offset + index] *
+                    active_route->weights[0];
+            }
+            for (std::size_t rank = 1U; rank < kTopK; ++rank) {
+                const auto* source = tiled_routed.data() +
+                    (shard * kTopK + rank) * kHidden + offset;
+                for (std::size_t index = 0U; index < block; ++index) {
+                    destination[index] = std::fma(
+                        source[index], active_route->weights[rank],
+                        destination[index]);
+                }
+            }
+        }, false);
+    }
+    device_moe_stats.routed_reduce_nanoseconds +=
+        elapsed_nanoseconds(routed_phase_started);
+    device_moe_stats.routed_cpu_nanoseconds +=
+        elapsed_nanoseconds(routed_started);
+    callback_finished = std::chrono::steady_clock::now();
+    callback_accepted = result.ok();
+    return callback_accepted;
+    };
+
+    using RoutedCallback = decltype(routed_callback);
+    const auto invoke_routed = +[](void* opaque,
+                                   std::span<float> rank_partials) {
+        return (*static_cast<RoutedCallback*>(opaque))(rank_partials);
+    };
+    auto device_input_callback = [&nobreak = callback_invoked,
+                                  &accepted = callback_accepted,
+                                  &finished = callback_finished,
+                                  &result, &staged_input, &staged_route,
+                                  &active_input, &active_route, &resolve_tiled,
+                                  &routed_callback, this, layer, token,
+                                  token_position](
+        std::span<const std::uint16_t> encoded_hidden,
+        std::span<const float> router_logits,
+        std::span<float> rank_partials) {
+        nobreak = true;
+        if (encoded_hidden.size() != kHidden ||
+            router_logits.size() != kExperts) {
+            result.errors.emplace_back(
+                "DeepSeek device-input CPU-MoE callback shape is invalid");
+            finished = std::chrono::steady_clock::now();
+            accepted = false;
+            return false;
+        }
+        for (std::size_t index = 0U; index < encoded_hidden.size(); ++index) {
+            staged_input[index] = std::bit_cast<float>(
+                static_cast<std::uint32_t>(encoded_hidden[index]) << 16U);
+            if (!std::isfinite(staged_input[index])) {
+                result.errors.emplace_back(
+                    "DeepSeek device-input CPU-MoE hidden row is non-finite");
+                finished = std::chrono::steady_clock::now();
+                accepted = false;
+                return false;
+            }
+        }
+        const auto route_started = std::chrono::steady_clock::now();
+        result = route_moe(
+            layer, token, router_logits, token_position, staged_route);
+        graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(route_started);
+        if (!result.ok() || !resolve_tiled(staged_route)) {
+            finished = std::chrono::steady_clock::now();
+            accepted = false;
+            return false;
+        }
+        active_input = staged_input;
+        active_route = &staged_route;
+        return routed_callback(rank_partials);
+    };
+    using DeviceInputCallback = decltype(device_input_callback);
+    const auto invoke_device_input = +[](
+        void* opaque, std::span<const std::uint16_t> encoded_hidden,
+        std::span<const float> router_logits,
+        std::span<float> rank_partials) {
+        return (*static_cast<DeviceInputCallback*>(opaque))(
+            encoded_hidden, router_logits, rank_partials);
+    };
+    ValidationResult enqueued;
+    if (device_input) {
+        enqueued = cuda.enqueue_dsv4_host_moe_from_device_input(
+            devices[shared_slot], shared,
+            kDeepSeekV4ExecutionContract.swiglu_limit,
+            invoke_device_input, &device_input_callback);
+    } else if (persistent_device_branch) {
+        enqueued = cuda.enqueue_dsv4_host_moe_from_mhc(
+            devices[shared_slot], shared,
+            kDeepSeekV4ExecutionContract.swiglu_limit,
+            invoke_routed, &routed_callback);
+    } else {
+        enqueued = cuda.enqueue_dsv4_host_moe(
+            devices[shared_slot], input, shared,
+            kDeepSeekV4ExecutionContract.swiglu_limit,
+            invoke_routed, &routed_callback);
+    }
+    if (!enqueued.ok()) {
+        append_errors(result, std::move(enqueued.errors),
+                      "DeepSeek CPU/shared MoE enqueue");
+        return result;
+    }
+
+    std::vector<float> ignored_routed;
+    const auto shared_started = std::chrono::steady_clock::now();
+    auto device_output = persistent_device_branch &&
+                         !config.enable_layer_hash_trace
+        ? std::span<float>{} : output;
+    auto collected = cuda.collect_deepseek_moe(
+        devices[shared_slot], ignored_routed, device_output);
+    const auto collected_finished = std::chrono::steady_clock::now();
+    if (callback_finished != std::chrono::steady_clock::time_point{} &&
+        collected_finished >= callback_finished) {
+        device_moe_stats.shared_collect_nanoseconds +=
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    collected_finished - callback_finished).count());
+    } else {
+        device_moe_stats.shared_collect_nanoseconds +=
+            elapsed_nanoseconds(shared_started);
+    }
+    if (callback_invoked) ++device_moe_stats.host_callback_batches;
+    if (!callback_accepted) ++device_moe_stats.host_callback_failures;
+    if (!collected.ok()) {
+        append_errors(result, std::move(collected.errors),
+                      "DeepSeek CPU/shared MoE collect");
+    }
+    if (!result.ok()) return result;
+
+    ++device_moe_stats.batches;
+    ++device_moe_stats.device_join_batches;
+    ++device_moe_stats.device_commands;
+    device_moe_stats.routed_experts += kTopK;
+    ++device_moe_stats.shared_experts;
+    device_moe_stats.nanoseconds += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - execution_started).count());
+    return result;
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::device_moe(
@@ -3173,6 +4624,9 @@ ValidationResult DeepSeekV4Runtime::Impl::execute_moe(
     std::uint32_t layer, const Dsv4Route& route,
     std::span<const float> input, std::span<float> output) {
     ValidationResult result;
+    if (config.enable_host_routed_moe) {
+        return host_routed_moe(layer, route, input, output);
+    }
     const auto prefix = layer_prefix(layer) + "ffn.";
     std::vector<ExpertKey> demand_keys;
     demand_keys.reserve(route.experts.size());
@@ -3234,10 +4688,22 @@ ValidationResult DeepSeekV4Runtime::Impl::moe(
     std::span<float> output, std::uint32_t position) {
     ValidationResult result;
     const auto router_started = std::chrono::steady_clock::now();
+    if (completed_router_projection && deferred_attention_moe_input) {
+        completed_router_projection = false;
+        deferred_attention_moe_input = false;
+        return host_routed_moe_from_device_input(
+            layer, token, position, output);
+    }
     std::vector<float> logits(kExperts);
-    result = linear(layer_device(layer), layer_prefix(layer) + "ffn.gate",
-                    kExperts, kHidden, input, logits, false);
-    if (!result.ok()) return result;
+    if (completed_router_projection) {
+        std::copy(combined_router_logits.begin(), combined_router_logits.end(),
+                  logits.begin());
+        completed_router_projection = false;
+    } else {
+        result = linear(layer_device(layer), layer_prefix(layer) + "ffn.gate",
+                        kExperts, kHidden, input, logits, false);
+        if (!result.ok()) return result;
+    }
     Dsv4Route route;
     result = route_moe(layer, token, logits, position, route);
     graph_stats.moe_router_nanoseconds += elapsed_nanoseconds(router_started);
@@ -3696,11 +5162,16 @@ ValidationResult DeepSeekV4Runtime::Impl::block_page(
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::forward_hidden(
-    std::uint32_t token, std::uint32_t position, std::span<float> hidden) {
+    std::uint32_t token, std::uint32_t position, std::span<float> hidden,
+    std::vector<float>* fused_logits) {
     const auto embedding_started = std::chrono::steady_clock::now();
     auto result = embed(token, hidden);
     graph_stats.embedding_nanoseconds += elapsed_nanoseconds(embedding_started);
     if (!result.ok()) return result;
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        return device_mhc_forward_hidden(
+            token, position, hidden, fused_logits);
+    }
     for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
         result = block(layer, token, hidden, position);
         if (!result.ok()) return result;
@@ -3711,12 +5182,241 @@ ValidationResult DeepSeekV4Runtime::Impl::forward_hidden(
     return result;
 }
 
+bool DeepSeekV4Runtime::Impl::device_head_callback(
+    void* opaque, std::span<const std::uint16_t> encoded_hidden,
+    std::span<float> reduced) {
+    if (opaque == nullptr) return false;
+    auto& context = *static_cast<DeviceHeadContext*>(opaque);
+    if (context.owner == nullptr) return false;
+    return context.owner->execute_device_head_callback(
+        context, encoded_hidden, reduced);
+}
+
+bool DeepSeekV4Runtime::Impl::execute_device_head_callback(
+    DeviceHeadContext& context,
+    std::span<const std::uint16_t> encoded_hidden,
+    std::span<float> reduced) {
+    context.invoked = true;
+    context.result = {};
+    const auto projection = host_tensors.find("hc_head_fn");
+    const auto scale = host_tensors.find("hc_head_scale");
+    const auto base = host_tensors.find("hc_head_base");
+    const auto norm_weight = host_tensors.find("norm.weight");
+    if (encoded_hidden.size() != context.hidden.size() ||
+        reduced.size() != kHidden || projection == host_tensors.end() ||
+        scale == host_tensors.end() || base == host_tensors.end() ||
+        norm_weight == host_tensors.end()) {
+        context.result.errors.emplace_back(
+            "DeepSeek deferred output-head inputs are unavailable");
+        return false;
+    }
+    for (std::size_t index = 0U; index < context.hidden.size(); ++index) {
+        context.hidden[index] = std::bit_cast<float>(
+            static_cast<std::uint32_t>(encoded_hidden[index]) << 16U);
+        if (!std::isfinite(context.hidden[index])) {
+            context.result.errors.emplace_back(
+                "DeepSeek deferred output-head hidden state is non-finite");
+            return false;
+        }
+    }
+    double square_sum = 0.0;
+    for (const float value : context.hidden) {
+        square_sum += static_cast<double>(value) * value;
+    }
+    const float reciprocal = 1.0F / std::sqrt(
+        static_cast<float>(square_sum /
+                           static_cast<double>(context.hidden.size())) +
+        kRmsEpsilon);
+    std::fill(reduced.begin(), reduced.end(), 0.0F);
+    for (std::uint32_t copy = 0U; copy < kMhc; ++copy) {
+        double projected = 0.0;
+        const auto row = static_cast<std::size_t>(copy) *
+                         context.hidden.size();
+        for (std::size_t column = 0U; column < context.hidden.size(); ++column) {
+            projected += static_cast<double>(
+                projection->second[row + column]) * context.hidden[column];
+        }
+        const float coefficient = sigmoid_f32(
+            static_cast<float>(projected) * reciprocal * scale->second[0] +
+            base->second[copy]) + kRmsEpsilon;
+        for (std::uint32_t column = 0U; column < kHidden; ++column) {
+            reduced[column] += coefficient * context.hidden[
+                static_cast<std::size_t>(copy) * kHidden + column];
+        }
+    }
+    round_bf16(reduced);
+    context.result = rms_norm_f32(
+        reduced, reduced, norm_weight->second, kRmsEpsilon);
+    if (context.result.ok()) round_bf16(reduced);
+    return context.result.ok();
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_hidden(
+    std::uint32_t token, std::uint32_t position,
+    std::span<float> hidden, std::vector<float>* fused_logits) {
+    ValidationResult result;
+    if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC hidden state has the wrong shape");
+        return result;
+    }
+    const auto device = devices[mhc_slot];
+    std::vector<float> weighted(
+        config.enable_layer_hash_trace ? kHidden : 0U);
+    std::vector<float> layer_input(kHidden);
+    Dsv4WeightCache::Lease head_lease;
+    const bool fuse_head = fused_logits != nullptr &&
+        !config.enable_layer_hash_trace &&
+        layer_device(kLayers - 1U) == mhc_slot;
+    if (fused_logits != nullptr) fused_logits->clear();
+    if (fuse_head) {
+        result = weights->acquire(
+            layer_device(kLayers - 1U), "head", kVocabulary, kHidden,
+            head_lease);
+        if (!result.ok()) return result;
+        fused_logits->assign(kVocabulary, 0.0F);
+    }
+    auto phase_started = std::chrono::steady_clock::now();
+    const bool device_only_begin = !config.enable_layer_hash_trace;
+    if (!device_only_begin) {
+        result = cuda.dsv4_mhc_begin(
+            device, device_mhc_weights[0U][0U], hidden, weighted,
+            layer_input);
+    } else {
+        result = cuda.dsv4_mhc_begin_device(
+            device, device_mhc_weights[0U][0U], hidden);
+    }
+    graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
+    if (!result.ok()) return result;
+    pending_mhc_attention_transition = false;
+    completed_attention_mhc_transition = false;
+    completed_router_projection = false;
+    deferred_attention_moe_input = false;
+
+    constexpr std::uint32_t branch_count = 2U * kLayers;
+    for (std::uint32_t flat = 0U; flat < branch_count; ++flat) {
+        const auto layer = flat / 2U;
+        const auto branch_index = flat % 2U;
+        const std::string branch = branch_index == 0U ? "attn" : "ffn";
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer,
+                                  branch + "_mhc_pre", weighted);
+            record_operation_hash(position, token, layer,
+                                  branch + "_norm", layer_input);
+        }
+
+        std::vector<float> branch_output(
+            config.enable_layer_hash_trace ? kHidden : 0U);
+        phase_started = std::chrono::steady_clock::now();
+        if (branch_index == 0U) {
+            result = attention(
+                layer, layer_input, position, branch_output);
+            graph_stats.attention_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+        } else {
+            result = moe(
+                layer, token, layer_input, branch_output, position);
+            graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
+        }
+        if (!result.ok()) return result;
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer,
+                                  branch + "_output", branch_output);
+        }
+
+        phase_started = std::chrono::steady_clock::now();
+        if (completed_attention_mhc_transition) {
+            if (branch_index != 0U || config.enable_layer_hash_trace) {
+                result.errors.emplace_back(
+                    "DeepSeek combined attention transition is out of order");
+            } else {
+                if (!deferred_attention_moe_input) {
+                    std::copy(combined_attention_mhc_input.begin(),
+                              combined_attention_mhc_input.end(),
+                              layer_input.begin());
+                }
+                completed_attention_mhc_transition = false;
+            }
+        } else if (flat + 1U < branch_count) {
+            const auto next = flat + 1U;
+            const auto next_layer = next / 2U;
+            const auto next_branch = next % 2U;
+            const bool combine_with_attention =
+                branch_index == 1U && next_branch == 0U &&
+                !config.enable_layer_hash_trace &&
+                attention_state[next_layer].indexer_compressor.ratio == 0U;
+            if (combine_with_attention) {
+                if (pending_mhc_attention_transition) {
+                    result.errors.emplace_back(
+                        "DeepSeek mHC attention transition is already pending");
+                } else {
+                    pending_mhc_attention_transition = true;
+                }
+            } else {
+                auto post_output = config.enable_layer_hash_trace
+                    ? hidden : std::span<float>{};
+                result = cuda.dsv4_mhc_transition_device(
+                    device, device_mhc_weights[next_layer][next_branch],
+                    weighted, layer_input, post_output);
+            }
+        } else if (fuse_head) {
+            device_head_context = {};
+            device_head_context.owner = this;
+            result = cuda.enqueue_dsv4_mhc_finish_head_device(
+                device, head_lease.weight(), device_head_callback,
+                &device_head_context);
+        } else {
+            result = cuda.dsv4_mhc_finish_device(device, hidden);
+        }
+        graph_stats.mhc_post_nanoseconds +=
+            elapsed_nanoseconds(phase_started);
+        if (!result.ok()) return result;
+        if (config.enable_layer_hash_trace) {
+            record_operation_hash(position, token, layer,
+                                  branch + "_mhc_post", hidden);
+            if (branch_index == 1U) {
+                record_layer_hash(position, token, layer, hidden);
+            }
+        }
+    }
+    auto moe_collected = collect_host_routed_moe_chain();
+    if (!moe_collected.ok()) {
+        append_errors(result, std::move(moe_collected.errors));
+    }
+    if (fuse_head && result.ok()) {
+        auto completed = cuda.complete_dsv4_mhc_head_device(
+            device, *fused_logits);
+        if (!completed.ok()) {
+            append_errors(result, std::move(completed.errors));
+        }
+        if (!device_head_context.result.ok()) {
+            append_errors(result,
+                          std::move(device_head_context.result.errors));
+        }
+        if (!device_head_context.invoked) {
+            result.errors.emplace_back(
+                "DeepSeek output-head host callback was not invoked");
+        }
+    }
+    if (pending_mhc_attention_transition) {
+        result.errors.emplace_back(
+            "DeepSeek mHC attention transition remained pending");
+    }
+    if (result.ok() && fused_logits != nullptr && !fuse_head) {
+        result = head_logits(hidden, *fused_logits);
+    }
+    return result;
+}
+
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     std::uint32_t token, std::uint32_t position, bool logits_required) {
     ParseResult<std::uint32_t> result;
     result.value = token;
     std::vector<float> hidden(static_cast<std::size_t>(kMhc) * kHidden);
-    auto validation = forward_hidden(token, position, hidden);
+    std::vector<float> fused_logits;
+    auto validation = forward_hidden(
+        token, position, hidden,
+        logits_required ? &fused_logits : nullptr);
     if (!validation.ok()) {
         result.errors = std::move(validation.errors);
         return result;
@@ -3727,7 +5427,9 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
         return result;
     }
 
-    return sample_hidden(token, position, hidden);
+    return sample_hidden(
+        token, position, hidden,
+        fused_logits.empty() ? nullptr : &fused_logits);
 }
 
 // A one-token pass writes the compressor accumulators in place, may shift them
@@ -3836,8 +5538,14 @@ ValidationResult DeepSeekV4Runtime::Impl::future_entropy(
     std::vector<float> logits;
     for (std::size_t index = 0U; index < candidates.size(); ++index) {
         ++graph_stats.future_entropy_passes;
-        result = forward_hidden(candidates[index], speculative_position, hidden);
-        if (result.ok()) result = head_logits(hidden, logits);
+        result = forward_hidden(
+            candidates[index], speculative_position, hidden,
+            config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice
+                ? &logits : nullptr);
+        if (result.ok() &&
+            config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
+            result = head_logits(hidden, logits);
+        }
         // Restore whether or not the pass succeeded: a half-applied pass would
         // desynchronize the caches from the accepted sequence.
         auto restored = restore_speculative_state(saved);
@@ -3901,11 +5609,15 @@ ValidationResult DeepSeekV4Runtime::Impl::head_logits(
 
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     std::uint32_t token, std::uint32_t position,
-    std::span<const float> hidden) {
+    std::span<const float> hidden,
+    const std::vector<float>* prepared_logits) {
     ParseResult<std::uint32_t> result;
     const auto head_started = std::chrono::steady_clock::now();
     std::vector<float> logits;
-    auto validation = head_logits(hidden, logits);
+    ValidationResult validation;
+    if (prepared_logits == nullptr) {
+        validation = head_logits(hidden, logits);
+    }
     // Stop the head timer before sampling: with a lookahead in the pipeline
     // the draw is whole forward passes, and folding those into the output head
     // would report the graph's cheapest phase as its most expensive one.
@@ -3923,8 +5635,10 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
                                   normalized_entropy);
         };
     }
+    const auto& active_logits = prepared_logits == nullptr
+        ? logits : *prepared_logits;
     last_sample = sample_logits(
-        logits, active_sampling,
+        active_logits, active_sampling,
         SamplingHistory{sampled_token_counts, sampled_token_ids}, sampler,
         lookahead);
     if (!last_sample.ok()) {
@@ -3935,7 +5649,7 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::sample_hidden(
     ++sampled_token_counts[result.value];
     sampled_token_ids.push_back(result.value);
     if (config.enable_logit_trace) {
-        record_logits(position, token, result.value, logits);
+        record_logits(position, token, result.value, active_logits);
     }
     ++graph_stats.forward_tokens;
     return result;
@@ -4003,7 +5717,8 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
         return result;
     }
     const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
-    if (config.prefill_page_tokens == 1U) {
+    if (config.prefill_page_tokens == 1U ||
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
         for (std::size_t position = 0U; position < tokens.size(); ++position) {
             ++graph_stats.prefill_pages;
             graph_stats.prefill_max_page_tokens = 1U;
@@ -4154,10 +5869,16 @@ ValidationResult DeepSeekV4Runtime::initialize(
             std::to_string(model_context) + "] tokens");
         return result;
     }
-    if (config.kv_cache_mode == Dsv4KvCacheMode::Block &&
+    if (config.kv_cache_mode != Dsv4KvCacheMode::ScalarOracle &&
         config.kv_block_rows == 0U) {
         result.errors.emplace_back(
             "DeepSeek KV block row count must be positive");
+        return result;
+    }
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+        config.kv_block_rows != kDsv4PhysicalKvBlockRows) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV requires 256-source-token blocks");
         return result;
     }
     if (config.enable_gpu_lightning_indexer &&
@@ -4224,13 +5945,21 @@ ValidationResult DeepSeekV4Runtime::initialize(
             "lease, and confidence");
         return result;
     }
+    if (config.enable_host_routed_moe &&
+        config.expert_prefetch_predictions != 0U) {
+        result.errors.emplace_back(
+            "DeepSeek host-routed MoE replaces routed GPU prefetch");
+        return result;
+    }
     if (config.enable_dspark) {
         result.errors.emplace_back(
             "DSpark tensors are verified, but speculative execution is not enabled in "
             "the base-model executor; refusing a silent approximation");
         return result;
     }
-    if (config.prepack_mhc_projection && !dsv4_mhc_prepacked_supported()) {
+    if (config.prepack_mhc_projection &&
+        config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice &&
+        !dsv4_mhc_prepacked_supported()) {
         result.errors.emplace_back(
             "DeepSeek prepacked mHC requires x86 AVX2");
         return result;
@@ -4274,6 +6003,63 @@ ValidationResult DeepSeekV4Runtime::initialize(
     auto kv_device_capacities = config.device_kv_cache_bytes;
     if (kv_device_capacities.empty()) {
         kv_device_capacities.resize(config.devices.size());
+        if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+            const auto add_pages = [&](std::size_t slot,
+                                       Dsv4KvBlockKind kind,
+                                       std::uint32_t ratio,
+                                       std::uint64_t rows) {
+                const auto capacity_rows = dsv4_kv_block_rows(
+                    kind, ratio, true);
+                const auto format = dsv4_kv_format(kind, false, true);
+                const auto page_bytes = dsv4_kv_row_bytes(kind, format) *
+                                        capacity_rows;
+                const auto pages = (rows + capacity_rows - 1U) /
+                                   capacity_rows;
+                if (capacity_rows == 0U || page_bytes == 0U ||
+                    pages > std::numeric_limits<std::uint64_t>::max() /
+                                page_bytes ||
+                    pages * page_bytes >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            kv_device_capacities[slot]) {
+                    return false;
+                }
+                kv_device_capacities[slot] += pages * page_bytes;
+                return true;
+            };
+            const auto& ratios =
+                kDeepSeekV4ExecutionContract.compression_ratios;
+            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+                const auto slot = device_plan.value.weighted_schedule[
+                    layer % device_plan.value.weighted_schedule.size()];
+                const auto sliding_rows = std::min<std::uint64_t>(
+                    config.maximum_context_tokens,
+                    kWindow + kDsv4PhysicalKvBlockRows - 1U);
+                const auto ratio = ratios[layer];
+                bool admitted = add_pages(
+                    slot, Dsv4KvBlockKind::Sliding, 1U, sliding_rows);
+                if (admitted && ratio != 0U) {
+                    const auto compressed_rows =
+                        (static_cast<std::uint64_t>(
+                             config.maximum_context_tokens) + ratio - 1U) /
+                        ratio;
+                    admitted = add_pages(
+                        slot, ratio == 4U ? Dsv4KvBlockKind::Csa
+                                         : Dsv4KvBlockKind::Hca,
+                        ratio, compressed_rows);
+                    if (admitted && ratio == 4U &&
+                        config.maximum_context_tokens > kIndexTopK * ratio) {
+                        admitted = add_pages(
+                            slot, Dsv4KvBlockKind::LearnedIndex, ratio,
+                            compressed_rows);
+                    }
+                }
+                if (!admitted) {
+                    result.errors.emplace_back(
+                        "DeepSeek physical KV capacity overflows");
+                    return result;
+                }
+            }
+        }
     }
     for (std::size_t slot = 0U; slot < weight_capacities.size(); ++slot) {
         if (kv_device_capacities[slot] >= weight_capacities[slot]) {
@@ -4283,6 +6069,50 @@ ValidationResult DeepSeekV4Runtime::initialize(
         }
         weight_capacities[slot] -= kv_device_capacities[slot];
     }
+    auto arena_capacities = weight_capacities;
+    auto cache_weight_capacities = arena_capacities;
+    const auto mhc_slot = static_cast<std::size_t>(std::distance(
+        arena_capacities.begin(),
+        std::max_element(arena_capacities.begin(), arena_capacities.end())));
+    std::uint64_t mhc_projection_bytes = 0U;
+    std::uint64_t mhc_auxiliary_bytes = 0U;
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        constexpr std::uint64_t projection_payload_bytes =
+            static_cast<std::uint64_t>(kMix) * kMhc * kHidden *
+            sizeof(float);
+        const auto projection_storage_bytes =
+            CudaBackend::weight_storage_bytes(projection_payload_bytes, 0U);
+        constexpr std::uint64_t boundary_count = 2U * kLayers;
+        constexpr std::uint64_t auxiliary_bytes_per_boundary =
+            112U + static_cast<std::uint64_t>(kHidden) *
+                       sizeof(std::uint16_t);
+        if (projection_storage_bytes == 0U ||
+            projection_storage_bytes >
+                std::numeric_limits<std::uint64_t>::max() / boundary_count) {
+            result.errors.emplace_back(
+                "DeepSeek device mHC projection capacity overflows");
+            return result;
+        }
+        mhc_projection_bytes = projection_storage_bytes * boundary_count;
+        mhc_auxiliary_bytes =
+            auxiliary_bytes_per_boundary * boundary_count;
+        if (mhc_auxiliary_bytes >= arena_capacities[mhc_slot]) {
+            result.errors.emplace_back(
+                "DeepSeek device mHC auxiliaries exceed device capacity");
+            return result;
+        }
+        arena_capacities[mhc_slot] -= mhc_auxiliary_bytes;
+        cache_weight_capacities = arena_capacities;
+        if (mhc_projection_bytes >= cache_weight_capacities[mhc_slot]) {
+            result.errors.emplace_back(
+                "DeepSeek device mHC projections leave no weight cache");
+            return result;
+        }
+        cache_weight_capacities[mhc_slot] -= mhc_projection_bytes;
+        result = impl_->cuda.validate_dsv4_mhc_device(
+            config.devices[mhc_slot]);
+        if (!result.ok()) return result;
+    }
     const auto admission_started = std::chrono::steady_clock::now();
     Dsv4AdmissionConfig admission_config;
     admission_config.host_memory_ceiling_bytes = config.host_memory_limit_bytes;
@@ -4291,9 +6121,16 @@ ValidationResult DeepSeekV4Runtime::initialize(
     admission_config.device_kv_cache_bytes = kv_device_capacities;
     admission_config.maximum_context_tokens = config.maximum_context_tokens;
     admission_config.enable_dspark = config.enable_dspark;
-    admission_config.enable_mhc_prepack = config.prepack_mhc_projection;
+    admission_config.enable_mhc_prepack =
+        config.prepack_mhc_projection &&
+        config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice;
+    admission_config.host_routed_experts = config.enable_host_routed_moe;
     admission_config.compact_kv_cache =
-        config.kv_cache_mode == Dsv4KvCacheMode::Block;
+        config.kv_cache_mode != Dsv4KvCacheMode::ScalarOracle;
+    admission_config.physical_kv_cache =
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice;
+    admission_config.device_resident_mhc =
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice;
     admission_config.require_zero_nvme_decode = config.require_zero_nvme_decode;
     auto admission = plan_dsv4_resident_topology(checkpoint.value->manifest(),
                                                   admission_config);
@@ -4310,8 +6147,9 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
-    impl_->capacities = weight_capacities;
+    impl_->capacities = cache_weight_capacities;
     impl_->schedule = std::move(device_plan.value.weighted_schedule);
+    impl_->mhc_slot = mhc_slot;
     if (!config.route_trace_path.empty()) {
         result = impl_->route_trace.open(config.route_trace_path);
         if (!result.ok()) return result;
@@ -4320,31 +6158,42 @@ ValidationResult DeepSeekV4Runtime::initialize(
         for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
             std::cerr << "[hardware] cuda=" << impl_->devices[slot]
                       << " vram_budget_bytes=" << capacities[slot]
-                      << " weight_cache_bytes=" << weight_capacities[slot]
+                      << " weight_cache_bytes="
+                      << cache_weight_capacities[slot]
+                      << " weight_arena_bytes=" << arena_capacities[slot]
                       << " kv_cache_bytes=" << kv_device_capacities[slot]
                       << " workspace_reserve_bytes=" << kDeviceWorkspaceReserve
                       << '\n';
         }
+        if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+            std::cerr << "[hardware] deepseek_device_mhc_cuda="
+                      << impl_->devices[impl_->mhc_slot]
+                      << " projection_bytes=" << mhc_projection_bytes
+                      << " auxiliary_bytes=" << mhc_auxiliary_bytes
+                      << " cross_layer_device_state=true\n";
+        }
     }
     for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
         result = impl_->cuda.reserve_weight_arena(
-            impl_->devices[slot], weight_capacities[slot]);
+            impl_->devices[slot], arena_capacities[slot]);
         if (!result.ok()) return result;
     }
     impl_->weights = std::make_unique<Dsv4WeightCache>(
         *impl_->checkpoint, impl_->resident, impl_->cuda,
-        impl_->devices, weight_capacities,
+        impl_->devices, cache_weight_capacities,
         config.expert_prefetch_predictions == 0U
             ? 0U : config.expert_prefetch_byte_budget,
         config.expert_prefetch_queue_depth,
         config.expert_prefetch_lease_ticks);
-    if (config.kv_cache_mode == Dsv4KvCacheMode::Block) {
+    if (config.kv_cache_mode != Dsv4KvCacheMode::ScalarOracle) {
         Dsv4KvCacheConfig kv_config;
         kv_config.block_rows = config.kv_block_rows;
         kv_config.sliding_window_rows = kWindow;
         kv_config.host_capacity_bytes = impl_->memory.host_kv_cache_bytes;
         kv_config.devices = config.devices;
         kv_config.device_capacity_bytes = kv_device_capacities;
+        kv_config.physical_layout =
+            config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice;
         impl_->kv_cache = std::make_unique<Dsv4KvCache>(
             std::move(kv_config), &impl_->cuda);
         result = impl_->kv_cache->validate();
@@ -4362,6 +6211,44 @@ ValidationResult DeepSeekV4Runtime::initialize(
     } else {
         impl_->attention_workers.reset();
     }
+    if (config.enable_host_routed_moe) {
+        constexpr std::size_t workers = 48U;
+        impl_->expert_workers = std::make_unique<HostWorkerPool>(
+            workers, std::chrono::milliseconds(1));
+        impl_->expert_lane_nodes.resize(workers);
+        impl_->expert_lane_positions.resize(workers);
+        const auto topology = NumaTopology::detect();
+        result = impl_->expert_workers->parallel_for_addressed(
+            workers, [&](std::size_t lane) {
+                impl_->expert_lane_nodes[lane] =
+                    topology.node_of_cpu(sched_getcpu());
+            });
+        if (!result.ok()) return result;
+        for (std::size_t lane = 0U; lane < workers; ++lane) {
+            const auto node = impl_->expert_lane_nodes[lane];
+            if (node < 0 || node >= 2) {
+                result.errors.emplace_back(
+                    "DeepSeek host-routed MoE worker is outside its two NUMA nodes");
+                return result;
+            }
+            auto& node_lanes = impl_->expert_node_lanes[
+                static_cast<std::size_t>(node)];
+            impl_->expert_lane_positions[lane] = node_lanes.size();
+            node_lanes.push_back(lane);
+        }
+        if (impl_->expert_node_lanes[0].size() != workers / 2U ||
+            impl_->expert_node_lanes[1].size() != workers / 2U) {
+            result.errors.emplace_back(
+                "DeepSeek host-routed MoE requires 24 workers per NUMA node");
+            return result;
+        }
+        constexpr std::size_t shards = 2U;
+        constexpr std::size_t shard_intermediate =
+            kExpertIntermediate / shards;
+        impl_->tiled_activation.resize(
+            shards * kTopK * shard_intermediate);
+        impl_->tiled_routed.resize(shards * kTopK * kHidden);
+    }
 
     ValidationResult staging_result;
     ValidationResult warmup_result;
@@ -4372,7 +6259,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         staging_result = impl_->resident.stage(*impl_->checkpoint,
                                                config.host_memory_limit_bytes,
                                                config.resident_read_workers,
-                                               config.enable_dspark);
+                                               config.enable_dspark,
+                                               config.enable_host_routed_moe);
         staging_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
     };
@@ -4455,10 +6343,12 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.detailed_timing = config.detailed_timing;
     impl_->initialization_metrics.dspark_enabled = false;
     impl_->initialization_metrics.device_moe_enabled = config.enable_device_moe;
+    impl_->initialization_metrics.host_routed_moe_enabled =
+        config.enable_host_routed_moe;
     impl_->initialization_metrics.resident_warmup_overlapped =
         config.overlap_resident_warmup;
     impl_->initialization_metrics.block_kv_cache_enabled =
-        config.kv_cache_mode == Dsv4KvCacheMode::Block;
+        config.kv_cache_mode != Dsv4KvCacheMode::ScalarOracle;
     impl_->initialization_metrics.kv_block_rows = config.kv_block_rows;
     impl_->initialization_metrics.host_attention_threads =
         config.host_attention_threads;
@@ -4544,7 +6434,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     ParseResult<std::vector<std::uint32_t>> encoded;
     for (;;) {
         encoded = impl_->tokenizer.encode(
-            render_deepseek_v4_chat_prompt(active_messages, false));
+            render_deepseek_v4_chat_prompt(active_messages));
         if (!encoded.ok()) {
             result.errors = std::move(encoded.errors);
             return result;

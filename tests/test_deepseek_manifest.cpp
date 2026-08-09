@@ -178,6 +178,16 @@ TEST_CASE("real DeepSeek V4 Flash 0731 checkpoint opens without format conversio
     REQUIRE(admission.plan.resident_spine_vram_bytes > (8ULL << 30U));
     REQUIRE(admission.plan.maximum_expert_bytes > (12ULL << 20U));
 
+    config.host_routed_experts = true;
+    const auto tiled_admission = strata::plan_dsv4_resident_topology(
+        checkpoint.value->manifest(), config);
+    REQUIRE(tiled_admission.ok());
+    REQUIRE(tiled_admission.plan.routed_expert_host_bytes ==
+            155'826'782'208ULL);
+    REQUIRE(tiled_admission.plan.required_host_bytes >
+            admission.plan.required_host_bytes);
+    config.host_routed_experts = false;
+
     config.enable_mhc_prepack = true;
     const auto prepacked_admission = strata::plan_dsv4_resident_topology(
         checkpoint.value->manifest(), config);
@@ -210,6 +220,29 @@ TEST_CASE("real DeepSeek V4 Flash 0731 checkpoint opens without format conversio
             compact_million.plan.kv_cache_payload_bytes +
                 compact_million.plan.kv_cache_metadata_bytes +
                 compact_million.plan.kv_cache_alignment_bytes);
+
+    config.maximum_context_tokens = 32'768U;
+    config.physical_kv_cache = true;
+    const auto physical_cache = strata::plan_dsv4_resident_topology(
+        checkpoint.value->manifest(), config);
+    REQUIRE(physical_cache.ok());
+    REQUIRE(physical_cache.plan.kv_cache_payload_bytes == 139'022'336ULL);
+    REQUIRE(physical_cache.plan.kv_cache_metadata_bytes > 0U);
+    REQUIRE(physical_cache.plan.kv_cache_alignment_bytes > 0U);
+    REQUIRE(physical_cache.plan.host_kv_cache_bytes ==
+            physical_cache.plan.kv_cache_payload_bytes +
+                physical_cache.plan.kv_cache_metadata_bytes +
+                physical_cache.plan.kv_cache_alignment_bytes);
+    config.device_resident_mhc = true;
+    const auto physical_device = strata::plan_dsv4_resident_topology(
+        checkpoint.value->manifest(), config);
+    REQUIRE(physical_device.ok());
+    REQUIRE(physical_device.plan.mhc_device_bytes == 135'980'448ULL);
+    REQUIRE(physical_device.plan.resident_spine_vram_bytes ==
+            physical_cache.plan.resident_spine_vram_bytes +
+                physical_device.plan.mhc_device_bytes);
+    config.device_resident_mhc = false;
+    config.physical_kv_cache = false;
     config.compact_kv_cache = false;
 
     config.maximum_context_tokens = 1'048'577U;

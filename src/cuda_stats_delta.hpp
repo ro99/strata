@@ -51,6 +51,27 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(flash_attention_kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(flash_attention_d2h_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(flash_attention_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_calls);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_kernel_launches);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_h2d_bytes);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_d2h_bytes);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_page_bytes);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_h2d_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_d2h_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_calls);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_standalone_calls);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_transition_calls);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_final_calls);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_kernel_launches);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_resident_weight_bytes);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_h2d_bytes);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_d2h_bytes);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_h2d_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_d2h_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(lightning_index_calls);
     STRATA_CUDA_DEVICE_DELTA(lightning_index_kernel_launches);
     STRATA_CUDA_DEVICE_DELTA(lightning_index_candidates);
@@ -111,6 +132,27 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(flash_attention_kernel_nanoseconds);
     STRATA_CUDA_DELTA(flash_attention_d2h_nanoseconds);
     STRATA_CUDA_DELTA(flash_attention_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_calls);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_kernel_launches);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_h2d_bytes);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_d2h_bytes);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_page_bytes);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_h2d_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_d2h_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_calls);
+    STRATA_CUDA_DELTA(dsv4_mhc_standalone_calls);
+    STRATA_CUDA_DELTA(dsv4_mhc_transition_calls);
+    STRATA_CUDA_DELTA(dsv4_mhc_final_calls);
+    STRATA_CUDA_DELTA(dsv4_mhc_kernel_launches);
+    STRATA_CUDA_DELTA(dsv4_mhc_resident_weight_bytes);
+    STRATA_CUDA_DELTA(dsv4_mhc_h2d_bytes);
+    STRATA_CUDA_DELTA(dsv4_mhc_d2h_bytes);
+    STRATA_CUDA_DELTA(dsv4_mhc_h2d_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_d2h_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_nanoseconds);
     STRATA_CUDA_DELTA(lightning_index_calls);
     STRATA_CUDA_DELTA(lightning_index_kernel_launches);
     STRATA_CUDA_DELTA(lightning_index_candidates);
@@ -143,6 +185,14 @@ inline void clear_cuda_critical_path(CudaBackendStats& result) noexcept {
     result.flash_attention_kernel_nanoseconds = 0U;
     result.flash_attention_d2h_nanoseconds = 0U;
     result.flash_attention_nanoseconds = 0U;
+    result.dsv4_paged_attention_h2d_nanoseconds = 0U;
+    result.dsv4_paged_attention_kernel_nanoseconds = 0U;
+    result.dsv4_paged_attention_d2h_nanoseconds = 0U;
+    result.dsv4_paged_attention_nanoseconds = 0U;
+    result.dsv4_mhc_h2d_nanoseconds = 0U;
+    result.dsv4_mhc_kernel_nanoseconds = 0U;
+    result.dsv4_mhc_d2h_nanoseconds = 0U;
+    result.dsv4_mhc_nanoseconds = 0U;
 }
 
 inline void accumulate_cuda_critical_path(CudaBackendStats& result,
@@ -177,6 +227,30 @@ inline void accumulate_cuda_critical_path(CudaBackendStats& result,
         result.flash_attention_d2h_nanoseconds, delta.flash_attention_d2h_nanoseconds);
     result.flash_attention_nanoseconds = std::max(
         result.flash_attention_nanoseconds, delta.flash_attention_nanoseconds);
+    result.dsv4_paged_attention_h2d_nanoseconds = std::max(
+        result.dsv4_paged_attention_h2d_nanoseconds,
+        delta.dsv4_paged_attention_h2d_nanoseconds);
+    result.dsv4_paged_attention_kernel_nanoseconds = std::max(
+        result.dsv4_paged_attention_kernel_nanoseconds,
+        delta.dsv4_paged_attention_kernel_nanoseconds);
+    result.dsv4_paged_attention_d2h_nanoseconds = std::max(
+        result.dsv4_paged_attention_d2h_nanoseconds,
+        delta.dsv4_paged_attention_d2h_nanoseconds);
+    result.dsv4_paged_attention_nanoseconds = std::max(
+        result.dsv4_paged_attention_nanoseconds,
+        delta.dsv4_paged_attention_nanoseconds);
+    result.dsv4_mhc_h2d_nanoseconds = std::max(
+        result.dsv4_mhc_h2d_nanoseconds,
+        delta.dsv4_mhc_h2d_nanoseconds);
+    result.dsv4_mhc_kernel_nanoseconds = std::max(
+        result.dsv4_mhc_kernel_nanoseconds,
+        delta.dsv4_mhc_kernel_nanoseconds);
+    result.dsv4_mhc_d2h_nanoseconds = std::max(
+        result.dsv4_mhc_d2h_nanoseconds,
+        delta.dsv4_mhc_d2h_nanoseconds);
+    result.dsv4_mhc_nanoseconds = std::max(
+        result.dsv4_mhc_nanoseconds,
+        delta.dsv4_mhc_nanoseconds);
 }
 
 inline CudaBackendStats cuda_delta(const CudaBackendStats& after,

@@ -2,6 +2,7 @@
 
 #include "strata/model.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -10,7 +11,9 @@ namespace strata {
 
 class HostWorkerPool {
 public:
-    explicit HostWorkerPool(std::size_t workers);
+    explicit HostWorkerPool(
+        std::size_t workers,
+        std::chrono::microseconds idle_spin = std::chrono::microseconds::zero());
     ~HostWorkerPool();
     HostWorkerPool(HostWorkerPool&&) noexcept;
     HostWorkerPool& operator=(HostWorkerPool&&) noexcept;

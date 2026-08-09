@@ -61,6 +61,7 @@ add_library(strata_core STATIC
     src/inkling_runtime.cpp
     src/deepseek_manifest.cpp
     src/deepseek_kv_cache.cpp
+    src/dsv4_attention_kv.cpp
     src/deepseek_ops.cpp
     src/deepseek_diagnostics.cpp
     src/deepseek_checkpoint.cpp
@@ -170,6 +171,9 @@ if(STRATA_HAS_CUDA)
     target_compile_options(strata-topology-probe PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-Wall,-Wextra>
     )
+
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(strata_core PUBLIC CUDA::cublas)
 endif()
 
 include(CTest)

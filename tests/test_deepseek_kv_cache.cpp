@@ -2,12 +2,16 @@
 
 #include "strata/deepseek_kv_cache.hpp"
 #include "strata/deepseek_ops.hpp"
+#include "strata/dsv4_attention_kv.hpp"
 #include "strata/model_adapter.hpp"
+#include "strata/numerics.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -26,6 +30,265 @@ void require_bit_equal(std::span<const float> actual,
 }
 
 }  // namespace
+
+TEST_CASE("DeepSeek physical KV layout is block-major and admitted") {
+    const auto main = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::Sliding);
+    REQUIRE(main.ok());
+    REQUIRE(main.value.semantic_width == 512U);
+    REQUIRE(main.value.block_rows == 256U);
+    REQUIRE(main.value.token_data_bytes == 576U);
+    REQUIRE(main.value.token_scale_bytes == 8U);
+    REQUIRE(main.value.block_bytes == 149504U);
+    REQUIRE(main.value.format ==
+            strata::Dsv4PhysicalKvFormat::
+                Fp8E4m3Group64Bf16RopeUe8m0);
+
+    const auto index = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::LearnedIndex);
+    REQUIRE(index.ok());
+    REQUIRE(index.value.semantic_width == 128U);
+    REQUIRE(index.value.token_data_bytes == 128U);
+    REQUIRE(index.value.token_scale_bytes == 4U);
+    REQUIRE(index.value.block_bytes == 33792U);
+    REQUIRE(index.value.format ==
+            strata::Dsv4PhysicalKvFormat::Fp8E4m3PerTensorF32Scale);
+    const auto compressed4 = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::Sliding, 64U);
+    const auto compressed128 = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::Sliding, 2U);
+    const auto compressed_index = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::LearnedIndex, 64U);
+    REQUIRE(compressed4.ok());
+    REQUIRE(compressed4.value.block_bytes == 37376U);
+    REQUIRE(compressed128.ok());
+    REQUIRE(compressed128.value.block_bytes == 1168U);
+    REQUIRE(compressed_index.ok());
+    REQUIRE(compressed_index.value.block_bytes == 8448U);
+    REQUIRE(!strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::LearnedIndex, 2U).ok());
+    REQUIRE(!strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::Sliding, 32U).ok());
+
+    constexpr std::uint32_t compressed_row = 63U;
+    std::vector<std::byte> compressed_block(
+        static_cast<std::size_t>(compressed4.value.block_bytes));
+    const auto compressed_data =
+        static_cast<std::size_t>(compressed_row) * 576U;
+    const auto compressed_scales = 64U * 576U +
+        static_cast<std::size_t>(compressed_row) * 8U;
+    std::fill_n(compressed_block.begin() +
+                    static_cast<std::ptrdiff_t>(compressed_data),
+                448U, std::byte{0x38U});
+    std::fill_n(compressed_block.begin() +
+                    static_cast<std::ptrdiff_t>(compressed_scales),
+                7U, std::byte{127U});
+    std::vector<float> decoded_compressed(512U);
+    REQUIRE(strata::dsv4_physical_decode_kv_row(
+        strata::Dsv4KvBlockKind::Csa, compressed_block,
+        compressed_row, decoded_compressed).ok());
+    REQUIRE(decoded_compressed[0] == 1.0F);
+
+    constexpr std::uint32_t row_index = 255U;
+    std::vector<std::byte> main_block(
+        static_cast<std::size_t>(main.value.block_bytes));
+    const auto main_data = static_cast<std::size_t>(row_index) * 576U;
+    const auto main_scales = 256U * 576U +
+                             static_cast<std::size_t>(row_index) * 8U;
+    for (std::size_t group = 0U; group < 7U; ++group) {
+        main_block[main_scales + group] =
+            static_cast<std::byte>(123U + group);
+        for (std::size_t column = 0U; column < 64U; ++column) {
+            main_block[main_data + group * 64U + column] = std::byte{0x38U};
+        }
+    }
+    for (std::size_t column = 0U; column < 64U; ++column) {
+        const auto encoded = strata::bf16_encode(
+            static_cast<float>(column) / 64.0F);
+        std::memcpy(main_block.data() + main_data + 448U +
+                        column * sizeof(encoded),
+                    &encoded, sizeof(encoded));
+    }
+    std::vector<float> decoded_main(512U);
+    REQUIRE(strata::dsv4_physical_decode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, main_block,
+        row_index, decoded_main).ok());
+    for (std::size_t group = 0U; group < 7U; ++group) {
+        const auto expected = strata::bf16_round_f32(
+            strata::dsv4_fp8_e8m0_scale_f32(
+                static_cast<std::uint8_t>(123U + group)));
+        REQUIRE(decoded_main[group * 64U] == expected);
+    }
+    REQUIRE(decoded_main[448U + 63U] ==
+            strata::bf16_round_f32(63.0F / 64.0F));
+    main_block[main_scales + 7U] = std::byte{1U};
+    REQUIRE(!strata::dsv4_physical_decode_kv_row(
+        strata::Dsv4KvBlockKind::Sliding, main_block,
+        row_index, decoded_main).ok());
+
+    std::vector<std::byte> index_block(
+        static_cast<std::size_t>(index.value.block_bytes));
+    const auto index_data = static_cast<std::size_t>(row_index) * 128U;
+    const auto index_scale = 256U * 128U +
+                             static_cast<std::size_t>(row_index) * 4U;
+    std::fill_n(index_block.begin() +
+                    static_cast<std::ptrdiff_t>(index_data),
+                128U, std::byte{0x38U});
+    constexpr float scale = 0.125F;
+    std::memcpy(index_block.data() + index_scale, &scale, sizeof(scale));
+    std::vector<float> decoded_index(128U);
+    REQUIRE(strata::dsv4_physical_decode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex, index_block,
+        row_index, decoded_index).ok());
+    REQUIRE(std::all_of(decoded_index.begin(), decoded_index.end(),
+                        [](float value) { return value == 0.125F; }));
+
+    const auto admission = strata::dsv4_physical_kv_admission(32768U);
+    REQUIRE(admission.ok());
+    REQUIRE(admission.value.sliding_bytes == 12857344U);
+    REQUIRE(admission.value.compressed_bytes == 103456768U);
+    REQUIRE(admission.value.index_bytes == 22708224U);
+    REQUIRE(admission.value.payload_bytes == 139022336U);
+    REQUIRE(admission.value.compressor_state_bytes == 11862016U);
+    REQUIRE(admission.value.index_state_bytes == 344064U);
+    REQUIRE(admission.value.total_bytes == 151228416U);
+    REQUIRE(admission.value.allocated_blocks == 1450U);
+}
+
+TEST_CASE("DeepSeek physical KV encoder writes accepted physical planes") {
+    const auto main_layout = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::Csa, 64U);
+    REQUIRE(main_layout.ok());
+    std::vector<std::byte> main_page(
+        static_cast<std::size_t>(main_layout.value.block_bytes));
+    std::vector<float> main_values(
+        strata::kDeepSeekV4ExecutionContract.head_dim, 1.0F);
+    main_values[0] = -0.0F;
+    for (std::size_t column = 448U; column < main_values.size(); ++column) {
+        main_values[column] = strata::bf16_round_f32(
+            static_cast<float>(static_cast<int>(column) - 480) / 64.0F);
+    }
+    constexpr std::uint32_t main_row = 63U;
+    REQUIRE(strata::dsv4_physical_encode_kv_row(
+        strata::Dsv4KvBlockKind::Csa, main_values,
+        main_row, main_page).ok());
+    const auto main_data = static_cast<std::size_t>(main_row) * 576U;
+    const auto main_scales = 64U * 576U +
+                             static_cast<std::size_t>(main_row) * 8U;
+    REQUIRE(main_page[main_data] == std::byte{0U});
+    REQUIRE(main_page[main_data + 1U] == std::byte{0x78U});
+    for (std::size_t group = 0U; group < 7U; ++group) {
+        REQUIRE(main_page[main_scales + group] == std::byte{119U});
+    }
+    REQUIRE(main_page[main_scales + 7U] == std::byte{0U});
+    std::vector<float> decoded_main(main_values.size());
+    REQUIRE(strata::dsv4_physical_decode_kv_row(
+        strata::Dsv4KvBlockKind::Csa, main_page,
+        main_row, decoded_main).ok());
+    REQUIRE(decoded_main[0] == 0.0F);
+    REQUIRE(!std::signbit(decoded_main[0]));
+    require_bit_equal(std::span<const float>(decoded_main).subspan(1U),
+                      std::span<const float>(main_values).subspan(1U));
+
+    const auto index_layout = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::LearnedIndex, 64U);
+    REQUIRE(index_layout.ok());
+    std::vector<std::byte> index_page(
+        static_cast<std::size_t>(index_layout.value.block_bytes));
+    std::vector<float> index_values(
+        strata::kDeepSeekV4ExecutionContract.index_head_dim, 1.0F);
+    REQUIRE(strata::dsv4_physical_encode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex, index_values,
+        main_row, index_page).ok());
+    const auto index_data = static_cast<std::size_t>(main_row) * 128U;
+    const auto index_scale = 64U * 128U +
+                             static_cast<std::size_t>(main_row) * 4U;
+    REQUIRE(index_page[index_data] == std::byte{0x78U});
+    float stored_scale = 0.0F;
+    std::memcpy(&stored_scale, index_page.data() + index_scale,
+                sizeof(stored_scale));
+    REQUIRE(stored_scale == std::ldexp(1.0F, -8));
+    std::vector<float> decoded_index(index_values.size());
+    REQUIRE(strata::dsv4_physical_decode_kv_row(
+        strata::Dsv4KvBlockKind::LearnedIndex, index_page,
+        main_row, decoded_index).ok());
+    require_bit_equal(decoded_index, index_values);
+
+    std::array<float, 4> query{-0.0F, 1.0F, -2.0F, 500.0F};
+    REQUIRE(strata::dsv4_physical_quantize_query_e4m3_f32(query).ok());
+    REQUIRE(query[0] == 0.0F && !std::signbit(query[0]));
+    REQUIRE(query[1] == 1.0F);
+    REQUIRE(query[2] == -2.0F);
+    REQUIRE(query[3] == 448.0F);
+}
+
+TEST_CASE("DeepSeek live cache retains physical page boundaries") {
+    strata::Dsv4KvCacheConfig invalid;
+    invalid.physical_layout = true;
+    invalid.host_capacity_bytes = 1U << 20U;
+    strata::Dsv4KvCache rejected(invalid);
+    REQUIRE(!rejected.validate().ok());
+
+    strata::Dsv4KvCacheConfig config;
+    config.block_rows = strata::kDsv4PhysicalKvBlockRows;
+    config.sliding_window_rows = 512U;
+    config.host_capacity_bytes = 1U << 20U;
+    config.physical_layout = true;
+    strata::Dsv4KvCache cache(config);
+    REQUIRE(cache.validate().ok());
+    const auto sequence = cache.create_sequence();
+    REQUIRE(sequence.ok());
+    const auto main = row(
+        strata::kDeepSeekV4ExecutionContract.head_dim, 1.0F);
+    const auto index = row(
+        strata::kDeepSeekV4ExecutionContract.index_head_dim, 1.0F);
+    for (std::uint64_t position = 0U; position < 257U; ++position) {
+        REQUIRE(cache.append(sequence.value,
+                             strata::Dsv4KvBlockKind::Sliding,
+                             0U, 1U, position, main).ok());
+    }
+    for (std::uint64_t position = 0U; position < 65U; ++position) {
+        REQUIRE(cache.append(sequence.value, strata::Dsv4KvBlockKind::Csa,
+                             1U, 4U, position, main).ok());
+        REQUIRE(cache.append(sequence.value,
+                             strata::Dsv4KvBlockKind::LearnedIndex,
+                             1U, 4U, position, index).ok());
+    }
+    for (std::uint64_t position = 0U; position < 3U; ++position) {
+        REQUIRE(cache.append(sequence.value, strata::Dsv4KvBlockKind::Hca,
+                             2U, 128U, position, main).ok());
+    }
+    const auto sliding = cache.block_table(
+        sequence.value, strata::Dsv4KvBlockKind::Sliding, 0U);
+    const auto csa = cache.block_table(
+        sequence.value, strata::Dsv4KvBlockKind::Csa, 1U);
+    const auto hca = cache.block_table(
+        sequence.value, strata::Dsv4KvBlockKind::Hca, 2U);
+    const auto learned = cache.block_table(
+        sequence.value, strata::Dsv4KvBlockKind::LearnedIndex, 1U);
+    REQUIRE(sliding.ok() && sliding.value.size() == 2U);
+    REQUIRE(csa.ok() && csa.value.size() == 2U);
+    REQUIRE(hca.ok() && hca.value.size() == 2U);
+    REQUIRE(learned.ok() && learned.value.size() == 2U);
+    REQUIRE(sliding.value[0].capacity_rows == 256U);
+    REQUIRE(csa.value[0].capacity_rows == 64U);
+    REQUIRE(hca.value[0].capacity_rows == 2U);
+    REQUIRE(learned.value[0].capacity_rows == 64U);
+    REQUIRE(sliding.value[0].payload_bytes == 149504U);
+    REQUIRE(csa.value[0].payload_bytes == 37376U);
+    REQUIRE(hca.value[0].payload_bytes == 1168U);
+    REQUIRE(learned.value[0].payload_bytes == 8448U);
+    REQUIRE(sliding.value[0].format ==
+            strata::Dsv4KvFormat::PhysicalFp8E4m3Group64Bf16Rope);
+    REQUIRE(learned.value[0].format ==
+            strata::Dsv4KvFormat::PhysicalFp8E4m3PerTensor);
+    const auto last = cache.row(
+        sequence.value, strata::Dsv4KvBlockKind::Sliding, 0U, 256U);
+    REQUIRE(last.ok());
+    require_bit_equal(last.value, main);
+    REQUIRE(!cache.learned_index_segments(
+        sequence.value, 1U, 65U).ok());
+}
 
 TEST_CASE("DeepSeek compact KV codecs are exact or reject the write") {
     constexpr auto head_dim = strata::kDeepSeekV4ExecutionContract.head_dim;

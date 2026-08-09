@@ -100,8 +100,12 @@ public:
         const Dsv4CheckpointReader& checkpoint,
         std::uint64_t host_memory_ceiling_bytes,
         std::uint32_t read_workers = 1U,
-        bool include_dspark = false);
+        bool include_dspark = false,
+        bool tiled_experts = false);
     [[nodiscard]] std::span<const std::byte> find(std::string_view name) const noexcept;
+    [[nodiscard]] std::span<const std::byte> find_tiled_expert(
+        std::uint32_t layer, std::uint32_t expert,
+        std::uint32_t shard) const noexcept;
     // Page-locks the staged arena so demand uploads DMA out of it directly.
     // Purely a transfer-rate optimization: it changes no bytes and no shape, so
     // a failure is reported and left unpinned rather than aborting the run.
@@ -120,6 +124,7 @@ private:
     Dsv4ResidentStageStats stats_;
     CudaBackend* pinned_backend_{};
     bool pinned_{};
+    bool tiled_experts_{};
     bool complete_{};
 };
 

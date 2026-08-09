@@ -2,7 +2,10 @@
 
 #include "checkpoint_common.hpp"
 
+#include "strata/deepseek_host_expert.hpp"
 #include "strata/deepseek_ops.hpp"
+#include "strata/model_adapter.hpp"
+#include "strata/numa_topology.hpp"
 
 #include <algorithm>
 #include <array>
@@ -237,6 +240,11 @@ ValidationResult Dsv4ResidentWeightStore::pin(CudaBackend& backend) {
         return result;
     }
     if (pinned_) return result;
+    if (tiled_experts_) {
+        result.errors.emplace_back(
+            "host-routed experts are CPU-only and cannot be page-locked for H2D");
+        return result;
+    }
     // stage() seals the arena with mprotect(PROT_READ). cudaHostRegister
     // refuses a read-only mapping with cudaErrorInvalidValue, and
     // cudaHostRegisterReadOnly is not an escape here: all three devices report
@@ -277,7 +285,7 @@ Dsv4ResidentWeightStore::~Dsv4ResidentWeightStore() {
 ValidationResult Dsv4ResidentWeightStore::stage(
     const Dsv4CheckpointReader& checkpoint,
     std::uint64_t host_memory_ceiling_bytes, std::uint32_t read_workers,
-    bool include_dspark) {
+    bool include_dspark, bool tiled_experts) {
     ValidationResult result;
     if (complete_ || arena_ != nullptr) {
         result.errors.emplace_back("DeepSeek resident expert store is already staged");
@@ -286,6 +294,189 @@ ValidationResult Dsv4ResidentWeightStore::stage(
     if (read_workers == 0U || read_workers > 64U) {
         result.errors.emplace_back(
             "DeepSeek resident read worker count must be within [1, 64]");
+        return result;
+    }
+    if (tiled_experts) {
+        if (include_dspark) {
+            result.errors.emplace_back(
+                "DeepSeek host-routed experts do not support DSpark tensors");
+            return result;
+        }
+        constexpr auto hidden =
+            static_cast<std::uint64_t>(kDeepSeekV4ExecutionContract.hidden_size);
+        constexpr auto intermediate = static_cast<std::uint64_t>(
+            kDeepSeekV4ExecutionContract.expert_intermediate_size);
+        constexpr auto layers = static_cast<std::uint64_t>(
+            kDeepSeekV4ExecutionContract.layer_count);
+        constexpr auto experts = static_cast<std::uint64_t>(
+            kDeepSeekV4ExecutionContract.routed_experts);
+        constexpr std::uint64_t shards = 2U;
+        const auto shard_bytes = dsv4_tiled_expert_shard_bytes(
+            hidden, intermediate, shards);
+        const auto tiled_bytes = shards * layers * experts * shard_bytes;
+        std::vector<const Dsv4ManifestTensor*> embeddings;
+        std::uint64_t embedding_bytes = 0U;
+        std::uint64_t routed_source_bytes = 0U;
+        std::uint64_t routed_tensors = 0U;
+        for (const auto& tensor : checkpoint.manifest().tensors) {
+            if (tensor.role == Dsv4TensorRole::RoutedExpert && !tensor.dspark) {
+                ++routed_tensors;
+                routed_source_bytes += tensor.source_bytes;
+            } else if (tensor.role == Dsv4TensorRole::Embedding) {
+                embeddings.push_back(&tensor);
+                if (tensor.source_bytes > std::numeric_limits<std::uint64_t>::max() -
+                                              embedding_bytes) {
+                    result.errors.emplace_back(
+                        "DeepSeek resident embedding byte count overflows");
+                    return result;
+                }
+                embedding_bytes += tensor.source_bytes;
+            }
+        }
+        if (shard_bytes == 0U || tiled_bytes > host_memory_ceiling_bytes ||
+            embedding_bytes > host_memory_ceiling_bytes - tiled_bytes ||
+            routed_tensors != layers * experts * 6U) {
+            result.errors.emplace_back(
+                "DeepSeek tiled expert arena does not match the admitted model");
+            return result;
+        }
+        arena_bytes_ = tiled_bytes + embedding_bytes;
+        void* allocation = mmap(nullptr, static_cast<std::size_t>(arena_bytes_),
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (allocation == MAP_FAILED) {
+            arena_bytes_ = 0U;
+            result.errors.emplace_back(
+                "cannot allocate DeepSeek tiled expert arena: " +
+                std::string(std::strerror(errno)));
+            return result;
+        }
+        arena_ = static_cast<std::byte*>(allocation);
+        const auto topology = NumaTopology::detect();
+        if (topology.nodes < static_cast<int>(shards)) {
+            result.errors.emplace_back(
+                "DeepSeek tiled experts require two NUMA nodes");
+            return result;
+        }
+        const auto shard_arena_bytes = layers * experts * shard_bytes;
+        for (std::uint64_t shard = 0U; shard < shards; ++shard) {
+            if (!numa_bind_range(arena_ + shard * shard_arena_bytes,
+                                 shard_arena_bytes,
+                                 static_cast<int>(shard))) {
+                result.errors.emplace_back(
+                    "cannot bind DeepSeek tiled expert shard to its NUMA node");
+                return result;
+            }
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        const auto active_workers = std::min<std::uint64_t>(
+            read_workers, layers * experts);
+        std::vector<ValidationResult> worker_results(active_workers);
+        std::vector<Dsv4CheckpointReadStats> worker_stats(active_workers);
+        std::atomic<std::uint64_t> next_expert{};
+        const auto worker = [&](std::size_t worker_index) {
+            const std::array<std::uint64_t, 6U> sizes{
+                intermediate * (hidden / 2U), intermediate * (hidden / 32U),
+                intermediate * (hidden / 2U), intermediate * (hidden / 32U),
+                hidden * (intermediate / 2U), hidden * (intermediate / 32U)};
+            std::array<std::vector<std::byte>, 6U> buffers;
+            for (std::size_t index = 0U; index < buffers.size(); ++index) {
+                buffers[index].resize(static_cast<std::size_t>(sizes[index]));
+            }
+            constexpr std::array<std::string_view, 6U> suffixes{
+                "w1.weight", "w1.scale", "w3.weight", "w3.scale",
+                "w2.weight", "w2.scale"};
+            auto& worker_result = worker_results[worker_index];
+            while (worker_result.ok()) {
+                const auto task = next_expert.fetch_add(
+                    1U, std::memory_order_relaxed);
+                if (task >= layers * experts) break;
+                const auto layer = task / experts;
+                const auto expert = task % experts;
+                const auto prefix = "layers." + std::to_string(layer) +
+                    ".ffn.experts." + std::to_string(expert) + ".";
+                for (std::size_t index = 0U; index < buffers.size(); ++index) {
+                    auto loaded = checkpoint.read_into(
+                        prefix + std::string(suffixes[index]), buffers[index],
+                        &worker_stats[worker_index]);
+                    if (!loaded.ok()) {
+                        move_errors(worker_result, std::move(loaded.errors));
+                        break;
+                    }
+                }
+                if (!worker_result.ok()) break;
+                const Dsv4HostExpertWeights canonical{
+                    buffers[0], buffers[1], buffers[2],
+                    buffers[3], buffers[4], buffers[5]};
+                for (std::uint64_t shard = 0U; shard < shards; ++shard) {
+                    const auto offset = shard * shard_arena_bytes +
+                        task * shard_bytes;
+                    auto transformed = dsv4_transform_tiled_expert_shard(
+                        {arena_ + offset, static_cast<std::size_t>(shard_bytes)},
+                        canonical, hidden, intermediate, shard, shards);
+                    if (!transformed.ok()) {
+                        move_errors(worker_result,
+                                    std::move(transformed.errors));
+                        break;
+                    }
+                }
+            }
+        };
+        if (active_workers == 1U) {
+            worker(0U);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(active_workers);
+            for (std::size_t index = 0U; index < active_workers; ++index) {
+                workers.emplace_back(worker, index);
+            }
+            for (auto& thread : workers) thread.join();
+        }
+        for (auto& worker_result : worker_results) {
+            if (!worker_result.ok()) {
+                move_errors(result, std::move(worker_result.errors));
+            }
+        }
+        if (!result.ok()) return result;
+
+        std::uint64_t cursor = tiled_bytes;
+        Dsv4CheckpointReadStats embedding_stats;
+        for (const auto* tensor : embeddings) {
+            auto loaded = checkpoint.read_into(
+                tensor->name,
+                {arena_ + cursor,
+                 static_cast<std::size_t>(tensor->source_bytes)},
+                &embedding_stats);
+            if (!loaded.ok()) {
+                move_errors(result, std::move(loaded.errors));
+                return result;
+            }
+            extents_.emplace(tensor->name,
+                             Extent{cursor, tensor->source_bytes});
+            cursor += tensor->source_bytes;
+        }
+        std::uint64_t read_calls = embedding_stats.calls;
+        std::uint64_t read_bytes = embedding_stats.bytes;
+        for (const auto& stats : worker_stats) {
+            read_calls += stats.calls;
+            read_bytes += stats.bytes;
+        }
+        if (read_calls != routed_tensors + embeddings.size() ||
+            read_bytes != routed_source_bytes + embedding_bytes) {
+            result.errors.emplace_back(
+                "tiled resident staging read accounting mismatch");
+            return result;
+        }
+        static_cast<void>(mprotect(
+            arena_, static_cast<std::size_t>(arena_bytes_), PROT_READ));
+        stats_.tensors = read_calls;
+        stats_.bytes = arena_bytes_;
+        stats_.workers = static_cast<std::uint32_t>(active_workers);
+        stats_.seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        tiled_experts_ = true;
+        complete_ = true;
         return result;
     }
     std::vector<const Dsv4ManifestTensor*> tensors;
@@ -409,6 +600,28 @@ std::span<const std::byte> Dsv4ResidentWeightStore::find(
     const auto found = extents_.find(name);
     if (found == extents_.end() || arena_ == nullptr) return {};
     return {arena_ + found->second.offset, static_cast<std::size_t>(found->second.bytes)};
+}
+
+std::span<const std::byte> Dsv4ResidentWeightStore::find_tiled_expert(
+    std::uint32_t layer, std::uint32_t expert,
+    std::uint32_t shard) const noexcept {
+    constexpr auto layers = kDeepSeekV4ExecutionContract.layer_count;
+    constexpr auto experts = kDeepSeekV4ExecutionContract.routed_experts;
+    constexpr std::uint32_t shards = 2U;
+    if (!tiled_experts_ || arena_ == nullptr || layer >= layers ||
+        expert >= experts || shard >= shards) {
+        return {};
+    }
+    const auto shard_bytes = dsv4_tiled_expert_shard_bytes(
+        kDeepSeekV4ExecutionContract.hidden_size,
+        kDeepSeekV4ExecutionContract.expert_intermediate_size, shards);
+    const auto shard_arena_bytes =
+        static_cast<std::uint64_t>(layers) * experts * shard_bytes;
+    const auto offset = static_cast<std::uint64_t>(shard) *
+                            shard_arena_bytes +
+                        (static_cast<std::uint64_t>(layer) * experts + expert) *
+                            shard_bytes;
+    return {arena_ + offset, static_cast<std::size_t>(shard_bytes)};
 }
 
 ValidationResult load_dsv4_cuda_linear(

@@ -61,6 +61,14 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         result.errors.emplace_back(
             "DeepSeek KV and VRAM device budget counts must match");
     }
+    if (config.physical_kv_cache && !config.compact_kv_cache) {
+        result.errors.emplace_back(
+            "DeepSeek physical KV admission requires the block cache");
+    }
+    if (config.device_resident_mhc && !config.physical_kv_cache) {
+        result.errors.emplace_back(
+            "DeepSeek device-resident mHC requires physical KV admission");
+    }
     const auto model_context =
         deepseek_v4_flash_0731_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||
@@ -83,6 +91,17 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         if (tensor.role == Dsv4TensorRole::RoutedExpert) {
             if (!add(result.plan.routed_expert_host_bytes, tensor.source_bytes)) {
                 result.errors.emplace_back("DeepSeek routed expert byte count overflows");
+                return result;
+            }
+            // The output-tiled decode layout duplicates each group-32 scale
+            // for its two group-16 inner loops. It replaces the canonical
+            // routed tensor arena, so only the scale expansion is additional.
+            if (config.host_routed_experts &&
+                tensor.component == Dsv4TensorComponent::Scale &&
+                !add(result.plan.routed_expert_host_bytes,
+                     tensor.source_bytes)) {
+                result.errors.emplace_back(
+                    "DeepSeek tiled expert scale byte count overflows");
                 return result;
             }
             if (tensor.layer < 0 || tensor.expert < 0) {
@@ -151,17 +170,22 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
     constexpr std::uint64_t window = kDeepSeekV4ExecutionContract.sliding_window;
     constexpr std::uint64_t fp32 = sizeof(float);
     const auto add_compact_blocks = [&](Dsv4KvBlockKind kind,
+                                        std::uint32_t ratio,
                                         std::uint64_t blocks,
                                         std::uint64_t& target) {
-        const auto format = dsv4_kv_format(kind);
+        const auto format = dsv4_kv_format(
+            kind, false, config.physical_kv_cache);
+        const auto capacity_rows = config.physical_kv_cache
+            ? dsv4_kv_block_rows(kind, ratio, true) : kDsv4KvBlockRows;
         const auto row_bytes = dsv4_kv_row_bytes(kind, format);
         const auto block_bytes = dsv4_kv_block_bytes(
-            kind, format, kDsv4KvBlockRows);
+            kind, format, capacity_rows);
         std::uint64_t payload = 0U;
         std::uint64_t metadata = 0U;
         std::uint64_t physical = 0U;
         if (block_bytes == 0U ||
-            !multiply(row_bytes * kDsv4KvBlockRows, blocks, payload) ||
+            capacity_rows == 0U ||
+            !multiply(row_bytes * capacity_rows, blocks, payload) ||
             !multiply(kDsv4KvBlockHeaderBytes, blocks, metadata) ||
             !multiply(block_bytes, blocks, physical) ||
             physical < payload || physical - payload < metadata ||
@@ -175,13 +199,17 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         return true;
     };
     if (config.compact_kv_cache) {
+        const auto sliding_capacity = config.physical_kv_cache
+            ? dsv4_kv_block_rows(Dsv4KvBlockKind::Sliding, 1U, true)
+            : kDsv4KvBlockRows;
         const auto maximum_sliding_rows = std::min<std::uint64_t>(
             config.maximum_context_tokens,
-            window + kDsv4KvBlockRows - 1U);
+            window + sliding_capacity - 1U);
         const auto sliding_blocks =
-            (maximum_sliding_rows + kDsv4KvBlockRows - 1U) /
-            kDsv4KvBlockRows;
+            (maximum_sliding_rows + sliding_capacity - 1U) /
+            sliding_capacity;
         if (!add_compact_blocks(Dsv4KvBlockKind::Sliding,
+                                1U,
                                 layers * sliding_blocks,
                                 result.plan.kv_state_bytes)) {
             result.errors.emplace_back(
@@ -199,12 +227,14 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         if (ratio == 0U) continue;
         const auto compressed =
             (static_cast<std::uint64_t>(config.maximum_context_tokens) + ratio - 1U) / ratio;
-        const auto blocks = (compressed + kDsv4KvBlockRows - 1U) /
-                            kDsv4KvBlockRows;
         const auto kind = ratio == 4U ? Dsv4KvBlockKind::Csa
                                      : Dsv4KvBlockKind::Hca;
+        const auto capacity_rows = config.physical_kv_cache
+            ? dsv4_kv_block_rows(kind, ratio, true) : kDsv4KvBlockRows;
+        const auto blocks = (compressed + capacity_rows - 1U) /
+                            capacity_rows;
         if (config.compact_kv_cache
-                ? !add_compact_blocks(kind, blocks,
+                ? !add_compact_blocks(kind, ratio, blocks,
                                       result.plan.kv_state_bytes)
                 : !add(result.plan.kv_state_bytes,
                        compressed * head_dim * fp32)) {
@@ -225,7 +255,8 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
             constexpr std::uint64_t index_compressor_state =
                 2U * 4U * 2U * index_head_dim * fp32 * 2U;
             const bool index_cache_ok = config.compact_kv_cache
-                ? add_compact_blocks(Dsv4KvBlockKind::LearnedIndex, blocks,
+                ? add_compact_blocks(Dsv4KvBlockKind::LearnedIndex, ratio,
+                                     blocks,
                                      result.plan.index_state_bytes)
                 : add(result.plan.index_state_bytes,
                       compressed * index_head_dim * fp32);
@@ -292,6 +323,24 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         if (!add(result.plan.host_workspace_bytes, mhc_prepack_bytes)) {
             result.errors.emplace_back(
                 "DeepSeek mHC prepack byte count overflows");
+            return result;
+        }
+    }
+    if (config.device_resident_mhc) {
+        constexpr std::uint64_t mhc_projection_bytes =
+            2U * layers * kDeepSeekV4ExecutionContract.mix_width *
+            kDeepSeekV4ExecutionContract.mhc_multiplier *
+            kDeepSeekV4ExecutionContract.hidden_size * fp32;
+        constexpr std::uint64_t mhc_auxiliary_bytes =
+            2U * layers *
+            (112U + kDeepSeekV4ExecutionContract.hidden_size *
+                        sizeof(std::uint16_t));
+        result.plan.mhc_device_bytes =
+            mhc_projection_bytes + mhc_auxiliary_bytes;
+        if (!add(result.plan.resident_spine_vram_bytes,
+                 result.plan.mhc_device_bytes)) {
+            result.errors.emplace_back(
+                "DeepSeek device mHC device byte count overflows");
             return result;
         }
     }

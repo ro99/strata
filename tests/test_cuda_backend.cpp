@@ -202,6 +202,24 @@ std::vector<float> reference_expert(
     return output;
 }
 
+struct Dsv4HostMoeCallbackFixture {
+    std::vector<float> rank_partials;
+    std::uint64_t calls{};
+    bool accepted{true};
+};
+
+bool fill_dsv4_host_moe_partials(
+    void* opaque, std::span<float> output) noexcept {
+    auto& fixture = *static_cast<Dsv4HostMoeCallbackFixture*>(opaque);
+    ++fixture.calls;
+    if (!fixture.accepted || output.size() != fixture.rank_partials.size()) {
+        return false;
+    }
+    std::copy(fixture.rank_partials.begin(), fixture.rank_partials.end(),
+              output.begin());
+    return true;
+}
+
 }  // namespace
 
 TEST_CASE("native CUDA FlashAttention validates device support before dispatch") {
@@ -1135,11 +1153,11 @@ TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE comman
         hidden[index] = static_cast<float>(static_cast<int>(index % 13U) - 6) /
                         16.0F;
     }
-    const auto reference0 = reference_int4_expert(
+    const auto expected0 = reference_int4_expert(
         backend, gate0, up0, down0, hidden, rows, intermediate_columns);
-    const auto reference1 = reference_int4_expert(
+    const auto expected1 = reference_int4_expert(
         backend, gate1, up1, down1, hidden, rows, intermediate_columns);
-    const auto reference_shared = reference_int4_expert(
+    const auto expected_shared = reference_int4_expert(
         backend, shared_gate, shared_up, shared_down, hidden, rows,
         intermediate_columns);
     const std::array<strata::CudaMoeExpert, 2> routed{{
@@ -1152,11 +1170,11 @@ TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE comman
     std::array<float, rows * hidden_columns> shared_output{};
     REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, &shared).ok());
     REQUIRE(backend.collect_moe(device, routed_output, shared_output).ok());
-    for (std::size_t index = 0U; index < reference0.size(); ++index) {
-        REQUIRE_NEAR(routed_output[index], reference0[index], 1.0e-4F);
-        REQUIRE_NEAR(routed_output[reference0.size() + index],
-                     reference1[index], 1.0e-4F);
-        REQUIRE_NEAR(shared_output[index], reference_shared[index], 1.0e-4F);
+    for (std::size_t index = 0U; index < expected0.size(); ++index) {
+        REQUIRE_NEAR(routed_output[index], expected0[index], 1.0e-4F);
+        REQUIRE_NEAR(routed_output[expected0.size() + index],
+                     expected1[index], 1.0e-4F);
+        REQUIRE_NEAR(shared_output[index], expected_shared[index], 1.0e-4F);
     }
     const auto first = backend.stats();
     REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, &shared).ok());
@@ -1204,13 +1222,13 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
     }
     constexpr float coefficient0 = 0.75F;
     constexpr float coefficient1 = 0.3125F;
-    const auto reference0 = reference_expert(
+    const auto expected0 = reference_expert(
         backend, routed0_w1, routed0_w3, routed0_w2, hidden,
         intermediate_columns, coefficient0, true);
-    const auto reference1 = reference_expert(
+    const auto expected1 = reference_expert(
         backend, routed1_w1, routed1_w3, routed1_w2, hidden,
         intermediate_columns, coefficient1, true);
-    const auto reference_shared = reference_expert(
+    const auto expected_shared = reference_expert(
         backend, shared_w1, shared_w3, shared_w2, hidden,
         intermediate_columns, 1.0F, false);
 
@@ -1233,21 +1251,21 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
         device, routed_output, shared_output).ok());
     float maximum_difference = 0.0F;
     for (std::size_t column = 0U; column < hidden_columns; ++column) {
-        const float difference0 = std::abs(routed_output[column] - reference0[column]);
+        const float difference0 = std::abs(routed_output[column] - expected0[column]);
         const float difference1 = std::abs(
-            routed_output[hidden_columns + column] - reference1[column]);
+            routed_output[hidden_columns + column] - expected1[column]);
         const float shared_difference =
-            std::abs(shared_output[column] - reference_shared[column]);
+            std::abs(shared_output[column] - expected_shared[column]);
         maximum_difference = std::max(
             maximum_difference,
             std::max(difference0, std::max(difference1, shared_difference)));
         REQUIRE(std::bit_cast<std::uint32_t>(routed_output[column]) ==
-                std::bit_cast<std::uint32_t>(reference0[column]));
+                std::bit_cast<std::uint32_t>(expected0[column]));
         REQUIRE(std::bit_cast<std::uint32_t>(
                     routed_output[hidden_columns + column]) ==
-                std::bit_cast<std::uint32_t>(reference1[column]));
+                std::bit_cast<std::uint32_t>(expected1[column]));
         REQUIRE(std::bit_cast<std::uint32_t>(shared_output[column]) ==
-                std::bit_cast<std::uint32_t>(reference_shared[column]));
+                std::bit_cast<std::uint32_t>(expected_shared[column]));
         REQUIRE((std::bit_cast<std::uint32_t>(routed_output[column]) & 0xFFFFU) == 0U);
         REQUIRE((std::bit_cast<std::uint32_t>(
                      routed_output[hidden_columns + column]) & 0xFFFFU) == 0U);
@@ -1289,6 +1307,64 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
             (after.deepseek_moe_d2h_nanoseconds -
              before.deepseek_moe_d2h_nanoseconds));
 
+    // The host callback boundary supplies two rank-local partials through one
+    // stream callback. The GPU must preserve the retained association exactly:
+    // bf16(bf16(rank0 + rank1) + bf16(shared)).
+    Dsv4HostMoeCallbackFixture host_fixture;
+    host_fixture.rank_partials.insert(
+        host_fixture.rank_partials.end(), expected0.begin(), expected0.end());
+    host_fixture.rank_partials.insert(
+        host_fixture.rank_partials.end(), expected1.begin(), expected1.end());
+    std::array<float, hidden_columns> host_join_output{};
+    const auto before_host_join = backend.stats();
+    REQUIRE(backend.enqueue_dsv4_host_moe(
+        device, hidden, shared, 10.0F, fill_dsv4_host_moe_partials,
+        &host_fixture).ok());
+    REQUIRE(!backend.synchronize(device).ok());
+    REQUIRE(backend.collect_deepseek_moe(
+        device, {}, host_join_output).ok());
+    REQUIRE(host_fixture.calls == 1U);
+    for (std::size_t column = 0U; column < hidden_columns; ++column) {
+        const auto expected = round_bf16(
+            round_bf16(expected0[column] + expected1[column]) +
+            round_bf16(expected_shared[column]));
+        REQUIRE(std::bit_cast<std::uint32_t>(host_join_output[column]) ==
+                std::bit_cast<std::uint32_t>(expected));
+    }
+    const auto after_host_join = backend.stats();
+    REQUIRE(after_host_join.deepseek_moe_calls -
+                before_host_join.deepseek_moe_calls == 1U);
+    REQUIRE(after_host_join.deepseek_moe_kernel_launches -
+                before_host_join.deepseek_moe_kernel_launches == 5U);
+    REQUIRE(after_host_join.deepseek_moe_h2d_transfers -
+                before_host_join.deepseek_moe_h2d_transfers == 2U);
+    REQUIRE(after_host_join.deepseek_moe_h2d_bytes -
+                before_host_join.deepseek_moe_h2d_bytes ==
+            3U * hidden_columns * sizeof(float));
+    REQUIRE(after_host_join.deepseek_moe_d2h_transfers -
+                before_host_join.deepseek_moe_d2h_transfers == 2U);
+    REQUIRE(after_host_join.deepseek_moe_d2h_bytes -
+                before_host_join.deepseek_moe_d2h_bytes ==
+            hidden_columns * sizeof(float) + sizeof(unsigned int));
+    REQUIRE(after_host_join.matmul_calls - before_host_join.matmul_calls == 3U);
+
+    host_fixture.accepted = false;
+    host_join_output.fill(123.0F);
+    REQUIRE(backend.enqueue_dsv4_host_moe(
+        device, hidden, shared, 10.0F, fill_dsv4_host_moe_partials,
+        &host_fixture).ok());
+    REQUIRE(!backend.collect_deepseek_moe(
+        device, {}, host_join_output).ok());
+    REQUIRE(host_fixture.calls == 2U);
+    REQUIRE(std::all_of(host_join_output.begin(), host_join_output.end(),
+                        [](float value) { return value == 123.0F; }));
+    host_fixture.accepted = true;
+    REQUIRE(backend.enqueue_dsv4_host_moe(
+        device, hidden, shared, 10.0F, fill_dsv4_host_moe_partials,
+        &host_fixture).ok());
+    REQUIRE(backend.collect_deepseek_moe(
+        device, {}, host_join_output).ok());
+
     // Non-finite W1/W3 output is an explicit failure and never reaches the
     // caller through the backend-owned staging buffer.
     auto invalid_w1 = upload_fp4_nan_scale(
@@ -1314,4 +1390,278 @@ TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when availabl
         device, hidden, routed, &shared, 10.0F).ok());
     REQUIRE(backend.collect_deepseek_moe(
         device, routed_output, shared_output).ok());
+}
+
+TEST_CASE("native CUDA DeepSeek paged attention reads persistent physical pages") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const auto device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_devices{device};
+    REQUIRE(backend.initialize(selected_devices, true).ok());
+
+    constexpr std::uint32_t page_rows = 256U;
+    std::vector<std::byte> physical_page(
+        static_cast<std::size_t>(page_rows) * 584U);
+    // Every candidate decodes to an all-one 512-wide value. This exercises
+    // the block-major FP8/BF16 materialization and the complete nonzero
+    // finish path while retaining an exact analytical result: identical
+    // zero scores give a weighted average of one in every output lane.
+    constexpr std::size_t data_row_bytes = 576U;
+    constexpr std::size_t nope_columns = 448U;
+    constexpr std::size_t rope_columns = 64U;
+    const auto one_bf16 = bf16(1.0F);
+    for (std::uint32_t row = 0U; row < page_rows; ++row) {
+        const auto data_offset = static_cast<std::size_t>(row) * data_row_bytes;
+        std::fill_n(physical_page.begin() +
+                        static_cast<std::ptrdiff_t>(data_offset),
+                    nope_columns, std::byte{0x38U});
+        for (std::size_t column = 0U; column < rope_columns; ++column) {
+            std::copy(one_bf16.begin(), one_bf16.end(),
+                      physical_page.begin() + static_cast<std::ptrdiff_t>(
+                          data_offset + nope_columns + column * 2U));
+        }
+        const auto scale_offset =
+            static_cast<std::size_t>(page_rows) * data_row_bytes +
+            static_cast<std::size_t>(row) * 8U;
+        std::fill_n(physical_page.begin() +
+                        static_cast<std::ptrdiff_t>(scale_offset),
+                    7U, std::byte{127U});
+    }
+    strata::CudaBuffer page_buffer;
+    REQUIRE(backend.upload_buffer(device, physical_page, page_buffer).ok());
+    const std::array<strata::CudaDsv4PhysicalPage, 1> pages{{
+        {&page_buffer, page_rows},
+    }};
+    std::vector<strata::CudaDsv4AttentionCandidate> candidates(128U);
+    for (std::uint32_t row = 0U; row < candidates.size(); ++row) {
+        candidates[row] = {0U, row, true};
+    }
+    std::vector<float> queries(64U * 512U);
+    std::array<float, 64> sinks{};
+    sinks.fill(-1.0e30F);
+    std::vector<float> output(queries.size());
+    const auto before = backend.stats();
+    for (std::size_t head_begin = 0U; head_begin < 64U; head_begin += 32U) {
+        strata::CudaDsv4PagedAttentionRequest request;
+        request.queries = std::span<const float>(queries).subspan(
+            head_begin * 512U, 32U * 512U);
+        request.head_sinks = std::span<const float>(sinks).subspan(
+            head_begin, 32U);
+        request.pages = pages;
+        request.candidates = candidates;
+        request.scale = 1.0F / std::sqrt(512.0F);
+        const auto executed = backend.dsv4_paged_attention(
+            device, request,
+            std::span<float>(output).subspan(
+                head_begin * 512U, 32U * 512U));
+        if (!executed.ok() && std::any_of(
+            executed.errors.begin(), executed.errors.end(),
+            [](const std::string& error) {
+                return error.find("SM86") != std::string::npos;
+            })) {
+            return;
+        }
+        REQUIRE(executed.ok());
+    }
+    REQUIRE(std::all_of(output.begin(), output.end(), [](float value) {
+        return std::bit_cast<std::uint32_t>(value) ==
+               std::bit_cast<std::uint32_t>(1.0F);
+    }));
+    const auto after = backend.stats();
+    REQUIRE(after.dsv4_paged_attention_calls -
+                before.dsv4_paged_attention_calls == 2U);
+    REQUIRE(after.dsv4_paged_attention_kernel_launches -
+                before.dsv4_paged_attention_kernel_launches == 14U);
+    REQUIRE(after.dsv4_paged_attention_page_bytes -
+                before.dsv4_paged_attention_page_bytes ==
+            2U * physical_page.size());
+    REQUIRE(after.dsv4_paged_attention_h2d_bytes >
+            before.dsv4_paged_attention_h2d_bytes);
+    REQUIRE(after.dsv4_paged_attention_d2h_bytes -
+                before.dsv4_paged_attention_d2h_bytes ==
+            output.size() * sizeof(std::uint16_t) +
+                2U * sizeof(unsigned int));
+}
+
+TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const auto device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_devices{device};
+    REQUIRE(backend.initialize(selected_devices, true).ok());
+    if (!backend.validate_dsv4_mhc_device(device).ok()) return;
+
+    constexpr std::size_t hidden = 4096U;
+    constexpr std::size_t multiplier = 4U;
+    constexpr std::size_t mixes = 24U;
+    std::vector<float> projection(mixes * multiplier * hidden);
+    std::array<float, 3> scale{};
+    std::array<float, mixes> base{};
+    std::vector<float> norm(hidden, 1.0F);
+    strata::CudaDsv4MhcWeights weights;
+    const auto before = backend.stats();
+    REQUIRE(backend.upload_dsv4_mhc_weights(
+        device, projection, scale, base, norm, weights).ok());
+    REQUIRE(weights.valid());
+
+    std::vector<float> residual(multiplier * hidden, 1.0F);
+    std::vector<float> weighted(hidden);
+    std::vector<float> layer_input(hidden);
+    REQUIRE(backend.dsv4_mhc_begin(
+        device, weights, residual, weighted, layer_input).ok());
+    REQUIRE(std::all_of(weighted.begin(), weighted.end(), [](float value) {
+        return value == 2.0F;
+    }));
+    REQUIRE(std::all_of(layer_input.begin(), layer_input.end(), [](float value) {
+        return value == 1.0F;
+    }));
+
+    std::vector<float> branch(hidden, 1.0F);
+    std::vector<float> post_residual(multiplier * hidden);
+    REQUIRE(backend.dsv4_mhc_transition(
+        device, weights, branch, weighted, layer_input,
+        post_residual).ok());
+    REQUIRE(std::all_of(post_residual.begin(), post_residual.end(),
+                        [](float value) { return value == 2.0F; }));
+    REQUIRE(std::all_of(weighted.begin(), weighted.end(), [](float value) {
+        return value == 4.0F;
+    }));
+    REQUIRE(std::all_of(layer_input.begin(), layer_input.end(), [](float value) {
+        return value == 1.0F;
+    }));
+
+    REQUIRE(backend.dsv4_mhc_finish(
+        device, branch, residual).ok());
+    REQUIRE(std::all_of(residual.begin(), residual.end(), [](float value) {
+        return value == 3.0F;
+    }));
+    const auto after = backend.stats();
+    REQUIRE(after.dsv4_mhc_calls - before.dsv4_mhc_calls == 3U);
+    REQUIRE(after.dsv4_mhc_standalone_calls -
+                before.dsv4_mhc_standalone_calls == 1U);
+    REQUIRE(after.dsv4_mhc_transition_calls -
+                before.dsv4_mhc_transition_calls == 1U);
+    REQUIRE(after.dsv4_mhc_final_calls -
+                before.dsv4_mhc_final_calls == 1U);
+    REQUIRE(after.dsv4_mhc_kernel_launches -
+                before.dsv4_mhc_kernel_launches == 8U);
+    REQUIRE(after.dsv4_mhc_resident_weight_bytes -
+                before.dsv4_mhc_resident_weight_bytes ==
+            weights.device_bytes());
+    REQUIRE(after.dsv4_mhc_h2d_bytes - before.dsv4_mhc_h2d_bytes ==
+            49'152U);
+    REQUIRE(after.dsv4_mhc_d2h_bytes - before.dsv4_mhc_d2h_bytes ==
+            98'304U);
+
+    const auto production_before = backend.stats();
+    REQUIRE(backend.dsv4_mhc_begin(
+        device, weights, residual, std::span<float>{}, layer_input).ok());
+    REQUIRE(std::all_of(layer_input.begin(), layer_input.end(), [](float value) {
+        return value == 1.0F;
+    }));
+    REQUIRE(backend.dsv4_mhc_transition(
+        device, weights, branch, std::span<float>{}, layer_input).ok());
+    REQUIRE(std::all_of(layer_input.begin(), layer_input.end(), [](float value) {
+        return value == 1.0F;
+    }));
+    REQUIRE(backend.dsv4_mhc_finish(device, branch, residual).ok());
+    const auto production_after = backend.stats();
+    REQUIRE(production_after.dsv4_mhc_h2d_bytes -
+                production_before.dsv4_mhc_h2d_bytes ==
+            49'152U);
+    REQUIRE(production_after.dsv4_mhc_d2h_bytes -
+                production_before.dsv4_mhc_d2h_bytes ==
+            49'152U);
+
+    // The live device path leaves the exact shared/routed BF16 result in
+    // the persistent mHC branch buffer. Its consumer must reject missing or
+    // stale producers and match the retained host bridge bit for bit.
+    constexpr std::uint64_t shared_intermediate = 128U;
+    auto shared_w1 = upload_fp8(
+        backend, device, shared_intermediate, hidden, 1U);
+    auto shared_w3 = upload_fp8(
+        backend, device, shared_intermediate, hidden, 4U);
+    auto shared_w2 = upload_fp8(
+        backend, device, hidden, shared_intermediate, 7U);
+    const strata::CudaDeepSeekMoeExpert shared{
+        &shared_w1, &shared_w3, &shared_w2, 1.0F};
+    Dsv4HostMoeCallbackFixture fixture;
+    fixture.rank_partials.resize(2U * hidden);
+    for (std::size_t index = 0U; index < fixture.rank_partials.size(); ++index) {
+        fixture.rank_partials[index] =
+            static_cast<float>(static_cast<int>(index % 13U) - 6) * 0.03125F;
+    }
+
+    const std::vector<float> initial(multiplier * hidden, 1.0F);
+    std::vector<float> device_residual = initial;
+    std::vector<float> device_input(hidden);
+    std::vector<float> device_post(multiplier * hidden);
+    std::vector<float> device_join(hidden);
+    REQUIRE(backend.dsv4_mhc_begin(
+        device, weights, device_residual, {}, device_input).ok());
+    REQUIRE(!backend.dsv4_mhc_transition_device(
+        device, weights, {}, device_input, device_post).ok());
+    REQUIRE(backend.enqueue_dsv4_host_moe_from_mhc(
+        device, shared, 10.0F, fill_dsv4_host_moe_partials,
+        &fixture).ok());
+    REQUIRE(backend.collect_deepseek_moe(device, {}, device_join).ok());
+    REQUIRE(!backend.dsv4_mhc_transition(
+        device, weights, branch, {}, device_input, device_post).ok());
+    REQUIRE(backend.dsv4_mhc_transition_device(
+        device, weights, {}, device_input, device_post).ok());
+    REQUIRE(backend.dsv4_mhc_finish(
+        device, branch, device_residual).ok());
+
+    std::vector<float> host_residual = initial;
+    std::vector<float> host_input(hidden);
+    std::vector<float> host_post(multiplier * hidden);
+    std::vector<float> host_join(hidden);
+    REQUIRE(backend.dsv4_mhc_begin(
+        device, weights, host_residual, {}, host_input).ok());
+    REQUIRE(backend.enqueue_dsv4_host_moe(
+        device, host_input, shared, 10.0F,
+        fill_dsv4_host_moe_partials, &fixture).ok());
+    REQUIRE(backend.collect_deepseek_moe(device, {}, host_join).ok());
+    REQUIRE(backend.dsv4_mhc_transition(
+        device, weights, host_join, {}, host_input, host_post).ok());
+    REQUIRE(backend.dsv4_mhc_finish(
+        device, branch, host_residual).ok());
+    for (std::size_t index = 0U; index < hidden; ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(device_join[index]) ==
+                std::bit_cast<std::uint32_t>(host_join[index]));
+    }
+    for (std::size_t index = 0U; index < device_post.size(); ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(device_post[index]) ==
+                std::bit_cast<std::uint32_t>(host_post[index]));
+    }
+
+    std::vector<float> traffic_residual = initial;
+    std::vector<float> traffic_input(hidden);
+    REQUIRE(backend.dsv4_mhc_begin(
+        device, weights, traffic_residual, {}, traffic_input).ok());
+    const auto bridge_before = backend.stats();
+    REQUIRE(backend.enqueue_dsv4_host_moe_from_mhc(
+        device, shared, 10.0F, fill_dsv4_host_moe_partials,
+        &fixture).ok());
+    REQUIRE(backend.collect_deepseek_moe(device, {}, {}).ok());
+    const auto bridge_after = backend.stats();
+    REQUIRE(bridge_after.deepseek_moe_kernel_launches -
+                bridge_before.deepseek_moe_kernel_launches == 5U);
+    REQUIRE(bridge_after.deepseek_moe_h2d_transfers -
+                bridge_before.deepseek_moe_h2d_transfers == 1U);
+    REQUIRE(bridge_after.deepseek_moe_h2d_bytes -
+                bridge_before.deepseek_moe_h2d_bytes ==
+            2U * hidden * sizeof(float));
+    REQUIRE(bridge_after.deepseek_moe_d2h_transfers -
+                bridge_before.deepseek_moe_d2h_transfers == 1U);
+    REQUIRE(bridge_after.deepseek_moe_d2h_bytes -
+                bridge_before.deepseek_moe_d2h_bytes == sizeof(unsigned int));
+    const auto finish_before = backend.stats();
+    REQUIRE(backend.dsv4_mhc_finish_device(
+        device, traffic_residual).ok());
+    const auto finish_after = backend.stats();
+    REQUIRE(finish_after.dsv4_mhc_h2d_bytes -
+                finish_before.dsv4_mhc_h2d_bytes == 0U);
 }

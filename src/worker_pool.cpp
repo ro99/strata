@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -50,9 +51,12 @@ struct HostWorkerPool::Impl {
     std::deque<std::function<void()>> queue;
     std::vector<std::deque<std::function<void()>>> queues;
     std::vector<std::thread> workers;
+    std::atomic<std::uint64_t> dispatches{};
+    std::chrono::microseconds idle_spin;
     bool stopping{};
 
-    explicit Impl(std::size_t count) {
+    explicit Impl(std::size_t count, std::chrono::microseconds spin)
+        : idle_spin(spin) {
         queues.resize(count);
         workers.reserve(count);
         for (std::size_t index = 0; index < count; ++index) {
@@ -76,6 +80,7 @@ struct HostWorkerPool::Impl {
                     pthread_self(), sizeof(affinity), &affinity));
                 for (;;) {
                     std::function<void()> task;
+                    std::uint64_t task_dispatch{};
                     {
                         std::unique_lock lock(mutex);
                         ready.wait(lock, [this, index] {
@@ -94,8 +99,26 @@ struct HostWorkerPool::Impl {
                         } else {
                             return;  // stopping, both queues drained
                         }
+                        task_dispatch = dispatches.load(std::memory_order_acquire);
                     }
                     task();
+                    if (idle_spin > std::chrono::microseconds::zero()) {
+                        const auto deadline =
+                            std::chrono::steady_clock::now() + idle_spin;
+                        std::uint32_t spins = 0U;
+                        while (dispatches.load(std::memory_order_acquire) ==
+                               task_dispatch) {
+#if defined(__x86_64__) || defined(__i386__)
+                            __builtin_ia32_pause();
+#else
+                            std::this_thread::yield();
+#endif
+                            if ((++spins & 255U) == 0U &&
+                                std::chrono::steady_clock::now() >= deadline) {
+                                break;
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -105,14 +128,16 @@ struct HostWorkerPool::Impl {
         {
             std::scoped_lock lock(mutex);
             stopping = true;
+            dispatches.fetch_add(1U, std::memory_order_release);
         }
         ready.notify_all();
         for (auto& worker : workers) worker.join();
     }
 };
 
-HostWorkerPool::HostWorkerPool(std::size_t workers)
-    : impl_(std::make_unique<Impl>(workers)) {}
+HostWorkerPool::HostWorkerPool(std::size_t workers,
+                               std::chrono::microseconds idle_spin)
+    : impl_(std::make_unique<Impl>(workers, idle_spin)) {}
 HostWorkerPool::~HostWorkerPool() = default;
 HostWorkerPool::HostWorkerPool(HostWorkerPool&&) noexcept = default;
 HostWorkerPool& HostWorkerPool::operator=(HostWorkerPool&&) noexcept = default;
@@ -157,6 +182,7 @@ ValidationResult HostWorkerPool::parallel_for_addressed(
                 completion->ready.notify_one();
             });
         }
+        impl_->dispatches.fetch_add(1U, std::memory_order_release);
     }
     impl_->ready.notify_all();
     {
@@ -216,6 +242,7 @@ ValidationResult HostWorkerPool::parallel_for(
                 completion->ready.notify_one();
             });
         }
+        impl_->dispatches.fetch_add(1U, std::memory_order_release);
     }
     impl_->ready.notify_all();
     {

@@ -318,6 +318,234 @@ bool dsv4_host_expert_avx2_supported() noexcept {
 #endif
 }
 
+std::uint64_t dsv4_tiled_expert_shard_bytes(
+    std::uint64_t hidden, std::uint64_t intermediate,
+    std::uint64_t shards) noexcept {
+    if (hidden == 0U || intermediate == 0U || shards == 0U ||
+        hidden % 32U != 0U || intermediate % (32U * shards) != 0U) {
+        return 0U;
+    }
+    const auto shard_intermediate = intermediate / shards;
+    return 2U * shard_intermediate * (hidden / 2U) +
+           2U * shard_intermediate * (hidden / 16U) +
+           hidden * (shard_intermediate / 2U) +
+           hidden * (shard_intermediate / 16U);
+}
+
+ParseResult<Dsv4TiledExpertWeights> dsv4_tiled_expert_weights(
+    std::span<const std::byte> storage, std::uint64_t hidden,
+    std::uint64_t intermediate, std::uint64_t shards) {
+    ParseResult<Dsv4TiledExpertWeights> result;
+    const auto bytes = dsv4_tiled_expert_shard_bytes(
+        hidden, intermediate, shards);
+    if (bytes == 0U || storage.size() != bytes) {
+        result.errors.emplace_back(
+            "DeepSeek tiled expert shard has an incompatible extent");
+        return result;
+    }
+    const auto shard_intermediate = intermediate / shards;
+    const auto w13_packed = 2U * shard_intermediate * (hidden / 2U);
+    const auto w13_scales = 2U * shard_intermediate * (hidden / 16U);
+    const auto w2_packed = hidden * (shard_intermediate / 2U);
+    const auto w2_scales = hidden * (shard_intermediate / 16U);
+    result.value.w13_packed = storage.first(w13_packed);
+    storage = storage.subspan(w13_packed);
+    result.value.w13_scales = storage.first(w13_scales);
+    storage = storage.subspan(w13_scales);
+    result.value.w2_packed = storage.first(w2_packed);
+    result.value.w2_scales = storage.subspan(w2_packed, w2_scales);
+    return result;
+}
+
+ValidationResult dsv4_transform_tiled_expert_shard(
+    std::span<std::byte> destination, const Dsv4HostExpertWeights& canonical,
+    std::uint64_t hidden, std::uint64_t intermediate, std::uint64_t shard,
+    std::uint64_t shards) {
+    ValidationResult result;
+    const auto shard_bytes = dsv4_tiled_expert_shard_bytes(
+        hidden, intermediate, shards);
+    if (shard >= shards || destination.size() != shard_bytes ||
+        canonical.w1_packed.size() != intermediate * (hidden / 2U) ||
+        canonical.w3_packed.size() != intermediate * (hidden / 2U) ||
+        canonical.w1_scales.size() != intermediate * (hidden / 32U) ||
+        canonical.w3_scales.size() != intermediate * (hidden / 32U) ||
+        canonical.w2_packed.size() != hidden * (intermediate / 2U) ||
+        canonical.w2_scales.size() != hidden * (intermediate / 32U)) {
+        result.errors.emplace_back(
+            "DeepSeek tiled expert transform has incompatible extents");
+        return result;
+    }
+    constexpr std::uint64_t block_rows = 32U;
+    const auto shard_intermediate = intermediate / shards;
+    const auto w13_packed_bytes =
+        2U * shard_intermediate * (hidden / 2U);
+    const auto w13_scale_bytes =
+        2U * shard_intermediate * (hidden / 16U);
+    const auto w2_packed_bytes = hidden * (shard_intermediate / 2U);
+    auto* packed13 = reinterpret_cast<std::uint8_t*>(destination.data());
+    auto* scales13 = packed13 + w13_packed_bytes;
+    auto* packed2 = scales13 + w13_scale_bytes;
+    auto* scales2 = packed2 + w2_packed_bytes;
+    const std::uint8_t* source[] = {
+        reinterpret_cast<const std::uint8_t*>(canonical.w1_packed.data()),
+        reinterpret_cast<const std::uint8_t*>(canonical.w3_packed.data())};
+    const std::uint8_t* source_scales[] = {
+        reinterpret_cast<const std::uint8_t*>(canonical.w1_scales.data()),
+        reinterpret_cast<const std::uint8_t*>(canonical.w3_scales.data())};
+    const auto* source_w2 =
+        reinterpret_cast<const std::uint8_t*>(canonical.w2_packed.data());
+    const auto* source_s2 =
+        reinterpret_cast<const std::uint8_t*>(canonical.w2_scales.data());
+    for (std::uint64_t projection = 0U; projection < 2U; ++projection) {
+        for (std::uint64_t row = 0U; row < shard_intermediate; ++row) {
+            const auto source_row = shard * shard_intermediate + row;
+            const auto output = projection * shard_intermediate + row;
+            const auto block = output / block_rows;
+            const auto within = output % block_rows;
+            for (std::uint64_t pair = 0U; pair < hidden / 2U; ++pair) {
+                packed13[(block * (hidden / 2U) + pair) * block_rows + within] =
+                    source[projection][source_row * (hidden / 2U) + pair];
+            }
+            for (std::uint64_t group = 0U; group < hidden / 16U; ++group) {
+                scales13[(block * (hidden / 16U) + group) * block_rows + within] =
+                    source_scales[projection][
+                        source_row * (hidden / 32U) + group / 2U];
+            }
+        }
+    }
+    for (std::uint64_t row = 0U; row < hidden; ++row) {
+        const auto block = row / block_rows;
+        const auto within = row % block_rows;
+        for (std::uint64_t pair = 0U; pair < shard_intermediate / 2U; ++pair) {
+            packed2[(block * (shard_intermediate / 2U) + pair) * block_rows +
+                    within] =
+                source_w2[row * (intermediate / 2U) +
+                          shard * (shard_intermediate / 2U) + pair];
+        }
+        for (std::uint64_t group = 0U; group < shard_intermediate / 16U;
+             ++group) {
+            scales2[(block * (shard_intermediate / 16U) + group) * block_rows +
+                    within] =
+                source_s2[row * (intermediate / 32U) +
+                          shard * (shard_intermediate / 32U) + group / 2U];
+        }
+    }
+    return result;
+}
+
+namespace {
+
+[[maybe_unused]] void tiled_matvec16_scalar(
+    float* output, const float* input, const std::uint8_t* packed,
+    const std::uint8_t* scales, std::uint64_t inputs) noexcept {
+    std::fill_n(output, 16U, 0.0F);
+    for (std::uint64_t column = 0U; column < inputs; ++column) {
+        const auto* weights = packed + (column / 2U) * 32U;
+        const auto* scale = scales + (column / 16U) * 32U;
+        for (std::uint64_t row = 0U; row < 16U; ++row) {
+            const auto encoded = column % 2U == 0U
+                ? weights[row] & 0x0FU : weights[row] >> 4U;
+            output[row] = std::fma(
+                input[column],
+                kFp4Value[encoded] * e8m0_scale(scale[row]), output[row]);
+        }
+    }
+}
+
+#if STRATA_DSV4_EXPERT_AVX2
+__attribute__((target("avx2,fma")))
+__m256 tiled_decode_fp4(__m256i bytes, __m256 magnitude) noexcept {
+    const auto index = _mm256_and_si256(bytes, _mm256_set1_epi32(7));
+    const auto sign = _mm256_slli_epi32(
+        _mm256_and_si256(bytes, _mm256_set1_epi32(8)), 28);
+    return _mm256_xor_ps(_mm256_permutevar8x32_ps(magnitude, index),
+                         _mm256_castsi256_ps(sign));
+}
+
+__attribute__((target("avx2,fma")))
+__m256 tiled_decode_e8m0(__m256i bytes) noexcept {
+    auto bits = _mm256_slli_epi32(bytes, 23);
+    bits = _mm256_blendv_epi8(
+        bits, _mm256_set1_epi32(0x0040'0000),
+        _mm256_cmpeq_epi32(bytes, _mm256_setzero_si256()));
+    bits = _mm256_blendv_epi8(
+        bits, _mm256_set1_epi32(0x7FC0'0000),
+        _mm256_cmpeq_epi32(bytes, _mm256_set1_epi32(0xFF)));
+    return _mm256_castsi256_ps(bits);
+}
+
+__attribute__((target("avx2,fma")))
+void tiled_matvec16_avx2(float* output, const float* input,
+                         const std::uint8_t* packed,
+                         const std::uint8_t* scales,
+                         std::uint64_t inputs) noexcept {
+    const __m256 magnitude = _mm256_loadu_ps(kFp4Magnitude.data());
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    for (std::uint64_t group = 0U; group < inputs / 16U; ++group) {
+        const auto raw_scale = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(scales + group * 32U));
+        const __m256 scale0 =
+            tiled_decode_e8m0(_mm256_cvtepu8_epi32(raw_scale));
+        const __m256 scale1 = tiled_decode_e8m0(
+            _mm256_cvtepu8_epi32(_mm_srli_si128(raw_scale, 8)));
+        for (std::uint64_t pair = 0U; pair < 8U; ++pair) {
+            const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                packed + (group * 8U + pair) * 32U));
+            const auto bytes0 = _mm256_cvtepu8_epi32(raw);
+            const auto bytes1 =
+                _mm256_cvtepu8_epi32(_mm_srli_si128(raw, 8));
+            const __m256 even =
+                _mm256_set1_ps(input[group * 16U + pair * 2U]);
+            const __m256 odd =
+                _mm256_set1_ps(input[group * 16U + pair * 2U + 1U]);
+            sum0 = _mm256_fmadd_ps(
+                _mm256_mul_ps(tiled_decode_fp4(bytes0, magnitude), scale0),
+                even, sum0);
+            sum1 = _mm256_fmadd_ps(
+                _mm256_mul_ps(tiled_decode_fp4(bytes1, magnitude), scale1),
+                even, sum1);
+            sum0 = _mm256_fmadd_ps(
+                _mm256_mul_ps(tiled_decode_fp4(
+                    _mm256_srli_epi32(bytes0, 4), magnitude), scale0),
+                odd, sum0);
+            sum1 = _mm256_fmadd_ps(
+                _mm256_mul_ps(tiled_decode_fp4(
+                    _mm256_srli_epi32(bytes1, 4), magnitude), scale1),
+                odd, sum1);
+        }
+    }
+    _mm256_storeu_ps(output, sum0);
+    _mm256_storeu_ps(output + 8U, sum1);
+}
+#endif
+
+}  // namespace
+
+void dsv4_tiled_expert_matvec16(
+    std::span<float, 16U> output, std::span<const float> input,
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    std::uint64_t outputs, std::uint64_t output_begin) noexcept {
+    constexpr std::uint64_t block_rows = 32U;
+    const auto block = output_begin / block_rows;
+    const auto within = output_begin % block_rows;
+    const auto* packed_data = reinterpret_cast<const std::uint8_t*>(
+        packed.data() + block * (input.size() / 2U) * block_rows + within);
+    const auto* scale_data = reinterpret_cast<const std::uint8_t*>(
+        scales.data() + block * (input.size() / 16U) * block_rows + within);
+    static_cast<void>(outputs);
+#if STRATA_DSV4_EXPERT_AVX2
+    static const bool vector = dsv4_host_expert_avx2_supported();
+    if (vector) {
+        tiled_matvec16_avx2(output.data(), input.data(), packed_data, scale_data,
+                            input.size());
+        return;
+    }
+#endif
+    tiled_matvec16_scalar(output.data(), input.data(), packed_data, scale_data,
+                          input.size());
+}
+
 namespace {
 
 [[nodiscard]] ValidationResult validate_shape(

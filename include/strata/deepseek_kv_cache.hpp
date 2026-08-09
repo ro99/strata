@@ -22,6 +22,8 @@ enum class Dsv4KvFormat : std::uint8_t {
     F32,
     Fp8E4m3Group64Bf16Rope,
     Fp4E2m1Group32,
+    PhysicalFp8E4m3Group64Bf16Rope,
+    PhysicalFp8E4m3PerTensor,
 };
 
 inline constexpr std::uint16_t kDsv4KvFormatVersion = 1U;
@@ -31,6 +33,7 @@ inline constexpr std::uint16_t kDsv4KvBlockHeaderBytes = 64U;
 enum class Dsv4KvCacheMode : std::uint8_t {
     ScalarOracle,
     Block,
+    PhysicalDevice,
 };
 
 using Dsv4SequenceHandle = std::uint64_t;
@@ -42,6 +45,7 @@ struct Dsv4KvCacheConfig {
     std::vector<int> devices;
     std::vector<std::uint64_t> device_capacity_bytes;
     bool f32_oracle{};
+    bool physical_layout{};
 };
 
 struct Dsv4KvBlockInfo {
@@ -64,7 +68,11 @@ struct Dsv4KvBlockInfo {
 };
 
 [[nodiscard]] Dsv4KvFormat dsv4_kv_format(
-    Dsv4KvBlockKind kind, bool f32_oracle = false) noexcept;
+    Dsv4KvBlockKind kind, bool f32_oracle = false,
+    bool physical_layout = false) noexcept;
+[[nodiscard]] std::uint32_t dsv4_kv_block_rows(
+    Dsv4KvBlockKind kind, std::uint32_t compression_ratio,
+    bool physical_layout = false) noexcept;
 [[nodiscard]] std::uint64_t dsv4_kv_row_bytes(
     Dsv4KvBlockKind kind, Dsv4KvFormat format) noexcept;
 [[nodiscard]] std::uint64_t dsv4_kv_block_bytes(
@@ -129,6 +137,58 @@ private:
     friend class Dsv4KvCache;
 };
 
+// Owns one contiguous physical append while its exact CPU encoder
+// and the following device-page patch execute in stream order.  Reservation
+// advances only host block-table metadata; commit publishes the accepted row
+// into both the canonical host page and caller-provided pinned patch bytes.
+class Dsv4KvPhysicalAppend {
+public:
+    Dsv4KvPhysicalAppend();
+    ~Dsv4KvPhysicalAppend();
+    Dsv4KvPhysicalAppend(Dsv4KvPhysicalAppend&&) noexcept;
+    Dsv4KvPhysicalAppend& operator=(Dsv4KvPhysicalAppend&&) noexcept;
+    Dsv4KvPhysicalAppend(const Dsv4KvPhysicalAppend&) = delete;
+    Dsv4KvPhysicalAppend& operator=(const Dsv4KvPhysicalAppend&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] const CudaBuffer* buffer() const noexcept;
+    [[nodiscard]] std::uint64_t data_offset() const noexcept;
+    [[nodiscard]] std::uint64_t scale_offset() const noexcept;
+    [[nodiscard]] std::uint32_t data_bytes() const noexcept;
+    [[nodiscard]] std::uint32_t scale_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t patch_bytes() const noexcept;
+    [[nodiscard]] ValidationResult commit(
+        std::span<const float> values, std::span<std::byte> patch);
+    [[nodiscard]] ValidationResult account();
+
+private:
+    std::shared_ptr<Dsv4KvCacheState> state_;
+    Dsv4KvDeviceLease lease_;
+    std::uint64_t block_id_{};
+    std::uint32_t physical_row_{};
+    std::uint64_t data_offset_{};
+    std::uint64_t scale_offset_{};
+    std::uint32_t data_bytes_{};
+    std::uint32_t scale_bytes_{};
+    std::byte* payload_{};
+    std::uint64_t payload_bytes_{};
+    std::uint32_t row_width_{};
+    Dsv4KvBlockKind kind_{Dsv4KvBlockKind::Sliding};
+    Dsv4KvFormat format_{Dsv4KvFormat::F32};
+    bool committed_{};
+    bool accounted_{};
+
+    Dsv4KvPhysicalAppend(
+        std::shared_ptr<Dsv4KvCacheState> state,
+        Dsv4KvDeviceLease lease, std::uint64_t block_id,
+        std::uint32_t physical_row, std::uint64_t data_offset,
+        std::uint64_t scale_offset, std::uint32_t data_bytes,
+        std::uint32_t scale_bytes, std::byte* payload,
+        std::uint64_t payload_bytes, std::uint32_t row_width,
+        Dsv4KvBlockKind kind, Dsv4KvFormat format);
+    friend class Dsv4KvCache;
+};
+
 class Dsv4KvCache {
 public:
     explicit Dsv4KvCache(Dsv4KvCacheConfig config,
@@ -147,6 +207,11 @@ public:
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::uint32_t compression_ratio,
         std::uint64_t logical_row, std::span<const float> values);
+    [[nodiscard]] ParseResult<Dsv4KvPhysicalAppend>
+    reserve_physical_append(
+        Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
+        std::uint32_t layer, std::uint32_t compression_ratio,
+        std::uint64_t logical_row, std::size_t device_slot);
     [[nodiscard]] ParseResult<std::vector<float>> row(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::uint64_t logical_row);

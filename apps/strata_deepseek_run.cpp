@@ -1,4 +1,5 @@
 #include "strata/deepseek_runtime.hpp"
+#include "strata/dsv4_attention_kv.hpp"
 
 #include "cli_common.hpp"
 
@@ -47,9 +48,11 @@ struct Options {
     bool quiet{};
     bool detailed_timing{};
     bool device_moe{true};
+    bool host_routed_moe{};
     bool flash_attention{};
     bool gpu_lightning_indexer{};
     bool block_kv_cache{};
+    bool device_resident_runtime{};
     bool logit_trace{};
     bool layer_hash_trace{};
     bool overlap_resident_warmup{true};
@@ -71,10 +74,11 @@ void usage() {
         << "       [--prepack-mhc|--no-prepack-mhc]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
-        << "       [--device-moe|--serial-device-moe]\n"
+        << "       [--device-moe|--serial-device-moe|--host-routed-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
-        << "       [--block-kv-cache|--scalar-kv-cache] [--row-major-moe-page]\n"
+        << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
+        << "       [--row-major-moe-page]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -228,6 +232,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.device_moe = true;
         } else if (argument == "--serial-device-moe") {
             options.device_moe = false;
+        } else if (argument == "--host-routed-moe") {
+            options.host_routed_moe = true;
         } else if (argument == "--flash-attention") {
             options.flash_attention = true;
         } else if (argument == "--scalar-attention") {
@@ -239,8 +245,20 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.gpu_lightning_indexer = false;
         } else if (argument == "--block-kv-cache") {
             options.block_kv_cache = true;
+            options.device_resident_runtime = false;
         } else if (argument == "--scalar-kv-cache") {
             options.block_kv_cache = false;
+            options.device_resident_runtime = false;
+        } else if (argument == "--device-resident-runtime") {
+            options.block_kv_cache = true;
+            options.device_resident_runtime = true;
+            options.flash_attention = true;
+            options.gpu_lightning_indexer = false;
+            // The device-resident decode contract places all routed experts in the
+            // two NUMA-local CPU shards.  Leaving this opt-in made the
+            // device-resident runtime exercise routed GPU
+            // experts while reporting the accepted attention/mHC path.
+            options.host_routed_moe = true;
         } else if (argument == "--flash-attention-minimum-rows") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(
@@ -337,6 +355,48 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.flash_attention_d2h_nanoseconds) / 1.0e9
            << ",\"maximum_device_flash_attention_seconds\":"
            << static_cast<double>(stats.flash_attention_nanoseconds) / 1.0e9
+           << ",\"dsv4_paged_attention_calls\":"
+           << stats.dsv4_paged_attention_calls
+           << ",\"dsv4_paged_attention_kernel_launches\":"
+           << stats.dsv4_paged_attention_kernel_launches
+           << ",\"dsv4_paged_attention_h2d_bytes\":"
+           << stats.dsv4_paged_attention_h2d_bytes
+           << ",\"dsv4_paged_attention_d2h_bytes\":"
+           << stats.dsv4_paged_attention_d2h_bytes
+           << ",\"dsv4_paged_attention_page_bytes\":"
+           << stats.dsv4_paged_attention_page_bytes
+           << ",\"maximum_device_dsv4_paged_attention_h2d_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_paged_attention_kernel_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_paged_attention_d2h_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_paged_attention_seconds\":"
+           << static_cast<double>(stats.dsv4_paged_attention_nanoseconds) /
+                  1.0e9
+           << ",\"dsv4_mhc_calls\":" << stats.dsv4_mhc_calls
+           << ",\"dsv4_mhc_standalone_calls\":"
+           << stats.dsv4_mhc_standalone_calls
+           << ",\"dsv4_mhc_transition_calls\":"
+           << stats.dsv4_mhc_transition_calls
+           << ",\"dsv4_mhc_final_calls\":" << stats.dsv4_mhc_final_calls
+           << ",\"dsv4_mhc_kernel_launches\":"
+           << stats.dsv4_mhc_kernel_launches
+           << ",\"dsv4_mhc_resident_weight_bytes\":"
+           << stats.dsv4_mhc_resident_weight_bytes
+           << ",\"dsv4_mhc_h2d_bytes\":" << stats.dsv4_mhc_h2d_bytes
+           << ",\"dsv4_mhc_d2h_bytes\":" << stats.dsv4_mhc_d2h_bytes
+           << ",\"maximum_device_dsv4_mhc_h2d_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_h2d_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_kernel_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_kernel_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_d2h_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_d2h_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_nanoseconds) / 1.0e9
            << ",\"lightning_index_calls\":" << stats.lightning_index_calls
            << ",\"lightning_index_kernel_launches\":"
            << stats.lightning_index_kernel_launches
@@ -429,6 +489,49 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.flash_attention_d2h_nanoseconds) / 1.0e9
                << ",\"flash_attention_seconds\":"
                << static_cast<double>(device.flash_attention_nanoseconds) / 1.0e9
+               << ",\"dsv4_paged_attention_calls\":"
+               << device.dsv4_paged_attention_calls
+               << ",\"dsv4_paged_attention_kernel_launches\":"
+               << device.dsv4_paged_attention_kernel_launches
+               << ",\"dsv4_paged_attention_h2d_bytes\":"
+               << device.dsv4_paged_attention_h2d_bytes
+               << ",\"dsv4_paged_attention_d2h_bytes\":"
+               << device.dsv4_paged_attention_d2h_bytes
+               << ",\"dsv4_paged_attention_page_bytes\":"
+               << device.dsv4_paged_attention_page_bytes
+               << ",\"dsv4_paged_attention_h2d_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_h2d_nanoseconds) / 1.0e9
+               << ",\"dsv4_paged_attention_kernel_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_kernel_nanoseconds) / 1.0e9
+               << ",\"dsv4_paged_attention_d2h_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_d2h_nanoseconds) / 1.0e9
+               << ",\"dsv4_paged_attention_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_calls\":" << device.dsv4_mhc_calls
+               << ",\"dsv4_mhc_standalone_calls\":"
+               << device.dsv4_mhc_standalone_calls
+               << ",\"dsv4_mhc_transition_calls\":"
+               << device.dsv4_mhc_transition_calls
+               << ",\"dsv4_mhc_final_calls\":"
+               << device.dsv4_mhc_final_calls
+               << ",\"dsv4_mhc_kernel_launches\":"
+               << device.dsv4_mhc_kernel_launches
+               << ",\"dsv4_mhc_resident_weight_bytes\":"
+               << device.dsv4_mhc_resident_weight_bytes
+               << ",\"dsv4_mhc_h2d_bytes\":" << device.dsv4_mhc_h2d_bytes
+               << ",\"dsv4_mhc_d2h_bytes\":" << device.dsv4_mhc_d2h_bytes
+               << ",\"dsv4_mhc_h2d_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_h2d_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_kernel_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_kernel_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_d2h_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_d2h_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_nanoseconds) / 1.0e9
                << ",\"lightning_index_calls\":"
                << device.lightning_index_calls
                << ",\"lightning_index_kernel_launches\":"
@@ -531,12 +634,26 @@ void print_kv_cache_stats(
 void print_device_moe_stats(
     std::ostream& output, const strata::Dsv4DeviceMoeStats& stats) {
     output << "{\"batches\":" << stats.batches
+           << ",\"host_callback_batches\":" << stats.host_callback_batches
+           << ",\"host_callback_failures\":" << stats.host_callback_failures
+           << ",\"device_join_batches\":" << stats.device_join_batches
            << ",\"device_commands\":" << stats.device_commands
            << ",\"routed_experts\":" << stats.routed_experts
            << ",\"shared_experts\":" << stats.shared_experts
+           << ",\"routed_gate_up_seconds\":"
+           << static_cast<double>(stats.routed_gate_up_nanoseconds) / 1.0e9
+           << ",\"routed_down_seconds\":"
+           << static_cast<double>(stats.routed_down_nanoseconds) / 1.0e9
+           << ",\"routed_reduce_seconds\":"
+           << static_cast<double>(stats.routed_reduce_nanoseconds) / 1.0e9
+           << ",\"routed_cpu_seconds\":"
+           << static_cast<double>(stats.routed_cpu_nanoseconds) / 1.0e9
+           << ",\"shared_collect_seconds\":"
+           << static_cast<double>(stats.shared_collect_nanoseconds) / 1.0e9
+           << ",\"combine_seconds\":"
+           << static_cast<double>(stats.combine_nanoseconds) / 1.0e9
            << ",\"execution_seconds\":"
-           << static_cast<double>(stats.nanoseconds) / 1.0e9
-           << '}';
+           << static_cast<double>(stats.nanoseconds) / 1.0e9 << '}';
 }
 
 void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats) {
@@ -631,6 +748,7 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
     output
            << ",\"host_workspace_bytes\":" << plan.host_workspace_bytes
            << ",\"mhc_prepack_bytes\":" << plan.mhc_prepack_bytes
+           << ",\"mhc_device_bytes\":" << plan.mhc_device_bytes
            << ",\"total_vram_budget_bytes\":" << plan.total_vram_budget_bytes
            << ",\"resident_spine_vram_bytes\":" << plan.resident_spine_vram_bytes
            << ",\"vram_workspace_bytes\":" << plan.vram_workspace_bytes
@@ -824,8 +942,12 @@ int main(int argc, char** argv) {
         config.device_kv_cache_bytes = options.device_kv_cache_bytes;
         config.vram_weight_budgets = budgets;
         config.maximum_context_tokens = options.maximum_context_tokens;
-        config.enable_mhc_prepack = options.prepack_mhc;
+        config.enable_mhc_prepack =
+            options.prepack_mhc && !options.device_resident_runtime;
         config.compact_kv_cache = options.block_kv_cache;
+        config.physical_kv_cache = options.device_resident_runtime;
+        config.device_resident_mhc = options.device_resident_runtime;
+        config.host_routed_experts = options.host_routed_moe;
         config.require_zero_nvme_decode = true;
         const auto admission = strata::plan_dsv4_resident_topology(
             checkpoint.value->manifest(), config);
@@ -861,7 +983,8 @@ int main(int argc, char** argv) {
     config.pin_resident_arena = options.pin_resident_arena;
     config.serial_expert_upload = options.serial_expert_upload;
     config.row_major_moe_page = options.row_major_moe_page;
-    config.prepack_mhc_projection = options.prepack_mhc;
+    config.prepack_mhc_projection =
+        options.prepack_mhc && !options.device_resident_runtime;
     config.expert_prefetch_predictions = options.expert_prefetch_predictions;
     config.expert_prefetch_queue_depth = options.expert_prefetch_queue_depth;
     config.expert_prefetch_byte_budget = options.expert_prefetch_byte_budget;
@@ -871,11 +994,15 @@ int main(int argc, char** argv) {
     config.require_zero_nvme_decode = true;
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
+    config.enable_host_routed_moe = options.host_routed_moe;
     config.enable_flash_attention = options.flash_attention;
     config.enable_gpu_lightning_indexer = options.gpu_lightning_indexer;
-    config.kv_cache_mode = options.block_kv_cache
-        ? strata::Dsv4KvCacheMode::Block
-        : strata::Dsv4KvCacheMode::ScalarOracle;
+    config.kv_cache_mode = options.device_resident_runtime
+        ? strata::Dsv4KvCacheMode::PhysicalDevice
+        : options.block_kv_cache ? strata::Dsv4KvCacheMode::Block
+                                 : strata::Dsv4KvCacheMode::ScalarOracle;
+    config.kv_block_rows = options.device_resident_runtime
+        ? strata::kDsv4PhysicalKvBlockRows : strata::kDsv4KvBlockRows;
     config.flash_attention_minimum_rows =
         options.flash_attention_minimum_rows;
     config.enable_logit_trace = options.logit_trace;
@@ -899,10 +1026,16 @@ int main(int argc, char** argv) {
     if (options.json) {
         std::cout << std::setprecision(10)
                   << "{\"answer\":\"" << strata::cli::json_escape(generated.text)
-                  << "\",\"execution\":\"exact_base_autoregressive\""
+                  << "\",\"execution\":\""
+                  << (metrics.host_routed_moe_enabled
+                          ? "host_routed_cpu_moe_autoregressive"
+                          : "exact_base_autoregressive")
+                  << "\""
                   << ",\"dspark\":\"disabled\""
                   << ",\"device_moe\":"
                   << (metrics.device_moe_enabled ? "true" : "false")
+                  << ",\"host_routed_moe\":"
+                  << (metrics.host_routed_moe_enabled ? "true" : "false")
                   << ",\"host_attention_threads\":"
                   << metrics.host_attention_threads
                   << ",\"prefill_page_tokens\":"
@@ -915,6 +1048,8 @@ int main(int argc, char** argv) {
                   << (metrics.gpu_lightning_indexer_enabled ? "true" : "false")
                   << ",\"block_kv_cache\":"
                   << (metrics.block_kv_cache_enabled ? "true" : "false")
+                  << ",\"device_resident_runtime\":"
+                  << (options.device_resident_runtime ? "true" : "false")
                   << ",\"kv_block_rows\":" << metrics.kv_block_rows
                   << ",\"flash_attention_minimum_rows\":"
                   << metrics.flash_attention_minimum_rows
@@ -925,7 +1060,11 @@ int main(int argc, char** argv) {
                   << ",\"resident_arena_pinned\":"
                   << (metrics.resident_arena_pinned ? "true" : "false")
                   << ",\"prepack_mhc\":"
-                  << (options.prepack_mhc ? "true" : "false")
+                  << (options.prepack_mhc &&
+                              !options.device_resident_runtime
+                          ? "true" : "false")
+                  << ",\"device_resident_mhc\":"
+                  << (options.device_resident_runtime ? "true" : "false")
                   << ",\"serial_expert_upload\":"
                   << (options.serial_expert_upload ? "true" : "false")
                   << ",\"row_major_moe_page\":"

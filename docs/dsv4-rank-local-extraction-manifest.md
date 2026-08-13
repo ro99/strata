@@ -430,6 +430,30 @@ format, at the production host-visible precision. Compare against an
 exactly — hashes, not tolerances — where the contract declares exactness.
 Preserve every failed arm; a rejection is evidence, not waste.
 
+**Landing lesson — read the record before filling a gap.** `a31ac58` is much
+narrower than this landing needs, so most gaps in it are real and must be
+written rather than moved. That is not licence to write them without reading
+it first.
+
+Stage 3's `Dsv4RankLocalKvTransaction` has no counterpart at `a31ac58`: the
+experiment patched **one** sliding row at a compile-time position from a
+fixture, with no reservation, no compressed or learned-index row, and no
+rollback. The transaction genuinely had to be written. But `a31ac58` computes
+its page offsets once and hands *both ranks the same ones*
+(`configure_live_page_patches`, `for (auto& context : contexts)`) — one logical
+row, two device buffers. The first landed version of the transaction instead
+reserved per rank, which `Dsv4KvCache::reserve_physical_append` rejects as
+non-contiguous because reservation advances the sequence's end row. Reading the
+experiment first would have shown the convention and prevented the defect; it
+was instead found two commits later, by writing the tests that should have
+existed from the start.
+
+The landed offsets do agree with the record where the record reaches:
+`reserve_physical_append` produces `physical_row * token_data_bytes` and
+`capacity_rows * token_data_bytes + physical_row * token_scale_bytes`, which is
+`a31ac58`'s formula under `physical_row`↔`kPosition`,
+`capacity_rows`↔`block_rows`.
+
 **Evidence.** M1 produced 15 valid files, 86 ordered records each, with a
 complete manifest hash. The methodology caught real defects repeatedly
 (0079, 0086, 0090).

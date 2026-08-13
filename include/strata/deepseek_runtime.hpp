@@ -21,6 +21,9 @@ namespace strata {
 struct Dsv4RuntimeConfig {
     std::vector<int> devices{0};
     double vram_cache_fraction{0.85};
+    // Optional hard per-device admission ceiling. Zero preserves the
+    // fractional-only contract; non-zero is combined with it as min().
+    std::uint64_t explicit_vram_budget_bytes{};
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;

@@ -49,6 +49,10 @@ public:
     [[nodiscard]] ValidationResult read_into(
         std::string_view name, std::span<std::byte> destination,
         Dsv4CheckpointReadStats* local_stats = nullptr) const;
+    [[nodiscard]] ValidationResult read_slice_into(
+        std::string_view name, std::uint64_t relative_offset,
+        std::span<std::byte> destination,
+        Dsv4CheckpointReadStats* local_stats = nullptr) const;
     [[nodiscard]] ParseResult<std::vector<std::byte>> read_slice(
         std::string_view name, std::uint64_t relative_offset,
         std::uint64_t bytes) const;

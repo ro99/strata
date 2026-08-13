@@ -16,6 +16,7 @@ docs/issues/
 hardware/
 # Agent working directory
 .claude/
+.codex/
 
 # Generated Python bytecode from the test oracles under scripts/.
 __pycache__/

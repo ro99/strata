@@ -146,6 +146,11 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     return {{"DeepSeek attention preparation requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_copy_prepared_queries(
+    int, std::span<float>) {
+    return {{"DeepSeek prepared query capture requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::upload_dsv4_mhc_weights(
     int, std::span<const float>, std::span<const float>,
     std::span<const float>, std::span<const float>, CudaDsv4MhcWeights&) {
@@ -180,6 +185,34 @@ ValidationResult CudaBackend::dsv4_mhc_finish_device(
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_mhc_device_view(
+    int, CudaDsv4MhcDeviceView&) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::dsv4_mhc_branch_to_fp32(int, float*) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::dsv4_mhc_commit_reduced_branch(
+    int, const float*) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::dsv4_mhc_abort_branch(int) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::dsv4_mhc_transition_router_device(
+    int, const CudaDsv4MhcWeights&, const CudaWeight&) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::dsv4_mhc_transition_next_device(
+    int, const CudaDsv4MhcWeights&) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::glm_absorbed_attention(
     const CudaWeight&, const CudaGlmAbsorbedAttentionRequest&,
     std::span<float>) {
@@ -204,6 +237,12 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::enqueue_dsv4_host_moe_device_view(
+    int, std::span<const float>, const CudaDeepSeekMoeExpert&, float,
+    CudaDsv4HostMoeCallback, void*, CudaDsv4HostMoeDeviceView&) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_mhc(
     int, const CudaDeepSeekMoeExpert&, float,
     CudaDsv4HostMoeCallback, void*) {
@@ -216,8 +255,18 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input_device_view(
+    int, const CudaDeepSeekMoeExpert&, float,
+    CudaDsv4DeviceInputHostMoeCallback, void*, CudaDsv4HostMoeDeviceView&) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::collect_deepseek_moe(
     int, std::span<float>, std::span<float>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::finish_deepseek_moe_chain(int) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

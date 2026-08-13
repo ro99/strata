@@ -1665,3 +1665,23 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
     REQUIRE(finish_after.dsv4_mhc_h2d_bytes -
                 finish_before.dsv4_mhc_h2d_bytes == 0U);
 }
+
+TEST_CASE("rank-local CUDA bridges fail closed before a borrowed lifetime exists") {
+    strata::CudaBackend backend;
+    strata::CudaDsv4MhcDeviceView mhc_view{};
+    strata::CudaDsv4HostMoeDeviceView moe_view{};
+    strata::CudaDsv4MhcWeights weights;
+    strata::CudaWeight router;
+
+    REQUIRE(!backend.dsv4_mhc_device_view(0, mhc_view).ok());
+    REQUIRE(!backend.dsv4_mhc_branch_to_fp32(0, nullptr).ok());
+    REQUIRE(!backend.dsv4_mhc_commit_reduced_branch(0, nullptr).ok());
+    REQUIRE(!backend.dsv4_mhc_abort_branch(0).ok());
+    REQUIRE(!backend.dsv4_mhc_transition_router_device(0, weights, router).ok());
+    REQUIRE(!backend.dsv4_mhc_transition_next_device(0, weights).ok());
+    REQUIRE(!backend.enqueue_dsv4_host_moe_from_device_input_device_view(
+        0, strata::CudaDeepSeekMoeExpert{}, 10.0F, nullptr, nullptr,
+        moe_view).ok());
+    REQUIRE(mhc_view.stream == nullptr);
+    REQUIRE(moe_view.stream == nullptr);
+}

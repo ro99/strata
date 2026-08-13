@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace strata {
 
@@ -13,6 +14,9 @@ class HostWorkerPool {
 public:
     explicit HostWorkerPool(
         std::size_t workers,
+        std::chrono::microseconds idle_spin = std::chrono::microseconds::zero());
+    explicit HostWorkerPool(
+        std::vector<int> cpus,
         std::chrono::microseconds idle_spin = std::chrono::microseconds::zero());
     ~HostWorkerPool();
     HostWorkerPool(HostWorkerPool&&) noexcept;

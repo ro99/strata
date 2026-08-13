@@ -1,5 +1,6 @@
 #include "strata/deepseek_runtime.hpp"
 #include "strata/dsv4_attention_kv.hpp"
+#include "strata/runtime_support.hpp"
 
 #include "cli_common.hpp"
 
@@ -42,6 +43,7 @@ struct Options {
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
+    std::uint64_t explicit_vram_budget_bytes{};
     double expert_prefetch_minimum_confidence{0.75};
     bool admission_only{};
     bool json{};
@@ -73,7 +75,8 @@ void usage() {
         << "       [--pin-resident-arena] [--serial-expert-upload]\n"
         << "       [--prepack-mhc|--no-prepack-mhc]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
-        << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
+        << "       [--vram-fraction F] [--vram-budget-bytes BYTES]\n"
+        << "       [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe|--host-routed-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
@@ -224,6 +227,11 @@ bool parse_options(int argc, char** argv, Options& options) {
             const auto* value = next(argument);
             if (value == nullptr) return false;
             if (!strata::cli::parse_double(value, options.vram_fraction, 0.0, 0.95)) return false;
+        } else if (argument == "--vram-budget-bytes") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_bytes(
+                    value, options.explicit_vram_budget_bytes) ||
+                options.explicit_vram_budget_bytes == 0U) return false;
         } else if (argument == "--route-trace") {
             const auto* value = next(argument);
             if (value == nullptr) return false;
@@ -754,6 +762,20 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << ",\"vram_workspace_bytes\":" << plan.vram_workspace_bytes
            << ",\"expert_vram_cache_bytes\":" << plan.expert_vram_cache_bytes
            << ",\"maximum_expert_placement_bytes\":" << plan.maximum_expert_bytes
+           << ",\"fractional_vram_budget_bytes\":";
+    strata::cli::print_array(output, plan.fractional_vram_budget_bytes);
+    output << ",\"explicit_vram_budget_bytes\":";
+    strata::cli::print_array(output, plan.explicit_vram_budget_bytes);
+    output << ",\"applied_vram_budget_bytes\":";
+    strata::cli::print_array(output, plan.applied_vram_budget_bytes);
+    output << ",\"vram_budget_bound\":[";
+    for (std::size_t index = 0U; index < plan.vram_budget_bound.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << '"' << strata::cli::json_escape(
+            plan.vram_budget_bound[index]) << '"';
+    }
+    output << ']';
+    output
            << ",\"steady_state_nvme_bytes\":" << plan.steady_state_nvme_bytes
            << ",\"maximum_context_tokens\":" << plan.maximum_context_tokens
            << ",\"zero_nvme_decode\":" << (plan.zero_nvme_decode ? "true" : "false")
@@ -886,6 +908,9 @@ void print_diagnostics(std::ostream& output,
 }
 
 bool device_budgets(const Options& options, std::vector<std::uint64_t>& budgets,
+                    std::vector<std::uint64_t>& fractional_budgets,
+                    std::vector<std::uint64_t>& explicit_budgets,
+                    std::vector<std::string>& budget_bounds,
                     std::vector<std::string>& errors) {
     if (!std::isfinite(options.vram_fraction) || options.vram_fraction <= 0.0 ||
         options.vram_fraction > 0.95) {
@@ -898,8 +923,18 @@ bool device_budgets(const Options& options, std::vector<std::uint64_t>& budgets,
             errors.insert(errors.end(), memory.errors.begin(), memory.errors.end());
             return false;
         }
-        budgets.push_back(static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * options.vram_fraction));
+        const auto computed = strata::compute_runtime_device_budget(
+            memory.value.free_bytes, options.vram_fraction,
+            options.explicit_vram_budget_bytes);
+        if (computed.applied_budget_bytes == 0U) {
+            errors.emplace_back("VRAM admission budget is zero");
+            return false;
+        }
+        fractional_budgets.push_back(computed.fractional_budget_bytes);
+        explicit_budgets.push_back(computed.explicit_budget_bytes);
+        budgets.push_back(computed.applied_budget_bytes);
+        budget_bounds.emplace_back(strata::runtime_budget_bound_name(
+            computed.fractional_budget_bytes, computed.explicit_budget_bytes));
     }
     return true;
 }
@@ -931,8 +966,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<std::uint64_t> budgets;
+        std::vector<std::uint64_t> fractional_budgets;
+        std::vector<std::uint64_t> explicit_budgets;
+        std::vector<std::string> budget_bounds;
         std::vector<std::string> errors;
-        if (!device_budgets(options, budgets, errors)) {
+        if (!device_budgets(options, budgets, fractional_budgets,
+                            explicit_budgets, budget_bounds, errors)) {
             for (const auto& error : errors) std::cerr << "error: " << error << '\n';
             return 1;
         }
@@ -949,12 +988,18 @@ int main(int argc, char** argv) {
         config.device_resident_mhc = options.device_resident_runtime;
         config.host_routed_experts = options.host_routed_moe;
         config.require_zero_nvme_decode = true;
-        const auto admission = strata::plan_dsv4_resident_topology(
+        auto admission = strata::plan_dsv4_resident_topology(
             checkpoint.value->manifest(), config);
         if (!admission.ok()) {
             for (const auto& error : admission.errors) std::cerr << "error: " << error << '\n';
             return 1;
         }
+        admission.plan.fractional_vram_budget_bytes =
+            std::move(fractional_budgets);
+        admission.plan.explicit_vram_budget_bytes =
+            std::move(explicit_budgets);
+        admission.plan.applied_vram_budget_bytes = budgets;
+        admission.plan.vram_budget_bound = std::move(budget_bounds);
         if (options.json) {
             std::cout << "{\"status\":\"admitted\",\"memory_plan\":";
             print_plan(std::cout, admission.plan);
@@ -970,6 +1015,7 @@ int main(int argc, char** argv) {
     strata::Dsv4RuntimeConfig config;
     config.devices = options.devices;
     config.vram_cache_fraction = options.vram_fraction;
+    config.explicit_vram_budget_bytes = options.explicit_vram_budget_bytes;
     config.host_memory_limit_bytes = options.host_memory_bytes;
     config.host_kv_cache_bytes = options.host_kv_cache_bytes;
     config.device_kv_cache_bytes = options.device_kv_cache_bytes;

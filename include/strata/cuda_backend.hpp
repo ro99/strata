@@ -79,6 +79,10 @@ struct CudaBackendStats {
         std::uint64_t deepseek_moe_d2h_bytes{};
         std::uint64_t deepseek_moe_h2d_nanoseconds{};
         std::uint64_t deepseek_moe_kernel_nanoseconds{};
+        std::uint64_t deepseek_moe_input_quantize_nanoseconds{};
+        std::uint64_t deepseek_moe_shared_gate_up_nanoseconds{};
+        std::uint64_t deepseek_moe_shared_activation_quantize_nanoseconds{};
+        std::uint64_t deepseek_moe_shared_down_nanoseconds{};
         std::uint64_t deepseek_moe_d2h_nanoseconds{};
         std::uint64_t deepseek_moe_nanoseconds{};
         std::uint64_t flash_attention_calls{};
@@ -337,6 +341,20 @@ struct CudaDsv4PagedAttentionMhcRequest {
     // the immediately following stream-ordered CPU-MoE command. Both host
     // output spans above must be empty in this mode.
     bool defer_host_moe_input{};
+    // Execute one TP2 rank's 32 attention heads and its local output
+    // projection.  The physical page is still the replicated 64-head page;
+    // `head_offset` selects the rank's contiguous 32-head slice.  The
+    // resulting branch remains in the target mHC workspace for an external
+    // FP32 reduction.  This is an explicit device-resident contract; the
+    // default path above remains the accepted 64-head operation.
+    bool rank_local{};
+    std::uint32_t head_offset{};
+    // Borrowed same-device storage for the raw FP32 rank-local wo_b partial.
+    // The caller owns this persistent buffer and keeps it alive until the
+    // queued command and its NCCL reduction complete. It is required for
+    // rank_local calls and forbidden otherwise; NCCL must reduce these raw
+    // FP32 values before any BF16 publication.
+    float* rank_local_raw_fp32_reduction{};
 };
 
 // Produces the accepted BF16 Q/KV boundary from the persistent mHC layer
@@ -373,6 +391,11 @@ struct CudaDsv4AttentionPrepareRequest {
     std::span<const CudaDsv4AttentionPageWrite> page_writes;
     int mhc_device{-1};
     std::uint64_t maximum_workspace_bytes{1ULL << 20U};
+    // When set, retain only the prepared device query and return without
+    // copying query/KV diagnostics or synchronizing.  The output spans must
+    // be empty in this mode.  This is setup for a dependent rank-local
+    // attention command, not a host-visible timing path.
+    bool device_only{};
 };
 
 class CudaBuffer {
@@ -437,6 +460,41 @@ struct CudaDeepSeekMoeExpert {
 // return fails the command after the stream is safely drained.
 using CudaDsv4HostMoeCallback = bool (*)(
     void* context, std::span<float> rank_partials);
+
+// Device-resident view returned by the rank-local host-MoE enqueue. The
+// pointers remain valid until the matching chain finish and are intended for
+// stream-ordered NCCL reduction and BF16 publication only.
+struct CudaDsv4HostMoeDeviceView {
+    void* stream{};
+    float* output{};
+    unsigned int* status{};
+};
+
+// Borrowed fixed-lifetime mHC workspace views.  No ownership is transferred;
+// pointers are valid only until the next command that advances this mHC
+// state.  They are intended for stream-ordered conversion/reduction and are
+// never host-dereferenced by the caller.
+struct CudaDsv4MhcDeviceView {
+    void* stream{};
+    std::uint16_t* weighted{};
+    std::uint16_t* layer_input{};
+    std::uint16_t* branch{};
+    // Current four-copy residual, borrowed for the post-layer diagnostic
+    // boundary only. It must not be dereferenced or modified in-flight.
+    std::uint16_t* residual{};
+    float* router_logits{};
+    unsigned int* status{};
+};
+
+// Borrowed output-head buffers returned by the device-resident final mHC/head
+// enqueue. They remain valid until complete_dsv4_mhc_head_device() and let a
+// rank-local caller publish directly from the projected device shard.
+struct CudaDsv4MhcHeadDeviceView {
+    void* stream{};
+    float* logits{};
+    std::uint16_t* final_hidden{};
+    std::uint64_t count{};
+};
 
 // Device-owned form of the same callback boundary. The backend first stages
 // the persistent mHC BF16 layer input and raw FP32 router logits in stream
@@ -622,6 +680,10 @@ public:
         std::span<float> compressor_scores = {},
         std::span<float> index_compressor_values = {},
         std::span<float> index_compressor_scores = {});
+    // Capture-only diagnostic for the prepared device-resident query. This
+    // method is not part of the timed runtime path and has no fallback.
+    [[nodiscard]] ValidationResult dsv4_copy_prepared_queries(
+        int device, std::span<float> output);
     // Accepted dsv4-sm86-v1 mHC sequence. `begin` uploads one initial
     // four-copy residual and retains it on the device. Each transition fuses
     // the preceding post mix with the next projection/Sinkhorn/pre/RMSNorm;
@@ -657,11 +719,32 @@ public:
         std::span<float> hidden);
     [[nodiscard]] ValidationResult dsv4_mhc_finish_device(
         int device, std::span<float> hidden);
+    // Device-only rank-local mHC bridges.  These preserve the existing state
+    // machine while keeping the attention/FFN boundary on the CUDA stream.
+    [[nodiscard]] ValidationResult dsv4_mhc_device_view(
+        int device, CudaDsv4MhcDeviceView& view);
+    [[nodiscard]] ValidationResult dsv4_mhc_branch_to_fp32(
+        int device, float* output);
+    [[nodiscard]] ValidationResult dsv4_mhc_commit_reduced_branch(
+        int device, const float* reduced);
+    // Reject a globally failed publication.  The branch and all transition
+    // scratch are cleared before the state machine is closed, so no later
+    // command can observe stale state from the failed layer.
+    [[nodiscard]] ValidationResult dsv4_mhc_abort_branch(int device);
+    [[nodiscard]] ValidationResult dsv4_mhc_transition_router_device(
+        int device, const CudaDsv4MhcWeights& next_weights,
+        const CudaWeight& router);
+    // Enqueue the final post/mix/norm transition without a host download.
+    // The caller owns the single diagnostic completion boundary after the
+    // whole layer.
+    [[nodiscard]] ValidationResult dsv4_mhc_transition_next_device(
+        int device, const CudaDsv4MhcWeights& next_weights);
     [[nodiscard]] ValidationResult reserve_dsv4_mhc_head(
         int device, std::uint64_t logits);
     [[nodiscard]] ValidationResult enqueue_dsv4_mhc_finish_head_device(
         int device, const CudaWeight& head,
-        CudaDsv4MhcHeadCallback callback, void* callback_context);
+        CudaDsv4MhcHeadCallback callback, void* callback_context,
+        CudaDsv4MhcHeadDeviceView* view = nullptr);
     // Called only after collect_deepseek_moe has completed the same stream.
     // This copies the already-staged logits and validates the host node without
     // issuing or waiting on CUDA work.
@@ -701,6 +784,15 @@ public:
         int device, std::span<const float> hidden,
         const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4HostMoeCallback callback, void* callback_context);
+    // Variant of enqueue_dsv4_host_moe that exposes the first hidden-width
+    // result and status flag for a stream-ordered device-resident collective.
+    // The backend still owns both rank-partial slots and the shared/routed
+    // BF16 join; callers must not synchronize or free the returned pointers.
+    [[nodiscard]] ValidationResult enqueue_dsv4_host_moe_device_view(
+        int device, std::span<const float> hidden,
+        const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
+        CudaDsv4HostMoeCallback callback, void* callback_context,
+        CudaDsv4HostMoeDeviceView& view);
     // Uses the current persistent mHC layer_input as the GPU shared-expert
     // source and writes the exact routed/shared BF16 result back to the mHC
     // branch buffer. The CPU callback still consumes the already-decoded host
@@ -712,9 +804,19 @@ public:
         int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4DeviceInputHostMoeCallback callback,
         void* callback_context);
+    [[nodiscard]] ValidationResult
+    enqueue_dsv4_host_moe_from_device_input_device_view(
+        int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
+        CudaDsv4DeviceInputHostMoeCallback callback,
+        void* callback_context, CudaDsv4HostMoeDeviceView& view);
     [[nodiscard]] ValidationResult collect_deepseek_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output);
+    // Drain a queued host-MoE chain after the caller's single completion
+    // boundary without downloading routed/shared output. A four-byte error
+    // status is staged and checked; the dependent shared vector remains
+    // device-resident. This is the production chain measurement boundary.
+    [[nodiscard]] ValidationResult finish_deepseek_moe_chain(int device);
     // Row-grouped form of the command above. `hidden` holds `hidden_rows`
     // contiguous activation rows; each group names one expert and the rows it
     // serves. Routed results are flattened group-major and, within a group, in

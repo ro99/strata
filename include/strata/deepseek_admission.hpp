@@ -3,6 +3,7 @@
 #include "strata/deepseek_manifest.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace strata {
@@ -42,6 +43,10 @@ struct Dsv4MemoryPlan {
     std::uint64_t total_vram_budget_bytes{};
     std::uint64_t expert_vram_cache_bytes{};
     std::uint64_t maximum_expert_bytes{};
+    std::vector<std::uint64_t> fractional_vram_budget_bytes;
+    std::vector<std::uint64_t> explicit_vram_budget_bytes;
+    std::vector<std::uint64_t> applied_vram_budget_bytes;
+    std::vector<std::string> vram_budget_bound;
     std::uint64_t steady_state_nvme_bytes{};
     std::uint32_t maximum_context_tokens{};
     bool dspark_enabled{};

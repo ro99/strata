@@ -5993,7 +5993,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
 
     auto device_plan = plan_runtime_devices(
         config.devices, config.vram_cache_fraction, kDeviceWorkspaceReserve,
-        2ULL << 30U, "DeepSeek");
+        2ULL << 30U, "DeepSeek", config.explicit_vram_budget_bytes);
     if (!device_plan.ok()) {
         result.errors = std::move(device_plan.errors);
         return result;
@@ -6139,6 +6139,18 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (!admission.ok()) {
         result.errors = std::move(admission.errors);
         return result;
+    }
+    admission.plan.fractional_vram_budget_bytes =
+        device_plan.value.fractional_budgets;
+    admission.plan.explicit_vram_budget_bytes =
+        device_plan.value.explicit_budgets;
+    admission.plan.applied_vram_budget_bytes = capacities;
+    admission.plan.vram_budget_bound.reserve(capacities.size());
+    for (std::size_t slot = 0U; slot < capacities.size(); ++slot) {
+        admission.plan.vram_budget_bound.emplace_back(
+            runtime_budget_bound_name(
+                device_plan.value.fractional_budgets[slot],
+                device_plan.value.explicit_budgets[slot]));
     }
 
     impl_->config = config;

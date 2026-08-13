@@ -251,6 +251,60 @@ __global__ void plain_matmul_kernel(float* output, const float* input,
     }
 }
 
+// Stage-4's rank-local attention contract uses a BF16-expanded weight and a
+// two-half reduction.  Keep that association when the reusable executor
+// supplies the expanded form; the native FP8 path below is intentionally not
+// substituted because its unrounded product association is a different
+// fixture contract.
+__global__ void dsv4_rank_bf16_matmul(
+    float* output, const float* input, const __nv_bfloat16* weights,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x);
+    const auto batch_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (output_row >= rows || batch_row >= batch) return;
+    const auto input_row = groups == 0U
+        ? batch_row
+        : static_cast<std::uint64_t>(batch_row) * groups +
+              output_row / rows_per_group;
+    const auto input_base = input_row * columns;
+    const auto weight_base = output_row * columns;
+    float low = 0.0F;
+    float high = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += 256U) {
+        low += input[input_base + column] *
+               __bfloat162float(weights[weight_base + column]);
+    }
+    for (std::uint64_t column = threadIdx.x + 128U; column < columns;
+         column += 256U) {
+        high += input[input_base + column] *
+                __bfloat162float(weights[weight_base + column]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        low += __shfl_down_sync(0xffff'ffffU, low, offset);
+        high += __shfl_down_sync(0xffff'ffffU, high, offset);
+    }
+    __shared__ float warps[8];
+    const auto lane = threadIdx.x & 31U;
+    const auto warp = threadIdx.x >> 5U;
+    if (lane == 0U) {
+        warps[warp] = low;
+        warps[warp + 4U] = high;
+    }
+    __syncthreads();
+    float reduced = threadIdx.x < 8U ? warps[lane] : 0.0F;
+    if (warp == 0U) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            reduced += __shfl_down_sync(0xffff'ffffU, reduced, offset);
+        }
+    }
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] =
+            reduced;
+    }
+}
+
 __global__ void packed_matmul_kernel(float* output, const float* input,
                                      const std::uint32_t* packed,
                                      const __nv_bfloat16* scales,
@@ -2550,13 +2604,12 @@ __global__ void dsv4_divide_and_store(
 
 __global__ void dsv4_inverse_rope_decode(
     const __nv_bfloat16* attended, const float* cosines,
-    const float* sines, float* output) {
-    constexpr std::uint32_t heads = 64U;
+    const float* sines, float* output, std::uint32_t heads) {
     constexpr std::uint32_t rope = 64U;
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
-    constexpr auto elements = static_cast<std::uint64_t>(heads) *
-                              kDsv4PagedHeadDim;
+    const auto elements = static_cast<std::uint64_t>(heads) *
+                          kDsv4PagedHeadDim;
     if (index >= elements) return;
     const auto dimension = static_cast<std::uint32_t>(
         index % kDsv4PagedHeadDim);
@@ -2575,6 +2628,20 @@ __global__ void dsv4_inverse_rope_decode(
         ? __fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))
         : __fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine));
     output[index] = bf16_round(value);
+}
+
+__global__ void dsv4_bf16_to_fp32(
+    const __nv_bfloat16* input, float* output, std::uint64_t elements) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (index < elements) output[index] = __bfloat162float(input[index]);
+}
+
+__global__ void dsv4_fp32_to_bf16(
+    const float* input, __nv_bfloat16* output, std::uint64_t elements) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (index < elements) output[index] = __float2bfloat16_rn(input[index]);
 }
 
 __global__ void dsv4_round_float_bf16(float* values,
@@ -3060,6 +3127,7 @@ struct alignas(256) Dsv4MhcWorkspace {
     float post[kDsv4MhcMultiplier];
     float combination[kDsv4MhcMultiplier * kDsv4MhcMultiplier];
     float router_logits[kDsv4MhcRouterLogits];
+    unsigned int failure{};
 };
 
 constexpr std::uint64_t kDsv4MhcMaximumHostStagingBytes =
@@ -3362,6 +3430,9 @@ struct CudaBackend::Impl {
         cudaEvent_t moe_kernel_finished{};
         cudaEvent_t moe_download_started{};
         cudaEvent_t moe_completed{};
+        cudaEvent_t moe_shared_input_finished{};
+        cudaEvent_t moe_shared_gate_up_finished{};
+        cudaEvent_t moe_shared_activation_finished{};
         cudaEvent_t moe_shared_finished{};
         cudaEvent_t dsv4_cross_device_ready{};
         cudaEvent_t dsv4_attention_input_ready{};
@@ -3424,6 +3495,7 @@ struct CudaBackend::Impl {
         std::uint32_t dsv4_mhc_stage{};
         std::uint32_t dsv4_mhc_residual_index{};
         bool dsv4_mhc_branch_ready{};
+        bool dsv4_mhc_failed{};
         float* dsv4_mhc_head_input{};
         float* dsv4_mhc_head_output{};
         std::byte* dsv4_mhc_head_host_staging{};
@@ -3482,6 +3554,11 @@ struct CudaBackend::Impl {
         std::vector<std::shared_ptr<CudaBuffer::Impl>> quarantined_buffers;
         std::shared_ptr<WeightArena> weight_arena;
         bool moe_has_shared{};
+        // True only for the single-row FP8 shared-expert path that records all
+        // four phase events below. Host-join, page, and generic MoE commands
+        // reuse moe_shared_finished for ordering but do not populate the
+        // intermediate events.
+        bool moe_shared_phase_timing_valid{};
         bool moe_host_join{};
         bool moe_output_to_mhc{};
         bool moe_in_flight{};
@@ -3632,6 +3709,12 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaEventDestroy(state.moe_kernel_finished));
                 static_cast<void>(cudaEventDestroy(state.moe_download_started));
                 static_cast<void>(cudaEventDestroy(state.moe_completed));
+                static_cast<void>(cudaEventDestroy(
+                    state.moe_shared_input_finished));
+                static_cast<void>(cudaEventDestroy(
+                    state.moe_shared_gate_up_finished));
+                static_cast<void>(cudaEventDestroy(
+                    state.moe_shared_activation_finished));
                 static_cast<void>(cudaEventDestroy(state.moe_shared_finished));
                 static_cast<void>(cudaEventDestroy(
                     state.dsv4_cross_device_ready));
@@ -3844,15 +3927,14 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         }
         for (auto* event : {&state.moe_start, &state.moe_hidden_uploaded,
                             &state.moe_kernel_finished, &state.moe_download_started,
-                            &state.moe_completed}) {
+                            &state.moe_completed,
+                            &state.moe_shared_input_finished,
+                            &state.moe_shared_gate_up_finished,
+                            &state.moe_shared_activation_finished,
+                            &state.moe_shared_finished}) {
             if (auto status = cudaEventCreate(event); status != cudaSuccess) {
                 return cuda_error(status, "create DeepSeek MoE event");
             }
-        }
-        if (auto status = cudaEventCreateWithFlags(
-                &state.moe_shared_finished, cudaEventDisableTiming);
-            status != cudaSuccess) {
-            return cuda_error(status, "create DeepSeek shared-expert event");
         }
         if (auto status = cudaEventCreateWithFlags(
                 &state.dsv4_cross_device_ready, cudaEventDisableTiming);
@@ -6203,6 +6285,14 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     const bool prepare_index_compressor = !index_compressor_values.empty();
     const bool transition_mhc = request.mhc_transition != nullptr;
     const bool host_deferred = request.host_callback != nullptr;
+    const bool device_only = request.device_only;
+    // Both deferred and device-only preparations belong to a queued layer that
+    // submits its upload and returns without synchronizing, so the next layer
+    // may rewrite this pinned staging before the queued H2D has read it.  Their
+    // staging must therefore be fixed per command, exactly as the rank-local
+    // attention command's staging already is.  Only the fully synchronous
+    // host-visible path may share one buffer.
+    const bool fixed_command_staging = host_deferred || device_only;
     const bool device_mhc_input = request.mhc_device != device &&
         !transition_mhc && request.cross_device_input.empty();
     if (source_found == impl_->devices.end() ||
@@ -6211,8 +6301,12 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         !query_a->valid() || !query_b->valid() ||
         !key_value_weight->valid() || query_a->device() != device ||
         query_b->device() != device || key_value_weight->device() != device ||
-        query_rank.size() != query_rank_elements ||
-        key_value.size() != key_value_elements ||
+        (device_only
+             ? (!query_rank.empty() || !key_value.empty() ||
+                prepare_compressor || prepare_index_compressor ||
+                host_deferred || !request.page_writes.empty())
+             : (query_rank.size() != query_rank_elements ||
+                key_value.size() != key_value_elements)) ||
         request.query_norm.size() != query_rank_elements ||
         request.key_value_norm.size() != key_value_elements ||
         request.rope_cosines.size() != rope_pairs ||
@@ -6222,8 +6316,10 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         index_compressor_values.size() != index_compressor_scores.size() ||
         ((request.host_callback == nullptr) !=
          (request.host_callback_context == nullptr)) ||
-        (host_deferred ? request.page_writes.empty()
-                       : !request.page_writes.empty()) ||
+        (device_only
+             ? !request.page_writes.empty()
+             : (host_deferred ? request.page_writes.empty()
+                              : !request.page_writes.empty())) ||
         (prepare_compressor
              ? (request.compressor_value == nullptr ||
                 request.compressor_gate == nullptr)
@@ -6283,14 +6379,21 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             "DeepSeek attention preparation input is non-finite or not BF16");
         return result;
     }
-    const auto accepted_weight = [device](const CudaWeight* weight,
-                                           std::uint64_t rows,
-                                           std::uint64_t columns) {
+    const auto accepted_weight = [device, device_only, host_deferred](const CudaWeight* weight,
+                                                        std::uint64_t rows,
+                                                        std::uint64_t columns) {
         const auto& descriptor = weight->impl_->descriptor;
-        return weight->device() == device &&
-               descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
-               descriptor.rows == rows && descriptor.columns == columns &&
-               descriptor.group_size == 128U;
+        const bool native =
+            descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
+            descriptor.dtype == SafetensorsDtype::F8E4M3 &&
+            descriptor.group_size == 128U;
+        // Expanded BF16 weights are valid for the deferred production host
+        // node too; synchronous host-visible preparation remains native-only.
+        const bool expanded = (device_only || host_deferred) &&
+            descriptor.encoding == CudaWeightEncoding::Plain &&
+            descriptor.dtype == SafetensorsDtype::Bf16;
+        return weight->device() == device && (native || expanded) &&
+               descriptor.rows == rows && descriptor.columns == columns;
     };
     const auto accepted_compressor_weight =
         [device](const CudaWeight* weight, std::uint64_t rows,
@@ -6334,7 +6437,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         mhc_state.dsv4_mhc_stage != 1U ||
         mhc_state.dsv4_mhc_branch_ready != transition_mhc ||
         state.dsv4_attention_prepared ||
-        (host_deferred &&
+        (fixed_command_staging &&
          state.dsv4_attention_prepare_host_command_count >=
              kDsv4FixedCommandCount)) {
         result.errors.emplace_back(
@@ -6373,7 +6476,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         return result;
     }
     const auto upload_bytes = cursor;
-    if (host_deferred &&
+    if (fixed_command_staging &&
         upload_bytes >
             kDsv4DeferredAttentionPrepareUploadSlotBytes) {
         result.errors.emplace_back(
@@ -6496,7 +6599,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         capacity = target_bytes;
         return true;
     };
-    if (host_deferred &&
+    if (fixed_command_staging &&
         state.dsv4_attention_prepare_fixed_host_upload == nullptr) {
         void* upload = nullptr;
         if (auto status = cudaMallocHost(
@@ -6512,11 +6615,14 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         state.dsv4_attention_prepare_fixed_host_upload =
             static_cast<std::byte*>(upload);
     }
-    if ((!host_deferred &&
-         !ensure_host(state.dsv4_attention_prepare_host_upload,
-                      state.dsv4_attention_prepare_host_upload_bytes,
-                      upload_bytes,
-                      "allocate pinned attention preparation upload")) ||
+    if (!fixed_command_staging &&
+        !ensure_host(state.dsv4_attention_prepare_host_upload,
+                     state.dsv4_attention_prepare_host_upload_bytes,
+                     upload_bytes,
+                     "allocate pinned attention preparation upload")) {
+        return result;
+    }
+    if (!device_only &&
         !ensure_host(state.dsv4_attention_prepare_host_download,
                      state.dsv4_attention_prepare_host_download_bytes,
                      host_deferred ? request.maximum_workspace_bytes
@@ -6524,7 +6630,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
                      "allocate pinned attention preparation download")) {
         return result;
     }
-    auto* host_upload = host_deferred
+    auto* host_upload = fixed_command_staging
         ? state.dsv4_attention_prepare_fixed_host_upload +
               static_cast<std::uint64_t>(
                   state.dsv4_attention_prepare_host_command_count) *
@@ -6825,17 +6931,29 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         }
     }
     constexpr std::uint32_t threads = 256U;
-    const auto launch_fp8 = [&](float* output, const float* input,
-                                const CudaWeight* weight,
-                                cudaStream_t stream) {
+    // The rank-local expanded-BF16 reduction emulates the accepted Stage-4
+    // two-half association with 128 physical threads (four warps). Its
+    // shared reduction stores low/high halves in eight slots; launching it
+    // with 256 threads would index past that contract and corrupt the sum.
+    constexpr std::uint32_t rank_threads = 128U;
+    const auto launch_projection = [&](float* output, const float* input,
+                                       const CudaWeight* weight,
+                                       cudaStream_t stream) {
         const auto& descriptor = weight->impl_->descriptor;
-        native_fp8_matmul_kernel<<<descriptor.rows, threads, 0U,
-                                   stream>>>(
-            output, input,
-            static_cast<const unsigned char*>(weight->impl_->weights),
-            static_cast<const unsigned char*>(weight->impl_->scales),
-            descriptor.scale_columns, 1U, descriptor.columns,
-            descriptor.rows, 0U, 0U);
+        if (descriptor.encoding == CudaWeightEncoding::Plain) {
+            dsv4_rank_bf16_matmul<<<descriptor.rows, rank_threads, 0U, stream>>>(
+                output, input,
+                static_cast<const __nv_bfloat16*>(weight->impl_->weights),
+                1U, descriptor.columns, descriptor.rows, 0U, 0U);
+        } else {
+            native_fp8_matmul_kernel<<<descriptor.rows, threads, 0U,
+                                       stream>>>(
+                output, input,
+                static_cast<const unsigned char*>(weight->impl_->weights),
+                static_cast<const unsigned char*>(weight->impl_->scales),
+                descriptor.scale_columns, 1U, descriptor.columns,
+                descriptor.rows, 0U, 0U);
+        }
     };
     const auto launch_compressor = [&](float* output,
                                        const CudaWeight* weight,
@@ -6849,16 +6967,16 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             static_cast<const __nv_bfloat16*>(weight->impl_->weights),
             descriptor.columns, descriptor.rows);
     };
-    launch_fp8(query_rank_raw, input_quant, query_a, state.stream);
+    launch_projection(query_rank_raw, input_quant, query_a, state.stream);
     dsv4_query_rank_norm<<<1U, 1U, 0U, state.stream>>>(
         query_rank_raw, device_query_norm, query_rank_bf16, failure);
     quantize_bf16_activation_e4m3_kernel<<<8U, 128U, 0U, state.stream>>>(
         query_rank_quant, query_rank_bf16, query_rank_elements);
-    launch_fp8(query_raw, query_rank_quant, query_b, state.stream);
+    launch_projection(query_raw, query_rank_quant, query_b, state.stream);
     dsv4_query_norm_rope<<<64U, 1U, 0U, state.stream>>>(
         query_raw, device_cosines, device_sines, prepared_query, failure);
     const auto kv_stream = state.dsv4_attention_aux_streams[0U];
-    launch_fp8(key_value_raw, input_quant, key_value_weight, kv_stream);
+    launch_projection(key_value_raw, input_quant, key_value_weight, kv_stream);
     dsv4_key_value_norm_rope<<<1U, 1U, 0U, kv_stream>>>(
         key_value_raw, device_key_value_norm, device_cosines, device_sines,
         key_value_bf16, failure);
@@ -6930,6 +7048,26 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             return cuda_error(status,
                               "record attention preparation kernel completion");
         }
+    }
+    if (device_only) {
+        state.dsv4_prepared_queries = prepared_query;
+        state.dsv4_attention_prepared = true;
+        // Retire this command's upload slot.  The device-only path enqueues no
+        // host node, so its command record stays empty and reports no failure,
+        // but the slot must not be reused until the chain has been drained.
+        state.dsv4_attention_prepare_host_commands[
+            state.dsv4_attention_prepare_host_command_count++] = {};
+        {
+            std::scoped_lock lock(impl_->mutex);
+            auto& stats = *std::find_if(
+                impl_->stats.devices.begin(), impl_->stats.devices.end(),
+                [device](const auto& value) { return value.device == device; });
+            stats.matmul_calls += 3U;
+            stats.activation_h2d_bytes += upload_bytes;
+            stats.workspace_allocation_calls += allocation_calls;
+            stats.workspace_allocation_bytes += allocation_bytes;
+        }
+        return result;
     }
     auto* host_download = state.dsv4_attention_prepare_host_download;
     if (auto status = cudaMemcpyAsync(
@@ -7277,17 +7415,64 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     return result;
 }
 
+ValidationResult CudaBackend::dsv4_copy_prepared_queries(
+    int device, std::span<float> output) {
+    ValidationResult result;
+    constexpr std::size_t query_elements = 64U * 512U;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() || output.size() != query_elements ||
+        found->second.dsv4_prepared_queries == nullptr) {
+        result.errors.emplace_back(
+            "DeepSeek prepared query capture request is invalid");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for prepared query capture");
+    }
+    if (auto status = cudaStreamSynchronize(found->second.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize DeepSeek prepared query capture");
+    }
+    std::vector<__nv_bfloat16> encoded(output.size());
+    if (auto status = cudaMemcpy(encoded.data(),
+                                 found->second.dsv4_prepared_queries,
+                                 encoded.size() * sizeof(__nv_bfloat16),
+                                 cudaMemcpyDeviceToHost); status != cudaSuccess) {
+        return cuda_error(status, "copy DeepSeek prepared query capture");
+    }
+    for (std::size_t index = 0U; index < output.size(); ++index) {
+        output[index] = __bfloat162float(encoded[index]);
+        if (!std::isfinite(output[index]) ||
+            bf16_round_f32(output[index]) != output[index]) {
+            result.errors.emplace_back(
+                "DeepSeek prepared query capture is non-finite or not BF16");
+            return result;
+        }
+    }
+    return result;
+}
+
+namespace {
+
+bool dsv4_validate_device_pointer(
+    int device, const void* pointer, const char* name,
+    ValidationResult& result);
+
+}  // namespace
+
 ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     int device, const CudaDsv4PagedAttentionMhcRequest& request,
     std::span<float> diagnostic_branch) {
     ValidationResult result;
-    constexpr std::uint32_t total_heads = 64U;
+    const std::uint32_t total_heads = request.rank_local ? 32U : 64U;
+    const std::uint32_t output_groups = request.rank_local ? 4U : 8U;
     constexpr std::uint32_t rope_pairs = 32U;
-    constexpr std::uint64_t attended_elements =
+    const std::uint64_t attended_elements =
         static_cast<std::uint64_t>(total_heads) * kDsv4PagedHeadDim;
     constexpr std::uint64_t group_elements =
         static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
-    constexpr std::uint64_t output_rank_elements = 8192U;
+    const std::uint64_t output_rank_elements =
+        static_cast<std::uint64_t>(output_groups) * 1024U;
     constexpr std::uint64_t branch_elements = kDsv4MhcHidden;
     const auto candidates = static_cast<std::uint32_t>(
         request.attention.candidates.size());
@@ -7299,6 +7484,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const bool transition_mhc = request.mhc_transition != nullptr;
     const bool project_router = request.router != nullptr;
     const bool defer_host_moe_input = request.defer_host_moe_input;
+    const bool fixed_command_staging = defer_host_moe_input || request.rank_local;
     if (source_found == impl_->devices.end() ||
         target_found == impl_->devices.end() ||
         (use_prepared_query
@@ -7307,6 +7493,12 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
              : (request.attention.queries.size() != attended_elements ||
                 source_found->second.dsv4_attention_prepared)) ||
         request.attention.head_sinks.size() != total_heads ||
+        (request.rank_local &&
+         (request.head_offset != 0U && request.head_offset != 32U)) ||
+        (!request.rank_local && request.head_offset != 0U) ||
+        (request.rank_local
+             ? request.rank_local_raw_fp32_reduction == nullptr
+             : request.rank_local_raw_fp32_reduction != nullptr) ||
         request.attention.pages.empty() ||
         request.attention.pages.size() >
             std::numeric_limits<std::uint32_t>::max() ||
@@ -7320,6 +7512,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         output_a == nullptr || output_b == nullptr ||
         !output_a->valid() || !output_b->valid() ||
         output_a->device() != device || output_b->device() != device ||
+        (request.rank_local && request.mhc_device != device) ||
         (transition_mhc
              ? (!request.mhc_transition->valid() ||
                 request.mhc_transition->device() != request.mhc_device ||
@@ -7357,16 +7550,27 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             "DeepSeek paged attention-to-mHC request is invalid");
         return result;
     }
+    if (request.rank_local) {
+        if (!dsv4_validate_device_pointer(
+                device, request.rank_local_raw_fp32_reduction,
+                "rank-local raw FP32 reduction destination", result)) {
+            return result;
+        }
+    }
     const auto& a = output_a->impl_->descriptor;
     const auto& b = output_b->impl_->descriptor;
+    const bool expanded_output_b = request.rank_local &&
+        b.encoding == CudaWeightEncoding::Plain &&
+        b.dtype == SafetensorsDtype::Bf16;
     const auto* router_descriptor = project_router
         ? &request.router->impl_->descriptor : nullptr;
     if (a.encoding != CudaWeightEncoding::Plain ||
         a.dtype != SafetensorsDtype::Bf16 ||
         a.rows != output_rank_elements || a.columns != 4096U ||
-        b.encoding != CudaWeightEncoding::Fp8E4m3Block128 ||
-        b.rows != branch_elements || b.columns != output_rank_elements ||
-        b.group_size != 128U) {
+        (!((b.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
+            b.dtype == SafetensorsDtype::F8E4M3 && b.group_size == 128U) ||
+           expanded_output_b)) ||
+        b.rows != branch_elements || b.columns != output_rank_elements) {
         result.errors.emplace_back(
             "DeepSeek attention output weights violate the accepted mixed BF16/FP8 contract");
         return result;
@@ -7389,7 +7593,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         !target.dsv4_mhc_supported || target.dsv4_mhc_workspace == nullptr ||
         target.dsv4_mhc_stage != 1U || target.dsv4_mhc_branch_ready ||
         target.dsv4_host_moe_input_pending ||
-        (defer_host_moe_input &&
+        (fixed_command_staging &&
          state.dsv4_deferred_attention_command_count >=
              kDsv4FixedCommandCount)) {
         result.errors.emplace_back(
@@ -7427,7 +7631,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         return cuda_error(status,
                           "select CUDA device for attention-to-mHC");
     }
-    if (defer_host_moe_input &&
+    if (fixed_command_staging &&
         (state.dsv4_deferred_attention_host_upload == nullptr ||
          state.dsv4_deferred_attention_host_download == nullptr)) {
         if (state.dsv4_deferred_attention_host_upload != nullptr ||
@@ -7476,7 +7680,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     std::uint64_t page_offset{}, candidate_offset{}, query_offset{};
     std::uint64_t sink_offset{}, cosine_offset{}, sine_offset{};
     std::uint64_t page_descriptor_bytes{}, candidate_bytes{}, query_bytes{};
-    constexpr std::uint64_t sink_bytes =
+    const std::uint64_t sink_bytes =
         static_cast<std::uint64_t>(total_heads) * sizeof(float);
     constexpr std::uint64_t rope_bytes =
         static_cast<std::uint64_t>(rope_pairs) * sizeof(float);
@@ -7595,14 +7799,14 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                                 transition_layer_bytes +
                                 router_download_bytes +
                                 attention_failure_bytes;
-    if (defer_host_moe_input &&
+    if (fixed_command_staging &&
         (upload_bytes > kDsv4DeferredAttentionUploadSlotBytes ||
          download_bytes > kDsv4DeferredAttentionDownloadSlotBytes)) {
         result.errors.emplace_back(
             "deferred attention staging exceeds its fixed command slot");
         return result;
     }
-    if (!defer_host_moe_input &&
+    if (!fixed_command_staging &&
         (!ensure_host(state.dsv4_attention_host_upload,
                       state.dsv4_attention_host_upload_bytes, upload_bytes,
                       "allocate pinned attention-to-mHC upload") ||
@@ -7612,13 +7816,13 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                       "allocate pinned attention-to-mHC download"))) {
         return result;
     }
-    auto* command_host_upload = defer_host_moe_input
+    auto* command_host_upload = fixed_command_staging
         ? state.dsv4_deferred_attention_host_upload +
               static_cast<std::uint64_t>(
                   state.dsv4_deferred_attention_command_count) *
                   kDsv4DeferredAttentionUploadSlotBytes
         : state.dsv4_attention_host_upload;
-    auto* command_host_download = defer_host_moe_input
+    auto* command_host_download = fixed_command_staging
         ? state.dsv4_deferred_attention_host_download +
               static_cast<std::uint64_t>(
                   state.dsv4_deferred_attention_command_count) *
@@ -7665,7 +7869,9 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         reinterpret_cast<Dsv4DeviceAttentionCandidate*>(
             workspace + candidate_offset);
     auto* device_query = use_prepared_query
-        ? state.dsv4_prepared_queries
+        ? state.dsv4_prepared_queries +
+              static_cast<std::uint64_t>(request.head_offset) *
+                  kDsv4PagedHeadDim
         : reinterpret_cast<__nv_bfloat16*>(workspace + query_offset);
     auto* device_sink = reinterpret_cast<float*>(workspace + sink_offset);
     auto* device_cosines = reinterpret_cast<float*>(workspace + cosine_offset);
@@ -7720,6 +7926,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         return cuda_error(status, "clear attention-to-mHC status");
     }
     constexpr std::uint32_t threads = 256U;
+    constexpr std::uint32_t rank_threads = 128U;
     const auto kv_elements = static_cast<std::uint64_t>(candidates) *
                              kDsv4PagedHeadDim;
     const auto kv_blocks = static_cast<std::uint32_t>(
@@ -7740,7 +7947,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
                               kDsv4PagedDimensionsPerBlock);
-    for (std::uint32_t group = 0U; group < 2U; ++group) {
+    const auto group_count = request.rank_local ? 1U : 2U;
+    for (std::uint32_t group = 0U; group < group_count; ++group) {
         auto* group_query = device_query +
             static_cast<std::uint64_t>(group) * group_elements;
         auto* group_sink = device_sink + group * kDsv4PagedHeads;
@@ -7775,7 +7983,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             device_denominators, candidates, boundaries);
         dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                              0U, state.stream>>>(
-            device_scores, device_candidates, device_maximums, device_kv,
+            device_scores, device_candidates, device_maximums,
+            device_kv,
             device_values, candidates, boundaries);
         dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
             device_values, device_denominators, group_output);
@@ -7783,10 +7992,19 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const auto attended_blocks = static_cast<std::uint32_t>(
         (attended_elements + threads - 1U) / threads);
     dsv4_inverse_rope_decode<<<attended_blocks, threads, 0U, state.stream>>>(
-        device_attended, device_cosines, device_sines, device_decoded);
-    plain_matmul_kernel<<<output_rank_elements, threads, 0U, state.stream>>>(
-        device_output_rank, device_decoded, output_a->impl_->weights,
-        static_cast<int>(a.dtype), 1U, a.columns, a.rows, 8U, 1024U);
+        device_attended, device_cosines, device_sines, device_decoded,
+        total_heads);
+    if (request.rank_local) {
+        dsv4_rank_bf16_matmul<<<output_rank_elements, rank_threads, 0U, state.stream>>>(
+            device_output_rank, device_decoded,
+            static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
+            1U, a.columns, a.rows, output_groups, 1024U);
+    } else {
+        plain_matmul_kernel<<<output_rank_elements, threads, 0U, state.stream>>>(
+            device_output_rank, device_decoded, output_a->impl_->weights,
+            static_cast<int>(a.dtype), 1U, a.columns, a.rows,
+            output_groups, 1024U);
+    }
     const auto output_rank_blocks = static_cast<std::uint32_t>(
         (output_rank_elements + threads - 1U) / threads);
     dsv4_round_float_bf16<<<output_rank_blocks, threads, 0U, state.stream>>>(
@@ -7796,15 +8014,24 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
                                       state.stream>>>(
         device_output_rank, output_rank_elements, 1U);
-    native_fp8_matmul_kernel<<<branch_elements, threads, 0U, state.stream>>>(
-        device_branch, device_output_rank,
-        static_cast<const unsigned char*>(output_b->impl_->weights),
-        static_cast<const unsigned char*>(output_b->impl_->scales),
-        b.scale_columns, 1U, b.columns, b.rows, 0U, 0U);
+    auto* raw_branch_output = request.rank_local
+        ? request.rank_local_raw_fp32_reduction : device_branch;
+    if (expanded_output_b) {
+        dsv4_rank_bf16_matmul<<<branch_elements, rank_threads, 0U, state.stream>>>(
+            raw_branch_output, device_output_rank,
+            static_cast<const __nv_bfloat16*>(output_b->impl_->weights),
+            1U, b.columns, b.rows, 0U, 0U);
+    } else {
+        native_fp8_matmul_kernel<<<branch_elements, threads, 0U, state.stream>>>(
+            raw_branch_output, device_output_rank,
+            static_cast<const unsigned char*>(output_b->impl_->weights),
+            static_cast<const unsigned char*>(output_b->impl_->scales),
+            b.scale_columns, 1U, b.columns, b.rows, 0U, 0U);
+    }
     const auto branch_blocks = static_cast<std::uint32_t>(
         (branch_elements + threads - 1U) / threads);
     dsv4_store_mhc_branch<<<branch_blocks, threads, 0U, state.stream>>>(
-        device_branch, device_encoded_branch,
+        raw_branch_output, device_encoded_branch,
         branch_elements);
     const auto cross_device = request.mhc_device != device;
     const auto cross_transition = cross_device && transition_mhc;
@@ -7825,6 +8052,44 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             return cuda_error(status,
                               "retain attention branch in mHC workspace");
         }
+    }
+    // Rank-local attention is the reusable device-resident boundary.  The
+    // local BF16 branch and page-status word are copied into the persistent
+    // target workspace, but no host download or stream wait is permitted.
+    // The caller obtains the borrowed status pointer through
+    // dsv4_mhc_device_view and closes it with the global U32 MAX collective.
+    if (request.rank_local) {
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(status, "launch rank-local attention kernels");
+        }
+        if (auto status = cudaMemcpyAsync(
+                &target.dsv4_mhc_workspace->failure, device_failure,
+                sizeof(device_failure), cudaMemcpyDeviceToDevice,
+                state.stream); status != cudaSuccess) {
+            return cuda_error(status,
+                              "retain rank-local attention status");
+        }
+        target.dsv4_mhc_branch_ready = false;
+        target.dsv4_mhc_failed = false;
+        target.dsv4_host_moe_input_pending = false;
+        target.dsv4_host_moe_router_logits = nullptr;
+        target.dsv4_host_moe_device_failure = nullptr;
+        target.dsv4_host_moe_host_failure = nullptr;
+        {
+            std::scoped_lock lock(impl_->mutex);
+            auto& stats = *std::find_if(
+                impl_->stats.devices.begin(), impl_->stats.devices.end(),
+                [device](const auto& value) { return value.device == device; });
+            ++stats.dsv4_paged_attention_calls;
+            stats.dsv4_paged_attention_kernel_launches += 19U;
+            stats.dsv4_paged_attention_h2d_bytes += upload_bytes;
+            stats.dsv4_paged_attention_page_bytes += page_bytes;
+            stats.activation_h2d_bytes += upload_bytes;
+            stats.workspace_allocation_calls += allocation_calls;
+            stats.workspace_allocation_bytes += allocation_bytes;
+        }
+        ++state.dsv4_deferred_attention_command_count;
+        return result;
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         if (transition_mhc) target.dsv4_mhc_stage = 0U;
@@ -8555,6 +8820,11 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
             state.stream); status != cudaSuccess) {
         return cuda_error(status, "upload DeepSeek device mHC residual");
     }
+    if (auto status = cudaMemsetAsync(
+            &workspace->failure, 0, sizeof(workspace->failure), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear DeepSeek device mHC status");
+    }
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(
                 state.activation_uploaded, state.stream);
@@ -8591,6 +8861,7 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         state.dsv4_mhc_stage = 1U;
         state.dsv4_mhc_residual_index = 0U;
         state.dsv4_mhc_branch_ready = false;
+        state.dsv4_mhc_failed = false;
         const auto operation_nanoseconds = elapsed_nanoseconds_since(
             operation_started);
         std::scoped_lock lock(impl_->mutex);
@@ -8682,6 +8953,7 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
     state.dsv4_mhc_stage = 1U;
     state.dsv4_mhc_residual_index = 0U;
     state.dsv4_mhc_branch_ready = false;
+    state.dsv4_mhc_failed = false;
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -8973,6 +9245,340 @@ ValidationResult CudaBackend::dsv4_mhc_finish_device(
     return dsv4_mhc_finish_impl(device, {}, hidden, true);
 }
 
+ValidationResult CudaBackend::dsv4_mhc_device_view(
+    int device, CudaDsv4MhcDeviceView& view) {
+    view = {};
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"DeepSeek device mHC view targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.moe_in_flight ||
+        state.dsv4_mhc_failed) {
+        return {{"DeepSeek device mHC view violates command order"}};
+    }
+    view.stream = state.stream;
+    view.weighted = reinterpret_cast<std::uint16_t*>(
+        state.dsv4_mhc_workspace->weighted);
+    view.layer_input = reinterpret_cast<std::uint16_t*>(
+        state.dsv4_mhc_workspace->layer_input);
+    view.branch = reinterpret_cast<std::uint16_t*>(
+        state.dsv4_mhc_workspace->branch);
+    view.residual = reinterpret_cast<std::uint16_t*>(
+        state.dsv4_mhc_workspace->residual[state.dsv4_mhc_residual_index]);
+    view.router_logits = state.dsv4_mhc_workspace->router_logits;
+    view.status = &state.dsv4_mhc_workspace->failure;
+    if (view.stream == nullptr || view.weighted == nullptr ||
+        view.layer_input == nullptr ||
+        view.branch == nullptr || view.residual == nullptr ||
+        view.router_logits == nullptr ||
+        view.status == nullptr) {
+        view = {};
+        return {{"DeepSeek device mHC view is incomplete"}};
+    }
+    return {};
+}
+
+namespace {
+
+bool dsv4_validate_device_pointer(
+    int device, const void* pointer, const char* name,
+    ValidationResult& result) {
+    if (pointer == nullptr) {
+        result.errors.emplace_back(std::string(name) + " is null");
+        return false;
+    }
+    cudaPointerAttributes attributes{};
+    if (const auto status = cudaPointerGetAttributes(&attributes, pointer);
+        status != cudaSuccess) {
+        result.errors.emplace_back(std::string(name) +
+                                   " is not a live CUDA pointer");
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+    if (attributes.type != cudaMemoryTypeDevice || attributes.device != device) {
+        result.errors.emplace_back(std::string(name) +
+                                   " is not resident on the requested device");
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+ValidationResult CudaBackend::dsv4_mhc_branch_to_fp32(
+    int device, float* output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek mHC branch conversion targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.moe_in_flight || state.dsv4_mhc_failed ||
+        !dsv4_validate_device_pointer(device, output, "mHC FP32 branch output",
+                                      result)) {
+        if (result.errors.empty()) {
+            result.errors.emplace_back(
+                "DeepSeek mHC branch conversion violates command order");
+        }
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch conversion");
+    }
+    constexpr std::uint32_t threads = 256U;
+    constexpr std::uint32_t blocks =
+        (kDsv4MhcHidden + threads - 1U) / threads;
+    dsv4_bf16_to_fp32<<<blocks, threads, 0U, state.stream>>>(
+        state.dsv4_mhc_workspace->branch, output, kDsv4MhcHidden);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch mHC branch conversion");
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_commit_reduced_branch(
+    int device, const float* reduced) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek mHC branch commit targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.dsv4_mhc_failed || state.dsv4_host_moe_input_pending ||
+        !dsv4_validate_device_pointer(device, reduced, "reduced mHC branch",
+                                      result)) {
+        if (result.errors.empty()) {
+            result.errors.emplace_back(
+                "DeepSeek mHC branch commit violates command order");
+        }
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch commit");
+    }
+    constexpr std::uint32_t threads = 256U;
+    constexpr std::uint32_t blocks =
+        (kDsv4MhcHidden + threads - 1U) / threads;
+    dsv4_fp32_to_bf16<<<blocks, threads, 0U, state.stream>>>(
+        reduced, state.dsv4_mhc_workspace->branch, kDsv4MhcHidden);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch mHC reduced branch publication");
+    }
+    state.dsv4_mhc_branch_ready = true;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_abort_branch(int device) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek mHC branch abort targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.moe_in_flight) {
+        result.errors.emplace_back(
+            "DeepSeek mHC branch abort violates command order");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch abort");
+    }
+    auto* workspace = state.dsv4_mhc_workspace;
+    if (auto status = cudaMemsetAsync(
+            workspace->branch, 0, sizeof(workspace->branch), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear failed mHC branch");
+    }
+    if (auto status = cudaMemsetAsync(
+            workspace->weighted, 0, sizeof(workspace->weighted), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear failed mHC weighted state");
+    }
+    if (auto status = cudaMemsetAsync(
+            workspace->layer_input, 0, sizeof(workspace->layer_input),
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "clear failed mHC layer input");
+    }
+    if (auto status = cudaMemsetAsync(
+            workspace->residual, 0, sizeof(workspace->residual), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear failed mHC residual state");
+    }
+    if (auto status = cudaMemsetAsync(
+            &workspace->failure, 1, sizeof(workspace->failure), state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "mark failed mHC state");
+    }
+    state.dsv4_mhc_stage = 0U;
+    state.dsv4_mhc_residual_index = 0U;
+    state.dsv4_mhc_branch_ready = false;
+    state.dsv4_mhc_failed = true;
+    state.dsv4_host_moe_input_pending = false;
+    state.dsv4_host_moe_router_logits = nullptr;
+    state.dsv4_host_moe_device_failure = nullptr;
+    state.dsv4_host_moe_host_failure = nullptr;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_transition_router_device(
+    int device, const CudaDsv4MhcWeights& next_weights,
+    const CudaWeight& router) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek mHC router transition targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!next_weights.valid() || next_weights.device() != device ||
+        !router.valid() || router.device() != device ||
+        !state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || !state.dsv4_mhc_branch_ready ||
+        state.dsv4_host_moe_input_pending || state.moe_in_flight ||
+        state.dsv4_mhc_failed) {
+        result.errors.emplace_back(
+            "DeepSeek mHC router transition violates command order or ownership");
+        return result;
+    }
+    const auto& descriptor = router.impl_->descriptor;
+    if (descriptor.encoding != CudaWeightEncoding::Plain ||
+        descriptor.dtype != SafetensorsDtype::Bf16 ||
+        descriptor.rows != kDsv4MhcRouterLogits ||
+        descriptor.columns != kDsv4MhcHidden) {
+        result.errors.emplace_back(
+            "DeepSeek mHC router transition requires a 256x4096 BF16 router");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC router transition");
+    }
+    auto* workspace = state.dsv4_mhc_workspace;
+    const auto current = state.dsv4_mhc_residual_index;
+    const auto next = current ^ 1U;
+    const auto* projection = static_cast<const float*>(
+        next_weights.impl_->projection.impl_->weights);
+    const auto* auxiliary = static_cast<const std::byte*>(
+        next_weights.impl_->auxiliary.impl_->data);
+    const auto* scale = reinterpret_cast<const float*>(auxiliary);
+    const auto* base = reinterpret_cast<const float*>(
+        auxiliary + 3U * sizeof(float));
+    const auto* norm = reinterpret_cast<const __nv_bfloat16*>(
+        auxiliary + kDsv4MhcAuxNormOffset);
+    dsv4_mhc_fused_post_projection<<<
+        dim3{kDsv4MhcMixes / kDsv4MhcProjectionTile, kDsv4MhcSplits},
+        kDsv4MhcProjectionThreads, 0U, state.stream>>>(
+        workspace->combination, workspace->residual[current], workspace->post,
+        workspace->branch, projection, workspace->partial_projection,
+        workspace->partial_square_sum, workspace->residual[next]);
+    dsv4_mhc_mix<<<1U, 32U, 0U, state.stream>>>(
+        workspace->partial_projection, workspace->partial_square_sum, scale,
+        base, kDsv4MhcSplits, workspace->pre, workspace->post,
+        workspace->combination);
+    dsv4_mhc_weighted_norm<<<1U, 64U, 0U, state.stream>>>(
+        workspace->residual[next], workspace->pre, norm, workspace->weighted,
+        workspace->layer_input);
+    constexpr unsigned int threads = 256U;
+    const auto blocks = static_cast<unsigned int>(
+        (kDsv4MhcRouterLogits + (threads / 32U) - 1U) / (threads / 32U));
+    bf16_input_matvec_kernel<<<blocks, threads, 0U, state.stream>>>(
+        workspace->router_logits, workspace->layer_input,
+        static_cast<const __nv_bfloat16*>(router.impl_->weights),
+        descriptor.columns, descriptor.rows);
+    if (auto status = cudaMemsetAsync(
+            workspace->branch, 0, sizeof(workspace->branch), state.stream);
+        status != cudaSuccess) {
+        state.dsv4_mhc_stage = 0U;
+        return cuda_error(status, "clear consumed mHC attention branch");
+    }
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        state.dsv4_mhc_stage = 0U;
+        return cuda_error(status, "launch mHC router transition");
+    }
+    state.dsv4_mhc_residual_index = next;
+    state.dsv4_mhc_branch_ready = false;
+    state.dsv4_host_moe_input_pending = true;
+    state.dsv4_host_moe_router_logits = workspace->router_logits;
+    state.dsv4_host_moe_device_failure = &workspace->failure;
+    state.dsv4_host_moe_host_failure = nullptr;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_transition_next_device(
+    int device, const CudaDsv4MhcWeights& next_weights) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek final mHC transition targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!next_weights.valid() || next_weights.device() != device ||
+        !state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || !state.dsv4_mhc_branch_ready ||
+        state.dsv4_host_moe_input_pending || state.moe_in_flight ||
+        state.dsv4_mhc_failed) {
+        result.errors.emplace_back(
+            "DeepSeek final mHC transition violates command order");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for final mHC transition");
+    }
+    auto* workspace = state.dsv4_mhc_workspace;
+    const auto current = state.dsv4_mhc_residual_index;
+    const auto next = current ^ 1U;
+    const auto* projection = static_cast<const float*>(
+        next_weights.impl_->projection.impl_->weights);
+    const auto* auxiliary = static_cast<const std::byte*>(
+        next_weights.impl_->auxiliary.impl_->data);
+    const auto* scale = reinterpret_cast<const float*>(auxiliary);
+    const auto* base = reinterpret_cast<const float*>(
+        auxiliary + 3U * sizeof(float));
+    const auto* norm = reinterpret_cast<const __nv_bfloat16*>(
+        auxiliary + kDsv4MhcAuxNormOffset);
+    dsv4_mhc_fused_post_projection<<<
+        dim3{kDsv4MhcMixes / kDsv4MhcProjectionTile, kDsv4MhcSplits},
+        kDsv4MhcProjectionThreads, 0U, state.stream>>>(
+        workspace->combination, workspace->residual[current], workspace->post,
+        workspace->branch, projection, workspace->partial_projection,
+        workspace->partial_square_sum, workspace->residual[next]);
+    dsv4_mhc_mix<<<1U, 32U, 0U, state.stream>>>(
+        workspace->partial_projection, workspace->partial_square_sum, scale,
+        base, kDsv4MhcSplits, workspace->pre, workspace->post,
+        workspace->combination);
+    dsv4_mhc_weighted_norm<<<1U, 64U, 0U, state.stream>>>(
+        workspace->residual[next], workspace->pre, norm, workspace->weighted,
+        workspace->layer_input);
+    if (auto status = cudaMemsetAsync(
+            workspace->branch, 0, sizeof(workspace->branch), state.stream);
+        status != cudaSuccess) {
+        state.dsv4_mhc_stage = 0U;
+        return cuda_error(status, "clear consumed mHC MoE branch");
+    }
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        state.dsv4_mhc_stage = 0U;
+        return cuda_error(status, "launch final mHC transition");
+    }
+    state.dsv4_mhc_residual_index = next;
+    state.dsv4_mhc_branch_ready = false;
+    return result;
+}
+
 ValidationResult CudaBackend::dsv4_mhc_finish_impl(
     int device, std::span<const float> branch_output,
     std::span<float> hidden, bool device_branch) {
@@ -9209,7 +9815,8 @@ ValidationResult CudaBackend::reserve_dsv4_mhc_head(
 
 ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
     int device, const CudaWeight& head,
-    CudaDsv4MhcHeadCallback callback, void* callback_context) {
+    CudaDsv4MhcHeadCallback callback, void* callback_context,
+    CudaDsv4MhcHeadDeviceView* view) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end() || !head.valid() ||
@@ -9366,6 +9973,11 @@ ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
     state.dsv4_mhc_residual_index = next;
     state.dsv4_mhc_branch_ready = false;
     state.dsv4_mhc_head_in_flight = true;
+    if (view != nullptr) {
+        *view = {state.stream, state.dsv4_mhc_head_output,
+                 reinterpret_cast<std::uint16_t*>(workspace->residual[next]),
+                 descriptor.rows};
+    }
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -10237,6 +10849,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     state.moe_shared_rows = 1U;
     state.moe_routed_count = routed_batch.count;
     state.moe_has_shared = shared != nullptr;
+    state.moe_shared_phase_timing_valid = false;
     state.moe_host_join = false;
     state.moe_output_to_mhc = false;
     state.moe_host_callback = {};
@@ -10291,6 +10904,14 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch DeepSeek MoE hidden quantization");
         return result;
+    }
+    if (shared != nullptr) {
+        if (auto status = cudaEventRecord(
+                state.moe_shared_input_finished, state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "record DeepSeek shared input quantization");
+            return result;
+        }
     }
 
     if (!routed.empty()) {
@@ -10354,6 +10975,12 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             abort_enqueue(status, "launch DeepSeek shared FP8 W1/W3 SwiGLU");
             return result;
         }
+        if (auto status = cudaEventRecord(
+                state.moe_shared_gate_up_finished, state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "record DeepSeek shared gate/up completion");
+            return result;
+        }
         const dim3 shared_activation_grid(
             static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
             1U, 1U);
@@ -10363,6 +10990,13 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared activation quantization");
+            return result;
+        }
+        if (auto status = cudaEventRecord(
+                state.moe_shared_activation_finished, state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status,
+                          "record DeepSeek shared activation quantization");
             return result;
         }
         deepseek_fp8_down_kernel<<<
@@ -10377,6 +11011,13 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             abort_enqueue(status, "launch DeepSeek shared FP8 W2");
             return result;
         }
+        if (auto status = cudaEventRecord(
+                state.moe_shared_finished, state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "record DeepSeek shared down completion");
+            return result;
+        }
+        state.moe_shared_phase_timing_valid = true;
     }
     if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
         status != cudaSuccess) {
@@ -10409,6 +11050,35 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe(
         nullptr, false);
 }
 
+ValidationResult CudaBackend::enqueue_dsv4_host_moe_device_view(
+    int device, std::span<const float> hidden,
+    const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
+    CudaDsv4HostMoeCallback callback, void* callback_context,
+    CudaDsv4HostMoeDeviceView& view) {
+    view = {};
+    auto result = enqueue_dsv4_host_moe(
+        device, hidden, shared, swiglu_limit, callback, callback_context);
+    if (!result.ok()) return result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() ||
+        found->second.moe_host_callback_count == 0U) {
+        result.errors.emplace_back(
+            "DeepSeek host MoE device view has no queued command");
+        return result;
+    }
+    auto& state = found->second;
+    view.stream = state.stream;
+    view.output = state.moe_output;
+    view.status = state.moe_error;
+    if (view.stream == nullptr || view.output == nullptr ||
+        view.status == nullptr) {
+        view = {};
+        result.errors.emplace_back(
+            "DeepSeek host MoE device view is incomplete");
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_mhc(
     int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
     CudaDsv4HostMoeCallback callback, void* callback_context) {
@@ -10423,6 +11093,39 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input(
     return enqueue_dsv4_host_moe_impl(
         device, {}, shared, swiglu_limit, nullptr, callback_context,
         callback, true);
+}
+
+ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input_device_view(
+    int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
+    CudaDsv4DeviceInputHostMoeCallback callback, void* callback_context,
+    CudaDsv4HostMoeDeviceView& view) {
+    view = {};
+    auto result = enqueue_dsv4_host_moe_from_device_input(
+        device, shared, swiglu_limit, callback, callback_context);
+    if (!result.ok()) return result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() ||
+        found->second.moe_host_callback_count == 0U) {
+        result.errors.emplace_back(
+            "DeepSeek device-input host MoE view has no queued command");
+        return result;
+    }
+    auto& state = found->second;
+    // The reusable rank-local view deliberately leaves the backend branch
+    // unpublished. The existing join still computes its local BF16 value in
+    // stream order, but only the caller's FP32 NCCL result may commit the
+    // branch through dsv4_mhc_commit_reduced_branch().
+    state.dsv4_mhc_branch_ready = false;
+    view.stream = state.stream;
+    view.output = state.moe_output;
+    view.status = state.moe_error;
+    if (view.stream == nullptr || view.output == nullptr ||
+        view.status == nullptr) {
+        view = {};
+        result.errors.emplace_back(
+            "DeepSeek device-input host MoE view is incomplete");
+    }
+    return result;
 }
 
 ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
@@ -10651,6 +11354,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     state.moe_shared_rows = 1U;
     state.moe_routed_count = 0U;
     state.moe_has_shared = true;
+    state.moe_shared_phase_timing_valid = false;
     state.moe_host_join = true;
     state.moe_output_to_mhc = mhc_source_and_destination;
     state.moe_kernel_launches = 0U;
@@ -10687,6 +11391,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
 
     const auto abort_enqueue = [&](cudaError_t status,
                                    const char* operation) {
+        state.moe_shared_phase_timing_valid = false;
         result = cuda_error(status, operation);
         const auto main_status = cudaStreamSynchronize(state.stream);
         const auto shared_status = cudaStreamSynchronize(
@@ -10797,6 +11502,13 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
                       "launch DeepSeek host MoE hidden quantization");
         return result;
     }
+    if (auto status = cudaEventRecord(
+            state.moe_shared_input_finished, state.moe_shared_stream);
+        status != cudaSuccess) {
+        abort_enqueue(status,
+                      "record DeepSeek shared input quantization");
+        return result;
+    }
 
     constexpr unsigned int threads = 256U;
     deepseek_fp8_gate_up_kernel<<<
@@ -10814,6 +11526,12 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         abort_enqueue(status, "launch DeepSeek host MoE shared W1/W3");
         return result;
     }
+    if (auto status = cudaEventRecord(
+            state.moe_shared_gate_up_finished, state.moe_shared_stream);
+        status != cudaSuccess) {
+        abort_enqueue(status, "record DeepSeek shared gate/up completion");
+        return result;
+    }
     const dim3 activation_grid(
         static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
         1U, 1U);
@@ -10824,6 +11542,13 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status,
                       "launch DeepSeek host MoE shared activation quantization");
+        return result;
+    }
+    if (auto status = cudaEventRecord(
+            state.moe_shared_activation_finished, state.moe_shared_stream);
+        status != cudaSuccess) {
+        abort_enqueue(status,
+                      "record DeepSeek shared activation quantization");
         return result;
     }
     deepseek_fp8_down_kernel<<<
@@ -10844,6 +11569,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         abort_enqueue(status, "record DeepSeek shared-expert completion");
         return result;
     }
+    state.moe_shared_phase_timing_valid = true;
 
     if (auto status = cudaLaunchHostFunc(
             state.stream, run_dsv4_host_moe_callback,
@@ -11283,6 +12009,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     state.moe_page_work_count = static_cast<std::uint32_t>(work_count);
     state.moe_page_shared_count = static_cast<std::uint32_t>(shared_count);
     state.moe_has_shared = shared != nullptr;
+    state.moe_shared_phase_timing_valid = false;
     state.moe_host_join = false;
     state.moe_output_to_mhc = false;
     state.moe_host_callback = {};
@@ -11760,6 +12487,7 @@ ValidationResult CudaBackend::enqueue_moe(
     state.moe_shared_rows = rows;
     state.moe_routed_count = static_cast<std::uint32_t>(routed.size());
     state.moe_has_shared = shared != nullptr;
+    state.moe_shared_phase_timing_valid = false;
     state.moe_host_join = false;
     state.moe_output_to_mhc = false;
     state.moe_host_callback = {};
@@ -12200,6 +12928,8 @@ ValidationResult CudaBackend::collect_deepseek_moe(
     }
     bool host_callback_failed =
         state.moe_host_join && state.moe_host_callback.failed;
+    const bool shared_phase_timing_valid =
+        state.moe_shared_phase_timing_valid;
     unsigned int first_upstream_failure =
         state.moe_host_callback.upstream_failure_value;
     for (std::uint32_t index = 0U;
@@ -12218,6 +12948,10 @@ ValidationResult CudaBackend::collect_deepseek_moe(
     float h2d_milliseconds = 0.0F;
     float kernel_milliseconds = 0.0F;
     float d2h_milliseconds = 0.0F;
+    float shared_input_quantize_milliseconds = 0.0F;
+    float shared_gate_up_milliseconds = 0.0F;
+    float shared_activation_quantize_milliseconds = 0.0F;
+    float shared_down_milliseconds = 0.0F;
     if (auto status = cudaEventElapsedTime(
             &h2d_milliseconds, state.moe_start, state.moe_hidden_uploaded);
         status != cudaSuccess) {
@@ -12235,6 +12969,43 @@ ValidationResult CudaBackend::collect_deepseek_moe(
         status != cudaSuccess) {
         return cuda_error(status, "measure DeepSeek MoE output download");
     }
+    if (shared_phase_timing_valid) {
+        const auto measure_shared_phase = [&](float& output,
+                                              cudaEvent_t begin,
+                                              cudaEvent_t end,
+                                              const char* operation) {
+            if (auto status = cudaEventElapsedTime(&output, begin, end);
+                status != cudaSuccess) {
+                result.errors.emplace_back(
+                    std::string(operation) + ": " +
+                    cudaGetErrorString(status));
+                return false;
+            }
+            return true;
+        };
+        if (!measure_shared_phase(
+                shared_input_quantize_milliseconds,
+                state.moe_hidden_uploaded,
+                state.moe_shared_input_finished,
+                "measure DeepSeek shared input quantization") ||
+            !measure_shared_phase(
+                shared_gate_up_milliseconds,
+                state.moe_shared_input_finished,
+                state.moe_shared_gate_up_finished,
+                "measure DeepSeek shared gate/up") ||
+            !measure_shared_phase(
+                shared_activation_quantize_milliseconds,
+                state.moe_shared_gate_up_finished,
+                state.moe_shared_activation_finished,
+                "measure DeepSeek shared activation quantization") ||
+            !measure_shared_phase(
+                shared_down_milliseconds,
+                state.moe_shared_activation_finished,
+                state.moe_shared_finished,
+                "measure DeepSeek shared down")) {
+            return result;
+        }
+    }
     const auto to_nanoseconds = [](float milliseconds) {
         return static_cast<std::uint64_t>(std::llround(
             static_cast<double>(milliseconds) * 1.0e6));
@@ -12244,6 +13015,14 @@ ValidationResult CudaBackend::collect_deepseek_moe(
     const auto d2h_nanoseconds = to_nanoseconds(d2h_milliseconds);
     const auto total_nanoseconds =
         h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+    const auto shared_input_quantize_nanoseconds =
+        to_nanoseconds(shared_input_quantize_milliseconds);
+    const auto shared_gate_up_nanoseconds =
+        to_nanoseconds(shared_gate_up_milliseconds);
+    const auto shared_activation_quantize_nanoseconds =
+        to_nanoseconds(shared_activation_quantize_milliseconds);
+    const auto shared_down_nanoseconds =
+        to_nanoseconds(shared_down_milliseconds);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& device_stats = *std::find_if(
@@ -12261,9 +13040,18 @@ ValidationResult CudaBackend::collect_deepseek_moe(
             downloaded_bytes + sizeof(unsigned int);
         device_stats.deepseek_moe_h2d_nanoseconds += h2d_nanoseconds;
         device_stats.deepseek_moe_kernel_nanoseconds += kernel_nanoseconds;
+        device_stats.deepseek_moe_input_quantize_nanoseconds +=
+            shared_input_quantize_nanoseconds;
+        device_stats.deepseek_moe_shared_gate_up_nanoseconds +=
+            shared_gate_up_nanoseconds;
+        device_stats.deepseek_moe_shared_activation_quantize_nanoseconds +=
+            shared_activation_quantize_nanoseconds;
+        device_stats.deepseek_moe_shared_down_nanoseconds +=
+            shared_down_nanoseconds;
         device_stats.deepseek_moe_d2h_nanoseconds += d2h_nanoseconds;
         device_stats.deepseek_moe_nanoseconds += total_nanoseconds;
     }
+    state.moe_shared_phase_timing_valid = false;
     if (*host_error != 0U) {
         result.errors.emplace_back(
             "MoE projection produced a non-finite activation");
@@ -12289,6 +13077,149 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                     host_bytes + static_cast<std::ptrdiff_t>(routed_bytes),
                     static_cast<std::size_t>(shared_bytes));
     }
+    return result;
+}
+
+ValidationResult CudaBackend::finish_deepseek_moe_chain(int device) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek MoE chain finish targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    const auto clear_shared_phase_timing = [&]() noexcept {
+        state.moe_shared_phase_timing_valid = false;
+    };
+    if (!state.moe_in_flight && state.moe_host_callback_count == 0U) {
+        clear_shared_phase_timing();
+        result.errors.emplace_back(
+            "DeepSeek MoE chain finish has no matching in-flight command");
+        return result;
+    }
+    if (state.moe_host_staging == nullptr || state.moe_error == nullptr) {
+        clear_shared_phase_timing();
+        result.errors.emplace_back(
+            "DeepSeek MoE chain finish has no fixed status staging");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        clear_shared_phase_timing();
+        return cuda_error(status, "select CUDA device for DeepSeek MoE chain finish");
+    }
+    auto* host_status = reinterpret_cast<unsigned int*>(state.moe_host_staging);
+    if (auto status = cudaMemcpyAsync(
+            host_status, state.moe_error, sizeof(*host_status),
+            cudaMemcpyDeviceToHost, state.stream); status != cudaSuccess) {
+        clear_shared_phase_timing();
+        return cuda_error(status, "stage DeepSeek MoE chain status");
+    }
+    if (auto status = cudaEventRecord(state.moe_completed, state.stream);
+        status != cudaSuccess) {
+        clear_shared_phase_timing();
+        return cuda_error(status, "record DeepSeek MoE chain finish");
+    }
+    if (auto status = cudaEventSynchronize(state.moe_completed);
+        status != cudaSuccess) {
+        clear_shared_phase_timing();
+        return cuda_error(status, "synchronize DeepSeek MoE chain finish");
+    }
+    // The attention host node belongs to this device's stream.  A paired
+    // rank-local finish must inspect and clear only this device's commands;
+    // clearing the other rank here would release a callback before its stream
+    // has drained.  Cross-device collection keeps its existing paired path.
+    for (std::uint32_t index = 0U;
+         index < state.dsv4_attention_prepare_host_command_count; ++index) {
+        if (state.dsv4_attention_prepare_host_commands[index].failed) {
+            result.errors.emplace_back(
+                "DeepSeek attention preparation host callback failed");
+        }
+        state.dsv4_attention_prepare_host_commands[index] = {};
+    }
+    state.dsv4_attention_prepare_host_command_count = 0U;
+    state.dsv4_deferred_attention_command_count = 0U;
+    std::array<std::uint64_t, 4U> shared_phase_nanoseconds{};
+    bool shared_phase_timing_ok = true;
+    if (state.moe_shared_phase_timing_valid) {
+        const auto measure_shared_phase = [&](std::size_t index,
+                                              cudaEvent_t begin,
+                                              cudaEvent_t end,
+                                              const char* operation) {
+            float milliseconds = 0.0F;
+            if (auto status = cudaEventElapsedTime(&milliseconds, begin, end);
+                status != cudaSuccess) {
+                result.errors.emplace_back(
+                    std::string(operation) + ": " +
+                    cudaGetErrorString(status));
+                shared_phase_timing_ok = false;
+                return;
+            }
+            shared_phase_nanoseconds[index] = static_cast<std::uint64_t>(
+                std::llround(static_cast<double>(milliseconds) * 1.0e6));
+        };
+        measure_shared_phase(
+            0U, state.moe_hidden_uploaded,
+            state.moe_shared_input_finished,
+            "measure DeepSeek shared input quantization");
+        measure_shared_phase(
+            1U, state.moe_shared_input_finished,
+            state.moe_shared_gate_up_finished,
+            "measure DeepSeek shared gate/up");
+        measure_shared_phase(
+            2U, state.moe_shared_gate_up_finished,
+            state.moe_shared_activation_finished,
+            "measure DeepSeek shared activation quantization");
+        measure_shared_phase(
+            3U, state.moe_shared_activation_finished,
+            state.moe_shared_finished,
+            "measure DeepSeek shared down");
+    }
+    if (shared_phase_timing_ok && state.moe_shared_phase_timing_valid) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        device_stats.deepseek_moe_input_quantize_nanoseconds +=
+            shared_phase_nanoseconds[0U];
+        device_stats.deepseek_moe_shared_gate_up_nanoseconds +=
+            shared_phase_nanoseconds[1U];
+        device_stats.deepseek_moe_shared_activation_quantize_nanoseconds +=
+            shared_phase_nanoseconds[2U];
+        device_stats.deepseek_moe_shared_down_nanoseconds +=
+            shared_phase_nanoseconds[3U];
+    }
+    clear_shared_phase_timing();
+    bool callback_failed = false;
+    for (std::uint32_t index = 0U;
+         index < state.moe_host_callback_count; ++index) {
+        callback_failed = callback_failed ||
+            state.moe_host_callbacks[index].failed;
+    }
+    if (callback_failed) {
+        result.errors.emplace_back("DeepSeek host-MoE callback failed");
+    }
+    if (*host_status != 0U) {
+        result.errors.emplace_back("DeepSeek host-MoE device status failed");
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++device_stats.deepseek_moe_d2h_transfers;
+        device_stats.deepseek_moe_d2h_bytes += sizeof(*host_status);
+    }
+    state.moe_in_flight = false;
+    state.moe_weights.clear();
+    state.moe_host_join = false;
+    state.moe_output_to_mhc = false;
+    state.moe_host_callback = {};
+    for (std::uint32_t index = 0U;
+         index < state.moe_host_callback_count; ++index) {
+        state.moe_host_callbacks[index] = {};
+    }
+    state.moe_host_callback_count = 0U;
     return result;
 }
 

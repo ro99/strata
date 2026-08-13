@@ -16,6 +16,14 @@ add_compile_options(
 
 option(STRATA_ENABLE_SANITIZERS "Enable address and undefined-behavior sanitizers" OFF)
 option(STRATA_ENABLE_CUDA "Build the native CUDA backend when a CUDA compiler is available" ON)
+# Production rank-local TP2 decode. OFF keeps every normal build supported and
+# unlinked against NCCL; the runtime then rejects --rank-local-decode before
+# model loading rather than falling back to centralized execution.
+option(STRATA_ENABLE_NCCL "Build the rank-local TP2 decode topology against NCCL" OFF)
+set(STRATA_NCCL_INCLUDE_DIR "" CACHE PATH
+    "NCCL include directory used by the rank-local decode topology")
+set(STRATA_NCCL_LIBRARY "" CACHE FILEPATH
+    "NCCL shared library used by the rank-local decode topology")
 
 include(CheckLanguage)
 if(STRATA_ENABLE_CUDA)
@@ -65,6 +73,8 @@ add_library(strata_core STATIC
     src/deepseek_ops.cpp
     src/deepseek_diagnostics.cpp
     src/deepseek_checkpoint.cpp
+    src/deepseek_rank_shard.cpp
+    src/dsv4_host_moe_executor.cpp
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp
     src/json_cursor.cpp
@@ -174,6 +184,32 @@ if(STRATA_HAS_CUDA)
 
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(strata_core PUBLIC CUDA::cublas)
+
+    if(STRATA_ENABLE_NCCL)
+        if(NOT STRATA_NCCL_INCLUDE_DIR OR NOT EXISTS "${STRATA_NCCL_INCLUDE_DIR}/nccl.h")
+            message(FATAL_ERROR
+                "STRATA_ENABLE_NCCL requires STRATA_NCCL_INCLUDE_DIR to contain nccl.h")
+        endif()
+        if(NOT STRATA_NCCL_LIBRARY OR NOT EXISTS "${STRATA_NCCL_LIBRARY}")
+            message(FATAL_ERROR
+                "STRATA_ENABLE_NCCL requires STRATA_NCCL_LIBRARY to name the NCCL shared library")
+        endif()
+        get_filename_component(STRATA_NCCL_LIBRARY_DIR "${STRATA_NCCL_LIBRARY}" DIRECTORY)
+        # Compiled into strata_core rather than a separate archive: the executor
+        # needs CudaBackend and the runtime needs the executor, so a distinct
+        # library would be a cycle.
+        target_sources(strata_core PRIVATE
+            kernels/cuda/dsv4_rank_local_layer_executor.cu)
+        target_include_directories(strata_core PRIVATE "${STRATA_NCCL_INCLUDE_DIR}")
+        target_link_libraries(strata_core PUBLIC "${STRATA_NCCL_LIBRARY}" ${CMAKE_DL_LIBS} ${NUMA_LIBRARY})
+        set_target_properties(strata_core PROPERTIES BUILD_RPATH "${STRATA_NCCL_LIBRARY_DIR}")
+        # PUBLIC so the runtime, CLI, chat and server all agree on whether the
+        # rank-local topology exists at all.
+        target_compile_definitions(strata_core PUBLIC STRATA_HAS_NCCL=1)
+        set_property(TARGET strata_core PROPERTY CUDA_ARCHITECTURES 86 120)
+        set_property(TARGET strata_core PROPERTY CUDA_STANDARD 20)
+        set_property(TARGET strata_core PROPERTY CUDA_STANDARD_REQUIRED ON)
+    endif()
 endif()
 
 include(CTest)
@@ -203,6 +239,7 @@ if(BUILD_TESTING)
         tests/test_inkling_checkpoint.cpp
         tests/test_inkling_runtime.cpp
         tests/test_deepseek_manifest.cpp
+        tests/test_deepseek_rank_shard.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
         tests/test_deepseek_host_expert.cpp

@@ -75,6 +75,8 @@ add_library(strata_core STATIC
     src/deepseek_checkpoint.cpp
     src/deepseek_rank_shard.cpp
     src/dsv4_host_moe_executor.cpp
+    src/dsv4_rank_local_topology.cpp
+    src/dsv4_rank_local_weights.cpp
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp
     src/json_cursor.cpp
@@ -240,6 +242,7 @@ if(BUILD_TESTING)
         tests/test_inkling_runtime.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_rank_shard.cpp
+        tests/test_dsv4_rank_local_topology.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
         tests/test_deepseek_host_expert.cpp

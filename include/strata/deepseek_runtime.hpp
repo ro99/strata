@@ -6,6 +6,7 @@
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/deepseek_diagnostics.hpp"
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/dsv4_rank_local_topology.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
@@ -20,6 +21,10 @@ namespace strata {
 
 struct Dsv4RuntimeConfig {
     std::vector<int> devices{0};
+    // Decode execution topology. Centralized is the default and is unchanged
+    // by the rank-local feature. RankLocalTp2 is explicit opt-in, is admitted
+    // fail-closed before model loading, and never falls back once admitted.
+    Dsv4DecodeTopology decode_topology{Dsv4DecodeTopology::Centralized};
     double vram_cache_fraction{0.85};
     // Optional hard per-device admission ceiling. Zero preserves the
     // fractional-only contract; non-zero is combined with it as min().

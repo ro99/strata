@@ -274,12 +274,38 @@ or projected bounds fail.
 Prefill runs centralized, so both resident sets must fit under the same per-GPU
 ceiling. The centralized plan at the operating point is `9,204,991,520 B`
 resident spine, `536,870,912 B` fixed workspace reserve, `7,236,928 B` physical
-KV, with the remainder as expert VRAM cache (Experiment 0082). Measured expert
-cache use was only `4,073,858,048` and `5,594,845,696 B` against roughly
-`20.9 GB` of capacity, so the centralized prefill cache is capped to free room
-for the rank-local resident set — measured at `8,190,558,208 B/GPU` in 0092 —
-rather than the two being summed at full capacity. Weights are never reloaded
-during decode.
+KV, with the remainder as expert VRAM cache (Experiment 0082). The centralized
+prefill cache is capped to free room for the rank-local resident set — measured
+at `8,190,558,208 B/GPU` in 0092 — rather than the two being summed at full
+capacity. Weights are never reloaded during decode.
+
+**Projected coexistence at the operating point.** Combining those measured
+constants:
+
+```text
+rank-local sharded weights      8,190,558,208 B   (0092, measured)
+centralized resident spine      9,204,991,520 B   (0082, planned)
+fixed workspace reserve           536,870,912 B   (0082)
+physical KV                         7,236,928 B   (0082)
+                              -----------------
+fixed subtotal                 17,939,657,568 B
+per-GPU ceiling                21,287,272,448 B
+remaining for cache + NCCL + head buffers
+                                3,347,614,880 B
+```
+
+Measured centralized prefill cache use was `4,073,858,048 B` on device 0 and
+`5,594,845,696 B` on device 1 (0082), both above what remains. Prefill will
+therefore demand-upload the shortfall rather than serving it from cache.
+
+This is accepted, not a defect: the expert cache is a prefill term, prefill is
+outside the measured decode window, and admission caps the cache rather than
+rejecting. It is also a **projection**, not a measurement — the 0092 figure was
+taken by a harness that did not hold the centralized spine, so the two constants
+come from different configurations. Stage 6 must report actual per-component
+residency at the live operating point rather than relying on this sum. If the
+fixed subtotal alone exceeds the ceiling in practice, admission rejects and
+names the component responsible.
 
 The `21,287,272,448 B/GPU` ceiling is enforceable because of the explicit VRAM
 byte admission from Experiment 0082:

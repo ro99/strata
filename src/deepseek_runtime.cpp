@@ -5860,6 +5860,36 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.devices, config.vram_cache_fraction,
         config.sampling_temperature, "DeepSeek");
     if (!result.ok()) return result;
+    if (config.decode_topology == Dsv4DecodeTopology::RankLocalTp2) {
+        // Fail closed before the checkpoint is opened or any weight is
+        // resident. Conditions that need the manifest are re-checked at
+        // admission; these are the ones knowable from the build and the
+        // request alone, and they must not cost a model load to discover.
+#if !defined(STRATA_HAS_NCCL)
+        result.errors.emplace_back(
+            "rank-local decode was requested but this build has no NCCL "
+            "support; rebuild with -DSTRATA_ENABLE_NCCL=ON");
+#endif
+        if (config.devices.size() != kDsv4RankLocalWorld) {
+            result.errors.emplace_back(
+                "rank-local decode requires exactly " +
+                std::to_string(kDsv4RankLocalWorld) + " CUDA devices, got " +
+                std::to_string(config.devices.size()));
+        }
+        if (config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
+            result.errors.emplace_back(
+                "rank-local decode requires the physical-device DSV4 KV mode");
+        }
+        std::array<std::vector<int>, kDsv4RankLocalWorld> rank_cpus;
+        auto cpu_plan = plan_dsv4_rank_local_cpus(
+            NumaTopology::detect(), kDsv4RankLocalMinimumCpusPerRank,
+            rank_cpus);
+        if (!cpu_plan.ok()) {
+            result.errors.insert(result.errors.end(), cpu_plan.errors.begin(),
+                                 cpu_plan.errors.end());
+        }
+        if (!result.ok()) return result;
+    }
     const auto model_context =
         deepseek_v4_flash_0731_spec().max_context_tokens;
     if (config.maximum_context_tokens == 0U ||

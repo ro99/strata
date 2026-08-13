@@ -212,6 +212,33 @@ conflated:
 The `8.70 forward/s` figure is **fixture scope only** and is never reported as an
 end-to-end throughput result.
 
+### What fixture replay hid
+
+The M3 arms replayed `.d4r` fixtures whose pages already contained compressed
+and learned-index rows, and whose live page patch rewrote only the sliding row.
+Three mechanisms the live path needs therefore do not exist anywhere in
+`a31ac58`, and Stage 4 had to build rather than transplant them:
+
+- **No compressor weights.** Neither the experiment's `RankWeights` nor the
+  production `Dsv4RankLocalRankLayerWeights` carries `compressor.wkv/wgate` or
+  `indexer.compressor.wkv/wgate`, and `Dsv4RankLocalLayerExecutor::run` sets no
+  compressor pointers on its preparation request. The landing runs one
+  host-visible `dsv4_prepare_attention` per layer on the slot owning the
+  centralized compressor weights. It is per layer, not per rank: the projection
+  is replicated, so computing it twice could only agree or diverge.
+- **`compress_state` always published.** A logical row has to reach two
+  devices' pages, so it gained an optional pooled-row output and the
+  transaction owns the encode.
+- **Candidates were an input.** `Dsv4RankLocalLayerCall` takes candidates the
+  caller has already selected, but sparse selection needs *this* layer's query
+  rank, which only exists after preparation. Selection therefore runs between
+  the preparation and the call. This is the same constraint that makes the
+  43-layer queued chain a short-context mode.
+
+The lesson generalizes: a fixture that supplies an input also suppresses the
+mechanism that would have produced it, and the manifest cannot record a
+mechanism the experiment never ran.
+
 ## Capability preservation ledger
 
 Thirteen capabilities were built or established over the course of this
@@ -492,6 +519,18 @@ sequential control.
 **Failure lesson.** The M3 arms read pages already materialized by earlier
 in-process arms (0091 states this explicitly). A path that never materializes a
 page under test has not tested materialization.
+
+**Landing lesson — the transport is not the encode.** Stage 3 encoded one
+logical row into per-rank staging and was documented as replicating it. Stage 4
+found that nothing carried those bytes to the second rank's page: the executor's
+page-patch callback is the experiment's transport, and using it forces a host
+synchronization per rank per layer, which is why this landing patches the pages
+itself with `update_buffer` and keeps the executor's preparation device-only.
+Neither the encode nor the reservation could have detected a missing transport —
+rank 1 would have attended a zero row with no error raised and identical
+timings. `download_buffer` was added for exactly this reason: there was no way
+to read a device page back, so "the bytes are on both devices" was an
+unfalsifiable claim. It is now a test.
 
 **Reuse guidance.** The block allocator, table, and validation transfer. Page
 format and the attention semantics reading it do not.

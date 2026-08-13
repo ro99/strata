@@ -161,12 +161,36 @@ attention for any position without a cross-rank KV fetch on the decode path.
    host-visible is published yet.
 2. Compute and publish query, KV, and compressor rows in stream order, using
    fixed per-command staging or device-resident buffers.
-3. Run exact live candidate selection on both ranks with the production
-   algorithm — the Lightning-Indexer scoring, compressor state, and top-k
-   selection that the M3 fixture chain replayed from `.d4r`.
-4. Queue all 43 layers, then reach the single final completion.
+3. Run exact live candidate selection with the production algorithm — the
+   Lightning-Indexer scoring, compressor state, and top-k selection that the M3
+   fixture chain replayed from `.d4r`.
+4. Run each layer, carrying the reduced attention input forward; queue the
+   terminal layer and reach the single final completion through the head.
 5. Commit host-visible KV metadata **only after** both ranks' data and status
    collectives have succeeded.
+
+Step 2 is one host-visible preparation per layer, not per rank. The rank-local
+weight set carries no compressor weights and the executor's own preparation
+computes no compressor projection, so the query rank, the key/value row and
+both compressor projections come from a single `dsv4_prepare_attention` on the
+slot that owns the centralized compressor weights. The result is replicated by
+construction; computing it on each rank could only agree or diverge, and the
+second outcome is a silent replica fault. The row is then encoded once and
+written to each rank's device page with `update_buffer`, which keeps the
+executor's own preparation device-only and costs no host synchronization.
+
+Step 3 sits between the preparation and the layer call rather than inside it.
+`Dsv4RankLocalLayerCall` takes candidates as an input, but sparse selection
+needs this layer's query rank, which only exists once preparation has run. This
+is the same constraint that makes the queued 43-layer chain a short-context
+mode: a chain cannot select candidates for a layer whose query it has not yet
+computed.
+
+Replication is asserted, not assumed. The ranks' reduced attention input must
+be identical between layers and their terminal hidden state identical before
+publication. Both are hard errors: a divergence is a replica fault, and without
+the first check one rank's state would silently drive both ranks' next
+selection.
 
 Before the first rank-local token of a sequence, centralized prefill state is
 replicated to both ranks. Continuation and later chat turns transfer only newly

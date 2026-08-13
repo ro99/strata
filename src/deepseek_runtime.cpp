@@ -5,6 +5,15 @@
 #include "strata/deepseek_ops.hpp"
 #include "strata/deepseek_host_expert.hpp"
 #include "strata/dsv4_attention_kv.hpp"
+#include "strata/dsv4_rank_local_kv.hpp"
+#include "strata/dsv4_rank_local_weights.hpp"
+// The two-rank executor is a CUDA translation unit compiled only when NCCL is
+// available. Rank-local decode already requires NCCL at config validation, so
+// the session it owns is guarded on the same condition rather than declared
+// and left unlinkable.
+#if defined(STRATA_HAS_NCCL)
+#include "strata/dsv4_rank_local_layer_executor.hpp"
+#endif
 #include "strata/model_adapter.hpp"
 #include "strata/numa_topology.hpp"
 #include "strata/numerics.hpp"
@@ -1378,6 +1387,15 @@ struct DeepSeekV4Runtime::Impl {
     CudaBackend cuda;
     std::unique_ptr<Dsv4WeightCache> weights;
     std::unique_ptr<Dsv4KvCache> kv_cache;
+    // Rank-local decode session. Present only under the explicit opt-in, and
+    // only once admission has passed against measured byte accounts; the
+    // centralized path never consults it.
+    std::unique_ptr<Dsv4RankLocalWeightStore> rank_local_weights;
+#if defined(STRATA_HAS_NCCL)
+    std::unique_ptr<Dsv4RankLocalLayerExecutor> rank_local_executor;
+#endif
+    Dsv4RankLocalAdmission rank_local_admission;
+    bool rank_local_active{};
     Dsv4SequenceHandle active_sequence{};
     std::array<PhysicalAttentionContext, kLayers>
         physical_attention_contexts{};
@@ -1566,6 +1584,17 @@ struct DeepSeekV4Runtime::Impl {
                              std::span<const float> base,
                              bool parallel_projection = false);
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
+    // Admits rank-local decode against measured byte accounts, then loads the
+    // rank-sharded weights and initializes the two-rank executor. Fail-closed:
+    // any rejection leaves rank_local_active false and the centralized path
+    // untouched, so a refused opt-in degrades to a reported error rather than
+    // to a silently different decode.
+    ValidationResult admit_rank_local();
+    // One rank-local decode token across the two-rank executor. Reached only
+    // when admission passed and the position is past the prompt.
+    ValidationResult rank_local_forward_hidden(
+        std::uint32_t token, std::uint32_t position, std::span<float> hidden,
+        std::vector<float>* fused_logits);
     ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
         std::uint64_t logical_row);
@@ -5319,6 +5348,13 @@ ValidationResult DeepSeekV4Runtime::Impl::forward_hidden(
     graph_stats.embedding_nanoseconds += elapsed_nanoseconds(embedding_started);
     if (!result.ok()) return result;
     if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        if (rank_local_active && position >= active_prompt_tokens) {
+            // Decode, and rank-local was admitted. Prefill stays centralized:
+            // the rank-local set is a decode-shaped ownership of the weights,
+            // and admission accounts for both being resident.
+            return rank_local_forward_hidden(
+                token, position, hidden, fused_logits);
+        }
         return device_mhc_forward_hidden(
             token, position, hidden, fused_logits);
     }
@@ -5399,6 +5435,124 @@ bool DeepSeekV4Runtime::Impl::execute_device_head_callback(
         reduced, reduced, norm_weight->second, kRmsEpsilon);
     if (context.result.ok()) round_bf16(reduced);
     return context.result.ok();
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
+    ValidationResult result;
+    rank_local_active = false;
+    if (checkpoint == nullptr || weights == nullptr || kv_cache == nullptr) {
+        result.errors.emplace_back(
+            "rank-local decode requires a loaded checkpoint, weight arena and "
+            "physical KV cache");
+        return result;
+    }
+    std::array<int, kDsv4RankLocalWorld> rank_devices{};
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        rank_devices[rank] = devices[rank];
+    }
+
+    // Load first: admission needs the sharded set's measured size, and a
+    // rejection after loading is still fail-closed because the store is
+    // cleared before returning.
+    auto store = std::make_unique<Dsv4RankLocalWeightStore>();
+    result = store->load(*checkpoint, cuda, rank_devices, kLayers);
+    if (!result.ok()) return result;
+    const auto sharded = store->device_bytes();
+
+    Dsv4RankLocalAdmissionRequest request;
+    request.devices.assign(rank_devices.begin(), rank_devices.end());
+    request.kv_cache_mode = config.kv_cache_mode;
+    request.supported_checkpoint = true;
+    request.fp4_routed_experts = config.enable_device_moe;
+    request.layer_count = kLayers;
+    // Admission is a setup-time check, so it uses the configured maximum for
+    // both: the prompt length is not known until generate() runs, and a plan
+    // that only fits the current prompt is not a plan.
+    request.active_context_tokens = config.maximum_context_tokens;
+    request.maximum_context_tokens = config.maximum_context_tokens;
+#if defined(STRATA_HAS_NCCL)
+    request.nccl_available = true;
+#else
+    request.nccl_available = false;
+#endif
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        auto& device = request.device[rank];
+        device.rank_local_weight_bytes = sharded[rank];
+        device.centralized_spine_bytes = memory.resident_spine_vram_bytes;
+        device.workspace_bytes = kDeviceWorkspaceReserve;
+        device.kv_capacity_bytes =
+            rank < memory.per_device_kv_cache_bytes.size()
+                ? memory.per_device_kv_cache_bytes[rank] : 0U;
+        device.nccl_buffer_bytes = 64ULL << 20U;
+        device.head_buffer_bytes = 16ULL << 20U;
+        device.expert_cache_bytes = memory.expert_vram_cache_bytes;
+    }
+    request.host.routed_cpu_storage_bytes = memory.routed_expert_host_bytes;
+    request.host.host_parameter_bytes = memory.host_parameter_bytes;
+    request.host.host_workspace_bytes = memory.host_workspace_bytes;
+
+    auto admitted = admit_dsv4_rank_local(request, NumaTopology::detect());
+    if (!admitted.ok()) {
+        store->clear();
+        result.errors = std::move(admitted.errors);
+        return result;
+    }
+
+#if defined(STRATA_HAS_NCCL)
+    auto executor = std::make_unique<Dsv4RankLocalLayerExecutor>(cuda);
+    Dsv4RankLocalLayerOptions options;
+    options.devices = rank_devices;
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        options.rank_cpus[rank] = admitted.rank_cpus[rank];
+    }
+    options.resident = &resident;
+    result = executor->initialize(options);
+    if (!result.ok()) {
+        store->clear();
+        return result;
+    }
+    rank_local_executor = std::move(executor);
+#else
+    store->clear();
+    result.errors.emplace_back(
+        "rank-local decode requires an NCCL-enabled build");
+    return result;
+#endif
+
+    rank_local_weights = std::move(store);
+    rank_local_admission = std::move(admitted);
+    rank_local_active = true;
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
+    std::uint32_t token, std::uint32_t position, std::span<float> hidden,
+    std::vector<float>* fused_logits) {
+    ValidationResult result;
+    static_cast<void>(token);
+    static_cast<void>(position);
+    static_cast<void>(hidden);
+    static_cast<void>(fused_logits);
+#if defined(STRATA_HAS_NCCL)
+    const bool session = rank_local_active &&
+                         rank_local_executor != nullptr &&
+                         rank_local_weights != nullptr;
+#else
+    const bool session = false;
+#endif
+    if (!session) {
+        result.errors.emplace_back(
+            "rank-local decode was entered without an admitted session");
+        return result;
+    }
+    // The per-layer chain body is the remaining Stage 4 work. Until it exists
+    // this reports a failure rather than quietly running the centralized path:
+    // an opt-in that silently decodes centrally would make every rank-local
+    // measurement a measurement of something else.
+    result.errors.emplace_back(
+        "rank-local decode is admitted but its per-layer chain is not yet "
+        "wired; run without --decode-topology rank-local-tp2");
+    return result;
 }
 
 ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_hidden(
@@ -6511,6 +6665,13 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result = impl_->weights->validate_atomic_expert_capacity(
             (impl_->memory.maximum_expert_bytes + kMaximumExpertArenaPadding) *
             kTopK);
+        if (!result.ok()) return result;
+    }
+    // Rank-local decode is admitted last, after every centralized component
+    // has reported its real size. Admission needs measured byte accounts, not
+    // estimates, and those only exist once the arena and KV cache are built.
+    if (config.decode_topology == Dsv4DecodeTopology::RankLocalTp2) {
+        result = impl_->admit_rank_local();
         if (!result.ok()) return result;
     }
     result = impl_->reset_sequence(1U);

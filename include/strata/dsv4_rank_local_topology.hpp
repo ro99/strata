@@ -27,8 +27,27 @@ inline constexpr std::uint32_t kDsv4RankLocalLayerCount = 43U;
 inline constexpr std::size_t kDsv4RankLocalMinimumCpusPerRank = 24U;
 // Program ceilings. These are the declared operating-point limits, not
 // hardware capacities; admission rejects rather than exceeding them.
+//
+// 21 GiB per device, raised from experiment 0082's 21,287,272,448 B. That
+// figure was the *observed peak* of the centralized baseline, recorded as a
+// regression tripwire; it was never a hardware bound. Rank-local decode is
+// expected to exceed it, because it holds a second weight set the baseline
+// never had: the centralized prefill spine (9,204,991,520 B) alongside the
+// rank-local decode set (12,893,962,880 B) is 22,098,954,400 B, which the old
+// gate refused by about 0.76 GiB.
+//
+// The card is 24 GiB and measures 23.561 GiB free with nothing resident, so
+// this leaves roughly 2.6 GiB for the CUDA context, cuBLAS workspaces, NCCL
+// internals and allocator fragmentation. What 0082 actually validated at its
+// budget was zero decode weight and workspace allocations; that property, not
+// the byte count, is the one a higher ceiling puts at risk, and Stage 6 must
+// re-assert it rather than assume it survives.
+//
+// This is headroom for integration, not the resolution. Releasing the
+// centralized spine after prefill returns 9.2 GB instead of the 0.76 GiB this
+// buys, and remains the correct fix.
 inline constexpr std::uint64_t kDsv4RankLocalPerDeviceVramCeiling =
-    21'287'272'448ULL;
+    22'548'578'304ULL;
 inline constexpr std::uint64_t kDsv4RankLocalHostRssCeiling =
     231'928'233'984ULL;
 // Rank-local decode supports the model's full declared context. Above

@@ -131,6 +131,43 @@ TEST_CASE("rank-local admission caps the centralized prefill expert cache") {
             strata::kDsv4RankLocalPerDeviceVramCeiling);
 }
 
+TEST_CASE("rank-local admission fits the 1M decode set beside the prefill spine") {
+    // This is what the per-device ceiling was raised for, so it is pinned
+    // rather than left implicit in the constant. At the declared 1,048,576
+    // context the rank-local decode set and the centralized prefill spine are
+    // resident together; experiment 0082's 21,287,272,448 B gate refused that
+    // combination by about 0.76 GiB.
+    auto request = admissible_request();
+    request.active_context_tokens = 1'048'576U;
+    for (auto& device : request.device) {
+        // Measured 1M KV and index state: 21 ratio-4 layers of 262,144
+        // compressed and learned-index rows, 20 ratio-128 layers of 8,192
+        // compressed rows, and the fixed 128-row sliding window.
+        device.kv_capacity_bytes = 4'082'533'760ULL;
+        // No prefill cache: the spine's own weights are the term under test.
+        device.expert_cache_bytes = 0ULL;
+    }
+    const auto admitted =
+        strata::admit_dsv4_rank_local(request, two_node_topology());
+    REQUIRE(admitted.ok());
+    for (std::size_t rank = 0U; rank < strata::kDsv4RankLocalWorld; ++rank) {
+        REQUIRE(admitted.device_total_bytes[rank] ==
+                request.device[rank].fixed_total());
+        REQUIRE(admitted.device_total_bytes[rank] >
+                21'287'272'448ULL);
+        REQUIRE(admitted.device_total_bytes[rank] <=
+                strata::kDsv4RankLocalPerDeviceVramCeiling);
+    }
+
+    // The headroom is finite: the ceiling still has to reject something, or it
+    // is not a ceiling. One more gigabyte of KV does not fit.
+    for (auto& device : request.device) {
+        device.kv_capacity_bytes += 1ULL << 30U;
+    }
+    REQUIRE(!strata::admit_dsv4_rank_local(
+        request, two_node_topology()).ok());
+}
+
 TEST_CASE("rank-local admission rejects the opt-in without NCCL") {
     auto request = admissible_request();
     request.nccl_available = false;

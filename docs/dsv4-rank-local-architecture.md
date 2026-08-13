@@ -532,16 +532,28 @@ NCCL and head buffers          ~     84,000,000 B
                                12,893,962,880 B   against 21,287,272,448 B
 ```
 
-That fits with roughly `8.4 GB` to spare — but **only if the centralized
-prefill spine is not also resident**. Adding its `9,204,991,520 B` gives
-`22.09 GB`, over the ceiling by about `0.81 GB`.
+Adding the centralized prefill spine's `9,204,991,520 B` gives
+`22,098,954,400 B`, which experiment 0082's `21,287,272,448 B` gate refused by
+about `0.76 GiB`.
 
-At 256 context the two coexist and the prefill expert cache is merely capped.
-At 1M they do not. The centralized spine must therefore be **released after
-prefill**, before the first rank-local token, rather than merely capped. The
-alternative — sharding KV across ranks instead of replicating it — would
-reintroduce a cross-rank fetch on the decode path and is rejected for that
-reason.
+That gate was the **observed peak** of the centralized baseline, recorded as a
+regression tripwire. It was never a hardware bound, and rank-local decode is
+expected to exceed it, because it holds a second weight set the baseline never
+had. The ceiling is therefore raised to `22,548,578,304 B` (21 GiB). The card
+is 24 GiB and measures `23.561 GiB` free with nothing resident, leaving about
+`2.6 GiB` for the CUDA context, cuBLAS workspaces, NCCL internals and
+allocator fragmentation.
+
+What 0082 validated at its budget was **zero decode weight and workspace
+allocations** — that property, not the byte count, is what a higher ceiling
+puts at risk, and Stage 6 must re-assert it rather than assume it survives.
+
+This is headroom for integration, not the resolution. Releasing the spine
+after prefill returns `9.2 GB` rather than the `0.76 GiB` the raise buys, and
+remains the correct fix; it costs a reload before the next request's prefill,
+roughly `0.8 s` at `12 GB/s`. The other alternative — sharding KV across ranks
+instead of replicating it — would reintroduce a cross-rank fetch on the decode
+path and is rejected for that reason.
 
 Because the attended `512` compressed rows are data-dependent and scattered
 across the full `4.08 GB` compressed set, that whole set must be device-resident;

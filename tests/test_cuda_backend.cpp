@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_kv_cache.hpp"
 #include "strata/deepseek_ops.hpp"
+#include "strata/dsv4_attention_kv.hpp"
 #include "strata/numerics.hpp"
 
 #include <algorithm>
@@ -352,6 +353,181 @@ TEST_CASE("native CUDA Lightning Indexer matches the scalar top-512 oracle") {
             3U * (top_k * sizeof(std::uint32_t) + sizeof(unsigned int)));
     REQUIRE(stats.lightning_index_useful_selection_bytes ==
             3U * top_k * row_bytes);
+}
+
+TEST_CASE("physical Lightning Indexer matches the scalar oracle at the 1M candidate count") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device, true).ok());
+    if (!backend.validate_lightning_index_device(devices.front()).ok()) return;
+
+    constexpr std::uint32_t heads = 64U;
+    constexpr std::uint32_t head_dim = 128U;
+    constexpr std::uint32_t top_k = 512U;
+    constexpr std::uint32_t block_rows = strata::kDsv4PhysicalKvBlockRows;
+
+    const auto layout = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::LearnedIndex, block_rows);
+    REQUIRE(layout.ok());
+    REQUIRE(layout.value.semantic_width == head_dim);
+
+    // Queries cross the same E4M3 round trip the runtime applies before it
+    // hands them to the backend, so the oracle and the kernel see identical
+    // inputs and the comparison is exactness, not tolerance.
+    std::vector<float> queries(static_cast<std::size_t>(heads) * head_dim);
+    for (std::size_t index = 0U; index < queries.size(); ++index) {
+        queries[index] = static_cast<float>((index * 37U) % 23U) / 8.0F - 1.5F;
+    }
+    REQUIRE(strata::dsv4_physical_quantize_query_e4m3_f32(queries).ok());
+    std::vector<float> weights(heads);
+    for (std::uint32_t head = 0U; head < heads; ++head) {
+        weights[head] = static_cast<float>(static_cast<int>(head % 7U) - 3) /
+                        8.0F;
+    }
+
+    // Two page shapes are exercised: a partially filled tail page proves the
+    // kernel never scores uncommitted rows, and the padded candidate count
+    // proves selection holds at the width a 1M context actually produces.
+    const auto run = [&](std::uint32_t pages, std::uint32_t tail_rows) {
+        const auto candidates = (pages - 1U) * block_rows + tail_rows;
+        std::vector<std::byte> storage(
+            static_cast<std::size_t>(pages) * layout.value.block_bytes);
+        std::vector<float> keys(
+            static_cast<std::size_t>(candidates) * head_dim);
+        for (std::uint32_t row = 0U; row < candidates; ++row) {
+            auto key = std::span<float>(keys).subspan(
+                static_cast<std::size_t>(row) * head_dim, head_dim);
+            for (std::uint32_t column = 0U; column < head_dim; ++column) {
+                key[column] = static_cast<float>(
+                    static_cast<int>((row * 31U + column * 11U) % 17U) - 8) /
+                    4.0F;
+            }
+            auto page = std::span<std::byte>(storage).subspan(
+                static_cast<std::size_t>(row / block_rows) *
+                    layout.value.block_bytes,
+                static_cast<std::size_t>(layout.value.block_bytes));
+            REQUIRE(strata::dsv4_physical_encode_kv_row(
+                strata::Dsv4KvBlockKind::LearnedIndex, key,
+                row % block_rows, page).ok());
+        }
+        // The oracle reads the encoded rows back rather than the pre-encoding
+        // floats, so quantization error cannot hide inside the comparison.
+        std::vector<float> decoded(keys.size());
+        for (std::uint32_t row = 0U; row < candidates; ++row) {
+            auto page = std::span<const std::byte>(storage).subspan(
+                static_cast<std::size_t>(row / block_rows) *
+                    layout.value.block_bytes,
+                static_cast<std::size_t>(layout.value.block_bytes));
+            REQUIRE(strata::dsv4_physical_decode_kv_row(
+                strata::Dsv4KvBlockKind::LearnedIndex, page,
+                row % block_rows,
+                std::span<float>(decoded).subspan(
+                    static_cast<std::size_t>(row) * head_dim,
+                    head_dim)).ok());
+        }
+        std::vector<float> scores(candidates);
+        REQUIRE(strata::dsv4_index_scores_f32(
+            scores, queries, decoded, weights, heads, head_dim).ok());
+        const auto expected = strata::dsv4_index_topk_f32(scores, top_k);
+        REQUIRE(expected.ok());
+
+        strata::CudaBuffer resident;
+        REQUIRE(backend.upload_buffer(devices.front(), storage, resident).ok());
+        std::vector<strata::CudaDsv4PhysicalIndexPage> page_descriptors;
+        for (std::uint32_t page = 0U; page < pages; ++page) {
+            page_descriptors.push_back(strata::CudaDsv4PhysicalIndexPage{
+                &resident,
+                static_cast<std::uint64_t>(page) * layout.value.block_bytes,
+                block_rows,
+                page + 1U == pages ? tail_rows : block_rows});
+        }
+        strata::CudaDsv4PhysicalIndexRequest request;
+        request.queries = queries;
+        request.weights = weights;
+        request.pages = page_descriptors;
+        request.heads = heads;
+        request.head_dim = head_dim;
+        request.top_k = top_k;
+        std::vector<std::uint32_t> actual(top_k);
+        REQUIRE(backend.dsv4_physical_lightning_index(
+            devices.front(), request, actual).ok());
+        REQUIRE(actual == expected.positions);
+    };
+
+    run(5U, 37U);
+    // 262,144 candidates is exactly context/4 at the declared 1,048,576-token
+    // maximum: the width one layer must select over on every decode step.
+    run(1'024U, block_rows);
+}
+
+TEST_CASE("physical Lightning Indexer rejects malformed pages and shapes") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{devices.front()};
+    REQUIRE(backend.initialize(selected_device, false).ok());
+    if (!backend.validate_lightning_index_device(devices.front()).ok()) return;
+
+    constexpr std::uint32_t heads = 64U;
+    constexpr std::uint32_t head_dim = 128U;
+    constexpr std::uint32_t block_rows = strata::kDsv4PhysicalKvBlockRows;
+    const auto layout = strata::dsv4_physical_kv_layout(
+        strata::Dsv4KvBlockKind::LearnedIndex, block_rows);
+    REQUIRE(layout.ok());
+    std::vector<std::byte> storage(
+        static_cast<std::size_t>(layout.value.block_bytes));
+    std::vector<float> key(head_dim, 0.5F);
+    for (std::uint32_t row = 0U; row < block_rows; ++row) {
+        REQUIRE(strata::dsv4_physical_encode_kv_row(
+            strata::Dsv4KvBlockKind::LearnedIndex, key, row, storage).ok());
+    }
+    strata::CudaBuffer resident;
+    REQUIRE(backend.upload_buffer(devices.front(), storage, resident).ok());
+
+    std::vector<float> queries(static_cast<std::size_t>(heads) * head_dim,
+                               0.25F);
+    std::vector<float> weights(heads, 0.5F);
+    const std::array pages{strata::CudaDsv4PhysicalIndexPage{
+        &resident, 0U, block_rows, block_rows}};
+    strata::CudaDsv4PhysicalIndexRequest request;
+    request.queries = queries;
+    request.weights = weights;
+    request.pages = pages;
+    request.heads = heads;
+    request.head_dim = head_dim;
+    request.top_k = 64U;
+    std::vector<std::uint32_t> output(64U);
+    REQUIRE(backend.dsv4_physical_lightning_index(
+        devices.front(), request, output).ok());
+
+    // A page claiming more committed rows than its block holds would read past
+    // the payload; it must be refused rather than clamped.
+    const std::array overrun{strata::CudaDsv4PhysicalIndexPage{
+        &resident, 0U, block_rows, block_rows + 1U}};
+    auto invalid = request;
+    invalid.pages = overrun;
+    REQUIRE(!backend.dsv4_physical_lightning_index(
+        devices.front(), invalid, output).ok());
+
+    // A byte offset that leaves less than one page inside the buffer likewise
+    // has to fail closed.
+    const std::array shifted{strata::CudaDsv4PhysicalIndexPage{
+        &resident, layout.value.block_bytes / 2U, block_rows, block_rows}};
+    invalid = request;
+    invalid.pages = shifted;
+    REQUIRE(!backend.dsv4_physical_lightning_index(
+        devices.front(), invalid, output).ok());
+
+    // top_k above the candidate count has no defined selection.
+    invalid = request;
+    invalid.top_k = block_rows + 1U;
+    std::vector<std::uint32_t> wide(block_rows + 1U);
+    REQUIRE(!backend.dsv4_physical_lightning_index(
+        devices.front(), invalid, wide).ok());
 }
 
 TEST_CASE("native CUDA backend executes generic tiled online FlashAttention when available") {

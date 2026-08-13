@@ -237,6 +237,38 @@ struct CudaLightningIndexRequest {
     std::uint64_t maximum_workspace_bytes{32ULL << 20U};
 };
 
+// One persistent physical-format learned-index page, block-major exactly as
+// dsv4_physical_encode_kv_row writes it: `block_rows` payloads of `head_dim`
+// E4M3 bytes, then `block_rows` f32 per-row scales. `rows` is how many of the
+// block's rows carry committed history; the tail is never scored.
+//
+// This is a different layout from CudaLightningIndexSegment, which carries
+// FP4 E2M1 keys plus per-32 E8M0 scales in row-major order. The physical KV
+// cache stores the learned index as E4M3 with one f32 scale per row, so the
+// two cannot share a kernel.
+struct CudaDsv4PhysicalIndexPage {
+    const CudaBuffer* buffer{};
+    std::uint64_t byte_offset{};
+    std::uint32_t block_rows{};
+    std::uint32_t rows{};
+};
+
+struct CudaDsv4PhysicalIndexRequest {
+    // Queries have already crossed the host E4M3 round trip performed by
+    // dsv4_physical_quantize_query_e4m3_f32; the backend consumes them as the
+    // exact float values that quantization produced and applies no further
+    // rotation or simulation. Scoring reproduces dsv4_index_scores_f32 term by
+    // term, and selection reproduces dsv4_index_topk_f32, so the result is bit
+    // identical to the scalar reference rather than merely close to it.
+    std::span<const float> queries;
+    std::span<const float> weights;
+    std::span<const CudaDsv4PhysicalIndexPage> pages;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t top_k{};
+    std::uint64_t maximum_workspace_bytes{64ULL << 20U};
+};
+
 // One persistent physical-format physical KV page. The buffer contains only
 // the block-major payload: 576 data plus eight scale bytes per row.
 struct CudaDsv4PhysicalPage {
@@ -762,6 +794,16 @@ public:
     // selected inside the backend.
     [[nodiscard]] ValidationResult lightning_index(
         int device, const CudaLightningIndexRequest& request,
+        std::span<std::uint32_t> output);
+    // Exact bounded-workspace Lightning Indexer over physical-format E4M3
+    // learned-index pages. Selection is a parallel radix select over a
+    // composite (score, position) key rather than the serial insertion merge
+    // the FP4 path uses, because the physical cache reaches 262,144 candidates
+    // per layer at the declared 1M context, where a single-thread merge is the
+    // dominant term. Output ordering matches lightning_index: descending
+    // score, lower position winning ties.
+    [[nodiscard]] ValidationResult dsv4_physical_lightning_index(
+        int device, const CudaDsv4PhysicalIndexRequest& request,
         std::span<std::uint32_t> output);
     // Enqueue first on every active device, then collect each device. Routed
     // results are flattened in the same order as `routed`; shared output is

@@ -2518,6 +2518,75 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
         1.0F / std::sqrt(static_cast<float>(kIndexHeadDim * kIndexHeads));
     for (auto& weight : index_weights) weight = round_bf16(weight * index_scale);
 
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        // Physical KV keeps the learned index as E4M3 rows with one f32 scale
+        // each, which the FP4 Lightning Indexer above cannot read. The scalar
+        // path below is exact but scores every candidate on the host: at the
+        // declared 1,048,576-token context that is 262,144 candidates over 64
+        // heads of 128 dimensions per layer, 1.85e11 FLOP per token across the
+        // 21 ratio-4 layers, which no CPU budget reaches. Device selection is
+        // therefore the only viable path here, not an optimization of one.
+        auto cuda_demand = weights->demand();
+        auto blocks = kv_cache->block_table(
+            active_sequence, Dsv4KvBlockKind::LearnedIndex, layer);
+        if (!blocks.ok()) {
+            append_errors(result, std::move(blocks.errors));
+            return result;
+        }
+        std::vector<Dsv4KvDeviceLease> leases;
+        std::vector<CudaDsv4PhysicalIndexPage> pages;
+        try {
+            leases.reserve(blocks.value.size());
+            pages.reserve(blocks.value.size());
+        } catch (const std::bad_alloc&) {
+            result.errors.emplace_back(
+                "cannot allocate physical Lightning Indexer page metadata");
+            return result;
+        }
+        std::uint32_t remaining = compressed_count;
+        for (const auto& block : blocks.value) {
+            if (remaining == 0U) break;
+            const auto logical_row = block.logical_begin /
+                                     block.compression_ratio;
+            auto lease = kv_cache->acquire_device(
+                active_sequence, Dsv4KvBlockKind::LearnedIndex, layer,
+                logical_row, slot);
+            if (!lease.ok()) {
+                append_errors(result, std::move(lease.errors));
+                return result;
+            }
+            const auto rows = std::min(remaining, block.used_rows);
+            leases.push_back(std::move(lease.value));
+            // A physical device lease holds the block-major payload alone;
+            // acquire_device strips the header on upload.
+            pages.push_back(CudaDsv4PhysicalIndexPage{
+                leases.back().buffer(), 0U, block.capacity_rows, rows});
+            remaining -= rows;
+        }
+        if (remaining != 0U) {
+            result.errors.emplace_back(
+                "physical Lightning Indexer device history is incomplete");
+            return result;
+        }
+        selected.resize(kIndexTopK);
+        CudaDsv4PhysicalIndexRequest request;
+        request.queries = queries;
+        request.weights = index_weights;
+        request.pages = pages;
+        request.heads = kIndexHeads;
+        request.head_dim = kIndexHeadDim;
+        request.top_k = kIndexTopK;
+        result = cuda.dsv4_physical_lightning_index(
+            devices[slot], request, selected);
+        if (!result.ok()) {
+            selected.clear();
+            return result;
+        }
+        ++graph_stats.attention_index_cuda_dispatches;
+        record_selection();
+        return result;
+    }
+
     if (config.enable_gpu_lightning_indexer) {
         auto cuda_demand = weights->demand();
         std::vector<CudaLightningIndexSegment> segments;

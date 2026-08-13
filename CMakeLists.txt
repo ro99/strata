@@ -156,6 +156,9 @@ target_link_libraries(strata-dsv4-host-expert-probe PRIVATE strata_core)
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 
+add_executable(strata-dsv4-index-probe apps/strata_dsv4_index_probe.cpp)
+target_link_libraries(strata-dsv4-index-probe PRIVATE strata_core)
+
 add_executable(strata-kimi-expert-probe apps/strata_kimi_expert_probe.cpp)
 target_link_libraries(strata-kimi-expert-probe PRIVATE strata_core)
 

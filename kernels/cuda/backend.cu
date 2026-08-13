@@ -978,6 +978,373 @@ __global__ void lightning_score_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Physical-format (E4M3, one f32 scale per row) learned-index scoring and an
+// exact parallel top-k.
+//
+// The FP4 path above resolves top-k with a single-thread insertion merge over
+// every candidate. That is affordable at block-KV scale but not here: the
+// physical cache holds `context / 4` index rows per layer, which is 262,144
+// rows at the declared 1,048,576-token context, and 43 layers of a serial
+// 262,144-element merge dominates a decode step on its own. Selection below is
+// a radix select over a composite key, so every stage is parallel.
+// ---------------------------------------------------------------------------
+
+struct PhysicalIndexDeviceSegment {
+    const unsigned char* payload{};
+    std::uint32_t begin{};
+    std::uint32_t rows{};
+    std::uint32_t block_rows{};
+};
+
+// Order-preserving map from float to unsigned so that a larger unsigned always
+// means a larger float. Finite inputs only; the score kernel flags anything
+// else before selection runs.
+__device__ unsigned int physical_index_sortable(float value) {
+    const unsigned int bits = __float_as_uint(value);
+    return (bits & 0x80000000U) != 0U ? ~bits : (bits | 0x80000000U);
+}
+
+// Composite selection key: score in the high 32 bits, the position's
+// complement in the low 32. Descending order on this single key therefore
+// reproduces dsv4_index_topk_f32's "higher score first, lower position wins
+// ties" without a separate tie-break stage. Keys are unique because positions
+// are, so the radix select never has to split a bucket it cannot resolve.
+//
+// Only the top 16 bits of the sortable score carry information: every score is
+// round_bf16'd, so the low 16 mantissa bits of the fp32 are zero (and after
+// complementing a negative value, uniformly one). The score kernel enforces
+// that invariant rather than assuming it, which is what lets the select run in
+// three 16-bit passes instead of four.
+__device__ unsigned long long physical_index_key(float score,
+                                                 std::uint32_t position) {
+    const unsigned long long score_bits =
+        static_cast<unsigned long long>(physical_index_sortable(score) >> 16U);
+    return (score_bits << 32U) |
+           static_cast<unsigned long long>(~position);
+}
+
+// Shared footprint is sized for the DSV4 contract: 64 index heads of 128
+// dimensions. `rows_per_block` candidates share one block so that a block is
+// 256 threads rather than 64 -- at 64 the hardware's 16-blocks-per-SM cap, not
+// the register or shared budget, holds occupancy to two thirds.
+constexpr std::uint32_t kPhysicalIndexBlockThreads = 256U;
+constexpr std::uint32_t kPhysicalIndexMaxRowsPerBlock = 8U;
+constexpr std::uint32_t kPhysicalIndexMaxHeadDim = 1'024U;
+
+__global__ void dsv4_physical_index_score_kernel(
+    float* scores, unsigned long long* keys, const float* queries,
+    const float* weights, const PhysicalIndexDeviceSegment* segments,
+    std::uint32_t segment_count, std::uint32_t candidates,
+    std::uint32_t heads, std::uint32_t head_dim,
+    std::uint32_t rows_per_block, unsigned int* error_flag) {
+    // The E4M3 decode is a branch plus ldexpf. Executed once per element it
+    // would run head_dim times per thread; a byte has only 256 possible
+    // values, so the whole decode collapses to one table built per block and
+    // read as a shared load.
+    //
+    // Sized dynamically from the real shapes. A static array big enough for
+    // the widest supported head_dim would reserve 32 KiB per block and hold an
+    // SM to two blocks; at the DSV4 contract the same layout needs about 4 KiB
+    // and reaches full occupancy.
+    extern __shared__ float physical_index_shared[];
+    auto* e4m3_table = physical_index_shared;
+    auto* key_values = e4m3_table + 256U;
+    auto* head_scores = key_values +
+        static_cast<std::uint64_t>(rows_per_block) * head_dim;
+    auto* row_live = reinterpret_cast<unsigned int*>(
+        head_scores + blockDim.x);
+
+    const auto lane = threadIdx.x % heads;
+    const auto slot = threadIdx.x / heads;
+    const auto first_row = blockIdx.x * rows_per_block;
+
+    for (std::uint32_t entry = threadIdx.x; entry < 256U;
+         entry += blockDim.x) {
+        e4m3_table[entry] =
+            fp8_e4m3_value(static_cast<unsigned char>(entry));
+    }
+    if (threadIdx.x < rows_per_block) row_live[threadIdx.x] = 1U;
+    __syncthreads();
+
+    // Dequantize each of the block's rows once, cooperatively, into shared
+    // floats. Every head then reads a plain float instead of chasing a byte
+    // through two dependent shared lookups on every iteration.
+    for (std::uint32_t index = slot; index < rows_per_block;
+         index += blockDim.x / heads) {
+        const auto row = first_row + index;
+        if (row >= candidates) {
+            if (lane == 0U) row_live[index] = 0U;
+            continue;
+        }
+        std::uint32_t low = 0U;
+        std::uint32_t high = segment_count;
+        while (low < high) {
+            const auto middle = low + (high - low) / 2U;
+            if (segments[middle].begin + segments[middle].rows <= row) {
+                low = middle + 1U;
+            } else {
+                high = middle;
+            }
+        }
+        if (low >= segment_count || row < segments[low].begin) {
+            if (lane == 0U) {
+                row_live[index] = 0U;
+                atomicExch(error_flag, 1U);
+            }
+            continue;
+        }
+        const auto& segment = segments[low];
+        const auto local = row - segment.begin;
+        const auto* data = segment.payload +
+            static_cast<std::uint64_t>(local) * head_dim;
+        // Assembled byte by byte: `byte_offset` places a page anywhere inside
+        // its block buffer, so the scale region carries no alignment
+        // guarantee. The order matches the little-endian host memcpy in
+        // dsv4_physical_encode_kv_row.
+        const auto* scale_bytes = segment.payload +
+            static_cast<std::uint64_t>(segment.block_rows) * head_dim +
+            static_cast<std::uint64_t>(local) * sizeof(float);
+        const unsigned int scale_raw =
+            static_cast<unsigned int>(scale_bytes[0]) |
+            (static_cast<unsigned int>(scale_bytes[1]) << 8U) |
+            (static_cast<unsigned int>(scale_bytes[2]) << 16U) |
+            (static_cast<unsigned int>(scale_bytes[3]) << 24U);
+        const float scale = __uint_as_float(scale_raw);
+        if (!isfinite(scale) || scale <= 0.0F) {
+            if (lane == 0U) {
+                row_live[index] = 0U;
+                atomicExch(error_flag, 1U);
+            }
+            continue;
+        }
+        auto* destination = key_values +
+            static_cast<std::uint64_t>(index) * head_dim;
+        for (std::uint32_t column = lane; column < head_dim; column += heads) {
+            // Exactly the value dsv4_physical_decode_kv_row materializes.
+            destination[column] = __fmul_rn(e4m3_table[data[column]], scale);
+        }
+    }
+    __syncthreads();
+
+    const auto row = first_row + slot;
+    const bool live = slot < rows_per_block && row < candidates &&
+                      row_live[slot] != 0U;
+    // Queries arrive column-major (column * heads + head) so the heads of one
+    // row read consecutive floats. Head-major queries would stride by head_dim
+    // and cost a separate transaction per thread.
+    float dot = 0.0F;
+    if (live) {
+        const auto* query = queries + lane;
+        const auto* key = key_values +
+            static_cast<std::uint64_t>(slot) * head_dim;
+        // dsv4_index_scores_f32 accumulates query * key with a separate
+        // multiply and add, in ascending column order. Explicit
+        // round-to-nearest intrinsics stop the compiler contracting that into
+        // an fma, and the loop stays sequential per head, so the result is bit
+        // identical to the reference rather than a reassociated approximation.
+        for (std::uint32_t column = 0U; column < head_dim; ++column) {
+            dot = __fadd_rn(
+                dot,
+                __fmul_rn(query[static_cast<std::uint64_t>(column) * heads],
+                          key[column]));
+        }
+    }
+    head_scores[threadIdx.x] = bf16_round(dot);
+    __syncthreads();
+    if (lane != 0U || !live) return;
+    const auto* row_scores = head_scores +
+        static_cast<std::uint64_t>(slot) * heads;
+    float score = 0.0F;
+    for (std::uint32_t head = 0U; head < heads; ++head) {
+        score = __fadd_rn(
+            score,
+            bf16_round(__fmul_rn(weights[head],
+                                 fmaxf(0.0F, row_scores[head]))));
+    }
+    score = bf16_round(score);
+    // The composite key drops the low 16 bits of the score. That is exact only
+    // while the score really is bf16-valued, so verify it here instead of
+    // trusting bf16_round's contract from a distance.
+    if (!isfinite(score) || (__float_as_uint(score) & 0xFFFFU) != 0U) {
+        atomicExch(error_flag, 1U);
+        return;
+    }
+    scores[row] = score;
+    keys[row] = physical_index_key(score, row);
+}
+
+constexpr std::uint32_t kPhysicalIndexRadixBins = 65'536U;
+
+// Every pass reads its element count from device memory and is launched over
+// the worst-case grid, because the surviving set shrinks between passes and
+// reading its size on the host would cost a stream synchronize per pass --
+// 129 of them per token across 43 layers. Threads past the live count exit
+// immediately instead.
+__global__ void dsv4_physical_index_histogram_kernel(
+    const unsigned long long* keys, const std::uint32_t* active,
+    const std::uint32_t* active_count, std::uint32_t shift,
+    std::uint32_t* histogram) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= *active_count) return;
+    const auto position = active == nullptr ? index : active[index];
+    const auto digit = static_cast<std::uint32_t>(
+        (keys[position] >> shift) & 0xFFFFULL);
+    atomicAdd(&histogram[digit], 1U);
+}
+
+// Walks the histogram from the highest digit down, accumulating until the
+// running count reaches the number of selections still owed. Everything above
+// the bin it stops on is an outright winner; the bin itself is the only one
+// that has to be split further.
+constexpr std::uint32_t kPhysicalIndexPivotThreads = 1'024U;
+constexpr std::uint32_t kPhysicalIndexPivotGroup =
+    kPhysicalIndexRadixBins / kPhysicalIndexPivotThreads;
+
+// Locates the bin holding the k-th largest key. A single thread walking all
+// 65,536 bins costs about 0.48 ms per pass here, which at three passes and 43
+// layers is 62 ms per token of pure serial scan -- the same defect the FP4
+// path's <<<1,1>>> merge has, moved rather than fixed. This reduces per group
+// in parallel, suffix-scans 1,024 group totals, and leaves one thread to walk
+// only the 64 bins of the group that actually contains the pivot.
+__global__ void dsv4_physical_index_pivot_kernel(
+    const std::uint32_t* histogram, const std::uint32_t* remaining,
+    std::uint32_t* pivot_bin, std::uint32_t* above_count) {
+    __shared__ std::uint32_t suffix[kPhysicalIndexPivotThreads];
+    __shared__ std::uint32_t pivot_group;
+    const auto thread = threadIdx.x;
+    const auto owed = *remaining;
+    std::uint32_t total = 0U;
+    for (std::uint32_t index = 0U; index < kPhysicalIndexPivotGroup; ++index) {
+        total += histogram[thread * kPhysicalIndexPivotGroup + index];
+    }
+    suffix[thread] = total;
+    if (thread == 0U) pivot_group = 0U;
+    __syncthreads();
+    // Inclusive suffix sum: suffix[t] ends as the population of every bin at
+    // or above group t, which is the count "from the top" the walk needs.
+    for (std::uint32_t stride = 1U; stride < kPhysicalIndexPivotThreads;
+         stride *= 2U) {
+        const std::uint32_t addend =
+            thread + stride < kPhysicalIndexPivotThreads
+                ? suffix[thread + stride] : 0U;
+        __syncthreads();
+        suffix[thread] += addend;
+        __syncthreads();
+    }
+    // Exactly one group satisfies both halves: it reaches the quota while the
+    // group above it does not.
+    const bool reaches = suffix[thread] >= owed;
+    const bool above_short = thread + 1U == kPhysicalIndexPivotThreads ||
+                             suffix[thread + 1U] < owed;
+    if (reaches && above_short) pivot_group = thread;
+    __syncthreads();
+    if (thread != 0U) return;
+    const auto group = pivot_group;
+    std::uint32_t accumulated = group + 1U == kPhysicalIndexPivotThreads
+        ? 0U : suffix[group + 1U];
+    const auto first = group * kPhysicalIndexPivotGroup;
+    for (std::uint32_t bin = first + kPhysicalIndexPivotGroup; bin-- > first;) {
+        const auto count = histogram[bin];
+        if (accumulated + count >= owed) {
+            *pivot_bin = bin;
+            *above_count = accumulated;
+            return;
+        }
+        accumulated += count;
+    }
+    *pivot_bin = first;
+    *above_count = accumulated;
+}
+
+__global__ void dsv4_physical_index_partition_kernel(
+    const unsigned long long* keys, const std::uint32_t* active,
+    const std::uint32_t* active_count, std::uint32_t shift,
+    const std::uint32_t* pivot, std::uint32_t* winners,
+    std::uint32_t* winner_count, std::uint32_t* next_active,
+    std::uint32_t* next_count) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= *active_count) return;
+    const auto position = active == nullptr ? index : active[index];
+    const auto digit = static_cast<std::uint32_t>(
+        (keys[position] >> shift) & 0xFFFFULL);
+    if (digit > *pivot) {
+        winners[atomicAdd(winner_count, 1U)] = position;
+    } else if (digit == *pivot) {
+        next_active[atomicAdd(next_count, 1U)] = position;
+    }
+}
+
+// Retires one pass: the winners above the pivot are already banked, so the
+// outstanding count drops by that many and the tied bucket becomes the next
+// pass's input.
+__global__ void dsv4_physical_index_advance_kernel(
+    std::uint32_t* remaining, const std::uint32_t* above_count,
+    std::uint32_t* active_count, std::uint32_t* next_count) {
+    if (threadIdx.x != 0U || blockIdx.x != 0U) return;
+    *remaining -= *above_count;
+    *active_count = *next_count;
+    *next_count = 0U;
+}
+
+// After the last pass the survivors agree on all 48 key bits. Keys are unique,
+// so that set holds exactly the outstanding selections.
+__global__ void dsv4_physical_index_finalize_kernel(
+    const std::uint32_t* active, const std::uint32_t* active_count,
+    const std::uint32_t* remaining, std::uint32_t* winners,
+    std::uint32_t* winner_count, unsigned int* error_flag) {
+    if (threadIdx.x != 0U || blockIdx.x != 0U) return;
+    if (*active_count < *remaining) {
+        atomicExch(error_flag, 1U);
+        return;
+    }
+    for (std::uint32_t index = 0U; index < *remaining; ++index) {
+        winners[(*winner_count)++] = active[index];
+    }
+}
+
+// Bitonic sort of the selected positions by descending composite key. The
+// radix select emits winners in bucket order, not in final order, so this is
+// what makes the output match dsv4_index_topk_f32 element for element.
+__global__ void dsv4_physical_index_sort_kernel(
+    std::uint32_t* selected, const unsigned long long* keys,
+    std::uint32_t count, std::uint32_t padded) {
+    extern __shared__ unsigned long long sort_keys[];
+    auto* sort_values = reinterpret_cast<std::uint32_t*>(sort_keys + padded);
+    for (std::uint32_t index = threadIdx.x; index < padded;
+         index += blockDim.x) {
+        const bool live = index < count;
+        sort_values[index] = live ? selected[index] : 0xFFFFFFFFU;
+        sort_keys[index] = live ? keys[selected[index]] : 0ULL;
+    }
+    __syncthreads();
+    for (std::uint32_t size = 2U; size <= padded; size *= 2U) {
+        for (std::uint32_t stride = size / 2U; stride > 0U; stride /= 2U) {
+            for (std::uint32_t index = threadIdx.x; index < padded;
+                 index += blockDim.x) {
+                const auto partner = index ^ stride;
+                if (partner <= index) continue;
+                const bool ascending = (index & size) != 0U;
+                const bool swap = ascending
+                    ? sort_keys[index] > sort_keys[partner]
+                    : sort_keys[index] < sort_keys[partner];
+                if (!swap) continue;
+                const auto key = sort_keys[index];
+                sort_keys[index] = sort_keys[partner];
+                sort_keys[partner] = key;
+                const auto value = sort_values[index];
+                sort_values[index] = sort_values[partner];
+                sort_values[partner] = value;
+            }
+            __syncthreads();
+        }
+    }
+    for (std::uint32_t index = threadIdx.x; index < count;
+         index += blockDim.x) {
+        selected[index] = sort_values[index];
+    }
+}
+
 __global__ void lightning_topk_initialize_kernel(
     float* top_scores, std::uint32_t* top_positions,
     std::uint32_t top_k) {
@@ -5357,6 +5724,451 @@ ValidationResult CudaBackend::lightning_index(
     if (host_error != 0U) {
         result.errors.emplace_back(
             "Lightning Indexer encountered corrupt FP4 values or incomplete keys");
+    }
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_physical_lightning_index(
+    int device, const CudaDsv4PhysicalIndexRequest& request,
+    std::span<std::uint32_t> output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.lightning_index_supported) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer CUDA kernel supports only SM86 and SM120 devices");
+        return result;
+    }
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer cannot overlap an in-flight DeepSeek MoE command");
+        return result;
+    }
+    const auto query_elements = static_cast<std::uint64_t>(request.heads) *
+                                request.head_dim;
+    if (request.heads == 0U || request.heads > 64U ||
+        request.head_dim < 32U || request.head_dim > 1'024U ||
+        request.head_dim % 4U != 0U || request.top_k == 0U ||
+        request.queries.size() != query_elements ||
+        request.weights.size() != request.heads ||
+        std::any_of(request.queries.begin(), request.queries.end(),
+                    [](float value) { return !std::isfinite(value); }) ||
+        std::any_of(request.weights.begin(), request.weights.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer query shape or values are unsupported");
+        return result;
+    }
+    std::uint64_t candidates64 = 0U;
+    for (const auto& page : request.pages) {
+        std::uint64_t bytes = 0U;
+        if (page.buffer == nullptr || !page.buffer->valid() ||
+            page.buffer->device() != device || page.rows == 0U ||
+            page.block_rows == 0U || page.rows > page.block_rows ||
+            !checked_bytes(page.block_rows,
+                           static_cast<std::uint64_t>(request.head_dim) +
+                               sizeof(float),
+                           1U, bytes) ||
+            bytes > page.buffer->device_bytes() ||
+            page.byte_offset > page.buffer->device_bytes() - bytes ||
+            candidates64 > std::numeric_limits<std::uint64_t>::max() -
+                               page.rows) {
+            result.errors.emplace_back(
+                "physical Lightning Indexer page is invalid");
+            return result;
+        }
+        candidates64 += page.rows;
+    }
+    if (candidates64 > 1'048'576U ||
+        request.pages.size() > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer candidate or page count is unsupported");
+        return result;
+    }
+    const auto candidates = static_cast<std::uint32_t>(candidates64);
+    const auto selected = std::min(request.top_k, candidates);
+    if (output.size() != selected) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer output extent is incompatible");
+        return result;
+    }
+    if (candidates == 0U) return result;
+    if (request.top_k > candidates) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer top-k exceeds the candidate count");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for physical Lightning Indexer");
+    }
+
+    std::uint64_t cursor = 0U;
+    const auto region = [&](std::uint64_t bytes, std::uint64_t alignment,
+                            std::uint64_t& offset) -> bool {
+        if (!align_up(cursor, alignment, offset) ||
+            bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+            return false;
+        }
+        cursor = offset + bytes;
+        return true;
+    };
+    std::uint64_t query_bytes = 0U;
+    std::uint64_t weight_bytes = 0U;
+    std::uint64_t segment_bytes = 0U;
+    std::uint64_t score_bytes = 0U;
+    std::uint64_t key_bytes = 0U;
+    std::uint64_t active_bytes = 0U;
+    std::uint64_t winner_bytes = 0U;
+    constexpr std::uint64_t histogram_bytes =
+        static_cast<std::uint64_t>(kPhysicalIndexRadixBins) *
+        sizeof(std::uint32_t);
+    // remaining, winner_count, active_count, next_count, pivot_bin,
+    // above_count, error
+    constexpr std::uint64_t counter_count = 7U;
+    if (!checked_bytes(request.queries.size(), 1U, sizeof(float),
+                       query_bytes) ||
+        !checked_bytes(request.weights.size(), 1U, sizeof(float),
+                       weight_bytes) ||
+        !checked_bytes(request.pages.size(), 1U,
+                       sizeof(PhysicalIndexDeviceSegment), segment_bytes) ||
+        !checked_bytes(candidates, 1U, sizeof(float), score_bytes) ||
+        !checked_bytes(candidates, 1U, sizeof(unsigned long long), key_bytes) ||
+        !checked_bytes(candidates, 1U, sizeof(std::uint32_t), active_bytes) ||
+        !checked_bytes(request.top_k, 1U, sizeof(std::uint32_t),
+                       winner_bytes)) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer workspace size overflows");
+        return result;
+    }
+    std::uint64_t query_offset = 0U;
+    std::uint64_t weight_offset = 0U;
+    std::uint64_t segment_offset = 0U;
+    std::uint64_t score_offset = 0U;
+    std::uint64_t key_offset = 0U;
+    std::uint64_t active_offset = 0U;
+    std::uint64_t next_offset = 0U;
+    std::uint64_t winner_offset = 0U;
+    std::uint64_t histogram_offset = 0U;
+    std::uint64_t counter_offset = 0U;
+    if (!region(query_bytes, alignof(float), query_offset) ||
+        !region(weight_bytes, alignof(float), weight_offset) ||
+        !region(segment_bytes, alignof(PhysicalIndexDeviceSegment),
+                segment_offset) ||
+        !region(score_bytes, alignof(float), score_offset) ||
+        !region(key_bytes, alignof(unsigned long long), key_offset) ||
+        !region(active_bytes, alignof(std::uint32_t), active_offset) ||
+        !region(active_bytes, alignof(std::uint32_t), next_offset) ||
+        !region(winner_bytes, alignof(std::uint32_t), winner_offset) ||
+        !region(histogram_bytes, alignof(std::uint32_t), histogram_offset) ||
+        !region(counter_count * sizeof(std::uint32_t), alignof(std::uint32_t),
+                counter_offset) ||
+        cursor > request.maximum_workspace_bytes ||
+        cursor > std::numeric_limits<std::size_t>::max()) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer exceeds its bounded CUDA workspace");
+        return result;
+    }
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    if (state.lightning_workspace_bytes < cursor ||
+        state.lightning_workspace_bytes > request.maximum_workspace_bytes) {
+        if (state.lightning_workspace != nullptr) {
+            static_cast<void>(cudaFree(state.lightning_workspace));
+            state.lightning_workspace = nullptr;
+            state.lightning_workspace_bytes = 0U;
+        }
+        if (auto status = cudaMalloc(&state.lightning_workspace,
+                                     static_cast<std::size_t>(cursor));
+            status != cudaSuccess) {
+            return cuda_error(
+                status,
+                "allocate bounded physical Lightning Indexer workspace");
+        }
+        state.lightning_workspace_bytes = cursor;
+        allocation_calls = 1U;
+        allocation_bytes = cursor;
+    }
+    auto* base = state.lightning_workspace;
+    auto* device_queries = reinterpret_cast<float*>(base + query_offset);
+    auto* device_weights = reinterpret_cast<float*>(base + weight_offset);
+    auto* device_segments = reinterpret_cast<PhysicalIndexDeviceSegment*>(
+        base + segment_offset);
+    auto* device_scores = reinterpret_cast<float*>(base + score_offset);
+    auto* device_keys = reinterpret_cast<unsigned long long*>(
+        base + key_offset);
+    auto* device_active = reinterpret_cast<std::uint32_t*>(
+        base + active_offset);
+    auto* device_next = reinterpret_cast<std::uint32_t*>(base + next_offset);
+    auto* device_winners = reinterpret_cast<std::uint32_t*>(
+        base + winner_offset);
+    auto* device_histogram = reinterpret_cast<std::uint32_t*>(
+        base + histogram_offset);
+    auto* counters = reinterpret_cast<std::uint32_t*>(base + counter_offset);
+    auto* device_remaining = counters + 0U;
+    auto* device_winner_count = counters + 1U;
+    auto* device_active_count = counters + 2U;
+    auto* device_next_count = counters + 3U;
+    auto* device_pivot = counters + 4U;
+    auto* device_above = counters + 5U;
+    auto* device_error = reinterpret_cast<unsigned int*>(counters + 6U);
+
+    std::vector<PhysicalIndexDeviceSegment> descriptors;
+    try {
+        descriptors.reserve(request.pages.size());
+    } catch (const std::bad_alloc&) {
+        result.errors.emplace_back(
+            "cannot allocate physical Lightning Indexer page metadata");
+        return result;
+    }
+    std::uint32_t row_begin = 0U;
+    for (const auto& page : request.pages) {
+        descriptors.push_back(PhysicalIndexDeviceSegment{
+            static_cast<const unsigned char*>(page.buffer->impl_->data) +
+                page.byte_offset,
+            row_begin, page.rows, page.block_rows});
+        row_begin += page.rows;
+    }
+
+    const auto operation_started = std::chrono::steady_clock::now();
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "record physical Lightning Indexer upload start");
+        }
+    }
+    std::uint64_t h2d_transfers = 0U;
+    std::uint64_t h2d_bytes = 0U;
+    const auto upload = [&](void* destination, const void* source,
+                            std::uint64_t bytes) -> bool {
+        if (bytes == 0U) return true;
+        if (auto status = cudaMemcpyAsync(destination, source,
+                                          static_cast<std::size_t>(bytes),
+                                          cudaMemcpyHostToDevice, state.stream);
+            status != cudaSuccess) {
+            result = cuda_error(status,
+                                "upload physical Lightning Indexer input");
+            return false;
+        }
+        ++h2d_transfers;
+        h2d_bytes += bytes;
+        return true;
+    };
+    // Transposed to column-major on the way in so the score kernel's 64
+    // threads read consecutive floats. The cost is one pass over 8,192 values
+    // per call; the alternative is a strided read in the innermost loop.
+    std::vector<float> transposed;
+    try {
+        transposed.resize(request.queries.size());
+    } catch (const std::bad_alloc&) {
+        result.errors.emplace_back(
+            "cannot allocate physical Lightning Indexer query staging");
+        return result;
+    }
+    for (std::uint32_t head = 0U; head < request.heads; ++head) {
+        for (std::uint32_t column = 0U; column < request.head_dim; ++column) {
+            transposed[static_cast<std::size_t>(column) * request.heads + head] =
+                request.queries[static_cast<std::size_t>(head) *
+                                    request.head_dim + column];
+        }
+    }
+    if (!upload(device_queries, transposed.data(), query_bytes) ||
+        !upload(device_weights, request.weights.data(), weight_bytes) ||
+        !upload(device_segments, descriptors.data(), segment_bytes)) {
+        return result;
+    }
+    const std::array<std::uint32_t, counter_count> initial_counters{
+        request.top_k, 0U, candidates, 0U, 0U, 0U, 0U};
+    if (!upload(counters, initial_counters.data(),
+                counter_count * sizeof(std::uint32_t))) {
+        return result;
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded,
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "record physical Lightning Indexer upload completion");
+        }
+    }
+
+    constexpr std::uint32_t kPassThreads = 256U;
+    const auto pass_blocks = (candidates + kPassThreads - 1U) / kPassThreads;
+    const auto rows_per_block = std::min(
+        kPhysicalIndexMaxRowsPerBlock,
+        std::max(1U, kPhysicalIndexBlockThreads / request.heads));
+    const auto score_threads = rows_per_block * request.heads;
+    const auto score_blocks =
+        (candidates + rows_per_block - 1U) / rows_per_block;
+    const auto score_shared = static_cast<std::size_t>(
+        (256U + rows_per_block * request.head_dim + score_threads +
+         rows_per_block) * sizeof(float));
+    dsv4_physical_index_score_kernel<<<score_blocks, score_threads,
+                                      score_shared, state.stream>>>(
+        device_scores, device_keys, device_queries, device_weights,
+        device_segments, static_cast<std::uint32_t>(request.pages.size()),
+        candidates, request.heads, request.head_dim, rows_per_block,
+        device_error);
+    // Three 16-bit passes cover the composite key's 48 live bits: the top 16
+    // are the bf16 score, the low 32 the position's complement.
+    const std::array<std::uint32_t, 3U> shifts{32U, 16U, 0U};
+    const std::uint32_t* pass_active = nullptr;
+    auto* pass_next = device_active;
+    auto* pass_spare = device_next;
+    for (const auto shift : shifts) {
+        if (auto status = cudaMemsetAsync(device_histogram, 0,
+                                          static_cast<std::size_t>(
+                                              histogram_bytes),
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "clear physical Lightning Indexer histogram");
+        }
+        dsv4_physical_index_histogram_kernel<<<pass_blocks, kPassThreads, 0U,
+                                              state.stream>>>(
+            device_keys, pass_active, device_active_count, shift,
+            device_histogram);
+        dsv4_physical_index_pivot_kernel<<<1U, kPhysicalIndexPivotThreads, 0U,
+                                          state.stream>>>(
+            device_histogram, device_remaining, device_pivot, device_above);
+        dsv4_physical_index_partition_kernel<<<pass_blocks, kPassThreads, 0U,
+                                              state.stream>>>(
+            device_keys, pass_active, device_active_count, shift, device_pivot,
+            device_winners, device_winner_count, pass_next, device_next_count);
+        dsv4_physical_index_advance_kernel<<<1U, 1U, 0U, state.stream>>>(
+            device_remaining, device_above, device_active_count,
+            device_next_count);
+        pass_active = pass_next;
+        std::swap(pass_next, pass_spare);
+    }
+    dsv4_physical_index_finalize_kernel<<<1U, 1U, 0U, state.stream>>>(
+        pass_active, device_active_count, device_remaining, device_winners,
+        device_winner_count, device_error);
+    std::uint32_t padded = 1U;
+    while (padded < selected) padded *= 2U;
+    const auto sort_shared =
+        static_cast<std::size_t>(padded) *
+        (sizeof(unsigned long long) + sizeof(std::uint32_t));
+    dsv4_physical_index_sort_kernel<<<1U, std::min(padded, 1'024U), sort_shared,
+                                     state.stream>>>(
+        device_winners, device_keys, selected, padded);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status,
+                          "launch physical Lightning Indexer kernels");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "record physical Lightning Indexer kernel completion");
+        }
+    }
+    unsigned int host_error = 0U;
+    const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    if (auto status = cudaMemcpyAsync(output.data(), device_winners,
+                                      output.size_bytes(),
+                                      cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status,
+                          "download physical Lightning Indexer positions");
+    }
+    if (auto status = cudaMemcpyAsync(&host_error, device_error,
+                                      sizeof(host_error),
+                                      cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status,
+                          "download physical Lightning Indexer error state");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded,
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status,
+                "record physical Lightning Indexer download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize physical Lightning Indexer");
+    }
+    const auto wait_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_started).count());
+    const auto total_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - operation_started).count());
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_ms = 0.0F;
+        float kernel_ms = 0.0F;
+        float d2h_ms = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_ms, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "measure physical Lightning Indexer upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_ms, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "measure physical Lightning Indexer kernels");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_ms, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "measure physical Lightning Indexer download");
+        }
+        h2d_nanoseconds = static_cast<std::uint64_t>(h2d_ms * 1.0e6F);
+        kernel_nanoseconds = static_cast<std::uint64_t>(kernel_ms * 1.0e6F);
+        d2h_nanoseconds = static_cast<std::uint64_t>(d2h_ms * 1.0e6F);
+    }
+    const auto row_bytes =
+        static_cast<std::uint64_t>(request.head_dim) + sizeof(float);
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += h2d_bytes;
+        stats.activation_d2h_bytes += output_bytes + sizeof(host_error);
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+        ++stats.synchronization_calls;
+        stats.synchronization_nanoseconds += wait_nanoseconds;
+        stats.activation_h2d_nanoseconds += h2d_nanoseconds;
+        stats.kernel_nanoseconds += kernel_nanoseconds;
+        stats.activation_d2h_nanoseconds += d2h_nanoseconds;
+        ++stats.lightning_index_calls;
+        stats.lightning_index_kernel_launches += 2U + shifts.size() * 4U;
+        stats.lightning_index_candidates += candidates;
+        stats.lightning_index_selected += selected;
+        stats.lightning_index_h2d_transfers += h2d_transfers;
+        stats.lightning_index_d2h_transfers += 2U;
+        stats.lightning_index_h2d_bytes += h2d_bytes;
+        stats.lightning_index_d2h_bytes += output_bytes + sizeof(host_error);
+        stats.lightning_index_useful_selection_bytes +=
+            static_cast<std::uint64_t>(selected) * row_bytes;
+        stats.lightning_index_h2d_nanoseconds += h2d_nanoseconds;
+        stats.lightning_index_kernel_nanoseconds += kernel_nanoseconds;
+        stats.lightning_index_d2h_nanoseconds += d2h_nanoseconds;
+        stats.lightning_index_nanoseconds += total_nanoseconds;
+    }
+    if (host_error != 0U) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer encountered a corrupt E4M3 row, a "
+            "non-bf16 score, or an incomplete key history");
     }
     return result;
 }

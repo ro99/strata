@@ -224,6 +224,11 @@ ValidationResult CudaBackend::lightning_index(
     return {{"Lightning Indexer requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_physical_lightning_index(
+    int, const CudaDsv4PhysicalIndexRequest&, std::span<std::uint32_t>) {
+    return {{"physical Lightning Indexer requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::enqueue_deepseek_moe(
     int, std::span<const float>,
     std::span<const CudaDeepSeekMoeExpert>,

@@ -5541,17 +5541,32 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
 #else
     request.nccl_available = false;
 #endif
+    // Dsv4MemoryPlan's spine and expert-cache figures are aggregates across
+    // every device -- admission compares their sum against the aggregate VRAM
+    // budget -- while the rank-local ceiling is per device. Charging each rank
+    // the aggregate would double-count both on a two-device topology and
+    // reject a configuration that fits. The weight cache measures the real
+    // per-slot split, so take it from there rather than dividing by the
+    // device count: 43 layers over two slots is 22 and 21, not 21.5.
+    const auto cache = weights->stats();
     for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
         auto& device = request.device[rank];
         device.rank_local_weight_bytes = sharded[rank];
-        device.centralized_spine_bytes = memory.resident_spine_vram_bytes;
+        device.centralized_spine_bytes =
+            rank < cache.pinned_bytes.size() ? cache.pinned_bytes[rank] : 0U;
         device.workspace_bytes = kDeviceWorkspaceReserve;
         device.kv_capacity_bytes =
             rank < memory.per_device_kv_cache_bytes.size()
                 ? memory.per_device_kv_cache_bytes[rank] : 0U;
         device.nccl_buffer_bytes = 64ULL << 20U;
         device.head_buffer_bytes = 16ULL << 20U;
-        device.expert_cache_bytes = memory.expert_vram_cache_bytes;
+        // Whatever the slot's weight-cache capacity leaves once the pinned
+        // spine is placed. This is the one component admission may cap.
+        device.expert_cache_bytes =
+            rank < cache.capacity_bytes.size() &&
+                    cache.capacity_bytes[rank] > device.centralized_spine_bytes
+                ? cache.capacity_bytes[rank] - device.centralized_spine_bytes
+                : 0U;
     }
     request.host.routed_cpu_storage_bytes = memory.routed_expert_host_bytes;
     request.host.host_parameter_bytes = memory.host_parameter_bytes;

@@ -3869,6 +3869,12 @@ struct CudaBackend::Impl {
         std::uint64_t dsv4_mhc_head_input_bytes{};
         std::uint64_t dsv4_mhc_head_output_bytes{};
         std::uint64_t dsv4_mhc_head_host_staging_bytes{};
+        // Logit bytes of the head currently in flight. The reservation above
+        // is a capacity, because one device may serve heads of two shapes:
+        // centralized prefill projects the full vocabulary while rank-local
+        // decode projects one rank's row shard. A completion must still match
+        // the enqueue that produced it exactly, which is what this pins.
+        std::uint64_t dsv4_mhc_head_logits_bytes{};
         Dsv4MhcHeadCallbackState dsv4_mhc_head_callback{};
         bool dsv4_mhc_head_in_flight{};
         float* gemma_workspace{};
@@ -10638,7 +10644,25 @@ ValidationResult CudaBackend::reserve_dsv4_mhc_head(
         }
         state.dsv4_mhc_head_input_bytes = input_bytes;
     }
-    if (state.dsv4_mhc_head_output == nullptr) {
+    // A reservation is a capacity, not a shape. One device can serve two head
+    // shapes: centralized prefill projects the full vocabulary while rank-local
+    // decode projects one rank's row shard, and under the rank-local opt-in
+    // both are resident on the same device. Growing is safe because the
+    // staging layout is offset-addressed from a fixed prefix; shrinking is a
+    // no-op that keeps the larger buffer. What must still match exactly is the
+    // enqueue against its own completion, which is pinned separately below.
+    if (state.dsv4_mhc_head_in_flight) {
+        result.errors.emplace_back(
+            "DeepSeek output-head reservation cannot change while a head is "
+            "in flight");
+        return result;
+    }
+    if (state.dsv4_mhc_head_output_bytes < output_bytes) {
+        if (state.dsv4_mhc_head_output != nullptr) {
+            static_cast<void>(cudaFree(state.dsv4_mhc_head_output));
+            state.dsv4_mhc_head_output = nullptr;
+            state.dsv4_mhc_head_output_bytes = 0U;
+        }
         if (auto status = cudaMalloc(
                 &state.dsv4_mhc_head_output,
                 static_cast<std::size_t>(output_bytes));
@@ -10647,7 +10671,13 @@ ValidationResult CudaBackend::reserve_dsv4_mhc_head(
         }
         state.dsv4_mhc_head_output_bytes = output_bytes;
     }
-    if (state.dsv4_mhc_head_host_staging == nullptr) {
+    if (state.dsv4_mhc_head_host_staging_bytes < host_bytes) {
+        if (state.dsv4_mhc_head_host_staging != nullptr) {
+            static_cast<void>(
+                cudaFreeHost(state.dsv4_mhc_head_host_staging));
+            state.dsv4_mhc_head_host_staging = nullptr;
+            state.dsv4_mhc_head_host_staging_bytes = 0U;
+        }
         void* staging = nullptr;
         if (auto status = cudaMallocHost(
                 &staging, static_cast<std::size_t>(host_bytes));
@@ -10659,10 +10689,11 @@ ValidationResult CudaBackend::reserve_dsv4_mhc_head(
         state.dsv4_mhc_head_host_staging_bytes = host_bytes;
     }
     if (state.dsv4_mhc_head_input_bytes != input_bytes ||
-        state.dsv4_mhc_head_output_bytes != output_bytes ||
-        state.dsv4_mhc_head_host_staging_bytes != host_bytes) {
+        state.dsv4_mhc_head_output_bytes < output_bytes ||
+        state.dsv4_mhc_head_host_staging_bytes < host_bytes) {
         result.errors.emplace_back(
-            "DeepSeek output-head reservation changed after initialization");
+            "DeepSeek output-head reservation is smaller than the head it "
+            "must serve");
         return result;
     }
     return result;
@@ -10692,13 +10723,16 @@ ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
         callback == nullptr || callback_context == nullptr ||
         descriptor.columns != kDsv4MhcHidden ||
         state.dsv4_mhc_head_input_bytes != input_bytes ||
-        state.dsv4_mhc_head_output_bytes != output_bytes ||
-        state.dsv4_mhc_head_host_staging_bytes !=
+        state.dsv4_mhc_head_output_bytes < output_bytes ||
+        state.dsv4_mhc_head_host_staging_bytes <
             hidden_bytes + input_bytes + output_bytes) {
         result.errors.emplace_back(
             "DeepSeek device output-head command order or shape is invalid");
         return result;
     }
+    // This head's own logit extent, so its completion cannot accept a span
+    // sized for the other head shape resident on this device.
+    state.dsv4_mhc_head_logits_bytes = output_bytes;
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status, "select CUDA device for output-head enqueue");
     }
@@ -10865,7 +10899,7 @@ ValidationResult CudaBackend::complete_dsv4_mhc_head_device(
     constexpr std::uint64_t input_bytes =
         kDsv4MhcHidden * sizeof(float);
     if (!state.dsv4_mhc_head_in_flight ||
-        output_bytes != state.dsv4_mhc_head_output_bytes) {
+        output_bytes != state.dsv4_mhc_head_logits_bytes) {
         result.errors.emplace_back(
             "DeepSeek output-head completion shape or order is invalid");
         return result;

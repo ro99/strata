@@ -562,23 +562,49 @@ the rest is model-bound.
 *Reuse: low. Model-specific: DeepSeek-specific.*
 
 **Preserved as** DSV4-specific production code on `main` (indexer, compressor,
-DSpark verification). In this landing, live candidate selection is Stage 3;
-in M3 it was replayed from `.d4r` (see CAP-07).
+DSpark verification), extended by this landing with device-side selection over
+physical-format pages (`CudaBackend::dsv4_physical_lightning_index`). In this
+landing, live candidate selection is Stage 3; in M3 it was replayed from
+`.d4r` (see CAP-07).
 
 **Invariants.** DSpark verification, the declared attention/compression layout,
 selection and scoring functions, top-k normalization, and routed scaling are
 preserved exactly as declared by the model manifest. Both ranks run selection
 independently on replicated state and must agree; correctness builds verify
 rank agreement. Compressor and index values are raw FP32 where the target
-format declares it, not BF16.
+format declares it, not BF16. Device selection is bit identical to
+`dsv4_index_scores_f32` followed by `dsv4_index_topk_f32`, not merely close:
+the dot product keeps the reference's sequential FP32 order under explicit
+`__fmul_rn`/`__fadd_rn`, so no fma contraction or reassociation occurs.
 
 **Evidence.** 0092 reproduced logits `343d766f3f5c0af3` and token `8806`;
 `docs/experiments/0064` and the Lightning-Indexer correctness gate on
-`feat/dsv4-gpu-lightning-indexer` hold the component records.
+`feat/dsv4-gpu-lightning-indexer` hold the component records. Device selection
+is verified position for position against the scalar oracle at a partially
+filled tail page and at the full 262,144-candidate width, and timed by
+`strata-dsv4-index-probe`: 3.158 ms per indexed layer at that width on one
+3090, 66.3 ms/token across the 21 ratio-4 layers.
 
-**Failure lesson.** The GPU Lightning Indexer is admitted only with the exact
-compact block KV cache; pairing it with another KV mode is rejected at config
-validation rather than silently producing a different selection.
+**Failure lesson.** Two, and both are about format and shape rather than
+policy.
+
+The FP4 GPU Lightning Indexer is admitted only with the exact compact block KV
+cache. That is a *format* constraint, not a preference: block KV stores index
+rows as FP4 E2M1 with per-32 E8M0 scales, physical KV stores them as E4M3 with
+one F32 scale per row, and one kernel cannot read both. Config validation
+rejects the pairing rather than silently producing a different selection. The
+consequence went unnoticed for longer than it should have: PhysicalDevice mode
+fell through to host scalar scoring, which is 1.85e11 FLOP/token at the
+declared 1M context and cannot meet any decode budget. A capability fenced off
+for a real reason still leaves a hole where it used to be.
+
+The device replacement then reproduced the very defect it was written to fix.
+Its first version resolved top-k with a `<<<1,1>>>` scan of 65,536 histogram
+bins -- the FP4 path's serial merge, relocated. It showed up as shape, not
+magnitude: 1.497 ms/layer at only 1,024 candidates, and 256x more candidates
+costing 13x more time. A cost that barely moves with the work is a constant,
+and a constant that large is a defect. Fixing the scan and the block geometry
+took the same measurement from 842 to 66.3 ms/token.
 
 **Reuse guidance.** Effectively none outside DeepSeek. Preserved for exactness
 auditing, not portability.

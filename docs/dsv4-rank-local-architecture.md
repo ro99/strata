@@ -462,34 +462,62 @@ the sparse indexer only engages above `index_topk * ratio = 2048` active tokens.
 
 ### Why `tau` is nearly context-independent
 
-Attention cost is **bounded by construction**. Each layer attends a fixed
-`128`-row sliding window plus at most `index_topk = 512` indexed compressed
-rows — `640` rows per layer regardless of context length, roughly `13 MB/token`
-across 43 layers. The compressed set grows with context but the *attended* set
-does not.
-
 The bottleneck term does not grow at all. The routed CPU MoE body moves
 `3,449,290,752 B/forward` of expert weights, which is a function of the model,
-not of `L`. It is `argmax_r` at every context length.
+not of `L`. It is `argmax_r` at short context.
 
-What does grow is the **indexer scoring**, which must score all `L/ratio`
-compressed candidates to select its top `512`. At 1M that is `262,144`
-candidates per layer, reading `732,512,256 B / 43 = 17.0 MB` of index state per
-layer, or `732 MB/token` across the chain. Device-resident that is roughly
-`0.8 ms/token` at HBM bandwidth; if the kernel is compute- rather than
-bandwidth-bound it is nearer `5.3 ms/token`.
+Two terms *do* grow, and an earlier revision of this document was wrong about
+both. It claimed attention was "bounded by construction" at `640` rows per
+layer and bracketed the indexer at `0.8-5.3 ms/token`. Measurement put the
+indexer at `66.3 ms/token`, twelve to eighty times the bracket, and the
+boundedness claim holds for only half the layers.
+
+**Attention is bounded on the ratio-4 layers only.** `compression_ratios`
+alternates `4` and `128` from layer 2, so of 43 layers, 21 run at ratio 4, 20
+at ratio 128, and 2 have no compressor. Only the ratio-4 layers engage the
+sparse indexer and attend the fixed `512 + 128 = 640` rows. The ratio-128
+layers attend their compressed history *densely*: `L/128` rows, which is `2` at
+256 context and `8,192` at 1M. Attended rows per token therefore rise from
+about `13 MB` to about `105 MB` — still small against HBM bandwidth, but the
+per-candidate host work in `physical_paged_attention`'s `locate()` is a linear
+block-table search per candidate and does not have that excuse.
+
+**Indexer scoring, measured.** It must score all `L/ratio` compressed
+candidates to select its top `512`: at 1M, `262,144` candidates per layer over
+the 21 ratio-4 layers. `strata-dsv4-index-probe` on one 3090:
 
 ```text
-tau(1M)  ~=  73.897 ms   routed CPU MoE      (context-independent, argmax_r)
-           + 41.048 ms   non-CPU envelope    (M3; orchestration, mHC, NCCL)
-           +  0.8-5.3 ms indexer scoring     (new; not present in any measurement)
-           =  116-120 ms  ->  8.3-8.6 tok/s
+context    candidates   ms/indexed layer   ms/token (21 layers)
+    4,096       1,024              0.264                  5.546
+   65,536      16,384              0.429                  9.003
+  262,144      65,536              0.975                 20.473
+1,048,576     262,144              3.158                 66.310
 ```
 
-This is the one genuinely unmeasured term in the landing: M3 replayed
-`indexed_positions` from `.d4r`, and at 256 context the indexer is disengaged
-entirely, so no arm has ever timed it. The bracket above is arithmetic, and
-Stage 6 must replace it with a measurement.
+Substituting the measurement for the bracket:
+
+```text
+tau(1M)  ~=  73.897 ms   routed CPU MoE      (context-independent)
+           + 41.048 ms   non-CPU envelope    (M3; orchestration, mHC, NCCL)
+           + 66.310 ms   indexer scoring     (measured, replicated per rank)
+           = 181.3 ms  ->  5.5 tok/s
+```
+
+**This misses the gate.** `125.0 ms/token` is the 8 tok/s budget and the
+indexer alone is `53%` of it. The term is not additive-by-nature — it is GPU
+work and the MoE body is CPU work — but the layer chain is dependent, so no
+overlap is available without speculation, and the M3 envelope was measured as
+serial terms rather than overlapped ones.
+
+The identified mitigation is to **shard index scoring across the two ranks**
+rather than replicating it. If a candidate belongs to the global top `512` it
+necessarily belongs to its own rank's local top `512`, so each rank scoring
+half the candidates and exchanging local winners yields the exact same
+selection: `1,024` candidates to merge, an `8 KB` exchange. That halves the
+term to roughly `33 ms/token` and preserves the agreement invariant, because
+both ranks then merge the same union. It is arithmetic, not a measurement, and
+it is not yet built. Stage 6 must measure `tau(1M)` end to end rather than
+inferring it from these components.
 
 ### Device residency at 1M
 
@@ -518,6 +546,36 @@ reason.
 Because the attended `512` compressed rows are data-dependent and scattered
 across the full `4.08 GB` compressed set, that whole set must be device-resident;
 demand-paging it over PCIe would cost far more than the entire step budget.
+
+### Selection is device work, and why it has to be
+
+The learned index lives in physical KV as E4M3 rows with one F32 scale each.
+The FP4 Lightning Indexer cannot read that layout — it expects FP4 E2M1 with
+per-32 E8M0 scales — which is why config validation admits it only with block
+KV. PhysicalDevice mode consequently fell through to *host scalar* scoring.
+
+That path cannot serve the declared context, and arithmetic settles it without
+a run: `262,144` candidates over `64` heads of `128` dimensions across 21
+layers is `1.85e11 FLOP/token`. Forty-eight cores at a generous `20 GFLOP/s`
+each is a `192 ms/token` floor — past the whole budget before any attention or
+MoE work exists.
+
+`CudaBackend::dsv4_physical_lightning_index` supplies the device path. Its
+output is bit identical to `dsv4_index_scores_f32` followed by
+`dsv4_index_topk_f32`: the dot product keeps the reference's sequential FP32
+order under explicit `__fmul_rn`/`__fadd_rn`, so the compiler cannot contract
+it into an fma and reassociate. That choice costs the tensor-core path, which
+would reassociate the accumulation and could change which rows are selected
+near the score threshold — a semantic change, not a rounding one. The cost of
+exactness is reported above rather than traded away silently.
+
+Selection remains **outside the queued chain**. `index_select` needs a
+host-visible `query_rank` to project index queries, and in the queued path that
+value exists only inside the CUDA host callback, where calling a CUDA API is
+forbidden. The 21 indexed layers therefore take the synchronous
+`attention_prepared` path and the other 22 keep the deferred page update. This
+is a real overlap cost, recorded rather than hidden; closing it requires index
+query projection to move into the queued chain as device work.
 
 ### What long context does not fix
 

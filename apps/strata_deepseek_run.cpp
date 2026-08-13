@@ -55,6 +55,9 @@ struct Options {
     bool gpu_lightning_indexer{};
     bool block_kv_cache{};
     bool device_resident_runtime{};
+    // Explicit opt-in. Centralized decode stays the default, and a rejected
+    // admission reports rather than falling back.
+    bool rank_local_decode{};
     bool logit_trace{};
     bool layer_hash_trace{};
     bool overlap_resident_warmup{true};
@@ -81,6 +84,7 @@ void usage() {
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
         << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
+        << "       [--decode-topology centralized|rank-local-tp2]\n"
         << "       [--row-major-moe-page]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
@@ -267,6 +271,28 @@ bool parse_options(int argc, char** argv, Options& options) {
             // device-resident runtime exercise routed GPU
             // experts while reporting the accepted attention/mHC path.
             options.host_routed_moe = true;
+        } else if (argument == "--decode-topology") {
+            const auto* value = next(argument);
+            if (value == nullptr) return false;
+            const std::string_view topology{value};
+            if (topology == "centralized") {
+                options.rank_local_decode = false;
+            } else if (topology == "rank-local-tp2") {
+                // Rank-local decode is a decode-shaped ownership of the same
+                // weights the device-resident contract places; it does not
+                // replace prefill, which stays centralized. Everything the
+                // centralized device-resident path requires is required here
+                // too, so the opt-in implies it rather than silently running
+                // rank-local against a scalar cache.
+                options.rank_local_decode = true;
+                options.block_kv_cache = true;
+                options.device_resident_runtime = true;
+                options.flash_attention = true;
+                options.gpu_lightning_indexer = false;
+                options.host_routed_moe = true;
+            } else {
+                return false;
+            }
         } else if (argument == "--flash-attention-minimum-rows") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(
@@ -1049,6 +1075,9 @@ int main(int argc, char** argv) {
                                  : strata::Dsv4KvCacheMode::ScalarOracle;
     config.kv_block_rows = options.device_resident_runtime
         ? strata::kDsv4PhysicalKvBlockRows : strata::kDsv4KvBlockRows;
+    config.decode_topology = options.rank_local_decode
+        ? strata::Dsv4DecodeTopology::RankLocalTp2
+        : strata::Dsv4DecodeTopology::Centralized;
     config.flash_attention_minimum_rows =
         options.flash_attention_minimum_rows;
     config.enable_logit_trace = options.logit_trace;

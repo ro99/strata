@@ -36,6 +36,8 @@ namespace {
     request.supported_checkpoint = true;
     request.fp4_routed_experts = true;
     request.layer_count = strata::kDsv4RankLocalLayerCount;
+    request.active_context_tokens = 256U;
+    request.maximum_context_tokens = 1'048'576U;
     for (auto& device : request.device) {
         device.rank_local_weight_bytes = 8'190'558'208ULL;
         device.centralized_spine_bytes = 9'204'991'520ULL;
@@ -194,6 +196,26 @@ TEST_CASE("rank-local admission rejects a per-GPU ceiling breach and names it") 
     REQUIRE(admitted.device_total_bytes[0] == 0U);
     REQUIRE(admitted.expert_cache_capacity_bytes[0] == 0U);
     REQUIRE(admitted.rank_cpus[0].empty());
+}
+
+TEST_CASE("rank-local admission serves the full declared context") {
+    auto request = admissible_request();
+    // Well past the sparse-indexer threshold: the topology must admit the
+    // indexer regime rather than cap the context.
+    request.active_context_tokens =
+        strata::kDsv4RankLocalSparseIndexerThreshold * 16U;
+    REQUIRE(strata::admit_dsv4_rank_local(request, two_node_topology()).ok());
+
+    // The model's own 1M declared maximum is admitted.
+    request.active_context_tokens = 1'048'576U;
+    REQUIRE(strata::admit_dsv4_rank_local(request, two_node_topology()).ok());
+
+    // Beyond the model maximum is rejected.
+    request.active_context_tokens = 1'048'577U;
+    const auto admitted =
+        strata::admit_dsv4_rank_local(request, two_node_topology());
+    REQUIRE(!admitted.ok());
+    REQUIRE(mentions(admitted.errors, "above the model maximum"));
 }
 
 TEST_CASE("rank-local admission rejects a host RSS ceiling breach") {

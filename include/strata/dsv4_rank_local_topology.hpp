@@ -31,6 +31,12 @@ inline constexpr std::uint64_t kDsv4RankLocalPerDeviceVramCeiling =
     21'287'272'448ULL;
 inline constexpr std::uint64_t kDsv4RankLocalHostRssCeiling =
     231'928'233'984ULL;
+// Rank-local decode supports the model's full declared context. Above
+// `index_topk * compression_ratio` (2048 at the DSV4 contract) active tokens
+// the sparse Lightning Indexer engages; the queued page-update path admits
+// sparse-index preparation, so no separate context ceiling applies here.
+// Admission still checks the request against the model's declared maximum.
+inline constexpr std::uint32_t kDsv4RankLocalSparseIndexerThreshold = 2048U;
 
 // Per-device residency accounted by component. These are deliberately separate
 // fields rather than one total: the landing must be able to say which component
@@ -72,6 +78,11 @@ struct Dsv4RankLocalAdmissionRequest {
     bool supported_checkpoint{};
     bool fp4_routed_experts{};
     std::uint32_t layer_count{};
+    // Active context tokens the session will reach, and the model's declared
+    // maximum. Rank-local decode serves the full declared context; the
+    // request is rejected only if it exceeds what the model itself allows.
+    std::uint32_t active_context_tokens{};
+    std::uint32_t maximum_context_tokens{};
     std::array<Dsv4RankLocalDeviceAccount, kDsv4RankLocalWorld> device{};
     Dsv4RankLocalHostAccount host{};
     std::uint64_t per_device_vram_ceiling_bytes{

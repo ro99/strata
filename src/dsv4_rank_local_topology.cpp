@@ -141,6 +141,17 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
         result.errors.emplace_back(
             "rank-local decode requires FP4 routed experts");
     }
+    // Rank-local decode serves the model's full declared context, including
+    // the sparse-indexer regime above kDsv4RankLocalSparseIndexerThreshold.
+    // Only a request beyond the model's own maximum is rejected.
+    if (request.maximum_context_tokens != 0U &&
+        request.active_context_tokens > request.maximum_context_tokens) {
+        result.errors.emplace_back(
+            "rank-local decode was asked for " +
+            std::to_string(request.active_context_tokens) +
+            " active context tokens, above the model maximum " +
+            std::to_string(request.maximum_context_tokens));
+    }
     if (request.layer_count != kDsv4RankLocalLayerCount) {
         result.errors.emplace_back(
             "rank-local decode requires " +

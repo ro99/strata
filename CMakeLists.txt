@@ -76,6 +76,7 @@ add_library(strata_core STATIC
     src/deepseek_rank_shard.cpp
     src/dsv4_host_moe_executor.cpp
     src/dsv4_rank_local_topology.cpp
+    src/dsv4_rank_local_kv.cpp
     src/dsv4_rank_local_weights.cpp
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp

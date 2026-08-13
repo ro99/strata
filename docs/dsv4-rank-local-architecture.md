@@ -574,8 +574,45 @@ host-visible `query_rank` to project index queries, and in the queued path that
 value exists only inside the CUDA host callback, where calling a CUDA API is
 forbidden. The 21 indexed layers therefore take the synchronous
 `attention_prepared` path and the other 22 keep the deferred page update. This
-is a real overlap cost, recorded rather than hidden; closing it requires index
-query projection to move into the queued chain as device work.
+is a real overlap cost, recorded rather than hidden.
+
+### The 43-layer chain is a short-context mode, not the general one
+
+`Dsv4RankLocalLayerExecutor` offers two shapes: `run()` executes one layer
+against live mHC state, and `enqueue_chain_layer`/`finish_chain` queue many
+layers and drain once. M3's `114.944 ms` was the chain.
+
+**The chain cannot serve a context where the indexer engages.**
+`Dsv4RankLocalLayerCall` takes `candidates` as an *input* span, so every
+layer's candidates must be known before the drain. For a ratio-4 layer the
+candidates come from `index_select`, which projects index queries from
+`query_rank = wq_a x input`, and that input is the previous layer's output —
+which does not exist until the drain has already run. All 43 must be known
+before the drain; 21 cannot be known until after it.
+
+This is why M3 replayed `indexed_positions` from `.d4r`. That was not a fixture
+convenience, it was the only way a full chain could be formed at all, and it is
+a further reason `8.70 forward/s` must never be quoted as end-to-end
+throughput.
+
+The consequence is that the two operating points this landing must serve run
+**different execution shapes**:
+
+```text
+active tokens <= 2048   indexer disengaged   one 43-layer chain, one drain
+active tokens >  2048   indexer engaged      layer-by-layer run(), ~22 drains
+```
+
+`2048` is `index_topk * ratio`; below it the runtime attends the compressed set
+densely and never selects. The 256-context performance gate therefore measures
+the chain, and 1M does not measure the same mechanism at all. Stage 6 must
+report them as two measurements, and must not present a chain figure as
+evidence for the long-context path.
+
+Closing the gap requires index query projection, scoring and top-k to run as
+device work *inside* the queued chain, so no host round trip interrupts it.
+`CudaBackend::dsv4_physical_lightning_index` is device work but is dispatched
+from the host and synchronizes its stream, so it does not yet satisfy that.
 
 ### What long context does not fix
 

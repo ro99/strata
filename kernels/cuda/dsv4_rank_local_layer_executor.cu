@@ -1157,6 +1157,7 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
     // after all final transitions and callback drains; no host continuation is
     // used to make a decision in the timed sequence. Chain mode defers this
     // entire boundary until finish_chain().
+    const auto boundary_started = std::chrono::steady_clock::now();
     if (!impl_->chain_mode) {
     for (std::size_t rank = 0U; rank < kWorld; ++rank) {
         const auto stream = attention_streams[rank];
@@ -1215,6 +1216,10 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
                                                 moe_status);
         }
     }
+    output.timing.diagnostic_boundary_ms =
+        std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - boundary_started).count() *
+        1000.0;
     const auto elapsed_wall = std::chrono::duration_cast<std::chrono::duration<double>>(
         std::chrono::steady_clock::now() - started);
     output.timing.total_ms = elapsed_wall.count() * 1000.0;

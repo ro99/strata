@@ -335,6 +335,21 @@ void apply_rope(std::span<float> values, std::uint64_t position,
         after.moe_prepare_nanoseconds - before.moe_prepare_nanoseconds,
         after.mhc_post_nanoseconds - before.mhc_post_nanoseconds,
         after.output_head_nanoseconds - before.output_head_nanoseconds,
+        after.rank_local_layer_nanoseconds -
+            before.rank_local_layer_nanoseconds,
+        after.rank_local_device_nanoseconds -
+            before.rank_local_device_nanoseconds,
+        after.rank_local_kv_nanoseconds - before.rank_local_kv_nanoseconds,
+        after.rank_local_candidate_nanoseconds -
+            before.rank_local_candidate_nanoseconds,
+        after.rank_local_boundary_nanoseconds -
+            before.rank_local_boundary_nanoseconds,
+        after.rank_local_collective_nanoseconds -
+            before.rank_local_collective_nanoseconds,
+        after.rank_local_transition_nanoseconds -
+            before.rank_local_transition_nanoseconds,
+        after.rank_local_shared_nanoseconds -
+            before.rank_local_shared_nanoseconds,
     };
 }
 
@@ -5694,8 +5709,31 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         }
         if (layer + 1U < kLayers) {
             Dsv4RankLocalLayerResult layer_result;
+            const auto layer_started = std::chrono::steady_clock::now();
             auto ran = rank_local_executor->run(
                 call, Dsv4RankLocalFailure::None, layer_result);
+            graph_stats.rank_local_layer_nanoseconds +=
+                elapsed_nanoseconds(layer_started);
+            graph_stats.rank_local_device_nanoseconds +=
+                static_cast<std::uint64_t>(layer_result.timing.total_ms * 1.0e6);
+            // total_ms is wall around the whole layer and already contains the
+            // boundary, so this is a component of it, not a separate term.
+            graph_stats.rank_local_boundary_nanoseconds +=
+                static_cast<std::uint64_t>(
+                    layer_result.timing.diagnostic_boundary_ms * 1.0e6);
+            graph_stats.rank_local_collective_nanoseconds +=
+                static_cast<std::uint64_t>(
+                    (layer_result.timing.attention_collective_ms +
+                     layer_result.timing.attention_publication_ms +
+                     layer_result.timing.moe_publication_ms) * 1.0e6);
+            graph_stats.rank_local_transition_nanoseconds +=
+                static_cast<std::uint64_t>(
+                    (layer_result.timing.transition_router_ms +
+                     layer_result.timing.final_transition_ms) * 1.0e6);
+            graph_stats.rank_local_shared_nanoseconds +=
+                static_cast<std::uint64_t>(
+                    std::max(layer_result.timing.shared_gpu_rank0_ms,
+                             layer_result.timing.shared_gpu_rank1_ms) * 1.0e6);
             if (!ran.ok() || !layer_result.success ||
                 layer_result.global_attention_status != 0U ||
                 layer_result.global_moe_status != 0U) {
@@ -5725,7 +5763,8 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
             graph_stats.attention_nanoseconds += static_cast<std::uint64_t>(
                 layer_result.timing.attention_ms * 1.0e6);
             graph_stats.moe_nanoseconds += static_cast<std::uint64_t>(
-                (layer_result.timing.cpu_routed_rank0_ms +
+                (std::max(layer_result.timing.cpu_routed_rank0_ms,
+                          layer_result.timing.cpu_routed_rank1_ms) +
                  layer_result.timing.moe_collective_ms) * 1.0e6);
             continue;
         }
@@ -5733,7 +5772,10 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         // consumes the mHC state, so the last layer is queued and drained by
         // finish_chain, exactly as run_m3_sequential does at
         // a31ac58:apps/strata_dsv4_rank_local_layer.cu:3038.
+        const auto terminal_started = std::chrono::steady_clock::now();
         auto queued = rank_local_executor->enqueue_chain_layer(call);
+        graph_stats.rank_local_layer_nanoseconds +=
+            elapsed_nanoseconds(terminal_started);
         if (!queued.ok()) {
             append_errors(result, std::move(queued.errors));
             static_cast<void>(rank_local_executor->abort_chain());
@@ -5764,8 +5806,11 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         }
     }
     Dsv4RankLocalLayerChainResult chain;
+    const auto finish_started = std::chrono::steady_clock::now();
     auto finished = rank_local_executor->finish_chain(
         &chain, fuse_head ? &head_request : nullptr);
+    graph_stats.rank_local_layer_nanoseconds +=
+        elapsed_nanoseconds(finish_started);
     if (!finished.ok() || chain.chain_count != 1U || !chain.terminal) {
         append_errors(result, std::move(finished.errors));
         if (result.ok()) {
@@ -6102,6 +6147,7 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
                             &scratch.index_row);
     if (!result.ok()) return result;
 
+    const auto kv_started = std::chrono::steady_clock::now();
     const auto patch_bytes =
         static_cast<std::size_t>(transaction.patch_bytes(layer));
     std::array<std::span<std::byte>, kDsv4RankLocalWorld> patches{};
@@ -6117,6 +6163,7 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
                                       scratch.index_row);
     if (!result.ok()) return result;
     result = rank_local_patch_pages(scratch);
+    graph_stats.rank_local_kv_nanoseconds += elapsed_nanoseconds(kv_started);
     if (!result.ok()) return result;
 
     scratch.indexed_positions.clear();
@@ -6137,8 +6184,11 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
             elapsed_nanoseconds(select_started);
         if (!result.ok()) return result;
     }
+    const auto candidate_started = std::chrono::steady_clock::now();
     result = rank_local_candidates(layer, position, scratch.indexed_positions,
                                    scratch);
+    graph_stats.rank_local_candidate_nanoseconds +=
+        elapsed_nanoseconds(candidate_started);
     if (!result.ok()) return result;
 
     call = {};

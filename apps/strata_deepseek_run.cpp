@@ -716,6 +716,22 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.attention_projection_matmul_rows
            << ",\"attention_index_seconds\":"
            << seconds(stats.attention_index_nanoseconds)
+           << ",\"rank_local_layer_seconds\":"
+           << seconds(stats.rank_local_layer_nanoseconds)
+           << ",\"rank_local_device_seconds\":"
+           << seconds(stats.rank_local_device_nanoseconds)
+           << ",\"rank_local_kv_seconds\":"
+           << seconds(stats.rank_local_kv_nanoseconds)
+           << ",\"rank_local_candidate_seconds\":"
+           << seconds(stats.rank_local_candidate_nanoseconds)
+           << ",\"rank_local_boundary_seconds\":"
+           << seconds(stats.rank_local_boundary_nanoseconds)
+           << ",\"rank_local_collective_seconds\":"
+           << seconds(stats.rank_local_collective_nanoseconds)
+           << ",\"rank_local_transition_seconds\":"
+           << seconds(stats.rank_local_transition_nanoseconds)
+           << ",\"rank_local_shared_seconds\":"
+           << seconds(stats.rank_local_shared_nanoseconds)
            << ",\"attention_index_queries\":"
            << stats.attention_index_queries
            << ",\"attention_index_candidates\":"

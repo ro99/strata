@@ -174,6 +174,22 @@ struct Dsv4GraphStats {
     std::uint64_t moe_prepare_nanoseconds{};
     std::uint64_t mhc_post_nanoseconds{};
     std::uint64_t output_head_nanoseconds{};
+    // Rank-local decode attribution. The executor reports the device work it
+    // performs; these account for the host-side glue around it, which is the
+    // only place a rank-local step can be slower than the centralized step it
+    // splits. Zero on the centralized path.
+    //
+    // `rank_local_layer_nanoseconds` is wall time inside run()/enqueue and
+    // `rank_local_device_nanoseconds` is what the executor measured of that,
+    // so their difference is submission plus the per-layer diagnostic boundary.
+    std::uint64_t rank_local_layer_nanoseconds{};
+    std::uint64_t rank_local_device_nanoseconds{};
+    std::uint64_t rank_local_kv_nanoseconds{};
+    std::uint64_t rank_local_candidate_nanoseconds{};
+    std::uint64_t rank_local_boundary_nanoseconds{};
+    std::uint64_t rank_local_collective_nanoseconds{};
+    std::uint64_t rank_local_transition_nanoseconds{};
+    std::uint64_t rank_local_shared_nanoseconds{};
     // Future-entropy lookahead, kept separate because it is whole speculative
     // forward passes rather than a phase of one. The per-phase counters above
     // include the work these passes did; this is how much of it was

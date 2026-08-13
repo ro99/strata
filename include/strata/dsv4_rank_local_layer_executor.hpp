@@ -113,6 +113,11 @@ struct Dsv4RankLocalLayerTiming {
     double moe_collective_ms{};
     double moe_publication_ms{};
     double final_transition_ms{};
+    // Wall time of the per-layer diagnostic boundary: one stream
+    // synchronization per rank plus the state copies that follow it. Chain
+    // mode defers this entire boundary to finish_chain(), so this is the cost
+    // of driving the executor one layer at a time rather than queuing it.
+    double diagnostic_boundary_ms{};
 };
 
 struct Dsv4RankLocalLayerResult {

@@ -1604,6 +1604,15 @@ struct DeepSeekV4Runtime::Impl {
                                      std::vector<std::uint32_t>& selected,
                                      std::span<const float> prepared_values = {},
                                      std::span<const float> prepared_scores = {});
+    // Selection only, against an indexer compressor whose row for this
+    // position has already been advanced. The queued page-update path commits
+    // that row in stream order from the preparation callback, so it must not
+    // be appended a second time here.
+    ValidationResult index_select(std::uint32_t layer,
+                                  std::span<const float> input,
+                                  std::span<const float> query_rank,
+                                  std::uint32_t position,
+                                  std::vector<std::uint32_t>& selected);
     ValidationResult attention(std::uint32_t layer, std::span<const float> input,
                                std::uint32_t position, std::span<float> output);
     ValidationResult physical_paged_attention(
@@ -2249,12 +2258,37 @@ bool DeepSeekV4Runtime::Impl::complete_physical_attention_prepare(
         view.compressor_values, view.compressor_scores,
         compressed_append, compressed_patch);
     if (!context.result.ok()) return false;
-    if (layer_state.indexer_compressor.ratio != 0U ||
-        !view.index_compressor_values.empty() ||
-        !view.index_compressor_scores.empty() ||
-        context.index_append.has_value()) {
+    if (layer_state.indexer_compressor.ratio != 0U) {
+        // The learned-index row is committed here, in the same stream order as
+        // the sliding and compressed rows, so index_select() later performs
+        // selection only and must not append it a second time.
+        auto* index_append = context.index_append.has_value()
+            ? &*context.index_append : nullptr;
+        std::span<std::byte> index_patch;
+        if (index_append != nullptr) {
+            const auto bytes = static_cast<std::size_t>(
+                index_append->patch_bytes());
+            if (bytes > view.page_patches.size() - patch_cursor) {
+                context.result.errors.emplace_back(
+                    "DeepSeek deferred learned-index staging is truncated");
+                return false;
+            }
+            index_patch = view.page_patches.subspan(patch_cursor, bytes);
+            patch_cursor += bytes;
+        }
+        context.result = compress_state(
+            context.layer, layer_state.indexer_compressor,
+            layer_prefix(context.layer) + "attn.indexer.compressor.", {},
+            context.position, layer_state.frequencies,
+            view.index_compressor_values, view.index_compressor_scores,
+            index_append, index_patch);
+        if (!context.result.ok()) return false;
+    } else if (!view.index_compressor_values.empty() ||
+               !view.index_compressor_scores.empty() ||
+               context.index_append.has_value()) {
         context.result.errors.emplace_back(
-            "DeepSeek deferred sparse-index preparation is not admitted");
+            "DeepSeek deferred sparse-index preparation was supplied for a "
+            "layer whose indexer is not admitted");
         return false;
     }
     if (patch_cursor != view.page_patches.size()) {
@@ -2402,6 +2436,26 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
     std::span<const float> prepared_scores) {
     ValidationResult result;
     selected.clear();
+    auto& compressor_state = attention_state[layer].indexer_compressor;
+    if (compressor_state.ratio == 0U) {
+        result.errors.emplace_back(
+            "DeepSeek sparse indexer was not admitted for a long context");
+        return result;
+    }
+    result = compress_state(
+        layer, compressor_state,
+        layer_prefix(layer) + "attn.indexer.compressor.", input, position,
+        attention_state[layer].frequencies, prepared_values, prepared_scores);
+    if (!result.ok()) return result;
+    return index_select(layer, input, query_rank, position, selected);
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::index_select(
+    std::uint32_t layer, std::span<const float> input,
+    std::span<const float> query_rank, std::uint32_t position,
+    std::vector<std::uint32_t>& selected) {
+    ValidationResult result;
+    selected.clear();
     const auto record_selection = [&] {
         auto hash = diagnostics.index_selection_trace_hash;
         hash = diagnostic_hash_u32(hash, layer);
@@ -2414,17 +2468,13 @@ ValidationResult DeepSeekV4Runtime::Impl::index_positions(
         diagnostics.index_selection_trace_hash = hash;
         ++diagnostics.index_selection_count;
     };
-    auto& state = attention_state[layer].indexer_compressor;
+    const auto& state = attention_state[layer].indexer_compressor;
     if (state.ratio == 0U) {
         result.errors.emplace_back(
             "DeepSeek sparse indexer was not admitted for a long context");
         return result;
     }
     const auto prefix = layer_prefix(layer) + "attn.indexer.";
-    result = compress_state(layer, state, prefix + "compressor.", input,
-                            position, attention_state[layer].frequencies,
-                            prepared_values, prepared_scores);
-    if (!result.ok()) return result;
 
     const auto compressed_count = (position + 1U) / state.ratio;
     if (compressed_count <= kIndexTopK) {
@@ -2608,6 +2658,21 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
     const auto prefix = layer_prefix(layer) + "attn.";
     if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
         auto cuda_demand = weights->demand();
+        // The learned-index *row* can now be reserved and committed in stream
+        // order with the sliding and compressed rows (see the index_append
+        // handling below and in complete_physical_attention_prepare). What
+        // still excludes the sparse indexer from the queued path is
+        // *selection*, not the append: index_select() projects index queries
+        // through wq_b and weights_proj, and linear() dispatches those to
+        // CUDA. Selection can only run once query_rank exists host-side, which
+        // in the queued path is inside the CUDA host callback -- where calling
+        // a CUDA API is not permitted.
+        //
+        // Until index query projection, scoring and top-k are moved onto the
+        // device inside the queued chain, this path must stay closed: enabling
+        // it would reach physical_paged_attention with sparse == true and an
+        // empty indexed_positions, which silently attends zero compressed
+        // rows. Fail closed instead.
         const bool deferred_page_update =
             !config.enable_layer_hash_trace && kv_cache != nullptr &&
             attention_state[layer].indexer_compressor.ratio == 0U;
@@ -2727,9 +2792,25 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
                     append.scale_offset(), append.data_bytes(),
                     append.scale_bytes()});
             };
+            const auto index_ratio =
+                attention_state[layer].indexer_compressor.ratio;
+            if (index_ratio != 0U && (position + 1U) % index_ratio == 0U) {
+                auto index = kv_cache->reserve_physical_append(
+                    active_sequence,
+                    attention_state[layer].indexer_compressor.kind, layer,
+                    index_ratio, position / index_ratio, slot);
+                if (!index.ok()) {
+                    append_errors(result, std::move(index.errors));
+                    return result;
+                }
+                deferred_context.index_append.emplace(std::move(index.value));
+            }
             add_write(*deferred_context.sliding_append);
             if (deferred_context.compressed_append.has_value()) {
                 add_write(*deferred_context.compressed_append);
+            }
+            if (deferred_context.index_append.has_value()) {
+                add_write(*deferred_context.index_append);
             }
         }
         CudaDsv4AttentionPrepareRequest request;

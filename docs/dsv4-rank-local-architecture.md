@@ -331,3 +331,130 @@ Inside the measured decode window, all of the following are zero:
 
 Per-layer host continuation is absent by construction: the chain reaches one
 final completion.
+
+## Cost model at this operating point
+
+The governing model is `research/moe-tiered-memory-decode-optimization.md`:
+
+```text
+tau = max_r (W_r / B_r) + Sigma_serial
+```
+
+It is instantiated, not assumed. At the declared operating point:
+
+| arm | `tau` | `argmax_r` (routed CPU) | `B_CPU` | `Sigma_serial` |
+|---|---:|---:|---:|---:|
+| centralized, ceiling-compliant (0082) | `151.155686 ms` | `84.710043 ms` | `40.718794 GB/s` | `66.445643 ms` |
+| centralized, pre-cap (0081) | `149.099058 ms` | `84.171250 ms` | `40.979441 GB/s` | `64.927808 ms` |
+| rank-local, M3 fixture scope (0092) | `114.944312 ms` | `73.896784 ms` | `46.677143 GB/s` | `41.047528 ms` |
+
+The routed CPU body is `argmax_r` in every arm, over an exact
+`3,449,290,752 B/forward` payload. The rank-local topology improves it by
+partitioning the pool across two NUMA nodes, and improves `Sigma_serial` by
+removing per-layer host continuation.
+
+Two standing rules apply to every number above. Overlapping spans are never
+summed into `tau` — the `126.3 ms` shared-collect and CUDA-synchronization
+spans in 0081 overlap the CPU body and adding them would double count. And no
+constant here transfers to another operating point: costs are `tau(L)`, functions
+of context length, prompt, cache bound, and batch shape.
+
+The `argmax` *inside* the rank-local `41.047528 ms` non-CPU envelope remains
+indeterminate — attention, HBM, link, and NCCL service were never independently
+timed (0092). No optimization mechanism may be selected from that envelope until
+it is instantiated at the live operating point.
+
+## Routing and selection contracts
+
+These are declared semantics. They never change silently, and a change to any of
+them is a different model, not an optimization.
+
+**Router.** 256 experts, top-k 6. The learned selection bias changes **only**
+top-k membership; it is not applied to the coefficients. Coefficients are
+gathered from unbiased `sqrt(softplus(logit))`, normalized, then routed-scaled.
+
+**Hash-routed prefix.** Layers 0-2 do not use the learned bias. They route by
+the checkpoint's `layers.<n>.ffn.gate.tid2eid` token-to-expert table. That table
+is made **fully resident at load**: reading one row per token would be checkpoint
+I/O inside the decode window, which the steady-state gate forbids. Exactly one
+routing membership is populated per layer view — bias or token-expert row, never
+both.
+
+**Selection.** Candidate selection runs live on both ranks over replicated
+sliding, compressed, and learned-index state, using the production
+Lightning-Indexer scoring and compressor. Both ranks must agree; correctness
+builds verify rank agreement explicitly. Compressor and index values are raw
+FP32 where the target format declares it — the BF16 boundary applies to
+publications, not to these.
+
+**DSpark.** Verification, the declared attention/compression layout,
+shared-expert execution, mHC state, scoring functions, top-k normalization, and
+routed scaling are preserved exactly as declared by the model manifest.
+
+**Admission coupling.** The GPU Lightning Indexer is admitted only with the
+exact compact block KV cache and is rejected at config validation otherwise,
+rather than silently producing a different selection.
+
+## Fixture methodology and its boundary
+
+The `.d4c`/`.d4r`/`.d4m`/`.d4o` capture-and-replay transports are **not** in the
+production binary. They remain immutable at `dsv4-m3-accepted` (`a31ac58`), and
+the extraction manifest records why they were excluded.
+
+The methodology they embody is worth keeping and reusing: capture at an accepted
+boundary in the target format at production precision; compare against an
+*independent* oracle rather than the implementation under test; compare exactly
+by hash where the contract declares exactness; and preserve every failed arm as
+evidence.
+
+The boundary that matters for reading any M3 number: `.d4r` carries
+`candidates`, `indexed_positions`, `index_compressor_values/scores`, `sinks`,
+and materialized `pages` as fixture data. A measurement taken against it has not
+measured live selection or live page materialization. **A fixture boundary must
+never silently become the measurement boundary** — state which terms the fixture
+supplies, and subtract them from any throughput claim.
+
+## Measurement and evidence discipline
+
+Binding for any performance claim about this topology.
+
+- Three interleaved repetitions minimum; report the median **and** the observed
+  range wherever a gate applies. Report every run.
+- Separate initialization, prefill, transition, and decode.
+- Record NVMe demand/prefetch bytes, host writes, H2D/D2H, cache
+  hits/evictions, allocation and synchronization counts, RSS, and per-GPU VRAM.
+- Measure useful-prefetch bytes, not prediction recall alone.
+- **Never call a result a win when it is within observed run variance.**
+- State the fixed-setup to measured-window ratio before launching a long run,
+  and say which cheaper experiment was rejected.
+- Check every headline number against the shape the design predicts, not only
+  against the previous run. A number that contradicts the mechanism is a bug
+  report.
+
+The reusable template is 0081's three fresh controls and 0082's binding matrix.
+This landing's own gate — `<=125.0 ms/token`, `>=8.0 tok/s` — was re-derived
+from the ceiling-compliant centralized baseline rather than carried across from
+M3's `8.70 forward/s` fixture figure, which is the discipline above applied to
+itself.
+
+## Capability index
+
+The thirteen program capabilities, and where each is specified here. Full
+disposition, provenance, evidence, and reuse guidance for every one is in
+`docs/dsv4-rank-local-extraction-manifest.md`.
+
+| id | capability | specified in this document |
+|---|---|---|
+| CAP-01 | Cost model and bottleneck procedure | Cost model at this operating point |
+| CAP-02 | Memory admission and VRAM/RSS accounting | Admission; Coexistence with centralized prefill |
+| CAP-03 | Rank-sharded checkpoint loading | Ownership → Tensor sharding |
+| CAP-04 | NUMA-bound CPU pools and resident expert storage | Ownership → NUMA and CPU |
+| CAP-05 | NCCL FP32/status reductions and failure closure | Collectives; Failure and rollback |
+| CAP-06 | Device-resident state and one-completion scheduling | Ownership → GPU and rank; Transactional state ownership |
+| CAP-07 | Replay capture and exact-oracle methodology | Fixture methodology and its boundary |
+| CAP-08 | Physical KV-page infrastructure | Transactional state ownership → Replicated, not sharded; Token transaction |
+| CAP-09 | Rank-local attention kernels | Asynchronous host-staging lifetimes (incl. the queue-depth rule) |
+| CAP-10 | Routed/shared MoE execution | Routing and selection contracts |
+| CAP-11 | mHC transitions | Transactional state ownership → mHC |
+| CAP-12 | Lightning Index / compressor / DSpark handling | Routing and selection contracts |
+| CAP-13 | End-to-end benchmark and resource ledger | Measurement and evidence discipline |

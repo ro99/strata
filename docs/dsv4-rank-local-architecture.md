@@ -437,6 +437,93 @@ from the ceiling-compliant centralized baseline rather than carried across from
 M3's `8.70 forward/s` fixture figure, which is the discipline above applied to
 itself.
 
+
+## Long context: 1M tokens with the same decode budget
+
+Long context is a fundamental requirement, not an extension: a topology that
+reaches its throughput gate only at a short context has not produced a usable
+model. The relevant question is therefore whether `tau` holds at the model's
+declared 1,048,576-token context, and it does, for a structural reason.
+
+### Measured admission plan
+
+From the admission planner on `models/dsv4f`, not estimated:
+
+| term | 256 context | 1,048,576 context |
+|---|---:|---:|
+| `kv_state_bytes` (includes index) | `19,105,280` | `4,082,533,760` |
+| `index_state_bytes` | `0` | `732,512,256` |
+| `required_host_bytes` | `159,189,843,804` | `163,253,272,284` |
+| `zero_nvme_decode` | true | true |
+
+Host residency at 1M is `163.25 GB` against the `231,928,233,984 B` ceiling, so
+the host side is not the constraint. `index_state_bytes` is zero at 256 because
+the sparse indexer only engages above `index_topk * ratio = 2048` active tokens.
+
+### Why `tau` is nearly context-independent
+
+Attention cost is **bounded by construction**. Each layer attends a fixed
+`128`-row sliding window plus at most `index_topk = 512` indexed compressed
+rows — `640` rows per layer regardless of context length, roughly `13 MB/token`
+across 43 layers. The compressed set grows with context but the *attended* set
+does not.
+
+The bottleneck term does not grow at all. The routed CPU MoE body moves
+`3,449,290,752 B/forward` of expert weights, which is a function of the model,
+not of `L`. It is `argmax_r` at every context length.
+
+What does grow is the **indexer scoring**, which must score all `L/ratio`
+compressed candidates to select its top `512`. At 1M that is `262,144`
+candidates per layer, reading `732,512,256 B / 43 = 17.0 MB` of index state per
+layer, or `732 MB/token` across the chain. Device-resident that is roughly
+`0.8 ms/token` at HBM bandwidth; if the kernel is compute- rather than
+bandwidth-bound it is nearer `5.3 ms/token`.
+
+```text
+tau(1M)  ~=  73.897 ms   routed CPU MoE      (context-independent, argmax_r)
+           + 41.048 ms   non-CPU envelope    (M3; orchestration, mHC, NCCL)
+           +  0.8-5.3 ms indexer scoring     (new; not present in any measurement)
+           =  116-120 ms  ->  8.3-8.6 tok/s
+```
+
+This is the one genuinely unmeasured term in the landing: M3 replayed
+`indexed_positions` from `.d4r`, and at 256 context the indexer is disengaged
+entirely, so no arm has ever timed it. The bracket above is arithmetic, and
+Stage 6 must replace it with a measurement.
+
+### Device residency at 1M
+
+Replicated on both GPUs, the rank-local decode set is:
+
+```text
+rank-local sharded weights      8,190,558,208 B
+KV and index state              4,082,533,760 B
+fixed workspace reserve           536,870,912 B
+NCCL and head buffers          ~     84,000,000 B
+                              -----------------
+                               12,893,962,880 B   against 21,287,272,448 B
+```
+
+That fits with roughly `8.4 GB` to spare — but **only if the centralized
+prefill spine is not also resident**. Adding its `9,204,991,520 B` gives
+`22.09 GB`, over the ceiling by about `0.81 GB`.
+
+At 256 context the two coexist and the prefill expert cache is merely capped.
+At 1M they do not. The centralized spine must therefore be **released after
+prefill**, before the first rank-local token, rather than merely capped. The
+alternative — sharding KV across ranks instead of replicating it — would
+reintroduce a cross-rank fetch on the decode path and is rejected for that
+reason.
+
+Because the attended `512` compressed rows are data-dependent and scattered
+across the full `4.08 GB` compressed set, that whole set must be device-resident;
+demand-paging it over PCIe would cost far more than the entire step budget.
+
+### What long context does not fix
+
+Prefill at 1M is a separate and much larger cost, outside the decode window and
+outside this landing's gate. Nothing here claims a 1M prefill budget.
+
 ## Capability index
 
 The thirteen program capabilities, and where each is specified here. Full

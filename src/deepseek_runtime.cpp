@@ -5545,13 +5545,55 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
             "rank-local decode was entered without an admitted session");
         return result;
     }
+    if (hidden.size() != static_cast<std::size_t>(kMhc) * kHidden) {
+        result.errors.emplace_back(
+            "rank-local decode hidden state has the wrong shape");
+        return result;
+    }
+#if defined(STRATA_HAS_NCCL)
+    // Seed the mHC state on both ranks before any layer runs. The executor
+    // takes dsv4_mhc_device_view per rank and refuses to execute against a
+    // closed state, so this is a precondition, not an optimization.
+    //
+    // Three properties, all taken from seed_m3_layer0 at
+    // a31ac58:apps/strata_dsv4_rank_local_layer.cu:2875 rather than inferred:
+    //   - once per rank, each on its own device
+    //   - always layer 0's *attention* mHC; later layers arrive through the
+    //     per-layer call's next_attention_mhc, and the terminal layer passes
+    //     nullptr for it
+    //   - mHC weights are replicated per rank, never sharded, because
+    //     dsv4_mhc_begin rejects a weight whose device is not the target
+    //
+    // It is once per token rather than once per session: the terminal
+    // finish_chain closes the state machine, and any layer failure aborts the
+    // branch, so each token re-seeds.
+    const auto seed = rank_local_weights->layer_view(0U, token);
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        const auto* attention_mhc = seed.rank[rank].attention_mhc;
+        if (attention_mhc == nullptr) {
+            result.errors.emplace_back(
+                "rank-local layer 0 attention mHC weights are unavailable for "
+                "rank " + std::to_string(rank));
+            return result;
+        }
+        result = cuda.dsv4_mhc_begin_device(
+            devices[rank], *attention_mhc, hidden);
+        if (!result.ok()) return result;
+    }
+#endif
     // The per-layer chain body is the remaining Stage 4 work. Until it exists
     // this reports a failure rather than quietly running the centralized path:
     // an opt-in that silently decodes centrally would make every rank-local
-    // measurement a measurement of something else.
+    // measurement a measurement of something else. The seed above has already
+    // opened the mHC state, so abort both branches rather than leaving them
+    // live for a chain that will never run.
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        static_cast<void>(cuda.dsv4_mhc_abort_branch(devices[rank]));
+    }
     result.errors.emplace_back(
-        "rank-local decode is admitted but its per-layer chain is not yet "
-        "wired; run without --decode-topology rank-local-tp2");
+        "rank-local decode is admitted and its mHC state seeds on both ranks, "
+        "but the per-layer chain is not yet wired; run without "
+        "--decode-topology rank-local-tp2");
     return result;
 }
 

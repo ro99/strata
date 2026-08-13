@@ -12,23 +12,34 @@
 
 namespace strata {
 
+// One replicated physical row: a single logical reservation plus one device
+// buffer per rank.
+//
+// A logical row is reserved once, not once per rank.
+// Dsv4KvCache::reserve_physical_append advances the table's end row, so
+// calling it twice for the same position rejects the second call as
+// non-contiguous -- reservation is a property of the sequence, not of a
+// device. Ranks other than zero therefore hold a plain device lease on the
+// same block, which yields their own device copy of identical bytes.
+struct Dsv4RankLocalRow {
+    std::optional<Dsv4KvPhysicalAppend> append;
+    // Index 0 is unused: rank 0 patches through `append`'s own lease.
+    std::array<Dsv4KvDeviceLease, kDsv4RankLocalWorld> peers;
+    bool present{};
+};
+
 // One layer's replicated physical reservations for a single token position.
-// Both ranks reserve the same logical row on their own device slot; the two
-// device copies are patched independently in each rank's stream order.
 struct Dsv4RankLocalLayerAppend {
-    std::array<std::optional<Dsv4KvPhysicalAppend>, kDsv4RankLocalWorld> sliding;
-    std::array<std::optional<Dsv4KvPhysicalAppend>, kDsv4RankLocalWorld>
-        compressed;
+    Dsv4RankLocalRow sliding;
+    Dsv4RankLocalRow compressed;
     // Learned-index row, present only in the sparse-indexer regime (above
     // kDsv4RankLocalSparseIndexerThreshold active tokens). Reserved here so the
     // index row is patched in the same stream order as the other two rather
     // than by a synchronous host append outside the queued chain.
-    std::array<std::optional<Dsv4KvPhysicalAppend>, kDsv4RankLocalWorld> index;
+    Dsv4RankLocalRow index;
     std::uint32_t layer{};
     std::uint32_t position{};
-    bool has_compressed{};
-    bool has_index{};
-    std::array<bool, kDsv4RankLocalWorld> committed{};
+    bool committed{};
 };
 
 // Result of comparing the two ranks' independently computed selections.
@@ -82,23 +93,29 @@ public:
         Dsv4KvBlockKind compressed_kind, std::uint32_t index_ratio = 0U);
 
     // Page writes for one rank's queued patch commands, in reservation order:
-    // sliding first, then the compressed row when present. Matches the order
-    // commit_layer consumes patch bytes in.
+    // sliding first, then the compressed row, then the learned-index row where
+    // each is present. Matches the order commit_layer lays bytes down in.
+    // Offsets and extents are identical across ranks; only the target device
+    // buffer differs.
     [[nodiscard]] ValidationResult page_writes(
         std::uint32_t layer, std::size_t rank,
         std::vector<CudaDsv4AttentionPageWrite>& output) const;
 
+    // Identical for every rank, since all ranks patch the same logical rows.
     [[nodiscard]] std::uint64_t patch_bytes(
-        std::uint32_t layer, std::size_t rank) const noexcept;
+        std::uint32_t layer) const noexcept;
 
-    // Commits one rank's rows for one layer into the canonical host page and
-    // that rank's pinned patch staging. Both ranks write the same canonical
-    // bytes; the patch spans are per-rank and disjoint.
+    // Commits one layer's rows into the canonical host page and every rank's
+    // pinned patch staging. The row is encoded once -- there is one logical
+    // row, so encoding it per rank would be redundant work whose only possible
+    // outcome is disagreement -- and the encoded bytes are copied into each
+    // rank's span. The spans are per-rank and disjoint, and every one must be
+    // exactly patch_bytes() long.
     [[nodiscard]] ValidationResult commit_layer(
-        std::uint32_t layer, std::size_t rank,
+        std::uint32_t layer,
         std::span<const float> sliding_values,
         std::span<const float> compressed_values,
-        std::span<std::byte> patch,
+        std::array<std::span<std::byte>, kDsv4RankLocalWorld> patches,
         std::span<const float> index_values = {});
 
     // Publishes the token. Legal only when every reserved layer has been

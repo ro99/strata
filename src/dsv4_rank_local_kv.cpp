@@ -81,41 +81,51 @@ ValidationResult Dsv4RankLocalKvTransaction::reserve_layer(
     Dsv4RankLocalLayerAppend entry;
     entry.layer = layer;
     entry.position = position;
-    entry.has_compressed = ratio != 0U && (position + 1U) % ratio == 0U;
-    entry.has_index =
-        index_ratio != 0U && (position + 1U) % index_ratio == 0U;
 
-    // All-or-nothing across both ranks: a reservation that succeeds on one
-    // rank and fails on the other must leave neither in place.
-    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-        auto sliding = cache_.reserve_physical_append(
-            sequence_, Dsv4KvBlockKind::Sliding, layer, 1U, position,
-            device_slots_[rank]);
-        if (!sliding.ok()) {
-            result.errors = std::move(sliding.errors);
-            return result;
+    // Reserve the logical row once on rank 0's slot, then lease the same block
+    // on every other rank's device. Reserving per rank would advance the
+    // table's end row once per rank and reject the second call as
+    // non-contiguous: reservation belongs to the sequence, replication belongs
+    // to the devices.
+    const auto reserve = [&](Dsv4RankLocalRow& row, Dsv4KvBlockKind kind,
+                             std::uint32_t row_ratio,
+                             std::uint64_t logical_row) {
+        auto reserved = cache_.reserve_physical_append(
+            sequence_, kind, layer, row_ratio, logical_row, device_slots_[0]);
+        if (!reserved.ok()) {
+            result.errors = std::move(reserved.errors);
+            return false;
         }
-        entry.sliding[rank].emplace(std::move(sliding.value));
-        if (!entry.has_compressed) continue;
-        auto compressed = cache_.reserve_physical_append(
-            sequence_, compressed_kind, layer, ratio, position / ratio,
-            device_slots_[rank]);
-        if (!compressed.ok()) {
-            result.errors = std::move(compressed.errors);
-            return result;
+        row.append.emplace(std::move(reserved.value));
+        for (std::size_t rank = 1U; rank < kDsv4RankLocalWorld; ++rank) {
+            auto lease = cache_.acquire_device(
+                sequence_, kind, layer, logical_row, device_slots_[rank]);
+            if (!lease.ok()) {
+                result.errors = std::move(lease.errors);
+                return false;
+            }
+            row.peers[rank] = std::move(lease.value);
         }
-        entry.compressed[rank].emplace(std::move(compressed.value));
+        row.present = true;
+        return true;
+    };
+
+    // All-or-nothing: a partial reservation leaves nothing behind, because the
+    // entry is only published to layers_ once every row is in place.
+    if (!reserve(entry.sliding, Dsv4KvBlockKind::Sliding, 1U, position)) {
+        return result;
     }
-    for (std::size_t rank = 0U; entry.has_index && rank < kDsv4RankLocalWorld;
-         ++rank) {
-        auto index = cache_.reserve_physical_append(
-            sequence_, Dsv4KvBlockKind::LearnedIndex, layer, index_ratio,
-            position / index_ratio, device_slots_[rank]);
-        if (!index.ok()) {
-            result.errors = std::move(index.errors);
+    if (ratio != 0U && (position + 1U) % ratio == 0U) {
+        if (!reserve(entry.compressed, compressed_kind, ratio,
+                     position / ratio)) {
             return result;
         }
-        entry.index[rank].emplace(std::move(index.value));
+    }
+    if (index_ratio != 0U && (position + 1U) % index_ratio == 0U) {
+        if (!reserve(entry.index, Dsv4KvBlockKind::LearnedIndex, index_ratio,
+                     position / index_ratio)) {
+            return result;
+        }
     }
 
     layers_.push_back(std::move(entry));
@@ -134,48 +144,46 @@ ValidationResult Dsv4RankLocalKvTransaction::page_writes(
             " has no reservation for rank " + std::to_string(rank));
         return result;
     }
-    const auto add = [&output](const Dsv4KvPhysicalAppend& append) {
+    // Offsets and extents come from the single reservation; only the target
+    // buffer is rank-specific, because each rank owns its own device copy of
+    // the same block.
+    const auto add = [&output, rank](const Dsv4RankLocalRow& row) {
+        if (!row.present) return;
+        const auto& append = *row.append;
         output.push_back(CudaDsv4AttentionPageWrite{
-            append.buffer(), append.data_offset(), append.scale_offset(),
-            append.data_bytes(), append.scale_bytes()});
+            rank == 0U ? append.buffer() : row.peers[rank].buffer(),
+            append.data_offset(), append.scale_offset(), append.data_bytes(),
+            append.scale_bytes()});
     };
-    if (!entry->sliding[rank].has_value()) {
+    if (!entry->sliding.present) {
         result.errors.emplace_back(
-            "rank-local KV sliding reservation is missing for rank " +
-            std::to_string(rank));
+            "rank-local KV sliding reservation is missing for layer " +
+            std::to_string(layer));
         return result;
     }
-    add(*entry->sliding[rank]);
-    if (entry->has_compressed && entry->compressed[rank].has_value()) {
-        add(*entry->compressed[rank]);
-    }
-    if (entry->has_index && entry->index[rank].has_value()) {
-        add(*entry->index[rank]);
-    }
+    add(entry->sliding);
+    add(entry->compressed);
+    add(entry->index);
     return result;
 }
 
 std::uint64_t Dsv4RankLocalKvTransaction::patch_bytes(
-    std::uint32_t layer, std::size_t rank) const noexcept {
+    std::uint32_t layer) const noexcept {
     const auto* entry = find(layer);
-    if (entry == nullptr || rank >= kDsv4RankLocalWorld) return 0U;
+    if (entry == nullptr) return 0U;
     std::uint64_t bytes = 0U;
-    if (entry->sliding[rank].has_value()) {
-        bytes += entry->sliding[rank]->patch_bytes();
+    if (entry->sliding.present) bytes += entry->sliding.append->patch_bytes();
+    if (entry->compressed.present) {
+        bytes += entry->compressed.append->patch_bytes();
     }
-    if (entry->has_compressed && entry->compressed[rank].has_value()) {
-        bytes += entry->compressed[rank]->patch_bytes();
-    }
-    if (entry->has_index && entry->index[rank].has_value()) {
-        bytes += entry->index[rank]->patch_bytes();
-    }
+    if (entry->index.present) bytes += entry->index.append->patch_bytes();
     return bytes;
 }
 
 ValidationResult Dsv4RankLocalKvTransaction::commit_layer(
-    std::uint32_t layer, std::size_t rank,
-    std::span<const float> sliding_values,
-    std::span<const float> compressed_values, std::span<std::byte> patch,
+    std::uint32_t layer, std::span<const float> sliding_values,
+    std::span<const float> compressed_values,
+    std::array<std::span<std::byte>, kDsv4RankLocalWorld> patches,
     std::span<const float> index_values) {
     ValidationResult result;
     if (committed_ || aborted_) {
@@ -184,76 +192,71 @@ ValidationResult Dsv4RankLocalKvTransaction::commit_layer(
         return result;
     }
     auto* entry = find(layer);
-    if (entry == nullptr || rank >= kDsv4RankLocalWorld) {
+    if (entry == nullptr) {
         result.errors.emplace_back(
             "rank-local KV layer " + std::to_string(layer) +
-            " has no reservation for rank " + std::to_string(rank));
+            " has no reservation");
         return result;
     }
-    if (entry->committed[rank]) {
+    if (entry->committed) {
         result.errors.emplace_back(
             "rank-local KV layer " + std::to_string(layer) +
-            " is already committed on rank " + std::to_string(rank));
+            " is already committed");
         return result;
     }
-    if (!entry->sliding[rank].has_value()) {
+    if (!entry->sliding.present) {
         result.errors.emplace_back(
-            "rank-local KV sliding reservation is missing for rank " +
-            std::to_string(rank));
+            "rank-local KV sliding reservation is missing for layer " +
+            std::to_string(layer));
+        return result;
+    }
+    const auto expected = static_cast<std::size_t>(patch_bytes(layer));
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        if (patches[rank].size() == expected) continue;
+        result.errors.emplace_back(
+            "rank-local KV patch staging for layer " + std::to_string(layer) +
+            " rank " + std::to_string(rank) + " is " +
+            std::to_string(patches[rank].size()) + " bytes, not " +
+            std::to_string(expected));
         return result;
     }
 
     std::size_t cursor = 0U;
-    const auto consume = [&](Dsv4KvPhysicalAppend& append,
+    const auto consume = [&](Dsv4RankLocalRow& row,
                              std::span<const float> values) {
+        if (!row.present) return true;
+        auto& append = *row.append;
         const auto bytes = static_cast<std::size_t>(append.patch_bytes());
-        if (bytes > patch.size() - cursor) {
-            result.errors.emplace_back(
-                "rank-local KV patch staging is truncated for layer " +
-                std::to_string(layer) + " rank " + std::to_string(rank));
-            return false;
-        }
-        auto committed = append.commit(values, patch.subspan(cursor, bytes));
-        cursor += bytes;
+        auto canonical = patches[0].subspan(cursor, bytes);
+        auto committed = append.commit(values, canonical);
         if (!committed.ok()) {
             result.errors.insert(result.errors.end(),
                                  committed.errors.begin(),
                                  committed.errors.end());
             return false;
         }
+        // One encode, copied out. Encoding per rank could only ever agree, and
+        // if it ever disagreed the replicas would silently diverge.
+        for (std::size_t rank = 1U; rank < kDsv4RankLocalWorld; ++rank) {
+            std::copy(canonical.begin(), canonical.end(),
+                      patches[rank].begin() +
+                          static_cast<std::ptrdiff_t>(cursor));
+        }
+        cursor += bytes;
         return true;
     };
 
-    if (!consume(*entry->sliding[rank], sliding_values)) return result;
-    if (entry->has_compressed) {
-        if (!entry->compressed[rank].has_value()) {
-            result.errors.emplace_back(
-                "rank-local KV compressed reservation is missing for rank " +
-                std::to_string(rank));
-            return result;
-        }
-        if (!consume(*entry->compressed[rank], compressed_values)) {
-            return result;
-        }
-    }
-    if (entry->has_index) {
-        if (!entry->index[rank].has_value()) {
-            result.errors.emplace_back(
-                "rank-local KV learned-index reservation is missing for rank " +
-                std::to_string(rank));
-            return result;
-        }
-        if (!consume(*entry->index[rank], index_values)) return result;
-    }
-    if (cursor != patch.size()) {
+    if (!consume(entry->sliding, sliding_values)) return result;
+    if (!consume(entry->compressed, compressed_values)) return result;
+    if (!consume(entry->index, index_values)) return result;
+    if (cursor != expected) {
         result.errors.emplace_back(
             "rank-local KV patch staging has " +
-            std::to_string(patch.size() - cursor) +
-            " unconsumed bytes for layer " + std::to_string(layer) +
-            " rank " + std::to_string(rank));
+            std::to_string(expected - cursor) +
+            " unconsumed bytes for layer " + std::to_string(layer));
         return result;
     }
-    entry->committed[rank] = true;
+    entry->committed = true;
     return result;
 }
 
@@ -274,33 +277,29 @@ ValidationResult Dsv4RankLocalKvTransaction::commit() {
             "rank-local KV transaction has no reserved layer to commit");
         return result;
     }
-    // Publish only when every rank has committed every reserved layer. A
-    // partially committed token is aborted, never published.
+    // Publish only when every reserved layer has been committed. A partially
+    // committed token is aborted, never published.
     for (const auto& entry : layers_) {
-        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-            if (entry.committed[rank]) continue;
-            result.errors.emplace_back(
-                "rank-local KV layer " + std::to_string(entry.layer) +
-                " is uncommitted on rank " + std::to_string(rank));
-        }
+        if (entry.committed) continue;
+        result.errors.emplace_back(
+            "rank-local KV layer " + std::to_string(entry.layer) +
+            " is uncommitted");
     }
     if (!result.ok()) return result;
 
     for (auto& entry : layers_) {
-        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-            const auto account = [&](std::optional<Dsv4KvPhysicalAppend>& slot) {
-                if (!slot.has_value()) return;
-                auto status = slot->account();
-                if (!status.ok()) {
-                    result.errors.insert(result.errors.end(),
-                                         status.errors.begin(),
-                                         status.errors.end());
-                }
-            };
-            account(entry.sliding[rank]);
-            if (entry.has_compressed) account(entry.compressed[rank]);
-            if (entry.has_index) account(entry.index[rank]);
-        }
+        const auto account = [&](Dsv4RankLocalRow& row) {
+            if (!row.present) return;
+            auto status = row.append->account();
+            if (!status.ok()) {
+                result.errors.insert(result.errors.end(),
+                                     status.errors.begin(),
+                                     status.errors.end());
+            }
+        };
+        account(entry.sliding);
+        account(entry.compressed);
+        account(entry.index);
     }
     if (!result.ok()) return result;
 

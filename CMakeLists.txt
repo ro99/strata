@@ -247,6 +247,7 @@ if(BUILD_TESTING)
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_rank_shard.cpp
         tests/test_dsv4_rank_local_topology.cpp
+        tests/test_dsv4_rank_local_kv.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
         tests/test_deepseek_host_expert.cpp

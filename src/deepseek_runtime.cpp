@@ -1396,6 +1396,40 @@ struct DeepSeekV4Runtime::Impl {
 #endif
     Dsv4RankLocalAdmission rank_local_admission;
     bool rank_local_active{};
+    // One rank-local layer's borrowed views. The terminal layer is queued by
+    // enqueue_chain_layer and read again by finish_chain after that call has
+    // returned, so the storage outlives the layer scope by living here.
+    struct RankLocalLayerScratch {
+        std::vector<Dsv4KvDeviceLease> leases;
+        std::array<std::vector<CudaDsv4PhysicalPage>, kDsv4RankLocalWorld> pages;
+        std::vector<CudaDsv4AttentionCandidate> candidates;
+        std::array<float, kRopeDim / 2U> cosines{};
+        std::array<float, kRopeDim / 2U> inverse_sines{};
+        std::vector<float> query_rank;
+        std::vector<float> key_value;
+        std::vector<float> compressor_values;
+        std::vector<float> compressor_scores;
+        std::vector<float> index_compressor_values;
+        std::vector<float> index_compressor_scores;
+        std::vector<float> compressed_row;
+        std::vector<float> index_row;
+        std::vector<std::uint32_t> indexed_positions;
+        std::array<std::vector<std::byte>, kDsv4RankLocalWorld> patches;
+        std::array<std::vector<CudaDsv4AttentionPageWrite>,
+                   kDsv4RankLocalWorld> page_writes;
+    };
+    // One layer is live at a time: the previous layer's run() has returned
+    // before the next layer overwrites this, and the terminal layer is the
+    // last writer before finish_chain reads it.
+    RankLocalLayerScratch rank_local_scratch{};
+    std::array<DeviceHeadContext, kDsv4RankLocalWorld> rank_local_head{};
+    std::array<std::vector<float>, kDsv4RankLocalWorld> rank_local_local_logits;
+    std::array<std::vector<std::uint16_t>, kDsv4RankLocalWorld>
+        rank_local_published_logits;
+    // The attention input of the layer about to run, carried out of the
+    // previous layer's reduction. Layers below three route by table and never
+    // reach the indexer, which is the only consumer.
+    std::vector<float> rank_local_attention_input;
     Dsv4SequenceHandle active_sequence{};
     std::array<PhysicalAttentionContext, kLayers>
         physical_attention_contexts{};
@@ -1595,6 +1629,22 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult rank_local_forward_hidden(
         std::uint32_t token, std::uint32_t position, std::span<float> hidden,
         std::vector<float>* fused_logits);
+    // Everything one rank-local layer needs before the executor runs it:
+    // the replicated KV rows for this position written into both ranks'
+    // device pages, the candidate set, and the borrowed call views.
+    ValidationResult rank_local_prepare_layer(
+        std::uint32_t layer, std::uint32_t token, std::uint32_t position,
+        Dsv4RankLocalKvTransaction& transaction,
+        RankLocalLayerScratch& scratch, Dsv4RankLocalLayerCall& call);
+    // Writes one layer's committed rows into every rank's device page. The
+    // bytes were encoded once by the transaction; this is the transport.
+    ValidationResult rank_local_patch_pages(
+        const RankLocalLayerScratch& scratch);
+    // Pages and candidates for both ranks over one shared logical row order.
+    ValidationResult rank_local_candidates(
+        std::uint32_t layer, std::uint32_t position,
+        std::span<const std::uint32_t> indexed_positions,
+        RankLocalLayerScratch& scratch);
     ParseResult<std::vector<float>> kv_row(
         std::uint32_t layer, Dsv4KvBlockKind kind,
         std::uint64_t logical_row);
@@ -1620,7 +1670,14 @@ struct DeepSeekV4Runtime::Impl {
                                     std::span<const float> prepared_values = {},
                                     std::span<const float> prepared_scores = {},
                                     Dsv4KvPhysicalAppend* prepared_append = nullptr,
-                                    std::span<std::byte> prepared_patch = {});
+                                    std::span<std::byte> prepared_patch = {},
+                                    // When set, the pooled row is returned
+                                    // instead of being appended, and stays
+                                    // empty away from a block boundary. The
+                                    // rank-local path needs the row itself
+                                    // because it writes one logical row into
+                                    // two devices' pages.
+                                    std::vector<float>* pooled_row = nullptr);
     static bool physical_attention_prepare_callback(
         void* opaque, const CudaDsv4AttentionPrepareHostView& view);
     bool complete_physical_attention_prepare(
@@ -2335,8 +2392,10 @@ ValidationResult DeepSeekV4Runtime::Impl::compress_state(
     std::span<const float> prepared_values,
     std::span<const float> prepared_scores,
     Dsv4KvPhysicalAppend* prepared_append,
-    std::span<std::byte> prepared_patch) {
+    std::span<std::byte> prepared_patch,
+    std::vector<float>* pooled_row) {
     ValidationResult result;
+    if (pooled_row != nullptr) pooled_row->clear();
     if (state.ratio == 0U) return result;
     const auto dimensions = static_cast<std::size_t>(state.coefficient) *
                             state.head_dim;
@@ -2439,6 +2498,13 @@ ValidationResult DeepSeekV4Runtime::Impl::compress_state(
             std::span<float>(pooled).first(state.head_dim - kRopeDim), 64U);
     }
     const auto compressed_row = position / state.ratio;
+    if (pooled_row != nullptr) {
+        // The caller owns publication. Returning here keeps the accumulator
+        // advance and the row encoding in one place while letting the
+        // rank-local path lay the same bytes into both ranks' pages.
+        *pooled_row = std::move(pooled);
+        return result;
+    }
     if (prepared_append != nullptr) {
         result = prepared_append->commit(pooled, prepared_patch);
         if (!result.ok()) return result;
@@ -5550,7 +5616,19 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
             "rank-local decode hidden state has the wrong shape");
         return result;
     }
+    if (kv_cache == nullptr || devices.size() < kDsv4RankLocalWorld) {
+        result.errors.emplace_back(
+            "rank-local decode requires a physical KV cache on two devices");
+        return result;
+    }
 #if defined(STRATA_HAS_NCCL)
+    // The token is a transaction over the sequence: every layer's KV rows are
+    // reserved and encoded here, and none of them is accounted until the
+    // terminal head has produced output on both ranks. The destructor aborts,
+    // so an early return truncates the sequence back to `position`.
+    Dsv4RankLocalKvTransaction transaction(
+        *kv_cache, active_sequence, {0U, 1U}, position);
+
     // Seed the mHC state on both ranks before any layer runs. The executor
     // takes dsv4_mhc_device_view per rank and refuses to execute against a
     // closed state, so this is a precondition, not an optimization.
@@ -5580,20 +5658,483 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
             devices[rank], *attention_mhc, hidden);
         if (!result.ok()) return result;
     }
-#endif
-    // The per-layer chain body is the remaining Stage 4 work. Until it exists
-    // this reports a failure rather than quietly running the centralized path:
-    // an opt-in that silently decodes centrally would make every rank-local
-    // measurement a measurement of something else. The seed above has already
-    // opened the mHC state, so abort both branches rather than leaving them
-    // live for a chain that will never run.
-    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-        static_cast<void>(cuda.dsv4_mhc_abort_branch(devices[rank]));
+    // From here every exit must close the mHC branches it opened and roll the
+    // token back. The transaction's destructor truncates the sequence, so an
+    // early return can never leave a half-appended position visible.
+    const auto close_branches = [&] {
+        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+            static_cast<void>(cuda.dsv4_mhc_abort_branch(devices[rank]));
+        }
+    };
+    rank_local_attention_input.clear();
+
+    Dsv4RankLocalLayerCall call;
+    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+        auto& scratch = rank_local_scratch;
+        result = rank_local_prepare_layer(
+            layer, token, position, transaction, scratch, call);
+        if (!result.ok()) {
+            close_branches();
+            return result;
+        }
+        if (layer + 1U < kLayers) {
+            Dsv4RankLocalLayerResult layer_result;
+            auto ran = rank_local_executor->run(
+                call, Dsv4RankLocalFailure::None, layer_result);
+            if (!ran.ok() || !layer_result.success ||
+                layer_result.global_attention_status != 0U ||
+                layer_result.global_moe_status != 0U) {
+                append_errors(result, std::move(
+                    ran.errors.empty() ? layer_result.errors : ran.errors));
+                result.errors.emplace_back(
+                    "rank-local decode failed at layer " +
+                    std::to_string(layer));
+                close_branches();
+                return result;
+            }
+            // Both ranks publish the same reduction. A divergence here is a
+            // replica fault, not a rounding difference, and the next layer's
+            // selection would silently use one rank's state for both.
+            if (!std::equal(layer_result.next_attention_input[0].begin(),
+                            layer_result.next_attention_input[0].end(),
+                            layer_result.next_attention_input[1].begin())) {
+                result.errors.emplace_back(
+                    "rank-local attention input diverged between ranks at "
+                    "layer " + std::to_string(layer));
+                close_branches();
+                return result;
+            }
+            rank_local_attention_input.assign(
+                layer_result.next_attention_input[0].begin(),
+                layer_result.next_attention_input[0].end());
+            graph_stats.attention_nanoseconds += static_cast<std::uint64_t>(
+                layer_result.timing.attention_ms * 1.0e6);
+            graph_stats.moe_nanoseconds += static_cast<std::uint64_t>(
+                (layer_result.timing.cpu_routed_rank0_ms +
+                 layer_result.timing.moe_collective_ms) * 1.0e6);
+            continue;
+        }
+        // Terminal layer. The executor refuses to run() it: the output head
+        // consumes the mHC state, so the last layer is queued and drained by
+        // finish_chain, exactly as run_m3_sequential does at
+        // a31ac58:apps/strata_dsv4_rank_local_layer.cu:3038.
+        auto queued = rank_local_executor->enqueue_chain_layer(call);
+        if (!queued.ok()) {
+            append_errors(result, std::move(queued.errors));
+            static_cast<void>(rank_local_executor->abort_chain());
+            close_branches();
+            return result;
+        }
     }
+
+    Dsv4RankLocalHeadRequest head_request;
+    const bool fuse_head = fused_logits != nullptr;
+    if (fuse_head) {
+        static_assert(kDsv4RankLocalVocabulary == kVocabulary,
+                      "rank-local head vocabulary must match the contract");
+        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+            rank_local_head[rank] = {};
+            rank_local_head[rank].owner = this;
+            rank_local_local_logits[rank].assign(
+                kDsv4RankLocalVocabularyShard, 0.0F);
+            rank_local_published_logits[rank].assign(
+                kDsv4RankLocalVocabulary, 0U);
+            head_request.heads[rank] =
+                &rank_local_weights->head().weights[rank];
+            head_request.callbacks[rank] = device_head_callback;
+            head_request.callback_contexts[rank] = &rank_local_head[rank];
+            head_request.local_logits[rank] = rank_local_local_logits[rank];
+            head_request.published_logits[rank] =
+                rank_local_published_logits[rank];
+        }
+    }
+    Dsv4RankLocalLayerChainResult chain;
+    auto finished = rank_local_executor->finish_chain(
+        &chain, fuse_head ? &head_request : nullptr);
+    if (!finished.ok() || chain.chain_count != 1U || !chain.terminal) {
+        append_errors(result, std::move(finished.errors));
+        if (result.ok()) {
+            result.errors.emplace_back(
+                "rank-local terminal layer did not complete");
+        }
+        close_branches();
+        return result;
+    }
+    if (fuse_head && (!rank_local_head[0].invoked ||
+                      !rank_local_head[1].invoked)) {
+        result.errors.emplace_back(
+            "rank-local output-head host callback was not invoked on both "
+            "ranks");
+        return result;
+    }
+    if (!std::equal(chain.final_hidden[0].begin(), chain.final_hidden[0].end(),
+                    chain.final_hidden[1].begin())) {
+        result.errors.emplace_back(
+            "rank-local terminal hidden state diverged between ranks");
+        return result;
+    }
+    std::copy(chain.final_hidden[0].begin(), chain.final_hidden[0].end(),
+              hidden.begin());
+    if (fuse_head) {
+        fused_logits->assign(kVocabulary, 0.0F);
+        for (std::size_t index = 0U; index < kVocabulary; ++index) {
+            (*fused_logits)[index] = std::bit_cast<float>(
+                static_cast<std::uint32_t>(
+                    rank_local_published_logits[0][index]) << 16U);
+        }
+        graph_stats.output_head_nanoseconds += static_cast<std::uint64_t>(
+            chain.terminal_head_ms * 1.0e6);
+    }
+    // Every layer ran, both ranks agreed, and the head produced output. Only
+    // now is the token's KV allowed to become visible.
+    result = transaction.commit();
+    if (config.enable_layer_hash_trace) {
+        record_layer_hash(position, token, kLayers - 1U, hidden);
+    }
+    return result;
+#else
     result.errors.emplace_back(
-        "rank-local decode is admitted and its mHC state seeds on both ranks, "
-        "but the per-layer chain is not yet wired; run without "
-        "--decode-topology rank-local-tp2");
+        "rank-local decode requires an NCCL-enabled build");
+    return result;
+#endif
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::rank_local_patch_pages(
+    const RankLocalLayerScratch& scratch) {
+    ValidationResult result;
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        const auto bytes = std::span<const std::byte>(scratch.patches[rank]);
+        std::size_t cursor = 0U;
+        for (const auto& write : scratch.page_writes[rank]) {
+            const auto extent = static_cast<std::size_t>(write.data_bytes) +
+                                write.scale_bytes;
+            if (write.buffer == nullptr || cursor + extent > bytes.size()) {
+                result.errors.emplace_back(
+                    "rank-local page patch is truncated for rank " +
+                    std::to_string(rank));
+                return result;
+            }
+            const std::array<CudaBufferPatch, 2U> patches{{
+                {write.data_offset, bytes.subspan(cursor, write.data_bytes)},
+                {write.scale_offset,
+                 bytes.subspan(cursor + write.data_bytes, write.scale_bytes)},
+            }};
+            result = cuda.update_buffer(*write.buffer, patches);
+            if (!result.ok()) return result;
+            cursor += extent;
+        }
+        if (cursor != bytes.size()) {
+            result.errors.emplace_back(
+                "rank-local page patch has unused bytes for rank " +
+                std::to_string(rank));
+            return result;
+        }
+    }
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
+    std::uint32_t layer, std::uint32_t position,
+    std::span<const std::uint32_t> indexed_positions,
+    RankLocalLayerScratch& scratch) {
+    ValidationResult result;
+    auto sliding = kv_cache->block_table(
+        active_sequence, Dsv4KvBlockKind::Sliding, layer);
+    if (!sliding.ok()) {
+        append_errors(result, std::move(sliding.errors));
+        return result;
+    }
+    const auto ratio = attention_state[layer].compressor.ratio;
+    ParseResult<std::vector<Dsv4KvBlockInfo>> compressed;
+    if (ratio != 0U) {
+        compressed = kv_cache->block_table(
+            active_sequence, attention_state[layer].compressor.kind, layer);
+        if (!compressed.ok()) {
+            append_errors(result, std::move(compressed.errors));
+            return result;
+        }
+    }
+
+    // Leases are released only after the executor has consumed the pages, so
+    // they are cleared here rather than at the end of the previous layer.
+    scratch.leases.clear();
+    for (auto& pages : scratch.pages) pages.clear();
+    std::unordered_map<std::uint64_t, std::uint32_t> page_indices;
+    // One logical row order, two device page lists. Both ranks index the same
+    // candidate array, so a page must occupy the same index in both lists.
+    const auto locate = [&](Dsv4KvBlockKind kind,
+                            const std::vector<Dsv4KvBlockInfo>& table,
+                            std::uint32_t logical_row,
+                            CudaDsv4AttentionCandidate& candidate) {
+        const auto found = std::find_if(
+            table.begin(), table.end(), [&](const Dsv4KvBlockInfo& block) {
+                const auto begin = block.logical_begin /
+                                   block.compression_ratio;
+                return logical_row >= begin &&
+                       logical_row < begin + block.used_rows;
+            });
+        if (found == table.end()) {
+            result.errors.emplace_back(
+                "rank-local attention candidate page is unavailable");
+            return;
+        }
+        const auto begin = found->logical_begin / found->compression_ratio;
+        auto page = page_indices.find(found->id);
+        if (page == page_indices.end()) {
+            const auto index =
+                static_cast<std::uint32_t>(scratch.pages[0].size());
+            for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+                auto lease = kv_cache->acquire_device(
+                    active_sequence, kind, layer, logical_row, rank);
+                if (!lease.ok()) {
+                    append_errors(result, std::move(lease.errors));
+                    return;
+                }
+                scratch.leases.push_back(std::move(lease.value));
+                scratch.pages[rank].push_back(
+                    {scratch.leases.back().buffer(), found->capacity_rows});
+            }
+            page = page_indices.emplace(found->id, index).first;
+        }
+        candidate.page = page->second;
+        candidate.row = static_cast<std::uint32_t>(logical_row - begin);
+        candidate.valid = true;
+    };
+
+    const auto compressed_count = ratio == 0U ? 0U : (position + 1U) / ratio;
+    const bool sparse = ratio == 4U &&
+        attention_state[layer].indexer_compressor.ratio == 4U;
+    const auto compressed_width = ratio == 0U ? 0U : ratio == 4U
+        ? kIndexTopK
+        : ((std::max(1U, compressed_count) + 127U) / 128U) * 128U;
+    constexpr std::uint32_t sliding_width = kWindow;
+    scratch.candidates.assign(
+        static_cast<std::size_t>(compressed_width) + sliding_width, {});
+    const auto attended_compressed = sparse
+        ? static_cast<std::uint32_t>(indexed_positions.size())
+        : compressed_count;
+    if (attended_compressed > compressed_width) {
+        result.errors.emplace_back(
+            "rank-local attention compressed candidates exceed their fixed "
+            "region");
+        return result;
+    }
+    for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
+        const auto logical_row = sparse ? indexed_positions[item] : item;
+        locate(attention_state[layer].compressor.kind, compressed.value,
+               logical_row, scratch.candidates[item]);
+        if (!result.ok()) return result;
+    }
+    const auto window_count = std::min(position + 1U, kWindow);
+    for (std::uint32_t item = 0U; item < window_count; ++item) {
+        const auto logical_row = position + 1U - window_count + item;
+        locate(Dsv4KvBlockKind::Sliding, sliding.value, logical_row,
+               scratch.candidates[
+                   static_cast<std::size_t>(compressed_width) + item]);
+        if (!result.ok()) return result;
+    }
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
+    std::uint32_t layer, std::uint32_t token, std::uint32_t position,
+    Dsv4RankLocalKvTransaction& transaction,
+    RankLocalLayerScratch& scratch, Dsv4RankLocalLayerCall& call) {
+    ValidationResult result;
+    auto& state = attention_state[layer];
+    const auto ratio = state.compressor.ratio;
+    const auto index_ratio = state.indexer_compressor.ratio;
+    const auto slot = layer_device(layer);
+    const auto prefix = layer_prefix(layer) + "attn.";
+
+    result = transaction.reserve_layer(
+        layer, position, ratio, state.compressor.kind, index_ratio);
+    if (!result.ok()) return result;
+
+    // One host-visible preparation per layer, on the slot that owns this
+    // layer's centralized compressor weights. The executor's own preparation
+    // is device-only and computes no compressor projection, so the pooled
+    // rows and the index query have to come from here. It is one extra
+    // projection pass per layer, not per rank: the result is replicated.
+    //
+    // The leases are scope-local because this preparation is synchronous:
+    // with a host-visible query and no page-patch callback the backend copies
+    // its diagnostics and synchronizes before returning, so nothing queued
+    // still reads the weights after this function exits.
+    Dsv4WeightCache::Lease query_a;
+    Dsv4WeightCache::Lease query_b;
+    Dsv4WeightCache::Lease key_value_weight;
+    Dsv4WeightCache::Lease compressor_value;
+    Dsv4WeightCache::Lease compressor_gate;
+    Dsv4WeightCache::Lease index_value;
+    Dsv4WeightCache::Lease index_gate;
+    result = weights->acquire(
+        slot, prefix + "wq_a", kQueryRank, kHidden, query_a);
+    if (!result.ok()) return result;
+    result = weights->acquire(
+        slot, prefix + "wq_b", kHeads * kHeadDim, kQueryRank, query_b);
+    if (!result.ok()) return result;
+    result = weights->acquire(
+        slot, prefix + "wkv", kHeadDim, kHidden, key_value_weight);
+    if (!result.ok()) return result;
+    scratch.compressor_values.clear();
+    scratch.compressor_scores.clear();
+    if (ratio != 0U) {
+        const auto dimensions =
+            static_cast<std::size_t>(state.compressor.coefficient) *
+            state.compressor.head_dim;
+        result = weights->acquire(slot, prefix + "compressor.wkv", dimensions,
+                                  kHidden, compressor_value);
+        if (!result.ok()) return result;
+        result = weights->acquire(slot, prefix + "compressor.wgate", dimensions,
+                                  kHidden, compressor_gate);
+        if (!result.ok()) return result;
+        scratch.compressor_values.assign(dimensions, 0.0F);
+        scratch.compressor_scores.assign(dimensions, 0.0F);
+    }
+    scratch.index_compressor_values.clear();
+    scratch.index_compressor_scores.clear();
+    if (index_ratio != 0U) {
+        const auto dimensions =
+            static_cast<std::size_t>(state.indexer_compressor.coefficient) *
+            state.indexer_compressor.head_dim;
+        result = weights->acquire(slot, prefix + "indexer.compressor.wkv",
+                                  dimensions, kHidden, index_value);
+        if (!result.ok()) return result;
+        result = weights->acquire(slot, prefix + "indexer.compressor.wgate",
+                                  dimensions, kHidden, index_gate);
+        if (!result.ok()) return result;
+        scratch.index_compressor_values.assign(dimensions, 0.0F);
+        scratch.index_compressor_scores.assign(dimensions, 0.0F);
+    }
+    auto query_norm = host_tensor(prefix + "q_norm.weight", kQueryRank);
+    if (!query_norm.ok()) {
+        append_errors(result, std::move(query_norm.errors));
+        return result;
+    }
+    auto key_value_norm = host_tensor(prefix + "kv_norm.weight", kHeadDim);
+    if (!key_value_norm.ok()) {
+        append_errors(result, std::move(key_value_norm.errors));
+        return result;
+    }
+    auto sink = host_tensor(prefix + "attn_sink", kHeads);
+    if (!sink.ok()) {
+        append_errors(result, std::move(sink.errors));
+        return result;
+    }
+
+    for (std::size_t index = 0U; index < scratch.cosines.size(); ++index) {
+        const float angle = static_cast<float>(position) *
+                            state.frequencies[index];
+        scratch.cosines[index] = std::cos(angle);
+        // The executor recovers the forward sine as its negation, so only the
+        // inverse pair travels in the call.
+        scratch.inverse_sines[index] = -std::sin(angle);
+    }
+
+    CudaDsv4AttentionPrepareRequest request;
+    request.query_a = &query_a.weight();
+    request.query_b = &query_b.weight();
+    request.key_value = &key_value_weight.weight();
+    if (!scratch.compressor_values.empty()) {
+        request.compressor_value = &compressor_value.weight();
+        request.compressor_gate = &compressor_gate.weight();
+    }
+    if (!scratch.index_compressor_values.empty()) {
+        request.index_compressor_value = &index_value.weight();
+        request.index_compressor_gate = &index_gate.weight();
+    }
+    request.query_norm = *query_norm.value;
+    request.key_value_norm = *key_value_norm.value;
+    // Forward RoPE for the key/value row; the query carries the same angles.
+    std::array<float, kRopeDim / 2U> sines{};
+    for (std::size_t index = 0U; index < sines.size(); ++index) {
+        sines[index] = -scratch.inverse_sines[index];
+    }
+    request.rope_cosines = scratch.cosines;
+    request.rope_sines = sines;
+    request.mhc_device = devices[slot];
+    request.maximum_workspace_bytes = 1ULL << 20U;
+    scratch.query_rank.assign(kQueryRank, 0.0F);
+    scratch.key_value.assign(kHeadDim, 0.0F);
+    auto prepare_started = std::chrono::steady_clock::now();
+    result = cuda.dsv4_prepare_attention(
+        devices[slot], request, scratch.query_rank, scratch.key_value,
+        scratch.compressor_values, scratch.compressor_scores,
+        scratch.index_compressor_values, scratch.index_compressor_scores);
+    graph_stats.attention_query_nanoseconds +=
+        elapsed_nanoseconds(prepare_started);
+    if (!result.ok()) return result;
+
+    // Pool the compressor rows without publishing them: one logical row has to
+    // reach two devices' pages, so the transaction owns the encode.
+    result = compress_state(layer, state.compressor, prefix + "compressor.",
+                            {}, position, state.frequencies,
+                            scratch.compressor_values,
+                            scratch.compressor_scores, nullptr, {},
+                            &scratch.compressed_row);
+    if (!result.ok()) return result;
+    result = compress_state(layer, state.indexer_compressor,
+                            prefix + "indexer.compressor.", {}, position,
+                            state.frequencies,
+                            scratch.index_compressor_values,
+                            scratch.index_compressor_scores, nullptr, {},
+                            &scratch.index_row);
+    if (!result.ok()) return result;
+
+    const auto patch_bytes =
+        static_cast<std::size_t>(transaction.patch_bytes(layer));
+    std::array<std::span<std::byte>, kDsv4RankLocalWorld> patches{};
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        scratch.patches[rank].assign(patch_bytes, std::byte{});
+        patches[rank] = scratch.patches[rank];
+        result = transaction.page_writes(layer, rank,
+                                         scratch.page_writes[rank]);
+        if (!result.ok()) return result;
+    }
+    result = transaction.commit_layer(layer, scratch.key_value,
+                                      scratch.compressed_row, patches,
+                                      scratch.index_row);
+    if (!result.ok()) return result;
+    result = rank_local_patch_pages(scratch);
+    if (!result.ok()) return result;
+
+    scratch.indexed_positions.clear();
+    if (index_ratio != 0U) {
+        const auto compressed_count = (position + 1U) / index_ratio;
+        if (compressed_count > kIndexTopK &&
+            rank_local_attention_input.size() != kHidden) {
+            result.errors.emplace_back(
+                "rank-local sparse selection has no attention input at layer " +
+                std::to_string(layer));
+            return result;
+        }
+        auto select_started = std::chrono::steady_clock::now();
+        result = index_select(layer, rank_local_attention_input,
+                              scratch.query_rank, position,
+                              scratch.indexed_positions);
+        graph_stats.attention_index_nanoseconds +=
+            elapsed_nanoseconds(select_started);
+        if (!result.ok()) return result;
+    }
+    result = rank_local_candidates(layer, position, scratch.indexed_positions,
+                                   scratch);
+    if (!result.ok()) return result;
+
+    call = {};
+    call.layer = layer;
+    call.position = position;
+    call.weights = rank_local_weights->layer_view(layer, token);
+    call.head_sinks = *sink.value;
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        call.pages[rank] = scratch.pages[rank];
+    }
+    call.candidates = scratch.candidates;
+    call.inverse_rope_cosines = scratch.cosines;
+    call.inverse_rope_sines = scratch.inverse_sines;
+    // No page patch: both ranks' pages already hold this position's rows, so
+    // the executor's preparation stays device-only and costs no host sync.
+    call.terminal = layer + 1U == kLayers;
     return result;
 }
 

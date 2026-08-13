@@ -655,6 +655,12 @@ public:
     // The source spans must remain valid until the stream next completes.
     [[nodiscard]] ValidationResult update_buffer(
         const CudaBuffer& buffer, std::span<const CudaBufferPatch> patches);
+    // Reads a byte range back from a device buffer. There is otherwise no way
+    // to assert that a queued page patch actually landed, which is exactly
+    // what a replicated KV row has to prove on both devices.
+    [[nodiscard]] ValidationResult download_buffer(
+        const CudaBuffer& buffer, std::uint64_t offset,
+        std::span<std::byte> output);
     [[nodiscard]] ValidationResult allocate_buffer(
         int device, std::uint64_t bytes, CudaBuffer& output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(

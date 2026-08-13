@@ -317,3 +317,135 @@ TEST_CASE("rank-local KV replication requires two distinct device slots") {
         kLayer, 0U, kRatio, strata::Dsv4KvBlockKind::Csa).ok());
     REQUIRE(transaction.reserved_layers() == 0U);
 }
+
+TEST_CASE("rank-local committed rows reach both ranks' device pages") {
+    RankLocalFixture fixture;
+    if (!fixture.available) return;
+
+    // The transaction encodes one logical row and stages it per rank; the
+    // runtime is what carries those bytes to each rank's device page. Nothing
+    // proves the transport except reading the pages back, and a patch that
+    // silently misses rank 1 would leave that rank attending a zero row --
+    // wrong output, no error, and identical timings.
+    constexpr std::uint32_t kPosition = 3U;
+    for (std::uint32_t position = 0U; position < kPosition; ++position) {
+        REQUIRE(publish_token(*fixture.cache, fixture.sequence, position,
+                              1.0F + static_cast<float>(position)));
+    }
+
+    strata::Dsv4RankLocalKvTransaction transaction(
+        *fixture.cache, fixture.sequence, kSlots, kPosition);
+    REQUIRE(transaction.reserve_layer(
+        kLayer, kPosition, kRatio, strata::Dsv4KvBlockKind::Csa).ok());
+    const auto patch_bytes = static_cast<std::size_t>(
+        transaction.patch_bytes(kLayer));
+    REQUIRE(patch_bytes != 0U);
+
+    std::array<std::vector<std::byte>, 2> staging{
+        std::vector<std::byte>(patch_bytes),
+        std::vector<std::byte>(patch_bytes)};
+    const std::array<std::span<std::byte>, 2> patches{staging[0], staging[1]};
+    // Position 3 closes a ratio-4 block, so this layer commits a compressed
+    // row beside the sliding one and both must travel.
+    REQUIRE(transaction.commit_layer(
+        kLayer, row(kHeadDim, 7.5F), row(kHeadDim, -2.25F), patches).ok());
+    REQUIRE(staging[0] == staging[1]);
+
+    std::array<std::vector<strata::CudaDsv4AttentionPageWrite>, 2> writes;
+    for (std::size_t rank = 0U; rank < 2U; ++rank) {
+        REQUIRE(transaction.page_writes(kLayer, rank, writes[rank]).ok());
+    }
+    // Sliding and compressed, in reservation order, on both ranks.
+    REQUIRE(writes[0].size() == 2U);
+    REQUIRE(writes[1].size() == 2U);
+    for (std::size_t index = 0U; index < writes[0].size(); ++index) {
+        // Only the target device differs: one logical row, one offset.
+        REQUIRE(writes[0][index].data_offset == writes[1][index].data_offset);
+        REQUIRE(writes[0][index].scale_offset == writes[1][index].scale_offset);
+        REQUIRE(writes[0][index].data_bytes == writes[1][index].data_bytes);
+        REQUIRE(writes[0][index].scale_bytes == writes[1][index].scale_bytes);
+        REQUIRE(writes[0][index].buffer != nullptr);
+        REQUIRE(writes[1][index].buffer != nullptr);
+        REQUIRE(writes[0][index].buffer->device() !=
+                writes[1][index].buffer->device());
+    }
+
+    for (std::size_t rank = 0U; rank < 2U; ++rank) {
+        std::size_t cursor = 0U;
+        const auto bytes = std::span<const std::byte>(staging[rank]);
+        for (const auto& write : writes[rank]) {
+            const std::array<strata::CudaBufferPatch, 2> update{{
+                {write.data_offset, bytes.subspan(cursor, write.data_bytes)},
+                {write.scale_offset,
+                 bytes.subspan(cursor + write.data_bytes, write.scale_bytes)},
+            }};
+            REQUIRE(fixture.backend->update_buffer(*write.buffer, update).ok());
+            cursor += static_cast<std::size_t>(write.data_bytes) +
+                      write.scale_bytes;
+        }
+        REQUIRE(cursor == staging[rank].size());
+    }
+    REQUIRE(transaction.commit().ok());
+
+    for (std::size_t index = 0U; index < writes[0].size(); ++index) {
+        std::size_t cursor = 0U;
+        for (std::size_t earlier = 0U; earlier < index; ++earlier) {
+            cursor += static_cast<std::size_t>(writes[0][earlier].data_bytes) +
+                      writes[0][earlier].scale_bytes;
+        }
+        for (std::size_t rank = 0U; rank < 2U; ++rank) {
+            const auto& write = writes[rank][index];
+            std::vector<std::byte> data(write.data_bytes);
+            std::vector<std::byte> scale(write.scale_bytes);
+            REQUIRE(fixture.backend->download_buffer(
+                *write.buffer, write.data_offset, data).ok());
+            REQUIRE(fixture.backend->download_buffer(
+                *write.buffer, write.scale_offset, scale).ok());
+            const auto expected = std::span<const std::byte>(staging[rank]);
+            REQUIRE(std::equal(data.begin(), data.end(),
+                               expected.begin() +
+                                   static_cast<std::ptrdiff_t>(cursor)));
+            REQUIRE(std::equal(
+                scale.begin(), scale.end(),
+                expected.begin() + static_cast<std::ptrdiff_t>(
+                                       cursor + write.data_bytes)));
+        }
+    }
+
+    // A row read back through the cache decodes to what was committed, so the
+    // canonical host page and the two device pages agree.
+    auto sliding = fixture.cache->row(
+        fixture.sequence, strata::Dsv4KvBlockKind::Sliding, kLayer, kPosition);
+    REQUIRE(sliding.ok());
+    REQUIRE(sliding.value.size() == kHeadDim);
+    auto compressed = fixture.cache->row(
+        fixture.sequence, strata::Dsv4KvBlockKind::Csa, kLayer,
+        kPosition / kRatio);
+    REQUIRE(compressed.ok());
+    REQUIRE(compressed.value.size() == kHeadDim);
+}
+
+TEST_CASE("rank-local device download refuses an out-of-range read") {
+    RankLocalFixture fixture;
+    if (!fixture.available) return;
+
+    REQUIRE(publish_token(*fixture.cache, fixture.sequence, 0U, 1.5F));
+    strata::Dsv4RankLocalKvTransaction transaction(
+        *fixture.cache, fixture.sequence, kSlots, 1U);
+    REQUIRE(transaction.reserve_layer(
+        kLayer, 1U, kRatio, strata::Dsv4KvBlockKind::Csa).ok());
+    std::vector<strata::CudaDsv4AttentionPageWrite> writes;
+    REQUIRE(transaction.page_writes(kLayer, 0U, writes).ok());
+    REQUIRE(!writes.empty());
+    const auto& buffer = *writes.front().buffer;
+
+    std::vector<std::byte> output(64U);
+    REQUIRE(fixture.backend->download_buffer(buffer, 0U, output).ok());
+    // A read that runs off the end of the page must be refused, not clamped:
+    // a short page would otherwise be reported as a page of zeros.
+    REQUIRE(!fixture.backend->download_buffer(
+        buffer, buffer.device_bytes(), output).ok());
+    REQUIRE(!fixture.backend->download_buffer(
+        buffer, buffer.device_bytes() - 8U, output).ok());
+    REQUIRE(!fixture.backend->download_buffer(buffer, 0U, {}).ok());
+}

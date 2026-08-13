@@ -90,6 +90,11 @@ ValidationResult CudaBackend::update_buffer(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::download_buffer(
+    const CudaBuffer&, std::uint64_t, std::span<std::byte>) {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
 ValidationResult CudaBackend::matmul(const CudaWeight&, std::span<const float>,
                                      std::uint32_t, std::span<float>) {
     return {{"CUDA support was not compiled into this build"}};

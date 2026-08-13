@@ -4754,6 +4754,49 @@ ValidationResult CudaBackend::upload_buffer(
     return result;
 }
 
+ValidationResult CudaBackend::download_buffer(
+    const CudaBuffer& buffer, std::uint64_t offset,
+    std::span<std::byte> output) {
+    ValidationResult result;
+    if (!buffer.impl_ || output.empty()) {
+        result.errors.emplace_back("CUDA buffer download is invalid");
+        return result;
+    }
+    if (offset > buffer.impl_->bytes ||
+        output.size() > buffer.impl_->bytes - offset) {
+        result.errors.emplace_back("CUDA buffer download is out of bounds");
+        return result;
+    }
+    const auto found = impl_->devices.find(buffer.impl_->device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "buffer download targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "buffer download cannot overlap an in-flight DeepSeek MoE command");
+        return result;
+    }
+    if (auto status = cudaSetDevice(buffer.impl_->device);
+        status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for buffer download");
+    }
+    const auto* source = static_cast<const std::byte*>(buffer.impl_->data);
+    if (auto status = cudaMemcpyAsync(
+            output.data(), source + offset, output.size(),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download CUDA buffer");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize CUDA buffer download");
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::update_buffer(
     const CudaBuffer& buffer, std::span<const CudaBufferPatch> patches) {
     ValidationResult result;

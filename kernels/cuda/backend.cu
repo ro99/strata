@@ -7147,6 +7147,9 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     const bool transition_mhc = request.mhc_transition != nullptr;
     const bool host_deferred = request.host_callback != nullptr;
     const bool device_only = request.device_only;
+    // A host-only preparation returns its projections and publishes no
+    // prepared device query, so nothing downstream may consume it.
+    const bool host_only = request.host_only;
     // Both deferred and device-only preparations belong to a queued layer that
     // submits its upload and returns without synchronizing, so the next layer
     // may rewrite this pinned staging before the queued H2D has read it.  Their
@@ -7297,7 +7300,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         mhc_state.dsv4_mhc_workspace == nullptr ||
         mhc_state.dsv4_mhc_stage != 1U ||
         mhc_state.dsv4_mhc_branch_ready != transition_mhc ||
-        state.dsv4_attention_prepared ||
+        state.dsv4_attention_prepared || (host_only && device_only) ||
         (fixed_command_staging &&
          state.dsv4_attention_prepare_host_command_count >=
              kDsv4FixedCommandCount)) {
@@ -7912,7 +7915,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     }
     if (device_only) {
         state.dsv4_prepared_queries = prepared_query;
-        state.dsv4_attention_prepared = true;
+        state.dsv4_attention_prepared = !host_only;
         // Retire this command's upload slot.  The device-only path enqueues no
         // host node, so its command record stays empty and reports no failure,
         // but the slot must not be reused until the chain has been drained.
@@ -8105,7 +8108,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             }
         }
         state.dsv4_prepared_queries = prepared_query;
-        state.dsv4_attention_prepared = true;
+        state.dsv4_attention_prepared = !host_only;
         return result;
     }
     const auto wait_started = std::chrono::steady_clock::now();
@@ -8272,7 +8275,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     }
     static_cast<void>(operation_nanoseconds);
     state.dsv4_prepared_queries = prepared_query;
-    state.dsv4_attention_prepared = true;
+    state.dsv4_attention_prepared = !host_only;
     return result;
 }
 

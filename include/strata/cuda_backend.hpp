@@ -428,6 +428,16 @@ struct CudaDsv4AttentionPrepareRequest {
     // be empty in this mode.  This is setup for a dependent rank-local
     // attention command, not a host-visible timing path.
     bool device_only{};
+    // The complement of `device_only`: return the host-visible projections and
+    // publish no prepared device query, so this preparation stages no command
+    // for a following attention to consume.
+    //
+    // Rank-local decode needs one host-visible projection per layer before it
+    // can select candidates, and the executor then prepares again per rank to
+    // stage the command its attention consumes. Without this the first
+    // preparation would leave a published query behind and the second would be
+    // rejected as out of order. Mutually exclusive with `device_only`.
+    bool host_only{};
 };
 
 class CudaBuffer {

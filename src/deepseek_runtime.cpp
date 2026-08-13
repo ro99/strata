@@ -6070,6 +6070,11 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
     request.rope_sines = sines;
     request.mhc_device = devices[slot];
     request.maximum_workspace_bytes = 1ULL << 20U;
+    // This preparation exists to produce host-visible projections, not to
+    // stage a command. The executor prepares again per rank to stage the one
+    // its attention consumes, and a published query left here would make that
+    // second preparation out of order.
+    request.host_only = true;
     scratch.query_rank.assign(kQueryRank, 0.0F);
     scratch.key_value.assign(kHeadDim, 0.0F);
     auto prepare_started = std::chrono::steady_clock::now();

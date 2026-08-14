@@ -87,7 +87,8 @@ RuntimeDevicePlanResult plan_runtime_devices(
     std::span<const int> devices, double vram_fraction,
     std::uint64_t per_device_workspace_reserve,
     std::uint64_t minimum_device_budget,
-    std::string_view model_label) {
+    std::string_view model_label,
+    std::uint64_t explicit_device_budget_bytes) {
     RuntimeDevicePlanResult result;
     std::vector<std::uint64_t> totals;
     result.value.devices.assign(devices.begin(), devices.end());
@@ -97,8 +98,10 @@ RuntimeDevicePlanResult plan_runtime_devices(
             result.errors = std::move(memory.errors);
             return result;
         }
-        const auto budget = static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * vram_fraction);
+        const auto computed = compute_runtime_device_budget(
+            memory.value.free_bytes, vram_fraction,
+            explicit_device_budget_bytes);
+        const auto budget = computed.applied_budget_bytes;
         if (budget < minimum_device_budget ||
             budget <= per_device_workspace_reserve) {
             result.errors.emplace_back(
@@ -108,6 +111,10 @@ RuntimeDevicePlanResult plan_runtime_devices(
             return result;
         }
         result.value.budgets.push_back(budget);
+        result.value.fractional_budgets.push_back(
+            computed.fractional_budget_bytes);
+        result.value.explicit_budgets.push_back(
+            computed.explicit_budget_bytes);
         result.value.weight_capacities.push_back(
             budget - per_device_workspace_reserve);
         totals.push_back(memory.value.total_bytes);
@@ -131,6 +138,45 @@ RuntimeDevicePlanResult plan_runtime_devices(
         }
     }
     return result;
+}
+
+RuntimeDeviceBudget compute_runtime_device_budget(
+    std::uint64_t free_bytes, double vram_fraction,
+    std::uint64_t explicit_budget_bytes) noexcept {
+    RuntimeDeviceBudget result;
+    // Keep the historical double product so the byte budget remains stable
+    // with the pre-existing fractional admission calculation.  The widened
+    // comparison below prevents an out-of-range integer conversion.
+    const double scaled = static_cast<double>(free_bytes) * vram_fraction;
+    if (std::isfinite(vram_fraction) && vram_fraction > 0.0 &&
+        std::isfinite(scaled) && scaled > 0.0) {
+        const auto maximum = std::numeric_limits<std::uint64_t>::max();
+        result.fractional_budget_bytes = static_cast<long double>(scaled) >=
+                static_cast<long double>(maximum)
+            ? maximum
+            : static_cast<std::uint64_t>(scaled);
+    }
+    result.explicit_budget_bytes = explicit_budget_bytes;
+    result.applied_budget_bytes = result.fractional_budget_bytes;
+    if (explicit_budget_bytes != 0U &&
+        explicit_budget_bytes < result.applied_budget_bytes) {
+        result.applied_budget_bytes = explicit_budget_bytes;
+    }
+    return result;
+}
+
+std::string_view runtime_budget_bound_name(
+    std::uint64_t fractional_budget_bytes,
+    std::uint64_t explicit_budget_bytes) noexcept {
+    if (explicit_budget_bytes != 0U &&
+        explicit_budget_bytes < fractional_budget_bytes) {
+        return "explicit";
+    }
+    if (explicit_budget_bytes != 0U &&
+        explicit_budget_bytes == fractional_budget_bytes) {
+        return "equal";
+    }
+    return "fractional";
 }
 
 std::uint64_t process_resident_set_bytes() noexcept {

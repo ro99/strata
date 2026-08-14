@@ -79,6 +79,10 @@ struct CudaBackendStats {
         std::uint64_t deepseek_moe_d2h_bytes{};
         std::uint64_t deepseek_moe_h2d_nanoseconds{};
         std::uint64_t deepseek_moe_kernel_nanoseconds{};
+        std::uint64_t deepseek_moe_input_quantize_nanoseconds{};
+        std::uint64_t deepseek_moe_shared_gate_up_nanoseconds{};
+        std::uint64_t deepseek_moe_shared_activation_quantize_nanoseconds{};
+        std::uint64_t deepseek_moe_shared_down_nanoseconds{};
         std::uint64_t deepseek_moe_d2h_nanoseconds{};
         std::uint64_t deepseek_moe_nanoseconds{};
         std::uint64_t flash_attention_calls{};
@@ -233,6 +237,57 @@ struct CudaLightningIndexRequest {
     std::uint64_t maximum_workspace_bytes{32ULL << 20U};
 };
 
+// One persistent physical-format learned-index page, block-major exactly as
+// dsv4_physical_encode_kv_row writes it: `block_rows` payloads of `head_dim`
+// E4M3 bytes, then `block_rows` f32 per-row scales. `rows` is how many of the
+// block's rows carry committed history; the tail is never scored.
+//
+// This is a different layout from CudaLightningIndexSegment, which carries
+// FP4 E2M1 keys plus per-32 E8M0 scales in row-major order. The physical KV
+// cache stores the learned index as E4M3 with one f32 scale per row, so the
+// two cannot share a kernel.
+struct CudaDsv4PhysicalIndexPage {
+    const CudaBuffer* buffer{};
+    std::uint64_t byte_offset{};
+    std::uint32_t block_rows{};
+    std::uint32_t rows{};
+};
+
+// Device-resident result of a selection that has been enqueued but not
+// synchronized. The positions live in the backend's persistent per-device
+// Lightning workspace, so they are valid only until the next selection on that
+// device; a consumer must therefore read them in stream order before the next
+// call, which is exactly what an in-chain resolve does.
+struct CudaDsv4DeviceIndexSelection {
+    // Opaque device pointers; the concrete types stay inside the backend.
+    void* positions{};
+    void* error{};
+    std::uint32_t selected{};
+};
+
+struct CudaDsv4PhysicalIndexRequest {
+    // Queries have already crossed the host E4M3 round trip performed by
+    // dsv4_physical_quantize_query_e4m3_f32; the backend consumes them as the
+    // exact float values that quantization produced and applies no further
+    // rotation or simulation. Scoring reproduces dsv4_index_scores_f32 term by
+    // term, and selection reproduces dsv4_index_topk_f32, so the result is bit
+    // identical to the scalar reference rather than merely close to it.
+    std::span<const float> queries;
+    std::span<const float> weights;
+    std::span<const CudaDsv4PhysicalIndexPage> pages;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t top_k{};
+    std::uint64_t maximum_workspace_bytes{64ULL << 20U};
+    // Consume the query and weights the preceding device-only
+    // dsv4_index_projections left on this device instead of uploading them.
+    // `queries` and `weights` must be empty in this mode, and the projection's
+    // own non-finite rejection is carried into this command's error word --
+    // the host validation it replaces has no other way to reach a selection
+    // that never crosses back.
+    bool device_projected{};
+};
+
 // One persistent physical-format physical KV page. The buffer contains only
 // the block-major payload: 576 data plus eight scale bytes per row.
 struct CudaDsv4PhysicalPage {
@@ -248,6 +303,27 @@ struct CudaDsv4AttentionCandidate {
     bool valid{};
 };
 
+// One physical KV block, as locate_physical_kv_block() sees it. `logical_begin`
+// counts SOURCE tokens; the block's first row is that divided by the ratio.
+struct CudaDsv4KvBlockDescriptor {
+    std::uint64_t logical_begin{};
+    std::uint32_t used_rows{};
+    std::uint32_t compression_ratio{};
+};
+
+// Resolves the compressed candidate region on the device from a selection the
+// host has not seen. The host cannot number pages by first touch under device
+// selection -- it does not know which blocks a candidate set will touch -- so
+// the page index is the block-table index and every attendable block owns its
+// slot. The sliding tail is still host-known and travels in `candidates`.
+struct CudaDsv4DeviceCandidateResolution {
+    CudaDsv4DeviceIndexSelection selection;
+    std::span<const CudaDsv4KvBlockDescriptor> blocks;
+    // Width of the compressed region at the front of `candidates`. Everything
+    // the resolution does not fill is left invalid.
+    std::uint32_t compressed_width{};
+};
+
 struct CudaDsv4PagedAttentionRequest {
     // Queries have crossed the production BF16 boundary. The backend converts
     // them to BF16, reads page payloads in place, and returns the exact BF16
@@ -256,6 +332,9 @@ struct CudaDsv4PagedAttentionRequest {
     std::span<const float> head_sinks;
     std::span<const CudaDsv4PhysicalPage> pages;
     std::span<const CudaDsv4AttentionCandidate> candidates;
+    // When set, the compressed region of `candidates` is ignored and resolved
+    // on the device instead, after the upload and before scoring.
+    const CudaDsv4DeviceCandidateResolution* resolution{};
     float scale{};
     std::uint64_t maximum_workspace_bytes{4ULL << 20U};
 };
@@ -337,6 +416,47 @@ struct CudaDsv4PagedAttentionMhcRequest {
     // the immediately following stream-ordered CPU-MoE command. Both host
     // output spans above must be empty in this mode.
     bool defer_host_moe_input{};
+    // Execute one TP2 rank's 32 attention heads and its local output
+    // projection.  The physical page is still the replicated 64-head page;
+    // `head_offset` selects the rank's contiguous 32-head slice.  The
+    // resulting branch remains in the target mHC workspace for an external
+    // FP32 reduction.  This is an explicit device-resident contract; the
+    // default path above remains the accepted 64-head operation.
+    bool rank_local{};
+    std::uint32_t head_offset{};
+    // Borrowed same-device storage for the raw FP32 rank-local wo_b partial.
+    // The caller owns this persistent buffer and keeps it alive until the
+    // queued command and its NCCL reduction complete. It is required for
+    // rank_local calls and forbidden otherwise; NCCL must reduce these raw
+    // FP32 values before any BF16 publication.
+    float* rank_local_raw_fp32_reduction{};
+};
+
+// One indexed layer's index-query and index-weight projections, computed from
+// the activations the attention preparation command already left on the
+// device: the E4M3-quantized query rank and the expanded BF16 layer input.
+//
+// Exactness here is by construction rather than by comparison. The host form
+// is two linear() calls, and linear() is CudaBackend::matmul followed by a host
+// round_bf16; this routes the same kernel matmul would dispatch for the same
+// weight, over an activation that is already in the state matmul's own upload
+// would have produced. A differently tiled kernel would change the
+// accumulation order and, through a hard top-k, the candidate set.
+struct CudaDsv4IndexProjectionRequest {
+    // attn.indexer.wq_b: consumes the quantized query rank.
+    const CudaWeight* query_projection{};
+    // attn.indexer.weights_proj: consumes the raw expanded layer input.
+    const CudaWeight* weight_projection{};
+    // Computed by the caller from the position and the layer frequencies.
+    // Host libm and device trigonometry differ in the last ulp.
+    std::span<const float> rope_cosines;
+    std::span<const float> rope_sines;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t rope_dim{};
+    // Applied after the projection's BF16 rounding; the product is rounded
+    // again, exactly as index_select() does on the host.
+    float weight_scale{};
 };
 
 // Produces the accepted BF16 Q/KV boundary from the persistent mHC layer
@@ -370,9 +490,39 @@ struct CudaDsv4AttentionPrepareRequest {
     // target is patched after the callback on this same stream.
     CudaDsv4AttentionPrepareHostCallback host_callback{};
     void* host_callback_context{};
+    // Device-only replica publication. Another stream fills this fixed pinned
+    // span and records `page_patch_ready_event`; this stream waits for that
+    // event, then uploads the already encoded bytes without a second host
+    // callback or Q/KV diagnostic download.
+    std::span<const std::byte> ready_page_patches;
+    void* page_patch_ready_event{};
     std::span<const CudaDsv4AttentionPageWrite> page_writes;
     int mhc_device{-1};
     std::uint64_t maximum_workspace_bytes{1ULL << 20U};
+    // When set, retain only the prepared device query and return without
+    // copying query/KV diagnostics or synchronizing.  The output spans must
+    // be empty in this mode.  This is setup for a dependent rank-local
+    // attention command, not a host-visible timing path.
+    bool device_only{};
+    // Publish this command's activations for a following in-chain
+    // dsv4_index_projections: the E4M3-quantized query rank, and the expanded
+    // BF16 layer input its weight projection reads.
+    //
+    // The expansion is otherwise computed only for a compressor projection,
+    // and the compressor is deliberately resident on rank 0 alone -- one
+    // logical replicated KV stream, whose encoded row is copied to both ranks.
+    // Rank 1 still has to select, so it asks for the expansion on its own.
+    bool publish_index_source{};
+    // The complement of `device_only`: return the host-visible projections and
+    // publish no prepared device query, so this preparation stages no command
+    // for a following attention to consume.
+    //
+    // Rank-local decode needs one host-visible projection per layer before it
+    // can select candidates, and the executor then prepares again per rank to
+    // stage the command its attention consumes. Without this the first
+    // preparation would leave a published query behind and the second would be
+    // rejected as out of order. Mutually exclusive with `device_only`.
+    bool host_only{};
 };
 
 class CudaBuffer {
@@ -437,6 +587,41 @@ struct CudaDeepSeekMoeExpert {
 // return fails the command after the stream is safely drained.
 using CudaDsv4HostMoeCallback = bool (*)(
     void* context, std::span<float> rank_partials);
+
+// Device-resident view returned by the rank-local host-MoE enqueue. The
+// pointers remain valid until the matching chain finish and are intended for
+// stream-ordered NCCL reduction and BF16 publication only.
+struct CudaDsv4HostMoeDeviceView {
+    void* stream{};
+    float* output{};
+    unsigned int* status{};
+};
+
+// Borrowed fixed-lifetime mHC workspace views.  No ownership is transferred;
+// pointers are valid only until the next command that advances this mHC
+// state.  They are intended for stream-ordered conversion/reduction and are
+// never host-dereferenced by the caller.
+struct CudaDsv4MhcDeviceView {
+    void* stream{};
+    std::uint16_t* weighted{};
+    std::uint16_t* layer_input{};
+    std::uint16_t* branch{};
+    // Current four-copy residual, borrowed for the post-layer diagnostic
+    // boundary only. It must not be dereferenced or modified in-flight.
+    std::uint16_t* residual{};
+    float* router_logits{};
+    unsigned int* status{};
+};
+
+// Borrowed output-head buffers returned by the device-resident final mHC/head
+// enqueue. They remain valid until complete_dsv4_mhc_head_device() and let a
+// rank-local caller publish directly from the projected device shard.
+struct CudaDsv4MhcHeadDeviceView {
+    void* stream{};
+    float* logits{};
+    std::uint16_t* final_hidden{};
+    std::uint64_t count{};
+};
 
 // Device-owned form of the same callback boundary. The backend first stages
 // the persistent mHC BF16 layer input and raw FP32 router logits in stream
@@ -565,6 +750,12 @@ public:
     // The source spans must remain valid until the stream next completes.
     [[nodiscard]] ValidationResult update_buffer(
         const CudaBuffer& buffer, std::span<const CudaBufferPatch> patches);
+    // Reads a byte range back from a device buffer. There is otherwise no way
+    // to assert that a queued page patch actually landed, which is exactly
+    // what a replicated KV row has to prove on both devices.
+    [[nodiscard]] ValidationResult download_buffer(
+        const CudaBuffer& buffer, std::uint64_t offset,
+        std::span<std::byte> output);
     [[nodiscard]] ValidationResult allocate_buffer(
         int device, std::uint64_t bytes, CudaBuffer& output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
@@ -622,6 +813,10 @@ public:
         std::span<float> compressor_scores = {},
         std::span<float> index_compressor_values = {},
         std::span<float> index_compressor_scores = {});
+    // Capture-only diagnostic for the prepared device-resident query. This
+    // method is not part of the timed runtime path and has no fallback.
+    [[nodiscard]] ValidationResult dsv4_copy_prepared_queries(
+        int device, std::span<float> output);
     // Accepted dsv4-sm86-v1 mHC sequence. `begin` uploads one initial
     // four-copy residual and retains it on the device. Each transition fuses
     // the preceding post mix with the next projection/Sinkhorn/pre/RMSNorm;
@@ -657,11 +852,32 @@ public:
         std::span<float> hidden);
     [[nodiscard]] ValidationResult dsv4_mhc_finish_device(
         int device, std::span<float> hidden);
+    // Device-only rank-local mHC bridges.  These preserve the existing state
+    // machine while keeping the attention/FFN boundary on the CUDA stream.
+    [[nodiscard]] ValidationResult dsv4_mhc_device_view(
+        int device, CudaDsv4MhcDeviceView& view);
+    [[nodiscard]] ValidationResult dsv4_mhc_branch_to_fp32(
+        int device, float* output);
+    [[nodiscard]] ValidationResult dsv4_mhc_commit_reduced_branch(
+        int device, const float* reduced);
+    // Reject a globally failed publication.  The branch and all transition
+    // scratch are cleared before the state machine is closed, so no later
+    // command can observe stale state from the failed layer.
+    [[nodiscard]] ValidationResult dsv4_mhc_abort_branch(int device);
+    [[nodiscard]] ValidationResult dsv4_mhc_transition_router_device(
+        int device, const CudaDsv4MhcWeights& next_weights,
+        const CudaWeight& router);
+    // Enqueue the final post/mix/norm transition without a host download.
+    // The caller owns the single diagnostic completion boundary after the
+    // whole layer.
+    [[nodiscard]] ValidationResult dsv4_mhc_transition_next_device(
+        int device, const CudaDsv4MhcWeights& next_weights);
     [[nodiscard]] ValidationResult reserve_dsv4_mhc_head(
         int device, std::uint64_t logits);
     [[nodiscard]] ValidationResult enqueue_dsv4_mhc_finish_head_device(
         int device, const CudaWeight& head,
-        CudaDsv4MhcHeadCallback callback, void* callback_context);
+        CudaDsv4MhcHeadCallback callback, void* callback_context,
+        CudaDsv4MhcHeadDeviceView* view = nullptr);
     // Called only after collect_deepseek_moe has completed the same stream.
     // This copies the already-staged logits and validates the host node without
     // issuing or waiting on CUDA work.
@@ -680,6 +896,44 @@ public:
     [[nodiscard]] ValidationResult lightning_index(
         int device, const CudaLightningIndexRequest& request,
         std::span<std::uint32_t> output);
+    // Exact bounded-workspace Lightning Indexer over physical-format E4M3
+    // learned-index pages. Selection is a parallel radix select over a
+    // composite (score, position) key rather than the serial insertion merge
+    // the FP4 path uses, because the physical cache reaches 262,144 candidates
+    // per layer at the declared 1M context, where a single-thread merge is the
+    // dominant term. Output ordering matches lightning_index: descending
+    // score, lower position winning ties.
+    // Applies the index query's RoPE, the bf16 rounding of that region, and the
+    // half-up E4M3 quantization, in the order index_select() performs them on
+    // the host. `cosines` and `sines` are computed by the caller from the
+    // position and the layer frequencies, because host and device
+    // trigonometry differ in the last ulp and a hard top-k turns that into a
+    // different candidate set. `queries` is head-major and updated in place.
+    [[nodiscard]] ValidationResult dsv4_index_query_rope_quantize(
+        int device, std::span<float> queries, std::span<const float> cosines,
+        std::span<const float> sines, std::uint32_t heads,
+        std::uint32_t head_dim, std::uint32_t rope_dim, bool quantize);
+    // Both index projections plus the query's RoPE, BF16 rounding and half-up
+    // E4M3 quantization, in one command over the preparation's own device
+    // activations. It replaces two host round trips per indexed layer: the
+    // host never sends the query rank or the layer input back to the device.
+    // The sources are published by the immediately preceding
+    // dsv4_prepare_attention on this device and are overwritten by the next
+    // one, so this must be issued between them.
+    [[nodiscard]] ValidationResult dsv4_index_projections(
+        int device, const CudaDsv4IndexProjectionRequest& request,
+        std::span<float> queries, std::span<float> weights);
+    // With `device_selection` null this downloads the positions into `output`
+    // and synchronizes, which is the host-visible selection the sequential path
+    // uses. With it non-null the kernels are left enqueued on the device
+    // stream, `output` may be empty, and the caller receives device pointers
+    // instead: no synchronization and no device-to-host copy. That is the form
+    // selection must take to run inside the queued chain, where a host round
+    // trip per indexed layer is what forces the chain to be abandoned.
+    [[nodiscard]] ValidationResult dsv4_physical_lightning_index(
+        int device, const CudaDsv4PhysicalIndexRequest& request,
+        std::span<std::uint32_t> output,
+        CudaDsv4DeviceIndexSelection* device_selection = nullptr);
     // Enqueue first on every active device, then collect each device. Routed
     // results are flattened in the same order as `routed`; shared output is
     // returned separately so the caller retains the global accumulation order.
@@ -701,6 +955,15 @@ public:
         int device, std::span<const float> hidden,
         const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4HostMoeCallback callback, void* callback_context);
+    // Variant of enqueue_dsv4_host_moe that exposes the first hidden-width
+    // result and status flag for a stream-ordered device-resident collective.
+    // The backend still owns both rank-partial slots and the shared/routed
+    // BF16 join; callers must not synchronize or free the returned pointers.
+    [[nodiscard]] ValidationResult enqueue_dsv4_host_moe_device_view(
+        int device, std::span<const float> hidden,
+        const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
+        CudaDsv4HostMoeCallback callback, void* callback_context,
+        CudaDsv4HostMoeDeviceView& view);
     // Uses the current persistent mHC layer_input as the GPU shared-expert
     // source and writes the exact routed/shared BF16 result back to the mHC
     // branch buffer. The CPU callback still consumes the already-decoded host
@@ -712,9 +975,19 @@ public:
         int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4DeviceInputHostMoeCallback callback,
         void* callback_context);
+    [[nodiscard]] ValidationResult
+    enqueue_dsv4_host_moe_from_device_input_device_view(
+        int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
+        CudaDsv4DeviceInputHostMoeCallback callback,
+        void* callback_context, CudaDsv4HostMoeDeviceView& view);
     [[nodiscard]] ValidationResult collect_deepseek_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output);
+    // Drain a queued host-MoE chain after the caller's single completion
+    // boundary without downloading routed/shared output. A four-byte error
+    // status is staged and checked; the dependent shared vector remains
+    // device-resident. This is the production chain measurement boundary.
+    [[nodiscard]] ValidationResult finish_deepseek_moe_chain(int device);
     // Row-grouped form of the command above. `hidden` holds `hidden_rows`
     // contiguous activation rows; each group names one expert and the rows it
     // serves. Routed results are flattened group-major and, within a group, in

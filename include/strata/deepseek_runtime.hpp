@@ -6,6 +6,7 @@
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/deepseek_diagnostics.hpp"
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/dsv4_rank_local_topology.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
@@ -20,7 +21,14 @@ namespace strata {
 
 struct Dsv4RuntimeConfig {
     std::vector<int> devices{0};
+    // Decode execution topology. Centralized is the default and is unchanged
+    // by the rank-local feature. RankLocalTp2 is explicit opt-in, is admitted
+    // fail-closed before model loading, and never falls back once admitted.
+    Dsv4DecodeTopology decode_topology{Dsv4DecodeTopology::Centralized};
     double vram_cache_fraction{0.85};
+    // Optional hard per-device admission ceiling. Zero preserves the
+    // fractional-only contract; non-zero is combined with it as min().
+    std::uint64_t explicit_vram_budget_bytes{};
     std::uint64_t host_memory_limit_bytes{216ULL << 30U};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
@@ -166,6 +174,22 @@ struct Dsv4GraphStats {
     std::uint64_t moe_prepare_nanoseconds{};
     std::uint64_t mhc_post_nanoseconds{};
     std::uint64_t output_head_nanoseconds{};
+    // Rank-local decode attribution. The executor reports the device work it
+    // performs; these account for the host-side glue around it, which is the
+    // only place a rank-local step can be slower than the centralized step it
+    // splits. Zero on the centralized path.
+    //
+    // `rank_local_layer_nanoseconds` is wall time inside run()/enqueue and
+    // `rank_local_device_nanoseconds` is what the executor measured of that,
+    // so their difference is submission plus the per-layer diagnostic boundary.
+    std::uint64_t rank_local_layer_nanoseconds{};
+    std::uint64_t rank_local_device_nanoseconds{};
+    std::uint64_t rank_local_kv_nanoseconds{};
+    std::uint64_t rank_local_candidate_nanoseconds{};
+    std::uint64_t rank_local_boundary_nanoseconds{};
+    std::uint64_t rank_local_collective_nanoseconds{};
+    std::uint64_t rank_local_transition_nanoseconds{};
+    std::uint64_t rank_local_shared_nanoseconds{};
     // Future-entropy lookahead, kept separate because it is whole speculative
     // forward passes rather than a phase of one. The per-phase counters above
     // include the work these passes did; this is how much of it was
@@ -190,12 +214,22 @@ struct Dsv4GenerationMetrics {
     double resident_warmup_seconds{};
     double prefill_seconds{};
     double decode_seconds{};
+    // Temporary Step-2 acceptance instrumentation. Reserved before the timed
+    // loop so recording one wall interval per step does not allocate there.
+    std::vector<double> decode_step_seconds;
     std::uint64_t prompt_tokens{};
     std::uint64_t prefill_tokens{};
     std::uint64_t reused_prompt_tokens{};
     std::uint64_t decode_tokens{};
     std::uint64_t rss_bytes{};
     std::vector<std::uint64_t> device_vram_used_bytes;
+    // Supported rank-local admission ledger. Empty on centralized execution.
+    // These are allocation-control values, not diagnostic timing counters.
+    std::vector<std::uint64_t> rank_local_initial_device_vram_bytes;
+    std::vector<std::uint64_t> rank_local_weight_bytes;
+    std::vector<std::uint64_t> rank_local_expert_cache_capacity_bytes;
+    std::vector<std::uint64_t> rank_local_admitted_device_bytes;
+    std::uint64_t rank_local_admitted_host_bytes{};
     Dsv4MemoryPlan memory;
     Dsv4ResidentStageStats resident_stage;
     Dsv4CheckpointReadStats generation_checkpoint_reads;

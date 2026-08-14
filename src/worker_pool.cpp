@@ -53,10 +53,15 @@ struct HostWorkerPool::Impl {
     std::vector<std::thread> workers;
     std::atomic<std::uint64_t> dispatches{};
     std::chrono::microseconds idle_spin;
+    std::vector<int> affinity_cpus;
     bool stopping{};
 
-    explicit Impl(std::size_t count, std::chrono::microseconds spin)
-        : idle_spin(spin) {
+    explicit Impl(std::size_t count, std::chrono::microseconds spin,
+                  std::vector<int> affinity_cpu_list = {})
+        : idle_spin(spin), affinity_cpus(std::move(affinity_cpu_list)) {
+        if (!this->affinity_cpus.empty() && this->affinity_cpus.size() != count) {
+            this->affinity_cpus.clear();
+        }
         queues.resize(count);
         workers.reserve(count);
         for (std::size_t index = 0; index < count; ++index) {
@@ -66,8 +71,9 @@ struct HostWorkerPool::Impl {
                 // 42-55. Keep the physical pass contiguous, but interleave the
                 // optional SMT pass so extra workers consume both NUMA memory
                 // controllers rather than piling onto socket 0.
-                std::size_t cpu = index;
-                if (index >= 28U && index < 56U) {
+                std::size_t cpu = this->affinity_cpus.empty()
+                    ? index : static_cast<std::size_t>(this->affinity_cpus[index]);
+                if (this->affinity_cpus.empty() && index >= 28U && index < 56U) {
                     const auto sibling = index - 28U;
                     cpu = (sibling & 1U) == 0U
                         ? 28U + sibling / 2U
@@ -138,6 +144,10 @@ struct HostWorkerPool::Impl {
 HostWorkerPool::HostWorkerPool(std::size_t workers,
                                std::chrono::microseconds idle_spin)
     : impl_(std::make_unique<Impl>(workers, idle_spin)) {}
+HostWorkerPool::HostWorkerPool(std::vector<int> affinity_cpu_list,
+                               std::chrono::microseconds idle_spin)
+    : impl_(std::make_unique<Impl>(affinity_cpu_list.size(), idle_spin,
+                                   std::move(affinity_cpu_list))) {}
 HostWorkerPool::~HostWorkerPool() = default;
 HostWorkerPool::HostWorkerPool(HostWorkerPool&&) noexcept = default;
 HostWorkerPool& HostWorkerPool::operator=(HostWorkerPool&&) noexcept = default;

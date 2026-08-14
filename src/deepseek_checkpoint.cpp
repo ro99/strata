@@ -182,6 +182,19 @@ ValidationResult Dsv4CheckpointReader::read_into(
     return pread_tensor_into(*tensor, 0U, destination, local_stats);
 }
 
+ValidationResult Dsv4CheckpointReader::read_slice_into(
+    std::string_view name, std::uint64_t relative_offset,
+    std::span<std::byte> destination, Dsv4CheckpointReadStats* local_stats) const {
+    ValidationResult result;
+    const auto* tensor = find(name);
+    if (tensor == nullptr) {
+        result.errors.emplace_back("DeepSeek checkpoint tensor does not exist: " +
+                                   std::string(name));
+        return result;
+    }
+    return pread_tensor_into(*tensor, relative_offset, destination, local_stats);
+}
+
 ParseResult<std::vector<std::byte>> Dsv4CheckpointReader::read_slice(
     std::string_view name, std::uint64_t relative_offset, std::uint64_t bytes) const {
     ParseResult<std::vector<std::byte>> result;

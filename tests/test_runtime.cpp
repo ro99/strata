@@ -16,6 +16,31 @@ TEST_CASE("common runtime validation rejects duplicate devices") {
                         }));
 }
 
+TEST_CASE("explicit runtime VRAM budget applies the stricter bound") {
+    const auto capped = strata::compute_runtime_device_budget(
+        25'007'554'560ULL, 0.95, 21'256'421'376ULL);
+    REQUIRE(capped.fractional_budget_bytes == 23'757'176'832ULL);
+    REQUIRE(capped.explicit_budget_bytes == 21'256'421'376ULL);
+    REQUIRE(capped.applied_budget_bytes == 21'256'421'376ULL);
+    REQUIRE(strata::runtime_budget_bound_name(
+                capped.fractional_budget_bytes,
+                capped.explicit_budget_bytes) == "explicit");
+
+    const auto unchanged = strata::compute_runtime_device_budget(
+        25'007'554'560ULL, 0.95, 0U);
+    REQUIRE(unchanged.applied_budget_bytes ==
+            unchanged.fractional_budget_bytes);
+    REQUIRE(strata::runtime_budget_bound_name(
+                unchanged.fractional_budget_bytes,
+                unchanged.explicit_budget_bytes) == "fractional");
+
+    const auto tie = strata::compute_runtime_device_budget(
+        25'007'554'560ULL, 0.95, 23'757'176'832ULL);
+    REQUIRE(strata::runtime_budget_bound_name(
+                tie.fractional_budget_bytes, tie.explicit_budget_bytes) ==
+            "equal");
+}
+
 TEST_CASE("incremental KV reuse requires a strict exact token prefix") {
     const std::vector<std::uint32_t> cached{1U, 2U, 3U};
     const std::vector<std::uint32_t> extended{1U, 2U, 3U, 4U, 5U};

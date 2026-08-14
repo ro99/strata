@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -208,10 +209,136 @@ TEST_CASE("DeepSeek sqrtsoftplus routing keeps selection bias out of weights") {
     const std::array<float, 4> bias{10.0F, 0.0F, 0.0F, 0.0F};
     const auto route = strata::dsv4_route_sqrtsoftplus_f32(logits, bias, spec);
     REQUIRE(route.ok());
+    std::array<float, 4> scratch{};
+    std::array<std::uint32_t, 2> experts{};
+    std::array<float, 2> coefficients{};
+    REQUIRE(strata::dsv4_route_sqrtsoftplus_f32_into(
+                logits, bias, spec, scratch, experts, coefficients).ok());
+    REQUIRE(std::memcmp(experts.data(), route.value.experts.data(), sizeof(experts)) == 0);
+    REQUIRE(std::memcmp(coefficients.data(), route.value.weights.data(), sizeof(coefficients)) == 0);
     const std::vector<std::uint32_t> expected{0U, 3U};
     REQUIRE(route.value.experts == expected);
     REQUIRE_NEAR(route.value.weights[0] + route.value.weights[1], 1.5F, 1.0e-6F);
     REQUIRE(route.value.weights[0] < route.value.weights[1]);
+}
+
+TEST_CASE("DeepSeek sqrtsoftplus into routing is exact and allocation-free") {
+    auto spec = strata::deepseek_v4_flash_0731_spec().router;
+    spec.routed_experts = 256U;
+    spec.experts_per_token = 6U;
+    std::array<float, 256> logits{}, bias{};
+    for (std::size_t index = 0U; index < logits.size(); ++index) {
+        logits[index] = static_cast<float>((index * 37U) % 101U) / 17.0F - 3.0F;
+        bias[index] = static_cast<float>(static_cast<int>((index * 13U) % 17U) - 8) / 100.0F;
+    }
+    const auto expected = strata::dsv4_route_sqrtsoftplus_f32(logits, bias, spec);
+    REQUIRE(expected.ok());
+    std::vector<float> scratch(spec.routed_experts), coefficients(spec.experts_per_token);
+    std::vector<std::uint32_t> experts(spec.experts_per_token);
+    const auto* scratch_data = scratch.data();
+    const auto* experts_data = experts.data();
+    const auto* coefficients_data = coefficients.data();
+    const auto scratch_capacity = scratch.capacity();
+    const auto experts_capacity = experts.capacity();
+    const auto coefficients_capacity = coefficients.capacity();
+    for (unsigned repeat = 0U; repeat < 100U; ++repeat) {
+        REQUIRE(strata::dsv4_route_sqrtsoftplus_f32_into(
+                    logits, bias, spec, scratch, experts, coefficients).ok());
+        REQUIRE(std::memcmp(experts.data(), expected.value.experts.data(), experts.size() * sizeof(experts[0])) == 0);
+        REQUIRE(std::memcmp(coefficients.data(), expected.value.weights.data(), coefficients.size() * sizeof(coefficients[0])) == 0);
+        REQUIRE(scratch.data() == scratch_data);
+        REQUIRE(experts.data() == experts_data);
+        REQUIRE(coefficients.data() == coefficients_data);
+        REQUIRE(scratch.capacity() == scratch_capacity && experts.capacity() == experts_capacity && coefficients.capacity() == coefficients_capacity);
+        REQUIRE(scratch.size() == spec.routed_experts && experts.size() == spec.experts_per_token && coefficients.size() == spec.experts_per_token);
+    }
+    auto tie_spec = spec;
+    tie_spec.routed_experts = 8U;
+    tie_spec.experts_per_token = 3U;
+    const std::array<float, 8> ties{};
+    std::array<float, 8> tie_scratch{};
+    std::array<std::uint32_t, 3> tie_experts{};
+    std::array<float, 3> tie_coefficients{};
+    REQUIRE(strata::dsv4_route_sqrtsoftplus_f32_into(
+                ties, ties, tie_spec, tie_scratch, tie_experts, tie_coefficients).ok());
+    const std::array<std::uint32_t, 3> expected_ties{0U, 1U, 2U};
+    REQUIRE(tie_experts == expected_ties);
+    std::fill(scratch.begin(), scratch.end(), 7.0F);
+    std::fill(experts.begin(), experts.end(), 99U);
+    std::fill(coefficients.begin(), coefficients.end(), 7.0F);
+    REQUIRE(!strata::dsv4_route_sqrtsoftplus_f32_into(
+                 logits, bias, spec, std::span<float>(scratch).first(255U),
+                 experts, coefficients).ok());
+    REQUIRE(std::all_of(scratch.begin(), scratch.begin() + 255U, [](float value) { return value == 0.0F; }));
+    REQUIRE(std::all_of(experts.begin(), experts.end(), [](auto value) { return value == 0U; }));
+    REQUIRE(std::all_of(coefficients.begin(), coefficients.end(), [](float value) { return value == 0.0F; }));
+    std::fill(scratch.begin(), scratch.end(), 7.0F);
+    std::fill(experts.begin(), experts.end(), 99U);
+    std::fill(coefficients.begin(), coefficients.end(), 7.0F);
+    REQUIRE(!strata::dsv4_route_sqrtsoftplus_f32_into(
+                 logits, bias, spec, scratch,
+                 std::span<std::uint32_t>(experts).first(5U), coefficients).ok());
+    REQUIRE(std::all_of(experts.begin(), experts.begin() + 5U, [](auto value) { return value == 0U; }));
+    auto invalid_spec = spec;
+    invalid_spec.experts_per_token = invalid_spec.routed_experts + 1U;
+    REQUIRE(!strata::dsv4_route_sqrtsoftplus_f32_into(
+                 logits, bias, invalid_spec, scratch, experts, coefficients).ok());
+    auto underflow_logits = logits;
+    underflow_logits.fill(-std::numeric_limits<float>::max());
+    std::fill(scratch.begin(), scratch.end(), 7.0F);
+    REQUIRE(!strata::dsv4_route_sqrtsoftplus_f32_into(
+                 underflow_logits, bias, spec, scratch, experts, coefficients).ok());
+    auto invalid_logits = logits;
+    invalid_logits[3] = std::numeric_limits<float>::quiet_NaN();
+    std::fill(scratch.begin(), scratch.end(), 7.0F);
+    std::fill(experts.begin(), experts.end(), 99U);
+    std::fill(coefficients.begin(), coefficients.end(), 7.0F);
+    REQUIRE(!strata::dsv4_route_sqrtsoftplus_f32_into(
+                 invalid_logits, bias, spec, scratch, experts, coefficients).ok());
+    REQUIRE(std::all_of(scratch.begin(), scratch.end(), [](float value) { return value == 0.0F; }));
+    REQUIRE(std::all_of(experts.begin(), experts.end(), [](auto value) { return value == 0U; }));
+    REQUIRE(std::all_of(coefficients.begin(), coefficients.end(), [](float value) { return value == 0.0F; }));
+}
+
+TEST_CASE("DeepSeek hash routing has an exact allocation-free form") {
+    auto spec = strata::deepseek_v4_flash_0731_spec().router;
+    spec.routed_experts = 8U;
+    spec.experts_per_token = 3U;
+    const std::array<float, 8> logits{
+        -2.0F, -1.0F, 0.0F, 1.0F, 2.0F, 3.0F, 4.0F, 5.0F};
+    const std::array<std::uint32_t, 3> selected{6U, 1U, 4U};
+    const auto expected = strata::dsv4_route_hash_sqrtsoftplus_f32(
+        logits, selected, spec);
+    REQUIRE(expected.ok());
+    std::array<std::uint32_t, 3> experts{};
+    std::array<float, 3> coefficients{};
+    REQUIRE(strata::dsv4_route_hash_sqrtsoftplus_f32_into(
+                logits, selected, spec, experts, coefficients).ok());
+    REQUIRE(std::memcmp(experts.data(), expected.value.experts.data(),
+                        sizeof(experts)) == 0);
+    REQUIRE(std::memcmp(coefficients.data(), expected.value.weights.data(),
+                        sizeof(coefficients)) == 0);
+
+    auto invalid = selected;
+    invalid[1] = 8U;
+    experts.fill(99U);
+    coefficients.fill(7.0F);
+    REQUIRE(!strata::dsv4_route_hash_sqrtsoftplus_f32_into(
+                 logits, invalid, spec, experts, coefficients).ok());
+    REQUIRE(std::all_of(experts.begin(), experts.end(),
+                        [](auto value) { return value == 0U; }));
+    REQUIRE(std::all_of(coefficients.begin(), coefficients.end(),
+                        [](float value) { return value == 0.0F; }));
+    auto invalid_logits = logits;
+    invalid_logits[0] = std::numeric_limits<float>::quiet_NaN();
+    experts.fill(99U);
+    coefficients.fill(7.0F);
+    REQUIRE(!strata::dsv4_route_hash_sqrtsoftplus_f32_into(
+                 invalid_logits, selected, spec, experts, coefficients).ok());
+    REQUIRE(std::all_of(experts.begin(), experts.end(),
+                        [](auto value) { return value == 0U; }));
+    REQUIRE(std::all_of(coefficients.begin(), coefficients.end(),
+                        [](float value) { return value == 0.0F; }));
 }
 
 TEST_CASE("DeepSeek mHC Sinkhorn preserves four residual lanes") {

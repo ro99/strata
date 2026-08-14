@@ -88,11 +88,25 @@ struct Dsv4IndexSelectionResult {
     std::span<const float> logits, std::span<const float> selection_bias,
     const RouterSpec& spec);
 
+// Allocation-free form of the same exact router. All spans are caller-owned
+// and must have exactly the shape declared by the RouterSpec.
+[[nodiscard]] ValidationResult dsv4_route_sqrtsoftplus_f32_into(
+    std::span<const float> logits, std::span<const float> selection_bias,
+    const RouterSpec& spec, std::span<float> selection_scratch,
+    std::span<std::uint32_t> expert_ids, std::span<float> coefficients);
+
 // Hash layers use the checkpoint's token-to-expert row for membership while
 // retaining the same score, normalization, and routed-scale semantics.
 [[nodiscard]] Dsv4RouteResult dsv4_route_hash_sqrtsoftplus_f32(
     std::span<const float> logits, std::span<const std::uint32_t> token_experts,
     const RouterSpec& spec);
+
+// Allocation-free form of the exact hash-layer router. Membership comes from
+// the checkpoint token row; only the normalized coefficients are computed.
+[[nodiscard]] ValidationResult dsv4_route_hash_sqrtsoftplus_f32_into(
+    std::span<const float> logits, std::span<const std::uint32_t> token_experts,
+    const RouterSpec& spec, std::span<std::uint32_t> expert_ids,
+    std::span<float> coefficients);
 
 [[nodiscard]] ValidationResult dsv4_swiglu_f32(
     std::span<float> output, std::span<const float> gate,

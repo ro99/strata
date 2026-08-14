@@ -79,6 +79,59 @@ namespace {
     return result;
 }
 
+[[nodiscard]] ValidationResult route_sqrtsoftplus_into_impl(
+    std::span<const float> logits, std::span<const float> selection_bias,
+    const RouterSpec& spec, std::span<float> scratch,
+    std::span<std::uint32_t> expert_ids, std::span<float> coefficients) {
+    const auto fail = [&](const char* message) {
+        std::fill(scratch.begin(), scratch.end(), 0.0F);
+        std::fill(expert_ids.begin(), expert_ids.end(), 0U);
+        std::fill(coefficients.begin(), coefficients.end(), 0.0F);
+        ValidationResult result;
+        result.errors.emplace_back(message);
+        return result;
+    };
+    if (!valid_router_spec(spec))
+        return fail("router specification is not the DeepSeek V4 sqrtsoftplus/noaux_tc contract");
+    if (logits.size() != spec.routed_experts || selection_bias.size() != logits.size() ||
+        scratch.size() != spec.routed_experts || expert_ids.size() != spec.experts_per_token ||
+        coefficients.size() != spec.experts_per_token)
+        return fail("DeepSeek router tensor shapes disagree with its contract");
+    for (std::size_t expert = 0U; expert < logits.size(); ++expert) {
+        if (!std::isfinite(logits[expert]) || !std::isfinite(selection_bias[expert]))
+            return fail("DeepSeek router tensors contain a non-finite value");
+        scratch[expert] = std::sqrt(dsv4_softplus_f32(logits[expert])) + selection_bias[expert];
+        if (!std::isfinite(scratch[expert])) return fail("DeepSeek router score is not finite");
+    }
+    for (std::uint32_t rank = 0U; rank < spec.experts_per_token; ++rank) {
+        bool found = false;
+        std::uint32_t best = 0U;
+        float best_score = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t expert = 0U; expert < spec.routed_experts; ++expert) {
+            if (std::find(expert_ids.begin(), expert_ids.begin() + rank, expert) !=
+                expert_ids.begin() + rank) continue;
+            if (!found || scratch[expert] > best_score) {
+                found = true; best = expert; best_score = scratch[expert];
+            }
+        }
+        if (!found || best >= logits.size()) return fail("DeepSeek route contains an out-of-range expert");
+        expert_ids[rank] = best;
+    }
+    float sum = 0.0F;
+    for (std::size_t rank = 0U; rank < expert_ids.size(); ++rank) {
+        const auto expert = expert_ids[rank];
+        coefficients[rank] = std::sqrt(dsv4_softplus_f32(logits[expert]));
+        if (!std::isfinite(coefficients[rank])) return fail("DeepSeek router score is not finite");
+        sum += coefficients[rank];
+    }
+    if (!std::isfinite(sum) || sum <= 0.0F) return fail("DeepSeek selected router scores do not normalize");
+    for (auto& coefficient : coefficients) {
+        coefficient = coefficient / sum * spec.routed_scale;
+        if (!std::isfinite(coefficient)) return fail("DeepSeek normalized router scores are not finite");
+    }
+    return {};
+}
+
 }  // namespace
 
 float dsv4_softplus_f32(float value) noexcept {
@@ -313,32 +366,25 @@ Dsv4RouteResult dsv4_route_sqrtsoftplus_f32(
         result.errors.emplace_back("DeepSeek router tensor shapes disagree with its contract");
         return result;
     }
-    std::vector<float> choices(logits.size());
-    for (std::size_t expert = 0U; expert < logits.size(); ++expert) {
-        if (!std::isfinite(logits[expert]) || !std::isfinite(selection_bias[expert])) {
-            result.errors.emplace_back("DeepSeek router tensors contain a non-finite value");
-            return result;
-        }
-        choices[expert] = std::sqrt(dsv4_softplus_f32(logits[expert])) +
-                          selection_bias[expert];
+    result.value.experts.resize(spec.experts_per_token);
+    result.value.weights.resize(spec.experts_per_token);
+    std::vector<float> scratch(spec.routed_experts);
+    const auto validation = route_sqrtsoftplus_into_impl(
+        logits, selection_bias, spec, scratch, result.value.experts,
+        result.value.weights);
+    if (!validation.ok()) {
+        result.errors = validation.errors;
+        result.value = {};
     }
-    std::vector<std::uint32_t> selected;
-    selected.reserve(spec.experts_per_token);
-    for (std::uint32_t rank = 0U; rank < spec.experts_per_token; ++rank) {
-        bool found = false;
-        std::uint32_t best = 0U;
-        float best_score = -std::numeric_limits<float>::infinity();
-        for (std::uint32_t expert = 0U; expert < spec.routed_experts; ++expert) {
-            if (std::find(selected.begin(), selected.end(), expert) != selected.end()) continue;
-            if (!found || choices[expert] > best_score) {
-                found = true;
-                best = expert;
-                best_score = choices[expert];
-            }
-        }
-        selected.push_back(best);
-    }
-    return gather_route(logits, selected, spec);
+    return result;
+}
+
+ValidationResult dsv4_route_sqrtsoftplus_f32_into(
+    std::span<const float> logits, std::span<const float> selection_bias,
+    const RouterSpec& spec, std::span<float> selection_scratch,
+    std::span<std::uint32_t> expert_ids, std::span<float> coefficients) {
+    return route_sqrtsoftplus_into_impl(logits, selection_bias, spec,
+                                        selection_scratch, expert_ids, coefficients);
 }
 
 Dsv4RouteResult dsv4_route_hash_sqrtsoftplus_f32(
@@ -362,6 +408,56 @@ Dsv4RouteResult dsv4_route_hash_sqrtsoftplus_f32(
         }
     }
     return gather_route(logits, token_experts, spec);
+}
+
+ValidationResult dsv4_route_hash_sqrtsoftplus_f32_into(
+    std::span<const float> logits, std::span<const std::uint32_t> token_experts,
+    const RouterSpec& spec, std::span<std::uint32_t> expert_ids,
+    std::span<float> coefficients) {
+    const auto fail = [&](const char* message) {
+        std::fill(expert_ids.begin(), expert_ids.end(), 0U);
+        std::fill(coefficients.begin(), coefficients.end(), 0.0F);
+        ValidationResult result;
+        result.errors.emplace_back(message);
+        return result;
+    };
+    if (!valid_router_spec(spec)) {
+        return fail(
+            "router specification is not the DeepSeek V4 hash-routing contract");
+    }
+    if (logits.size() != spec.routed_experts ||
+        token_experts.size() != spec.experts_per_token ||
+        expert_ids.size() != spec.experts_per_token ||
+        coefficients.size() != spec.experts_per_token) {
+        return fail("DeepSeek hash router tensor shapes disagree with its contract");
+    }
+    if (std::any_of(logits.begin(), logits.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        return fail("DeepSeek hash router logits contain a non-finite value");
+    }
+    float sum = 0.0F;
+    for (std::size_t rank = 0U; rank < token_experts.size(); ++rank) {
+        const auto expert = token_experts[rank];
+        if (expert >= logits.size()) {
+            return fail("DeepSeek hash route contains an invalid expert");
+        }
+        expert_ids[rank] = expert;
+        coefficients[rank] = std::sqrt(dsv4_softplus_f32(logits[expert]));
+        if (!std::isfinite(coefficients[rank])) {
+            return fail("DeepSeek hash router score is not finite");
+        }
+        sum += coefficients[rank];
+    }
+    if (!std::isfinite(sum) || sum <= 0.0F) {
+        return fail("DeepSeek selected hash router scores do not normalize");
+    }
+    for (auto& coefficient : coefficients) {
+        coefficient = coefficient / sum * spec.routed_scale;
+        if (!std::isfinite(coefficient)) {
+            return fail("DeepSeek normalized hash router score is not finite");
+        }
+    }
+    return {};
 }
 
 ValidationResult dsv4_swiglu_f32(std::span<float> output,

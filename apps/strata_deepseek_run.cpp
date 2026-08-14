@@ -1,5 +1,6 @@
 #include "strata/deepseek_runtime.hpp"
 #include "strata/dsv4_attention_kv.hpp"
+#include "strata/runtime_support.hpp"
 
 #include "cli_common.hpp"
 
@@ -42,6 +43,7 @@ struct Options {
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     double vram_fraction{0.85};
+    std::uint64_t explicit_vram_budget_bytes{};
     double expert_prefetch_minimum_confidence{0.75};
     bool admission_only{};
     bool json{};
@@ -53,6 +55,9 @@ struct Options {
     bool gpu_lightning_indexer{};
     bool block_kv_cache{};
     bool device_resident_runtime{};
+    // Explicit opt-in. Centralized decode stays the default, and a rejected
+    // admission reports rather than falling back.
+    bool rank_local_decode{};
     bool logit_trace{};
     bool layer_hash_trace{};
     bool overlap_resident_warmup{true};
@@ -73,11 +78,13 @@ void usage() {
         << "       [--pin-resident-arena] [--serial-expert-upload]\n"
         << "       [--prepack-mhc|--no-prepack-mhc]\n"
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
-        << "       [--vram-fraction F] [--admission-only] [--route-trace PATH]\n"
+        << "       [--vram-fraction F] [--vram-budget-bytes BYTES]\n"
+        << "       [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe|--host-routed-moe]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
         << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
+        << "       [--decode-topology centralized|rank-local-tp2]\n"
         << "       [--row-major-moe-page]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
@@ -224,6 +231,11 @@ bool parse_options(int argc, char** argv, Options& options) {
             const auto* value = next(argument);
             if (value == nullptr) return false;
             if (!strata::cli::parse_double(value, options.vram_fraction, 0.0, 0.95)) return false;
+        } else if (argument == "--vram-budget-bytes") {
+            const auto* value = next(argument);
+            if (value == nullptr || !parse_bytes(
+                    value, options.explicit_vram_budget_bytes) ||
+                options.explicit_vram_budget_bytes == 0U) return false;
         } else if (argument == "--route-trace") {
             const auto* value = next(argument);
             if (value == nullptr) return false;
@@ -259,6 +271,28 @@ bool parse_options(int argc, char** argv, Options& options) {
             // device-resident runtime exercise routed GPU
             // experts while reporting the accepted attention/mHC path.
             options.host_routed_moe = true;
+        } else if (argument == "--decode-topology") {
+            const auto* value = next(argument);
+            if (value == nullptr) return false;
+            const std::string_view topology{value};
+            if (topology == "centralized") {
+                options.rank_local_decode = false;
+            } else if (topology == "rank-local-tp2") {
+                // Rank-local decode is a decode-shaped ownership of the same
+                // weights the device-resident contract places; it does not
+                // replace prefill, which stays centralized. Everything the
+                // centralized device-resident path requires is required here
+                // too, so the opt-in implies it rather than silently running
+                // rank-local against a scalar cache.
+                options.rank_local_decode = true;
+                options.block_kv_cache = true;
+                options.device_resident_runtime = true;
+                options.flash_attention = true;
+                options.gpu_lightning_indexer = false;
+                options.host_routed_moe = true;
+            } else {
+                return false;
+            }
         } else if (argument == "--flash-attention-minimum-rows") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(
@@ -682,6 +716,22 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.attention_projection_matmul_rows
            << ",\"attention_index_seconds\":"
            << seconds(stats.attention_index_nanoseconds)
+           << ",\"rank_local_layer_seconds\":"
+           << seconds(stats.rank_local_layer_nanoseconds)
+           << ",\"rank_local_device_seconds\":"
+           << seconds(stats.rank_local_device_nanoseconds)
+           << ",\"rank_local_kv_seconds\":"
+           << seconds(stats.rank_local_kv_nanoseconds)
+           << ",\"rank_local_candidate_seconds\":"
+           << seconds(stats.rank_local_candidate_nanoseconds)
+           << ",\"rank_local_boundary_seconds\":"
+           << seconds(stats.rank_local_boundary_nanoseconds)
+           << ",\"rank_local_collective_seconds\":"
+           << seconds(stats.rank_local_collective_nanoseconds)
+           << ",\"rank_local_transition_seconds\":"
+           << seconds(stats.rank_local_transition_nanoseconds)
+           << ",\"rank_local_shared_seconds\":"
+           << seconds(stats.rank_local_shared_nanoseconds)
            << ",\"attention_index_queries\":"
            << stats.attention_index_queries
            << ",\"attention_index_candidates\":"
@@ -754,6 +804,20 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << ",\"vram_workspace_bytes\":" << plan.vram_workspace_bytes
            << ",\"expert_vram_cache_bytes\":" << plan.expert_vram_cache_bytes
            << ",\"maximum_expert_placement_bytes\":" << plan.maximum_expert_bytes
+           << ",\"fractional_vram_budget_bytes\":";
+    strata::cli::print_array(output, plan.fractional_vram_budget_bytes);
+    output << ",\"explicit_vram_budget_bytes\":";
+    strata::cli::print_array(output, plan.explicit_vram_budget_bytes);
+    output << ",\"applied_vram_budget_bytes\":";
+    strata::cli::print_array(output, plan.applied_vram_budget_bytes);
+    output << ",\"vram_budget_bound\":[";
+    for (std::size_t index = 0U; index < plan.vram_budget_bound.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << '"' << strata::cli::json_escape(
+            plan.vram_budget_bound[index]) << '"';
+    }
+    output << ']';
+    output
            << ",\"steady_state_nvme_bytes\":" << plan.steady_state_nvme_bytes
            << ",\"maximum_context_tokens\":" << plan.maximum_context_tokens
            << ",\"zero_nvme_decode\":" << (plan.zero_nvme_decode ? "true" : "false")
@@ -886,6 +950,9 @@ void print_diagnostics(std::ostream& output,
 }
 
 bool device_budgets(const Options& options, std::vector<std::uint64_t>& budgets,
+                    std::vector<std::uint64_t>& fractional_budgets,
+                    std::vector<std::uint64_t>& explicit_budgets,
+                    std::vector<std::string>& budget_bounds,
                     std::vector<std::string>& errors) {
     if (!std::isfinite(options.vram_fraction) || options.vram_fraction <= 0.0 ||
         options.vram_fraction > 0.95) {
@@ -898,8 +965,18 @@ bool device_budgets(const Options& options, std::vector<std::uint64_t>& budgets,
             errors.insert(errors.end(), memory.errors.begin(), memory.errors.end());
             return false;
         }
-        budgets.push_back(static_cast<std::uint64_t>(
-            static_cast<double>(memory.value.free_bytes) * options.vram_fraction));
+        const auto computed = strata::compute_runtime_device_budget(
+            memory.value.free_bytes, options.vram_fraction,
+            options.explicit_vram_budget_bytes);
+        if (computed.applied_budget_bytes == 0U) {
+            errors.emplace_back("VRAM admission budget is zero");
+            return false;
+        }
+        fractional_budgets.push_back(computed.fractional_budget_bytes);
+        explicit_budgets.push_back(computed.explicit_budget_bytes);
+        budgets.push_back(computed.applied_budget_bytes);
+        budget_bounds.emplace_back(strata::runtime_budget_bound_name(
+            computed.fractional_budget_bytes, computed.explicit_budget_bytes));
     }
     return true;
 }
@@ -924,6 +1001,13 @@ int main(int argc, char** argv) {
             << "[contract] optional DSpark proposals disabled, never approximated\n";
     }
 
+    if (options.admission_only && options.rank_local_decode) {
+        std::cerr
+            << "error: rank-local admission requires full initialization to "
+               "measure the resident spine and sharded weight set; "
+               "--admission-only cannot validate rank-local-tp2\n";
+        return 1;
+    }
     if (options.admission_only) {
         auto checkpoint = strata::Dsv4CheckpointReader::open(options.model);
         if (!checkpoint.ok()) {
@@ -931,8 +1015,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::vector<std::uint64_t> budgets;
+        std::vector<std::uint64_t> fractional_budgets;
+        std::vector<std::uint64_t> explicit_budgets;
+        std::vector<std::string> budget_bounds;
         std::vector<std::string> errors;
-        if (!device_budgets(options, budgets, errors)) {
+        if (!device_budgets(options, budgets, fractional_budgets,
+                            explicit_budgets, budget_bounds, errors)) {
             for (const auto& error : errors) std::cerr << "error: " << error << '\n';
             return 1;
         }
@@ -949,12 +1037,18 @@ int main(int argc, char** argv) {
         config.device_resident_mhc = options.device_resident_runtime;
         config.host_routed_experts = options.host_routed_moe;
         config.require_zero_nvme_decode = true;
-        const auto admission = strata::plan_dsv4_resident_topology(
+        auto admission = strata::plan_dsv4_resident_topology(
             checkpoint.value->manifest(), config);
         if (!admission.ok()) {
             for (const auto& error : admission.errors) std::cerr << "error: " << error << '\n';
             return 1;
         }
+        admission.plan.fractional_vram_budget_bytes =
+            std::move(fractional_budgets);
+        admission.plan.explicit_vram_budget_bytes =
+            std::move(explicit_budgets);
+        admission.plan.applied_vram_budget_bytes = budgets;
+        admission.plan.vram_budget_bound = std::move(budget_bounds);
         if (options.json) {
             std::cout << "{\"status\":\"admitted\",\"memory_plan\":";
             print_plan(std::cout, admission.plan);
@@ -970,6 +1064,7 @@ int main(int argc, char** argv) {
     strata::Dsv4RuntimeConfig config;
     config.devices = options.devices;
     config.vram_cache_fraction = options.vram_fraction;
+    config.explicit_vram_budget_bytes = options.explicit_vram_budget_bytes;
     config.host_memory_limit_bytes = options.host_memory_bytes;
     config.host_kv_cache_bytes = options.host_kv_cache_bytes;
     config.device_kv_cache_bytes = options.device_kv_cache_bytes;
@@ -1003,6 +1098,9 @@ int main(int argc, char** argv) {
                                  : strata::Dsv4KvCacheMode::ScalarOracle;
     config.kv_block_rows = options.device_resident_runtime
         ? strata::kDsv4PhysicalKvBlockRows : strata::kDsv4KvBlockRows;
+    config.decode_topology = options.rank_local_decode
+        ? strata::Dsv4DecodeTopology::RankLocalTp2
+        : strata::Dsv4DecodeTopology::Centralized;
     config.flash_attention_minimum_rows =
         options.flash_attention_minimum_rows;
     config.enable_logit_trace = options.logit_trace;
@@ -1099,8 +1197,33 @@ int main(int argc, char** argv) {
                   << ",\"device_vram_used_bytes\":";
         strata::cli::print_array(std::cout, metrics.device_vram_used_bytes);
         std::cout
+                  << ",\"rank_local_memory\":{"
+                  << "\"initial_device_vram_bytes\":";
+        strata::cli::print_array(
+            std::cout, metrics.rank_local_initial_device_vram_bytes);
+        std::cout << ",\"weight_bytes\":";
+        strata::cli::print_array(std::cout,
+                                 metrics.rank_local_weight_bytes);
+        std::cout << ",\"expert_cache_capacity_bytes\":";
+        strata::cli::print_array(
+            std::cout,
+            metrics.rank_local_expert_cache_capacity_bytes);
+        std::cout << ",\"admitted_device_bytes\":";
+        strata::cli::print_array(
+            std::cout, metrics.rank_local_admitted_device_bytes);
+        std::cout << ",\"admitted_host_bytes\":"
+                  << metrics.rank_local_admitted_host_bytes << '}'
                   << ",\"prefill_seconds\":" << metrics.prefill_seconds
-                  << ",\"decode_seconds\":" << metrics.decode_seconds
+                  << ",\"decode_seconds\":" << metrics.decode_seconds;
+        // Per-step decode walls separate first-use setup from steady state,
+        // which every throughput gate in scripts/ depends on. It is a
+        // diagnostic surface rather than part of the supported production
+        // output, so it is emitted only under --detailed-timing.
+        if (metrics.detailed_timing) {
+            std::cout << ",\"decode_step_seconds\":";
+            strata::cli::print_array(std::cout, metrics.decode_step_seconds);
+        }
+        std::cout
                   << ",\"decode_checkpoint_read_bytes\":"
                   << metrics.decode_checkpoint_reads.bytes
                   << ",\"generation_checkpoint_read_bytes\":"

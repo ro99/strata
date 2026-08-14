@@ -304,22 +304,21 @@ ParseResult<Dsv4PhysicalKvAdmission> dsv4_physical_kv_admission(
         return result;
     }
     const auto main = dsv4_physical_kv_layout(Dsv4KvBlockKind::Sliding);
-    const auto index =
-        dsv4_physical_kv_layout(Dsv4KvBlockKind::LearnedIndex);
-    if (!main.ok() || !index.ok()) {
+    if (!main.ok()) {
         result.errors.emplace_back(
             "DeepSeek V4 DeepSeek-V4 KV layouts are unavailable");
         return result;
     }
-    const auto blocks_for = [](std::uint64_t rows) {
-        return (rows + kDsv4PhysicalKvBlockRows - 1U) /
-               kDsv4PhysicalKvBlockRows;
+    const auto blocks_for = [](std::uint64_t rows,
+                               std::uint32_t block_rows) {
+        return (rows + block_rows - 1U) / block_rows;
     };
     const auto sliding_rows = std::min<std::uint64_t>(
         maximum_context_tokens,
         kDeepSeekV4ExecutionContract.sliding_window +
             kDsv4PhysicalKvBlockRows - 1U);
-    const auto sliding_blocks = blocks_for(sliding_rows);
+    const auto sliding_blocks = blocks_for(
+        sliding_rows, kDsv4PhysicalKvBlockRows);
     std::uint64_t layer_sliding = 0U;
     if (!multiply(sliding_blocks, main.value.block_bytes, layer_sliding) ||
         !multiply(layer_sliding, kDeepSeekV4ExecutionContract.layer_count,
@@ -338,9 +337,19 @@ ParseResult<Dsv4PhysicalKvAdmission> dsv4_physical_kv_admission(
         if (ratio == 0U) continue;
         const auto compressed_rows =
             (maximum_context_tokens + ratio - 1U) / ratio;
-        const auto blocks = blocks_for(compressed_rows);
+        const auto kind = ratio == 4U ? Dsv4KvBlockKind::Csa
+                                     : Dsv4KvBlockKind::Hca;
+        const auto physical_rows = kDsv4PhysicalKvBlockRows / ratio;
+        const auto compressed = dsv4_physical_kv_layout(
+            kind, physical_rows);
+        if (!compressed.ok()) {
+            result.errors.emplace_back(
+                "DeepSeek V4 DeepSeek-V4 compressed KV layout is unavailable");
+            return result;
+        }
+        const auto blocks = blocks_for(compressed_rows, physical_rows);
         std::uint64_t bytes = 0U;
-        if (!multiply(blocks, main.value.block_bytes, bytes) ||
+        if (!multiply(blocks, compressed.value.block_bytes, bytes) ||
             !add(result.value.compressed_bytes, bytes) ||
             !add(result.value.allocated_blocks, blocks)) {
             result.errors.emplace_back(
@@ -362,6 +371,13 @@ ParseResult<Dsv4PhysicalKvAdmission> dsv4_physical_kv_admission(
             return result;
         }
         if (ratio == 4U) {
+            const auto index = dsv4_physical_kv_layout(
+                Dsv4KvBlockKind::LearnedIndex, physical_rows);
+            if (!index.ok()) {
+                result.errors.emplace_back(
+                    "DeepSeek V4 DeepSeek-V4 index KV layout is unavailable");
+                return result;
+            }
             if (!multiply(blocks, index.value.block_bytes, bytes) ||
                 !add(result.value.index_bytes, bytes) ||
                 !add(result.value.allocated_blocks, blocks)) {

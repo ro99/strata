@@ -5,7 +5,7 @@
 //
 // The width that matters is context/4: the learned-index compressor runs at
 // ratio 4, so a 1,048,576-token context presents 262,144 candidates per layer
-// and 43 layers of that per decoded token. Reporting is per layer and per
+// and 21 ratio-4 layers of that per decoded token. Reporting is per layer and per
 // token, because the budget is stated per token.
 //
 // Usage: strata-dsv4-index-probe [device] [repetitions]
@@ -34,7 +34,8 @@ constexpr std::uint32_t kHeadDim =
     strata::kDeepSeekV4ExecutionContract.index_head_dim;
 constexpr std::uint32_t kTopK =
     strata::kDeepSeekV4ExecutionContract.index_topk;
-constexpr std::uint32_t kBlockRows = strata::kDsv4PhysicalKvBlockRows;
+constexpr std::uint32_t kBlockRows =
+    strata::kDsv4PhysicalKvBlockRows / 4U;
 
 // The sparse indexer engages only where the compressor runs at ratio 4
 // (see the ratio == 4 guard in the runtime); the ratio-128 layers attend

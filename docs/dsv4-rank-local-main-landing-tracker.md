@@ -1537,6 +1537,109 @@ This does not change the value of the work -- the measured prize is still about
 `61 ms/token` -- but it does change its size, and the estimate that in-chain
 selection was "four pieces, two of them screened" was wrong.
 
+## Stage 2 handoff
+
+Everything below is what a successor needs to close in-chain selection. The
+groundwork is committed and green; what remains is one integration that cannot
+be gated in pieces.
+
+### The binding bar
+
+Stage 2's end state **must not be slower than where Stage 1 left it**:
+
+```text
+must not exceed              158.353 ms/token    (Stage 1, rank-local)
+target                       about 113 ms/token  (109.612 queued + ~3.5 index)
+current                      159.673 ms/token    (+1.320, groundwork only)
+centralized, same arm        142.777 ms/token
+```
+
+The target is not arbitrary: `109.612` is the measured queued arm at 2,014
+active tokens, and the queued path is context-insensitive across this range, so
+the chain should hold its cost when the indexer engages. Anything that does not
+beat `142.777` has not earned the topology.
+
+### What is already done and must not be rebuilt
+
+```text
+device index-query preparation   committed, gated, -15.9 ms both topologies
+non-synchronizing index entry    committed, gated, no production caller yet
+positional page numbering        committed, gated, page index = block index
+lazy first-touch leasing         committed, gated, 512 of 4,096 blocks at 1M
+device candidate resolution      SCREENED, not yet in the backend
+device block descriptors         SCREENED, not yet in the backend
+E4M3 half-up encoder             committed and live in the backend
+```
+
+The two screened pieces live at
+`results/dsv4-rank-local-main-landing/step4-inchain-selection/resolve_screen.cu`
+and are verified against the host `locate_physical_kv_block` over three
+geometries, 516 probes each, zero block and zero row mismatches.
+
+### What remains, in dependency order
+
+```text
+1  port the resolve kernel into kernels/cuda/backend.cu from the screen
+2  upload a device block-descriptor table per indexed layer
+3  make the index-query projections device-resident: in the chain, query_rank
+   and the hidden input exist only on the device, so wq_b and weights_proj must
+   run device-to-device. Exact by construction ONLY if the same kernel that
+   backend_.matmul uses is routed, not a differently tiled one
+4  give CudaDsv4PagedAttentionRequest an optional device-candidate input that
+   skips host staging for the compressed region
+5  wire the executor: enqueue prepare -> index-query prep -> select -> resolve
+   -> attention inside the per-layer command sequence
+6  stop forcing the sequential arm: queued_short_context currently goes false
+   whenever any layer has indexer_compressor.ratio != 0
+```
+
+Items 3 to 6 have no intermediate gate. Their partial states do not produce
+valid candidates at all, so the only signal is the end-to-end arm, which
+reports "the answer text differs" without localising which step caused it.
+Budget for several diagnostic cycles.
+
+### The gate
+
+```bash
+./build-landing-nccl/strata-deepseek-run --model models/dsv4f \
+  --prompt "$(cat results/dsv4-rank-local-main-landing/step4-sparse-path/prompt-long.txt)" \
+  --max-new 12 --devices 1,2 --max-context 8192 --host-memory 216G \
+  --vram-fraction 0.95 --device-resident-runtime \
+  --decode-topology rank-local-tp2 --detailed-timing --quiet --json
+```
+
+Required, all of them:
+
+```text
+prompt_tokens                     2,673   (active 2,685, above the 2,048 gate)
+generated token IDs               identical to rank-local-lazypos.json
+answer text                       identical
+attention_index_cuda_dispatches   231
+attention_index_scalar_dispatches 0
+decode_checkpoint_read_bytes      0
+steady median                     <= 158.353 ms/token
+```
+
+An arm whose `prompt_tokens` falls below about 2,036 has not engaged the
+indexer and proves nothing; check it before reading any other number.
+
+### Traps found the hard way
+
+- **Leases block appends.** `rank_local_prepare_layer` clears a layer's leases
+  before candidate resolution because a leased block cannot receive the next
+  token's row. Any scheme that holds compressed leases across tokens is
+  silently defeated there, which is how the prefix cache came to measure zero.
+- **A vector load inherits its allocator's alignment.** The pivot's `uint4`
+  read needed 16-byte alignment the histogram region did not have; the symptom
+  was 21 failing tests, including a *valid* request being rejected.
+- **The reference has an E4M3 quirk that must be reproduced.** Just below a
+  power of two the host encodes a factor of two low. It is matched
+  deliberately; see the suspected-defect entry.
+- **Do not reuse `quantize_e4m3_value`.** It rounds ties to even; the
+  index-query contract is half-up, and the difference changes selection.
+- **Costs measured at 2,685 tokens do not transfer to 1M**, and one
+  extrapolation in this document was already withdrawn for exactly that reason.
+
 ### Step 5 prerequisites now due
 
 - `decode_step_seconds` and its JSON surface are marked **ACTIVE TEMPORARY;

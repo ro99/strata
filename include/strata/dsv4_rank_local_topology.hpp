@@ -62,6 +62,10 @@ inline constexpr std::uint32_t kDsv4RankLocalSparseIndexerThreshold = 2048U;
 // pushed a device over the ceiling, and the centralized prefill cache is the
 // only one that may be capped to make room.
 struct Dsv4RankLocalDeviceAccount {
+    // Device usage already present before the runtime allocation plan. This
+    // includes the CUDA context and is conservatively measured as total device
+    // usage, so unrelated processes can only reduce admission headroom.
+    std::uint64_t initial_device_usage_bytes{};
     // Rank-local sharded attention, router, shared-expert and mHC weights.
     std::uint64_t rank_local_weight_bytes{};
     // Centralized resident spine retained so prefill can still run.
@@ -83,6 +87,10 @@ struct Dsv4RankLocalHostAccount {
     // centralized path rather than duplicated.
     std::uint64_t routed_cpu_storage_bytes{};
     std::uint64_t host_parameter_bytes{};
+    // Full admitted host KV/index/compressor state, including block metadata
+    // and alignment. Physical pages are lazily committed, but their declared
+    // capacity still belongs in the fail-closed host residency contract.
+    std::uint64_t kv_state_bytes{};
     std::uint64_t host_workspace_bytes{};
 
     [[nodiscard]] std::uint64_t total() const noexcept;

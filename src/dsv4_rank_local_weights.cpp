@@ -17,6 +17,7 @@ constexpr std::uint64_t kMhc = 4U * kHidden;
 constexpr std::uint64_t kRouterExperts = 256U;
 constexpr std::uint64_t kQueryNormWidth = 1024U;
 constexpr std::uint64_t kKeyValueNormWidth = 512U;
+constexpr std::uint64_t kIndexHeadDim = 128U;
 // Layers below this route by the checkpoint token-to-expert table rather than
 // by a learned selection bias.
 constexpr std::uint32_t kHashRoutedLayers = 3U;
@@ -84,7 +85,7 @@ struct HostShard {
         result.errors = std::move(status.errors);
         return result;
     }
-    device_bytes += host.payload.weight.size() + host.payload.scale.size();
+    device_bytes += output.device_bytes();
     return result;
 }
 
@@ -181,13 +182,14 @@ struct HostShard {
         result.errors = std::move(status.errors);
         return result;
     }
-    device_bytes += bytes.value.size();
+    device_bytes += output.device_bytes();
     return result;
 }
 
 [[nodiscard]] ValidationResult load_mhc(
     const Dsv4CheckpointReader& checkpoint, CudaBackend& backend, int device,
-    std::uint32_t layer, bool ffn, CudaDsv4MhcWeights& output) {
+    std::uint32_t layer, bool ffn, CudaDsv4MhcWeights& output,
+    std::uint64_t& device_bytes) {
     ValidationResult result;
     const auto prefix = "layers." + std::to_string(layer) + ".";
     const std::string stem = ffn ? "hc_ffn_" : "hc_attn_";
@@ -204,7 +206,11 @@ struct HostShard {
     }
     auto uploaded = backend.upload_dsv4_mhc_weights(
         device, projection.value, scale.value, base.value, norm.value, output);
-    if (!uploaded.ok()) result.errors = std::move(uploaded.errors);
+    if (!uploaded.ok()) {
+        result.errors = std::move(uploaded.errors);
+    } else {
+        device_bytes += output.device_bytes();
+    }
     return result;
 }
 
@@ -272,6 +278,51 @@ struct HostShard {
         }
     }
     if (!result.ok()) return result;
+
+    // Compressor state is one logical, replicated KV stream. Rank 0 owns its
+    // projection and exact host pooling; the deferred page callback copies the
+    // resulting encoded row to both ranks. Loading a second identical set
+    // would add roughly 0.6 GiB without reducing the binding CPU term.
+    if (rank == 0U) {
+        const auto& ratios =
+            deepseek_v4_flash_0731_spec().deepseek_v4.compression_ratios;
+        if (layer >= ratios.size()) {
+            result.errors.emplace_back(
+                "compression-ratio contract is missing layer " +
+                std::to_string(layer));
+            return result;
+        }
+        const auto ratio = ratios[layer];
+        if (ratio != 0U) {
+            const auto coefficient = ratio == 4U ? 2U : 1U;
+            const auto elements = coefficient * kKeyValueNormWidth;
+            auto value = load_plain_cuda(
+                checkpoint, prefix + "compressor.wkv.weight", elements, kHidden,
+                device, backend, output.compressor_value, device_bytes);
+            if (!value.ok()) return value;
+            auto gate = load_plain_cuda(
+                checkpoint, prefix + "compressor.wgate.weight", elements, kHidden,
+                device, backend, output.compressor_gate, device_bytes);
+            if (!gate.ok()) return gate;
+            output.compressor_elements = static_cast<std::uint32_t>(elements);
+
+            if (ratio == 4U) {
+                constexpr auto index_elements = 2U * kIndexHeadDim;
+                auto index_value = load_plain_cuda(
+                    checkpoint, prefix + "indexer.compressor.wkv.weight",
+                    index_elements, kHidden, device, backend,
+                    output.index_compressor_value, device_bytes);
+                if (!index_value.ok()) return index_value;
+                auto index_gate = load_plain_cuda(
+                    checkpoint, prefix + "indexer.compressor.wgate.weight",
+                    index_elements, kHidden, device, backend,
+                    output.index_compressor_gate, device_bytes);
+                if (!index_gate.ok()) return index_gate;
+                output.index_compressor_elements =
+                    static_cast<std::uint32_t>(index_elements);
+            }
+        }
+    }
 
     output.query_norm = decode_plain_f32(query_norm);
     output.key_value_norm = decode_plain_f32(key_value_norm);
@@ -416,6 +467,18 @@ Dsv4RankLocalLayerWeights Dsv4RankLocalWeightStore::layer_view(
         target.query_a = &source.query_a;
         target.query_b = &source.query_b;
         target.key_value = &source.key_value;
+        target.compressor_value = source.compressor_elements == 0U
+            ? nullptr : &source.compressor_value;
+        target.compressor_gate = source.compressor_elements == 0U
+            ? nullptr : &source.compressor_gate;
+        target.index_compressor_value =
+            source.index_compressor_elements == 0U
+                ? nullptr : &source.index_compressor_value;
+        target.index_compressor_gate =
+            source.index_compressor_elements == 0U
+                ? nullptr : &source.index_compressor_gate;
+        target.compressor_elements = source.compressor_elements;
+        target.index_compressor_elements = source.index_compressor_elements;
         target.output_a = &source.output_a;
         target.output_b = &source.output_b;
         target.router = &source.router;
@@ -492,10 +555,12 @@ ValidationResult Dsv4RankLocalWeightStore::load(
                 clear();
                 return result;
             }
-            auto attention_mhc = load_mhc(checkpoint, backend, device, layer,
-                                          false, target.attention_mhc);
-            auto ffn_mhc = load_mhc(checkpoint, backend, device, layer, true,
-                                    target.ffn_mhc);
+            auto attention_mhc = load_mhc(
+                checkpoint, backend, device, layer, false,
+                target.attention_mhc, device_bytes[rank]);
+            auto ffn_mhc = load_mhc(
+                checkpoint, backend, device, layer, true,
+                target.ffn_mhc, device_bytes[rank]);
             if (!attention_mhc.ok() || !ffn_mhc.ok()) {
                 result.errors = attention_mhc.ok() ? std::move(ffn_mhc.errors)
                                                    : std::move(attention_mhc.errors);
@@ -506,8 +571,9 @@ ValidationResult Dsv4RankLocalWeightStore::load(
             // this layer, so every layer but the last owns its successor's
             // attention mHC weights.
             if (layer + 1U < layer_count) {
-                auto next = load_mhc(checkpoint, backend, device, layer + 1U,
-                                     false, target.next_attention_mhc);
+                auto next = load_mhc(
+                    checkpoint, backend, device, layer + 1U, false,
+                    target.next_attention_mhc, device_bytes[rank]);
                 if (!next.ok()) {
                     result.errors = std::move(next.errors);
                     clear();

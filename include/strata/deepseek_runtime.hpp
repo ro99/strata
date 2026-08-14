@@ -214,12 +214,22 @@ struct Dsv4GenerationMetrics {
     double resident_warmup_seconds{};
     double prefill_seconds{};
     double decode_seconds{};
+    // Temporary Step-2 acceptance instrumentation. Reserved before the timed
+    // loop so recording one wall interval per step does not allocate there.
+    std::vector<double> decode_step_seconds;
     std::uint64_t prompt_tokens{};
     std::uint64_t prefill_tokens{};
     std::uint64_t reused_prompt_tokens{};
     std::uint64_t decode_tokens{};
     std::uint64_t rss_bytes{};
     std::vector<std::uint64_t> device_vram_used_bytes;
+    // Supported rank-local admission ledger. Empty on centralized execution.
+    // These are allocation-control values, not diagnostic timing counters.
+    std::vector<std::uint64_t> rank_local_initial_device_vram_bytes;
+    std::vector<std::uint64_t> rank_local_weight_bytes;
+    std::vector<std::uint64_t> rank_local_expert_cache_capacity_bytes;
+    std::vector<std::uint64_t> rank_local_admitted_device_bytes;
+    std::uint64_t rank_local_admitted_host_bytes{};
     Dsv4MemoryPlan memory;
     Dsv4ResidentStageStats resident_stage;
     Dsv4CheckpointReadStats generation_checkpoint_reads;

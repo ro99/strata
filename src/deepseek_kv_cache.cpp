@@ -779,7 +779,11 @@ ValidationResult Dsv4KvPhysicalAppend::commit(
     ValidationResult result;
     if (!valid() || committed_ || patch.size() != patch_bytes()) {
         result.errors.emplace_back(
-            "DeepSeek physical KV append commit is invalid");
+            "DeepSeek physical KV append commit is invalid (valid=" +
+            std::to_string(valid()) + ", committed=" +
+            std::to_string(committed_) + ", patch=" +
+            std::to_string(patch.size()) + ", expected=" +
+            std::to_string(patch_bytes()) + ")");
         return result;
     }
     if (values.size() != row_width_ ||
@@ -811,7 +815,10 @@ ValidationResult Dsv4KvPhysicalAppend::account() {
     ValidationResult result;
     if (!valid() || !committed_ || accounted_) {
         result.errors.emplace_back(
-            "DeepSeek physical KV append accounting is invalid");
+            "DeepSeek physical KV append accounting is invalid (valid=" +
+            std::to_string(valid()) + ", committed=" +
+            std::to_string(committed_) + ", accounted=" +
+            std::to_string(accounted_) + ")");
         return result;
     }
     state_->metrics.host_write_bytes += dsv4_kv_row_bytes(kind_, format_);
@@ -1553,10 +1560,11 @@ ParseResult<Dsv4KvDeviceLease> Dsv4KvCache::acquire_device(
     return result;
 }
 
-ParseResult<std::vector<Dsv4KvBlockInfo>> Dsv4KvCache::block_table(
-    Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
-    std::uint32_t layer) const {
-    ParseResult<std::vector<Dsv4KvBlockInfo>> result;
+ValidationResult Dsv4KvCache::block_table_into(
+    Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind, std::uint32_t layer,
+    std::vector<Dsv4KvBlockInfo>& output) const {
+    ValidationResult result;
+    output.clear();
     const auto* target = state_->sequence(sequence);
     if (target == nullptr) {
         result.errors.emplace_back("DeepSeek KV sequence does not exist");
@@ -1564,17 +1572,21 @@ ParseResult<std::vector<Dsv4KvBlockInfo>> Dsv4KvCache::block_table(
     }
     const auto table_found = target->tables.find(TableKey{kind, layer});
     if (table_found == target->tables.end()) return result;
-    result.value.reserve(table_found->second.blocks.size());
+    output.reserve(table_found->second.blocks.size());
     for (const auto id : table_found->second.blocks) {
         const auto found = state_->blocks.find(id);
         if (found == state_->blocks.end()) continue;
-        auto info = found->second.info;
-        info.device_resident.reserve(found->second.devices.size());
-        for (const auto& device : found->second.devices) {
-            info.device_resident.push_back(device.valid());
-        }
-        result.value.push_back(std::move(info));
+        output.push_back(found->second.info);
     }
+    return result;
+}
+
+ParseResult<std::vector<Dsv4KvBlockInfo>> Dsv4KvCache::block_table(
+    Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
+    std::uint32_t layer) const {
+    ParseResult<std::vector<Dsv4KvBlockInfo>> result;
+    auto filled = block_table_into(sequence, kind, layer, result.value);
+    if (!filled.ok()) result.errors = std::move(filled.errors);
     return result;
 }
 

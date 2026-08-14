@@ -152,7 +152,18 @@ TEST_CASE("DeepSeek physical KV layout is block-major and admitted") {
     REQUIRE(admission.value.compressor_state_bytes == 11862016U);
     REQUIRE(admission.value.index_state_bytes == 344064U);
     REQUIRE(admission.value.total_bytes == 151228416U);
-    REQUIRE(admission.value.allocated_blocks == 1450U);
+    // Physical allocator identities cover 256 source tokens, so compressed
+    // pages contain 256 / ratio rows. Count those real cache blocks rather
+    // than 256-row accounting aggregates.
+    REQUIRE(admission.value.allocated_blocks == 8022U);
+
+    const auto short_admission =
+        strata::dsv4_physical_kv_admission(4096U);
+    REQUIRE(short_admission.ok());
+    REQUIRE(short_admission.value.sliding_bytes == 12'857'344ULL);
+    REQUIRE(short_admission.value.compressed_bytes == 12'932'096ULL);
+    REQUIRE(short_admission.value.index_bytes == 2'838'528ULL);
+    REQUIRE(short_admission.value.payload_bytes == 28'627'968ULL);
 }
 
 TEST_CASE("DeepSeek physical KV encoder writes accepted physical planes") {

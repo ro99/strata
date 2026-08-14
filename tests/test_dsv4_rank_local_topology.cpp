@@ -1,5 +1,6 @@
 #include "test.hpp"
 
+#include "strata/dsv4_attention_kv.hpp"
 #include "strata/deepseek_runtime.hpp"
 #include "strata/dsv4_rank_local_topology.hpp"
 
@@ -39,6 +40,7 @@ namespace {
     request.active_context_tokens = 256U;
     request.maximum_context_tokens = 1'048'576U;
     for (auto& device : request.device) {
+        device.initial_device_usage_bytes = 290'586'624ULL;
         device.rank_local_weight_bytes = 8'190'558'208ULL;
         device.centralized_spine_bytes = 9'204'991'520ULL;
         device.workspace_bytes = 536'870'912ULL;
@@ -49,6 +51,7 @@ namespace {
     }
     request.host.routed_cpu_storage_bytes = 150ULL << 30U;
     request.host.host_parameter_bytes = 4ULL << 30U;
+    request.host.kv_state_bytes = 4'078'601'600ULL;
     request.host.host_workspace_bytes = 1ULL << 30U;
     return request;
 }
@@ -75,6 +78,18 @@ TEST_CASE("rank-local CPU planning assigns one disjoint NUMA node per rank") {
         REQUIRE(std::find(cpus[1].begin(), cpus[1].end(), cpu) ==
                 cpus[1].end());
     }
+}
+
+TEST_CASE("rank-local CPU planning preserves the calibrated pool width") {
+    std::array<std::vector<int>, strata::kDsv4RankLocalWorld> cpus;
+    const auto planned = strata::plan_dsv4_rank_local_cpus(
+        two_node_topology(28U), strata::kDsv4RankLocalMinimumCpusPerRank, cpus);
+    REQUIRE(planned.ok());
+    REQUIRE(cpus[0].size() == strata::kDsv4RankLocalMinimumCpusPerRank);
+    REQUIRE(cpus[1].size() == strata::kDsv4RankLocalMinimumCpusPerRank);
+    REQUIRE(cpus[0].back() == 23);
+    REQUIRE(cpus[1].front() == 28);
+    REQUIRE(cpus[1].back() == 51);
 }
 
 TEST_CASE("rank-local CPU planning rejects a single-node host") {
@@ -139,11 +154,20 @@ TEST_CASE("rank-local admission fits the 1M decode set beside the prefill spine"
     // combination by about 0.76 GiB.
     auto request = admissible_request();
     request.active_context_tokens = 1'048'576U;
+    const auto physical =
+        strata::dsv4_physical_kv_admission(request.active_context_tokens);
+    REQUIRE(physical.ok());
+    REQUIRE(physical.value.sliding_bytes == 12'857'344ULL);
+    REQUIRE(physical.value.compressed_bytes == 3'310'616'576ULL);
+    REQUIRE(physical.value.index_bytes == 726'663'168ULL);
+    REQUIRE(physical.value.payload_bytes == 4'050'137'088ULL);
     for (auto& device : request.device) {
         // Measured 1M KV and index state: 21 ratio-4 layers of 262,144
         // compressed and learned-index rows, 20 ratio-128 layers of 8,192
         // compressed rows, and the fixed 128-row sliding window.
-        device.kv_capacity_bytes = 4'082'533'760ULL;
+        // The logical stream is physically replicated, so every rank carries
+        // the complete payload returned by the canonical KV planner.
+        device.kv_capacity_bytes = physical.value.payload_bytes;
         // No prefill cache: the spine's own weights are the term under test.
         device.expert_cache_bytes = 0ULL;
     }

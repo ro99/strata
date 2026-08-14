@@ -64,7 +64,6 @@ struct Dsv4KvBlockInfo {
     Dsv4KvBlockKind kind{Dsv4KvBlockKind::Sliding};
     Dsv4KvFormat format{Dsv4KvFormat::F32};
     std::uint16_t format_version{kDsv4KvFormatVersion};
-    std::vector<bool> device_resident;
 };
 
 [[nodiscard]] Dsv4KvFormat dsv4_kv_format(
@@ -231,6 +230,15 @@ public:
     [[nodiscard]] ParseResult<std::vector<Dsv4KvBlockInfo>> block_table(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer) const;
+    // Same table into caller-owned storage. The decode path calls this once
+    // per kind per layer per token, and at the declared 1,048,576-token
+    // context a compressed table holds 4,096 blocks -- about 176,000 block
+    // infos per decoded token. Returning by value there both allocates on the
+    // timed path, which the steady-state contract forbids, and costs measured
+    // milliseconds. `output` is cleared and refilled; its capacity is reused.
+    [[nodiscard]] ValidationResult block_table_into(
+        Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
+        std::uint32_t layer, std::vector<Dsv4KvBlockInfo>& output) const;
     [[nodiscard]] Dsv4KvCacheStats stats() const noexcept;
 
 private:

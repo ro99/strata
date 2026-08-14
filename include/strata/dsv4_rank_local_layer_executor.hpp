@@ -45,6 +45,15 @@ struct Dsv4RankLocalLayerRankWeights {
     const CudaWeight* query_a{};
     const CudaWeight* query_b{};
     const CudaWeight* key_value{};
+    // Optional unsharded compressor projections. A single rank may own these:
+    // its ordered page callback advances the canonical compressor state and
+    // publishes the identical encoded row to both device pages.
+    const CudaWeight* compressor_value{};
+    const CudaWeight* compressor_gate{};
+    const CudaWeight* index_compressor_value{};
+    const CudaWeight* index_compressor_gate{};
+    std::uint32_t compressor_elements{};
+    std::uint32_t index_compressor_elements{};
     const CudaWeight* output_a{};
     const CudaWeight* output_b{};
     const CudaWeight* router{};
@@ -68,6 +77,7 @@ struct Dsv4RankLocalLayerWeights {
 struct Dsv4RankLocalLayerPagePatch {
     CudaDsv4AttentionPrepareHostCallback callback{};
     void* context{};
+    std::span<const std::byte> ready_patch;
     std::span<const CudaDsv4AttentionPageWrite> writes;
 };
 
@@ -81,6 +91,10 @@ struct Dsv4RankLocalLayerCall {
     std::span<const float> inverse_rope_cosines;
     std::span<const float> inverse_rope_sines;
     std::array<Dsv4RankLocalLayerPagePatch, 2U> page_patches{};
+    // The rank-1 preparation waits for rank 0's page callback and patch copies.
+    // This is used only when rank 0 owns the canonical compressor/KV update and
+    // rank 1 copies its already encoded bytes into the replica page.
+    bool ordered_page_patches{};
     Dsv4RankLocalLayerObservation* observation{};
     bool terminal{};
 };
@@ -155,6 +169,9 @@ struct Dsv4RankLocalLayerChainResult {
     std::uint64_t terminal_logits_hash{};
     std::uint32_t next_token{};
     double terminal_head_ms{};
+    // Sum of the exact routed CPU body over every queued layer, per rank.
+    // The slower rank is the chain's routed-CPU critical term.
+    std::array<Dsv4HostMoePhaseTimings, 2U> cpu_moe_phases{};
 };
 
 struct Dsv4RankLocalHeadRequest {
@@ -182,6 +199,10 @@ public:
 
     [[nodiscard]] ValidationResult initialize(
         const Dsv4RankLocalLayerOptions& options);
+    // One fixed pinned slot per queued layer. Rank 0 fills it in its canonical
+    // callback and rank 1 uploads it after the executor's page-ready event.
+    [[nodiscard]] ValidationResult replica_page_patch_staging(
+        std::size_t slot, std::size_t bytes, std::span<std::byte>& output);
 
     // One complete layer. All device work is queued before the single final
     // diagnostic boundary. Failure cases still enter both data and U32 MAX

@@ -18,6 +18,12 @@ struct Dsv4RankLocalRankLayerWeights {
     CudaWeight query_a;
     CudaWeight query_b;
     CudaWeight key_value;
+    CudaWeight compressor_value;
+    CudaWeight compressor_gate;
+    CudaWeight index_compressor_value;
+    CudaWeight index_compressor_gate;
+    std::uint32_t compressor_elements{};
+    std::uint32_t index_compressor_elements{};
     CudaWeight output_a;
     CudaWeight output_b;
     CudaWeight router;

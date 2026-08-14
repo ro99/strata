@@ -1001,6 +1001,13 @@ int main(int argc, char** argv) {
             << "[contract] optional DSpark proposals disabled, never approximated\n";
     }
 
+    if (options.admission_only && options.rank_local_decode) {
+        std::cerr
+            << "error: rank-local admission requires full initialization to "
+               "measure the resident spine and sharded weight set; "
+               "--admission-only cannot validate rank-local-tp2\n";
+        return 1;
+    }
     if (options.admission_only) {
         auto checkpoint = strata::Dsv4CheckpointReader::open(options.model);
         if (!checkpoint.ok()) {
@@ -1190,8 +1197,27 @@ int main(int argc, char** argv) {
                   << ",\"device_vram_used_bytes\":";
         strata::cli::print_array(std::cout, metrics.device_vram_used_bytes);
         std::cout
+                  << ",\"rank_local_memory\":{"
+                  << "\"initial_device_vram_bytes\":";
+        strata::cli::print_array(
+            std::cout, metrics.rank_local_initial_device_vram_bytes);
+        std::cout << ",\"weight_bytes\":";
+        strata::cli::print_array(std::cout,
+                                 metrics.rank_local_weight_bytes);
+        std::cout << ",\"expert_cache_capacity_bytes\":";
+        strata::cli::print_array(
+            std::cout,
+            metrics.rank_local_expert_cache_capacity_bytes);
+        std::cout << ",\"admitted_device_bytes\":";
+        strata::cli::print_array(
+            std::cout, metrics.rank_local_admitted_device_bytes);
+        std::cout << ",\"admitted_host_bytes\":"
+                  << metrics.rank_local_admitted_host_bytes << '}'
                   << ",\"prefill_seconds\":" << metrics.prefill_seconds
                   << ",\"decode_seconds\":" << metrics.decode_seconds
+                  << ",\"decode_step_seconds\":";
+        strata::cli::print_array(std::cout, metrics.decode_step_seconds);
+        std::cout
                   << ",\"decode_checkpoint_read_bytes\":"
                   << metrics.decode_checkpoint_reads.bytes
                   << ",\"generation_checkpoint_read_bytes\":"

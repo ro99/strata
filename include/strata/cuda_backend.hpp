@@ -420,6 +420,17 @@ struct CudaDsv4AttentionPrepareRequest {
     // target is patched after the callback on this same stream.
     CudaDsv4AttentionPrepareHostCallback host_callback{};
     void* host_callback_context{};
+    // Optional CUDA event, kept opaque in the public C++ header. Projection
+    // and diagnostic downloads are submitted before this wait; only the host
+    // callback and its page publication wait. This preserves cross-rank Q/KV
+    // concurrency when one rank owns the canonical encoded row.
+    void* host_callback_wait_event{};
+    // Device-only replica publication. Another stream fills this fixed pinned
+    // span and records `page_patch_ready_event`; this stream waits for that
+    // event, then uploads the already encoded bytes without a second host
+    // callback or Q/KV diagnostic download.
+    std::span<const std::byte> ready_page_patches;
+    void* page_patch_ready_event{};
     std::span<const CudaDsv4AttentionPageWrite> page_writes;
     int mhc_device{-1};
     std::uint64_t maximum_workspace_bytes{1ULL << 20U};

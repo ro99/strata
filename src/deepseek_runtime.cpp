@@ -649,6 +649,60 @@ public:
         return result;
     }
 
+    // Applies the rank-local admission result to the cache that owns the
+    // centralized prefill weights. `expert_bytes` excludes the pinned spine;
+    // the resulting capacity includes it. This runs only during setup, after
+    // warm-up and before a session can become active.
+    ValidationResult cap_expert_capacity(
+        std::span<const std::uint64_t> expert_bytes) {
+        ValidationResult result;
+        finish_prefetch();
+        if (expert_bytes.size() != states_.size()) {
+            result.errors.emplace_back(
+                "DeepSeek rank-local cache cap count does not match devices");
+            return result;
+        }
+        std::vector<std::uint64_t> targets(states_.size());
+        for (std::size_t slot = 0U; slot < states_.size(); ++slot) {
+            auto& state = states_[slot];
+            if (expert_bytes[slot] >
+                std::numeric_limits<std::uint64_t>::max() - state.pinned) {
+                result.errors.emplace_back(
+                    "DeepSeek rank-local cache cap overflows");
+                return result;
+            }
+            targets[slot] = state.pinned + expert_bytes[slot];
+            const auto leased = std::any_of(
+                state.entries.begin(), state.entries.end(),
+                [](const auto& entry) { return entry.second.leases != 0U; });
+            if (targets[slot] < state.pinned || leased) {
+                result.errors.emplace_back(
+                    "DeepSeek rank-local cache cannot be capped with pinned "
+                    "or leased weights in excess of admission");
+                return result;
+            }
+        }
+        for (std::size_t slot = 0U; slot < states_.size(); ++slot) {
+            auto& state = states_[slot];
+            while (state.used > targets[slot]) {
+                auto victim = select_victim(state);
+                if (victim == state.entries.end()) {
+                    result.errors.emplace_back(
+                        "DeepSeek rank-local cache cap cannot evict enough "
+                        "centralized prefill weights");
+                    return result;
+                }
+                state.used -= victim->second.weight.device_bytes();
+                discard_prefetched(state, victim->second, true);
+                unlink_recency(state, victim->second);
+                state.entries.erase(victim);
+                ++evictions_;
+            }
+            state.capacity = targets[slot];
+        }
+        return result;
+    }
+
     ValidationResult matmul(std::size_t slot, std::string_view base,
                             std::uint64_t output_columns,
                             std::uint64_t input_columns,
@@ -1349,6 +1403,67 @@ struct SpeculativeState {
     std::uint64_t tokens{};
 };
 
+// Finds the block owning `logical_row` in a per-(sequence, kind, layer)
+// physical block table.
+//
+// This replaces a linear `std::find_if` that ran once per attended candidate.
+// At the declared 1,048,576-token context a compressed stream's table holds
+// 4,096 blocks and a ratio-128 layer attends 8,192 candidates, so the scan
+// measured 2,889.637 ms per decoded token across the 43 layers -- about
+// twenty-two times the entire decode budget.
+//
+// Blocks partition the row space and are appended in increasing logical order,
+// and every block holds `capacity_rows` rows with only the last possibly
+// short, so the owning block is normally computable directly from the first
+// block's geometry. Ordered and exhaustive fallbacks follow, so a table that
+// has been reordered by eviction or reuse still resolves correctly.
+//
+// Every path validates the same predicate before returning, and blocks do not
+// overlap within one table, so whichever path succeeds returns exactly the
+// block the original scan would have found.
+[[nodiscard]] std::size_t locate_physical_kv_block(
+    const std::vector<Dsv4KvBlockInfo>& table, std::uint64_t logical_row) {
+    const auto owns = [&](std::size_t index) {
+        const auto& block = table[index];
+        if (block.compression_ratio == 0U) return false;
+        const auto begin = block.logical_begin / block.compression_ratio;
+        return logical_row >= begin &&
+               logical_row < begin + block.used_rows;
+    };
+    if (table.empty()) return table.size();
+
+    const auto& first = table.front();
+    if (first.compression_ratio != 0U && first.capacity_rows != 0U) {
+        const auto base = first.logical_begin / first.compression_ratio;
+        if (logical_row >= base) {
+            const auto guess = static_cast<std::size_t>(
+                (logical_row - base) / first.capacity_rows);
+            if (guess < table.size() && owns(guess)) return guess;
+        }
+    }
+
+    std::size_t low = 0U;
+    std::size_t high = table.size();
+    while (low < high) {
+        const auto middle = low + (high - low) / 2U;
+        const auto& block = table[middle];
+        if (block.compression_ratio == 0U) break;
+        const auto begin = block.logical_begin / block.compression_ratio;
+        if (logical_row < begin) {
+            high = middle;
+        } else if (logical_row >= begin + block.used_rows) {
+            low = middle + 1U;
+        } else {
+            return middle;
+        }
+    }
+
+    for (std::size_t index = 0U; index < table.size(); ++index) {
+        if (owns(index)) return index;
+    }
+    return table.size();
+}
+
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
@@ -1410,10 +1525,11 @@ struct DeepSeekV4Runtime::Impl {
     std::unique_ptr<Dsv4RankLocalLayerExecutor> rank_local_executor;
 #endif
     Dsv4RankLocalAdmission rank_local_admission;
+    std::vector<std::uint64_t> rank_local_initial_device_vram_bytes;
+    std::vector<std::uint64_t> rank_local_actual_device_vram_bytes;
     bool rank_local_active{};
-    // One rank-local layer's borrowed views. The terminal layer is queued by
-    // enqueue_chain_layer and read again by finish_chain after that call has
-    // returned, so the storage outlives the layer scope by living here.
+    // One rank-local layer's borrowed views. Queued mode submits all 43 calls
+    // before finish_chain, so every layer owns a distinct stable record.
     struct RankLocalLayerScratch {
         std::vector<Dsv4KvDeviceLease> leases;
         std::array<std::vector<CudaDsv4PhysicalPage>, kDsv4RankLocalWorld> pages;
@@ -1430,13 +1546,25 @@ struct DeepSeekV4Runtime::Impl {
         std::vector<float> index_row;
         std::vector<std::uint32_t> indexed_positions;
         std::array<std::vector<std::byte>, kDsv4RankLocalWorld> patches;
+        std::span<std::byte> replica_patch;
         std::array<std::vector<CudaDsv4AttentionPageWrite>,
                    kDsv4RankLocalWorld> page_writes;
     };
-    // One layer is live at a time: the previous layer's run() has returned
-    // before the next layer overwrites this, and the terminal layer is the
-    // last writer before finish_chain reads it.
-    RankLocalLayerScratch rank_local_scratch{};
+    struct RankLocalPageContext {
+        Impl* owner{};
+        Dsv4RankLocalKvTransaction* transaction{};
+        RankLocalLayerScratch* scratch{};
+        std::uint32_t layer{};
+        std::uint32_t position{};
+        std::size_t rank{};
+        ValidationResult result;
+        bool invoked{};
+        std::uint64_t elapsed_nanoseconds{};
+    };
+    std::array<RankLocalLayerScratch, kLayers> rank_local_scratch{};
+    std::array<Dsv4RankLocalLayerCall, kLayers> rank_local_calls{};
+    std::array<std::array<RankLocalPageContext, kDsv4RankLocalWorld>, kLayers>
+        rank_local_page_contexts{};
     std::array<DeviceHeadContext, kDsv4RankLocalWorld> rank_local_head{};
     std::array<std::vector<float>, kDsv4RankLocalWorld> rank_local_local_logits;
     std::array<std::vector<std::uint16_t>, kDsv4RankLocalWorld>
@@ -1448,6 +1576,16 @@ struct DeepSeekV4Runtime::Impl {
     Dsv4SequenceHandle active_sequence{};
     std::array<PhysicalAttentionContext, kLayers>
         physical_attention_contexts{};
+    // Reused block tables for candidate resolution. Both topologies rebuild
+    // these once per kind per layer per decoded token; at the declared context
+    // a compressed table is 4,096 blocks, so returning them by value allocated
+    // on the timed path and cost about 8.1 ms/token. Only one layer's tables
+    // are live at a time, so a single pair of buffers suffices.
+    std::vector<Dsv4KvBlockInfo> physical_sliding_blocks;
+    std::vector<Dsv4KvBlockInfo> physical_compressed_blocks;
+    // Learned-index table for sparse selection. Held separately because it is
+    // resolved in a different phase from the attention candidate tables.
+    std::vector<Dsv4KvBlockInfo> physical_index_blocks;
     std::array<HostMoeContext, kLayers> host_moe_contexts{};
     std::uint32_t host_moe_pending{};
     std::uint64_t host_moe_routed_cpu_before{};
@@ -1651,6 +1789,11 @@ struct DeepSeekV4Runtime::Impl {
         std::uint32_t layer, std::uint32_t token, std::uint32_t position,
         Dsv4RankLocalKvTransaction& transaction,
         RankLocalLayerScratch& scratch, Dsv4RankLocalLayerCall& call);
+    static bool rank_local_page_patch_callback(
+        void* opaque, const CudaDsv4AttentionPrepareHostView& view);
+    bool complete_rank_local_page_patch(
+        RankLocalPageContext& context,
+        const CudaDsv4AttentionPrepareHostView& view);
     // Writes one layer's committed rows into every rank's device page. The
     // bytes were encoded once by the transaction; this is the transport.
     ValidationResult rank_local_patch_pages(
@@ -2298,6 +2441,81 @@ bool DeepSeekV4Runtime::Impl::physical_attention_prepare_callback(
     return context.owner->complete_physical_attention_prepare(context, view);
 }
 
+bool DeepSeekV4Runtime::Impl::rank_local_page_patch_callback(
+    void* opaque, const CudaDsv4AttentionPrepareHostView& view) {
+    if (opaque == nullptr) return false;
+    auto& context = *static_cast<RankLocalPageContext*>(opaque);
+    if (context.owner == nullptr) return false;
+    return context.owner->complete_rank_local_page_patch(context, view);
+}
+
+bool DeepSeekV4Runtime::Impl::complete_rank_local_page_patch(
+    RankLocalPageContext& context,
+    const CudaDsv4AttentionPrepareHostView& view) {
+    const auto started = std::chrono::steady_clock::now();
+    context.invoked = true;
+    context.result = {};
+    auto* scratch = context.scratch;
+    const auto complete = [&](bool success) {
+        context.elapsed_nanoseconds = ::strata::elapsed_nanoseconds(started);
+        return success;
+    };
+    const auto fail = [&](std::string message) {
+        context.result.errors.push_back(std::move(message));
+        return complete(false);
+    };
+    if (context.transaction == nullptr || scratch == nullptr ||
+        context.layer >= kLayers || context.rank >= kDsv4RankLocalWorld ||
+        view.query_rank.size() != kQueryRank ||
+        view.key_value.size() != kHeadDim) {
+        return fail("rank-local deferred page-patch shape is invalid");
+    }
+
+    const auto& state = attention_state[context.layer];
+    const auto compressor_elements = static_cast<std::size_t>(
+        state.compressor.coefficient) * state.compressor.head_dim;
+    const auto index_elements = static_cast<std::size_t>(
+        state.indexer_compressor.coefficient) *
+        state.indexer_compressor.head_dim;
+    if (view.compressor_values.size() != compressor_elements ||
+        view.compressor_scores.size() != compressor_elements ||
+        view.index_compressor_values.size() != index_elements ||
+        view.index_compressor_scores.size() != index_elements ||
+        view.page_patches.size() != scratch->replica_patch.size()) {
+        return fail("rank-local canonical page-patch payload is invalid");
+    }
+
+    scratch->key_value.resize(kHeadDim);
+    for (std::size_t index = 0U; index < kHeadDim; ++index) {
+        scratch->key_value[index] = std::bit_cast<float>(
+            static_cast<std::uint32_t>(view.key_value[index]) << 16U);
+    }
+
+    const auto prefix = layer_prefix(context.layer) + "attn.";
+    context.result = compress_state(
+        context.layer, attention_state[context.layer].compressor,
+        prefix + "compressor.", {}, context.position,
+        attention_state[context.layer].frequencies,
+        view.compressor_values, view.compressor_scores, nullptr, {},
+        &scratch->compressed_row);
+    if (context.result.ok()) {
+        context.result = compress_state(
+            context.layer, attention_state[context.layer].indexer_compressor,
+            prefix + "indexer.compressor.", {}, context.position,
+            attention_state[context.layer].frequencies,
+            view.index_compressor_values, view.index_compressor_scores,
+            nullptr, {}, &scratch->index_row);
+    }
+    if (context.result.ok()) {
+        std::array<std::span<std::byte>, kDsv4RankLocalWorld> patches{
+            view.page_patches, scratch->replica_patch};
+        context.result = context.transaction->commit_layer(
+            context.layer, scratch->key_value, scratch->compressed_row,
+            patches, scratch->index_row);
+    }
+    return complete(context.result.ok());
+}
+
 bool DeepSeekV4Runtime::Impl::complete_physical_attention_prepare(
     PhysicalAttentionContext& context,
     const CudaDsv4AttentionPrepareHostView& view) {
@@ -2637,24 +2855,22 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
         // 21 ratio-4 layers, which no CPU budget reaches. Device selection is
         // therefore the only viable path here, not an optimization of one.
         auto cuda_demand = weights->demand();
-        auto blocks = kv_cache->block_table(
-            active_sequence, Dsv4KvBlockKind::LearnedIndex, layer);
-        if (!blocks.ok()) {
-            append_errors(result, std::move(blocks.errors));
-            return result;
-        }
+        auto& blocks = physical_index_blocks;
+        result = kv_cache->block_table_into(
+            active_sequence, Dsv4KvBlockKind::LearnedIndex, layer, blocks);
+        if (!result.ok()) return result;
         std::vector<Dsv4KvDeviceLease> leases;
         std::vector<CudaDsv4PhysicalIndexPage> pages;
         try {
-            leases.reserve(blocks.value.size());
-            pages.reserve(blocks.value.size());
+            leases.reserve(blocks.size());
+            pages.reserve(blocks.size());
         } catch (const std::bad_alloc&) {
             result.errors.emplace_back(
                 "cannot allocate physical Lightning Indexer page metadata");
             return result;
         }
         std::uint32_t remaining = compressed_count;
-        for (const auto& block : blocks.value) {
+        for (const auto& block : blocks) {
             if (remaining == 0U) break;
             const auto logical_row = block.logical_begin /
                                      block.compression_ratio;
@@ -2705,22 +2921,21 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
             !config.device_kv_cache_bytes.empty() &&
             config.device_kv_cache_bytes[slot] != 0U;
         if (device_resident) {
-            auto blocks = kv_cache->block_table(
-                active_sequence, Dsv4KvBlockKind::LearnedIndex, layer);
-            if (!blocks.ok()) {
-                append_errors(result, std::move(blocks.errors));
-                return result;
-            }
+            auto& blocks = physical_index_blocks;
+            result = kv_cache->block_table_into(
+                active_sequence, Dsv4KvBlockKind::LearnedIndex, layer,
+                blocks);
+            if (!result.ok()) return result;
             try {
-                segments.reserve(blocks.value.size());
-                leases.reserve(blocks.value.size());
+                segments.reserve(blocks.size());
+                leases.reserve(blocks.size());
             } catch (const std::bad_alloc&) {
                 result.errors.emplace_back(
                     "cannot allocate Lightning Indexer block metadata");
                 return result;
             }
             std::uint32_t remaining = compressed_count;
-            for (const auto& block : blocks.value) {
+            for (const auto& block : blocks) {
                 if (remaining == 0U) break;
                 const auto logical_row = block.logical_begin /
                                          block.compression_ratio;
@@ -3146,21 +3361,21 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         return result;
     }
     const auto slot = layer_device(layer);
-    auto sliding = kv_cache->block_table(
-        active_sequence, Dsv4KvBlockKind::Sliding, layer);
-    if (!sliding.ok()) {
-        append_errors(result, std::move(sliding.errors));
-        return result;
-    }
+    // Process-lifetime buffers: these tables reach 4,096 blocks at the declared
+    // context and are rebuilt once per kind per layer per token, so they must
+    // not allocate on the timed path.
+    auto& sliding = physical_sliding_blocks;
+    auto& compressed = physical_compressed_blocks;
+    result = kv_cache->block_table_into(
+        active_sequence, Dsv4KvBlockKind::Sliding, layer, sliding);
+    if (!result.ok()) return result;
     const auto ratio = attention_state[layer].compressor.ratio;
-    ParseResult<std::vector<Dsv4KvBlockInfo>> compressed;
+    compressed.clear();
     if (ratio != 0U) {
-        compressed = kv_cache->block_table(
-            active_sequence, attention_state[layer].compressor.kind, layer);
-        if (!compressed.ok()) {
-            append_errors(result, std::move(compressed.errors));
-            return result;
-        }
+        result = kv_cache->block_table_into(
+            active_sequence, attention_state[layer].compressor.kind, layer,
+            compressed);
+        if (!result.ok()) return result;
     }
 
     std::vector<Dsv4KvDeviceLease> leases;
@@ -3170,18 +3385,13 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
                             const std::vector<Dsv4KvBlockInfo>& table,
                             std::uint32_t logical_row,
                             CudaDsv4AttentionCandidate& candidate) {
-        const auto found = std::find_if(
-            table.begin(), table.end(), [&](const Dsv4KvBlockInfo& block) {
-                const auto begin = block.logical_begin /
-                                   block.compression_ratio;
-                return logical_row >= begin &&
-                       logical_row < begin + block.used_rows;
-            });
-        if (found == table.end()) {
+        const auto located = locate_physical_kv_block(table, logical_row);
+        if (located == table.size()) {
             result.errors.emplace_back(
                 "DeepSeek physical attention candidate page is unavailable");
             return;
         }
+        const auto found = table.begin() + static_cast<std::ptrdiff_t>(located);
         const auto begin = found->logical_begin / found->compression_ratio;
         auto page = page_indices.find(found->id);
         if (page == page_indices.end()) {
@@ -3221,14 +3431,14 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
     }
     for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
         const auto logical_row = sparse ? indexed_positions[item] : item;
-        locate(attention_state[layer].compressor.kind, compressed.value,
+        locate(attention_state[layer].compressor.kind, compressed,
                logical_row, candidates[item]);
         if (!result.ok()) return result;
     }
     const auto window_count = std::min(position + 1U, kWindow);
     for (std::uint32_t item = 0U; item < window_count; ++item) {
         const auto logical_row = position + 1U - window_count + item;
-        locate(Dsv4KvBlockKind::Sliding, sliding.value, logical_row,
+        locate(Dsv4KvBlockKind::Sliding, sliding, logical_row,
                candidates[static_cast<std::size_t>(compressed_width) + item]);
         if (!result.ok()) return result;
     }
@@ -4241,11 +4451,28 @@ ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
         }
     }
     for (auto& context : physical_attention_contexts) {
+        if (!context.result.ok()) {
+            append_errors(
+                result, std::move(context.result.errors),
+                "DeepSeek physical attention callback layer " +
+                    std::to_string(context.layer));
+        }
+        if ((context.sliding_append.has_value() ||
+             context.compressed_append.has_value() ||
+             context.index_append.has_value()) &&
+            !context.invoked) {
+            result.errors.emplace_back(
+                "DeepSeek physical attention callback was not invoked for layer " +
+                std::to_string(context.layer));
+        }
         const auto account = [&](auto& append) {
             if (!append.has_value()) return;
             auto accounted = append->account();
             if (!accounted.ok()) {
-                append_errors(result, std::move(accounted.errors));
+                append_errors(
+                    result, std::move(accounted.errors),
+                    "DeepSeek physical attention account layer " +
+                        std::to_string(context.layer));
             }
         };
         account(context.sliding_append);
@@ -5566,31 +5793,65 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
     const auto cache = weights->stats();
     for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
         auto& device = request.device[rank];
+        device.initial_device_usage_bytes =
+            rank_local_initial_device_vram_bytes[rank];
         device.rank_local_weight_bytes = sharded[rank];
         device.centralized_spine_bytes =
             rank < cache.pinned_bytes.size() ? cache.pinned_bytes[rank] : 0U;
+        if (rank == mhc_slot) {
+            device.centralized_spine_bytes += memory.mhc_device_bytes;
+        }
         device.workspace_bytes = kDeviceWorkspaceReserve;
         device.kv_capacity_bytes =
             rank < memory.per_device_kv_cache_bytes.size()
                 ? memory.per_device_kv_cache_bytes[rank] : 0U;
         device.nccl_buffer_bytes = 64ULL << 20U;
         device.head_buffer_bytes = 16ULL << 20U;
-        // Whatever the slot's weight-cache capacity leaves once the pinned
-        // spine is placed. This is the one component admission may cap.
-        device.expert_cache_bytes =
+        // The rank-local store and centralized cache share one fixed CUDA
+        // weight arena. Admission must cap the cache against the suballocation
+        // space left after the store, as well as against the overall program
+        // ceiling; otherwise the logical cache capacity can promise bytes the
+        // arena can never allocate.
+        const auto cache_pinned =
+            rank < cache.pinned_bytes.size() ? cache.pinned_bytes[rank] : 0U;
+        if (rank >= capacities.size() ||
+            sharded[rank] > capacities[rank] ||
+            cache_pinned > capacities[rank] - sharded[rank]) {
+            result.errors.emplace_back(
+                "rank-local CUDA device " + std::to_string(devices[rank]) +
+                " weight arena cannot retain the rank-local store beside "
+                "the centralized prefill spine");
+            continue;
+        }
+        const auto arena_expert_bytes =
+            capacities[rank] - sharded[rank] - cache_pinned;
+        const auto cache_expert_bytes =
             rank < cache.capacity_bytes.size() &&
-                    cache.capacity_bytes[rank] > device.centralized_spine_bytes
-                ? cache.capacity_bytes[rank] - device.centralized_spine_bytes
+                    cache.capacity_bytes[rank] > cache_pinned
+                ? cache.capacity_bytes[rank] - cache_pinned
                 : 0U;
+        device.expert_cache_bytes =
+            std::min(arena_expert_bytes, cache_expert_bytes);
+    }
+    if (!result.ok()) {
+        store->clear();
+        return result;
     }
     request.host.routed_cpu_storage_bytes = memory.routed_expert_host_bytes;
     request.host.host_parameter_bytes = memory.host_parameter_bytes;
+    request.host.kv_state_bytes = memory.kv_state_bytes;
     request.host.host_workspace_bytes = memory.host_workspace_bytes;
 
     auto admitted = admit_dsv4_rank_local(request, NumaTopology::detect());
     if (!admitted.ok()) {
         store->clear();
         result.errors = std::move(admitted.errors);
+        return result;
+    }
+    result = weights->cap_expert_capacity(
+        admitted.expert_cache_capacity_bytes);
+    if (!result.ok()) {
+        store->clear();
         return result;
     }
 
@@ -5607,6 +5868,29 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
         store->clear();
         return result;
     }
+    rank_local_actual_device_vram_bytes =
+        device_vram_used_bytes(devices);
+    if (rank_local_actual_device_vram_bytes.size() !=
+        kDsv4RankLocalWorld) {
+        store->clear();
+        result.errors.emplace_back(
+            "rank-local actual VRAM ledger does not match devices");
+        return result;
+    }
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        if (rank_local_actual_device_vram_bytes[rank] >
+            kDsv4RankLocalPerDeviceVramCeiling) {
+            store->clear();
+            result.errors.emplace_back(
+                "rank-local CUDA device " +
+                std::to_string(devices[rank]) + " uses " +
+                std::to_string(rank_local_actual_device_vram_bytes[rank]) +
+                " B after setup, above the " +
+                std::to_string(kDsv4RankLocalPerDeviceVramCeiling) +
+                " B program ceiling");
+        }
+    }
+    if (!result.ok()) return result;
     rank_local_executor = std::move(executor);
 #else
     store->clear();
@@ -5698,20 +5982,55 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
     };
     rank_local_attention_input.clear();
 
-    Dsv4RankLocalLayerCall call;
-    for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-        auto& scratch = rank_local_scratch;
-        result = rank_local_prepare_layer(
-            layer, token, position, transaction, scratch, call);
-        if (!result.ok()) {
-            close_branches();
-            return result;
+    const bool queued_short_context = std::none_of(
+            attention_state.begin(), attention_state.end(),
+            [](const AttentionState& state) {
+                return state.indexer_compressor.ratio != 0U;
+            });
+    if (queued_short_context) {
+        // Finish every host-side reservation and cache lookup before a CUDA host
+        // node can start. Besides keeping all borrowed views stable, this avoids
+        // concurrent access to the host-tensor map from submission and callback
+        // threads.
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            result = rank_local_prepare_layer(
+                layer, token, position, transaction,
+                rank_local_scratch[layer], rank_local_calls[layer]);
+            if (!result.ok()) {
+                close_branches();
+                return result;
+            }
         }
-        if (layer + 1U < kLayers) {
-            Dsv4RankLocalLayerResult layer_result;
-            const auto layer_started = std::chrono::steady_clock::now();
-            auto ran = rank_local_executor->run(
-                call, Dsv4RankLocalFailure::None, layer_result);
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto enqueue_started = std::chrono::steady_clock::now();
+            auto queued = rank_local_executor->enqueue_chain_layer(
+                rank_local_calls[layer]);
+            graph_stats.rank_local_layer_nanoseconds +=
+                elapsed_nanoseconds(enqueue_started);
+            if (!queued.ok()) {
+                append_errors(result, std::move(queued.errors));
+                static_cast<void>(rank_local_executor->abort_chain());
+                close_branches();
+                return result;
+            }
+        }
+    }
+    if (!queued_short_context) {
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            auto& scratch = rank_local_scratch[layer];
+            auto& call = rank_local_calls[layer];
+            result = rank_local_prepare_layer(
+                layer, token, position, transaction, scratch, call);
+            if (!result.ok()) {
+                static_cast<void>(rank_local_executor->abort_chain());
+                close_branches();
+                return result;
+            }
+            if (layer + 1U < kLayers) {
+                Dsv4RankLocalLayerResult layer_result;
+                const auto layer_started = std::chrono::steady_clock::now();
+                auto ran = rank_local_executor->run(
+                    call, Dsv4RankLocalFailure::None, layer_result);
             graph_stats.rank_local_layer_nanoseconds +=
                 elapsed_nanoseconds(layer_started);
             graph_stats.rank_local_device_nanoseconds +=
@@ -5766,21 +6085,22 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
                 (std::max(layer_result.timing.cpu_routed_rank0_ms,
                           layer_result.timing.cpu_routed_rank1_ms) +
                  layer_result.timing.moe_collective_ms) * 1.0e6);
-            continue;
-        }
-        // Terminal layer. The executor refuses to run() it: the output head
-        // consumes the mHC state, so the last layer is queued and drained by
-        // finish_chain, exactly as run_m3_sequential does at
-        // a31ac58:apps/strata_dsv4_rank_local_layer.cu:3038.
-        const auto terminal_started = std::chrono::steady_clock::now();
-        auto queued = rank_local_executor->enqueue_chain_layer(call);
-        graph_stats.rank_local_layer_nanoseconds +=
-            elapsed_nanoseconds(terminal_started);
-        if (!queued.ok()) {
-            append_errors(result, std::move(queued.errors));
-            static_cast<void>(rank_local_executor->abort_chain());
-            close_branches();
-            return result;
+                continue;
+            }
+            // Terminal layer. The executor refuses to run() it: the output
+            // head consumes the mHC state, so the last layer is queued and
+            // drained by finish_chain, exactly as run_m3_sequential does at
+            // a31ac58:apps/strata_dsv4_rank_local_layer.cu:3038.
+            const auto terminal_started = std::chrono::steady_clock::now();
+            auto queued = rank_local_executor->enqueue_chain_layer(call);
+            graph_stats.rank_local_layer_nanoseconds +=
+                elapsed_nanoseconds(terminal_started);
+            if (!queued.ok()) {
+                append_errors(result, std::move(queued.errors));
+                static_cast<void>(rank_local_executor->abort_chain());
+                close_branches();
+                return result;
+            }
         }
     }
 
@@ -5811,8 +6131,22 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         &chain, fuse_head ? &head_request : nullptr);
     graph_stats.rank_local_layer_nanoseconds +=
         elapsed_nanoseconds(finish_started);
-    if (!finished.ok() || chain.chain_count != 1U || !chain.terminal) {
+    const auto expected_chain_count = queued_short_context
+        ? static_cast<std::size_t>(kLayers) : 1U;
+    if (!finished.ok() || chain.chain_count != expected_chain_count ||
+        !chain.terminal) {
         append_errors(result, std::move(finished.errors));
+        if (queued_short_context) {
+            for (const auto& contexts : rank_local_page_contexts) {
+                for (const auto& context : contexts) {
+                    append_errors(result, context.result.errors,
+                                  "rank-local page callback layer " +
+                                      std::to_string(context.layer) +
+                                      " rank " +
+                                      std::to_string(context.rank));
+                }
+            }
+        }
         if (result.ok()) {
             result.errors.emplace_back(
                 "rank-local terminal layer did not complete");
@@ -5820,6 +6154,38 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         close_branches();
         return result;
     }
+    if (queued_short_context) {
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            for (std::size_t rank = 0U; rank < 1U; ++rank) {
+                const auto& context = rank_local_page_contexts[layer][rank];
+                if (!context.invoked || !context.result.ok()) {
+                    append_errors(result, context.result.errors,
+                                  "rank-local page callback layer " +
+                                      std::to_string(context.layer) +
+                                      " rank " +
+                                      std::to_string(context.rank));
+                    if (context.result.ok()) {
+                        result.errors.emplace_back(
+                            "rank-local page callback was not invoked at layer " +
+                            std::to_string(layer) + " rank " +
+                            std::to_string(rank));
+                    }
+                }
+            }
+        }
+        if (!result.ok()) {
+            close_branches();
+            return result;
+        }
+        std::uint64_t page_callback_nanoseconds = 0U;
+        for (const auto& contexts : rank_local_page_contexts) {
+            page_callback_nanoseconds += contexts[0].elapsed_nanoseconds;
+        }
+        graph_stats.rank_local_kv_nanoseconds += page_callback_nanoseconds;
+    }
+    graph_stats.moe_nanoseconds += std::max(
+        chain.cpu_moe_phases[0].total_nanoseconds,
+        chain.cpu_moe_phases[1].total_nanoseconds);
     if (fuse_head && (!rank_local_head[0].invoked ||
                       !rank_local_head[1].invoked)) {
         result.errors.emplace_back(
@@ -5898,21 +6264,18 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
     std::span<const std::uint32_t> indexed_positions,
     RankLocalLayerScratch& scratch) {
     ValidationResult result;
-    auto sliding = kv_cache->block_table(
-        active_sequence, Dsv4KvBlockKind::Sliding, layer);
-    if (!sliding.ok()) {
-        append_errors(result, std::move(sliding.errors));
-        return result;
-    }
+    auto& sliding = physical_sliding_blocks;
+    auto& compressed = physical_compressed_blocks;
+    result = kv_cache->block_table_into(
+        active_sequence, Dsv4KvBlockKind::Sliding, layer, sliding);
+    if (!result.ok()) return result;
     const auto ratio = attention_state[layer].compressor.ratio;
-    ParseResult<std::vector<Dsv4KvBlockInfo>> compressed;
+    compressed.clear();
     if (ratio != 0U) {
-        compressed = kv_cache->block_table(
-            active_sequence, attention_state[layer].compressor.kind, layer);
-        if (!compressed.ok()) {
-            append_errors(result, std::move(compressed.errors));
-            return result;
-        }
+        result = kv_cache->block_table_into(
+            active_sequence, attention_state[layer].compressor.kind, layer,
+            compressed);
+        if (!result.ok()) return result;
     }
 
     // Leases are released only after the executor has consumed the pages, so
@@ -5926,18 +6289,13 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
                             const std::vector<Dsv4KvBlockInfo>& table,
                             std::uint32_t logical_row,
                             CudaDsv4AttentionCandidate& candidate) {
-        const auto found = std::find_if(
-            table.begin(), table.end(), [&](const Dsv4KvBlockInfo& block) {
-                const auto begin = block.logical_begin /
-                                   block.compression_ratio;
-                return logical_row >= begin &&
-                       logical_row < begin + block.used_rows;
-            });
-        if (found == table.end()) {
+        const auto located = locate_physical_kv_block(table, logical_row);
+        if (located == table.size()) {
             result.errors.emplace_back(
                 "rank-local attention candidate page is unavailable");
             return;
         }
+        const auto found = table.begin() + static_cast<std::ptrdiff_t>(located);
         const auto begin = found->logical_begin / found->compression_ratio;
         auto page = page_indices.find(found->id);
         if (page == page_indices.end()) {
@@ -5981,14 +6339,14 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
     }
     for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
         const auto logical_row = sparse ? indexed_positions[item] : item;
-        locate(attention_state[layer].compressor.kind, compressed.value,
+        locate(attention_state[layer].compressor.kind, compressed,
                logical_row, scratch.candidates[item]);
         if (!result.ok()) return result;
     }
     const auto window_count = std::min(position + 1U, kWindow);
     for (std::uint32_t item = 0U; item < window_count; ++item) {
         const auto logical_row = position + 1U - window_count + item;
-        locate(Dsv4KvBlockKind::Sliding, sliding.value, logical_row,
+        locate(Dsv4KvBlockKind::Sliding, sliding, logical_row,
                scratch.candidates[
                    static_cast<std::size_t>(compressed_width) + item]);
         if (!result.ok()) return result;
@@ -6007,9 +6365,121 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
     const auto slot = layer_device(layer);
     const auto prefix = layer_prefix(layer) + "attn.";
 
+    // Every queued call has completed before the next token enters this
+    // function. Release that layer's previous-token candidate leases before
+    // reserving its next row; otherwise the cache correctly refuses to mutate
+    // a block that still appears in flight.
+    scratch.leases.clear();
+    for (auto& pages : scratch.pages) pages.clear();
     result = transaction.reserve_layer(
         layer, position, ratio, state.compressor.kind, index_ratio);
     if (!result.ok()) return result;
+
+    // Below the sparse-index threshold every candidate is determined entirely
+    // by position and the reserved block table. Build the complete borrowed
+    // call now; the live Q/KV and compressor rows are produced later by the
+    // executor's stream-ordered callback, so all 43 layers can be submitted
+    // before the one completion boundary.
+    if (index_ratio == 0U) {
+        auto sink = host_tensor(prefix + "attn_sink", kHeads);
+        if (!sink.ok()) {
+            append_errors(result, std::move(sink.errors));
+            return result;
+        }
+        if (ratio != 0U) {
+            const auto dimensions = static_cast<std::size_t>(
+                state.compressor.coefficient) * state.compressor.head_dim;
+            auto ape = host_tensor(
+                prefix + "compressor.ape",
+                static_cast<std::uint64_t>(ratio) * dimensions);
+            auto norm_weight = host_tensor(
+                prefix + "compressor.norm.weight",
+                state.compressor.head_dim);
+            if (!ape.ok() || !norm_weight.ok()) {
+                append_errors(result, ape.ok() ? std::move(norm_weight.errors)
+                                               : std::move(ape.errors));
+                return result;
+            }
+        }
+        for (std::size_t index = 0U; index < scratch.cosines.size(); ++index) {
+            const float angle = static_cast<float>(position) *
+                                state.frequencies[index];
+            scratch.cosines[index] = std::cos(angle);
+            scratch.inverse_sines[index] = -std::sin(angle);
+        }
+
+        const auto patch_bytes =
+            static_cast<std::size_t>(transaction.patch_bytes(layer));
+        scratch.patches[0].clear();
+        scratch.patches[1].clear();
+        // The executor only exists in an NCCL build. Rank-local decode already
+        // fails closed at initialization without it, so this branch is
+        // unreachable there; it still reports rather than falling through, and
+        // the guard is what keeps a default STRATA_ENABLE_NCCL=OFF build
+        // compiling.
+#if defined(STRATA_HAS_NCCL)
+        result = rank_local_executor->replica_page_patch_staging(
+            layer, patch_bytes, scratch.replica_patch);
+#else
+        result.errors.emplace_back(
+            "rank-local replica page staging requires an NCCL build");
+#endif
+        if (!result.ok()) return result;
+        std::fill(scratch.replica_patch.begin(), scratch.replica_patch.end(),
+                  std::byte{});
+        scratch.compressed_row.clear();
+        scratch.index_row.clear();
+        scratch.indexed_positions.clear();
+        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+            result = transaction.page_writes(
+                layer, rank, scratch.page_writes[rank]);
+            if (!result.ok()) return result;
+        }
+        const auto candidate_started = std::chrono::steady_clock::now();
+        result = rank_local_candidates(layer, position, {}, scratch);
+        graph_stats.rank_local_candidate_nanoseconds +=
+            elapsed_nanoseconds(candidate_started);
+        if (!result.ok()) return result;
+
+        call = {};
+        call.layer = layer;
+        call.position = position;
+        call.weights = rank_local_weights->layer_view(layer, token);
+        // The sparse-index compressor exists in the resident store for the 1M
+        // operating point but is not part of this request's active state.
+        for (auto& rank_weights : call.weights.rank) {
+            rank_weights.index_compressor_value = nullptr;
+            rank_weights.index_compressor_gate = nullptr;
+            rank_weights.index_compressor_elements = 0U;
+        }
+        call.head_sinks = *sink.value;
+        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+            call.pages[rank] = scratch.pages[rank];
+            auto& context = rank_local_page_contexts[layer][rank];
+            context.owner = this;
+            context.transaction = &transaction;
+            context.scratch = &scratch;
+            context.layer = layer;
+            context.position = position;
+            context.rank = rank;
+            context.result = {};
+            context.invoked = false;
+            context.elapsed_nanoseconds = 0U;
+            call.page_patches[rank].callback = rank == 0U
+                ? rank_local_page_patch_callback : nullptr;
+            call.page_patches[rank].context = rank == 0U ? &context : nullptr;
+            call.page_patches[rank].ready_patch = rank == 1U
+                ? std::span<const std::byte>(scratch.replica_patch)
+                : std::span<const std::byte>{};
+            call.page_patches[rank].writes = scratch.page_writes[rank];
+        }
+        call.candidates = scratch.candidates;
+        call.inverse_rope_cosines = scratch.cosines;
+        call.inverse_rope_sines = scratch.inverse_sines;
+        call.ordered_page_patches = true;
+        call.terminal = layer + 1U == kLayers;
+        return result;
+    }
 
     // One host-visible preparation per layer, on the slot that owns this
     // layer's centralized compressor weights. The executor's own preparation
@@ -6195,6 +6665,17 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_prepare_layer(
     call.layer = layer;
     call.position = position;
     call.weights = rank_local_weights->layer_view(layer, token);
+    // Indexed-context preparation remains the explicit sequential arm until
+    // Step 4 moves selection inside the device command. Its separate
+    // host-visible preparation already computed these projections.
+    for (auto& rank_weights : call.weights.rank) {
+        rank_weights.compressor_value = nullptr;
+        rank_weights.compressor_gate = nullptr;
+        rank_weights.index_compressor_value = nullptr;
+        rank_weights.index_compressor_gate = nullptr;
+        rank_weights.compressor_elements = 0U;
+        rank_weights.index_compressor_elements = 0U;
+    }
     call.head_sinks = *sink.value;
     for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
         call.pages[rank] = scratch.pages[rank];
@@ -6978,9 +7459,42 @@ ValidationResult DeepSeekV4Runtime::initialize(
         }
     }
 
+    auto effective_explicit_vram_budget = config.explicit_vram_budget_bytes;
+    if (config.decode_topology == Dsv4DecodeTopology::RankLocalTp2) {
+        impl_->rank_local_initial_device_vram_bytes =
+            device_vram_used_bytes(config.devices);
+        if (impl_->rank_local_initial_device_vram_bytes.size() !=
+            config.devices.size()) {
+            result.errors.emplace_back(
+                "rank-local initial VRAM ledger does not match devices");
+            return result;
+        }
+        for (std::size_t slot = 0U;
+             slot < impl_->rank_local_initial_device_vram_bytes.size();
+             ++slot) {
+            const auto initial =
+                impl_->rank_local_initial_device_vram_bytes[slot];
+            if (initial >= kDsv4RankLocalPerDeviceVramCeiling) {
+                result.errors.emplace_back(
+                    "rank-local CUDA device " +
+                    std::to_string(config.devices[slot]) +
+                    " already uses " + std::to_string(initial) +
+                    " B, which leaves no room below the " +
+                    std::to_string(kDsv4RankLocalPerDeviceVramCeiling) +
+                    " B program ceiling");
+                return result;
+            }
+            const auto available =
+                kDsv4RankLocalPerDeviceVramCeiling - initial;
+            effective_explicit_vram_budget =
+                effective_explicit_vram_budget == 0U
+                    ? available
+                    : std::min(effective_explicit_vram_budget, available);
+        }
+    }
     auto device_plan = plan_runtime_devices(
         config.devices, config.vram_cache_fraction, kDeviceWorkspaceReserve,
-        2ULL << 30U, "DeepSeek", config.explicit_vram_budget_bytes);
+        2ULL << 30U, "DeepSeek", effective_explicit_vram_budget);
     if (!device_plan.ok()) {
         result.errors = std::move(device_plan.errors);
         return result;
@@ -6991,60 +7505,95 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (kv_device_capacities.empty()) {
         kv_device_capacities.resize(config.devices.size());
         if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
-            const auto add_pages = [&](std::size_t slot,
-                                       Dsv4KvBlockKind kind,
-                                       std::uint32_t ratio,
-                                       std::uint64_t rows) {
-                const auto capacity_rows = dsv4_kv_block_rows(
-                    kind, ratio, true);
-                const auto format = dsv4_kv_format(kind, false, true);
-                const auto page_bytes = dsv4_kv_row_bytes(kind, format) *
-                                        capacity_rows;
-                const auto pages = (rows + capacity_rows - 1U) /
-                                   capacity_rows;
-                if (capacity_rows == 0U || page_bytes == 0U ||
-                    pages > std::numeric_limits<std::uint64_t>::max() /
-                                page_bytes ||
-                    pages * page_bytes >
-                        std::numeric_limits<std::uint64_t>::max() -
-                            kv_device_capacities[slot]) {
-                    return false;
-                }
-                kv_device_capacities[slot] += pages * page_bytes;
-                return true;
-            };
-            const auto& ratios =
-                kDeepSeekV4ExecutionContract.compression_ratios;
-            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-                const auto slot = device_plan.value.weighted_schedule[
-                    layer % device_plan.value.weighted_schedule.size()];
-                const auto sliding_rows = std::min<std::uint64_t>(
-                    config.maximum_context_tokens,
-                    kWindow + kDsv4PhysicalKvBlockRows - 1U);
-                const auto ratio = ratios[layer];
-                bool admitted = add_pages(
-                    slot, Dsv4KvBlockKind::Sliding, 1U, sliding_rows);
-                if (admitted && ratio != 0U) {
-                    const auto compressed_rows =
-                        (static_cast<std::uint64_t>(
-                             config.maximum_context_tokens) + ratio - 1U) /
-                        ratio;
-                    admitted = add_pages(
-                        slot, ratio == 4U ? Dsv4KvBlockKind::Csa
-                                         : Dsv4KvBlockKind::Hca,
-                        ratio, compressed_rows);
-                    if (admitted && ratio == 4U &&
-                        config.maximum_context_tokens > kIndexTopK * ratio) {
-                        admitted = add_pages(
-                            slot, Dsv4KvBlockKind::LearnedIndex, ratio,
-                            compressed_rows);
-                    }
-                }
-                if (!admitted) {
-                    result.errors.emplace_back(
-                        "DeepSeek physical KV capacity overflows");
+            if (config.decode_topology == Dsv4DecodeTopology::RankLocalTp2) {
+                auto physical = dsv4_physical_kv_admission(
+                    config.maximum_context_tokens);
+                if (!physical.ok()) {
+                    result.errors = std::move(physical.errors);
                     return result;
                 }
+                std::fill(kv_device_capacities.begin(),
+                          kv_device_capacities.end(),
+                          physical.value.payload_bytes);
+            } else {
+                const auto add_pages = [&](std::size_t slot,
+                                           Dsv4KvBlockKind kind,
+                                           std::uint32_t ratio,
+                                           std::uint64_t rows) {
+                    const auto capacity_rows = dsv4_kv_block_rows(
+                        kind, ratio, true);
+                    const auto format = dsv4_kv_format(kind, false, true);
+                    const auto page_bytes = dsv4_kv_row_bytes(kind, format) *
+                                            capacity_rows;
+                    const auto pages = (rows + capacity_rows - 1U) /
+                                       capacity_rows;
+                    if (capacity_rows == 0U || page_bytes == 0U ||
+                        pages > std::numeric_limits<std::uint64_t>::max() /
+                                    page_bytes ||
+                        pages * page_bytes >
+                            std::numeric_limits<std::uint64_t>::max() -
+                                kv_device_capacities[slot]) {
+                        return false;
+                    }
+                    kv_device_capacities[slot] += pages * page_bytes;
+                    return true;
+                };
+                const auto& ratios =
+                    kDeepSeekV4ExecutionContract.compression_ratios;
+                for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+                    const auto slot = device_plan.value.weighted_schedule[
+                        layer % device_plan.value.weighted_schedule.size()];
+                    const auto sliding_rows = std::min<std::uint64_t>(
+                        config.maximum_context_tokens,
+                        kWindow + kDsv4PhysicalKvBlockRows - 1U);
+                    const auto ratio = ratios[layer];
+                    bool admitted = add_pages(
+                        slot, Dsv4KvBlockKind::Sliding, 1U, sliding_rows);
+                    if (admitted && ratio != 0U) {
+                        const auto compressed_rows =
+                            (static_cast<std::uint64_t>(
+                                 config.maximum_context_tokens) + ratio - 1U) /
+                            ratio;
+                        admitted = add_pages(
+                            slot, ratio == 4U ? Dsv4KvBlockKind::Csa
+                                             : Dsv4KvBlockKind::Hca,
+                            ratio, compressed_rows);
+                        if (admitted && ratio == 4U &&
+                            config.maximum_context_tokens >
+                                kIndexTopK * ratio) {
+                            admitted = add_pages(
+                                slot, Dsv4KvBlockKind::LearnedIndex, ratio,
+                                compressed_rows);
+                        }
+                    }
+                    if (!admitted) {
+                        result.errors.emplace_back(
+                            "DeepSeek physical KV capacity overflows");
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+    if (config.decode_topology == Dsv4DecodeTopology::RankLocalTp2 &&
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        auto physical = dsv4_physical_kv_admission(
+            config.maximum_context_tokens);
+        if (!physical.ok()) {
+            result.errors = std::move(physical.errors);
+            return result;
+        }
+        for (std::size_t slot = 0U; slot < kv_device_capacities.size();
+             ++slot) {
+            if (kv_device_capacities[slot] < physical.value.payload_bytes) {
+                result.errors.emplace_back(
+                    "rank-local CUDA device " +
+                    std::to_string(config.devices[slot]) +
+                    " KV capacity " +
+                    std::to_string(kv_device_capacities[slot]) +
+                    " B is below the replicated full-context requirement " +
+                    std::to_string(physical.value.payload_bytes) + " B");
+                return result;
             }
         }
     }
@@ -7340,6 +7889,22 @@ ValidationResult DeepSeekV4Runtime::initialize(
     impl_->initialization_metrics.resident_stage = impl_->resident.stats();
     impl_->initialization_metrics.cuda = impl_->cuda.stats();
     impl_->initialization_metrics.cache = impl_->weights->stats();
+    if (impl_->rank_local_active && impl_->rank_local_weights != nullptr) {
+        const auto rank_weights = impl_->rank_local_weights->device_bytes();
+        impl_->initialization_metrics.rank_local_initial_device_vram_bytes =
+            impl_->rank_local_initial_device_vram_bytes;
+        impl_->initialization_metrics.rank_local_weight_bytes.assign(
+            rank_weights.begin(), rank_weights.end());
+        impl_->initialization_metrics
+            .rank_local_expert_cache_capacity_bytes.assign(
+                impl_->rank_local_admission.expert_cache_capacity_bytes.begin(),
+                impl_->rank_local_admission.expert_cache_capacity_bytes.end());
+        impl_->initialization_metrics.rank_local_admitted_device_bytes.assign(
+            impl_->rank_local_admission.device_total_bytes.begin(),
+            impl_->rank_local_admission.device_total_bytes.end());
+        impl_->initialization_metrics.rank_local_admitted_host_bytes =
+            impl_->rank_local_admission.host_total_bytes;
+    }
     if (impl_->kv_cache != nullptr) {
         impl_->initialization_metrics.kv_cache = impl_->kv_cache->stats();
     }
@@ -7530,11 +8095,16 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     std::uint32_t position = static_cast<std::uint32_t>(
         result.prompt_token_ids.size());
     std::uint64_t decode_steps = 0U;
+    result.metrics.decode_step_seconds.reserve(maximum_new_tokens);
     const auto decode_started = std::chrono::steady_clock::now();
     while (next.value != stop_token && !output.stopped() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const auto input_token = next.value;
+        const auto step_started = std::chrono::steady_clock::now();
         next = impl_->forward_token(input_token, position++, true);
+        result.metrics.decode_step_seconds.push_back(
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - step_started).count());
         if (!next.ok()) {
             result.errors = std::move(next.errors);
             return result;
@@ -7568,9 +8138,11 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     const auto graph_after_decode = impl_->graph_stats;
     const double prefill_seconds = result.metrics.prefill_seconds;
     const double decode_seconds = result.metrics.decode_seconds;
+    auto decode_step_seconds = std::move(result.metrics.decode_step_seconds);
     result.metrics = impl_->initialization_metrics;
     result.metrics.prefill_seconds = prefill_seconds;
     result.metrics.decode_seconds = decode_seconds;
+    result.metrics.decode_step_seconds = std::move(decode_step_seconds);
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
     result.metrics.prefill_tokens = prefill_tokens.size();
     result.metrics.reused_prompt_tokens = prefill_offset;

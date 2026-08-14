@@ -29,6 +29,7 @@ const char* dsv4_decode_topology_name(Dsv4DecodeTopology topology) noexcept {
 
 std::uint64_t Dsv4RankLocalDeviceAccount::fixed_total() const noexcept {
     std::uint64_t total = 0U;
+    total = add_saturating(total, initial_device_usage_bytes);
     total = add_saturating(total, rank_local_weight_bytes);
     total = add_saturating(total, centralized_spine_bytes);
     total = add_saturating(total, workspace_bytes);
@@ -46,6 +47,7 @@ std::uint64_t Dsv4RankLocalHostAccount::total() const noexcept {
     std::uint64_t total = 0U;
     total = add_saturating(total, routed_cpu_storage_bytes);
     total = add_saturating(total, host_parameter_bytes);
+    total = add_saturating(total, kv_state_bytes);
     total = add_saturating(total, host_workspace_bytes);
     return total;
 }
@@ -82,7 +84,14 @@ ValidationResult plan_dsv4_rank_local_cpus(
                 std::to_string(minimum_cpus_per_rank));
             continue;
         }
-        rank_cpus[rank] = cpus;
+        // The accepted M3 operating point uses exactly 24 workers per rank.
+        // Passing every logical CPU from a larger NUMA node changes that
+        // measured resource shape (and can add SMT contention) while still
+        // appearing to satisfy the minimum. Keep admission tied to the
+        // calibrated pool width.
+        rank_cpus[rank].assign(
+            cpus.begin(),
+            cpus.begin() + static_cast<std::ptrdiff_t>(minimum_cpus_per_rank));
     }
     if (!result.ok()) {
         for (auto& cpus : rank_cpus) cpus.clear();
@@ -182,6 +191,8 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
                 std::to_string(ceiling) + " B by " +
                 std::to_string(fixed - ceiling) + " B (rank-local weights " +
                 std::to_string(account.rank_local_weight_bytes) +
+                " B, initial device usage " +
+                std::to_string(account.initial_device_usage_bytes) +
                 " B, centralized spine " +
                 std::to_string(account.centralized_spine_bytes) +
                 " B, workspace " + std::to_string(account.workspace_bytes) +

@@ -29,6 +29,9 @@ static_assert(kChainSlots == 43U,
 constexpr std::size_t kHidden = 4096U;
 constexpr std::size_t kQueryRank = 1024U;
 constexpr std::size_t kKeyValue = 512U;
+constexpr std::size_t kMaximumCompressorElements = 1024U;
+constexpr std::size_t kMaximumIndexCompressorElements = 256U;
+constexpr std::size_t kReplicaPagePatchSlotBytes = 2048U;
 constexpr std::size_t kMhc = 4U * kHidden;
 constexpr std::size_t kRouter = 256U;
 constexpr std::size_t kVocabulary = kDsv4RankLocalVocabulary;
@@ -221,6 +224,15 @@ struct Dsv4RankLocalLayerExecutor::Impl {
         std::uint16_t* attention_publication{};
         std::array<float, kQueryRank> prepared_query{};
         std::array<float, kKeyValue> prepared_key_value{};
+        std::array<float, kMaximumCompressorElements>
+            prepared_compressor_values{};
+        std::array<float, kMaximumCompressorElements>
+            prepared_compressor_scores{};
+        std::array<float, kMaximumIndexCompressorElements>
+            prepared_index_compressor_values{};
+        std::array<float, kMaximumIndexCompressorElements>
+            prepared_index_compressor_scores{};
+        Dsv4HostMoePhaseTimings chain_cpu_moe_phases{};
         float* moe_snapshot{};
         std::uint16_t* moe_publication{};
         std::uint16_t* head_send{};
@@ -239,6 +251,8 @@ struct Dsv4RankLocalLayerExecutor::Impl {
     bool chain_mode{};
     std::size_t chain_count{};
     bool terminal_active{};
+    cudaEvent_t rank0_page_patch_ready{};
+    std::byte* replica_page_patch_staging{};
     RouterSpec router_spec;
     bool initialized{};
 };
@@ -268,11 +282,27 @@ struct ActiveCallGuard {
     const bool next_mhc_valid = require_next_attention_mhc
         ? valid_mhc(weights.next_attention_mhc)
         : weights.next_attention_mhc == nullptr;
+    const auto valid_optional_projection = [&](const CudaWeight* value,
+                                               const CudaWeight* gate,
+                                               std::uint32_t elements,
+                                               std::size_t maximum) {
+        return elements == 0U
+            ? value == nullptr && gate == nullptr
+            : elements <= maximum && valid_weight(value) && valid_weight(gate);
+    };
     return valid_weight(weights.query_a) && valid_weight(weights.query_b) &&
            valid_weight(weights.key_value) && valid_weight(weights.output_a) &&
            valid_weight(weights.output_b) && valid_weight(weights.router) &&
            valid_expert(weights.shared) && valid_mhc(weights.attention_mhc) &&
            valid_mhc(weights.ffn_mhc) && next_mhc_valid &&
+           valid_optional_projection(
+               weights.compressor_value, weights.compressor_gate,
+               weights.compressor_elements, kMaximumCompressorElements) &&
+           valid_optional_projection(
+               weights.index_compressor_value,
+               weights.index_compressor_gate,
+               weights.index_compressor_elements,
+               kMaximumIndexCompressorElements) &&
            weights.query_norm.size() == 1024U &&
            weights.key_value_norm.size() == 512U &&
            std::all_of(weights.query_norm.begin(), weights.query_norm.end(),
@@ -326,12 +356,19 @@ struct ActiveCallGuard {
         const auto& patch = call.page_patches[rank];
         const bool enabled = patch.callback != nullptr ||
                               patch.context != nullptr ||
+                              !patch.ready_patch.empty() ||
                               !patch.writes.empty();
         if (rank == 0U) patches_enabled = enabled;
+        const bool host_patch = patch.callback != nullptr &&
+            patch.context != nullptr && patch.ready_patch.empty() &&
+            !patch.writes.empty();
+        const bool replica_patch = call.ordered_page_patches && rank == 1U &&
+            patch.callback == nullptr && patch.context == nullptr &&
+            !patch.ready_patch.empty() && !patch.writes.empty();
         if (enabled != patches_enabled ||
-            (enabled && (patch.callback == nullptr || patch.context == nullptr ||
-                         patch.writes.empty())) ||
+            (enabled && !(host_patch || replica_patch)) ||
             (!enabled && (patch.callback != nullptr || patch.context != nullptr ||
+                          !patch.ready_patch.empty() ||
                           !patch.writes.empty()))) return false;
         if (enabled) {
             for (const auto& write : patch.writes) {
@@ -349,6 +386,7 @@ struct ActiveCallGuard {
             }
         }
     }
+    if (call.ordered_page_patches && !patches_enabled) return false;
     for (std::size_t rank = 0U; rank < kWorld; ++rank) {
         for (const auto& candidate : call.candidates) {
             if (candidate.valid &&
@@ -464,6 +502,14 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
         slot.layer, state.route, input,
         *owner.options.resident,
         destination, &callback_phases);
+    state.chain_cpu_moe_phases.gate_up_nanoseconds +=
+        callback_phases.gate_up_nanoseconds;
+    state.chain_cpu_moe_phases.down_nanoseconds +=
+        callback_phases.down_nanoseconds;
+    state.chain_cpu_moe_phases.reduce_nanoseconds +=
+        callback_phases.reduce_nanoseconds;
+    state.chain_cpu_moe_phases.total_nanoseconds +=
+        callback_phases.total_nanoseconds;
     if (slot.result != nullptr)
         slot.result->cpu_moe_phases[rank] = callback_phases;
     if (slot.result != nullptr && status.ok()) {
@@ -578,6 +624,15 @@ Dsv4RankLocalLayerExecutor::Dsv4RankLocalLayerExecutor(CudaBackend& backend)
 
 Dsv4RankLocalLayerExecutor::~Dsv4RankLocalLayerExecutor() {
     if (impl_ == nullptr) return;
+    if (impl_->rank0_page_patch_ready != nullptr) {
+        static_cast<void>(cudaSetDevice(impl_->options.devices[0]));
+        static_cast<void>(cudaEventDestroy(impl_->rank0_page_patch_ready));
+        impl_->rank0_page_patch_ready = nullptr;
+    }
+    if (impl_->replica_page_patch_staging != nullptr) {
+        static_cast<void>(cudaFreeHost(impl_->replica_page_patch_staging));
+        impl_->replica_page_patch_staging = nullptr;
+    }
     for (auto& rank : impl_->ranks) {
         if (rank.communicator != nullptr) {
             static_cast<void>(ncclCommDestroy(rank.communicator));
@@ -669,6 +724,24 @@ ValidationResult Dsv4RankLocalLayerExecutor::initialize(
             return result;
         }
     }
+    if (!cuda_ok(cudaSetDevice(options.devices[0]),
+                 "select rank-0 page-patch event device", result.errors)) {
+        return result;
+    }
+    void* replica_staging = nullptr;
+    if (!cuda_ok(cudaMallocHost(
+                     &replica_staging,
+                     kChainSlots * kReplicaPagePatchSlotBytes),
+                 "allocate fixed replica page-patch staging", result.errors)) {
+        return result;
+    }
+    impl_->replica_page_patch_staging =
+        static_cast<std::byte*>(replica_staging);
+    if (!cuda_ok(cudaEventCreateWithFlags(&impl_->rank0_page_patch_ready,
+                                           cudaEventDisableTiming),
+                 "create rank-0 page-patch event", result.errors)) {
+        return result;
+    }
     std::array<ncclComm_t, kWorld> communicators{};
     if (!nccl_ok(ncclCommInitAll(
                      communicators.data(), static_cast<int>(kWorld),
@@ -680,6 +753,24 @@ ValidationResult Dsv4RankLocalLayerExecutor::initialize(
         impl_->ranks[rank].communicator = communicators[rank];
     }
     impl_->initialized = true;
+    return result;
+}
+
+ValidationResult Dsv4RankLocalLayerExecutor::replica_page_patch_staging(
+    std::size_t slot, std::size_t bytes, std::span<std::byte>& output) {
+    ValidationResult result;
+    output = {};
+    if (!impl_->initialized || impl_->replica_page_patch_staging == nullptr ||
+        slot >= kChainSlots || bytes == 0U ||
+        bytes > kReplicaPagePatchSlotBytes) {
+        result.errors.emplace_back(
+            "rank-local replica page-patch staging request is invalid");
+        return result;
+    }
+    output = std::span<std::byte>(
+        impl_->replica_page_patch_staging +
+            static_cast<std::ptrdiff_t>(slot * kReplicaPagePatchSlotBytes),
+        bytes);
     return result;
 }
 
@@ -812,6 +903,10 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
         prepare.query_a = weights.query_a;
         prepare.query_b = weights.query_b;
         prepare.key_value = weights.key_value;
+        prepare.compressor_value = weights.compressor_value;
+        prepare.compressor_gate = weights.compressor_gate;
+        prepare.index_compressor_value = weights.index_compressor_value;
+        prepare.index_compressor_gate = weights.index_compressor_gate;
         prepare.mhc_device = devices_[rank];
         prepare.query_norm = weights.query_norm;
         prepare.key_value_norm = weights.key_value_norm;
@@ -821,6 +916,9 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
         const bool host_page_patch = page_patch.callback != nullptr;
         prepare.host_callback = page_patch.callback;
         prepare.host_callback_context = page_patch.context;
+        prepare.ready_page_patches = page_patch.ready_patch;
+        prepare.page_patch_ready_event = !page_patch.ready_patch.empty()
+            ? static_cast<void*>(impl_->rank0_page_patch_ready) : nullptr;
         prepare.page_writes = page_patch.writes;
         prepare.device_only = !host_page_patch;
         auto prepared = backend_.dsv4_prepare_attention(
@@ -831,10 +929,30 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
             host_page_patch
                 ? std::span<float>(impl_->ranks[rank].prepared_key_value)
                 : std::span<float>{},
-            {}, {}, {}, {});
+            std::span<float>(impl_->ranks[rank].prepared_compressor_values)
+                .first(weights.compressor_elements),
+            std::span<float>(impl_->ranks[rank].prepared_compressor_scores)
+                .first(weights.compressor_elements),
+            std::span<float>(
+                impl_->ranks[rank].prepared_index_compressor_values)
+                .first(weights.index_compressor_elements),
+            std::span<float>(
+                impl_->ranks[rank].prepared_index_compressor_scores)
+                .first(weights.index_compressor_elements));
         if (!prepared.ok()) {
             output.errors.insert(output.errors.end(), prepared.errors.begin(),
                                  prepared.errors.end());
+            break;
+        }
+        if (rank == 0U && call.ordered_page_patches &&
+            (!cuda_ok(cudaSetDevice(devices_[rank]),
+                      "select canonical page-patch event device",
+                      output.errors) ||
+             !cuda_ok(cudaEventRecord(
+                          impl_->rank0_page_patch_ready,
+                          static_cast<cudaStream_t>(mhc_views[rank].stream)),
+                      "record canonical rank-0 page patch",
+                      output.errors))) {
             break;
         }
         CudaDsv4PagedAttentionMhcRequest request;
@@ -1300,6 +1418,11 @@ ValidationResult Dsv4RankLocalLayerExecutor::enqueue_chain_layer(
         result.errors.emplace_back("rank-local chain accepts at most 43 layers");
         return result;
     }
+    if (impl_->chain_count == 0U) {
+        for (auto& rank : impl_->ranks) {
+            rank.chain_cpu_moe_phases = {};
+        }
+    }
     if (failure != Dsv4RankLocalFailure::None &&
         (!call.terminal || failure == Dsv4RankLocalFailure::MoeBeforeEnqueueRank1)) {
         result.errors.emplace_back(
@@ -1340,6 +1463,12 @@ ValidationResult Dsv4RankLocalLayerExecutor::finish_chain(
         auto finished = backend_.finish_deepseek_moe_chain(devices_[rank]);
         result.errors.insert(result.errors.end(), finished.errors.begin(),
                              finished.errors.end());
+    }
+    // The CPU callbacks update these records asynchronously. Read them only
+    // after both rank streams have drained above.
+    for (std::size_t rank = 0U; rank < kWorld; ++rank) {
+        chain_result.cpu_moe_phases[rank] =
+            impl_->ranks[rank].chain_cpu_moe_phases;
     }
     for (std::size_t rank = 0U; rank < kWorld; ++rank) {
         CudaDsv4MhcDeviceView view{};

@@ -1029,9 +1029,17 @@ __device__ unsigned long long physical_index_key(float score,
 // 256 threads rather than 64 -- at 64 the hardware's 16-blocks-per-SM cap, not
 // the register or shared budget, holds occupancy to two thirds.
 constexpr std::uint32_t kPhysicalIndexBlockThreads = 256U;
-constexpr std::uint32_t kPhysicalIndexMaxRowsPerBlock = 8U;
 constexpr std::uint32_t kPhysicalIndexMaxHeadDim = 1'024U;
+// Candidate rows scored per thread. One row per thread leaves each thread with
+// a single dependent __fadd_rn chain fed by one load per iteration, which at
+// full occupancy still issues at about 0.28 instructions per cycle: the loop
+// stalls on latency rather than saturating any resource. Scoring several rows
+// against the same query element gives the scheduler independent chains and
+// amortizes the query load, which measurement attributes at about 32% of the
+// kernel. Rows are added to the block, not threads, so occupancy is unchanged.
+constexpr std::uint32_t kPhysicalIndexRowsPerThread = 4U;
 
+template <std::uint32_t kRowsPerThread>
 __global__ void dsv4_physical_index_score_kernel(
     float* scores, unsigned long long* keys, const float* queries,
     const float* weights, const PhysicalIndexDeviceSegment* segments,
@@ -1053,7 +1061,7 @@ __global__ void dsv4_physical_index_score_kernel(
     auto* head_scores = key_values +
         static_cast<std::uint64_t>(rows_per_block) * head_dim;
     auto* row_live = reinterpret_cast<unsigned int*>(
-        head_scores + blockDim.x);
+        head_scores + static_cast<std::uint64_t>(rows_per_block) * heads);
 
     const auto lane = threadIdx.x % heads;
     const auto slot = threadIdx.x / heads;
@@ -1064,7 +1072,10 @@ __global__ void dsv4_physical_index_score_kernel(
         e4m3_table[entry] =
             fp8_e4m3_value(static_cast<unsigned char>(entry));
     }
-    if (threadIdx.x < rows_per_block) row_live[threadIdx.x] = 1U;
+    for (std::uint32_t index = threadIdx.x; index < rows_per_block;
+         index += blockDim.x) {
+        row_live[index] = 1U;
+    }
     __syncthreads();
 
     // Dequantize each of the block's rows once, cooperatively, into shared
@@ -1127,34 +1138,58 @@ __global__ void dsv4_physical_index_score_kernel(
     }
     __syncthreads();
 
-    const auto row = first_row + slot;
-    const bool live = slot < rows_per_block && row < candidates &&
-                      row_live[slot] != 0U;
     // Queries arrive column-major (column * heads + head) so the heads of one
     // row read consecutive floats. Head-major queries would stride by head_dim
     // and cost a separate transaction per thread.
-    float dot = 0.0F;
-    if (live) {
-        const auto* query = queries + lane;
-        const auto* key = key_values +
-            static_cast<std::uint64_t>(slot) * head_dim;
-        // dsv4_index_scores_f32 accumulates query * key with a separate
-        // multiply and add, in ascending column order. Explicit
-        // round-to-nearest intrinsics stop the compiler contracting that into
-        // an fma, and the loop stays sequential per head, so the result is bit
-        // identical to the reference rather than a reassociated approximation.
-        for (std::uint32_t column = 0U; column < head_dim; ++column) {
-            dot = __fadd_rn(
-                dot,
-                __fmul_rn(query[static_cast<std::uint64_t>(column) * heads],
-                          key[column]));
+    //
+    // Each thread owns `kRowsPerThread` consecutive local rows. The query
+    // element for this column is loaded once and reused across them, and each
+    // row keeps its own accumulator. dsv4_index_scores_f32 accumulates
+    // query * key with a separate multiply and add in ascending column order;
+    // every accumulator here still walks columns in that same ascending order
+    // under explicit round-to-nearest intrinsics, so no fma contraction or
+    // reassociation occurs and each row's result is bit identical to the
+    // reference. Only which thread computes a row has changed.
+    const auto* query = queries + lane;
+    float dot[kRowsPerThread];
+    #pragma unroll
+    for (std::uint32_t index = 0U; index < kRowsPerThread; ++index) {
+        dot[index] = 0.0F;
+    }
+    const auto first_local = slot * kRowsPerThread;
+    for (std::uint32_t column = 0U; column < head_dim; ++column) {
+        const float query_value =
+            query[static_cast<std::uint64_t>(column) * heads];
+        #pragma unroll
+        for (std::uint32_t index = 0U; index < kRowsPerThread; ++index) {
+            const auto local = first_local + index;
+            dot[index] = __fadd_rn(
+                dot[index],
+                __fmul_rn(query_value,
+                          key_values[static_cast<std::uint64_t>(local) *
+                                         head_dim + column]));
         }
     }
-    head_scores[threadIdx.x] = bf16_round(dot);
+    #pragma unroll
+    for (std::uint32_t index = 0U; index < kRowsPerThread; ++index) {
+        const auto local = first_local + index;
+        if (local >= rows_per_block) continue;
+        const auto candidate_row = first_row + local;
+        const bool live = candidate_row < candidates &&
+                          row_live[local] != 0U;
+        head_scores[static_cast<std::uint64_t>(local) * heads + lane] =
+            live ? bf16_round(dot[index]) : 0.0F;
+    }
     __syncthreads();
-    if (lane != 0U || !live) return;
+
+    // One thread per local row performs the weighted reduction, in the same
+    // ascending head order as before.
+    if (threadIdx.x >= rows_per_block) return;
+    const auto local = threadIdx.x;
+    const auto row = first_row + local;
+    if (row >= candidates || row_live[local] == 0U) return;
     const auto* row_scores = head_scores +
-        static_cast<std::uint64_t>(slot) * heads;
+        static_cast<std::uint64_t>(local) * heads;
     float score = 0.0F;
     for (std::uint32_t head = 0U; head < heads; ++head) {
         score = __fadd_rn(
@@ -1211,12 +1246,28 @@ __global__ void dsv4_physical_index_pivot_kernel(
     const std::uint32_t* histogram, const std::uint32_t* remaining,
     std::uint32_t* pivot_bin, std::uint32_t* above_count) {
     __shared__ std::uint32_t suffix[kPhysicalIndexPivotThreads];
+    __shared__ std::uint32_t pivot_bins[kPhysicalIndexPivotGroup];
     __shared__ std::uint32_t pivot_group;
     const auto thread = threadIdx.x;
     const auto owed = *remaining;
+    // Bin counts are integers, so the group sum is order-independent and only
+    // the access pattern matters. Reading the group one uint32 at a time makes
+    // a warp touch 32 separate 256 B regions, and each 4 B request still pulls
+    // a whole 32 B sector: 8x read amplification, turning 256 KiB of histogram
+    // into about 2 MiB of traffic. A group is 64 contiguous uint32 and the
+    // allocation is 256 B aligned, so it can be read as 16 uint4 instead,
+    // which cuts the amplification to 2x for the same arithmetic.
     std::uint32_t total = 0U;
-    for (std::uint32_t index = 0U; index < kPhysicalIndexPivotGroup; ++index) {
-        total += histogram[thread * kPhysicalIndexPivotGroup + index];
+    const auto* group_words = reinterpret_cast<const uint4*>(
+        histogram + thread * kPhysicalIndexPivotGroup);
+    #pragma unroll
+    for (std::uint32_t index = 0U;
+         index < kPhysicalIndexPivotGroup / 4U; ++index) {
+        const uint4 quad = group_words[index];
+        total += quad.x;
+        total += quad.y;
+        total += quad.z;
+        total += quad.w;
     }
     suffix[thread] = total;
     if (thread == 0U) pivot_group = 0U;
@@ -1239,15 +1290,24 @@ __global__ void dsv4_physical_index_pivot_kernel(
                              suffix[thread + 1U] < owed;
     if (reaches && above_short) pivot_group = thread;
     __syncthreads();
-    if (thread != 0U) return;
+
+    // The final walk is inherently sequential -- it stops at the first bin that
+    // reaches the quota -- but it does not have to chase global memory. Staging
+    // the pivot group's 64 bins coalesced turns up to 64 dependent global loads
+    // on one thread into 64 shared reads.
     const auto group = pivot_group;
+    const auto first = group * kPhysicalIndexPivotGroup;
+    if (thread < kPhysicalIndexPivotGroup) {
+        pivot_bins[thread] = histogram[first + thread];
+    }
+    __syncthreads();
+    if (thread != 0U) return;
     std::uint32_t accumulated = group + 1U == kPhysicalIndexPivotThreads
         ? 0U : suffix[group + 1U];
-    const auto first = group * kPhysicalIndexPivotGroup;
-    for (std::uint32_t bin = first + kPhysicalIndexPivotGroup; bin-- > first;) {
-        const auto count = histogram[bin];
+    for (std::uint32_t index = kPhysicalIndexPivotGroup; index-- > 0U;) {
+        const auto count = pivot_bins[index];
         if (accumulated + count >= owed) {
-            *pivot_bin = bin;
+            *pivot_bin = first + index;
             *above_count = accumulated;
             return;
         }
@@ -3038,63 +3098,128 @@ __device__ __forceinline__ float dsv4_rope_second(
                      __fmul_rn(first, sine));
 }
 
+// The declared contract pins the accumulation *order* of the FP64 sum, not
+// where its operands are read from. The dequantize/square phase and the
+// scale/store phase carry no cross-column dependency, so only the reduction
+// itself has to stay on one thread, reading shared memory instead of stalling
+// on global latency 1,024 times in a row.
+constexpr std::uint32_t kDsv4QueryRankNormColumns = 1024U;
+constexpr std::uint32_t kDsv4QueryRankNormThreads = kDsv4QueryRankNormColumns;
+
 __global__ void dsv4_query_rank_norm(
     const float* input, const float* weight, __nv_bfloat16* output,
     unsigned int* error) {
-    if (blockIdx.x != 0U || threadIdx.x != 0U) return;
-    constexpr std::uint32_t columns = 1024U;
-    double squared_sum = 0.0;
-    for (std::uint32_t column = 0U; column < columns; ++column) {
+    constexpr std::uint32_t columns = kDsv4QueryRankNormColumns;
+    __shared__ double squares[columns];
+    __shared__ float rounded[columns];
+    __shared__ unsigned int rejected;
+    __shared__ float shared_reciprocal;
+
+    if (threadIdx.x == 0U) rejected = 0U;
+    __syncthreads();
+
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kDsv4QueryRankNormThreads) {
         const float value = bf16_round(input[column]);
         if (!isfinite(value) || !isfinite(weight[column])) {
-            atomicExch(error, 1U);
-            return;
+            atomicExch(&rejected, 1U);
+            continue;
         }
-        squared_sum = __dadd_rn(
-            squared_sum,
-            __dmul_rn(static_cast<double>(value),
-                      static_cast<double>(value)));
+        rounded[column] = value;
+        squares[column] = __dmul_rn(static_cast<double>(value),
+                                    static_cast<double>(value));
     }
-    const float reciprocal = 1.0F / sqrtf(
-        static_cast<float>(squared_sum / static_cast<double>(columns)) +
-        1.0e-6F);
-    for (std::uint32_t column = 0U; column < columns; ++column) {
-        const float value = bf16_round(input[column]);
+    __syncthreads();
+    // The sequential shape returned before writing any output on the first
+    // non-finite column, so a rejected row leaves the destination untouched.
+    if (rejected != 0U) {
+        if (threadIdx.x == 0U) atomicExch(error, 1U);
+        return;
+    }
+
+    if (threadIdx.x == 0U) {
+        double squared_sum = 0.0;
+        for (std::uint32_t column = 0U; column < columns; ++column) {
+            squared_sum = __dadd_rn(squared_sum, squares[column]);
+        }
+        shared_reciprocal = 1.0F / sqrtf(
+            static_cast<float>(squared_sum / static_cast<double>(columns)) +
+            1.0e-6F);
+    }
+    __syncthreads();
+
+    const float reciprocal = shared_reciprocal;
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kDsv4QueryRankNormThreads) {
         output[column] = __float2bfloat16_rn(
-            __fmul_rn(__fmul_rn(value, reciprocal), weight[column]));
+            __fmul_rn(__fmul_rn(rounded[column], reciprocal), weight[column]));
     }
 }
+
+// One block per head, as before. Within the head the same rule applies: the
+// FP64 accumulation keeps its ascending order on one thread, everything else
+// is per-column independent. The RoPE tail rewrites disjoint output pairs, so
+// it parallelizes across pairs once the store phase has been synchronized.
+constexpr std::uint32_t kDsv4QueryNormRopeColumns = 512U;
+constexpr std::uint32_t kDsv4QueryNormRopeThreads = kDsv4QueryNormRopeColumns;
 
 __global__ void dsv4_query_norm_rope(
     const float* input, const float* cosines, const float* sines,
     __nv_bfloat16* output, unsigned int* error) {
     constexpr std::uint32_t heads = 64U;
-    constexpr std::uint32_t columns = 512U;
+    constexpr std::uint32_t columns = kDsv4QueryNormRopeColumns;
     constexpr std::uint32_t rope = 64U;
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
-    if (head >= heads || threadIdx.x != 0U) return;
+    if (head >= heads) return;
     const auto base = static_cast<std::uint64_t>(head) * columns;
-    double squared_sum = 0.0;
-    for (std::uint32_t column = 0U; column < columns; ++column) {
+
+    __shared__ double squares[columns];
+    __shared__ float rounded[columns];
+    __shared__ unsigned int rejected;
+    __shared__ float shared_reciprocal;
+
+    if (threadIdx.x == 0U) rejected = 0U;
+    __syncthreads();
+
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kDsv4QueryNormRopeThreads) {
         const float value = bf16_round(input[base + column]);
         if (!isfinite(value)) {
-            atomicExch(error, 1U);
-            return;
+            atomicExch(&rejected, 1U);
+            continue;
         }
-        squared_sum = __dadd_rn(
-            squared_sum,
-            __dmul_rn(static_cast<double>(value),
-                      static_cast<double>(value)));
+        rounded[column] = value;
+        squares[column] = __dmul_rn(static_cast<double>(value),
+                                    static_cast<double>(value));
     }
-    const float reciprocal = 1.0F / sqrtf(
-        static_cast<float>(squared_sum / static_cast<double>(columns)) +
-        1.0e-6F);
-    for (std::uint32_t column = 0U; column < columns; ++column) {
+    __syncthreads();
+    if (rejected != 0U) {
+        if (threadIdx.x == 0U) atomicExch(error, 1U);
+        return;
+    }
+
+    if (threadIdx.x == 0U) {
+        double squared_sum = 0.0;
+        for (std::uint32_t column = 0U; column < columns; ++column) {
+            squared_sum = __dadd_rn(squared_sum, squares[column]);
+        }
+        shared_reciprocal = 1.0F / sqrtf(
+            static_cast<float>(squared_sum / static_cast<double>(columns)) +
+            1.0e-6F);
+    }
+    __syncthreads();
+
+    const float reciprocal = shared_reciprocal;
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kDsv4QueryNormRopeThreads) {
         output[base + column] = __float2bfloat16_rn(
-            __fmul_rn(bf16_round(input[base + column]), reciprocal));
+            __fmul_rn(rounded[column], reciprocal));
     }
+    __syncthreads();
+
     constexpr std::uint32_t rope_begin = columns - rope;
-    for (std::uint32_t pair = 0U; pair < rope / 2U; ++pair) {
+    for (std::uint32_t pair = threadIdx.x; pair < rope / 2U;
+         pair += kDsv4QueryNormRopeThreads) {
         const auto first_index = base + rope_begin + pair * 2U;
         const float first = __bfloat162float(output[first_index]);
         const float second = __bfloat162float(output[first_index + 1U]);
@@ -3105,34 +3230,62 @@ __global__ void dsv4_query_norm_rope(
     }
 }
 
+constexpr std::uint32_t kDsv4KeyValueNormColumns = 512U;
+constexpr std::uint32_t kDsv4KeyValueNormThreads = kDsv4KeyValueNormColumns;
+
 __global__ void dsv4_key_value_norm_rope(
     const float* input, const float* weight, const float* cosines,
     const float* sines, __nv_bfloat16* output, unsigned int* error) {
-    if (blockIdx.x != 0U || threadIdx.x != 0U) return;
-    constexpr std::uint32_t columns = 512U;
+    constexpr std::uint32_t columns = kDsv4KeyValueNormColumns;
     constexpr std::uint32_t rope = 64U;
-    double squared_sum = 0.0;
-    for (std::uint32_t column = 0U; column < columns; ++column) {
+
+    __shared__ double squares[columns];
+    __shared__ float rounded[columns];
+    __shared__ unsigned int rejected;
+    __shared__ float shared_reciprocal;
+
+    if (threadIdx.x == 0U) rejected = 0U;
+    __syncthreads();
+
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kDsv4KeyValueNormThreads) {
         const float value = bf16_round(input[column]);
         if (!isfinite(value) || !isfinite(weight[column])) {
-            atomicExch(error, 1U);
-            return;
+            atomicExch(&rejected, 1U);
+            continue;
         }
-        squared_sum = __dadd_rn(
-            squared_sum,
-            __dmul_rn(static_cast<double>(value),
-                      static_cast<double>(value)));
+        rounded[column] = value;
+        squares[column] = __dmul_rn(static_cast<double>(value),
+                                    static_cast<double>(value));
     }
-    const float reciprocal = 1.0F / sqrtf(
-        static_cast<float>(squared_sum / static_cast<double>(columns)) +
-        1.0e-6F);
-    for (std::uint32_t column = 0U; column < columns; ++column) {
-        const float value = bf16_round(input[column]);
+    __syncthreads();
+    if (rejected != 0U) {
+        if (threadIdx.x == 0U) atomicExch(error, 1U);
+        return;
+    }
+
+    if (threadIdx.x == 0U) {
+        double squared_sum = 0.0;
+        for (std::uint32_t column = 0U; column < columns; ++column) {
+            squared_sum = __dadd_rn(squared_sum, squares[column]);
+        }
+        shared_reciprocal = 1.0F / sqrtf(
+            static_cast<float>(squared_sum / static_cast<double>(columns)) +
+            1.0e-6F);
+    }
+    __syncthreads();
+
+    const float reciprocal = shared_reciprocal;
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kDsv4KeyValueNormThreads) {
         output[column] = __float2bfloat16_rn(
-            __fmul_rn(__fmul_rn(value, reciprocal), weight[column]));
+            __fmul_rn(__fmul_rn(rounded[column], reciprocal), weight[column]));
     }
+    __syncthreads();
+
     constexpr std::uint32_t rope_begin = columns - rope;
-    for (std::uint32_t pair = 0U; pair < rope / 2U; ++pair) {
+    for (std::uint32_t pair = threadIdx.x; pair < rope / 2U;
+         pair += kDsv4KeyValueNormThreads) {
         const auto first_index = rope_begin + pair * 2U;
         const float first = __bfloat162float(output[first_index]);
         const float second = __bfloat162float(output[first_index + 1U]);
@@ -3403,57 +3556,85 @@ __global__ void dsv4_mhc_mix(
     combination[thread] = value;
 }
 
+// Unlike the attention norms, this reduction is already a tree: 64 per-thread
+// accumulators, each summing four blocks in order, combined by a fixed xor
+// pattern. That shape *is* the contract, so the accumulator count and its
+// combination order are preserved exactly. Only the two elementwise phases,
+// which carry no cross-element dependency, are widened; the FP32 values are
+// staged in shared memory so the pinned reduction consumes identical operands.
+constexpr std::uint32_t kDsv4MhcWeightedNormThreads = 512U;
+constexpr std::uint32_t kDsv4MhcWeightedNormAccumulators = 64U;
+
 __global__ void dsv4_mhc_weighted_norm(
     const __nv_bfloat16* residual, const float* pre,
     const __nv_bfloat16* norm_weight, __nv_bfloat16* weighted_bf16,
     __nv_bfloat16* layer_input) {
     const auto thread = static_cast<std::uint32_t>(threadIdx.x);
-    float per_position[16]{};
-    #pragma unroll
-    for (std::uint32_t block = 0U; block < 4U; ++block) {
+    __shared__ float staged[kDsv4MhcHidden];
+    __shared__ float cross_warp[kDsv4MhcWeightedNormAccumulators];
+    __shared__ float shared_reciprocal;
+
+    for (std::uint32_t index = thread; index < kDsv4MhcHidden;
+         index += kDsv4MhcWeightedNormThreads) {
+        float value = 0.0F;
         #pragma unroll
-        for (std::uint32_t lane = 0U; lane < 16U; ++lane) {
-            const auto hidden_index = block * 1024U + thread * 16U + lane;
-            float value = 0.0F;
-            #pragma unroll
-            for (std::uint32_t copy = 0U; copy < kDsv4MhcMultiplier; ++copy) {
-                value += pre[copy] * __bfloat162float(
-                    residual[copy * kDsv4MhcHidden + hidden_index]);
-            }
-            per_position[lane] += value * value;
-            weighted_bf16[hidden_index] = __float2bfloat16_rn(value);
+        for (std::uint32_t copy = 0U; copy < kDsv4MhcMultiplier; ++copy) {
+            value += pre[copy] * __bfloat162float(
+                residual[copy * kDsv4MhcHidden + index]);
         }
+        staged[index] = value;
+        weighted_bf16[index] = __float2bfloat16_rn(value);
     }
-    float sum = 0.0F;
-    #pragma unroll
-    for (std::uint32_t lane = 0U; lane < 16U; lane += 2U) {
-        sum += per_position[lane];
-    }
-    #pragma unroll
-    for (std::uint32_t lane = 1U; lane < 16U; lane += 2U) {
-        sum += per_position[lane];
-    }
-    __shared__ float cross_warp[64];
-    cross_warp[thread] = sum;
     __syncthreads();
-    sum += cross_warp[thread ^ 32U];
-    sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 16);
-    sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 8);
-    sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 4);
-    sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 2);
-    sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 1);
-    const float reciprocal = rsqrtf(
-        sum / static_cast<float>(kDsv4MhcHidden) + 1.0e-6F);
-    #pragma unroll
-    for (std::uint32_t block = 0U; block < 4U; ++block) {
+
+    // Threads 0-63 are exactly two warps, so the full-mask shuffles below keep
+    // every lane they require.
+    float sum = 0.0F;
+    if (thread < kDsv4MhcWeightedNormAccumulators) {
+        float per_position[16]{};
         #pragma unroll
-        for (std::uint32_t lane = 0U; lane < 16U; ++lane) {
-            const auto hidden_index = block * 1024U + thread * 16U + lane;
-            const float value = __bfloat162float(weighted_bf16[hidden_index]) *
-                                reciprocal *
-                                __bfloat162float(norm_weight[hidden_index]);
-            layer_input[hidden_index] = __float2bfloat16_rn(value);
+        for (std::uint32_t block = 0U; block < 4U; ++block) {
+            #pragma unroll
+            for (std::uint32_t lane = 0U; lane < 16U; ++lane) {
+                const auto hidden_index = block * 1024U + thread * 16U + lane;
+                const float value = staged[hidden_index];
+                per_position[lane] += value * value;
+            }
         }
+        #pragma unroll
+        for (std::uint32_t lane = 0U; lane < 16U; lane += 2U) {
+            sum += per_position[lane];
+        }
+        #pragma unroll
+        for (std::uint32_t lane = 1U; lane < 16U; lane += 2U) {
+            sum += per_position[lane];
+        }
+        cross_warp[thread] = sum;
+    }
+    __syncthreads();
+    if (thread < kDsv4MhcWeightedNormAccumulators) {
+        sum += cross_warp[thread ^ 32U];
+        sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 16);
+        sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 8);
+        sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 4);
+        sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 2);
+        sum += __shfl_xor_sync(0xFFFF'FFFFU, sum, 1);
+        if (thread == 0U) {
+            shared_reciprocal = rsqrtf(
+                sum / static_cast<float>(kDsv4MhcHidden) + 1.0e-6F);
+        }
+    }
+    __syncthreads();
+
+    // Reads the BF16 round trip rather than the staged FP32 value, exactly as
+    // the sequential shape did.
+    const float reciprocal = shared_reciprocal;
+    for (std::uint32_t index = thread; index < kDsv4MhcHidden;
+         index += kDsv4MhcWeightedNormThreads) {
+        const float value = __bfloat162float(weighted_bf16[index]) *
+                            reciprocal *
+                            __bfloat162float(norm_weight[index]);
+        layer_input[index] = __float2bfloat16_rn(value);
     }
 }
 
@@ -5914,7 +6095,9 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
         !region(active_bytes, alignof(std::uint32_t), active_offset) ||
         !region(active_bytes, alignof(std::uint32_t), next_offset) ||
         !region(winner_bytes, alignof(std::uint32_t), winner_offset) ||
-        !region(histogram_bytes, alignof(std::uint32_t), histogram_offset) ||
+        // The pivot kernel reads each 64-bin group as 16 uint4, so this region
+        // needs vector alignment, not merely uint32 alignment.
+        !region(histogram_bytes, alignof(uint4), histogram_offset) ||
         !region(counter_count * sizeof(std::uint32_t), alignof(std::uint32_t),
                 counter_offset) ||
         cursor > request.maximum_workspace_bytes ||
@@ -6049,17 +6232,20 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
 
     constexpr std::uint32_t kPassThreads = 256U;
     const auto pass_blocks = (candidates + kPassThreads - 1U) / kPassThreads;
-    const auto rows_per_block = std::min(
-        kPhysicalIndexMaxRowsPerBlock,
-        std::max(1U, kPhysicalIndexBlockThreads / request.heads));
-    const auto score_threads = rows_per_block * request.heads;
+    // Slots are threads-per-block divided by heads; each slot scores
+    // kPhysicalIndexRowsPerThread rows, so the block covers that many more
+    // candidates without changing its thread count or its occupancy.
+    const auto score_slots =
+        std::max(1U, kPhysicalIndexBlockThreads / request.heads);
+    const auto rows_per_block = score_slots * kPhysicalIndexRowsPerThread;
+    const auto score_threads = score_slots * request.heads;
     const auto score_blocks =
         (candidates + rows_per_block - 1U) / rows_per_block;
     const auto score_shared = static_cast<std::size_t>(
-        (256U + rows_per_block * request.head_dim + score_threads +
-         rows_per_block) * sizeof(float));
-    dsv4_physical_index_score_kernel<<<score_blocks, score_threads,
-                                      score_shared, state.stream>>>(
+        (256U + rows_per_block * request.head_dim +
+         rows_per_block * request.heads + rows_per_block) * sizeof(float));
+    dsv4_physical_index_score_kernel<kPhysicalIndexRowsPerThread>
+        <<<score_blocks, score_threads, score_shared, state.stream>>>(
         device_scores, device_keys, device_queries, device_weights,
         device_segments, static_cast<std::uint32_t>(request.pages.size()),
         candidates, request.heads, request.head_dim, rows_per_block,
@@ -7147,6 +7333,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     const bool transition_mhc = request.mhc_transition != nullptr;
     const bool host_deferred = request.host_callback != nullptr;
     const bool device_only = request.device_only;
+    const bool ready_page_patch = !request.ready_page_patches.empty();
     // A host-only preparation returns its projections and publishes no
     // prepared device query, so nothing downstream may consume it.
     const bool host_only = request.host_only;
@@ -7168,7 +7355,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         (device_only
              ? (!query_rank.empty() || !key_value.empty() ||
                 prepare_compressor || prepare_index_compressor ||
-                host_deferred || !request.page_writes.empty())
+                host_deferred)
              : (query_rank.size() != query_rank_elements ||
                 key_value.size() != key_value_elements)) ||
         request.query_norm.size() != query_rank_elements ||
@@ -7180,8 +7367,10 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         index_compressor_values.size() != index_compressor_scores.size() ||
         ((request.host_callback == nullptr) !=
          (request.host_callback_context == nullptr)) ||
+        (request.host_callback_wait_event != nullptr && !host_deferred) ||
+        ((request.page_patch_ready_event != nullptr) != ready_page_patch) ||
         (device_only
-             ? !request.page_writes.empty()
+             ? (ready_page_patch != !request.page_writes.empty())
              : (host_deferred ? request.page_writes.empty()
                               : !request.page_writes.empty())) ||
         (prepare_compressor
@@ -7224,6 +7413,12 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             return result;
         }
         page_patch_bytes += write_bytes;
+    }
+    if (ready_page_patch &&
+        request.ready_page_patches.size() != page_patch_bytes) {
+        result.errors.emplace_back(
+            "DeepSeek ready page-patch staging has the wrong extent");
+        return result;
     }
     const auto finite = [](float value) { return std::isfinite(value); };
     const auto bf16_finite = [](float value) {
@@ -7679,7 +7874,8 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             mhc_state.dsv4_mhc_workspace->pre,
             mhc_state.dsv4_mhc_workspace->post,
             mhc_state.dsv4_mhc_workspace->combination);
-        dsv4_mhc_weighted_norm<<<1U, 64U, 0U, transition_stream>>>(
+        dsv4_mhc_weighted_norm<<<1U, kDsv4MhcWeightedNormThreads, 0U,
+                                 transition_stream>>>(
             mhc_state.dsv4_mhc_workspace->residual[next],
             mhc_state.dsv4_mhc_workspace->pre, norm,
             mhc_state.dsv4_mhc_workspace->weighted,
@@ -7832,16 +8028,16 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             descriptor.columns, descriptor.rows);
     };
     launch_projection(query_rank_raw, input_quant, query_a, state.stream);
-    dsv4_query_rank_norm<<<1U, 1U, 0U, state.stream>>>(
+    dsv4_query_rank_norm<<<1U, kDsv4QueryRankNormThreads, 0U, state.stream>>>(
         query_rank_raw, device_query_norm, query_rank_bf16, failure);
     quantize_bf16_activation_e4m3_kernel<<<8U, 128U, 0U, state.stream>>>(
         query_rank_quant, query_rank_bf16, query_rank_elements);
     launch_projection(query_raw, query_rank_quant, query_b, state.stream);
-    dsv4_query_norm_rope<<<64U, 1U, 0U, state.stream>>>(
+    dsv4_query_norm_rope<<<64U, kDsv4QueryNormRopeThreads, 0U, state.stream>>>(
         query_raw, device_cosines, device_sines, prepared_query, failure);
     const auto kv_stream = state.dsv4_attention_aux_streams[0U];
     launch_projection(key_value_raw, input_quant, key_value_weight, kv_stream);
-    dsv4_key_value_norm_rope<<<1U, 1U, 0U, kv_stream>>>(
+    dsv4_key_value_norm_rope<<<1U, kDsv4KeyValueNormThreads, 0U, kv_stream>>>(
         key_value_raw, device_key_value_norm, device_cosines, device_sines,
         key_value_bf16, failure);
     if (auto status = cudaEventRecord(
@@ -7914,6 +8110,38 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         }
     }
     if (device_only) {
+        if (ready_page_patch) {
+            if (auto status = cudaStreamWaitEvent(
+                    state.stream,
+                    static_cast<cudaEvent_t>(request.page_patch_ready_event));
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "wait for canonical DeepSeek page patch");
+            }
+            std::uint64_t patch_cursor = 0U;
+            for (const auto& write : request.page_writes) {
+                auto* destination = static_cast<std::byte*>(
+                    write.buffer->impl_->data);
+                if (auto status = cudaMemcpyAsync(
+                        destination + write.data_offset,
+                        request.ready_page_patches.data() + patch_cursor,
+                        write.data_bytes, cudaMemcpyHostToDevice,
+                        state.stream); status != cudaSuccess) {
+                    return cuda_error(
+                        status, "replicate DeepSeek prepared page data");
+                }
+                patch_cursor += write.data_bytes;
+                if (auto status = cudaMemcpyAsync(
+                        destination + write.scale_offset,
+                        request.ready_page_patches.data() + patch_cursor,
+                        write.scale_bytes, cudaMemcpyHostToDevice,
+                        state.stream); status != cudaSuccess) {
+                    return cuda_error(
+                        status, "replicate DeepSeek prepared page scale");
+                }
+                patch_cursor += write.scale_bytes;
+            }
+        }
         state.dsv4_prepared_queries = prepared_query;
         state.dsv4_attention_prepared = !host_only;
         // Retire this command's upload slot.  The device-only path enqueues no
@@ -7927,7 +8155,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
                 impl_->stats.devices.begin(), impl_->stats.devices.end(),
                 [device](const auto& value) { return value.device == device; });
             stats.matmul_calls += 3U;
-            stats.activation_h2d_bytes += upload_bytes;
+            stats.activation_h2d_bytes += upload_bytes + page_patch_bytes;
             stats.workspace_allocation_calls += allocation_calls;
             stats.workspace_allocation_bytes += allocation_bytes;
         }
@@ -8029,6 +8257,18 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         command.page_patch_bytes = page_patch_bytes;
         command.upstream_failure = reinterpret_cast<const unsigned int*>(
             host_download + failure_download_offset);
+        if (request.host_callback_wait_event != nullptr) {
+            if (auto status = cudaStreamWaitEvent(
+                    state.stream,
+                    static_cast<cudaEvent_t>(
+                        request.host_callback_wait_event));
+                status != cudaSuccess) {
+                if (transition_mhc) mhc_state.dsv4_mhc_stage = 0U;
+                return cuda_error(
+                    status,
+                    "wait for attention preparation host callback owner");
+            }
+        }
         if (auto status = cudaLaunchHostFunc(
                 state.stream,
                 run_dsv4_attention_prepare_host_callback, &command);
@@ -9081,7 +9321,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             target.dsv4_mhc_workspace->pre,
             target.dsv4_mhc_workspace->post,
             target.dsv4_mhc_workspace->combination);
-        dsv4_mhc_weighted_norm<<<1U, 64U, 0U, transition_stream>>>(
+        dsv4_mhc_weighted_norm<<<1U, kDsv4MhcWeightedNormThreads, 0U,
+                                 transition_stream>>>(
             target.dsv4_mhc_workspace->residual[next],
             target.dsv4_mhc_workspace->pre, norm,
             target.dsv4_mhc_workspace->weighted,
@@ -9707,7 +9948,8 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         workspace->partial_projection, workspace->partial_square_sum,
         scale, base, kDsv4MhcStandaloneSplits, workspace->pre,
         workspace->post, workspace->combination);
-    dsv4_mhc_weighted_norm<<<1U, 64U, 0U, state.stream>>>(
+    dsv4_mhc_weighted_norm<<<1U, kDsv4MhcWeightedNormThreads, 0U,
+                             state.stream>>>(
         workspace->residual[0], workspace->pre, norm,
         workspace->weighted, workspace->layer_input);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
@@ -9957,7 +10199,8 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
         workspace->partial_projection, workspace->partial_square_sum,
         scale, base, kDsv4MhcSplits, workspace->pre, workspace->post,
         workspace->combination);
-    dsv4_mhc_weighted_norm<<<1U, 64U, 0U, state.stream>>>(
+    dsv4_mhc_weighted_norm<<<1U, kDsv4MhcWeightedNormThreads, 0U,
+                             state.stream>>>(
         workspace->residual[next], workspace->pre, norm,
         workspace->weighted, workspace->layer_input);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
@@ -10352,7 +10595,8 @@ ValidationResult CudaBackend::dsv4_mhc_transition_router_device(
         workspace->partial_projection, workspace->partial_square_sum, scale,
         base, kDsv4MhcSplits, workspace->pre, workspace->post,
         workspace->combination);
-    dsv4_mhc_weighted_norm<<<1U, 64U, 0U, state.stream>>>(
+    dsv4_mhc_weighted_norm<<<1U, kDsv4MhcWeightedNormThreads, 0U,
+                             state.stream>>>(
         workspace->residual[next], workspace->pre, norm, workspace->weighted,
         workspace->layer_input);
     constexpr unsigned int threads = 256U;
@@ -10425,7 +10669,8 @@ ValidationResult CudaBackend::dsv4_mhc_transition_next_device(
         workspace->partial_projection, workspace->partial_square_sum, scale,
         base, kDsv4MhcSplits, workspace->pre, workspace->post,
         workspace->combination);
-    dsv4_mhc_weighted_norm<<<1U, 64U, 0U, state.stream>>>(
+    dsv4_mhc_weighted_norm<<<1U, kDsv4MhcWeightedNormThreads, 0U,
+                             state.stream>>>(
         workspace->residual[next], workspace->pre, norm, workspace->weighted,
         workspace->layer_input);
     if (auto status = cudaMemsetAsync(
@@ -13668,7 +13913,20 @@ ValidationResult CudaBackend::collect_deepseek_moe(
         return result;
     }
     for (auto& [attention_device, attention_state] : impl_->devices) {
-        static_cast<void>(attention_device);
+        if (attention_state.dsv4_attention_prepare_host_command_count != 0U) {
+            if (auto status = cudaSetDevice(attention_device);
+                status != cudaSuccess) {
+                result.errors.emplace_back(
+                    std::string("select deferred attention callback device: ") +
+                    cudaGetErrorString(status));
+            } else if (auto status = cudaStreamSynchronize(
+                           attention_state.stream);
+                       status != cudaSuccess) {
+                result.errors.emplace_back(
+                    std::string("drain deferred attention callback stream: ") +
+                    cudaGetErrorString(status));
+            }
+        }
         for (std::uint32_t index = 0U;
              index <
                  attention_state.dsv4_attention_prepare_host_command_count;
@@ -13681,6 +13939,11 @@ ValidationResult CudaBackend::collect_deepseek_moe(
         }
         attention_state.dsv4_attention_prepare_host_command_count = 0U;
         attention_state.dsv4_deferred_attention_command_count = 0U;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        result.errors.emplace_back(
+            std::string("restore DeepSeek MoE device after callback drain: ") +
+            cudaGetErrorString(status));
     }
     if (state.dsv4_deferred_attention_source_device >= 0) {
         const auto source_found = impl_->devices.find(

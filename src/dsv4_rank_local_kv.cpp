@@ -292,9 +292,11 @@ ValidationResult Dsv4RankLocalKvTransaction::commit() {
             if (!row.present) return;
             auto status = row.append->account();
             if (!status.ok()) {
-                result.errors.insert(result.errors.end(),
-                                     status.errors.begin(),
-                                     status.errors.end());
+                for (auto& error : status.errors) {
+                    result.errors.push_back(
+                        "rank-local KV account layer " +
+                        std::to_string(entry.layer) + ": " + error);
+                }
             }
         };
         account(entry.sliding);

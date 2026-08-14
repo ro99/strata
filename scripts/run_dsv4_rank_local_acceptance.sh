@@ -52,7 +52,7 @@ run_arm() {
         --vram-fraction 0.95 \
         --device-resident-runtime \
         --decode-topology "${topology}" \
-        --quiet --json \
+        --detailed-timing --quiet --json \
         >"${stem}.json" 2>"${stem}.log"
     local status=$?
     set -e

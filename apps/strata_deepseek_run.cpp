@@ -1214,9 +1214,15 @@ int main(int argc, char** argv) {
         std::cout << ",\"admitted_host_bytes\":"
                   << metrics.rank_local_admitted_host_bytes << '}'
                   << ",\"prefill_seconds\":" << metrics.prefill_seconds
-                  << ",\"decode_seconds\":" << metrics.decode_seconds
-                  << ",\"decode_step_seconds\":";
-        strata::cli::print_array(std::cout, metrics.decode_step_seconds);
+                  << ",\"decode_seconds\":" << metrics.decode_seconds;
+        // Per-step decode walls separate first-use setup from steady state,
+        // which every throughput gate in scripts/ depends on. It is a
+        // diagnostic surface rather than part of the supported production
+        // output, so it is emitted only under --detailed-timing.
+        if (metrics.detailed_timing) {
+            std::cout << ",\"decode_step_seconds\":";
+            strata::cli::print_array(std::cout, metrics.decode_step_seconds);
+        }
         std::cout
                   << ",\"decode_checkpoint_read_bytes\":"
                   << metrics.decode_checkpoint_reads.bytes

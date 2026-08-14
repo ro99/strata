@@ -8032,7 +8032,6 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         index_compressor_values.size() != index_compressor_scores.size() ||
         ((request.host_callback == nullptr) !=
          (request.host_callback_context == nullptr)) ||
-        (request.host_callback_wait_event != nullptr && !host_deferred) ||
         ((request.page_patch_ready_event != nullptr) != ready_page_patch) ||
         (device_only
              ? (ready_page_patch != !request.page_writes.empty())
@@ -8926,18 +8925,6 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         command.page_patch_bytes = page_patch_bytes;
         command.upstream_failure = reinterpret_cast<const unsigned int*>(
             host_download + failure_download_offset);
-        if (request.host_callback_wait_event != nullptr) {
-            if (auto status = cudaStreamWaitEvent(
-                    state.stream,
-                    static_cast<cudaEvent_t>(
-                        request.host_callback_wait_event));
-                status != cudaSuccess) {
-                if (transition_mhc) mhc_state.dsv4_mhc_stage = 0U;
-                return cuda_error(
-                    status,
-                    "wait for attention preparation host callback owner");
-            }
-        }
         if (auto status = cudaLaunchHostFunc(
                 state.stream,
                 run_dsv4_attention_prepare_host_callback, &command);

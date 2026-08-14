@@ -47,7 +47,7 @@ run_args=(
     --vram-fraction 0.95
     --device-resident-runtime
     --decode-topology rank-local-tp2
-    --quiet --json
+    --detailed-timing --quiet --json
 )
 
 # Every profiled arm must still produce the accepted token sequence. The

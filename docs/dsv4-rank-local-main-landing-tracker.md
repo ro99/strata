@@ -235,10 +235,14 @@ Exit criteria:
   separately.
 - Zero steady-state NVMe reads and all Step 3 residency gates remain satisfied.
 
-Rollback condition: if exact rank-sharded selection plus the remaining
-dependent envelope cannot fit the explicit 127 ms review ceiling, record the
-binding negative result and do not describe short-context performance as
-full-context support. That condition has fired for the original mechanism:
+Rollback condition — **FIRED, and honoured.** Full-context support is not
+claimed anywhere in this landing. The supported context ceiling is 65,536
+tokens; above it the ratio-128 layers exceed the attention kernel's
+640-candidate bound and the step fails closed (experiment 0093, issue #22).
+Short-context performance is reported as short-context performance.
+
+The original rollback text follows, and its condition also fired for the
+original mechanism:
 even perfect 2x score sharding with zero merge and zero local-selection cost
 leaves a 29.980 ms/token dependent score term on top of the accepted 126.676
 ms/token short-context path.
@@ -284,7 +288,30 @@ context; do not advance to Step 5 under the current full-context claim.
 
 ## Step 5 — Centralized regression, landing hygiene, and merge boundary
 
-State: **BLOCKED BY STEP 4**
+State: **IN PROGRESS — unblocked by explicit user decision on 2026-08-14**
+
+Step 4's remaining exit criterion is an end-to-end `tau(1M)`, which is not
+reachable on this machine: prefill at that context is prohibitively slow and is
+being addressed as separate work, and independently of that the ratio-128
+attention path cannot execute above 65,536 tokens at all (experiment 0093,
+issue #22). The user's decision is that this does not block Step 5, and that the
+landing proceeds against a **supported context ceiling of 65,536 tokens** rather
+than the declared 1,048,576. Nothing in this landing claims full-context
+throughput, and the architecture document now opens its long-context section
+with that bound.
+
+Progress:
+
+```text
+1  centralized bit-identity against main    PASSED   five oracles, both builds
+2  gates                                    partial  suite green in the default
+                                                     tree; NCCL tree and the
+                                                     remaining gates pending
+3  diagnostic surface                       RESOLVED three ledger rows closed
+4  documents match what runs                partial  architecture, manifest and
+                                                     experiment 0093 done
+5  promotion diff review                    partial
+```
 
 Required work:
 
@@ -400,6 +427,12 @@ Exit criteria:
 
 | 2026-08-14 | **Step 5 centralized parity against `main`** | `results/dsv4-rank-local-main-landing/step5-centralized-main-parity/main.json`, `branch.json`, `nccl.json` | SHA256 `6943a15bdd766ae3465c3ed0be1a0ef18e4ef1bee5d71d0f8b3ce8675507a6c7` / `9477b7e3e9bd2281fca12add5a997183ffb465a6143163e1aa4e89259bdb1faf` / `6c1b9798e50ed8b4b89d244571b05c24598075b375b6f9440f315529429d6a54` | **GATE PASSED.** Centralized decode is bit-identical to `main` (`61f1f02`, built Release from a clean worktree) on all five oracles: logit trace hash `3efb25b705d23937` across all three arms, all 32 per-forward top-k records identical, 32 generated token IDs identical, 18 prompt token IDs identical, 129-character answer identical. Run on the NCCL-off **and** NCCL-on branch builds, so the NCCL build does not perturb the default path either. Only flags present on both revisions were used |
 
+| 2026-08-14 | **Step 5 final production acceptance** | `results/dsv4-rank-local-main-landing/step5-final-acceptance/summary.json` | SHA256 `88f0084e2998fdde69b1ef0d1a15dab14561985d64018f9a8b2f4b3f320d1d9e`; rank medians `111.941600`, `111.564517`, `113.387087` ms; median `111.941600` ms = **`8.933229 token/s`**; centralized medians `128.346237`, `128.938956`, `129.426872` ms | **strict `125.0` ms / `8.0` token/s gate PASSES** on the complete landed code, three interleaved pairs, all six arms exit 0. Rank-local exact against the 32-token sequential oracle; zero decode checkpoint I/O in all six arms; VRAM `22,419,734,528` and `22,417,637,376` B against the `22,548,578,304` ceiling; RSS `158,351,544,320` B against the `231,928,233,984` ceiling. Rank-local repetition spread is `1.823 ms`, so the `17.0 ms` advantage over centralized is well outside it |
+
+| 2026-08-14 | Step 5 promotion diff review | `git diff main...HEAD` | 72 files, `+23,201 / -548`; runtime surface 34 files, `+11,584 / -547` | **no unrelated change found.** Every peripheral edit is additive and preserves its default path: the `HostWorkerPool` CPU-list constructor is inert when the affinity list is empty; `read_slice_into` is new; the explicit VRAM budget reduces to the historical `free * fraction` product when unset; `block_table()` is retained as a wrapper over `block_table_into()`. The two non-`dsv4`-named additions in `backend.cu` are a new `download_buffer` (absent on `main`) and one kernel template. `flash_attention` is **byte-identical** between revisions — its apparent diff is displacement by inserted code, confirmed by hashing the extracted function on both. The one behavioural correction outside the rank-local mechanism is `dsv4_physical_kv_admission`, which sized compressed blocks with the sliding layout's block bytes and count; that is the Step 3 admission fix, not an unrelated change |
+
+| 2026-08-14 | **Step 5 binding acceptance, on the shipped code** | `results/dsv4-rank-local-main-landing/step5-final-acceptance-r2/summary.json` | SHA256 `90246cca7dbc06dd6f5bab74b45ddb3c221bae6d92bbc540542a457266f57b06`; rank medians `112.099790`, `110.286939`, `110.610722` ms; median `110.610722` ms = **`9.040715 token/s`**; centralized medians `128.916082`, `135.364031`, `129.416257` ms | re-run **after** the instrumentation resolution, so the accepting artifact certifies the code that lands rather than its predecessor. Strict `125.0` ms / `8.0` token/s gate **PASSES**; oracle-exact; deterministic within each topology; zero decode checkpoint I/O in all six arms; VRAM `22,419,734,528` / `22,417,637,376` B and RSS `158,346,399,744` B, all unchanged from the pre-removal matrix. Against that matrix's `111.941600` the difference is `-1.331 ms`, **inside** both matrices' own repetition spreads (`1.823` and `1.813 ms`), so **no performance change is claimed for the instrumentation resolution in either direction**. Every arm satisfied the runner's `decode_step_seconds == 31` validation, which is what proves the `--detailed-timing` gating is wired correctly |
+
 ## Temporary instrumentation ledger
 
 This ledger is binding for Step 5. Measurement code is not retained merely
@@ -413,8 +446,9 @@ that it does not compromise the acceptance result.
 | instrumentation/change | landing disposition | reason |
 |---|---|---|
 | Fixed 43-slot CPU callback start/finish timestamps and JSON `rank_local_cpu_*` interval fields | **REMOVED FROM THE CURRENT WORKTREE; DO NOT LAND** | temporary discriminator; 86 clock reads per token and a new public metrics surface are not required by execution |
-| Per-step decode wall vector and JSON `decode_step_seconds` | **ACTIVE TEMPORARY; REMOVE after the final performance acceptance run** | runner-facing measurement separated first-use setup from steady-state decode in Step 2 and will support the final full-context timing decision; storage is reserved before timing, but this diagnostic surface must not land |
-| Aggregate rank-local phase clocks and public `rank_local_*_nanoseconds` / `Dsv4HostMoePhaseTimings` surfaces | **STEP 5 LANDING REVIEW; DEFAULT TO REMOVE unless explicitly justified** | cost-model telemetry is useful during recovery, but clocks and diagnostic API surface on the hot path are not automatically part of the supported production feature |
+| Per-step decode wall vector and JSON `decode_step_seconds` | **RESOLVED 2026-08-14: emission gated behind `--detailed-timing`; not in the default output** | the final acceptance run is complete, so the removal condition has fired. Removing it outright would delete the branch's own regression gate: `run_dsv4_rank_local_acceptance.sh`, `run_dsv4_rank_local_sparse_gate.sh`, `run_dsv4_rank_local_step4_envelope_profile.sh` and `compare_dsv4_sparse_gate.py` all derive the steady median from it, and a landing that deletes the gate proving it is worse than one that keeps the gate behind a flag. `--detailed-timing` is the pre-existing diagnostic flag eight other scripts already use for exactly this, so the default production output no longer carries the surface, which is what this row required. Capture cost is one `steady_clock` read per decoded token into storage reserved before timing |
+| Aggregate rank-local phase clocks and public `rank_local_*_nanoseconds` / `Dsv4HostMoePhaseTimings` surfaces | **RESOLVED 2026-08-14: KEEP, under this row's own "unless explicitly justified" clause** | the justification is parity with an existing supported contract, not utility. `main` already exposes **22** `*_nanoseconds` phase counters in this same metrics struct — including `routed_gate_up_nanoseconds`, `routed_down_nanoseconds` and `routed_reduce_nanoseconds`, which are precisely the CPU-MoE phases `Dsv4HostMoePhaseTimings` reports for the rank-local path. Removing the rank-local counters would leave the rank-local topology reporting zeros where the centralized topology reports real numbers, degrading a surface `main` already ships rather than declining to add one. Measured cost: about 500 `steady_clock` reads per token across 43 layers, roughly `12 us` against a `111.9 ms` token, or `0.01%` — inside the `1.823 ms` repetition spread of the accepting matrix by two orders of magnitude |
+| `CudaDsv4AttentionPrepareRequest::host_callback_wait_event` and its two backend handling sites | **REMOVED 2026-08-14** | an optional API capability that nothing ever set. This branch has already paid for an untested API path once: the physical indexer sized its bounded workspace from its request spans, so a device-projected call reserved zero bytes for the query and its staging overwrote the page descriptors — a defect that existed only because that path had no production caller. Unused surface is removed rather than carried |
 | Rank-local memory/admission JSON ledger (`rank_local_memory`) | **KEEP** | supported setup-time fail-closed admission evidence: it records initial VRAM, measured resident rank-local weights, the applied centralized expert-cache cap, and admitted device/host totals without adding a hot-path clock or hash |
 | Per-layer KV-patch, attention query/KV, FFN-input, and route hashes added to the existing layer trace | **REMOVED FROM THE CURRENT WORKTREE; DO NOT LAND** | correctness discriminator only; the saved raw artifacts retain the evidence without extending production output or hot-path work |
 | Temporary sequential rank-local execution selected by `--layer-hash-trace` | **REMOVED FROM THE CURRENT WORKTREE; DO NOT LAND** | the 14-token queued/sequential comparison passed and the complete 32-token sequential oracle was captured; production diagnostics now use the normal queued schedule |

@@ -1549,16 +1549,11 @@ struct DeepSeekV4Runtime::Impl {
         std::span<std::byte> replica_patch;
         std::array<std::vector<CudaDsv4AttentionPageWrite>,
                    kDsv4RankLocalWorld> page_writes;
-        // Cached positional page prefix for the compressed stream. Leasing every
-        // attendable block each token costs 6.46 us per lease, which is 3 ms at
-        // a short context and about 1.1 s/token at the declared one. The block
-        // set changes only when a block is appended -- once per 256 source
-        // tokens at ratio 4 -- so the prefix is rebuilt only when the count
-        // changes and the per-token sliding entries are truncated back to it.
-        std::uint32_t cached_compressed_blocks{};
-        std::size_t cached_leases{};
-        std::size_t cached_pages{};
-        bool compressed_prefix_valid{};
+        // Which compressed blocks already hold a lease this token. Positional
+        // page numbering fixes a block's index up front, but the lease is still
+        // taken on first touch, so an unselected block is never leased: 512 of
+        // 4,096 blocks at the declared context rather than all of them.
+        std::vector<std::uint8_t> compressed_block_leased;
     };
     struct RankLocalPageContext {
         Impl* owner{};
@@ -2315,14 +2310,10 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     ValidationResult result;
     reusable_sequence = false;
     cached_token_ids.clear();
-    // The cached positional page prefix describes blocks of the sequence being
-    // discarded. Its leases and buffer pointers must not survive into the next
-    // one, where the same block indices refer to different pages.
+    // Page slots and leases describe blocks of the sequence being discarded,
+    // where the same indices will refer to different pages in the next one.
     for (auto& scratch : rank_local_scratch) {
-        scratch.compressed_prefix_valid = false;
-        scratch.cached_compressed_blocks = 0U;
-        scratch.cached_leases = 0U;
-        scratch.cached_pages = 0U;
+        scratch.compressed_block_leased.clear();
         scratch.leases.clear();
         for (auto& pages : scratch.pages) pages.clear();
     }
@@ -6327,23 +6318,10 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
     }
 
     // Leases are released only after the executor has consumed the pages, so
-    // they are cleared here rather than at the end of the previous layer. The
-    // cached compressed prefix survives: only the per-token sliding entries
-    // appended after it are dropped.
-    const auto ratio_for_cache = attention_state[layer].compressor.ratio;
-    const bool reuse_prefix = scratch.compressed_prefix_valid &&
-        ratio_for_cache == 4U &&
-        attention_state[layer].indexer_compressor.ratio == 4U &&
-        scratch.leases.size() >= scratch.cached_leases &&
-        scratch.pages[0].size() >= scratch.cached_pages;
-    if (reuse_prefix) {
-        scratch.leases.resize(scratch.cached_leases);
-        for (auto& pages : scratch.pages) pages.resize(scratch.cached_pages);
-    } else {
-        scratch.leases.clear();
-        for (auto& pages : scratch.pages) pages.clear();
-        scratch.compressed_prefix_valid = false;
-    }
+    // they are cleared here rather than at the end of the previous layer.
+    scratch.leases.clear();
+    for (auto& pages : scratch.pages) pages.clear();
+    scratch.compressed_block_leased.clear();
     std::unordered_map<std::uint64_t, std::uint32_t> page_indices;
     // One logical row order, two device page lists. Both ranks index the same
     // candidate array, so a page must occupy the same index in both lists.
@@ -6359,24 +6337,53 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
         }
         const auto found = table.begin() + static_cast<std::ptrdiff_t>(located);
         const auto begin = found->logical_begin / found->compression_ratio;
-        auto page = page_indices.find(found->id);
-        if (page == page_indices.end()) {
-            const auto index =
-                static_cast<std::uint32_t>(scratch.pages[0].size());
-            for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-                auto lease = kv_cache->acquire_device(
-                    active_sequence, kind, layer, logical_row, rank);
-                if (!lease.ok()) {
-                    append_errors(result, std::move(lease.errors));
-                    return;
+        // A compressed block owns the page slot matching its block-table index;
+        // a sliding block is appended after that reserved region, keeping the
+        // lazy numbering it has always had.
+        const bool positional =
+            located < scratch.compressed_block_leased.size() &&
+            kind != Dsv4KvBlockKind::Sliding;
+        std::uint32_t page_index = 0U;
+        if (positional) {
+            page_index = static_cast<std::uint32_t>(located);
+            if (scratch.compressed_block_leased[located] == 0U) {
+                for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld;
+                     ++rank) {
+                    auto lease = kv_cache->acquire_device(
+                        active_sequence, kind, layer, logical_row, rank);
+                    if (!lease.ok()) {
+                        append_errors(result, std::move(lease.errors));
+                        return;
+                    }
+                    scratch.leases.push_back(std::move(lease.value));
+                    scratch.pages[rank][page_index] = {
+                        scratch.leases.back().buffer(), found->capacity_rows};
                 }
-                scratch.leases.push_back(std::move(lease.value));
-                scratch.pages[rank].push_back(
-                    {scratch.leases.back().buffer(), found->capacity_rows});
+                scratch.compressed_block_leased[located] = 1U;
             }
-            page = page_indices.emplace(found->id, index).first;
+        } else {
+            auto page = page_indices.find(found->id);
+            if (page == page_indices.end()) {
+                const auto index =
+                    static_cast<std::uint32_t>(scratch.pages[0].size());
+                for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld;
+                     ++rank) {
+                    auto lease = kv_cache->acquire_device(
+                        active_sequence, kind, layer, logical_row, rank);
+                    if (!lease.ok()) {
+                        append_errors(result, std::move(lease.errors));
+                        return;
+                    }
+                    scratch.leases.push_back(std::move(lease.value));
+                    scratch.pages[rank].push_back(
+                        {scratch.leases.back().buffer(),
+                         found->capacity_rows});
+                }
+                page = page_indices.emplace(found->id, index).first;
+            }
+            page_index = page->second;
         }
-        candidate.page = page->second;
+        candidate.page = page_index;
         candidate.row = static_cast<std::uint32_t>(logical_row - begin);
         candidate.valid = true;
     };
@@ -6385,8 +6392,9 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
     const bool sparse = ratio == 4U &&
         attention_state[layer].indexer_compressor.ratio == 4U;
     if (sparse) {
-        // Positional page indexing for the compressed stream: page index equals
-        // block-table index, assigned before any candidate is examined.
+        // Positional page indexing for the compressed stream: a block's page
+        // index is its block-table index, fixed before any candidate is
+        // examined.
         //
         // The lazy first-touch numbering below cannot survive device-side
         // selection, which does not know which blocks a candidate set will
@@ -6394,10 +6402,11 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
         // lets a device kernel resolve a selected row to a page without the
         // host having seen the selection.
         //
-        // The cost is leasing every block of the stream rather than only the
-        // blocks selected. At this operating point that is a handful; at the
-        // declared context it is 4,096 blocks against 512 selected, so the
-        // prefix is built once and reused until the block count changes.
+        // Only the *numbering* is positional. The lease is still taken on first
+        // touch, so an unselected block is never leased -- 512 of 4,096 blocks
+        // at the declared context rather than all of them -- and the page slot
+        // of an untouched block stays empty because no candidate can reference
+        // it.
         std::uint32_t attendable_blocks = 0U;
         for (const auto& block : compressed) {
             const auto first_row = block.compression_ratio == 0U
@@ -6405,48 +6414,10 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
             if (first_row >= compressed_count) break;
             ++attendable_blocks;
         }
-        if (reuse_prefix &&
-            scratch.cached_compressed_blocks == attendable_blocks) {
-            // The prefix already holds these blocks' leases and pages in
-            // block-table order; only the index map has to be restated.
-            for (std::uint32_t index = 0U; index < attendable_blocks;
-                 ++index) {
-                page_indices.emplace(compressed[index].id, index);
-            }
-        } else {
-        scratch.leases.clear();
-        for (auto& pages : scratch.pages) pages.clear();
-        scratch.compressed_prefix_valid = false;
-        for (std::size_t index = 0U; index < compressed.size(); ++index) {
-            const auto& block = compressed[index];
-            const auto logical_row =
-                block.compression_ratio == 0U
-                    ? 0U : block.logical_begin / block.compression_ratio;
-            // Only blocks that actually hold attendable rows. The table is
-            // sized for the configured context, so without this the stream
-            // leases its whole future allocation every layer -- 32 blocks
-            // instead of 11 at this operating point.
-            if (logical_row >= compressed_count) break;
-            for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-                auto lease = kv_cache->acquire_device(
-                    active_sequence, attention_state[layer].compressor.kind,
-                    layer, logical_row, rank);
-                if (!lease.ok()) {
-                    append_errors(result, std::move(lease.errors));
-                    return result;
-                }
-                scratch.leases.push_back(std::move(lease.value));
-                scratch.pages[rank].push_back(
-                    {scratch.leases.back().buffer(), block.capacity_rows});
-            }
-            page_indices.emplace(block.id,
-                                 static_cast<std::uint32_t>(index));
+        for (auto& pages : scratch.pages) {
+            pages.assign(attendable_blocks, CudaDsv4PhysicalPage{});
         }
-        scratch.cached_compressed_blocks = attendable_blocks;
-        scratch.cached_leases = scratch.leases.size();
-        scratch.cached_pages = scratch.pages[0].size();
-        scratch.compressed_prefix_valid = true;
-        }
+        scratch.compressed_block_leased.assign(attendable_blocks, 0U);
     }
     const auto compressed_width = ratio == 0U ? 0U : ratio == 4U
         ? kIndexTopK

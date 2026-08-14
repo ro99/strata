@@ -1389,12 +1389,30 @@ costs three milliseconds.
 > lazy scheme happened to number them in selection order; that is a hypothesis
 > and is recorded as one, not as a finding.
 >
-> The cache is retained rather than reverted, on a structural argument rather
-> than a measured one: at the declared context a layer leases 4,096 blocks
-> instead of 11, so the per-token lease count rises from 462 to about 172,000
-> across the 21 indexed layers. That is a 372x increase in work whose unit cost
-> is small but unmeasured. Retaining it is insurance, its benefit here is zero,
-> and it must not be described as a measured improvement.
+> **Why the cache did nothing, and the completed attribution.**
+> `rank_local_prepare_layer` clears the layer's leases before
+> `rank_local_candidates` runs, and for a real reason: a block that still holds
+> a lease cannot receive the next token's appended row. The cache was therefore
+> defeated upstream and never hit, which is why it removed nothing. It has been
+> removed.
+>
+> The discriminating experiment is positional numbering with *lazy* leasing,
+> which is also the better design -- an unselected block is never leased:
+>
+> ```text
+> stage 1, lazy numbering and lazy leasing     158.353 ms/token
+> positional numbering, pre-leasing            161.338 ms/token   +2.985
+> positional numbering, lazy leasing           159.673 ms/token   +1.320
+> ```
+>
+> So `1.665 ms` was leasing blocks the selection never touched, now eliminated,
+> and `1.320 ms` is the positional numbering itself. The residual is small and
+> **still unattributed**; the leading hypothesis is that the page-descriptor
+> array's shape and traversal order change what the attention kernel walks, and
+> it is recorded as a hypothesis.
+>
+> Lazy leasing also disposes of the 1M scaling worry on its own terms: a layer
+> leases the blocks its 512 selected rows touch, not all 4,096.
 
 ### How B8 should be sequenced so it stays gateable
 

@@ -81,6 +81,34 @@ struct Dsv4RankLocalLayerPagePatch {
     std::span<const CudaDsv4AttentionPageWrite> writes;
 };
 
+// One indexed layer's in-chain sparse selection. When this is active the
+// executor projects the index query, scores and selects, and resolves the
+// compressed candidate region on each rank's own device between preparation
+// and attention. Nothing crosses to the host, which is what lets an indexed
+// layer stay in the queued chain.
+//
+// Both ranks select independently over their own replicated index pages rather
+// than one rank selecting and broadcasting. The inputs are identical and the
+// kernels are deterministic, so the two agree by construction, the duplicated
+// work is concurrent on two devices, and no exchange enters the critical path.
+struct Dsv4RankLocalLayerSelection {
+    bool active{};
+    std::array<const CudaWeight*, 2U> query_projection{};
+    std::array<const CudaWeight*, 2U> weight_projection{};
+    std::array<std::span<const CudaDsv4PhysicalIndexPage>, 2U> index_pages{};
+    // Positional compressed block table; identical on both ranks because the
+    // physical rows are replicated.
+    std::span<const CudaDsv4KvBlockDescriptor> blocks;
+    std::span<const float> rope_cosines;
+    std::span<const float> rope_sines;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t rope_dim{};
+    std::uint32_t top_k{};
+    std::uint32_t compressed_width{};
+    float weight_scale{};
+};
+
 struct Dsv4RankLocalLayerCall {
     std::uint32_t layer{};
     std::uint32_t position{};
@@ -90,6 +118,7 @@ struct Dsv4RankLocalLayerCall {
     std::span<const CudaDsv4AttentionCandidate> candidates;
     std::span<const float> inverse_rope_cosines;
     std::span<const float> inverse_rope_sines;
+    Dsv4RankLocalLayerSelection selection{};
     std::array<Dsv4RankLocalLayerPagePatch, 2U> page_patches{};
     // The rank-1 preparation waits for rank 0's page callback and patch copies.
     // This is used only when rank 0 owns the canonical compressor/KV update and

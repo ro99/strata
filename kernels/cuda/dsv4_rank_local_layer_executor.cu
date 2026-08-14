@@ -387,8 +387,53 @@ struct ActiveCallGuard {
         }
     }
     if (call.ordered_page_patches && !patches_enabled) return false;
+    const auto& selection = call.selection;
+    if (selection.active) {
+        if (selection.blocks.empty() || selection.heads == 0U ||
+            selection.head_dim == 0U || selection.rope_dim == 0U ||
+            selection.top_k == 0U ||
+            selection.compressed_width < selection.top_k ||
+            selection.compressed_width > call.candidates.size() ||
+            selection.rope_cosines.size() != selection.rope_dim / 2U ||
+            selection.rope_sines.size() != selection.rope_dim / 2U ||
+            !std::isfinite(selection.weight_scale) ||
+            !std::all_of(selection.rope_cosines.begin(),
+                         selection.rope_cosines.end(),
+                         [](float value) { return std::isfinite(value); }) ||
+            !std::all_of(selection.rope_sines.begin(),
+                         selection.rope_sines.end(),
+                         [](float value) { return std::isfinite(value); })) {
+            return false;
+        }
+        for (std::size_t rank = 0U; rank < kWorld; ++rank) {
+            if (selection.query_projection[rank] == nullptr ||
+                selection.weight_projection[rank] == nullptr ||
+                !selection.query_projection[rank]->valid() ||
+                !selection.weight_projection[rank]->valid() ||
+                selection.query_projection[rank]->device() != devices[rank] ||
+                selection.weight_projection[rank]->device() != devices[rank] ||
+                selection.index_pages[rank].empty() ||
+                // Every attendable compressed block must own a live attention
+                // page: a selection the host never sees has no first touch to
+                // lease on.
+                selection.blocks.size() > call.pages[rank].size()) {
+                return false;
+            }
+            for (const auto& page : selection.index_pages[rank]) {
+                if (page.buffer == nullptr || !page.buffer->valid() ||
+                    page.buffer->device() != devices[rank] ||
+                    page.rows == 0U || page.rows > page.block_rows) {
+                    return false;
+                }
+            }
+        }
+    }
+    const auto host_candidate_begin = selection.active
+        ? selection.compressed_width : 0U;
     for (std::size_t rank = 0U; rank < kWorld; ++rank) {
-        for (const auto& candidate : call.candidates) {
+        for (std::size_t index = host_candidate_begin;
+             index < call.candidates.size(); ++index) {
+            const auto& candidate = call.candidates[index];
             if (candidate.valid &&
                 (candidate.page >= call.pages[rank].size() ||
                  candidate.row >= call.pages[rank][candidate.page].rows)) return false;
@@ -912,6 +957,7 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
         prepare.key_value_norm = weights.key_value_norm;
         prepare.rope_cosines = call.inverse_rope_cosines;
         prepare.rope_sines = forward_sines;
+        prepare.publish_index_source = call.selection.active;
         const auto& page_patch = call.page_patches[rank];
         const bool host_page_patch = page_patch.callback != nullptr;
         prepare.host_callback = page_patch.callback;
@@ -955,11 +1001,54 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
                       output.errors))) {
             break;
         }
+        // Selection is enqueued between this layer's preparation and its
+        // attention on the same stream. That ordering is what makes it safe to
+        // reuse one projection and one selection workspace per device across
+        // 43 queued layers: layer N's resolve reads the winners before layer
+        // N+1's selection overwrites them.
+        CudaDsv4DeviceCandidateResolution resolution;
+        if (call.selection.active) {
+            CudaDsv4IndexProjectionRequest projection;
+            projection.query_projection = call.selection.query_projection[rank];
+            projection.weight_projection =
+                call.selection.weight_projection[rank];
+            projection.rope_cosines = call.selection.rope_cosines;
+            projection.rope_sines = call.selection.rope_sines;
+            projection.heads = call.selection.heads;
+            projection.head_dim = call.selection.head_dim;
+            projection.rope_dim = call.selection.rope_dim;
+            projection.weight_scale = call.selection.weight_scale;
+            auto projected = backend_.dsv4_index_projections(
+                devices_[rank], projection, {}, {});
+            if (!projected.ok()) {
+                output.errors.insert(output.errors.end(),
+                                     projected.errors.begin(),
+                                     projected.errors.end());
+                break;
+            }
+            CudaDsv4PhysicalIndexRequest index;
+            index.pages = call.selection.index_pages[rank];
+            index.heads = call.selection.heads;
+            index.head_dim = call.selection.head_dim;
+            index.top_k = call.selection.top_k;
+            index.device_projected = true;
+            auto selected = backend_.dsv4_physical_lightning_index(
+                devices_[rank], index, {}, &resolution.selection);
+            if (!selected.ok()) {
+                output.errors.insert(output.errors.end(),
+                                     selected.errors.begin(),
+                                     selected.errors.end());
+                break;
+            }
+            resolution.blocks = call.selection.blocks;
+            resolution.compressed_width = call.selection.compressed_width;
+        }
         CudaDsv4PagedAttentionMhcRequest request;
         request.attention.head_sinks = call.head_sinks
             .subspan(rank * 32U, 32U);
         request.attention.pages = call.pages[rank];
         request.attention.candidates = call.candidates;
+        if (call.selection.active) request.attention.resolution = &resolution;
         request.attention.scale = kAttentionScale;
         request.attention.maximum_workspace_bytes = 8ULL << 20U;
         request.inverse_rope_cosines = call.inverse_rope_cosines;
@@ -1487,9 +1576,16 @@ ValidationResult Dsv4RankLocalLayerExecutor::finish_chain(
         chain_result.attention_status[rank] = attention_status;
         chain_result.global_attention_status = std::max(
             chain_result.global_attention_status, attention_status);
-        if (attention_status != 0U)
+        if (attention_status != 0U) {
+            // The status is the attention command's own word, carried
+            // verbatim. Bits 1 to 3 are raised by an in-chain candidate
+            // resolution and say which of its three causes fired; bit 0 is the
+            // plain failure any DeepSeek attention kernel reports.
             result.errors.emplace_back(
-                "rank-local chain attention device status failed");
+                "rank-local chain attention device status failed on rank " +
+                std::to_string(rank) + " with status " +
+                std::to_string(attention_status));
+        }
         if (impl_->ranks[rank].moe_status != nullptr) {
             std::uint32_t moe_status = 0U;
             if (cudaMemcpy(&moe_status, impl_->ranks[rank].moe_status,

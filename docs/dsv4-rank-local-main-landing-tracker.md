@@ -378,6 +378,9 @@ Exit criteria:
 | 2026-08-13 | Step 4 Nsight Compute availability | `results/dsv4-rank-local-main-landing/step4-scorer-diagnosis/ncu-score-PERMISSION-DENIED.log` | `ERR_NVGPUCTRPERM` on device 1 | correction to the record: Nsight Compute 2025.1.1 **is** installed and recognizes every device; counter *collection* is refused by the driver permission setting, which is a different thing. The scorer diagnosis' hand-derived rates are inferences, not counter measurements, and are labelled as such |
 | 2026-08-13 | Step 4 pivot alignment defect | full `strata-tests` run before the alignment fix | 278/300, 21 failures incl. `physical Lightning Indexer rejects malformed pages and shapes` at `tests/test_cuda_backend.cpp:504` | **defect I introduced and caught**: the pivot's new `uint4` group read needs 16 B alignment, but the histogram workspace region was reserved with `alignof(std::uint32_t)`. Misaligned vector loads left a sticky CUDA error, so 21 failures traced to one root cause. Fixed by reserving the region at `alignof(uint4)` |
 | 2026-08-13 | Step 4 pivot correction | `results/dsv4-rank-local-main-landing/step4-scorer-diagnosis/pivot-fixed-binding.txt` | SHA256 `0eceffc332f340ce2dfe12c87f35c03673927ffccabca825107b9dfd438f834a`; complete index `36.062` to `34.092 ms/token`; pivot kernel `47.288` to `15.728 us` (`3.01x`) | pivot drops from 22.2% to 8.6% of index GPU time; all four indexer exactness tests pass and the suite returns to 299/300 with one declared opt-in skip |
+| 2026-08-14 | Step 4 Stage 2 gate A: device index projections | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-gateA.json`, `centralized-gateA.json` | SHA256 `7b42280b537fa5bb28abbb81ad14f05748ca6fa1176cd8fd53939af5796ad4a8` / `1f04d79202dc21eb3a363c7554604e6e2064e4a3b155b0b6ecf56ae557587e31`; rank-local `159.673` to `156.080`, centralized `142.777` to `140.610 ms/token` | both index projections moved onto the device against the preparation command's own activations. Selection trace hashes **identical** on both topologies (`f14e5cde177258bd`, `d7e791756a7355d2`), token IDs and answer text identical, `231` CUDA and `0` scalar dispatches, zero decode checkpoint I/O. Exact by construction: the same kernel `matmul` would dispatch, over the activation its own upload would have produced |
+| 2026-08-14 | Step 4 Stage 2 gate B: device candidate resolution | `results/dsv4-rank-local-main-landing/step4-sparse-path/centralized-gateB.json` | SHA256 `4d03784b3683f9422e8a6025e8fa234aa0adc7b27420c3d423fa161878db0c61`; `140.610` to `142.339 ms/token` | the resolve kernel, the positional block table and the device-candidate attention input, gated on the centralized arm where the selection is still host-visible and everything else is held constant. Identical IDs, answer and selection trace. The `+1.729 ms` is the price of pre-leasing every attendable block, which device selection requires and first-touch leasing cannot serve |
+| 2026-08-14 | **Step 4 Stage 2 gate C: in-chain selection** | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-gateC5.json` | SHA256 `17df56adb0b8def079c5a505428d564527f140be820ba6101c3f55571436a0f8`; steady median **`115.795 ms/token`** against Stage 1's `159.673` (`-43.878`) | selection runs inside the queued chain: projection, score, top-k and candidate resolution are enqueued in each layer's own command sequence and no indexed layer leaves the chain. **Generated token IDs and answer text identical** to the sequential baseline; `462` CUDA and `0` scalar index dispatches (both ranks select on their own device); zero decode checkpoint I/O; decode synchronization calls `1,462` to `748`; D2H `27.96` to `19.85 MB`. VRAM `22,419,734,528` B/device against the `22,548,578,304` ceiling and RSS `158,365,499,392` B |
 | 2026-08-13 | Step 4 gates after mHC correction | `results/dsv4-rank-local-main-landing/step4-make-check-default-r3.log`, `step4-make-check-nccl-r2.log` | default 2/2 pass exit 0; NCCL 2/2 pass exit 0; `git diff --check` clean | both builds re-verified with all four corrected kernels |
 | 2026-08-13 | Step 4 mHC acceptance | `results/dsv4-rank-local-main-landing/step4-mhc-acceptance/summary.json` | rank medians `111.895850`, `111.721523`, `111.528517` ms; median `111.721523` ms = `8.950827` token/s; central median `133.867678` ms | strict gate still **PASSES**; oracle-exact; centralized IDs still bit-identical; the `+0.544 ms` against the previous matrix is **inside** that matrix's own `2.932 ms` repetition spread, so **no end-to-end change is claimed in either direction** |
 | 2026-08-13 | Step 4 mHC mechanism screen | `results/dsv4-rank-local-main-landing/step4-norm-correction-r1/mhc_screen.cu` and `mhc-screen-device0.txt` | device 1 `15.35` to `6.07 us` (`2.53x`); device 0 `15.47` to `6.09 us` (`2.54x`); **0 bit mismatches on both outputs** | `dsv4_mhc_weighted_norm`'s xor reduction shape is itself the contract, so the 64 accumulators and their combination order are preserved and only the elementwise phases widen; `1.320` to `0.522 ms/token` |
@@ -1536,6 +1539,135 @@ branch.
 This does not change the value of the work -- the measured prize is still about
 `61 ms/token` -- but it does change its size, and the estimate that in-chain
 selection was "four pieces, two of them screened" was wrong.
+
+### 2026-08-14 — Stage 2 built in three gated steps
+
+The handoff said items 3 to 6 have no intermediate gate and that the only
+signal is an end-to-end arm reporting "the answer text differs" without
+localizing the cause. Two of the three risks turned out to be separable, and
+separating them cost two arms and repaid both.
+
+```text
+gate A  both index projections onto the device, selection still host-visible
+        rank-local  159.673 -> 156.080   trace f14e5cde177258bd unchanged
+        centralized 142.777 -> 140.610   trace d7e791756a7355d2 unchanged
+
+gate B  device candidate resolution, positional pages, device-candidate
+        attention input -- gated on the centralized arm, where the selection
+        is still host-visible and only the consumer changes
+        centralized 140.610 -> 142.339   same IDs, answer and trace
+```
+
+Gate A is exact **by construction rather than by comparison**, and that is the
+reason to prefer it over a hand-written kernel: `linear()` is
+`CudaBackend::matmul` plus a host `round_bf16`, so the device form routes the
+same kernel `matmul` would dispatch for that weight, over an activation already
+in the state `matmul`'s own upload would have produced. Two encodings appear
+here and each pairs with exactly one activation state -- FP8 with the
+E4M3-quantized query rank, plain BF16 with the raw expanded layer input --
+so the backend requires the encoding rather than dispatching over it. Feeding
+one to the other's kernel would be silently wrong rather than rejected.
+
+Gate B carries a real cost and it is not a defect: `+1.729 ms/token` is the
+price of leasing every attendable compressed block. **First-touch leasing and
+device selection are mutually exclusive**, which the lazy-leasing commit
+earlier in this step did not anticipate: the host leases a page when a selected
+row first names it, and a selection the host never sees has no first touch. An
+unleased slot in a positional page array is an empty page, and the command
+would name it. At this operating point that is 11 blocks per indexed layer.
+What it costs at the declared context is an open question, recorded below.
+
+### 2026-08-14 — Rank 1 owns no compressor, and that broke the first in-chain arm
+
+The first end-to-end in-chain arm failed closed with "CUDA index projections
+have no prepared attention source". The cause is a deliberate asymmetry: the
+compressor is **resident on rank 0 alone**, because it is one logical
+replicated KV stream whose encoded row is copied to both ranks, and loading a
+second identical set would add about 0.6 GiB for nothing. The expanded BF16
+layer input the index weight projection reads was computed only as a side
+effect of a compressor projection, so on rank 1 it did not exist.
+
+Rank 1 still has to select. The preparation now expands its layer input on
+request, which is one 4,096-element widening, and the request names why.
+
+This is the shape of defect the gate decomposition was meant to expose: it is a
+residency asymmetry, not a kernel error, and an undecomposed arm would have
+reported it as the same "the answer differs" that a wrong candidate set does.
+
+### 2026-08-14 — A workspace sized from its request spans, and an enqueue-only path that had no caller
+
+The second in-chain arm failed differently: the chain ran, and both ranks
+reported a non-zero attention status. The status word is the attention
+command's own, carried verbatim into the mHC workspace, so the fix was to make
+the in-chain resolution raise **distinct bits** for its three causes -- the
+selection rejected its own input, a selected row is owned by no block, a
+resolved candidate falls outside its page -- and to report the numeric status
+rather than the fact of failure. That diagnostic is fail-closed-path only and
+stays.
+
+The cause was found by inspection before the instrumented arm returned. The
+physical Lightning Indexer sizes its bounded workspace from the *request
+spans*:
+
+```cpp
+!checked_bytes(request.queries.size(), 1U, sizeof(float), query_bytes) ||
+!checked_bytes(request.weights.size(), 1U, sizeof(float), weight_bytes) ||
+```
+
+A device-projected call carries no host spans by construction, so both regions
+were **zero bytes**, and the transposed query staging wrote 8,192 floats over
+the page descriptors, scores and keys that follow it. Sizing from the shape
+rather than from the spans is the fix.
+
+This is a defect in a path that until now had **no production caller**: the
+enqueue-only selection form was committed with the device-selection entry point
+and gated only by a unit test that never exercised device projection. An
+unused API is not a tested one.
+
+**Recorded, not yet acted on:** the same enqueue-only path uploads its page
+descriptors from a `std::vector` local to the call. For pageable host memory
+CUDA stages the copy before returning, so this is correct, but the driver may
+also synchronize the stream to do it -- which in a queued chain is exactly the
+serialization the chain exists to remove. If the in-chain timing disappoints,
+measure this before designing anything else.
+
+### 2026-08-14 — Stage 2 closes: the topology is finally worth its cost above the threshold
+
+```text
+must not exceed                          158.353 ms/token   (Stage 1 bar)
+target                                   about 113
+measured, in-chain selection             115.795            -43.878
+centralized, same arm                    140.610
+below-threshold queued arm               109.612
+```
+
+Token IDs and answer text are **identical** to the sequential baseline, so the
+`43.878 ms` is entirely topology and not a different candidate set. Rank-local
+above the threshold moves from `15.576 ms/token` **slower** than centralized to
+about `25 ms` **faster**, which is the standing the queued chain always had
+below the threshold and could not carry across it.
+
+The mechanism shows in two counters rather than one: decode synchronization
+calls fall from `1,462` to `748`, and decode D2H from `27.96` to `19.85 MB`.
+Both ranks now select on their own device -- `462` CUDA dispatches where the
+sequential arm issued `231` -- and that duplication is deliberate. The two
+ranks read identical inputs with deterministic kernels, so they agree by
+construction; the work is concurrent on two devices, and no exchange or merge
+enters the critical path. **The candidate-sharding mechanism this step
+falsified in April is not needed at all**: what the chain wanted was not a
+cheaper score but no host boundary.
+
+The residual against the `109.612` below-threshold arm is `6.183 ms/token` for
+21 indexed layers, which is the index work itself plus the pre-leasing the
+device selection requires.
+
+**What this does not establish.** Every number here is at 2,685 active tokens.
+The leasing term scales with the block count and the score term with the
+candidate count, and one extrapolation in this document has already been
+withdrawn for exactly that reason. Two things must be measured before any 1M
+claim: what pre-leasing every attendable block costs at 4,096 blocks per
+indexed layer, and whether the enqueue-only page-descriptor upload synchronizes
+the stream.
 
 ## Stage 2 handoff
 

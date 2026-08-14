@@ -279,6 +279,13 @@ struct CudaDsv4PhysicalIndexRequest {
     std::uint32_t head_dim{};
     std::uint32_t top_k{};
     std::uint64_t maximum_workspace_bytes{64ULL << 20U};
+    // Consume the query and weights the preceding device-only
+    // dsv4_index_projections left on this device instead of uploading them.
+    // `queries` and `weights` must be empty in this mode, and the projection's
+    // own non-finite rejection is carried into this command's error word --
+    // the host validation it replaces has no other way to reach a selection
+    // that never crosses back.
+    bool device_projected{};
 };
 
 // One persistent physical-format physical KV page. The buffer contains only
@@ -296,6 +303,27 @@ struct CudaDsv4AttentionCandidate {
     bool valid{};
 };
 
+// One physical KV block, as locate_physical_kv_block() sees it. `logical_begin`
+// counts SOURCE tokens; the block's first row is that divided by the ratio.
+struct CudaDsv4KvBlockDescriptor {
+    std::uint64_t logical_begin{};
+    std::uint32_t used_rows{};
+    std::uint32_t compression_ratio{};
+};
+
+// Resolves the compressed candidate region on the device from a selection the
+// host has not seen. The host cannot number pages by first touch under device
+// selection -- it does not know which blocks a candidate set will touch -- so
+// the page index is the block-table index and every attendable block owns its
+// slot. The sliding tail is still host-known and travels in `candidates`.
+struct CudaDsv4DeviceCandidateResolution {
+    CudaDsv4DeviceIndexSelection selection;
+    std::span<const CudaDsv4KvBlockDescriptor> blocks;
+    // Width of the compressed region at the front of `candidates`. Everything
+    // the resolution does not fill is left invalid.
+    std::uint32_t compressed_width{};
+};
+
 struct CudaDsv4PagedAttentionRequest {
     // Queries have crossed the production BF16 boundary. The backend converts
     // them to BF16, reads page payloads in place, and returns the exact BF16
@@ -304,6 +332,9 @@ struct CudaDsv4PagedAttentionRequest {
     std::span<const float> head_sinks;
     std::span<const CudaDsv4PhysicalPage> pages;
     std::span<const CudaDsv4AttentionCandidate> candidates;
+    // When set, the compressed region of `candidates` is ignored and resolved
+    // on the device instead, after the upload and before scoring.
+    const CudaDsv4DeviceCandidateResolution* resolution{};
     float scale{};
     std::uint64_t maximum_workspace_bytes{4ULL << 20U};
 };
@@ -401,6 +432,33 @@ struct CudaDsv4PagedAttentionMhcRequest {
     float* rank_local_raw_fp32_reduction{};
 };
 
+// One indexed layer's index-query and index-weight projections, computed from
+// the activations the attention preparation command already left on the
+// device: the E4M3-quantized query rank and the expanded BF16 layer input.
+//
+// Exactness here is by construction rather than by comparison. The host form
+// is two linear() calls, and linear() is CudaBackend::matmul followed by a host
+// round_bf16; this routes the same kernel matmul would dispatch for the same
+// weight, over an activation that is already in the state matmul's own upload
+// would have produced. A differently tiled kernel would change the
+// accumulation order and, through a hard top-k, the candidate set.
+struct CudaDsv4IndexProjectionRequest {
+    // attn.indexer.wq_b: consumes the quantized query rank.
+    const CudaWeight* query_projection{};
+    // attn.indexer.weights_proj: consumes the raw expanded layer input.
+    const CudaWeight* weight_projection{};
+    // Computed by the caller from the position and the layer frequencies.
+    // Host libm and device trigonometry differ in the last ulp.
+    std::span<const float> rope_cosines;
+    std::span<const float> rope_sines;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t rope_dim{};
+    // Applied after the projection's BF16 rounding; the product is rounded
+    // again, exactly as index_select() does on the host.
+    float weight_scale{};
+};
+
 // Produces the accepted BF16 Q/KV boundary from the persistent mHC layer
 // input. The 64x512 query remains device-resident for the immediately
 // following paged-attention command. Query-rank, KV, and optional raw-F32
@@ -451,6 +509,15 @@ struct CudaDsv4AttentionPrepareRequest {
     // be empty in this mode.  This is setup for a dependent rank-local
     // attention command, not a host-visible timing path.
     bool device_only{};
+    // Publish this command's activations for a following in-chain
+    // dsv4_index_projections: the E4M3-quantized query rank, and the expanded
+    // BF16 layer input its weight projection reads.
+    //
+    // The expansion is otherwise computed only for a compressor projection,
+    // and the compressor is deliberately resident on rank 0 alone -- one
+    // logical replicated KV stream, whose encoded row is copied to both ranks.
+    // Rank 1 still has to select, so it asks for the expansion on its own.
+    bool publish_index_source{};
     // The complement of `device_only`: return the host-visible projections and
     // publish no prepared device query, so this preparation stages no command
     // for a following attention to consume.
@@ -851,6 +918,16 @@ public:
         int device, std::span<float> queries, std::span<const float> cosines,
         std::span<const float> sines, std::uint32_t heads,
         std::uint32_t head_dim, std::uint32_t rope_dim, bool quantize);
+    // Both index projections plus the query's RoPE, BF16 rounding and half-up
+    // E4M3 quantization, in one command over the preparation's own device
+    // activations. It replaces two host round trips per indexed layer: the
+    // host never sends the query rank or the layer input back to the device.
+    // The sources are published by the immediately preceding
+    // dsv4_prepare_attention on this device and are overwritten by the next
+    // one, so this must be issued between them.
+    [[nodiscard]] ValidationResult dsv4_index_projections(
+        int device, const CudaDsv4IndexProjectionRequest& request,
+        std::span<float> queries, std::span<float> weights);
     // With `device_selection` null this downloads the positions into `output`
     // and synchronizes, which is the host-visible selection the sequential path
     // uses. With it non-null the kernels are left enqueued on the device

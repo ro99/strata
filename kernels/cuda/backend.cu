@@ -2758,6 +2758,111 @@ struct Dsv4DeviceAttentionCandidate {
     std::uint32_t valid{};
 };
 
+// Status bits an in-chain resolution can raise. Bit 0 is left to the plain
+// failure every other DeepSeek attention kernel already reports.
+constexpr unsigned int kDsv4ResolveSelectionRejected = 1U << 1U;
+constexpr unsigned int kDsv4ResolveRowUnowned = 1U << 2U;
+constexpr unsigned int kDsv4ResolveOutsidePage = 1U << 3U;
+
+struct Dsv4DeviceKvBlock {
+    std::uint64_t logical_begin{};
+    std::uint32_t used_rows{};
+    std::uint32_t compression_ratio{};
+};
+
+// Resolves each selected logical row to its physical page and row without the
+// host having seen the selection. This is locate_physical_kv_block()'s three
+// tiers -- uniform guess, binary search, exhaustive scan -- with the same
+// ownership predicate validated on every path, so a row resolves to the block
+// the host would have chosen or to nothing at all.
+//
+// The page index is the block-table index: under device selection there is no
+// first-touch order to compact against. The bounds the host checks per
+// candidate are checked here too, against the same uploaded page descriptors,
+// so an out-of-range resolution fails the command instead of reading a page it
+// does not own.
+//
+// Screened against the host over three geometries and 516 probes each -- short
+// final blocks, block boundaries, ratio 4 and ratio 128, at 2,685 and
+// 1,048,576 tokens -- with zero block and zero row mismatches on both
+// architectures.
+__global__ void dsv4_resolve_candidates_kernel(
+    const std::uint32_t* selected, std::uint32_t selected_count,
+    const Dsv4DeviceKvBlock* blocks, std::uint32_t block_count,
+    const Dsv4DevicePhysicalPage* pages, std::uint32_t page_count,
+    Dsv4DeviceAttentionCandidate* candidates, std::uint32_t candidate_width,
+    const unsigned int* selection_error, unsigned int* error) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    // The selection ran without a host boundary, so its own rejection has no
+    // other way back. Carry it into the command that consumes it.
+    //
+    // The three causes are distinguished in the status word because they are
+    // otherwise indistinguishable from a decode failure downstream, and this
+    // command has no host boundary of its own to report at. They are set as
+    // bits so a later kernel's plain failure does not hide them.
+    if (index == 0U && selection_error != nullptr && *selection_error != 0U) {
+        atomicOr(error, kDsv4ResolveSelectionRejected);
+    }
+    if (index >= candidate_width) return;
+    if (index >= selected_count) {
+        candidates[index] = {0U, 0U, 0U};
+        return;
+    }
+    const std::uint64_t logical_row = selected[index];
+
+    const auto owns = [&](std::uint32_t slot) {
+        const auto& block = blocks[slot];
+        if (block.compression_ratio == 0U) return false;
+        const auto begin = block.logical_begin / block.compression_ratio;
+        return logical_row >= begin && logical_row < begin + block.used_rows;
+    };
+
+    std::uint32_t found = block_count;
+    if (block_count != 0U) {
+        const auto& first = blocks[0];
+        if (first.compression_ratio != 0U && first.used_rows != 0U) {
+            const auto base = first.logical_begin / first.compression_ratio;
+            if (logical_row >= base) {
+                const auto guess = static_cast<std::uint32_t>(
+                    (logical_row - base) / first.used_rows);
+                if (guess < block_count && owns(guess)) found = guess;
+            }
+        }
+    }
+    if (found == block_count) {
+        std::uint32_t low = 0U;
+        std::uint32_t high = block_count;
+        while (low < high) {
+            const auto middle = low + (high - low) / 2U;
+            const auto& block = blocks[middle];
+            if (block.compression_ratio == 0U) break;
+            const auto begin = block.logical_begin / block.compression_ratio;
+            if (logical_row < begin) high = middle;
+            else if (logical_row >= begin + block.used_rows) low = middle + 1U;
+            else { found = middle; break; }
+        }
+    }
+    if (found == block_count) {
+        for (std::uint32_t slot = 0U; slot < block_count; ++slot) {
+            if (owns(slot)) { found = slot; break; }
+        }
+    }
+    if (found == block_count) {
+        atomicOr(error, kDsv4ResolveRowUnowned);
+        candidates[index] = {0U, 0U, 0U};
+        return;
+    }
+    const auto& block = blocks[found];
+    const auto begin = block.logical_begin / block.compression_ratio;
+    const auto row = static_cast<std::uint32_t>(logical_row - begin);
+    if (found >= page_count || row >= pages[found].rows) {
+        atomicOr(error, kDsv4ResolveOutsidePage);
+        candidates[index] = {0U, 0U, 0U};
+        return;
+    }
+    candidates[index] = {found, row, 1U};
+}
+
 __device__ __forceinline__ float dsv4_decode_e4m3fn(
     std::uint8_t code, unsigned int* failure) {
     const auto exponent = static_cast<std::uint32_t>((code >> 3U) & 0x0fU);
@@ -3200,6 +3305,47 @@ __global__ void dsv4_index_query_rope_quantize_kernel(
         query[index] =
             fp8_e4m3_value(dsv4_encode_e4m3_half_up(query[index]));
     }
+}
+
+// The BF16 rounding linear() applies to every projection output, plus the
+// non-finite rejection the host performs before scoring. Rejecting here rather
+// than after a download keeps the failure closed when the projection never
+// crosses back to the host.
+__global__ void dsv4_index_projection_round_kernel(
+    float* values, std::uint32_t count, unsigned int* error) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const float rounded = bf16_round(values[index]);
+    if (!isfinite(rounded)) atomicExch(error, 1U);
+    values[index] = rounded;
+}
+
+// index_select()'s per-head weight tail: the projection's own BF16 rounding,
+// then the scale, then a second rounding of the product. The multiply is
+// explicitly non-contracted so no fma can absorb it.
+__global__ void dsv4_index_weight_scale_kernel(
+    float* values, std::uint32_t count, float scale, unsigned int* error) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const float scaled =
+        bf16_round(__fmul_rn(bf16_round(values[index]), scale));
+    if (!isfinite(scaled)) atomicExch(error, 1U);
+    values[index] = scaled;
+}
+
+// Column-major staging for the score kernel's 64 consecutive-float reads. The
+// host form does this pass on the CPU on its way to the upload; with the query
+// already on the device there is nothing to upload, so the same permutation
+// runs here.
+__global__ void dsv4_index_query_transpose_kernel(
+    float* destination, const float* source, std::uint32_t heads,
+    std::uint32_t head_dim) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= heads * head_dim) return;
+    const auto head = index / head_dim;
+    const auto column = index % head_dim;
+    destination[static_cast<std::uint64_t>(column) * heads + head] =
+        source[index];
 }
 
 // The declared contract pins the accumulation *order* of the FP64 sum, not
@@ -4132,6 +4278,20 @@ struct CudaBackend::Impl {
         std::uint64_t dsv4_attention_prepare_host_download_bytes{};
         __nv_bfloat16* dsv4_prepared_queries{};
         bool dsv4_attention_prepared{};
+        // Index-projection sources left behind by the last preparation on this
+        // device: the E4M3-quantized query rank, and the expanded BF16 layer
+        // input. Both point into the preparation workspace, so the next
+        // preparation on this device overwrites them.
+        const float* dsv4_prepared_index_query_source{};
+        const float* dsv4_prepared_index_hidden_source{};
+        // Device-only index projections awaiting an in-chain selection. Set by
+        // dsv4_index_projections when it returns no host output, consumed by
+        // the next dsv4_physical_lightning_index on this device.
+        const float* dsv4_index_projection_queries{};
+        const float* dsv4_index_projection_weights{};
+        const unsigned int* dsv4_index_projection_error{};
+        std::uint32_t dsv4_index_projection_heads{};
+        std::uint32_t dsv4_index_projection_head_dim{};
         std::array<Dsv4AttentionPrepareHostCommand, 43U>
             dsv4_attention_prepare_host_commands{};
         std::uint32_t dsv4_attention_prepare_host_command_count{};
@@ -6168,6 +6328,215 @@ ValidationResult CudaBackend::dsv4_index_query_rope_quantize(
     return result;
 }
 
+ValidationResult CudaBackend::dsv4_index_projections(
+    int device, const CudaDsv4IndexProjectionRequest& request,
+    std::span<float> queries, std::span<float> weights) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "CUDA index projections received an unknown device");
+        return result;
+    }
+    auto& state = found->second;
+    const auto query_elements =
+        static_cast<std::uint64_t>(request.heads) * request.head_dim;
+    // With both output spans empty the projections stay on the device for an
+    // in-chain selection to consume: no download and no synchronize, which is
+    // the whole point of running them here rather than through two host
+    // round trips.
+    const bool device_only = queries.empty() && weights.empty();
+    if (request.heads == 0U || request.heads > 64U ||
+        request.head_dim < 32U || request.head_dim > 1'024U ||
+        request.rope_dim == 0U || request.rope_dim > request.head_dim ||
+        (request.rope_dim % 2U) != 0U ||
+        (!device_only && queries.size() != query_elements) ||
+        (!device_only && weights.size() != request.heads) ||
+        request.rope_cosines.size() != request.rope_dim / 2U ||
+        request.rope_sines.size() != request.rope_dim / 2U ||
+        !std::isfinite(request.weight_scale) ||
+        request.query_projection == nullptr ||
+        request.weight_projection == nullptr ||
+        !request.query_projection->valid() ||
+        !request.weight_projection->valid() ||
+        request.query_projection->device() != device ||
+        request.weight_projection->device() != device) {
+        result.errors.emplace_back(
+            "CUDA index projection shapes are incompatible");
+        return result;
+    }
+    const auto& query_descriptor = request.query_projection->impl_->descriptor;
+    const auto& weight_descriptor =
+        request.weight_projection->impl_->descriptor;
+    // The two sources are the preparation's own activations, and each one is
+    // in the state exactly one encoding expects. A quantized activation fed to
+    // a plain BF16 kernel, or a raw one fed to an FP8 kernel, would be silently
+    // wrong rather than rejected, so the encodings are required rather than
+    // dispatched over.
+    if (query_descriptor.encoding != CudaWeightEncoding::Fp8E4m3Block128 ||
+        query_descriptor.rows != query_elements ||
+        weight_descriptor.encoding != CudaWeightEncoding::Plain ||
+        weight_descriptor.dtype != SafetensorsDtype::Bf16 ||
+        weight_descriptor.rows != request.heads) {
+        result.errors.emplace_back(
+            "CUDA index projections require an FP8 query projection and a "
+            "BF16 weight projection");
+        return result;
+    }
+    if (state.dsv4_prepared_index_query_source == nullptr ||
+        state.dsv4_prepared_index_hidden_source == nullptr) {
+        result.errors.emplace_back(
+            std::string("CUDA index projections on device ") +
+            std::to_string(device) + " have no prepared " +
+            (state.dsv4_prepared_index_query_source == nullptr
+                 ? "query rank"
+                 : "layer input") +
+            "; the preparation before them must publish its index source");
+        return result;
+    }
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "CUDA index projections cannot overlap an in-flight DeepSeek MoE "
+            "command");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for index projections");
+    }
+    const auto query_bytes = query_elements * sizeof(float);
+    const auto weight_bytes =
+        static_cast<std::uint64_t>(request.heads) * sizeof(float);
+    const auto rope_bytes =
+        static_cast<std::uint64_t>(request.rope_cosines.size()) * sizeof(float);
+    const auto required =
+        query_bytes + weight_bytes + 2U * rope_bytes + sizeof(unsigned int);
+    if (state.dsv4_index_query_workspace_bytes < required) {
+        if (state.dsv4_index_query_workspace != nullptr) {
+            static_cast<void>(cudaFree(state.dsv4_index_query_workspace));
+            state.dsv4_index_query_workspace = nullptr;
+            state.dsv4_index_query_workspace_bytes = 0U;
+        }
+        if (auto status = cudaMalloc(&state.dsv4_index_query_workspace,
+                                     static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate index projection workspace");
+        }
+        state.dsv4_index_query_workspace_bytes = required;
+    }
+    auto* base = state.dsv4_index_query_workspace;
+    auto* device_queries = reinterpret_cast<float*>(base);
+    auto* device_weights = reinterpret_cast<float*>(base + query_bytes);
+    auto* device_cosines =
+        reinterpret_cast<float*>(base + query_bytes + weight_bytes);
+    auto* device_sines = reinterpret_cast<float*>(
+        base + query_bytes + weight_bytes + rope_bytes);
+    auto* device_error = reinterpret_cast<unsigned int*>(
+        base + query_bytes + weight_bytes + 2U * rope_bytes);
+
+    const auto copy = [&](void* destination, const void* source,
+                          std::uint64_t bytes, cudaMemcpyKind kind,
+                          const char* what) {
+        const auto status = cudaMemcpyAsync(
+            destination, source, static_cast<std::size_t>(bytes), kind,
+            state.stream);
+        if (status != cudaSuccess) result = cuda_error(status, what);
+        return status == cudaSuccess;
+    };
+    if (!copy(device_cosines, request.rope_cosines.data(), rope_bytes,
+              cudaMemcpyHostToDevice, "upload index rope cosines") ||
+        !copy(device_sines, request.rope_sines.data(), rope_bytes,
+              cudaMemcpyHostToDevice, "upload index rope sines")) {
+        return result;
+    }
+    if (auto status = cudaMemsetAsync(device_error, 0, sizeof(unsigned int),
+                                      state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear index projection error state");
+    }
+    constexpr unsigned int threads = 256U;
+    native_fp8_matmul_kernel<<<
+        dim3(static_cast<unsigned int>(query_descriptor.rows), 1U, 1U), threads,
+        0U, state.stream>>>(
+        device_queries, state.dsv4_prepared_index_query_source,
+        static_cast<const unsigned char*>(
+            request.query_projection->impl_->weights),
+        static_cast<const unsigned char*>(
+            request.query_projection->impl_->scales),
+        query_descriptor.scale_columns, 1U, query_descriptor.columns,
+        query_descriptor.rows, 0U, 0U);
+    dsv4_index_projection_round_kernel<<<
+        static_cast<unsigned int>((query_elements + threads - 1U) / threads),
+        threads, 0U, state.stream>>>(
+        device_queries, static_cast<std::uint32_t>(query_elements),
+        device_error);
+    dsv4_index_query_rope_quantize_kernel<<<request.heads, request.head_dim, 0U,
+                                           state.stream>>>(
+        device_queries, device_cosines, device_sines, request.head_dim,
+        request.rope_dim, 1U, device_error);
+    constexpr unsigned int warps_per_block = threads / 32U;
+    bf16_matvec_kernel<<<
+        static_cast<unsigned int>(
+            (weight_descriptor.rows + warps_per_block - 1U) / warps_per_block),
+        threads, 0U, state.stream>>>(
+        device_weights, state.dsv4_prepared_index_hidden_source,
+        static_cast<const __nv_bfloat16*>(
+            request.weight_projection->impl_->weights),
+        weight_descriptor.columns, weight_descriptor.rows);
+    dsv4_index_weight_scale_kernel<<<1U, threads, 0U, state.stream>>>(
+        device_weights, request.heads, request.weight_scale, device_error);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch index projection kernels");
+    }
+    // One preparation publishes one index projection. Retiring the sources here
+    // means a second use without a fresh preparation is rejected instead of
+    // silently projecting the previous layer's activations.
+    state.dsv4_prepared_index_query_source = nullptr;
+    state.dsv4_prepared_index_hidden_source = nullptr;
+    if (device_only) {
+        state.dsv4_index_projection_queries = device_queries;
+        state.dsv4_index_projection_weights = device_weights;
+        state.dsv4_index_projection_error = device_error;
+        state.dsv4_index_projection_heads = request.heads;
+        state.dsv4_index_projection_head_dim = request.head_dim;
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.matmul_calls += 2U;
+        stats.activation_h2d_bytes += 2U * rope_bytes;
+        return result;
+    }
+    unsigned int host_error = 0U;
+    if (!copy(queries.data(), device_queries, query_bytes,
+              cudaMemcpyDeviceToHost, "download index queries") ||
+        !copy(weights.data(), device_weights, weight_bytes,
+              cudaMemcpyDeviceToHost, "download index weights") ||
+        !copy(&host_error, device_error, sizeof(host_error),
+              cudaMemcpyDeviceToHost, "download index projection state")) {
+        return result;
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize index projections");
+    }
+    if (host_error != 0U) {
+        result.errors.emplace_back(
+            "DeepSeek index projection produced a non-finite value");
+        return result;
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.matmul_calls += 2U;
+        stats.activation_h2d_bytes += 2U * rope_bytes;
+        stats.activation_d2h_bytes +=
+            query_bytes + weight_bytes + sizeof(unsigned int);
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::dsv4_physical_lightning_index(
     int device, const CudaDsv4PhysicalIndexRequest& request,
     std::span<std::uint32_t> output,
@@ -6196,14 +6565,25 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     if (request.heads == 0U || request.heads > 64U ||
         request.head_dim < 32U || request.head_dim > 1'024U ||
         request.head_dim % 4U != 0U || request.top_k == 0U ||
-        request.queries.size() != query_elements ||
-        request.weights.size() != request.heads ||
+        (request.device_projected
+             ? (!request.queries.empty() || !request.weights.empty())
+             : (request.queries.size() != query_elements ||
+                request.weights.size() != request.heads)) ||
         std::any_of(request.queries.begin(), request.queries.end(),
                     [](float value) { return !std::isfinite(value); }) ||
         std::any_of(request.weights.begin(), request.weights.end(),
                     [](float value) { return !std::isfinite(value); })) {
         result.errors.emplace_back(
             "physical Lightning Indexer query shape or values are unsupported");
+        return result;
+    }
+    if (request.device_projected &&
+        (state.dsv4_index_projection_queries == nullptr ||
+         state.dsv4_index_projection_weights == nullptr ||
+         state.dsv4_index_projection_heads != request.heads ||
+         state.dsv4_index_projection_head_dim != request.head_dim)) {
+        result.errors.emplace_back(
+            "physical Lightning Indexer has no matching device projection");
         return result;
     }
     std::uint64_t candidates64 = 0U;
@@ -6277,10 +6657,11 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     // remaining, winner_count, active_count, next_count, pivot_bin,
     // above_count, error
     constexpr std::uint64_t counter_count = 7U;
-    if (!checked_bytes(request.queries.size(), 1U, sizeof(float),
-                       query_bytes) ||
-        !checked_bytes(request.weights.size(), 1U, sizeof(float),
-                       weight_bytes) ||
+    // Sized from the shape, not from the request spans: a device-projected
+    // call carries no host spans, and reserving nothing for the query would
+    // leave the transposed staging writing over the regions that follow it.
+    if (!checked_bytes(query_elements, 1U, sizeof(float), query_bytes) ||
+        !checked_bytes(request.heads, 1U, sizeof(float), weight_bytes) ||
         !checked_bytes(request.pages.size(), 1U,
                        sizeof(PhysicalIndexDeviceSegment), segment_bytes) ||
         !checked_bytes(candidates, 1U, sizeof(float), score_bytes) ||
@@ -6411,24 +6792,30 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     // Transposed to column-major on the way in so the score kernel's 64
     // threads read consecutive floats. The cost is one pass over 8,192 values
     // per call; the alternative is a strided read in the innermost loop.
-    std::vector<float> transposed;
-    try {
-        transposed.resize(request.queries.size());
-    } catch (const std::bad_alloc&) {
-        result.errors.emplace_back(
-            "cannot allocate physical Lightning Indexer query staging");
-        return result;
-    }
-    for (std::uint32_t head = 0U; head < request.heads; ++head) {
-        for (std::uint32_t column = 0U; column < request.head_dim; ++column) {
-            transposed[static_cast<std::size_t>(column) * request.heads + head] =
-                request.queries[static_cast<std::size_t>(head) *
-                                    request.head_dim + column];
+    if (!request.device_projected) {
+        std::vector<float> transposed;
+        try {
+            transposed.resize(request.queries.size());
+        } catch (const std::bad_alloc&) {
+            result.errors.emplace_back(
+                "cannot allocate physical Lightning Indexer query staging");
+            return result;
+        }
+        for (std::uint32_t head = 0U; head < request.heads; ++head) {
+            for (std::uint32_t column = 0U; column < request.head_dim;
+                 ++column) {
+                transposed[static_cast<std::size_t>(column) * request.heads +
+                           head] =
+                    request.queries[static_cast<std::size_t>(head) *
+                                        request.head_dim + column];
+            }
+        }
+        if (!upload(device_queries, transposed.data(), query_bytes) ||
+            !upload(device_weights, request.weights.data(), weight_bytes)) {
+            return result;
         }
     }
-    if (!upload(device_queries, transposed.data(), query_bytes) ||
-        !upload(device_weights, request.weights.data(), weight_bytes) ||
-        !upload(device_segments, descriptors.data(), segment_bytes)) {
+    if (!upload(device_segments, descriptors.data(), segment_bytes)) {
         return result;
     }
     const std::array<std::uint32_t, counter_count> initial_counters{
@@ -6436,6 +6823,36 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     if (!upload(counters, initial_counters.data(),
                 counter_count * sizeof(std::uint32_t))) {
         return result;
+    }
+    if (request.device_projected) {
+        constexpr std::uint32_t transpose_threads = 256U;
+        dsv4_index_query_transpose_kernel<<<
+            static_cast<unsigned int>(
+                (query_elements + transpose_threads - 1U) / transpose_threads),
+            transpose_threads, 0U, state.stream>>>(
+            device_queries, state.dsv4_index_projection_queries, request.heads,
+            request.head_dim);
+        if (auto status = cudaMemcpyAsync(
+                device_weights, state.dsv4_index_projection_weights,
+                static_cast<std::size_t>(weight_bytes),
+                cudaMemcpyDeviceToDevice, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "stage device-projected Lightning Indexer weights");
+        }
+        // The projection's non-finite rejection replaces the host validation
+        // above and has no other route back, so it seeds this command's error
+        // word rather than being checked on the host.
+        if (auto status = cudaMemcpyAsync(
+                device_error, state.dsv4_index_projection_error,
+                sizeof(unsigned int), cudaMemcpyDeviceToDevice, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "carry the device index projection rejection");
+        }
+        state.dsv4_index_projection_queries = nullptr;
+        state.dsv4_index_projection_weights = nullptr;
+        state.dsv4_index_projection_error = nullptr;
     }
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.activation_uploaded,
@@ -6513,14 +6930,17 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
         return cuda_error(status,
                           "launch physical Lightning Indexer kernels");
     }
-    // Enqueue-only form: the selection stays on the device and the caller
-    // consumes it in stream order. Everything below this point is the
-    // host-visible tail -- a device-to-host copy and a stream synchronize --
-    // and it is exactly what a queued chain cannot afford per indexed layer.
+    // The selection stays on the device for a caller that consumes it in
+    // stream order. With no host output span this returns here, and everything
+    // below -- a device-to-host copy and a stream synchronize -- is exactly
+    // what a queued chain cannot afford per indexed layer. A caller may still
+    // ask for both while the device form is being brought up.
     if (device_selection != nullptr) {
         device_selection->positions = device_winners;
         device_selection->error = device_error;
         device_selection->selected = selected;
+    }
+    if (device_selection != nullptr && output.empty()) {
         {
             std::scoped_lock lock(impl_->mutex);
             auto& stats = *std::find_if(
@@ -7570,6 +7990,11 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     const auto* key_value_weight = request.key_value;
     const bool prepare_compressor = !compressor_values.empty();
     const bool prepare_index_compressor = !index_compressor_values.empty();
+    // The raw BF16 layer input, widened. Every compressor projection reads it,
+    // and so does an in-chain index weight projection on a rank that owns no
+    // compressor.
+    const bool expand_input = prepare_compressor || prepare_index_compressor ||
+                              request.publish_index_source;
     const bool transition_mhc = request.mhc_transition != nullptr;
     const bool host_deferred = request.host_callback != nullptr;
     const bool device_only = request.device_only;
@@ -7792,8 +8217,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     std::uint64_t index_compressor_score_offset{};
     std::uint64_t failure_offset{};
     if (!region(hidden * sizeof(float), 16U, input_quant_offset) ||
-        !region((prepare_compressor || prepare_index_compressor)
-                    ? hidden * sizeof(float) : 0U,
+        !region(expand_input ? hidden * sizeof(float) : 0U,
                 16U, compressor_input_offset) ||
         !region(query_rank_elements * sizeof(float), 16U,
                 query_rank_raw_offset) ||
@@ -8210,7 +8634,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     }
     quantize_bf16_activation_e4m3_kernel<<<32U, 128U, 0U, state.stream>>>(
         input_quant, device_input, hidden);
-    if (prepare_compressor || prepare_index_compressor) {
+    if (expand_input) {
         expand_bf16_activation_kernel<<<32U, 128U, 0U, state.stream>>>(
             compressor_input, device_input, hidden);
     }
@@ -8342,6 +8766,11 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
         if (transition_mhc) mhc_state.dsv4_mhc_stage = 0U;
         return cuda_error(status, "launch attention preparation kernels");
     }
+    // Publish the two index-projection sources for a following in-chain index
+    // command.
+    state.dsv4_prepared_index_query_source = query_rank_quant;
+    state.dsv4_prepared_index_hidden_source =
+        expand_input ? compressor_input : nullptr;
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
             status != cudaSuccess) {
@@ -8961,7 +9390,26 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         }
         page_bytes += page.buffer->device_bytes();
     }
-    for (const auto& candidate : request.attention.candidates) {
+    // The resolved region is checked on the device against these same page
+    // descriptors, because the host has not seen the selection that fills it.
+    const auto* resolution = request.attention.resolution;
+    const auto host_candidate_begin = resolution == nullptr
+        ? 0U : resolution->compressed_width;
+    if (resolution != nullptr &&
+        (resolution->selection.positions == nullptr ||
+         resolution->selection.error == nullptr ||
+         resolution->blocks.empty() ||
+         resolution->blocks.size() > request.attention.pages.size() ||
+         resolution->compressed_width == 0U ||
+         resolution->compressed_width > candidates ||
+         resolution->selection.selected > resolution->compressed_width)) {
+        result.errors.emplace_back(
+            "DeepSeek attention-to-mHC device candidate resolution is invalid");
+        return result;
+    }
+    for (std::size_t index = host_candidate_begin;
+         index < request.attention.candidates.size(); ++index) {
+        const auto& candidate = request.attention.candidates[index];
         if (candidate.valid &&
             (candidate.page >= request.attention.pages.size() ||
              candidate.row >=
@@ -9023,7 +9471,9 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     };
     std::uint64_t page_offset{}, candidate_offset{}, query_offset{};
     std::uint64_t sink_offset{}, cosine_offset{}, sine_offset{};
+    std::uint64_t block_offset{};
     std::uint64_t page_descriptor_bytes{}, candidate_bytes{}, query_bytes{};
+    std::uint64_t block_bytes{};
     const std::uint64_t sink_bytes =
         static_cast<std::uint64_t>(total_heads) * sizeof(float);
     constexpr std::uint64_t rope_bytes =
@@ -9036,12 +9486,15 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                        candidate_bytes) ||
         !checked_bytes(use_prepared_query ? 0U : attended_elements, 1U,
                        sizeof(std::uint16_t), query_bytes) ||
+        !checked_bytes(resolution == nullptr ? 0U : resolution->blocks.size(),
+                       1U, sizeof(Dsv4DeviceKvBlock), block_bytes) ||
         !region(page_descriptor_bytes, 16U, page_offset) ||
         !region(candidate_bytes, 16U, candidate_offset) ||
         !region(query_bytes, 16U, query_offset) ||
         !region(sink_bytes, 16U, sink_offset) ||
         !region(rope_bytes, 16U, cosine_offset) ||
-        !region(rope_bytes, 16U, sine_offset)) {
+        !region(rope_bytes, 16U, sine_offset) ||
+        !region(block_bytes, 16U, block_offset)) {
         result.errors.emplace_back(
             "DeepSeek attention-to-mHC upload layout overflows");
         return result;
@@ -9205,6 +9658,16 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 request.inverse_rope_cosines.data(), rope_bytes);
     std::memcpy(command_host_upload + sine_offset,
                 request.inverse_rope_sines.data(), rope_bytes);
+    if (resolution != nullptr) {
+        auto* host_blocks = reinterpret_cast<Dsv4DeviceKvBlock*>(
+            command_host_upload + block_offset);
+        for (std::size_t index = 0U; index < resolution->blocks.size();
+             ++index) {
+            const auto& block = resolution->blocks[index];
+            host_blocks[index] = {block.logical_begin, block.used_rows,
+                                  block.compression_ratio};
+        }
+    }
 
     auto* workspace = state.dsv4_attention_workspace;
     auto* device_pages = reinterpret_cast<Dsv4DevicePhysicalPage*>(
@@ -9271,6 +9734,30 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     }
     constexpr std::uint32_t threads = 256U;
     constexpr std::uint32_t rank_threads = 128U;
+    // Overwrites the compressed region the upload just staged. Stream order
+    // makes that safe and keeps the upload one contiguous copy; the selection
+    // it reads was enqueued on this same stream and has not been seen by the
+    // host. Its failures land in the command's own status word, so an
+    // unresolvable row fails the layer rather than attending a wrong page.
+    if (resolution != nullptr) {
+        dsv4_resolve_candidates_kernel<<<
+            (resolution->compressed_width + threads - 1U) / threads, threads,
+            0U, state.stream>>>(
+            static_cast<const std::uint32_t*>(resolution->selection.positions),
+            resolution->selection.selected,
+            reinterpret_cast<const Dsv4DeviceKvBlock*>(workspace +
+                                                       block_offset),
+            static_cast<std::uint32_t>(resolution->blocks.size()),
+            device_pages,
+            static_cast<std::uint32_t>(request.attention.pages.size()),
+            device_candidates, resolution->compressed_width,
+            static_cast<const unsigned int*>(resolution->selection.error),
+            device_failure);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(status,
+                              "launch DeepSeek device candidate resolution");
+        }
+    }
     const auto kv_elements = static_cast<std::uint64_t>(candidates) *
                              kDsv4PagedHeadDim;
     const auto kv_blocks = static_cast<std::uint32_t>(
@@ -9408,7 +9895,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         }
         if (auto status = cudaMemcpyAsync(
                 &target.dsv4_mhc_workspace->failure, device_failure,
-                sizeof(device_failure), cudaMemcpyDeviceToDevice,
+                sizeof(*device_failure), cudaMemcpyDeviceToDevice,
                 state.stream); status != cudaSuccess) {
             return cuda_error(status,
                               "retain rank-local attention status");

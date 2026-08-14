@@ -85,6 +85,42 @@ TEST_CASE("common runtime rejects DeepSeek cache controls for GLM") {
                         }));
 }
 
+// A DeepSeek-only decode control must never be silently ignored by another
+// runtime: a request for rank-local decode that quietly runs a centralized GLM
+// would report the accepted path while executing a different one.
+TEST_CASE("common runtime rejects DeepSeek decode controls for GLM") {
+    const auto rejected = [](void (*apply)(strata::RuntimeConfig&),
+                             std::string_view expected) {
+        strata::RuntimeSession runtime;
+        strata::RuntimeConfig config;
+        apply(config);
+        const auto initialized = runtime.initialize("not-used", config);
+        REQUIRE(!initialized.ok());
+        REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                            [expected](const std::string& error) {
+                                return error.find(expected) !=
+                                       std::string::npos;
+                            }));
+    };
+    rejected([](strata::RuntimeConfig& config) {
+        config.deepseek_device_resident_runtime = true;
+    }, "DeepSeek device-resident runtime");
+    rejected([](strata::RuntimeConfig& config) {
+        config.deepseek_rank_local_decode = true;
+    }, "DeepSeek rank-local decode");
+}
+
+// The placement plan must describe the layout the runtime will build, not the
+// bare flags: the device-resident contract implies both of these.
+TEST_CASE("device-resident runtime implies its placement request flags") {
+    strata::RuntimeConfig config;
+    config.model = strata::RuntimeModel::DeepSeekV4;
+    config.deepseek_device_resident_runtime = true;
+    const auto request = strata::placement_request_for("not-used", config);
+    REQUIRE(request.block_kv_cache);
+    REQUIRE(request.flash_attention);
+}
+
 TEST_CASE("runtime session cannot generate before initialization") {
     strata::RuntimeSession runtime;
     REQUIRE(!runtime.generate_stream("hello", 1U).ok());

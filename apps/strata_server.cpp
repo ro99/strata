@@ -43,6 +43,8 @@ struct Options {
     bool devices_explicit{};
     bool flash_attention{};
     bool block_kv_cache{};
+    bool device_resident_runtime{};
+    bool rank_local_decode{};
     bool pin_resident_arena{};
     std::string plan_cache;
     bool dry_run{};
@@ -73,8 +75,22 @@ void usage() {
         << "                     [--devices 0,1,2] [--vram-fraction F]\n"
         << "                     [--flash-attention] [--block-kv-cache]\n"
         << "                     [--pin-resident-arena]\n"
+        << "                     [--device-resident-runtime]\n"
+        << "                     [--decode-topology centralized|rank-local-tp2]\n"
         << "                     [--dry-run] [--replan]\n"
         << "                     [--plan-cache DIR] [--no-plan-cache]\n\n"
+        << "--device-resident-runtime is the DeepSeek device-resident decode\n"
+        << "contract as a whole: physical KV pages, device-resident mHC, CUDA\n"
+        << "attention, the scalar lightning indexer, and routed experts in the\n"
+        << "two NUMA-local CPU shards. --decode-topology rank-local-tp2 adds\n"
+        << "rank-local decode on top of it, and needs a build with NCCL and\n"
+        << "exactly two devices. It is admitted fail-closed before the\n"
+        << "checkpoint is opened and supports at most 65,536 context tokens\n"
+        << "(issue #22). Both are DeepSeek-only and are rejected by every other\n"
+        << "--model-type. Each topology is deterministic and exact against its\n"
+        << "own oracle, but they are not token-identical to each other: greedy\n"
+        << "decode can diverge a dozen steps in, so switching topology changes\n"
+        << "the text a served request returns, not just its speed.\n\n"
         << "--dry-run sizes every component against this machine, prints the\n"
         << "placement, caches it, and exits without reading a weight. Run it\n"
         << "before starting a service to see whether the configuration fits.\n";
@@ -93,6 +109,15 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--block-kv-cache") {
             options.block_kv_cache = true;
+            options.device_resident_runtime = false;
+            continue;
+        }
+        if (argument == "--device-resident-runtime") {
+            options.block_kv_cache = true;
+            options.device_resident_runtime = true;
+            // Implication of the contract; the runtime enforces the rest for
+            // embedders that never pass through this parser.
+            options.flash_attention = true;
             continue;
         }
         if (argument == "--pin-resident-arena") {
@@ -118,6 +143,22 @@ bool parse_options(int argc, char** argv, Options& options) {
         else if (argument == "--model-type") options.model_type = next();
         else if (argument == "--model-id") options.model_id = next();
         else if (argument == "--host") options.host = next();
+        else if (argument == "--decode-topology") {
+            const auto topology = next();
+            if (topology == "centralized") {
+                options.rank_local_decode = false;
+            } else if (topology == "rank-local-tp2") {
+                // Rank-local decode owns the same weights the device-resident
+                // contract places, so the opt-in implies that contract rather
+                // than silently running rank-local against a scalar cache.
+                options.rank_local_decode = true;
+                options.block_kv_cache = true;
+                options.device_resident_runtime = true;
+                options.flash_attention = true;
+            } else {
+                return false;
+            }
+        }
         else if (argument == "--port") {
             std::uint32_t port = 0U;
             if (!strata::cli::parse_positive_u32(next(), port) ||
@@ -691,6 +732,8 @@ int main(int argc, char** argv) {
         options.flash_attention || options.model_type == "gemma4" ||
         options.model_type == "laguna";
     config.deepseek_block_kv_cache = options.block_kv_cache;
+    config.deepseek_device_resident_runtime = options.device_resident_runtime;
+    config.deepseek_rank_local_decode = options.rank_local_decode;
     config.pin_resident_arena = options.pin_resident_arena;
     config.verbose = options.model_type == "deepseek";
     config.load_progress = options.model_type != "deepseek";

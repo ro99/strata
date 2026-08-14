@@ -68,6 +68,73 @@ Place a checkpoint under `models/` in its original Safetensors form. Strata read
   --vram-fraction 0.95 --pin-resident-arena --flash-attention
 ```
 
+#### Fastest DeepSeek V4 route: rank-local TP2
+
+`--decode-topology rank-local-tp2` gives each of two GPUs rank-local ownership of
+the decode chain and joins the layers with collectives instead of routing every
+layer through the host. On the reference pair it is the fastest supported path.
+
+It is opt-in and admitted fail-closed, because it needs all of:
+
+- a build with NCCL (the default build has it **off**);
+- exactly **two** CUDA devices;
+- both devices at compute capability **8.6** — the DeepSeek device-resident
+  kernels are validated only there, so a 4090, A100, H100, or 50-series device
+  is refused rather than approximated ([#23](https://github.com/ro99/strata/issues/23));
+- at least **two NUMA nodes**, one per rank;
+- a context of **65,536 tokens or fewer**
+  ([#22](https://github.com/ro99/strata/issues/22)).
+
+The first four are checked before the checkpoint is opened, so an unusable
+configuration costs a second rather than a model load, and Strata names the
+condition that failed. The context bound is the exception: it is not checked at
+admission today, so an over-large `--context-size` is accepted, loads, and then
+fails at the first affected layer. Either way nothing silently falls back to a
+slower or less exact path.
+
+```bash
+cmake -S . -B build-nccl -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_NCCL=ON \
+  -DSTRATA_NCCL_INCLUDE_DIR=/path/to/nccl/include \
+  -DSTRATA_NCCL_LIBRARY=/path/to/nccl/lib/libnccl.so.2
+cmake --build build-nccl --target strata-server -j
+
+# Pin the device order: CUDA does not enumerate GPUs the way nvidia-smi does,
+# so without this --devices can select different physical cards on the same box.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+./build-nccl/strata-server \
+  --model models/dsv4f --model-type deepseek --model-id dsv4 \
+  --devices 1,2 --context-size 4096 --vram-fraction 0.95 \
+  --decode-topology rank-local-tp2 --port 8080
+
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dsv4","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+`--decode-topology rank-local-tp2` implies `--device-resident-runtime`, so the
+physical KV pages, device-resident mHC, CUDA attention, and NUMA-local routed
+experts come with it. Pass `--device-resident-runtime` alone for the same
+contract on the centralized topology. Both flags work identically on
+`strata-chat` and are rejected by every non-DeepSeek `--model-type`.
+
+Measured on 2× RTX 3090, an 18-token prompt and 31 decode steps including
+warm-up:
+
+| topology | ms/token | tok/s |
+| --- | --- | --- |
+| centralized | 133.080 | 7.51 |
+| rank-local-tp2 | 112.494 | 8.89 |
+
+Those are single-turn figures at a 4,096-token bound. Decode cost is a function
+of context length, so a long multi-turn session is dominated by re-prefill
+rather than by the step measured here.
+
+Each topology is deterministic and exact against its own oracle, but the two are
+**not token-identical to each other**: rank-local reduces in a different order,
+so greedy decode can select a different token a dozen steps in. Switching
+topology changes the text a request returns, not only its speed.
+
 Gemma 4 uses its native W8A16 checkpoint directly and enables CUDA attention:
 
 ```bash
@@ -310,6 +377,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 It serves `/v1/models`, `/v1/health`, `/v1/chat/completions`, `/v1/completions`, and `/v1/tokenize`, with streaming over SSE. An endpoint the loaded model has no exact implementation for returns an explicit error. Measured serving overhead is about 0.04% of a decode step.
+
+For DeepSeek V4 on two GPUs, see
+[the rank-local TP2 route](#fastest-deepseek-v4-route-rank-local-tp2) above for
+the fastest supported topology and what it requires.
 
 ## Models
 

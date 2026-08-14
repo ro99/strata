@@ -359,6 +359,15 @@ Exit criteria:
 | 2026-08-13 | Step 4 `block_table()` screen | `results/dsv4-rank-local-main-landing/step4-locate-screen/blocktable_screen.cpp`, `blocktable-screen.txt` | by value `11.0--13.6 ms/token`; caller buffer without the dead field `2.9--3.2 ms/token`; `3.8--4.2x`, saving `8.1--10.4 ms/token` | 4,096-block table materialized once per kind per layer per token at 1M; `Dsv4KvBlockInfo::device_resident` was populated on every call and **read by nothing** anywhere in the tree, costing a heap allocation per block |
 | 2026-08-13 | Step 4 `block_table()` fix | `results/dsv4-rank-local-main-landing/step4-blocktable-fix-r1/run.json` | exact against all 12 sequential-oracle IDs; steady median `113.68 ms/token`, inside the `111.90`/`112.53` arm spread | dead `device_resident` field removed; `block_table_into()` added and used with process-lifetime buffers at all four hot call sites, including the two learned-index tables; `block_table()` retained as a thin wrapper for non-hot callers; suite 299/300, one declared skip |
 | 2026-08-13 | Step 4 gates after `locate()` fix | `results/dsv4-rank-local-main-landing/step4-make-check-default-r5.log` | default 2/2 pass exit 0; NCCL suite 299/300 with one declared skip; `git diff --check` clean | both builds green with all five corrected mechanisms: three attention norms, `dsv4_mhc_weighted_norm`, the index scorer, the radix pivot, and `locate()` |
+| 2026-08-13 | Step 4 sparse-path below-threshold negative | `results/dsv4-rank-local-main-landing/step4-sparse-path/centralized.json` | `prompt_tokens` `1,593`, active `1,605` | preserved: a `9,155`-character prompt tokenized below the `2,048` threshold, so the arm exercised nothing new. Caught by checking `prompt_tokens`, the check 0087's INVALID N4 arm failed |
+| 2026-08-13 | **Step 4 first real sparse decode** | `results/dsv4-rank-local-main-landing/step4-sparse-path/` | prompt SHA256 `0c7b142e7c24f9d1990ac98ebf11839abd141a342fd87b999bca0bbf1d9bb88f`; centralized `014aa827326144ab8c89d87409cc219773caabc93199e19d5ef675f695b035e2`; rank-local `5e64228e0dc04cba52592d5acba51b3892ecda4dba0ab462f2787239f00caa04` | closes rescue-brief defect 9 at this context: `231` CUDA index dispatches, **`0` scalar**, exactly `118,272 = 231 x 512` selected, identical answer text, zero decode checkpoint I/O on both topologies |
+| 2026-08-13 | Step 4 sequential-arm penalty | same arms | centralized `157.603`, rank-local `174.285 ms/token` at `2,685` active tokens | rank-local is `16.682 ms/token` **slower** than centralized above the threshold, and `62.788 ms` above its own queued short-context median: the measured value of moving selection inside the queued chain |
+| 2026-08-13 | Step 4 below-threshold queued control | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-below.json` | `2,014` active tokens, `0` index dispatches, steady median `109.612 ms/token` | removes the context-growth confound: the queued path is context-insensitive from ~50 to 2,014 active tokens, so about `61` of the `64.673 ms` sequential-arm gap is topology, not indexing |
+| 2026-08-14 | **Step 4 Stage 1 device index-query preparation** | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-stage1.json`, `centralized-stage1.json` | rank-local `174.285` to `158.353`; centralized `157.603` to `142.777 ms/token`; **selection trace hashes identical on both** (`f14e5cde177258bd`, `d7e791756a7355d2`) | RoPE, bf16 rounding and half-up E4M3 moved onto the device in one kernel. Token IDs and answer text identical on both topologies; `231` CUDA and `0` scalar dispatches; zero decode checkpoint I/O. Removes about 172,000 host `log2`/`exp2` calls per token. **Both topologies gain about 15 ms, so the relative gap is unchanged**: rank-local is still `15.576 ms/token` slower above the threshold |
+| 2026-08-14 | Step 4 B3 E4M3 query-quantization screen | `results/dsv4-rank-local-main-landing/step4-inchain-selection/e4m3_screen.cu`, `e4m3-screen.txt` | **0 mismatches in 4,000,663 probes** on both architectures, after a first form disagreed on 32 | the backend's existing `quantize_e4m3_value` rounds ties to even and cannot serve the half-up index-query contract; and the exponent must come from `log2f`, not `frexpf`, to reproduce the reference at power-of-two boundaries |
+| 2026-08-14 | Suspected reference defect: E4M3 half-up at power-of-two boundaries | same screen | host encodes `0.0312499963` as `2^-6`, a factor-of-two error | `log2f` rounding to exactly `-5.0` sends the host into its sub-1 mantissa branch spuriously. Reproduced deliberately for exactness; **not fixed here**, since changing it silently would alter selection. Reachable at roughly `1e-5` of values. Needs its own branch and review |
+| 2026-08-14 | Step 4 A3 end-to-end exactness arm | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-a3.json` | token IDs and answer text **identical** to the pre-A3 baseline; `174.422` against `174.285 ms/token`; `231` CUDA and `0` scalar index dispatches; zero decode checkpoint I/O | the optional device-selection entry point does not disturb the live path: with the parameter null the behaviour is unchanged end to end, not merely in the unit gates |
+| 2026-08-13 | Step 4 in-chain selection A1+A2 screen | `results/dsv4-rank-local-main-landing/step4-inchain-selection/` | 3 geometries, 516 probes each, **0 block and 0 row mismatches**, both architectures | device candidate resolution reproduces the host `locate_physical_kv_block` exactly, including short final blocks and block-boundary probes; the subtle half of in-chain selection is de-risked before any runtime change |
 | 2026-08-13 | **Step 4 binding final acceptance** | `results/dsv4-rank-local-main-landing/step4-final-acceptance/summary.json` | SHA256 `9dc391c245e93d49f536088d62dcaf146471f0abd28c1b67e040ca0a3c1e8285`; rank medians `111.496762`, `114.787396`, `110.820323` ms; median **`111.496762` ms = `8.968870` token/s**; central medians `133.919461`, `128.710203`, `130.545682` ms | binding short-context result on the **complete corrected code**, run after every Step 4 correction rather than assembled from earlier arms. Strict `125.0` ms / `8.0` token/s gate **PASSES**. All three rank arms bit-exact against the 32-token sequential oracle; centralized IDs bit-identical to the pre-correction `step2-acceptance-r2` baseline; zero decode checkpoint I/O in all six arms |
 | 2026-08-13 | Step 4 memory gates at final acceptance | same summary | VRAM `22,419,734,528` / `22,417,637,376` B/device against the `22,548,578,304` ceiling; peak RSS `158,350,274,560` B against `231,928,233,984` | Step 3 residency gates re-verified on the corrected code: headroom `128,843,776` / `130,940,928` B/device and `73,577,959,424` B host |
 | 2026-08-13 | Step 4 extraction audit | `scripts/audit_dsv4_extraction_manifest.sh` | PASS, 91 paths, 13/13 capabilities | traceability gate still green after the Step 4 corrections |
@@ -994,6 +1003,453 @@ and selection inside the queued chain — plus three terms that are still
 unmeasured and charged nowhere: the exchange, the merge, and the ratio-128 dense
 attention growth. Every defect discoverable by reading and measuring the
 existing path has now been corrected.
+
+### 2026-08-13 — The sparse indexer path has now run inside a real decode
+
+Rescue-brief defect 9 recorded that the sparse indexer had **never run inside a
+real decode**: every end-to-end arm in the program's history sat below the
+`2,048`-token engagement threshold (`index_topk * ratio`), so the entire
+selection path was unexercised on both topologies. It has now run on both.
+
+Reaching it does not require the 1M context. `active_context_tokens` is
+`prompt_tokens + max_new`, so a prompt above about `2,036` tokens engages the
+indexer, which costs minutes rather than the roughly two days that prefilling
+1,048,576 tokens at the measured `128 ms/token` would take.
+
+A first arm at `9,155` characters tokenized to only `1,593` tokens, leaving
+active context at `1,605` — **below** the threshold, so it exercised nothing new.
+It was caught by checking `prompt_tokens` in the output, which is the same check
+experiment 0087's INVALID N4 arm failed. The binding arms use a `15,413`
+character prompt giving `2,673` prompt tokens and `2,685` active.
+
+```text
+                                centralized      rank-local
+steady median                   157.603 ms       174.285 ms
+index CUDA dispatches                  231             231     = 21 layers x 11 steps
+index scalar dispatches                  0               0     no host fallback
+index selected                     118,272         118,272     = 231 x 512 exactly
+index candidates                   154,623         154,623     = 231 x ~669 = L/4
+index selection entries             56,364          56,364
+selection trace hash        d7e791756a7355d2  f14e5cde177258bd
+decode checkpoint bytes                  0               0
+generated answer text                        identical
+```
+
+- **The mechanism works.** Selection runs on `dsv4_physical_lightning_index`
+  with **zero scalar dispatches**, selects exactly `512` of `~669` candidates
+  per indexed layer, and both topologies produce identical answer text with zero
+  decode checkpoint I/O.
+- The selection trace hashes differ between topologies and are **expected** to.
+  Selection depends on each layer's query, and the accepted rank-local BF16
+  publication association differs from centralized from layer 0 onward
+  (0073, 0088). The entry counts match exactly, which is the comparable
+  invariant.
+- **Rank-local is currently `16.682 ms/token` slower than centralized above the
+  threshold.** This is the known structural gap, now measured rather than
+  asserted: above `2,048` active tokens the runtime leaves the queued 43-layer
+  chain and drives layers sequentially, because `Dsv4RankLocalLayerCall` takes
+  candidates as an input and a chain cannot select candidates for a layer whose
+  query it has not yet computed.
+- **The sequential arm costs `62.788 ms/token`** against the queued short-context
+  median of `111.497`. That is the value of moving selection inside the queued
+  chain: it is not an optimization but the precondition for rank-local being
+  worth selecting at all at long context, and it is now a measured quantity
+  rather than an estimate.
+
+### 2026-08-13 — The sequential-arm penalty attributed: about 61 ms is topology, not indexing
+
+The first `62.788 ms/token` figure was confounded: it compared the queued arm at
+about 50 active tokens against the sequential arm at 2,685, mixing topology,
+index work and context growth. A third arm just **below** the engagement
+threshold separates them.
+
+```text
+arm                                        active   indexer   ms/token
+rank-local queued                           2,014       off    109.612
+rank-local sequential                       2,685        on    174.285
+centralized                                 2,685        on    157.603
+rank-local queued, short context               50       off    111.497
+```
+
+- The queued arm at `2,014` active tokens is indistinguishable from the same arm
+  at about 50 tokens (`109.612` against `111.497`). **The queued path is
+  context-insensitive across that range**, which is what the cost model predicts:
+  the routed CPU body is a function of the model, not of `L`.
+- Index compute at this width is about `3.5 ms/token` by the probe
+  (`0.165 ms/indexed layer` at 4,096 context across 21 layers).
+- Therefore of the `64.673 ms` gap between the queued and sequential arms,
+  roughly **`61 ms/token` is the sequential topology itself** and only about
+  `3.5 ms` is the indexing it was introduced to serve.
+- Target for in-chain selection, stated before the work: rank-local at `2,685`
+  active tokens should land near `113 ms/token`, against `174.285` today and
+  `157.603` for centralized. Anything that does not materially beat the
+  centralized arm at this operating point has not earned the topology.
+
+### 2026-08-13 — In-chain selection: the design, from reading the data flow
+
+Recorded before implementation so it does not have to be re-derived. Three facts
+from the current code decide the shape:
+
+1. **The attention kernel already reads device-resident candidates.**
+   `dsv4_paged_attention_to_mhc` stages `CudaDsv4AttentionCandidate` entries into
+   a pinned buffer and uploads them to `workspace + candidate_offset` as
+   `Dsv4DeviceAttentionCandidate`. Candidates merely *arrive* there by host
+   upload. **The attention kernel itself does not need to change** -- something
+   else must write that array device-side.
+2. **The index call is host-synchronizing by construction.**
+   `dsv4_physical_lightning_index` ends with `cudaStreamSynchronize` plus a D2H
+   of the winners into a host span. That is the host round trip to remove.
+3. **The page mapping is host work.** `locate()` resolves a selected logical row
+   to `{page, row}`, where `page` indexes a *compacted* list built lazily in
+   first-touch order over the selected candidates.
+
+Fact 3 is the real constraint. Device-side selection cannot build a compacted
+list, because the selection is not known when the list would be built. The
+resolution is to index the **full** per-layer block list instead: at 1M that is
+4,096 page descriptors of 16 B, about 64 KiB per layer and 1.3 MB per token
+across the 21 indexed layers, roughly 0.1 ms at link speed and cacheable while
+the block table is stable. The attention kernel indexes a larger array and is
+otherwise unchanged.
+
+The work therefore decomposes into four pieces, in dependency order:
+
+```text
+A1  device page-descriptor table: {logical_begin, used_rows, buffer, capacity}
+    for every block of a layer, uploaded once per layer and reused
+A2  resolve kernel: selected logical row -> Dsv4DeviceAttentionCandidate,
+    reproducing locate_physical_kv_block's predicate on device
+A3  non-synchronizing index entry point leaving winners on device
+A4  an optional device-candidate input on CudaDsv4PagedAttentionRequest that
+    skips host staging when the candidates are already resident
+```
+
+A1+A2 carry the subtle correctness risk -- the resolved `{page, row}` must equal
+what the host produces -- and are verifiable in isolation against the host path
+without touching the chain. A3+A4 are plumbing that only pays off once A1+A2 are
+exact. Only after all four does the selection move inside the queued chain,
+which is where the measured `61 ms/token` is recovered.
+
+Note that the `index_selections` trace hash is computed host-side from the
+downloaded positions; once selection stays on device that diagnostic requires an
+explicit download and must become opt-in rather than always-on.
+
+**A1+A2 are screened and exact.** Before any runtime change, the device
+resolution was verified against the host `locate_physical_kv_block` plus the
+host candidate arithmetic, over three production geometries and including the
+boundary probes an off-by-one would hit -- row 0, the last row, and both sides
+of a block boundary -- with a deliberately short final block:
+
+```text
+ratio-4   @ 2,685        11 blocks   516 probes   0 block, 0 row mismatches
+ratio-4   @ 1,048,576  4,096 blocks  516 probes   0 block, 0 row mismatches
+ratio-128 @ 1,048,576  4,096 blocks  516 probes   0 block, 0 row mismatches
+```
+
+Reproduced on both GPU architectures present. The screen is retained at
+`results/dsv4-rank-local-main-landing/step4-inchain-selection/`.
+
+**A3 is implemented and gated.** `dsv4_physical_lightning_index` takes an
+optional `CudaDsv4DeviceIndexSelection*`. With it null the behaviour is exactly
+as before -- download the positions, synchronize -- so every existing caller and
+the scalar-oracle gate are untouched. With it non-null the kernels are left
+enqueued, `output` may be empty, and the caller receives device pointers to the
+winners and the error flag, with the selection counters still recorded. The
+host-visible tail that a queued chain cannot afford per indexed layer is
+precisely what that branch skips.
+
+The device pointers reference the backend's persistent per-device Lightning
+workspace, so they are valid only until the next selection on that device. That
+is sufficient for an in-chain consumer, which reads them in stream order before
+the following layer's selection overwrites them, and the contract is stated on
+the struct.
+
+Gate: NCCL suite 299/300 with the one declared skip, zero failures. The index
+probe measures `1.544--1.549 ms/indexed layer` in this session state against the
+`1.623` recorded earlier; the default path is behaviour-unchanged and
+oracle-verified, so this is **not** a performance effect of the edit and is not
+claimed as one. The earlier figure was taken immediately after sustained
+acceptance-matrix load and this one after an idle period, which is the likely
+difference. The binding pivot-fix comparison stays with its own
+same-session baseline.
+
+### The A1--A4 decomposition was incomplete; corrected scope
+
+Reading `index_select` before implementing A4 shows the decomposition above
+understated the work, and the correction is worth recording precisely.
+
+A4 assumed the index *queries* were already device-resident, so that only the
+selection and its candidate resolution had to move. They are not. Everything the
+selection consumes is computed on the host from `query_rank`, and `linear()` is
+`weights->matmul()` taking **host spans in and out**:
+
+```text
+index_select, per indexed layer, all host-visible today
+  wq_b projection          query_rank[1024] -> queries[64 x 128]
+  per-head RoPE on the trailing 64 dims, then round_bf16
+  dsv4_physical_quantize_query_e4m3_f32 on each head
+  weights_proj projection  input[4096] -> index_weights[64]
+  scale by 1/sqrt(head_dim * heads), then round_bf16
+  -> CudaDsv4PhysicalIndexRequest{queries, weights, pages}
+```
+
+A queued chain cannot perform any of that: `query_rank` and `input` exist only
+on the device mid-chain, and the CUDA host callback where they would otherwise
+be visible is forbidden from calling CUDA APIs. There is also **no partial
+win** available -- keeping the query projection on the host requires the very
+synchronization the change exists to remove, so the pipeline moves device-side
+in full or not at all.
+
+Corrected decomposition, with status:
+
+```text
+B1  device wq_b index-query projection                        NOT NEEDED for stage 1: host matmul retained
+B2  device RoPE + round_bf16 on the query tail                DONE AND GATED, trace-hash identical
+B3  device E4M3 query quantization                            DONE AND GATED, trace-hash identical
+B4  device weights_proj projection, scale, round_bf16         NOT NEEDED for stage 1: host matmul retained
+B5  device block-descriptor table                             SCREENED (A1)
+B6  resolve kernel, selected row -> attention candidate       SCREENED (A2)
+B7  non-synchronizing index entry point                       DONE AND GATED (A3)
+B8  attention integration and runtime wiring                  TO DO
+```
+
+### Stage 1 opened: every B1--B4 exactness question is now resolved
+
+Stage 1's risk was never the plumbing, it was whether four host computations can
+be reproduced bit-exactly on the device. Each is now either screened or exact by
+construction, and the reasoning is recorded because it is not re-derivable from
+the code alone.
+
+- **B1 and B4 carry no exactness risk at all.** `linear()` is
+  `weights->matmul()` is `backend_.matmul()`, and `matmul_impl` already runs the
+  projection as a **device kernel**, uploading the input and downloading the
+  output. The device-resident form runs the *same* kernel and simply does not
+  download, so the arithmetic is identical by construction rather than by
+  comparison. B4 adds a scale multiply and a `round_bf16`.
+- **B2's application arithmetic is safe, and this had to be checked.**
+  `apply_rope` computes `first * cosine - second * sine` with plain operators.
+  Had the host contracted that into an FMA, a non-contracted device form would
+  differ. A discriminating probe -- values where a fused and an unfused
+  evaluation genuinely disagree -- shows the host does **not** contract at
+  `-O3`:
+
+```text
+separate   0                 <- what the host actually produces
+contracted 1.42108547e-14    <- what an FMA would produce
+host contracts into FMA: NO
+```
+
+  So the existing `dsv4_rope_first`/`dsv4_rope_second`, which use explicit
+  `__fmul_rn`/`__fsub_rn`/`__fadd_rn`, already match.
+- **B2 needs no device trigonometry**, per the note above: the cosines and sines
+  are computed host-side from `position` and the layer frequencies and uploaded,
+  exactly as `dsv4_prepare_attention` already does for the attention query.
+- **B3 is screened** at 4,000,663 probes, and **`round_bf16`**, shared by B1, B2
+  and B4, at 15,728,728.
+
+The consequence is that Stage 1 has no remaining unknown arithmetic. What is
+left is mechanical: port the screened E4M3 kernel, add the RoPE-plus-round
+kernel over uploaded trig, add device-resident forms of the existing matmul that
+skip the download, and let `index_select` consume them while still
+synchronizing. Its gate is unchanged -- the 2,685-token arm must reproduce the
+recorded baseline exactly.
+
+### 2026-08-14 — Stage 1 built and passed, and it is not performance-neutral
+
+The device index-query preparation is implemented and live for PhysicalDevice
+KV: `CudaBackend::dsv4_index_query_rope_quantize` applies the RoPE, the bf16
+rounding of the rotated region, and the half-up E4M3 quantization in one kernel,
+one block per index head. `index_select` uses it in place of its per-head host
+loop; the selection still synchronizes, so the topology is untouched.
+
+The gate is the strongest available, and it passes:
+
+```text
+generated token IDs            identical to the pre-Stage-1 baseline
+answer text                    identical
+index selection trace hash     f14e5cde177258bd  ==  f14e5cde177258bd
+index selection entries        56,364
+index CUDA / scalar dispatches 231 / 0
+decode checkpoint bytes        0
+NCCL suite                     299/300, one declared skip
+```
+
+The trace hash is the decisive one: it folds every selected position across all
+56,364 selection entries, so an identical hash means the device pipeline chose
+bit-identical candidates to the host it replaced. That is what the screens
+predicted -- B3 exact by measurement, B2 exact by construction with uploaded
+trigonometry and non-contracted rotation -- confirmed in production.
+
+**Stage 1 was expected to be performance-neutral and is not:**
+
+```text
+rank-local, host index-query preparation     174.285 ms/token
+rank-local, device index-query preparation   158.353 ms/token
+centralized, same operating point            157.603 ms/token
+```
+
+`-15.932 ms/token`. The removed work is larger than it looks: the host loop ran
+64 heads x 128 dimensions of E4M3 encoding per indexed layer, and that encoding
+calls `log2` and `exp2` per element -- about **172,000 transcendental calls per
+decoded token** across the 21 indexed layers, on the critical path, plus the
+rotation and rounding. None of it was visible as a kernel or a transfer, which
+is why the earlier Nsight attribution of the *short-context* envelope never
+showed it: at 4,096 context the indexer does not engage at all.
+
+This closes most of the gap to centralized at this operating point without any
+topology change: rank-local moves from `16.682 ms/token` slower to `0.750 ms`
+slower. Stage 2, which keeps the queued chain, is still where the remaining
+`~45 ms` sits.
+
+`index_select` is shared by both topologies, so centralized above the threshold
+should benefit identically. **Measured, and it does** -- which corrects the
+comparison above:
+
+```text
+                      before Stage 1   after Stage 1     delta
+centralized             157.603          142.777       -14.825
+rank-local              174.285          158.353       -15.932
+rank-local minus centralized                   +15.576
+```
+
+Centralized generated the identical tokens and the identical selection trace
+hash `d7e791756a7355d2`, so its gain is the same removal of host transcendental
+work, not a behaviour change.
+
+**The earlier reading of "rank-local is now within 0.750 ms of centralized" was
+wrong**, because it compared a Stage-1 rank-local arm against a pre-Stage-1
+centralized baseline. Measured on the same build, rank-local remains
+`15.576 ms/token` slower above the threshold -- essentially the `16.682 ms` gap
+it had before, since both topologies gained about the same `15 ms`. Stage 1 made
+both faster; it did not change their relative standing, and the sequential
+topology is still the whole of the difference.
+
+The Stage 2 target is correspondingly restated: rank-local should reach about
+`113 ms/token` -- the `109.612` queued arm plus roughly `3.5 ms` of index work --
+which would be about `30 ms/token` **faster** than centralized at this operating
+point rather than `15.6` slower. That is the number Stage 2 has to earn.
+
+### How B8 should be sequenced so it stays gateable
+
+B8 cannot be screened in isolation -- it changes what the attention kernel
+reads -- and it also cannot be reached without B1, B2 and B4, because the
+selection consumes index queries that are host-computed today. Taken together
+that is roughly 700 lines across `kernels/cuda/backend.cu`,
+`include/strata/cuda_backend.hpp`, `src/deepseek_runtime.cpp` and the executor,
+behind a **single** end-to-end gate of about nine minutes per attempt. Written
+in one step it has no intermediate checkpoint, which is the shape that produced
+the `uint4` alignment defect earlier in this step, where the symptom surfaced 21
+tests away from its cause.
+
+There is a decomposition that keeps a gate at every stage, and it should be
+preferred even though it runs the work twice:
+
+```text
+stage 1  build the device pipeline -- B1 B2 B3 B4 B5 B6 -- and use it INSIDE
+         the existing host index_select, still synchronizing at the end.
+         No performance win; the topology is untouched.
+         GATE: the 2,685-token arm must reproduce the recorded baseline
+         exactly -- identical token IDs and answer text, 231 CUDA and 0 scalar
+         dispatches. This validates every new kernel in production against a
+         known-good result, with the sequential topology holding everything
+         else constant.
+
+stage 2  remove the host synchronization and let the queued chain keep all 43
+         layers above the threshold, using B7's device-selection entry point.
+         GATE: the same arm, now expected near 113 ms/token rather than
+         174.285, still bit-exact.
+```
+
+Stage 1 converts "did I write six kernels correctly" into a question the arm can
+answer, while stage 2 isolates the topology change to a diff that touches
+scheduling alone. Attempting both at once conflates a correctness failure with a
+scheduling failure, and the arm cannot distinguish them.
+
+B1--B4 each need a device kernel that is **bit-identical** to its host
+reference, not merely close: the selection is a hard top-k, so a single
+differing low bit in a query can change which rows are attended. Each is
+screenable in isolation against the host function the same way B5 and B6 were,
+which is the cheap way to build them.
+
+### B3 screened, and two findings that would each have been silent bugs
+
+**The existing device quantizer cannot be reused.** `quantize_e4m3_value()` in
+the backend uses `frexpf` plus `rintf`, which rounds ties to **even**. The
+index-query contract is `encode_e4m3_half_up`, `floor(x * 8 + 0.5)`, which
+rounds ties **up**. Reusing the existing kernel would have changed which
+candidates a hard top-k selects, with no error raised anywhere.
+
+**The obvious exponent extraction is also wrong here.** A first device form took
+the exponent from `frexpf`, which is the mathematically exact binade. It
+disagreed with the host on **32 of 4,000,663 probes**, all immediately below a
+power of two:
+
+```text
+value 0.0312499963  (just below 2^-5)     host 0x08     device 0x10
+```
+
+The cause is in the reference, not the port. Host `log2f` rounds that value to
+exactly `-5.0`, so `floor` yields `-5`, the mantissa becomes `0.99999988` which
+is `< 1`, and the host falls into its **sub-1 mantissa branch spuriously**,
+encoding a value of `0.03125` as `2^-6 = 0.015625` -- a factor-of-two error.
+Taking the exponent from `log2f` on the device as well reproduces it exactly:
+
+```text
+4,000,663 probes, boundaries + half-up ties + saturation + random
+encode mismatches vs host reference : 0     on both GPU architectures
+```
+
+### B1, B2 and B4 are routing, not new exact arithmetic
+
+Reading the host references changes what these three cost. None of them needs a
+newly invented exact kernel; each reduces to reusing arithmetic that already
+exists, which makes exactness true **by construction** rather than by
+comparison. That is a materially smaller and safer job than the earlier note
+implied.
+
+- **B2 needs no device trigonometry.** `apply_rope` calls `std::cos`/`std::sin`,
+  and device `cosf`/`sinf` would differ in the last ulp. But the existing design
+  already avoids this: `dsv4_prepare_attention` takes `rope_cosines` and
+  `rope_sines` as *inputs*, computed host-side into `scratch.cosines` /
+  `scratch.inverse_sines`. The RoPE angles depend only on `position` and the
+  layer frequencies, both known before the chain is enqueued, so the index
+  query's cosines and sines can be precomputed and uploaded the same way. What
+  remains is applying them, and `dsv4_rope_first`/`dsv4_rope_second` already do
+  that with explicit `__fmul_rn`/`__fadd_rn`/`__fsub_rn`, so no fma contraction
+  can occur.
+- **B1 and B4 are the same matmul, routed device-to-device.** `linear()` is
+  `weights->matmul()`, which is `backend_.matmul()` -- already a device kernel --
+  followed by a **host-side** `round_bf16`. The device-resident form must run
+  the *same* kernel rather than a differently tiled one, since a different
+  accumulation order would change low bits; exposing a device-to-device variant
+  of that exact kernel makes the projection bit-identical by construction. B4
+  adds only a scale multiply and a rounding step.
+
+**The shared rounding step is screened.** All three end in `round_bf16`, host
+bit-manipulation RNE against device `__float2bfloat16_rn`:
+
+```text
+15,728,728 probes: exhaustive low-bit sweeps across 60 exponents, exact
+half-ulp ties, zero, denormal, infinity and NaN
+round_bf16 mismatches : 0     on both GPU architectures
+```
+
+So of the four pieces called "exact-critical", only B3 required genuinely new
+exact arithmetic, and it is done. B1, B2 and B4 now carry a proof obligation --
+route the same kernel, upload the same trig -- rather than an invention.
+
+**This is recorded as a suspected latent defect in the reference**, not fixed
+here. Exactness against the declared scalar reference is the binding contract,
+so the device path must reproduce the quirk; changing it would be a silent
+semantics change of exactly the kind the invariants forbid. It is reachable in
+production -- roughly 1 in 10^5 values by the random sweep, so on the order of
+one or two of the ~172,000 index-query elements per token -- and the current
+host path already exhibits it, so reproducing it preserves today's behaviour
+rather than introducing anything. It deserves its own review on a separate
+branch.
+
+This does not change the value of the work -- the measured prize is still about
+`61 ms/token` -- but it does change its size, and the estimate that in-chain
+selection was "four pieces, two of them screened" was wrong.
 
 ### Step 5 prerequisites now due
 

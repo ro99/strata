@@ -190,8 +190,18 @@ complete component ledger.
 
 ## Step 4 — Build and measure the full-context sparse-index mechanism
 
-State: **OPEN — SHORT PATH CORRECTED AND STRICT-GATE PASSING; INDEX MECHANISM
-STILL UNBUILT AND GATED ON A MEASURED SCORER SCREEN**
+State: **OPEN — INDEX MECHANISM BUILT, EXACT AND IN-CHAIN; FULL-CONTEXT CLAIM
+BLOCKED BY A CAPABILITY CEILING AT 65,536 TOKENS IN DENSE COMPRESSED ATTENTION**
+
+The index work required by items 1 and 3 below is done, exact and measured. The
+blocker is elsewhere and was found on 2026-08-14: both device attention entry
+points reject more than 640 candidates, and the 20 ratio-128 layers need
+`roundup(context/128, 128) + 128` — `8,320` at the declared context. The
+supported context ceiling of the device attention path is therefore `65,536`
+tokens, and no `tau(1M)` can be measured until that is lifted. Item 4 below is
+blocked on a kernel design task, not on tuning. The candidate-sharding
+mechanism in item 2 is separately obviated: in-chain selection removed the host
+boundary that made it look attractive, and both ranks now select concurrently.
 
 The original candidate-sharding mechanism remains falsified. The short-path
 correction required before any index work is now done and measured: the
@@ -386,6 +396,7 @@ Exit criteria:
 | 2026-08-13 | Step 4 mHC acceptance | `results/dsv4-rank-local-main-landing/step4-mhc-acceptance/summary.json` | rank medians `111.895850`, `111.721523`, `111.528517` ms; median `111.721523` ms = `8.950827` token/s; central median `133.867678` ms | strict gate still **PASSES**; oracle-exact; centralized IDs still bit-identical; the `+0.544 ms` against the previous matrix is **inside** that matrix's own `2.932 ms` repetition spread, so **no end-to-end change is claimed in either direction** |
 | 2026-08-13 | Step 4 mHC mechanism screen | `results/dsv4-rank-local-main-landing/step4-norm-correction-r1/mhc_screen.cu` and `mhc-screen-device0.txt` | device 1 `15.35` to `6.07 us` (`2.53x`); device 0 `15.47` to `6.09 us` (`2.54x`); **0 bit mismatches on both outputs** | `dsv4_mhc_weighted_norm`'s xor reduction shape is itself the contract, so the 64 accumulators and their combination order are preserved and only the elementwise phases widen; `1.320` to `0.522 ms/token` |
 | 2026-08-13 | Step 4 corrected acceptance | `results/dsv4-rank-local-main-landing/step4-norm-acceptance/summary.json` | rank medians `109.335778`, `112.268811`, `111.177092` ms; median `111.177092` ms = `8.994659` token/s; central medians `135.012134`, `134.005181`, `137.349264` ms | **strict `125.0` ms / `8.0` token/s gate PASSES**; all three rank arms match all 32 sequential-oracle IDs; centralized IDs bit-identical to the pre-correction arm across all 32 tokens; zero decode checkpoint I/O in all six arms |
+| 2026-08-14 | **Step 4 ratio-128 attention growth** | `results/dsv4-rank-local-main-landing/step4-ratio128-attention-growth/probe-r1.txt`, `-r2`, `-r3` | SHA256 `8ac542e7a96ad85a113f56fff00f75039e9a6cc01efc882f4986e84e4b7504e6` / `64171af7208db0888323d071434f58c5ba52d00af9ce5c5ff9ec6534f709a60d` / `9bee399706a5e452d71d4696b0fbc4a25a80b488ce7a17dc3e3975d8dcaf396d`; three interleaved runs of nine repetitions, device 1, Release `build-landing`, idle GPU | the context-dependent attention term measured across every candidate width the kernel accepts, and **rejected at every width above it**. Kernel medians `0.043`/`0.049`/`0.056`/`0.064 ms` per layer at `256`/`384`/`512`/`640` candidates; `1,152`, `2,176` and `8,320` candidates are refused. The 1M requirement is `8,320`. A fourth run taken while `ctest` held the same device was **discarded**, not averaged: it broke monotonicity at 512 candidates |
 
 ## Temporary instrumentation ledger
 
@@ -1684,6 +1695,121 @@ claim: what pre-leasing every attendable block costs at 4,096 blocks per
 indexed layer, and whether the enqueue-only page-descriptor upload synchronizes
 the stream.
 
+### 2026-08-14 — The ratio-128 term is not slow at 1M, it is unimplemented at 1M
+
+The remaining unmeasured attention term was the 20 ratio-128 layers, the only
+part of attention whose width depends on context. Reading the runtime's
+candidate assembly first (`attention_physical`, `deepseek_runtime.cpp:3552`)
+bounds the question before any measurement:
+
+```text
+ratio 0    layers   0 compressed + 128 sliding                     = 128    fixed
+ratio 4    layers   512 index top-k + 128 sliding                  = 640    fixed
+ratio 128  layers   roundup(context/128, 128) + 128 sliding        = grows
+```
+
+`sliding_window` is **128**, not 2,048 — an early note in this session read the
+contract's positional field order wrongly and is corrected here. So ratio-4 and
+ratio-0 attention are already at their 1,048,576-token width in every
+short-context arm ever run on this branch, and the entire context-dependent
+attention term is the 20 ratio-128 layers.
+
+`apps/strata_dsv4_attention_probe.cpp` walks that term across every candidate
+width the kernel accepts, at the production page geometry (`Hca`, 2 rows per
+block, 584 B per row) and the production candidate layout:
+
+Medians of three interleaved runs of nine repetitions on an idle device:
+
+```text
+context    comp rows   cands   pages   ms/layer   ms/token   kernel ms   status
+    4,096         32     256      17      0.159      3.188       0.043   ok
+   16,384        128     256      65      0.158      3.167       0.043   ok
+   32,768        256     384     129      0.170      3.400       0.049   ok
+   49,152        384     512     193      0.177      3.537       0.056   ok
+   65,536        512     640     257      0.186      3.729       0.064   ok
+  131,072      1,024   1,152     513          -          -           -   REJECTED
+  262,144      2,048   2,176   1,025          -          -           -   REJECTED
+1,048,576      8,192   8,320   4,097          -          -           -   REJECTED
+```
+
+The three runs agree to `0.001`--`0.002 ms` on every kernel cell. A fourth run
+was taken while `ctest` held the same device and is **discarded rather than
+averaged in**: it reported `0.083 ms` at 512 candidates against `0.067` at 640,
+which is not a monotone function of candidate count and so is contention, not
+signal. It is recorded here because the mistake was mine and the shape of the
+error — a non-monotone cell in a term that must be monotone — is the cheapest
+way to catch it.
+
+**The finding is the last three rows, not the first five.** `dsv4_paged_attention`
+and `dsv4_paged_attention_to_mhc` both validate `candidates > 640U` as invalid
+(`backend.cu:7545` and `backend.cu:9278`). A ratio-128 layer exceeds 640
+candidates as soon as `compressed_width > 512`, that is as soon as context
+exceeds `512 x 128 = 65,536` tokens. The first five rows are the control that
+identifies the cause: the same queries, sinks, scale and entry point pass at
+640 and fail at 1,152, and 1,152 is a multiple of the required 128, so the
+candidate cap is the only clause that can fire.
+
+A second ceiling sits behind the first. The kernel's KV staging is
+`candidates * 512 * sizeof(uint16)`, and production sets
+`maximum_workspace_bytes = 4 MiB` (`deepseek_runtime.cpp:3606`). At 640
+candidates that staging is `655 KB`; at 8,320 it is `8.52 MB`. Lifting the
+candidate cap alone would move the rejection, not remove it.
+
+**Therefore the declared 1,048,576-token context is not currently executable at
+all**, on either topology, for reasons that have nothing to do with the index,
+the chain, or rank-local decode. The supported context ceiling of the device
+attention path is `65,536` tokens. This is a capability bound, and it fails
+closed, which is the contract behaving correctly — but no throughput number for
+1M can exist until it is lifted.
+
+What the growth would cost if it were lifted, stated as an extrapolation and
+not a measurement: the kernel term is linear in candidates to within the
+resolution of the sweep. Fitting the endpoints gives `5.469e-5 ms/candidate`
+with a `0.029 ms` intercept, which predicts `0.0500` and `0.0570` at the two
+interior widths against `0.049` and `0.056` measured. At 8,320 candidates that
+is `0.484 ms/layer` of kernel, about `9.7 ms/token` over 20 layers against the
+`0.86 ms/token` at the current gate arm's 256 — a growth of about
+`+8.8 ms/token`.
+
+**This is a 13x extrapolation beyond the measured range and is not a result.**
+Two documented extrapolations in this file have already been withdrawn, and a
+linear fit is exactly what would fail here: at 8,320 candidates the kernel's KV
+staging no longer fits the workspace it is written against, so whatever runs at
+that width will not be this kernel unmodified.
+
+Two cautions on reading the table:
+
+- The `ms/layer` column is a **standalone** entry-point call and includes a
+  host round trip the production fused and queued paths do not pay. Roughly
+  `0.12`--`0.13 ms` of every row is outside the kernel. The `kernel ms` column
+  is the part that transfers.
+- Page count grows with context too (`4,097` descriptors at 1M against `257` at
+  65,536), and the descriptor upload is inside the untimed part of that
+  overhead. It is charged nowhere in the extrapolation above.
+
+**A reporting defect rides along with it.** Nothing between the configured
+`maximum_context_tokens` and the attention call bounds the context against 640
+candidates, so a run at, say, 100,000 tokens does not fail admission — it
+reaches the first ratio-128 layer and returns *"DeepSeek paged attention
+request shape, BF16 query, scale, or sink is invalid"*. That fails closed,
+which is the contract, but it names the query and the scale for what is
+actually an unsupported context length. Whatever lifts the ceiling should also
+make the bound explicit where the context is accepted.
+
+Consequence for the standing 1M arithmetic, with each term's provenance:
+
+```text
+below-threshold queued base, measured at ~2,000 tokens   109.612   does not describe 1M
+1M in-chain index, measured at 1M page geometry           +31.362   34.092 less the 2.730 host term
+ratio-128 growth, extrapolated 13x beyond measurement      +8.8     not a result
+                                                        ---------
+                                                          149.8
+review ceiling                                            127.000
+```
+
+Pre-leasing at 4,096 blocks per layer, the descriptor upload, and the growth of
+the base terms themselves are all still charged nowhere.
+
 ## Stage 3 handoff
 
 Stage 2 is closed: in-chain selection is committed, exact and measured at
@@ -1701,10 +1827,26 @@ in-chain selection               committed, gated, -43.9 ms rank-local
 E4M3 half-up encoder             committed and live in the backend
 ```
 
+### The blocking question, which is not about performance
+
+**The device attention path cannot execute above 65,536 tokens of context.**
+Both attention entry points reject more than 640 candidates, and a ratio-128
+layer needs `roundup(context/128, 128) + 128`, which passes 640 at 65,537
+tokens and reaches 8,320 at the declared context. The 4 MiB workspace bound is
+a second ceiling behind it. See the 2026-08-14 entry above for the measured
+sweep and the control that identifies the cause.
+
+Nothing else in this handoff can produce a 1M number until this is resolved,
+and resolving it is a kernel design task — tiled or multi-pass dense attention
+over an unbounded compressed history with an online softmax — not a tuning
+task. Until then the honest description of this branch is a supported context
+ceiling of 65,536 tokens, not 1,048,576.
+
 ### The two open questions, both about 1M and both measurable
 
-Neither is a design question. Both are measurements nobody has taken, and both
-were created by decisions this stage made.
+Both are downstream of the blocker above; neither can be answered end to end
+until it lifts. Both are measurements nobody has taken, and both were created
+by decisions Stage 2 made.
 
 1. **Pre-leasing every attendable block.** Device selection has no first touch
    to lease on, so an in-chain layer leases every attendable compressed block

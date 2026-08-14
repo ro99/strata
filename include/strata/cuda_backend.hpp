@@ -253,6 +253,18 @@ struct CudaDsv4PhysicalIndexPage {
     std::uint32_t rows{};
 };
 
+// Device-resident result of a selection that has been enqueued but not
+// synchronized. The positions live in the backend's persistent per-device
+// Lightning workspace, so they are valid only until the next selection on that
+// device; a consumer must therefore read them in stream order before the next
+// call, which is exactly what an in-chain resolve does.
+struct CudaDsv4DeviceIndexSelection {
+    // Opaque device pointers; the concrete types stay inside the backend.
+    void* positions{};
+    void* error{};
+    std::uint32_t selected{};
+};
+
 struct CudaDsv4PhysicalIndexRequest {
     // Queries have already crossed the host E4M3 round trip performed by
     // dsv4_physical_quantize_query_e4m3_f32; the backend consumes them as the
@@ -829,9 +841,27 @@ public:
     // per layer at the declared 1M context, where a single-thread merge is the
     // dominant term. Output ordering matches lightning_index: descending
     // score, lower position winning ties.
+    // Applies the index query's RoPE, the bf16 rounding of that region, and the
+    // half-up E4M3 quantization, in the order index_select() performs them on
+    // the host. `cosines` and `sines` are computed by the caller from the
+    // position and the layer frequencies, because host and device
+    // trigonometry differ in the last ulp and a hard top-k turns that into a
+    // different candidate set. `queries` is head-major and updated in place.
+    [[nodiscard]] ValidationResult dsv4_index_query_rope_quantize(
+        int device, std::span<float> queries, std::span<const float> cosines,
+        std::span<const float> sines, std::uint32_t heads,
+        std::uint32_t head_dim, std::uint32_t rope_dim, bool quantize);
+    // With `device_selection` null this downloads the positions into `output`
+    // and synchronizes, which is the host-visible selection the sequential path
+    // uses. With it non-null the kernels are left enqueued on the device
+    // stream, `output` may be empty, and the caller receives device pointers
+    // instead: no synchronization and no device-to-host copy. That is the form
+    // selection must take to run inside the queued chain, where a host round
+    // trip per indexed layer is what forces the chain to be abandoned.
     [[nodiscard]] ValidationResult dsv4_physical_lightning_index(
         int device, const CudaDsv4PhysicalIndexRequest& request,
-        std::span<std::uint32_t> output);
+        std::span<std::uint32_t> output,
+        CudaDsv4DeviceIndexSelection* device_selection = nullptr);
     // Enqueue first on every active device, then collect each device. Routed
     // results are flattened in the same order as `routed`; shared output is
     // returned separately so the caller retains the global accumulation order.

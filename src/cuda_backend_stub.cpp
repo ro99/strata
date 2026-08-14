@@ -229,8 +229,15 @@ ValidationResult CudaBackend::lightning_index(
     return {{"Lightning Indexer requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_index_query_rope_quantize(
+    int, std::span<float>, std::span<const float>, std::span<const float>,
+    std::uint32_t, std::uint32_t, std::uint32_t, bool) {
+    return {{"index-query preparation requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::dsv4_physical_lightning_index(
-    int, const CudaDsv4PhysicalIndexRequest&, std::span<std::uint32_t>) {
+    int, const CudaDsv4PhysicalIndexRequest&, std::span<std::uint32_t>,
+    CudaDsv4DeviceIndexSelection*) {
     return {{"physical Lightning Indexer requires a CUDA-enabled build"}};
 }
 

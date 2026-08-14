@@ -1586,6 +1586,10 @@ struct DeepSeekV4Runtime::Impl {
     // Learned-index table for sparse selection. Held separately because it is
     // resolved in a different phase from the attention candidate tables.
     std::vector<Dsv4KvBlockInfo> physical_index_blocks;
+    // Host-evaluated rope rotation for the index query, uploaded rather than
+    // recomputed on the device so the two agree bit for bit.
+    std::vector<float> index_rope_cosines;
+    std::vector<float> index_rope_sines;
     std::array<HostMoeContext, kLayers> host_moe_contexts{};
     std::uint32_t host_moe_pending{};
     std::uint64_t host_moe_routed_cpu_before{};
@@ -2821,20 +2825,43 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
     result = linear(slot, prefix + "wq_b", kIndexHeads * kIndexHeadDim,
                     kQueryRank, query_rank, queries);
     if (!result.ok()) return result;
-    for (std::uint32_t head = 0U; head < kIndexHeads; ++head) {
-        auto query = std::span<float>(queries).subspan(
-            static_cast<std::size_t>(head) * kIndexHeadDim, kIndexHeadDim);
-        apply_rope(query.last(kRopeDim), position,
-                   attention_state[layer].frequencies);
-        round_bf16(query.last(kRopeDim));
-        if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
-            result = dsv4_physical_quantize_query_e4m3_f32(query);
-            if (!result.ok()) return result;
-        } else if (!config.enable_gpu_lightning_indexer) {
-            result = dsv4_hadamard_rotate_f32(query);
-            if (!result.ok()) return result;
-            result = dsv4_fp4_e2m1_simulate_f32(query, 32U);
-            if (!result.ok()) return result;
+    const auto& frequencies = attention_state[layer].frequencies;
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        // Device preparation. The rotation is evaluated here rather than in the
+        // kernel because host libm and device trigonometry differ in the last
+        // ulp, and selection is a hard top-k where that becomes a different
+        // candidate set. The angles depend only on the position and the layer
+        // frequencies, so they are knowable before the call -- which is also
+        // what will let this run inside the queued chain.
+        if (frequencies.size() < kRopeDim / 2U) {
+            result.errors.emplace_back(
+                "DeepSeek index rope frequencies are too short");
+            return result;
+        }
+        index_rope_cosines.resize(kRopeDim / 2U);
+        index_rope_sines.resize(kRopeDim / 2U);
+        for (std::size_t pair = 0U; pair < index_rope_cosines.size(); ++pair) {
+            const float angle =
+                static_cast<float>(position) * frequencies[pair];
+            index_rope_cosines[pair] = std::cos(angle);
+            index_rope_sines[pair] = std::sin(angle);
+        }
+        result = cuda.dsv4_index_query_rope_quantize(
+            devices[slot], queries, index_rope_cosines, index_rope_sines,
+            kIndexHeads, kIndexHeadDim, kRopeDim, true);
+        if (!result.ok()) return result;
+    } else {
+        for (std::uint32_t head = 0U; head < kIndexHeads; ++head) {
+            auto query = std::span<float>(queries).subspan(
+                static_cast<std::size_t>(head) * kIndexHeadDim, kIndexHeadDim);
+            apply_rope(query.last(kRopeDim), position, frequencies);
+            round_bf16(query.last(kRopeDim));
+            if (!config.enable_gpu_lightning_indexer) {
+                result = dsv4_hadamard_rotate_f32(query);
+                if (!result.ok()) return result;
+                result = dsv4_fp4_e2m1_simulate_f32(query, 32U);
+                if (!result.ok()) return result;
+            }
         }
     }
 

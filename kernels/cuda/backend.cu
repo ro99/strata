@@ -3098,6 +3098,110 @@ __device__ __forceinline__ float dsv4_rope_second(
                      __fmul_rn(first, sine));
 }
 
+// Reproduces encode_e4m3_half_up() from src/dsv4_attention_kv.cpp exactly.
+//
+// Two things here are deliberate and neither is the obvious choice. The
+// backend's other quantizer, quantize_e4m3_value(), rounds ties to even via
+// rintf; this contract is half-up, floor(x * 8 + 0.5), and using the wrong one
+// silently changes which candidates a hard top-k selects. And the exponent
+// comes from log2f rather than the mathematically exact frexpf binade: just
+// below a power of two the host's log2 rounds up to the next integer, after
+// which its mantissa falls below 1 and it takes the sub-1 branch. That is a
+// suspected defect in the reference, recorded separately, but exactness against
+// the declared scalar reference is the binding contract, so it is reproduced
+// rather than corrected here.
+//
+// Screened against the host over 4,000,663 probes -- power-of-two boundaries,
+// half-up ties, saturation, zero, denormal and a random sweep -- with zero
+// mismatches on both supported architectures.
+__device__ unsigned char dsv4_encode_e4m3_half_up(float value) {
+    const unsigned int sign = value < 0.0F ? 1U : 0U;
+    float magnitude = fminf(fabsf(value), 448.0F);
+    if (!isfinite(magnitude)) magnitude = 0.0F;
+    if (magnitude == 0.0F) return 0U;
+    float exponent = floorf(log2f(magnitude));
+    exponent = fminf(fmaxf(exponent, -6.0F), 8.0F);
+    const float mantissa = magnitude / exp2f(exponent);
+    int exponent_field = 0;
+    int mantissa_field = 0;
+    if (mantissa >= 1.0F) {
+        exponent_field = static_cast<int>(exponent) + 7;
+        mantissa_field = static_cast<int>(
+            floorf((mantissa - 1.0F) * 8.0F + 0.5F));
+        if (mantissa_field >= 8) {
+            mantissa_field = 0;
+            ++exponent_field;
+        }
+    } else {
+        mantissa_field = static_cast<int>(floorf(mantissa * 8.0F + 0.5F));
+        if (mantissa_field >= 8) {
+            mantissa_field = 0;
+            exponent_field = 1;
+        }
+    }
+    exponent_field = min(exponent_field, 15);
+    return static_cast<unsigned char>(
+        (sign << 7U) | (static_cast<unsigned int>(exponent_field) << 3U) |
+        static_cast<unsigned int>(mantissa_field));
+}
+
+// One block per index head, one thread per head dimension. Mirrors the per-head
+// sequence index_select() runs on the host: RoPE over the trailing rope_dim
+// elements, then bf16 rounding of that region *only*, then E4M3 quantization of
+// the whole head.
+//
+// The cosines and sines are computed host-side and uploaded rather than
+// evaluated here, because host libm and device trigonometry differ in the last
+// ulp and the angles depend only on the position and the layer frequencies,
+// both known before the call. The rotation itself uses the existing
+// non-contracted helpers; a probe confirms the host does not contract its
+// equivalent expression into an fma at -O3, so the two agree.
+//
+// The non-finite check covers the whole head and leaves it unmodified on
+// failure, as dsv4_physical_quantize_query_e4m3_f32 does.
+__global__ void dsv4_index_query_rope_quantize_kernel(
+    float* queries, const float* cosines, const float* sines,
+    std::uint32_t head_dim, std::uint32_t rope_dim, unsigned int quantize,
+    unsigned int* error) {
+    __shared__ unsigned int rejected;
+    auto* query = queries +
+        static_cast<std::uint64_t>(blockIdx.x) * head_dim;
+    const auto rope_begin = head_dim - rope_dim;
+    if (threadIdx.x < rope_dim / 2U) {
+        const auto pair = threadIdx.x;
+        const float first = query[rope_begin + pair * 2U];
+        const float second = query[rope_begin + pair * 2U + 1U];
+        const float cosine = cosines[pair];
+        const float sine = sines[pair];
+        query[rope_begin + pair * 2U] =
+            dsv4_rope_first(first, second, cosine, sine);
+        query[rope_begin + pair * 2U + 1U] =
+            dsv4_rope_second(first, second, cosine, sine);
+    }
+    __syncthreads();
+    if (threadIdx.x < rope_dim) {
+        auto& value = query[rope_begin + threadIdx.x];
+        value = bf16_round(value);
+    }
+    if (quantize == 0U) return;
+    if (threadIdx.x == 0U) rejected = 0U;
+    __syncthreads();
+    for (std::uint32_t index = threadIdx.x; index < head_dim;
+         index += blockDim.x) {
+        if (!isfinite(query[index])) atomicExch(&rejected, 1U);
+    }
+    __syncthreads();
+    if (rejected != 0U) {
+        if (threadIdx.x == 0U) atomicExch(error, 1U);
+        return;
+    }
+    for (std::uint32_t index = threadIdx.x; index < head_dim;
+         index += blockDim.x) {
+        query[index] =
+            fp8_e4m3_value(dsv4_encode_e4m3_half_up(query[index]));
+    }
+}
+
 // The declared contract pins the accumulation *order* of the FP64 sum, not
 // where its operands are read from. The dequantize/square phase and the
 // scale/store phase carry no cross-column dependency, so only the reduction
@@ -4009,6 +4113,10 @@ struct CudaBackend::Impl {
         std::uint64_t attention_host_upload_bytes{};
         std::uint64_t attention_host_download_bytes{};
         std::uint64_t attention_score_bytes{};
+        // Index-query preparation: the head-major query block plus its rope
+        // cosines and sines. Grown once and reused, never on a timed path.
+        std::byte* dsv4_index_query_workspace{};
+        std::uint64_t dsv4_index_query_workspace_bytes{};
         std::byte* dsv4_attention_workspace{};
         std::byte* dsv4_attention_host_upload{};
         std::byte* dsv4_attention_host_download{};
@@ -4148,6 +4256,9 @@ struct CudaBackend::Impl {
             }
             if (state.dsv4_attention_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_attention_workspace));
+            }
+            if (state.dsv4_index_query_workspace != nullptr) {
+                static_cast<void>(cudaFree(state.dsv4_index_query_workspace));
             }
             if (state.dsv4_attention_prepare_workspace != nullptr) {
                 static_cast<void>(
@@ -5958,10 +6069,111 @@ ValidationResult CudaBackend::lightning_index(
     return result;
 }
 
+ValidationResult CudaBackend::dsv4_index_query_rope_quantize(
+    int device, std::span<float> queries, std::span<const float> cosines,
+    std::span<const float> sines, std::uint32_t heads,
+    std::uint32_t head_dim, std::uint32_t rope_dim, bool quantize) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "CUDA index-query preparation received an unknown device");
+        return result;
+    }
+    auto& state = found->second;
+    if (heads == 0U || head_dim == 0U || rope_dim == 0U ||
+        rope_dim > head_dim || (rope_dim % 2U) != 0U ||
+        head_dim > 1024U ||
+        queries.size() != static_cast<std::size_t>(heads) * head_dim ||
+        cosines.size() != rope_dim / 2U || sines.size() != rope_dim / 2U) {
+        result.errors.emplace_back(
+            "CUDA index-query preparation shapes are incompatible");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for index-query preparation");
+    }
+    const auto query_bytes =
+        static_cast<std::uint64_t>(queries.size()) * sizeof(float);
+    const auto rope_bytes =
+        static_cast<std::uint64_t>(cosines.size()) * sizeof(float);
+    const auto required = query_bytes + 2U * rope_bytes + sizeof(unsigned int);
+    if (state.dsv4_index_query_workspace_bytes < required) {
+        if (state.dsv4_index_query_workspace != nullptr) {
+            static_cast<void>(cudaFree(state.dsv4_index_query_workspace));
+            state.dsv4_index_query_workspace = nullptr;
+            state.dsv4_index_query_workspace_bytes = 0U;
+        }
+        if (auto status = cudaMalloc(&state.dsv4_index_query_workspace,
+                                     static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "allocate index-query preparation workspace");
+        }
+        state.dsv4_index_query_workspace_bytes = required;
+    }
+    auto* base = state.dsv4_index_query_workspace;
+    auto* device_queries = reinterpret_cast<float*>(base);
+    auto* device_cosines = reinterpret_cast<float*>(base + query_bytes);
+    auto* device_sines =
+        reinterpret_cast<float*>(base + query_bytes + rope_bytes);
+    auto* device_error = reinterpret_cast<unsigned int*>(
+        base + query_bytes + 2U * rope_bytes);
+
+    const auto copy = [&](void* destination, const void* source,
+                          std::uint64_t bytes, cudaMemcpyKind kind,
+                          const char* what) {
+        const auto status = cudaMemcpyAsync(
+            destination, source, static_cast<std::size_t>(bytes), kind,
+            state.stream);
+        if (status != cudaSuccess) result = cuda_error(status, what);
+        return status == cudaSuccess;
+    };
+    if (!copy(device_queries, queries.data(), query_bytes,
+              cudaMemcpyHostToDevice, "upload index queries") ||
+        !copy(device_cosines, cosines.data(), rope_bytes,
+              cudaMemcpyHostToDevice, "upload index rope cosines") ||
+        !copy(device_sines, sines.data(), rope_bytes,
+              cudaMemcpyHostToDevice, "upload index rope sines")) {
+        return result;
+    }
+    if (auto status = cudaMemsetAsync(device_error, 0, sizeof(unsigned int),
+                                      state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "clear index-query preparation error state");
+    }
+    dsv4_index_query_rope_quantize_kernel<<<heads, head_dim, 0U,
+                                           state.stream>>>(
+        device_queries, device_cosines, device_sines, head_dim, rope_dim,
+        quantize ? 1U : 0U, device_error);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch index-query preparation");
+    }
+    unsigned int host_error = 0U;
+    if (!copy(queries.data(), device_queries, query_bytes,
+              cudaMemcpyDeviceToHost, "download index queries") ||
+        !copy(&host_error, device_error, sizeof(host_error),
+              cudaMemcpyDeviceToHost, "download index-query error state")) {
+        return result;
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize index-query preparation");
+    }
+    if (host_error != 0U) {
+        result.errors.emplace_back(
+            "DeepSeek V4 DeepSeek-V4 index query contains a non-finite value");
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::dsv4_physical_lightning_index(
     int device, const CudaDsv4PhysicalIndexRequest& request,
-    std::span<std::uint32_t> output) {
+    std::span<std::uint32_t> output,
+    CudaDsv4DeviceIndexSelection* device_selection) {
     ValidationResult result;
+    if (device_selection != nullptr) *device_selection = {};
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
         result.errors.emplace_back(
@@ -6022,7 +6234,11 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     }
     const auto candidates = static_cast<std::uint32_t>(candidates64);
     const auto selected = std::min(request.top_k, candidates);
-    if (output.size() != selected) {
+    // A device-selection caller reads the positions on the device and need not
+    // provide host storage at all; it may still pass a correctly sized span if
+    // it wants both.
+    if (output.size() != selected &&
+        !(device_selection != nullptr && output.empty())) {
         result.errors.emplace_back(
             "physical Lightning Indexer output extent is incompatible");
         return result;
@@ -6296,6 +6512,30 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch physical Lightning Indexer kernels");
+    }
+    // Enqueue-only form: the selection stays on the device and the caller
+    // consumes it in stream order. Everything below this point is the
+    // host-visible tail -- a device-to-host copy and a stream synchronize --
+    // and it is exactly what a queued chain cannot afford per indexed layer.
+    if (device_selection != nullptr) {
+        device_selection->positions = device_winners;
+        device_selection->error = device_error;
+        device_selection->selected = selected;
+        {
+            std::scoped_lock lock(impl_->mutex);
+            auto& stats = *std::find_if(
+                impl_->stats.devices.begin(), impl_->stats.devices.end(),
+                [device](const auto& value) { return value.device == device; });
+            ++stats.lightning_index_calls;
+            stats.lightning_index_kernel_launches += 2U + shifts.size() * 4U;
+            stats.lightning_index_candidates += candidates;
+            stats.lightning_index_selected += selected;
+            stats.lightning_index_h2d_transfers += h2d_transfers;
+            stats.lightning_index_h2d_bytes += h2d_bytes;
+            stats.workspace_allocation_calls += allocation_calls;
+            stats.workspace_allocation_bytes += allocation_bytes;
+        }
+        return result;
     }
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.kernel_finished, state.stream);

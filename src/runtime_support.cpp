@@ -18,13 +18,16 @@ namespace strata {
 void StopSequenceBuffer::emit(std::size_t end, std::uint32_t token,
                               const TokenStreamCallback& callback) {
     if (end <= emitted_) return;
-    if (callback) callback(token, std::string_view(text_).substr(emitted_, end - emitted_));
+    if (callback &&
+        !callback(token, std::string_view(text_).substr(emitted_, end - emitted_))) {
+        cancelled_ = true;
+    }
     emitted_ = end;
 }
 
 void StopSequenceBuffer::append(std::uint32_t token, std::string_view piece,
                                 const TokenStreamCallback& callback) {
-    if (stopped_) return;
+    if (stopped_ || cancelled_) return;
     text_.append(piece);
     std::size_t stop_at = std::string::npos;
     for (const auto& stop : stops_) {
@@ -52,7 +55,7 @@ void StopSequenceBuffer::append(std::uint32_t token, std::string_view piece,
 }
 
 void StopSequenceBuffer::finish(const TokenStreamCallback& callback) {
-    if (!stopped_) emit(text_.size(), 0U, callback);
+    if (!stopped_ && !cancelled_) emit(text_.size(), 0U, callback);
 }
 
 ValidationResult validate_common_runtime_config(

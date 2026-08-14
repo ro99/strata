@@ -22,6 +22,7 @@ public:
     void finish(const TokenStreamCallback& callback);
 
     [[nodiscard]] bool stopped() const noexcept { return stopped_; }
+    [[nodiscard]] bool cancelled() const noexcept { return cancelled_; }
     [[nodiscard]] const std::string& text() const noexcept { return text_; }
 
 private:
@@ -32,6 +33,7 @@ private:
     std::string text_;
     std::size_t emitted_{};
     bool stopped_{};
+    bool cancelled_{};
 };
 
 struct RuntimeDeviceBudget {

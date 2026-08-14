@@ -1617,7 +1617,7 @@ InklingGenerationResult InklingRuntime::Impl::generate(
         auto piece = impl.tokenizer.decode_token(token);
         if (piece.ok()) {
             text += piece.value;
-            if (on_token) on_token(token, piece.value);
+            if (on_token && !on_token(token, piece.value)) break;
         }
         bool hit_stop = false;
         for (const auto& sequence : stop) {

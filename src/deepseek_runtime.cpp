@@ -8495,7 +8495,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     std::uint64_t decode_steps = 0U;
     result.metrics.decode_step_seconds.reserve(maximum_new_tokens);
     const auto decode_started = std::chrono::steady_clock::now();
-    while (next.value != stop_token && !output.stopped() &&
+    while (next.value != stop_token && !output.stopped() && !output.cancelled() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const auto input_token = next.value;
         const auto step_started = std::chrono::steady_clock::now();

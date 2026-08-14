@@ -1464,7 +1464,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
     }
     auto position = static_cast<std::uint32_t>(result.prompt_token_ids.size());
     const auto decode_started = std::chrono::steady_clock::now();
-    while (!is_stop(next.value) && !output.stopped() &&
+    while (!is_stop(next.value) && !output.stopped() && !output.cancelled() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const std::array<std::uint32_t, 1> token{next.value};
         next = impl_->forward(token, position++);

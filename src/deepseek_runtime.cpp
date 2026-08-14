@@ -5899,8 +5899,57 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
     // rejection after loading is still fail-closed because the store is
     // cleared before returning.
     auto store = std::make_unique<Dsv4RankLocalWeightStore>();
+    const auto checkpoint_before = checkpoint->stats();
+    const auto cuda_before = cuda.stats();
     result = store->load(*checkpoint, cuda, rank_devices, kLayers);
     if (!result.ok()) return result;
+    if (config.verbose) {
+        const auto stats = store->stats();
+        const auto checkpoint_after = checkpoint->stats();
+        const auto cuda_after = cuda.stats();
+        std::uint64_t cuda_copy_nanoseconds = 0U;
+        std::uint64_t cuda_wait_nanoseconds = 0U;
+        std::uint64_t cuda_allocation_nanoseconds = 0U;
+        for (std::size_t slot = 0U; slot < cuda_after.devices.size(); ++slot) {
+            const auto& after = cuda_after.devices[slot];
+            const auto before = slot < cuda_before.devices.size()
+                ? cuda_before.devices[slot] : CudaBackendStats::Device{};
+            cuda_copy_nanoseconds += after.weight_copy_nanoseconds -
+                                     before.weight_copy_nanoseconds;
+            cuda_wait_nanoseconds += after.upload_wait_nanoseconds -
+                                     before.upload_wait_nanoseconds;
+            cuda_allocation_nanoseconds += after.weight_allocation_nanoseconds -
+                                           before.weight_allocation_nanoseconds;
+        }
+        const auto read_nanoseconds = checkpoint_after.nanoseconds -
+                                      checkpoint_before.nanoseconds;
+        const auto accounted_seconds = static_cast<double>(
+            read_nanoseconds + cuda_copy_nanoseconds + cuda_wait_nanoseconds +
+            cuda_allocation_nanoseconds) / 1.0e9;
+        const auto cpu_other_seconds = std::max(
+            0.0, stats.seconds - accounted_seconds);
+        const auto read_gib_s = stats.seconds == 0.0
+            ? 0.0
+            : static_cast<double>(stats.checkpoint_read_bytes) /
+                  stats.seconds / static_cast<double>(1ULL << 30U);
+        std::cerr << "[deepseek-load] phase=rank_local_weights elapsed_ms="
+                  << stats.seconds * 1000.0
+                  << " checkpoint_read_calls=" << stats.checkpoint_read_calls
+                  << " checkpoint_read_bytes=" << stats.checkpoint_read_bytes
+                  << " checkpoint_read_gib_s=" << read_gib_s
+                  << " checkpoint_read_ms="
+                  << static_cast<double>(read_nanoseconds) / 1.0e6
+                  << " cuda_copy_ms="
+                  << static_cast<double>(cuda_copy_nanoseconds) / 1.0e6
+                  << " cuda_wait_ms="
+                  << static_cast<double>(cuda_wait_nanoseconds) / 1.0e6
+                  << " cuda_allocation_ms="
+                  << static_cast<double>(cuda_allocation_nanoseconds) / 1.0e6
+                  << " cpu_other_ms=" << cpu_other_seconds * 1000.0
+                  << " rank0_device_bytes=" << stats.device_weight_bytes[0]
+                  << " rank1_device_bytes=" << stats.device_weight_bytes[1]
+                  << '\n';
+    }
     const auto sharded = store->device_bytes();
 
     Dsv4RankLocalAdmissionRequest request;
@@ -8190,6 +8239,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     ValidationResult warmup_result;
     double staging_seconds = 0.0;
     double warmup_seconds = 0.0;
+    std::atomic<bool> staging_finished{false};
     const auto stage_resident = [&] {
         const auto started = std::chrono::steady_clock::now();
         staging_result = impl_->resident.stage(*impl_->checkpoint,
@@ -8199,6 +8249,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
                                                config.enable_host_routed_moe);
         staging_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
+        staging_finished.store(true, std::memory_order_release);
     };
     const auto warm_spine = [&] {
         const auto started = std::chrono::steady_clock::now();
@@ -8209,10 +8260,28 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (config.overlap_resident_warmup) {
         std::thread staging_thread(stage_resident);
         warm_spine();
+        if (config.verbose) {
+            std::cerr << "[deepseek-load] phase=spine_warmup_complete elapsed_ms="
+                      << warmup_seconds * 1000.0 << '\n';
+            if (!staging_finished.load(std::memory_order_acquire)) {
+                std::cerr << "[deepseek-load] phase=resident_stage_wait_start\n";
+            }
+        }
         staging_thread.join();
     } else {
         stage_resident();
         if (staging_result.ok()) warm_spine();
+        if (config.verbose) {
+            std::cerr << "[deepseek-load] phase=spine_warmup_complete elapsed_ms="
+                      << warmup_seconds * 1000.0 << '\n';
+        }
+    }
+    if (config.verbose) {
+        const auto stage_stats = impl_->resident.stats();
+        std::cerr << "[deepseek-load] phase=resident_stage_complete elapsed_ms="
+                  << staging_seconds * 1000.0
+                  << " bytes=" << stage_stats.bytes
+                  << " workers=" << stage_stats.workers << '\n';
     }
     if (!staging_result.ok()) {
         append_errors(result, std::move(staging_result.errors));
@@ -8261,10 +8330,27 @@ ValidationResult DeepSeekV4Runtime::initialize(
     // has reported its real size. Admission needs measured byte accounts, not
     // estimates, and those only exist once the arena and KV cache are built.
     if (config.decode_topology == Dsv4DecodeTopology::RankLocalTp2) {
+        if (config.verbose) {
+            std::cerr << "[deepseek-load] phase=rank_local_setup_start\n";
+        }
+        const auto rank_local_started = std::chrono::steady_clock::now();
         result = impl_->admit_rank_local();
+        const auto rank_local_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - rank_local_started).count();
+        if (config.verbose) {
+            std::cerr << "[deepseek-load] phase=rank_local_setup elapsed_ms="
+                      << rank_local_seconds * 1000.0 << '\n';
+        }
         if (!result.ok()) return result;
     }
+    const auto reset_started = std::chrono::steady_clock::now();
     result = impl_->reset_sequence(1U);
+    const auto reset_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - reset_started).count();
+    if (config.verbose) {
+        std::cerr << "[deepseek-load] phase=sequence_reset elapsed_ms="
+                  << reset_seconds * 1000.0 << '\n';
+    }
     if (!result.ok()) return result;
     impl_->initialized = true;
     impl_->initialization_metrics.initialization_seconds =
@@ -8338,6 +8424,37 @@ ValidationResult DeepSeekV4Runtime::initialize(
         config.expert_prefetch_lease_ticks;
     impl_->initialization_metrics.expert_prefetch_minimum_confidence =
         config.expert_prefetch_minimum_confidence;
+    if (config.verbose) {
+        const auto& metrics = impl_->initialization_metrics;
+        const auto overlapped_seconds = std::max(
+            metrics.resident_staging_seconds,
+            metrics.resident_warmup_seconds);
+        const auto serial_seconds = std::max(
+            0.0, metrics.initialization_seconds - overlapped_seconds);
+        const auto stage_gib_s = metrics.resident_staging_seconds == 0.0
+            ? 0.0
+            : static_cast<double>(metrics.resident_stage.bytes) /
+                  metrics.resident_staging_seconds / static_cast<double>(1ULL << 30U);
+        std::cerr << "[deepseek-load] phase=summary total_ms="
+                  << metrics.initialization_seconds * 1000.0
+                  << " admission_ms=" << metrics.admission_seconds * 1000.0
+                  << " resident_stage_ms="
+                  << metrics.resident_staging_seconds * 1000.0
+                  << " resident_stage_bytes=" << metrics.resident_stage.bytes
+                  << " resident_stage_gib_s=" << stage_gib_s
+                  << " spine_warmup_ms="
+                  << metrics.resident_warmup_seconds * 1000.0
+                  << " weight_upload_bytes=" << metrics.cuda.weight_upload_bytes
+                  << " weight_copy_ms="
+                  << static_cast<double>(metrics.cuda.weight_copy_nanoseconds) /
+                         1.0e6
+                  << " weight_allocation_ms="
+                  << static_cast<double>(
+                         metrics.cuda.weight_allocation_nanoseconds) / 1.0e6
+                  << " overlap_window_ms=" << overlapped_seconds * 1000.0
+                  << " other_serial_ms=" << serial_seconds * 1000.0
+                  << " rss_bytes=" << metrics.rss_bytes << '\n';
+    }
     return result;
 }
 
@@ -8495,7 +8612,7 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
     std::uint64_t decode_steps = 0U;
     result.metrics.decode_step_seconds.reserve(maximum_new_tokens);
     const auto decode_started = std::chrono::steady_clock::now();
-    while (next.value != stop_token && !output.stopped() &&
+    while (next.value != stop_token && !output.stopped() && !output.cancelled() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const auto input_token = next.value;
         const auto step_started = std::chrono::steady_clock::now();

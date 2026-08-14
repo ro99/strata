@@ -819,7 +819,7 @@ KimiK3GenerationResult KimiK3Runtime::generate_from_tokens(
         result.logprobs.push_back(drawn);
         ++sampled_counts[drawn.token];
         sampled_ids.push_back(drawn.token);
-        if (on_token) on_token(drawn.token, {});
+        if (on_token && !on_token(drawn.token, {})) break;
         if (index + 1U == maximum_new_tokens) break;
         const std::array<std::uint32_t, 1U> next{drawn.token};
         auto step = evaluate(next, position, logits);

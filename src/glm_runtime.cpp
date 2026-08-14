@@ -2033,7 +2033,7 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
         output.append(next.value, piece.value, on_token);
     }
     const auto decode_start = std::chrono::steady_clock::now();
-    while (!is_stop(next.value) && !output.stopped() &&
+    while (!is_stop(next.value) && !output.stopped() && !output.cancelled() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const std::array<std::uint32_t, 1> input{next.value};
         next = impl_->forward(input, position++, false);

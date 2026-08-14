@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace strata {
@@ -523,66 +524,89 @@ ValidationResult Dsv4RankLocalWeightStore::load(
 
     layers_.resize(layer_count);
     std::array<std::uint64_t, kDsv4RankLocalWorld> device_bytes{};
+    std::array<ValidationResult, kDsv4RankLocalWorld> rank_results;
+    std::array<std::thread, kDsv4RankLocalWorld> rank_workers;
 
-    for (std::uint32_t layer = 0U; layer < layer_count; ++layer) {
-        auto& storage = layers_[layer];
-        for (std::uint32_t rank = 0U;
-             rank < static_cast<std::uint32_t>(kDsv4RankLocalWorld); ++rank) {
+    // Each rank owns a distinct CUDA device, arena, stream, and destination
+    // slot. Load the two complete rank streams concurrently so their host FP8
+    // conversion does not serialize startup after the resident spine warmup.
+    for (std::uint32_t rank = 0U;
+         rank < static_cast<std::uint32_t>(kDsv4RankLocalWorld); ++rank) {
+        rank_workers[rank] = std::thread([&, rank] {
+            auto& rank_result = rank_results[rank];
             const auto device = devices[rank];
-            auto& target = storage.rank[rank];
-            auto attention = load_rank_attention(
-                checkpoint, backend, device, layer, rank, target,
-                device_bytes[rank]);
-            if (!attention.ok()) {
-                result.errors = std::move(attention.errors);
-                clear();
-                return result;
-            }
-            auto shared = load_rank_shared(checkpoint, backend, device, layer,
-                                           rank, target, device_bytes[rank]);
-            if (!shared.ok()) {
-                result.errors = std::move(shared.errors);
-                clear();
-                return result;
-            }
-            auto router = load_plain_cuda(
-                checkpoint,
-                "layers." + std::to_string(layer) + ".ffn.gate.weight",
-                kRouterExperts, kHidden, device, backend, target.router,
-                device_bytes[rank]);
-            if (!router.ok()) {
-                result.errors = std::move(router.errors);
-                clear();
-                return result;
-            }
-            auto attention_mhc = load_mhc(
-                checkpoint, backend, device, layer, false,
-                target.attention_mhc, device_bytes[rank]);
-            auto ffn_mhc = load_mhc(
-                checkpoint, backend, device, layer, true,
-                target.ffn_mhc, device_bytes[rank]);
-            if (!attention_mhc.ok() || !ffn_mhc.ok()) {
-                result.errors = attention_mhc.ok() ? std::move(ffn_mhc.errors)
-                                                   : std::move(attention_mhc.errors);
-                clear();
-                return result;
-            }
-            // The chain queues the next layer's attention mHC transition from
-            // this layer, so every layer but the last owns its successor's
-            // attention mHC weights.
-            if (layer + 1U < layer_count) {
-                auto next = load_mhc(
-                    checkpoint, backend, device, layer + 1U, false,
-                    target.next_attention_mhc, device_bytes[rank]);
-                if (!next.ok()) {
-                    result.errors = std::move(next.errors);
-                    clear();
-                    return result;
+            for (std::uint32_t layer = 0U;
+                 layer < layer_count && rank_result.ok(); ++layer) {
+                auto& storage = layers_[layer];
+                auto& target = storage.rank[rank];
+                auto attention = load_rank_attention(
+                    checkpoint, backend, device, layer, rank, target,
+                    device_bytes[rank]);
+                if (!attention.ok()) {
+                    rank_result.errors = std::move(attention.errors);
+                    break;
                 }
-                target.has_next_attention_mhc = true;
+                auto shared = load_rank_shared(
+                    checkpoint, backend, device, layer, rank, target,
+                    device_bytes[rank]);
+                if (!shared.ok()) {
+                    rank_result.errors = std::move(shared.errors);
+                    break;
+                }
+                auto router = load_plain_cuda(
+                    checkpoint,
+                    "layers." + std::to_string(layer) + ".ffn.gate.weight",
+                    kRouterExperts, kHidden, device, backend, target.router,
+                    device_bytes[rank]);
+                if (!router.ok()) {
+                    rank_result.errors = std::move(router.errors);
+                    break;
+                }
+                auto attention_mhc = load_mhc(
+                    checkpoint, backend, device, layer, false,
+                    target.attention_mhc, device_bytes[rank]);
+                auto ffn_mhc = load_mhc(
+                    checkpoint, backend, device, layer, true,
+                    target.ffn_mhc, device_bytes[rank]);
+                if (!attention_mhc.ok() || !ffn_mhc.ok()) {
+                    rank_result.errors = attention_mhc.ok()
+                        ? std::move(ffn_mhc.errors)
+                        : std::move(attention_mhc.errors);
+                    break;
+                }
+                // The chain queues the next layer's attention mHC transition
+                // from this layer, so every layer but the last owns its
+                // successor's attention mHC weights.
+                if (layer + 1U < layer_count) {
+                    auto next = load_mhc(
+                        checkpoint, backend, device, layer + 1U, false,
+                        target.next_attention_mhc, device_bytes[rank]);
+                    if (!next.ok()) {
+                        rank_result.errors = std::move(next.errors);
+                        break;
+                    }
+                    target.has_next_attention_mhc = true;
+                }
+            }
+        });
+    }
+    for (auto& worker : rank_workers) worker.join();
+    for (auto& rank_result : rank_results) {
+        if (!rank_result.ok()) {
+            for (auto& error : rank_result.errors) {
+                result.errors.emplace_back(std::move(error));
             }
         }
+    }
+    if (!result.ok()) {
+        clear();
+        return result;
+    }
 
+    // Router membership/bias is shared host state, so populate it once after
+    // both independent rank streams have completed.
+    for (std::uint32_t layer = 0U; layer < layer_count; ++layer) {
+        auto& storage = layers_[layer];
         if (layer < kHashRoutedLayers) {
             auto table = load_hash_router_table(checkpoint, layer, storage);
             if (!table.ok()) {

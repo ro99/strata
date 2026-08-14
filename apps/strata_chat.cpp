@@ -612,6 +612,7 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
     const strata::TokenStreamCallback stream = [&](std::uint32_t token,
                                                     std::string_view piece) {
         display.token(token, piece);
+        return true;
     };
     const auto result = runtime.generate_chat_stream(
         messages, options.max_new_tokens, stream);

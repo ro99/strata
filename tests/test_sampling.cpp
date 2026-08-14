@@ -559,7 +559,10 @@ TEST_CASE("stop sequences are withheld across token-piece boundaries") {
     strata::StopSequenceBuffer buffer(stops);
     std::string streamed;
     const strata::TokenStreamCallback callback =
-        [&streamed](std::uint32_t, std::string_view piece) { streamed += piece; };
+        [&streamed](std::uint32_t, std::string_view piece) {
+            streamed += piece;
+            return true;
+        };
     buffer.append(1U, "hello E", callback);
     REQUIRE(streamed == "hello ");
     buffer.append(2U, "ND ignored", callback);
@@ -567,6 +570,25 @@ TEST_CASE("stop sequences are withheld across token-piece boundaries") {
     REQUIRE(buffer.stopped());
     REQUIRE(buffer.text() == "hello ");
     REQUIRE(streamed == "hello ");
+}
+
+TEST_CASE("a token stream callback can cancel generation at a token boundary") {
+    strata::StopSequenceBuffer buffer(std::span<const std::string>{});
+    std::uint32_t callbacks = 0U;
+    const strata::TokenStreamCallback callback =
+        [&callbacks](std::uint32_t, std::string_view) {
+            ++callbacks;
+            return false;
+        };
+
+    buffer.append(1U, "first", callback);
+    buffer.append(2U, " ignored", callback);
+    buffer.finish(callback);
+
+    REQUIRE(buffer.cancelled());
+    REQUIRE(!buffer.stopped());
+    REQUIRE(buffer.text() == "first");
+    REQUIRE(callbacks == 1U);
 }
 
 TEST_CASE("chat history trimming preserves system messages and the newest turn") {

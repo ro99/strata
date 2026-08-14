@@ -209,6 +209,31 @@ bool send_all(int socket, std::string_view data) {
     return true;
 }
 
+bool client_disconnected(int socket) {
+    char byte{};
+    for (;;) {
+        const auto received = recv(socket, &byte, 1U, MSG_PEEK | MSG_DONTWAIT);
+        if (received == 0) return true;
+        if (received > 0) return false;
+        if (errno == EINTR) continue;
+        return errno != EAGAIN && errno != EWOULDBLOCK;
+    }
+}
+
+double elapsed_ms(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
+std::size_t message_bytes(std::span<const strata::ChatMessage> messages) {
+    std::size_t bytes = 0U;
+    for (const auto& message : messages) {
+        bytes += message.content.size();
+        for (const auto& part : message.parts) bytes += part.data.size();
+    }
+    return bytes;
+}
+
 bool send_response(int socket, int status, std::string_view reason,
                    std::string_view content_type, std::string_view body) {
     std::ostringstream header;
@@ -433,21 +458,31 @@ private:
 
     void completion(int socket, std::string_view body, bool chat) {
         const auto request_started = std::chrono::steady_clock::now();
+        const auto id = next_id(chat);
+        std::cerr << "[request] id=" << id << " phase=received endpoint="
+                  << (chat ? "chat.completions" : "completions")
+                  << " body_bytes=" << body.size() << '\n';
         strata::OpenAiChatRequest request;
         std::string error;
         const bool parsed = chat
             ? strata::parse_openai_chat_request(body, request, error)
             : strata::parse_openai_completion_request(body, request, error);
         if (!parsed) {
+            std::cerr << "[request] id=" << id
+                      << " phase=rejected status=400 error=" << error << '\n';
             send_error(socket, 400, "Bad Request", error, "invalid_request_error");
             return;
         }
         if (request.model != options_.model_id) {
+            std::cerr << "[request] id=" << id
+                      << " phase=rejected status=404 error=model_not_found\n";
             send_error(socket, 404, "Not Found", "requested model is not loaded",
                        "invalid_request_error", "model_not_found");
             return;
         }
         if (request.has_tools) {
+            std::cerr << "[request] id=" << id
+                      << " phase=rejected status=400 error=unsupported_tools\n";
             send_error(socket, 400, "Bad Request",
                        "tool calling is not supported by this loaded base model",
                        "invalid_request_error", "unsupported_parameter");
@@ -456,6 +491,8 @@ private:
         for (const auto& [token, bias] : request.generation.sampling.logit_bias) {
             static_cast<void>(bias);
             if (token >= tokenizer_.vocabulary_size()) {
+                std::cerr << "[request] id=" << id
+                          << " phase=rejected status=400 error=invalid_logit_bias\n";
                 send_error(socket, 400, "Bad Request",
                            "logit_bias token id is outside the loaded vocabulary",
                            "invalid_request_error", "invalid_logit_bias");
@@ -465,8 +502,14 @@ private:
         if (!request.has_max_tokens) {
             request.generation.maximum_new_tokens = options_.max_new_tokens;
         }
-        if (request.stream) stream(socket, request, chat);
-        else complete(socket, request, chat, request_started);
+        std::cerr << "[request] id=" << id << " phase=accepted stream="
+                  << (request.stream ? "true" : "false")
+                  << " messages=" << request.messages.size()
+                  << " message_bytes=" << message_bytes(request.messages)
+                  << " choices=" << request.n
+                  << " max_tokens=" << request.generation.maximum_new_tokens << '\n';
+        if (request.stream) stream(socket, request, chat, id, request_started);
+        else complete(socket, request, chat, id, request_started);
     }
 
     std::string next_id(bool chat) {
@@ -475,16 +518,23 @@ private:
         return id.str();
     }
 
-    void stream(int socket, const strata::OpenAiChatRequest& request, bool chat) {
-        const auto id = next_id(chat);
+    void stream(int socket, const strata::OpenAiChatRequest& request, bool chat,
+                const std::string& id,
+                std::chrono::steady_clock::time_point request_started) {
         const auto created = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         const std::string header =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\nConnection: close\r\n"
             "Access-Control-Allow-Origin: *\r\n\r\n";
-        if (!send_all(socket, header)) return;
+        if (!send_all(socket, header)) {
+            std::cerr << "[request] id=" << id
+                      << " phase=cancelled stage=response_headers elapsed_ms="
+                      << elapsed_ms(request_started) << '\n';
+            return;
+        }
         strata::GenerationMetrics aggregated;
+        std::uint64_t returned_tokens = 0U;
         for (std::uint32_t index = 0U; index < request.n; ++index) {
             auto options = request.generation;
             options.sampling.seed = request.has_seed
@@ -500,21 +550,40 @@ private:
                      << "\",\"choices\":[{\"index\":" << index
                      << ",\"delta\":{\"role\":\"assistant\",\"content\":\"\"},"
                         "\"logprobs\":null,\"finish_reason\":null}]}\n\n";
-                if (!send_all(socket, role.str())) return;
+                if (!send_all(socket, role.str())) {
+                    std::cerr << "[request] id=" << id
+                              << " phase=cancelled stage=role_chunk elapsed_ms="
+                              << elapsed_ms(request_started) << '\n';
+                    return;
+                }
             }
             bool connected = true;
+            bool valid_utf8 = true;
+            bool first_token = true;
             std::string utf8_pending;
+            std::cerr << "[request] id=" << id
+                      << " phase=generation_start choice=" << index << '\n';
             const strata::TokenStreamCallback callback =
                 [&](std::uint32_t, std::string_view piece) {
-                    if (!connected) return;
-                    if (request.json_object) return;
+                    if (!connected) return false;
+                    if (client_disconnected(socket)) {
+                        connected = false;
+                        return false;
+                    }
+                    if (first_token) {
+                        first_token = false;
+                        std::cerr << "[request] id=" << id
+                                  << " phase=first_token choice=" << index
+                                  << " ttft_ms=" << elapsed_ms(request_started) << '\n';
+                    }
+                    if (request.json_object) return true;
                     utf8_pending.append(piece);
                     const auto complete = strata::complete_utf8_prefix(utf8_pending);
                     if (complete == std::string_view::npos) {
-                        connected = false;
-                        return;
+                        valid_utf8 = false;
+                        return false;
                     }
-                    if (complete == 0U) return;
+                    if (complete == 0U) return true;
                     piece = std::string_view(utf8_pending).substr(0U, complete);
                     std::ostringstream chunk;
                     chunk << "data: {\"id\":\"" << id << "\",\"object\":\""
@@ -528,9 +597,13 @@ private:
                     chunk << ",\"logprobs\":null,\"finish_reason\":null}]}\n\n";
                     connected = send_all(socket, chunk.str());
                     utf8_pending.erase(0U, complete);
+                    return connected;
                 };
             auto result = runtime_.generate_chat_stream(request.messages, options, callback);
             if (!result.ok()) {
+                std::cerr << "[request] id=" << id
+                          << " phase=error stage=generation error="
+                          << result.errors.front() << '\n';
                 send_all(socket, "data: " + error_json(result.errors.front(), "server_error") + "\n\n");
                 send_all(socket, "data: [DONE]\n\n");
                 return;
@@ -541,7 +614,17 @@ private:
             aggregated.decode_tokens += result.metrics.decode_tokens;
             aggregated.decode_seconds += result.metrics.decode_seconds;
             aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
-            if (!connected || !utf8_pending.empty()) {
+            returned_tokens += result.generated_token_ids.size();
+            if (!connected) {
+                std::cerr << "[request] id=" << id
+                          << " phase=cancelled stage=generation completion_tokens="
+                          << result.generated_token_ids.size()
+                          << " elapsed_ms=" << elapsed_ms(request_started) << '\n';
+                return;
+            }
+            if (!valid_utf8 || !utf8_pending.empty()) {
+                std::cerr << "[request] id=" << id
+                          << " phase=error stage=utf8\n";
                 send_all(socket, "data: " + error_json(
                     "generated text is not valid UTF-8", "server_error") + "\n\n");
                 send_all(socket, "data: [DONE]\n\n");
@@ -585,12 +668,24 @@ private:
             final << "}\n\n";
             if (!send_all(socket, final.str())) return;
         }
-        send_all(socket, "data: [DONE]\n\n");
+        if (!send_all(socket, "data: [DONE]\n\n")) {
+            std::cerr << "[request] id=" << id
+                      << " phase=cancelled stage=done_chunk elapsed_ms="
+                      << elapsed_ms(request_started) << '\n';
+            return;
+        }
+        std::cerr << "[request] id=" << id
+                  << " phase=completed status=200 prompt_tokens="
+                  << aggregated.prompt_tokens << " completion_tokens="
+                  << returned_tokens << " prefill_ms="
+                  << aggregated.prefill_seconds * 1000.0 << " decode_ms="
+                  << aggregated.decode_seconds * 1000.0 << " total_ms="
+                  << elapsed_ms(request_started) << '\n';
     }
 
     void complete(int socket, const strata::OpenAiChatRequest& request, bool chat,
+                  const std::string& id,
                   std::chrono::steady_clock::time_point request_started) {
-        const auto id = next_id(chat);
         const auto created = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         std::vector<strata::GenerationResult> results;
@@ -601,8 +696,13 @@ private:
                 ? options.sampling.seed + index
                 : static_cast<std::uint64_t>(
                     std::chrono::steady_clock::now().time_since_epoch().count()) + index;
+            std::cerr << "[request] id=" << id
+                      << " phase=generation_start choice=" << index << '\n';
             auto result = runtime_.generate_chat_stream(request.messages, options);
             if (!result.ok()) {
+                std::cerr << "[request] id=" << id
+                          << " phase=error stage=generation error="
+                          << result.errors.front() << '\n';
                 send_error(socket, 500, "Internal Server Error", result.errors.front(),
                            "server_error");
                 return;
@@ -666,7 +766,11 @@ private:
         const double overhead_ms = std::max(0.0, request_seconds - model_seconds) * 1000.0;
         const double decode_step_ms = decode_steps == 0U ? 0.0
             : decode_seconds * 1000.0 / static_cast<double>(decode_steps);
-        std::cerr << "[request] serving_overhead_ms=" << overhead_ms
+        std::cerr << "[request] id=" << id
+                  << " phase=completed status=200 prompt_tokens=" << prompt_tokens
+                  << " completion_tokens=" << completion_tokens
+                  << " total_ms=" << request_seconds * 1000.0
+                  << " serving_overhead_ms=" << overhead_ms
                   << " decode_step_ms=" << decode_step_ms
                   << " overhead_percent="
                   << (decode_step_ms == 0.0 ? 0.0 : overhead_ms * 100.0 / decode_step_ms)

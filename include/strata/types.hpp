@@ -7,7 +7,9 @@
 
 namespace strata {
 
-using TokenStreamCallback = std::function<void(std::uint32_t, std::string_view)>;
+// Return false to stop generation at the next token boundary. Applications
+// use this to release a serialized runtime when a streaming client goes away.
+using TokenStreamCallback = std::function<bool(std::uint32_t, std::string_view)>;
 
 inline constexpr std::uint32_t kMinimumQuantBits = 4;
 

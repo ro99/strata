@@ -259,7 +259,12 @@ TEST_CASE("rank-local admission rejects a per-GPU ceiling breach and names it") 
     REQUIRE(admitted.rank_cpus[0].empty());
 }
 
-TEST_CASE("rank-local admission serves the full declared context") {
+// Admission is a memory-residency decision and nothing more. It admitting a
+// context is NOT a claim that the runtime executes it: above 65,536 tokens the
+// ratio-128 layers exceed the attention kernel's 640-candidate bound and the
+// step fails, which is issue #22. Admission is deliberately left unchanged
+// here so this test keeps describing the residency contract it was written for.
+TEST_CASE("rank-local admission admits the full declared context") {
     auto request = admissible_request();
     // Well past the sparse-indexer threshold: the topology must admit the
     // indexer regime rather than cap the context.

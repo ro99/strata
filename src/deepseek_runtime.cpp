@@ -6349,6 +6349,46 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_candidates(
     const auto compressed_count = ratio == 0U ? 0U : (position + 1U) / ratio;
     const bool sparse = ratio == 4U &&
         attention_state[layer].indexer_compressor.ratio == 4U;
+    if (sparse) {
+        // Positional page indexing for the compressed stream: page index equals
+        // block-table index, assigned before any candidate is examined.
+        //
+        // The lazy first-touch numbering below cannot survive device-side
+        // selection, which does not know which blocks a candidate set will
+        // touch, let alone in what order. Making the mapping positional is what
+        // lets a device kernel resolve a selected row to a page without the
+        // host having seen the selection.
+        //
+        // The cost is leasing every block of the stream rather than only the
+        // blocks selected. At this operating point that is a handful; at the
+        // declared context it is 4,096 blocks against 512 selected, which is a
+        // real scaling term and is recorded rather than assumed away.
+        for (std::size_t index = 0U; index < compressed.size(); ++index) {
+            const auto& block = compressed[index];
+            const auto logical_row =
+                block.compression_ratio == 0U
+                    ? 0U : block.logical_begin / block.compression_ratio;
+            // Only blocks that actually hold attendable rows. The table is
+            // sized for the configured context, so without this the stream
+            // leases its whole future allocation every layer -- 32 blocks
+            // instead of 11 at this operating point.
+            if (logical_row >= compressed_count) break;
+            for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+                auto lease = kv_cache->acquire_device(
+                    active_sequence, attention_state[layer].compressor.kind,
+                    layer, logical_row, rank);
+                if (!lease.ok()) {
+                    append_errors(result, std::move(lease.errors));
+                    return result;
+                }
+                scratch.leases.push_back(std::move(lease.value));
+                scratch.pages[rank].push_back(
+                    {scratch.leases.back().buffer(), block.capacity_rows});
+            }
+            page_indices.emplace(block.id,
+                                 static_cast<std::uint32_t>(index));
+        }
+    }
     const auto compressed_width = ratio == 0U ? 0U : ratio == 4U
         ? kIndexTopK
         : ((std::max(1U, compressed_count) + 127U) / 128U) * 128U;

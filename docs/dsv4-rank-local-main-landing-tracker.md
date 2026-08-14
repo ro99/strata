@@ -363,6 +363,7 @@ Exit criteria:
 | 2026-08-13 | **Step 4 first real sparse decode** | `results/dsv4-rank-local-main-landing/step4-sparse-path/` | prompt SHA256 `0c7b142e7c24f9d1990ac98ebf11839abd141a342fd87b999bca0bbf1d9bb88f`; centralized `014aa827326144ab8c89d87409cc219773caabc93199e19d5ef675f695b035e2`; rank-local `5e64228e0dc04cba52592d5acba51b3892ecda4dba0ab462f2787239f00caa04` | closes rescue-brief defect 9 at this context: `231` CUDA index dispatches, **`0` scalar**, exactly `118,272 = 231 x 512` selected, identical answer text, zero decode checkpoint I/O on both topologies |
 | 2026-08-13 | Step 4 sequential-arm penalty | same arms | centralized `157.603`, rank-local `174.285 ms/token` at `2,685` active tokens | rank-local is `16.682 ms/token` **slower** than centralized above the threshold, and `62.788 ms` above its own queued short-context median: the measured value of moving selection inside the queued chain |
 | 2026-08-13 | Step 4 below-threshold queued control | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-below.json` | `2,014` active tokens, `0` index dispatches, steady median `109.612 ms/token` | removes the context-growth confound: the queued path is context-insensitive from ~50 to 2,014 active tokens, so about `61` of the `64.673 ms` sequential-arm gap is topology, not indexing |
+| 2026-08-14 | Step 4 Stage 2a positional page indexing | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-stage2a2.json` | token IDs and answer identical; `161.338` against Stage 1's `158.353 ms/token` | page index now equals block-table index, the precondition for device-side candidate resolution. `+2.985 ms/token` here, but the same code extrapolates to `1.11 s/token` at the declared context, so the page array must be cached across tokens before Stage 2 goes to 1M |
 | 2026-08-14 | **Step 4 Stage 1 device index-query preparation** | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-stage1.json`, `centralized-stage1.json` | rank-local `174.285` to `158.353`; centralized `157.603` to `142.777 ms/token`; **selection trace hashes identical on both** (`f14e5cde177258bd`, `d7e791756a7355d2`) | RoPE, bf16 rounding and half-up E4M3 moved onto the device in one kernel. Token IDs and answer text identical on both topologies; `231` CUDA and `0` scalar dispatches; zero decode checkpoint I/O. Removes about 172,000 host `log2`/`exp2` calls per token. **Both topologies gain about 15 ms, so the relative gap is unchanged**: rank-local is still `15.576 ms/token` slower above the threshold |
 | 2026-08-14 | Step 4 B3 E4M3 query-quantization screen | `results/dsv4-rank-local-main-landing/step4-inchain-selection/e4m3_screen.cu`, `e4m3-screen.txt` | **0 mismatches in 4,000,663 probes** on both architectures, after a first form disagreed on 32 | the backend's existing `quantize_e4m3_value` rounds ties to even and cannot serve the half-up index-query contract; and the exponent must come from `log2f`, not `frexpf`, to reproduce the reference at power-of-two boundaries |
 | 2026-08-14 | Suspected reference defect: E4M3 half-up at power-of-two boundaries | same screen | host encodes `0.0312499963` as `2^-6`, a factor-of-two error | `log2f` rounding to exactly `-5.0` sends the host into its sub-1 mantissa branch spuriously. Reproduced deliberately for exactness; **not fixed here**, since changing it silently would alter selection. Reachable at roughly `1e-5` of values. Needs its own branch and review |
@@ -1327,6 +1328,52 @@ The Stage 2 target is correspondingly restated: rank-local should reach about
 `113 ms/token` -- the `109.612` queued arm plus roughly `3.5 ms` of index work --
 which would be about `30 ms/token` **faster** than centralized at this operating
 point rather than `15.6` slower. That is the number Stage 2 has to earn.
+
+### 2026-08-14 — Stage 2a: positional page indexing works, and exposes a scaling trap
+
+Stage 2's first obstacle is not a kernel. The host assigns a candidate's page
+index lazily, in **first-touch order** over the selected rows. Device-side
+selection cannot reproduce that: it does not know which blocks a candidate set
+will touch, or in what order. The mapping has to become **positional** -- page
+index equals block-table index -- which means every attendable block must have a
+page before selection is known.
+
+That change is now in and gated. Both arms produce identical token IDs and
+identical answer text at 2,685 active tokens, so the numbering scheme is
+behaviour-preserving:
+
+```text
+lazy first-touch page indexing (Stage 1)      158.353 ms/token
+positional, leasing the whole table           167.013 ms/token   +8.660
+positional, leasing only in-use blocks        161.338 ms/token   +2.985
+```
+
+The first attempt leased every block the table held, which is sized for the
+configured context rather than the live one -- 32 blocks where 11 hold
+attendable rows. Bounding it to blocks below `compressed_count` recovers most of
+the cost.
+
+**The residual `+2.985 ms/token` does not transfer, and that is the finding.**
+It is the price of leasing all blocks rather than only selected ones, and it
+scales with the block count:
+
+```text
+implied cost per lease                              6.46 us
+blocks per indexed layer at 2,685 active              11
+blocks per indexed layer at 1,048,576 active       4,096
+naive pre-lease cost at the declared context    52.9 ms/layer, 1.11 s/token
+```
+
+A second of per-token leasing would dwarf every other term in this program. So
+positional indexing as implemented is correct but **must not be carried to the
+declared context in this form**. The page array for a layer changes only when a
+new block is appended -- once per 256 source tokens at ratio 4 -- so it has to be
+built once and reused across tokens, rebuilt only when the block count changes,
+rather than reconstructed per token per layer.
+
+That caching is now a prerequisite of Stage 2 rather than an optimization of it,
+and it was invisible at the short-context operating point where the same code
+costs three milliseconds.
 
 ### How B8 should be sequenced so it stays gateable
 

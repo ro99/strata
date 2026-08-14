@@ -288,7 +288,21 @@ context; do not advance to Step 5 under the current full-context claim.
 
 ## Step 5 — Centralized regression, landing hygiene, and merge boundary
 
-State: **IN PROGRESS — unblocked by explicit user decision on 2026-08-14**
+State: **COMPLETE — review boundary reached 2026-08-14**
+
+```text
+1  centralized bit-identity against main    PASSED    five oracles, both builds
+2  gates                                    PASSED    both builds, audit, diff --check
+3  diagnostic surface                       RESOLVED  three ledger rows closed
+4  documents match what runs                DONE      architecture, manifest, 0093
+5  promotion diff review                    DONE      no unrelated change found
+```
+
+Accepted result on the shipped code: **`110.610722 ms/token` = `9.040715
+token/s`** rank-local, against `129.416257 ms/token` centralized, both
+oracle-exact with zero decode checkpoint I/O and inside every memory ceiling.
+Supported context ceiling is **65,536 tokens** (experiment 0093, issue #22); no
+full-context claim is made anywhere in this landing.
 
 Step 4's remaining exit criterion is an end-to-end `tau(1M)`, which is not
 reachable on this machine: prefill at that context is prohibitively slow and is
@@ -432,6 +446,8 @@ Exit criteria:
 | 2026-08-14 | Step 5 promotion diff review | `git diff main...HEAD` | 72 files, `+23,201 / -548`; runtime surface 34 files, `+11,584 / -547` | **no unrelated change found.** Every peripheral edit is additive and preserves its default path: the `HostWorkerPool` CPU-list constructor is inert when the affinity list is empty; `read_slice_into` is new; the explicit VRAM budget reduces to the historical `free * fraction` product when unset; `block_table()` is retained as a wrapper over `block_table_into()`. The two non-`dsv4`-named additions in `backend.cu` are a new `download_buffer` (absent on `main`) and one kernel template. `flash_attention` is **byte-identical** between revisions — its apparent diff is displacement by inserted code, confirmed by hashing the extracted function on both. The one behavioural correction outside the rank-local mechanism is `dsv4_physical_kv_admission`, which sized compressed blocks with the sliding layout's block bytes and count; that is the Step 3 admission fix, not an unrelated change |
 
 | 2026-08-14 | **Step 5 binding acceptance, on the shipped code** | `results/dsv4-rank-local-main-landing/step5-final-acceptance-r2/summary.json` | SHA256 `90246cca7dbc06dd6f5bab74b45ddb3c221bae6d92bbc540542a457266f57b06`; rank medians `112.099790`, `110.286939`, `110.610722` ms; median `110.610722` ms = **`9.040715 token/s`**; centralized medians `128.916082`, `135.364031`, `129.416257` ms | re-run **after** the instrumentation resolution, so the accepting artifact certifies the code that lands rather than its predecessor. Strict `125.0` ms / `8.0` token/s gate **PASSES**; oracle-exact; deterministic within each topology; zero decode checkpoint I/O in all six arms; VRAM `22,419,734,528` / `22,417,637,376` B and RSS `158,346,399,744` B, all unchanged from the pre-removal matrix. Against that matrix's `111.941600` the difference is `-1.331 ms`, **inside** both matrices' own repetition spreads (`1.823` and `1.813 ms`), so **no performance change is claimed for the instrumentation resolution in either direction**. Every arm satisfied the runner's `decode_step_seconds == 31` validation, which is what proves the `--detailed-timing` gating is wired correctly |
+
+| 2026-08-14 | **Step 5 final gate set** | `build-landing` (Release, NCCL off) and `build-landing-nccl` (Release, NCCL on) | default suite `160.07 s` 2/2 pass; NCCL suite `160.65 s` 2/2 pass; `299/300` with the one declared opt-in skip; 25 rank-local/rank-shard cases and 45 rejection/fail-closed cases pass; extraction audit **PASS** 91 paths and 13/13 capabilities; `git diff --check` clean | run after the instrumentation resolution, so every gate describes the shipped code. Both build configurations are green, which also covers the default-build breakage that was a live defect earlier in this recovery |
 
 ## Temporary instrumentation ledger
 

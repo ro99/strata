@@ -24,14 +24,21 @@ per-layer attention state, candidate selection, and physical pages supplied by
 **This landing** runs the same topology on live state: live candidate
 selection, live transactional KV append, live page materialization, embedding,
 and sampling. Those terms are additional to the M3 window, so the M3 constant
-does not transfer. The landing gate is `<=125.0 ms/token` (`>=8.0 tok/s`),
-derived from the ceiling-compliant centralized baseline of `151.155686 ms/forward`
-(Experiment 0082), not carried across from `8.70 forward/s`.
+does not transfer. The strict landing target is `<=125.0 ms/token` (`>=8.0
+tok/s`), derived from the ceiling-compliant centralized baseline of
+`151.155686 ms/forward` (Experiment 0082), not carried across from `8.70
+forward/s`. The user separately approved `125 +/- 2 ms` as a review boundary:
+a median through `127.0 ms/token` may advance but is never relabelled as 8.0
+tok/s when it misses the strict target.
 
 **Stage 10** is the separate CPU gate/up, down, and weighted-reduction parity
-work. It is out of scope here. The routed CPU body remains `argmax_r` at
-`73.896784 ms` and `46.677143 GB/s`; closing the remaining distance to
-`<=100 ms/forward` is its job, re-measured at that operating point.
+work. It is out of scope here. In accepted production measurement the routed
+CPU body remains `argmax_r` at `75.895 ms/token`. The external `72.889 ms`
+callback body leaves only `3.006 ms` of navigation gap at this operating point,
+and is not equal-scope proof. The historical `11--12.4 ms` estimate came from
+the old `84.710 ms` centralized body and does not transfer after rank-local
+CPU bandwidth improved. Stage 10 cannot by itself close either the current
+`11.177 ms` short-context distance to 10 tok/s or the 1M index term.
 
 `8.70 forward/s` is a fixture-scope figure. It is never reported as end-to-end
 throughput.
@@ -371,6 +378,89 @@ It is instantiated, not assumed. At the declared operating point:
 | centralized, ceiling-compliant (0082) | `151.155686 ms` | `84.710043 ms` | `40.718794 GB/s` | `66.445643 ms` |
 | centralized, pre-cap (0081) | `149.099058 ms` | `84.171250 ms` | `40.979441 GB/s` | `64.927808 ms` |
 | rank-local, M3 fixture scope (0092) | `114.944312 ms` | `73.896784 ms` | `46.677143 GB/s` | `41.047528 ms` |
+| rank-local production, pre-correction | `126.675822 ms` | `75.895000 ms` | `45.448000 GB/s` | `51.921000 ms` |
+| rank-local production, corrected | `111.177092 ms` | `75.895000 ms` | `45.448000 GB/s` | about `35.3 ms` |
+
+The corrected row is the current binding short-context result and it meets the
+strict `<=125.0 ms` / `>=8.0 tok/s` target at `8.994659 tok/s`, so it is not a
+tolerance acceptance.
+
+### The dependent envelope is attributed, not indeterminate
+
+Experiment 0092 recorded the `argmax` *inside* the non-CPU envelope as
+indeterminate. It is no longer. One Nsight Systems capture of the accepted
+production arm, with an unprofiled control at the same shape to price the
+`+2.6%` profiler perturbation, decomposes it over ten steady tokens without any
+hot-path instrumentation:
+
+```text
+GPU kernel busy union, rank 0                   36.97 ms/token
+GPU kernel busy union, rank 1                   42.07 ms/token
+routed CPU body, as the 43 gaps before
+  dsv4_host_moe_join_mhc_kernel            81.72 / 77.13 ms/token
+page-materialization wait                   8.41 / 10.57 ms/token
+terminal head and standalone projection      2.05 /  1.95 ms/token
+remaining launch gaps                             about 6 ms/token
+```
+
+The CPU term recovered from the trace reproduces the independently measured
+`75.895 ms` body, which is what validates the gap attribution. The envelope is
+therefore **dependent GPU work serialized behind the CPU body by the layer
+chain**, not an overlap defect: within a layer, attention precedes the router,
+which precedes the routed CPU body, which precedes the join, and layer `L+1`
+depends on layer `L`.
+
+**The single-threaded-kernel defect.** The attribution located most of the
+removable time inside the GPU busy term. Three attention-preparation kernels
+were launched effectively single-threaded:
+
+```text
+dsv4_query_rank_norm      <<<1, 1>>>     240.6 us   43/token   10.345 ms/token
+dsv4_key_value_norm_rope  <<<1, 1>>>     124.8 us   43/token    5.368 ms/token
+dsv4_query_norm_rope      <<<64, 1>>>     88.2 us   43/token    3.791 ms/token
+```
+
+Together they cost more than every projection matmul on the layer
+(`dsv4_rank_bf16_matmul`, `9.27 ms/token`). This is the same shape as CAP-12's
+recorded `<<<1,1>>>` radix-merge defect, in a different path: a cost that barely
+moves with the work is a constant, and a constant that large is a defect.
+
+The declared contract pins the **order** of the FP64 accumulation, not where its
+operands are read. The corrected kernels stage the dequantize/square and the
+scale/store phases across the block and leave the ascending `__dadd_rn` chain on
+one thread reading shared memory, which is bit-identical by construction. The
+mechanism was screened standalone before any production edit — `5.92x`, zero bit
+mismatches, on two GPU architectures — and integration is exact against the
+32-token rank-local sequential oracle. Because these kernels live in
+`dsv4_prepare_attention`, which both topologies share, centralized generated IDs
+were checked and are bit-identical across all 32 tokens.
+
+**Not every narrow launch is the same defect.** Enumerating the remaining
+kernels by launch width rather than by cost gives two more candidates, and they
+resolve differently:
+
+- `dsv4_mhc_weighted_norm` (`<<<1,64>>>`, `1.442 ms/token`) is the same defect,
+  but its FP32 reduction is *already* a tree — 64 accumulators, each summing
+  four blocks in order, combined by a fixed xor pattern — so that shape is
+  itself the contract. The correction preserves the accumulator count and every
+  combination order, staging FP32 values in shared so the pinned reduction sees
+  identical operands, and widens only the elementwise phases. Screened at
+  `2.53x`, zero bit mismatches on both outputs.
+- `dsv4_mhc_mix` (`<<<1,32>>>`, `0.547 ms/token`) is **not** this defect and was
+  deliberately left alone. Its cost is a 20-iteration dependent shuffle chain
+  over 16 lanes: inherently serial normalization whose iteration order is
+  contract-bearing, and whose `6.4 us` is mostly launch and dependent-shuffle
+  latency rather than parallelizable work. Widening it cannot help.
+
+The distinction matters for reuse: the diagnosis is "a cost that does not scale
+with the work", not "a small launch geometry". A serial algorithm with a small
+launch is correctly sized; an elementwise phase with a small launch is not.
+
+The `dsv4_mhc_weighted_norm` correction's `0.8 ms/token` predicted gain is below
+the observed inter-repetition spread, and the confirming matrix measured
+`111.721523 ms/token` against the prior `111.177092 ms`. **No end-to-end change
+is claimed for it in either direction**; the standalone screen is its evidence,
+and the matrix's role is exactness and gate confirmation.
 
 The routed CPU body is `argmax_r` in every arm, over an exact
 `3,449,290,752 B/forward` payload. The rank-local topology improves it by
@@ -456,10 +546,10 @@ Binding for any performance claim about this topology.
   report.
 
 The reusable template is 0081's three fresh controls and 0082's binding matrix.
-This landing's own gate — `<=125.0 ms/token`, `>=8.0 tok/s` — was re-derived
-from the ceiling-compliant centralized baseline rather than carried across from
-M3's `8.70 forward/s` fixture figure, which is the discipline above applied to
-itself.
+This landing's strict target — `<=125.0 ms/token`, `>=8.0 tok/s` — was
+re-derived from the ceiling-compliant centralized baseline rather than carried
+across from M3's `8.70 forward/s` fixture figure. The separate `<=127.0 ms`
+review boundary is reported as tolerance acceptance, never as strict 8 tok/s.
 
 
 ## Long context: 1M tokens with the same decode budget
@@ -467,7 +557,11 @@ itself.
 Long context is a fundamental requirement, not an extension: a topology that
 reaches its throughput gate only at a short context has not produced a usable
 model. The relevant question is therefore whether `tau` holds at the model's
-declared 1,048,576-token context, and it does, for a structural reason.
+declared 1,048,576-token context and whether its exact residency fits. The
+residency now fits under enforced admission; end-to-end `tau(1M)` remains
+unmeasured because the original Step 4 sharding mechanism was falsified by the
+component lower bound below. Short-context acceptance is not full-context
+support.
 
 ### Measured admission plan
 
@@ -484,6 +578,23 @@ Host residency at 1M is `163.25 GB` against the `231,928,233,984 B` ceiling, so
 the host side is not the constraint. `index_state_bytes` is zero at 256 because
 the sparse indexer only engages above `index_topk * ratio = 2048` active tokens.
 
+The 1M `kv_state_bytes` value is the complete host admission account, not the
+CUDA payload promoted to each rank. Its exact decomposition is:
+
+| physical KV term | bytes |
+|---|---:|
+| promoted CUDA payload (sliding + compressed + learned index) | `4,050,137,088` |
+| host block metadata | `16,258,432` |
+| host block alignment | `3,932,160` |
+| host physical block cache | `4,070,327,680` |
+| compressor and index-compressor state | `12,206,080` |
+| complete host `kv_state_bytes` | `4,082,533,760` |
+
+Rank-local physical pages are one logical stream replicated on both GPUs, so
+each device is admitted for the full `4,050,137,088`-byte promoted payload.
+Neither the host metadata/alignment nor the compressor's host state is charged
+again as CUDA page payload.
+
 ### Why `tau` is nearly context-independent
 
 The bottleneck term does not grow at all. The routed CPU MoE body moves
@@ -492,8 +603,9 @@ not of `L`. It is `argmax_r` at short context.
 
 Two terms *do* grow, and an earlier revision of this document was wrong about
 both. It claimed attention was "bounded by construction" at `640` rows per
-layer and bracketed the indexer at `0.8-5.3 ms/token`. Measurement put the
-indexer at `66.3 ms/token`, twelve to eighty times the bracket, and the
+layer and bracketed the indexer at `0.8-5.3 ms/token`. The corrected
+production-page measurement puts the indexer at `68.482 ms/token`, thirteen
+to eighty-six times the bracket, and the
 boundedness claim holds for only half the layers.
 
 **Attention is bounded on the ratio-4 layers only.** `compression_ratios`
@@ -511,54 +623,134 @@ candidates to select its top `512`: at 1M, `262,144` candidates per layer over
 the 21 ratio-4 layers. `strata-dsv4-index-probe` on one 3090:
 
 ```text
-context    candidates   ms/indexed layer   ms/token (21 layers)
-    4,096       1,024              0.264                  5.546
-   65,536      16,384              0.429                  9.003
-  262,144      65,536              0.975                 20.473
-1,048,576     262,144              3.158                 66.310
+                          baseline                  corrected
+context    candidates   ms/layer   ms/token     ms/layer   ms/token
+    4,096       1,024     0.268      5.619        0.165      3.463
+   65,536      16,384     0.433      9.083        0.250      5.241
+  262,144      65,536     0.996     20.910        0.519     10.892
+1,048,576     262,144     3.261     68.482        1.623     34.092
 ```
 
-Substituting the measurement for the bracket:
+The corrected column is `2.01x` at the 1M operating point and comes from two
+exact kernel corrections, each screened before integration and each verified
+against the scalar oracle at the full 262,144-candidate width:
+
+- **Scoring, `2.15x`.** The kernel was not bound by what it looked bound by. A
+  deliberately incorrect query-address-collapse variant priced query re-read
+  traffic at only `32%` of the kernel, falsifying the L2-bound reading; the
+  residual was a latency-hiding defect, issuing at about `0.28` instructions per
+  cycle at full occupancy because each thread carried a single dependent
+  `__fadd_rn` chain fed by one load. Scoring four rows per thread gives
+  independent chains and amortizes the query load. Exactness holds because every
+  accumulator still walks columns in ascending order; only which thread computes
+  a row changed.
+- **Radix pivot, `3.01x`.** Bin counts are integers, so the sums are
+  order-independent and only access patterns were in question. The group scan
+  read one uint32 per thread at 256 B stride, costing `8x` read amplification,
+  and now reads 16 `uint4` per group. The final walk ran up to 64 dependent
+  *global* loads on one thread and now stages its 64 bins coalesced into shared.
+
+A caution worth carrying: the `uint4` read requires 16 B alignment, and the
+histogram workspace region was reserved at `alignof(std::uint32_t)`. The
+resulting misaligned vector loads left a sticky CUDA error that failed 21 tests
+from one root cause, including a *valid* request being rejected — a symptom far
+from its cause. A vector load added to a kernel silently inherits whatever
+alignment its allocator happened to give it.
+
+Substituting the measurement into the accepted landing runtime gives the
+navigation lower bound:
 
 ```text
-tau(1M)  ~=  73.897 ms   routed CPU MoE      (context-independent)
-           + 41.048 ms   non-CPU envelope    (M3; orchestration, mHC, NCCL)
-           + 66.310 ms   indexer scoring     (measured, replicated per rank)
-           = 181.3 ms  ->  5.5 tok/s
+corrected short-context production      111.177092 ms/token
+corrected replicated 1M indexer          34.092000 ms/token
+unchanged-chain navigation total        145.269092 ms/token
 ```
 
-**This misses the gate.** `125.0 ms/token` is the 8 tok/s budget and the
-indexer alone is `53%` of it. The term is not additive-by-nature — it is GPU
-work and the MoE body is CPU work — but the layer chain is dependent, so no
-overlap is available without speculation, and the M3 envelope was measured as
-serial terms rather than overlapped ones.
+The permitted complete index budget, derived from the corrected short path
+rather than assumed, is `127.000000 - 111.177092 = 15.822908 ms/token` at the
+review ceiling, or `13.822908 ms/token` against the strict target. A single
+replicated indexer therefore still does not fit, and candidate sharding is
+required rather than optional. With scoring halved across the two ranks and the
+fixed-cost terms unchanged:
 
-The identified mitigation is to **shard index scoring across the two ranks**
-rather than replicating it. If a candidate belongs to the global top `512` it
-necessarily belongs to its own rank's local top `512`, so each rank scoring
-half the candidates and exchanging local winners yields the exact same
-selection: `1,024` candidates to merge, an `8 KB` exchange. That halves the
-term to roughly `33 ms/token` and preserves the agreement invariant, because
-both ranks then merge the same union. It is arithmetic, not a measurement, and
-it is not yet built. Stage 6 must measure `tau(1M)` end to end rather than
-inferring it from these components.
+```text
+scoring / 2                                  13.940000 ms/token
+pivot, fixed at 65,536 bins per rank          0.990000 ms/token
+histogram and remaining select, halved        1.250000 ms/token
+outside (host launch and synchronization)     2.730000 ms/token
+                                            ---------------------
+sharded index projection                     18.910000 ms/token
+corrected short path                        111.177092 ms/token
+projected tau(1M)                           130.087092 ms/token
+review ceiling                              127.000000 ms/token
+remaining gap                                 3.087092 ms/token
+```
+
+The gap stood at `29.66 ms/token` when this landing was handed over. The largest
+named remaining term is the `2.73 ms/token` of host launch and synchronization,
+which the full-context design must remove in any case by moving selection inside
+the queued chain.
+
+This remains a **projection, not a measurement**. The exchange, the
+deterministic merge, the ratio-128 dense attention growth and the linear host
+`locate()` are unmeasured and are charged nowhere in it. No 1M throughput claim
+follows from these component figures, and none is made.
+
+Two further 1M terms remain **unmeasured and are not charged above**: the
+ratio-128 dense attention growth to `8,192` rows across 20 layers, and
+`physical_paged_attention`'s host `locate()`, which is linear per candidate.
+
+**This misses both gates.** `125.0 ms/token` is the strict 8 tok/s budget and
+`127.0 ms/token` is the explicit review ceiling. The index query is produced
+by the preceding dependent state and must select positions before that layer's
+attention, so this work cannot be moved under the same layer's later routed
+CPU body without speculation.
+
+Candidate sharding is exact in principle: a global top-512 candidate must be
+inside its owning rank's local top 512, so exchanging the two local sets and
+merging their 1,024 entries reproduces the scalar result. It is not sufficient
+in this runtime. Nsight measures the 1M exact score kernel at `2.855265
+ms/indexed layer`, or `59.960565 ms/token`; even perfect 2x score sharding with
+free local selection, free exchange, and free merge leaves `29.980283
+ms/token`. Added to the then-accepted `126.675822 ms/token` short path, that was
+a strict lower bound of `156.656105 ms/token`, which falsified the original
+sharding design before integration. That rejection stands on its own terms and
+is not relabelled: sharding the *current* scorer is still not sufficient. On the
+corrected `111.177092 ms/token` short path the same ideal shard gives
+`141.157375 ms/token`, still above both gates.
+
+The decisive bound is independent of the scorer entirely. The index's
+non-scoring residue is about `8.52 ms/token`, so **even a free scorer** leaves
+`111.177092 + 8.52 = 119.70 ms/token` — inside the review ceiling but only
+because the short path was corrected first; against the pre-correction path the
+same arithmetic gave `135.20 ms/token` and no scorer work of any size could have
+passed. This is why the short-path correction had to precede any index work, and
+why the two savings are reported as a joint requirement rather than stacked.
 
 ### Device residency at 1M
 
-Replicated on both GPUs, the rank-local decode set is:
+The production admission arm measures rank-specific weights and the initial
+CUDA baseline rather than applying an aggregate spine value to both devices.
+The controlling 1M component ledger is:
 
-```text
-rank-local sharded weights      8,190,558,208 B
-KV and index state              4,082,533,760 B
-fixed workspace reserve           536,870,912 B
-NCCL and head buffers          ~     84,000,000 B
-                              -----------------
-                               12,893,962,880 B   against 21,287,272,448 B
-```
+| per-device term | rank 0 bytes | rank 1 bytes |
+|---|---:|---:|
+| initial CUDA/device usage | `290,586,624` | `290,586,624` |
+| measured rank-local weights | `8,283,797,760` | `7,675,623,680` |
+| centralized pinned spine plus resident mHC | `4,209,838,496` | `4,995,026,432` |
+| fixed workspace reserve | `268,435,456` | `268,435,456` |
+| replicated KV/index CUDA payload capacity | `4,050,137,088` | `4,050,137,088` |
+| NCCL and terminal-head reserve | `83,886,080` | `83,886,080` |
+| admitted centralized expert cache | `5,361,896,800` | `5,184,882,944` |
+| admitted total | `22,548,578,304` | `22,548,578,304` |
 
-Adding the centralized prefill spine's `9,204,991,520 B` gives
-`22,098,954,400 B`, which experiment 0082's `21,287,272,448 B` gate refused by
-about `0.76 GiB`.
+The cache cap is applied to the live centralized prefill cache and is also
+bounded by the CUDA weight-arena suballocation left after the rank-local store.
+The one-step 1M-capacity arm uses only `7,213,568` bytes of KV payload per rank
+because pages are lazily committed; its final observed VRAM is
+`18,397,396,992` bytes/device. That lower instantaneous number is not treated
+as full-context physical residency. The admitted total is the binding capacity
+contract, and Step 4 must fill and execute the long-context access pattern.
 
 That gate was the **observed peak** of the centralized baseline, recorded as a
 regression tripwire. It was never a hardware bound, and rank-local decode is
@@ -580,7 +772,7 @@ instead of replicating it — would reintroduce a cross-rank fetch on the decode
 path and is rejected for that reason.
 
 Because the attended `512` compressed rows are data-dependent and scattered
-across the full `4.08 GB` compressed set, that whole set must be device-resident;
+across the full `4.05 GB` device payload, that whole set must be device-resident;
 demand-paging it over PCIe would cost far more than the entire step budget.
 
 ### Selection is device work, and why it has to be

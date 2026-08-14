@@ -11,7 +11,7 @@ everything below.
 ## 1. The repository and its rules
 
 `/home/rodrigo/Developer/strata` — a ground-up, dependency-light C/C++ inference
-engine for dense and MoE models larger than local VRAM. Read `CLAUDE.md` first;
+engine for dense and MoE models larger than local VRAM. Read `AGENTS.md` first;
 it is a binding research charter, not style guidance. The rules that matter most
 here:
 

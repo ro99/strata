@@ -1740,6 +1740,8 @@ signal. It is recorded here because the mistake was mine and the shape of the
 error — a non-monotone cell in a term that must be monotone — is the cheapest
 way to catch it.
 
+Tracked as [issue #22](https://github.com/ro99/strata/issues/22).
+
 **The finding is the last three rows, not the first five.** `dsv4_paged_attention`
 and `dsv4_paged_attention_to_mhc` both validate `candidates > 640U` as invalid
 (`backend.cu:7545` and `backend.cu:9278`). A ratio-128 layer exceeds 640
@@ -1841,6 +1843,13 @@ and resolving it is a kernel design task — tiled or multi-pass dense attention
 over an unbounded compressed history with an online softmax — not a tuning
 task. Until then the honest description of this branch is a supported context
 ceiling of 65,536 tokens, not 1,048,576.
+
+Tracked as [issue #22](https://github.com/ro99/strata/issues/22), which carries
+the measured sweep, the reproduction command, the proposed kernel shape and its
+exactness bar, and the reason prefill work does not unblock it. **This does not
+block Step 5**, by explicit user decision on 2026-08-14: end-to-end `tau(1M)`
+is not reachable on this box until prefill throughput is addressed separately,
+so Step 5 proceeds against the 65,536-token supported ceiling.
 
 ### The two open questions, both about 1M and both measurable
 

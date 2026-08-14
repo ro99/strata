@@ -36,6 +36,17 @@ struct RuntimeConfig {
     bool enable_flash_attention{};
     bool enable_incremental_kv_continuation{true};
     bool deepseek_block_kv_cache{};
+    // The DeepSeek device-resident decode contract: physical KV pages,
+    // device-resident mHC, CUDA attention, the scalar lightning indexer, and
+    // routed experts in the two NUMA-local CPU shards. It is a bundle rather
+    // than a knob, so setting it overrides the individual switches above
+    // exactly as strata-deepseek-run's --device-resident-runtime does.
+    bool deepseek_device_resident_runtime{};
+    // Rank-local TP2 decode. Opt-in, admitted fail-closed before the
+    // checkpoint is opened, and never falling back once admitted. Requires an
+    // NCCL build and exactly two devices, and implies the device-resident
+    // contract above.
+    bool deepseek_rank_local_decode{};
     bool pin_resident_arena{};
     bool prepack_mhc_projection{true};
     // Placement plan cache. An empty directory selects the default location;

@@ -34,6 +34,8 @@ struct Options {
     bool flash_attention{};
     bool incremental_kv_continuation{true};
     bool block_kv_cache{};
+    bool device_resident_runtime{};
+    bool rank_local_decode{};
     bool pin_resident_arena{};
     bool prepack_mhc{true};
     bool jsonl_protocol{};
@@ -104,6 +106,8 @@ void usage() {
         << "                    [--no-prepack-mhc]\n"
         << "                    [--protocol jsonl]\n"
         << "                    [--prompt TEXT]\n\n"
+        << "deepseek decode:    [--device-resident-runtime]\n"
+        << "                    [--decode-topology centralized|rank-local-tp2]\n\n"
         << "placement:          [--dry-run] [--replan]\n"
         << "                    [--plan-cache DIR] [--no-plan-cache]\n\n"
         << "sampler:            [--preset precise|balanced|creative|future-entropy]\n"
@@ -129,6 +133,23 @@ void usage() {
         << "one. --alpha crossfades from -1 (ordinary sampling, the stage is\n"
         << "a no-op) to +1 (future entropy alone). Pair it with --min-p 0.05\n"
         << "or higher; entropy favours broken word-fragments otherwise.\n\n"
+        << "--device-resident-runtime is the DeepSeek device-resident decode\n"
+        << "contract as a whole: physical KV pages, device-resident mHC, CUDA\n"
+        << "attention, the scalar lightning indexer, and routed experts in the\n"
+        << "two NUMA-local CPU shards. It overrides the individual cache and\n"
+        << "attention flags rather than combining with them.\n\n"
+        << "--decode-topology rank-local-tp2 adds rank-local decode on top of\n"
+        << "that contract, and needs a build with NCCL and exactly two devices.\n"
+        << "It is admitted fail-closed before the checkpoint is opened and never\n"
+        << "falls back once admitted. It supports at most 65,536 context tokens:\n"
+        << "above that the ratio-128 layers exceed the attention kernel's\n"
+        << "candidate bound and the step fails (issue #22). Both flags are\n"
+        << "DeepSeek-only and are rejected by every other --model-type.\n\n"
+        << "Each topology is deterministic and exact against its own oracle,\n"
+        << "but they are not token-identical to each other: rank-local reduces\n"
+        << "in a different order, so greedy decode can pick a different token\n"
+        << "a dozen steps in and the wording diverges from there. Switching\n"
+        << "topology mid-project changes the text, not just the speed.\n\n"
         << "Without --prompt, read one question per line until EOF.\n"
         << "The jsonl protocol reads prompt text and an optional messages array.\n\n"
         << "--dry-run sizes every component against this machine, prints where\n"
@@ -157,6 +178,17 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--block-kv-cache") {
             options.block_kv_cache = true;
+            options.device_resident_runtime = false;
+            continue;
+        }
+        if (argument == "--device-resident-runtime") {
+            options.block_kv_cache = true;
+            options.device_resident_runtime = true;
+            // Implications of the contract, applied here so the hello event
+            // reports what will actually run. The runtime enforces them again
+            // for embedders that never pass through this parser.
+            options.flash_attention = true;
+            options.prepack_mhc = false;
             continue;
         }
         if (argument == "--pin-resident-arena") {
@@ -185,6 +217,26 @@ bool parse_options(int argc, char** argv, Options& options) {
         else if (argument == "--model-type") options.model_type = std::string(next());
         else if (argument == "--prompt") options.prompt = std::string(next());
         else if (argument == "--plan-cache") options.plan_cache = std::string(next());
+        else if (argument == "--decode-topology") {
+            const auto topology = next();
+            if (topology == "centralized") {
+                options.rank_local_decode = false;
+            } else if (topology == "rank-local-tp2") {
+                // Rank-local decode is a decode-shaped ownership of the same
+                // weights the device-resident contract places; it does not
+                // replace prefill, which stays centralized. Everything that
+                // contract requires is required here too, so the opt-in
+                // implies it rather than silently running rank-local against
+                // a scalar cache.
+                options.rank_local_decode = true;
+                options.block_kv_cache = true;
+                options.device_resident_runtime = true;
+                options.flash_attention = true;
+                options.prepack_mhc = false;
+            } else {
+                return false;
+            }
+        }
         else if (argument == "--context-size" || argument == "--max-context") {
             if (!strata::cli::parse_positive_u32(next(), options.context_size)) return false;
         } else if (argument == "--max-new") {
@@ -635,6 +687,11 @@ int main(int argc, char** argv) {
                << (options.incremental_kv_continuation ? "true" : "false")
                << ",\"block_kv_cache\":"
                << (options.block_kv_cache ? "true" : "false")
+               << ",\"device_resident_runtime\":"
+               << (options.device_resident_runtime ? "true" : "false")
+               << ",\"decode_topology\":\""
+               << (options.rank_local_decode ? "rank-local-tp2" : "centralized")
+               << '"'
                << ",\"pin_resident_arena\":"
                << (options.pin_resident_arena ? "true" : "false")
                << ",\"prepack_mhc\":"
@@ -666,6 +723,8 @@ int main(int argc, char** argv) {
     config.enable_incremental_kv_continuation =
         options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;
+    config.deepseek_device_resident_runtime = options.device_resident_runtime;
+    config.deepseek_rank_local_decode = options.rank_local_decode;
     config.pin_resident_arena = options.pin_resident_arena;
     config.prepack_mhc_projection = options.prepack_mhc;
     config.placement_cache_directory = options.plan_cache;

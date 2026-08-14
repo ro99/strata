@@ -1,6 +1,7 @@
 #include "strata/runtime.hpp"
 
 #include "strata/deepseek_runtime.hpp"
+#include "strata/dsv4_attention_kv.hpp"
 #include "strata/gemma4_runtime.hpp"
 #include "strata/glm_runtime.hpp"
 #include "strata/inkling_runtime.hpp"
@@ -10,6 +11,7 @@
 #include <array>
 #include <algorithm>
 #include <iostream>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -38,6 +40,20 @@ namespace {
     return PlacementModel::Gemma4;
 }
 
+// Names the DeepSeek-only switch a request carries, or nullptr if it carries
+// none. Every other runtime rejects on it rather than ignoring it: a request
+// for rank-local decode that quietly runs a centralized GLM would report the
+// accepted path while executing a different one.
+[[nodiscard]] const char* deepseek_only_control(
+    const RuntimeConfig& config) noexcept {
+    if (config.deepseek_rank_local_decode) return "rank-local decode";
+    if (config.deepseek_device_resident_runtime) {
+        return "device-resident runtime";
+    }
+    if (config.deepseek_block_kv_cache) return "block KV cache";
+    return nullptr;
+}
+
 }  // namespace
 
 PlacementRequest placement_request_for(const std::string& model_directory,
@@ -48,8 +64,15 @@ PlacementRequest placement_request_for(const std::string& model_directory,
     request.devices = config.devices;
     request.vram_cache_fraction = config.vram_cache_fraction;
     request.maximum_context_tokens = config.maximum_context_tokens;
-    request.flash_attention = config.enable_flash_attention;
-    request.block_kv_cache = config.deepseek_block_kv_cache;
+    // The device-resident contract implies both of these, so the plan reports
+    // the layout the runtime will actually build rather than the one the bare
+    // flags describe. A request cannot express physical KV pages, so for that
+    // mode the plan still sizes the compact cache; it is advisory for DeepSeek
+    // and the runtime admits the physical geometry itself.
+    request.flash_attention = config.enable_flash_attention ||
+                              config.deepseek_device_resident_runtime;
+    request.block_kv_cache = config.deepseek_block_kv_cache ||
+                             config.deepseek_device_resident_runtime;
     return request;
 }
 
@@ -112,9 +135,10 @@ ValidationResult RuntimeSession::initialize(
         impl_->placement_ready ? &impl_->placement : nullptr;
 
     if (config.model == RuntimeModel::Glm52) {
-        if (config.deepseek_block_kv_cache) {
+        if (const auto* control = deepseek_only_control(config)) {
             result.errors.emplace_back(
-                "DeepSeek block KV cache cannot be used by the GLM runtime");
+                std::string("DeepSeek ") + control +
+                " cannot be used by the GLM runtime");
             return result;
         }
         Glm52Runtime runtime;
@@ -134,9 +158,10 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     if (config.model == RuntimeModel::KimiK3) {
-        if (config.deepseek_block_kv_cache) {
+        if (const auto* control = deepseek_only_control(config)) {
             result.errors.emplace_back(
-                "DeepSeek block KV cache cannot be used by the Kimi-K3 runtime");
+                std::string("DeepSeek ") + control +
+                " cannot be used by the Kimi-K3 runtime");
             return result;
         }
         KimiK3Runtime runtime;
@@ -152,9 +177,10 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     if (config.model == RuntimeModel::Gemma4) {
-        if (config.deepseek_block_kv_cache) {
+        if (const auto* control = deepseek_only_control(config)) {
             result.errors.emplace_back(
-                "DeepSeek block KV cache cannot be used by the Gemma 4 runtime");
+                std::string("DeepSeek ") + control +
+                " cannot be used by the Gemma 4 runtime");
             return result;
         }
         Gemma4Runtime runtime;
@@ -175,9 +201,10 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     if (config.model == RuntimeModel::Inkling) {
-        if (config.deepseek_block_kv_cache) {
+        if (const auto* control = deepseek_only_control(config)) {
             result.errors.emplace_back(
-                "DeepSeek block KV cache cannot be used by the Inkling runtime");
+                std::string("DeepSeek ") + control +
+                " cannot be used by the Inkling runtime");
             return result;
         }
         InklingRuntime runtime;
@@ -192,9 +219,10 @@ ValidationResult RuntimeSession::initialize(
         return result;
     }
     if (config.model == RuntimeModel::Laguna) {
-        if (config.deepseek_block_kv_cache) {
+        if (const auto* control = deepseek_only_control(config)) {
             result.errors.emplace_back(
-                "DeepSeek block KV cache cannot be used by the Laguna runtime");
+                std::string("DeepSeek ") + control +
+                " cannot be used by the Laguna runtime");
             return result;
         }
         LagunaRuntime runtime;
@@ -226,8 +254,26 @@ ValidationResult RuntimeSession::initialize(
         config.enable_incremental_kv_continuation;
     concrete.pin_resident_arena = config.pin_resident_arena;
     concrete.prepack_mhc_projection = config.prepack_mhc_projection;
-    concrete.kv_cache_mode = config.deepseek_block_kv_cache
-        ? Dsv4KvCacheMode::Block : Dsv4KvCacheMode::ScalarOracle;
+    concrete.kv_cache_mode = config.deepseek_device_resident_runtime
+        ? Dsv4KvCacheMode::PhysicalDevice
+        : config.deepseek_block_kv_cache ? Dsv4KvCacheMode::Block
+                                         : Dsv4KvCacheMode::ScalarOracle;
+    concrete.kv_block_rows = config.deepseek_device_resident_runtime
+        ? kDsv4PhysicalKvBlockRows : kDsv4KvBlockRows;
+    if (config.deepseek_device_resident_runtime) {
+        // The device-resident decode contract is a bundle, not a knob. Leaving
+        // any member of it to the caller lets a run report the accepted
+        // attention/mHC path while executing routed experts somewhere else,
+        // which is what made this opt-in rather than a default. These are the
+        // same implications strata-deepseek-run applies to the flag.
+        concrete.enable_flash_attention = true;
+        concrete.enable_gpu_lightning_indexer = false;
+        concrete.enable_host_routed_moe = true;
+        concrete.prepack_mhc_projection = false;
+    }
+    concrete.decode_topology = config.deepseek_rank_local_decode
+        ? Dsv4DecodeTopology::RankLocalTp2
+        : Dsv4DecodeTopology::Centralized;
     result = runtime.initialize(model_directory, concrete);
     if (result.ok()) impl_->runtime.emplace<DeepSeekV4Runtime>(std::move(runtime));
     return result;

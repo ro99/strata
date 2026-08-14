@@ -1616,17 +1616,6 @@ struct DeepSeekV4Runtime::Impl {
     // recomputed on the device so the two agree bit for bit.
     std::vector<float> index_rope_cosines;
     std::vector<float> index_rope_sines;
-    // Positional block table for the layer whose candidates are resolved on
-    // the device. Process-lifetime for the same reason the tables above are.
-    std::vector<CudaDsv4KvBlockDescriptor> physical_index_descriptors;
-    // The last selection left on a device by index_select(), and the layer and
-    // position it belongs to. The backend's workspace holds one selection per
-    // device, so a consumer must name the exact layer and position it expects;
-    // anything else falls back to the host-built candidate list.
-    CudaDsv4DeviceIndexSelection index_selection{};
-    std::uint32_t index_selection_layer{};
-    std::uint32_t index_selection_position{};
-    bool index_selection_valid{};
     std::array<HostMoeContext, kLayers> host_moe_contexts{};
     std::uint32_t host_moe_pending{};
     std::uint64_t host_moe_routed_cpu_before{};
@@ -2869,8 +2858,6 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
         ++diagnostics.index_selection_count;
     };
     const auto& state = attention_state[layer].indexer_compressor;
-    index_selection = {};
-    index_selection_valid = false;
     if (state.ratio == 0U) {
         result.errors.emplace_back(
             "DeepSeek sparse indexer was not admitted for a long context");
@@ -3046,21 +3033,9 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
         request.heads = kIndexHeads;
         request.head_dim = kIndexHeadDim;
         request.top_k = kIndexTopK;
-        // The device selection is kept alongside the download so the attention
-        // command can resolve its own candidates from it. The download is what
-        // the queued chain must eventually drop; keeping both here is what lets
-        // the resolution be gated against a known-good host-built candidate
-        // list before that happens.
         result = cuda.dsv4_physical_lightning_index(
-            devices[slot], request, selected, &index_selection);
-        if (result.ok()) {
-            index_selection_layer = layer;
-            index_selection_position = position;
-            index_selection_valid = index_selection.positions != nullptr;
-        }
+            devices[slot], request, selected);
         if (!result.ok()) {
-            index_selection = {};
-            index_selection_valid = false;
             selected.clear();
             return result;
         }
@@ -3574,44 +3549,6 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         ? 0U : (position + 1U) / ratio;
     const bool sparse = ratio == 4U &&
         attention_state[layer].indexer_compressor.ratio == 4U;
-    // Device-resolved selection: the page index is the block-table index, and
-    // every attendable block owns its slot before any candidate is known.
-    //
-    // First-touch leasing is not available here and this is the reason. The
-    // host numbers and leases a page when a selected row first names it; a
-    // selection the host never sees has no first touch, so every attendable
-    // block must carry a live page or the command would name an empty slot.
-    // At this context that is 11 blocks per indexed layer. The cost of holding
-    // that at the declared context is an open question recorded with the step.
-    const bool resolve_on_device = sparse && index_selection_valid &&
-        index_selection_layer == layer && index_selection_position == position;
-    if (resolve_on_device) {
-        std::uint32_t attendable_blocks = 0U;
-        for (const auto& block : compressed) {
-            const auto first_row = block.compression_ratio == 0U
-                ? 0U : block.logical_begin / block.compression_ratio;
-            if (first_row >= compressed_count) break;
-            ++attendable_blocks;
-        }
-        physical_index_descriptors.clear();
-        for (std::uint32_t index = 0U; index < attendable_blocks; ++index) {
-            const auto& block = compressed[index];
-            auto lease = kv_cache->acquire_device(
-                active_sequence, attention_state[layer].compressor.kind, layer,
-                static_cast<std::uint32_t>(block.logical_begin /
-                                           block.compression_ratio),
-                slot);
-            if (!lease.ok()) {
-                append_errors(result, std::move(lease.errors));
-                return result;
-            }
-            leases.push_back(std::move(lease.value));
-            pages.push_back({leases.back().buffer(), block.capacity_rows});
-            page_indices.emplace(block.id, index);
-            physical_index_descriptors.push_back(CudaDsv4KvBlockDescriptor{
-                block.logical_begin, block.used_rows, block.compression_ratio});
-        }
-    }
     const auto compressed_width = ratio == 0U ? 0U : ratio == 4U
         ? kIndexTopK
         : ((std::max(1U, compressed_count) + 127U) / 128U) * 128U;
@@ -3626,16 +3563,11 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
             "DeepSeek physical attention compressed candidates exceed their fixed region");
         return result;
     }
-    // The compressed region is filled by the resolution kernel when it runs;
-    // its host entries would be ignored, and building them would defeat the
-    // point of not having the selection on the host.
-    if (!resolve_on_device) {
-        for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
-            const auto logical_row = sparse ? indexed_positions[item] : item;
-            locate(attention_state[layer].compressor.kind, compressed,
-                   logical_row, candidates[item]);
-            if (!result.ok()) return result;
-        }
+    for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
+        const auto logical_row = sparse ? indexed_positions[item] : item;
+        locate(attention_state[layer].compressor.kind, compressed,
+               logical_row, candidates[item]);
+        if (!result.ok()) return result;
     }
     const auto window_count = std::min(position + 1U, kWindow);
     for (std::uint32_t item = 0U; item < window_count; ++item) {
@@ -3666,17 +3598,10 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         sines[index] = std::sin(angle);
     }
     CudaDsv4PagedAttentionMhcRequest request;
-    CudaDsv4DeviceCandidateResolution resolution;
     request.attention.queries = queries;
     request.attention.head_sinks = sinks;
     request.attention.pages = pages;
     request.attention.candidates = candidates;
-    if (resolve_on_device) {
-        resolution.selection = index_selection;
-        resolution.blocks = physical_index_descriptors;
-        resolution.compressed_width = compressed_width;
-        request.attention.resolution = &resolution;
-    }
     request.attention.scale = kAttentionScale;
     request.attention.maximum_workspace_bytes = 4ULL << 20U;
     request.inverse_rope_cosines = cosines;
@@ -6197,9 +6122,21 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
     // driver, because selection needed the query rank on the host and the only
     // host node available is inside a CUDA callback, where a CUDA call is not
     // permitted. With projection, scoring, selection and candidate resolution
-    // all enqueued in the layer's own command sequence, there is nothing left
-    // that the chain cannot express.
-    const bool queued = true;
+    // all enqueued in the layer's own command sequence, that is no longer true
+    // of an indexed layer that actually selects.
+    //
+    // One narrow band remains sequential: an admitted indexer whose compressed
+    // history has not yet passed its own top-k, where every compressed row is
+    // attended and no selection runs at all. It is reachable only between an
+    // admitted context above 2,048 tokens and a decode position below 2,052,
+    // and it is left on the path that has been measured rather than moved onto
+    // one that has not.
+    const bool queued = std::none_of(
+        attention_state.begin(), attention_state.end(),
+        [position](const AttentionState& state) {
+            const auto ratio = state.indexer_compressor.ratio;
+            return ratio != 0U && (position + 1U) / ratio <= kIndexTopK;
+        });
     if (queued) {
         // Finish every host-side reservation and cache lookup before a CUDA host
         // node can start. Besides keeping all borrowed views stable, this avoids

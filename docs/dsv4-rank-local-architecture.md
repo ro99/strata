@@ -176,22 +176,45 @@ attention for any position without a cross-rank KV fetch on the decode path.
 5. Commit host-visible KV metadata **only after** both ranks' data and status
    collectives have succeeded.
 
-Step 2 is one host-visible preparation per layer, not per rank. The rank-local
-weight set carries no compressor weights and the executor's own preparation
-computes no compressor projection, so the query rank, the key/value row and
-both compressor projections come from a single `dsv4_prepare_attention` on the
-slot that owns the centralized compressor weights. The result is replicated by
-construction; computing it on each rank could only agree or diverge, and the
-second outcome is a silent replica fault. The row is then encoded once and
-written to each rank's device page with `update_buffer`, which keeps the
-executor's own preparation device-only and costs no host synchronization.
+Step 2 is one canonical row per layer, not one per rank. The compressor is
+resident on rank 0 alone — it is one logical replicated KV stream, and a second
+copy would add about 0.6 GiB without reducing the binding CPU term — so rank 0
+owns the compressor and index-compressor projections, advances the state in its
+page callback, encodes the row once, and publishes the identical bytes to both
+ranks' device pages. Rank 1 waits on rank 0's page-ready event and uploads
+those bytes; it computes no compressor projection and performs no host
+callback. Computing the row on each rank could only agree or diverge, and the
+second outcome is a silent replica fault.
 
-Step 3 sits between the preparation and the layer call rather than inside it.
-`Dsv4RankLocalLayerCall` takes candidates as an input, but sparse selection
-needs this layer's query rank, which only exists once preparation has run. This
-is the same constraint that makes the queued 43-layer chain a short-context
-mode: a chain cannot select candidates for a layer whose query it has not yet
-computed.
+Anything rank 1 needs that used to arrive as a side effect of a compressor
+projection now has to be asked for explicitly. The expanded BF16 layer input is
+the case in point: the index weight projection reads it, and rank 1 selects, so
+the preparation publishes it on request.
+
+Step 3 is part of the layer's own command sequence. `Dsv4RankLocalLayerCall`
+still takes candidates as an input, and below the sparse threshold they are
+determined by position alone; above it the compressed region is left empty and
+filled on the device.
+
+Sparse selection needs this layer's query rank, which exists only once
+preparation has run — and only on the device, because the chain's one host node
+is a CUDA callback where a CUDA call is not permitted. So the whole of
+selection is enqueued between preparation and attention: the index query and
+weight projections read the preparation command's own activations, the score
+and top-k leave their result in the device workspace, and a resolution kernel
+turns the selected logical rows into attention candidates without the host
+seeing any of it.
+
+Two consequences follow from the host never seeing the selection. A compressed
+block's page index must be its block-table index, because there is no
+first-touch order to compact against; and every attendable block must hold a
+live page before the layer is queued, because the page a selected row will name
+is not knowable in advance.
+
+Both ranks select independently over their own replicated index pages rather
+than one rank selecting and broadcasting. The inputs are identical and the
+kernels deterministic, so the two agree by construction; the duplicated work is
+concurrent on two devices, and no exchange or merge enters the critical path.
 
 Replication is asserted, not assumed. The ranks' reduced attention input must
 be identical between layers and their terminal hidden state identical before
@@ -500,6 +523,18 @@ Lightning-Indexer scoring and compressor. Both ranks must agree; correctness
 builds verify rank agreement explicitly. Compressor and index values are raw
 FP32 where the target format declares it — the BF16 boundary applies to
 publications, not to these.
+
+Where selection runs is a scheduling decision; what it computes is not. The
+device form projects the index query and weights from the preparation's own
+activations by routing the same kernel `CudaBackend::matmul` would dispatch for
+that weight, over the activation `matmul`'s own upload would have produced.
+Each of the two encodings pairs with exactly one activation state — FP8 with
+the E4M3-quantized query rank, plain BF16 with the raw expanded layer input —
+and the backend requires the encoding rather than dispatching over it, because
+feeding one to the other's kernel would be silently wrong rather than rejected.
+The rotation angles are still evaluated on the host and uploaded: host libm and
+device trigonometry differ in the last ulp, and a hard top-k turns that into a
+different candidate set.
 
 **DSpark.** Verification, the declared attention/compression layout,
 shared-expert execution, mHC state, scoring functions, top-k normalization, and

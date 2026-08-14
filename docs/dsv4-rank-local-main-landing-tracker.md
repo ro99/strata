@@ -379,8 +379,9 @@ Exit criteria:
 | 2026-08-13 | Step 4 pivot alignment defect | full `strata-tests` run before the alignment fix | 278/300, 21 failures incl. `physical Lightning Indexer rejects malformed pages and shapes` at `tests/test_cuda_backend.cpp:504` | **defect I introduced and caught**: the pivot's new `uint4` group read needs 16 B alignment, but the histogram workspace region was reserved with `alignof(std::uint32_t)`. Misaligned vector loads left a sticky CUDA error, so 21 failures traced to one root cause. Fixed by reserving the region at `alignof(uint4)` |
 | 2026-08-13 | Step 4 pivot correction | `results/dsv4-rank-local-main-landing/step4-scorer-diagnosis/pivot-fixed-binding.txt` | SHA256 `0eceffc332f340ce2dfe12c87f35c03673927ffccabca825107b9dfd438f834a`; complete index `36.062` to `34.092 ms/token`; pivot kernel `47.288` to `15.728 us` (`3.01x`) | pivot drops from 22.2% to 8.6% of index GPU time; all four indexer exactness tests pass and the suite returns to 299/300 with one declared opt-in skip |
 | 2026-08-14 | Step 4 Stage 2 gate A: device index projections | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-gateA.json`, `centralized-gateA.json` | SHA256 `7b42280b537fa5bb28abbb81ad14f05748ca6fa1176cd8fd53939af5796ad4a8` / `1f04d79202dc21eb3a363c7554604e6e2064e4a3b155b0b6ecf56ae557587e31`; rank-local `159.673` to `156.080`, centralized `142.777` to `140.610 ms/token` | both index projections moved onto the device against the preparation command's own activations. Selection trace hashes **identical** on both topologies (`f14e5cde177258bd`, `d7e791756a7355d2`), token IDs and answer text identical, `231` CUDA and `0` scalar dispatches, zero decode checkpoint I/O. Exact by construction: the same kernel `matmul` would dispatch, over the activation its own upload would have produced |
-| 2026-08-14 | Step 4 Stage 2 gate B: device candidate resolution | `results/dsv4-rank-local-main-landing/step4-sparse-path/centralized-gateB.json` | SHA256 `4d03784b3683f9422e8a6025e8fa234aa0adc7b27420c3d423fa161878db0c61`; `140.610` to `142.339 ms/token` | the resolve kernel, the positional block table and the device-candidate attention input, gated on the centralized arm where the selection is still host-visible and everything else is held constant. Identical IDs, answer and selection trace. The `+1.729 ms` is the price of pre-leasing every attendable block, which device selection requires and first-touch leasing cannot serve |
+| 2026-08-14 | Step 4 Stage 2 gate B: device candidate resolution | `results/dsv4-rank-local-main-landing/step4-sparse-path/centralized-gateB.json` | SHA256 `4d03784b3683f9422e8a6025e8fa234aa0adc7b27420c3d423fa161878db0c61`; `142.339 ms/token` | the resolve kernel, the positional block table and the device-candidate attention input, gated on the centralized arm where the selection is still host-visible and everything else is held constant. Identical IDs, answer and selection trace. **No timing claim**: four single centralized arms of this workload span `140.610`--`143.908 ms/token`, so the `+1.729` against gate A is inside the spread |
 | 2026-08-14 | **Step 4 Stage 2 gate C: in-chain selection** | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-gateC5.json` | SHA256 `17df56adb0b8def079c5a505428d564527f140be820ba6101c3f55571436a0f8`; steady median **`115.795 ms/token`** against Stage 1's `159.673` (`-43.878`) | selection runs inside the queued chain: projection, score, top-k and candidate resolution are enqueued in each layer's own command sequence and no indexed layer leaves the chain. **Generated token IDs and answer text identical** to the sequential baseline; `462` CUDA and `0` scalar index dispatches (both ranks select on their own device); zero decode checkpoint I/O; decode synchronization calls `1,462` to `748`; D2H `27.96` to `19.85 MB`. VRAM `22,419,734,528` B/device against the `22,548,578,304` ceiling and RSS `158,365,499,392` B |
+| 2026-08-14 | Step 4 Stage 2 final state after cleanup | `results/dsv4-rank-local-main-landing/step4-sparse-path/rank-local-final.json`, `centralized-final.json` | rank-local SHA256 `3a783c8adac28202593e4ee4b31f621ec643c21bcbea885f01fb24ae08602fba`; rank-local `118.168`, centralized `143.908 ms/token` | run after removing the centralized device-resolution wiring and restricting the queued path to positions where every indexed layer actually selects. Both arms exact: identical token IDs and answer text, `0` scalar dispatches, zero decode checkpoint I/O. The rank-local spread across the two in-chain arms is `115.795`--`118.168`, so **the binding claim is the range, not either endpoint**; a three-repetition acceptance matrix is still owed |
 | 2026-08-13 | Step 4 gates after mHC correction | `results/dsv4-rank-local-main-landing/step4-make-check-default-r3.log`, `step4-make-check-nccl-r2.log` | default 2/2 pass exit 0; NCCL 2/2 pass exit 0; `git diff --check` clean | both builds re-verified with all four corrected kernels |
 | 2026-08-13 | Step 4 mHC acceptance | `results/dsv4-rank-local-main-landing/step4-mhc-acceptance/summary.json` | rank medians `111.895850`, `111.721523`, `111.528517` ms; median `111.721523` ms = `8.950827` token/s; central median `133.867678` ms | strict gate still **PASSES**; oracle-exact; centralized IDs still bit-identical; the `+0.544 ms` against the previous matrix is **inside** that matrix's own `2.932 ms` repetition spread, so **no end-to-end change is claimed in either direction** |
 | 2026-08-13 | Step 4 mHC mechanism screen | `results/dsv4-rank-local-main-landing/step4-norm-correction-r1/mhc_screen.cu` and `mhc-screen-device0.txt` | device 1 `15.35` to `6.07 us` (`2.53x`); device 0 `15.47` to `6.09 us` (`2.54x`); **0 bit mismatches on both outputs** | `dsv4_mhc_weighted_norm`'s xor reduction shape is itself the contract, so the 64 accumulators and their combination order are preserved and only the elementwise phases widen; `1.320` to `0.522 ms/token` |
@@ -408,6 +409,8 @@ that it does not compromise the acceptance result.
 | Layer-qualified physical/rank-local callback and KV-account errors | **KEEP** | fail-closed diagnostics run only on an error path and localize the owning layer/rank |
 | CUDA `host_callback_wait_event` API at the old page-publication boundary | **CURRENTLY HAS NO CALLER; REMOVE IN STEP 5 unless a supported path is proven to require it** | the corrected replica path uses its page-ready ownership event instead; an unused synchronization API must not land as residue |
 | Detailed-event arm with an invalid mHC interval | **DO NOT USE OR EXTEND** | rejected measurement evidence; no counter derived from the invalid interval may support acceptance |
+| In-chain resolution status bits and the numeric attention status in the rank-local chain error | **KEEP** | fail-closed diagnostics on an error path only. The three causes an in-chain resolution can raise are otherwise indistinguishable from a downstream decode failure, and the command has no host boundary of its own to report at |
+| `scripts/run_dsv4_rank_local_sparse_gate.sh` and `scripts/compare_dsv4_sparse_gate.py` | **KEEP** | the Stage 2 gate itself, reusable and deterministic; no production surface and no hot-path work |
 | All-device deferred-attention stream drain at centralized collection | **KEEP** | correctness ownership edge; r18 proved the MoE event does not dominate every attention host node even on the primary device, so all streams with live commands must drain before context reuse |
 
 ## Decision log
@@ -1568,14 +1571,20 @@ E4M3-quantized query rank, plain BF16 with the raw expanded layer input --
 so the backend requires the encoding rather than dispatching over it. Feeding
 one to the other's kernel would be silently wrong rather than rejected.
 
-Gate B carries a real cost and it is not a defect: `+1.729 ms/token` is the
-price of leasing every attendable compressed block. **First-touch leasing and
-device selection are mutually exclusive**, which the lazy-leasing commit
-earlier in this step did not anticipate: the host leases a page when a selected
-row first names it, and a selection the host never sees has no first touch. An
-unleased slot in a positional page array is an empty page, and the command
-would name it. At this operating point that is 11 blocks per indexed layer.
-What it costs at the declared context is an open question, recorded below.
+Gate B established exactness, not a cost. It read `+1.729 ms/token` against
+gate A, and **that number is not attributable**: four single centralized arms
+of the identical workload span `140.610` to `143.908 ms/token`, so any
+per-arm difference of this size is inside the spread. It is recorded as
+unresolved at n=1 rather than as the price of anything.
+
+What gate B did establish is structural. **First-touch leasing and device
+selection are mutually exclusive**, which the lazy-leasing commit earlier in
+this step did not anticipate: the host leases a page when a selected row first
+names it, and a selection the host never sees has no first touch. An unleased
+slot in a positional page array is an empty page, and the command would name
+it. So an in-chain layer leases every attendable block -- 11 per indexed layer
+here, 4,096 at the declared context, which is the open question recorded
+below.
 
 ### 2026-08-14 — Rank 1 owns no compressor, and that broke the first in-chain arm
 
@@ -1636,13 +1645,18 @@ measure this before designing anything else.
 ```text
 must not exceed                          158.353 ms/token   (Stage 1 bar)
 target                                   about 113
-measured, in-chain selection             115.795            -43.878
-centralized, same arm                    140.610
+measured, in-chain selection             115.795 and 118.168
+centralized, four single arms            140.610 to 143.908
 below-threshold queued arm               109.612
 ```
 
+The two in-chain arms differ by `2.373 ms` and the four centralized arms of an
+unchanged workload span `3.298 ms`, so single arms resolve about `3 ms` here and
+no smaller difference in this document is a result. The `-43.9` is four times
+larger than that; the `+1.7` gate B read is not.
+
 Token IDs and answer text are **identical** to the sequential baseline, so the
-`43.878 ms` is entirely topology and not a different candidate set. Rank-local
+gain is entirely topology and not a different candidate set. Rank-local
 above the threshold moves from `15.576 ms/token` **slower** than centralized to
 about `25 ms` **faster**, which is the standing the queued chain always had
 below the threshold and could not carry across it.
@@ -1657,9 +1671,10 @@ enters the critical path. **The candidate-sharding mechanism this step
 falsified in April is not needed at all**: what the chain wanted was not a
 cheaper score but no host boundary.
 
-The residual against the `109.612` below-threshold arm is `6.183 ms/token` for
-21 indexed layers, which is the index work itself plus the pre-leasing the
-device selection requires.
+The residual against the `109.612` below-threshold arm is about `6`--`9
+ms/token` for 21 indexed layers, which is the index work itself plus the
+pre-leasing the device selection requires. It is quoted as a range because a
+single arm does not resolve better than that here.
 
 **What this does not establish.** Every number here is at 2,685 active tokens.
 The leasing term scales with the block count and the score term with the
@@ -1669,75 +1684,66 @@ claim: what pre-leasing every attendable block costs at 4,096 blocks per
 indexed layer, and whether the enqueue-only page-descriptor upload synchronizes
 the stream.
 
-## Stage 2 handoff
+## Stage 3 handoff
 
-Everything below is what a successor needs to close in-chain selection. The
-groundwork is committed and green; what remains is one integration that cannot
-be gated in pieces.
+Stage 2 is closed: in-chain selection is committed, exact and measured at
+`115.795 ms/token` on the 2,685-active-token arm. Everything below is what a
+successor needs next.
 
-### The binding bar
-
-Stage 2's end state **must not be slower than where Stage 1 left it**:
-
-```text
-must not exceed              158.353 ms/token    (Stage 1, rank-local)
-target                       about 113 ms/token  (109.612 queued + ~3.5 index)
-current                      159.673 ms/token    (+1.320, groundwork only)
-centralized, same arm        142.777 ms/token
-```
-
-The target is not arbitrary: `109.612` is the measured queued arm at 2,014
-active tokens, and the queued path is context-insensitive across this range, so
-the chain should hold its cost when the indexer engages. Anything that does not
-beat `142.777` has not earned the topology.
-
-### What is already done and must not be rebuilt
+### What is done and must not be rebuilt
 
 ```text
 device index-query preparation   committed, gated, -15.9 ms both topologies
-non-synchronizing index entry    committed, gated, no production caller yet
+device index projections         committed, gated, exact by construction
+device candidate resolution      committed, gated on the centralized arm
 positional page numbering        committed, gated, page index = block index
-lazy first-touch leasing         committed, gated, 512 of 4,096 blocks at 1M
-device candidate resolution      SCREENED, not yet in the backend
-device block descriptors         SCREENED, not yet in the backend
+in-chain selection               committed, gated, -43.9 ms rank-local
 E4M3 half-up encoder             committed and live in the backend
 ```
 
-The two screened pieces live at
-`results/dsv4-rank-local-main-landing/step4-inchain-selection/resolve_screen.cu`
-and are verified against the host `locate_physical_kv_block` over three
-geometries, 516 probes each, zero block and zero row mismatches.
+### The two open questions, both about 1M and both measurable
 
-### What remains, in dependency order
+Neither is a design question. Both are measurements nobody has taken, and both
+were created by decisions this stage made.
 
-```text
-1  port the resolve kernel into kernels/cuda/backend.cu from the screen
-2  upload a device block-descriptor table per indexed layer
-3  make the index-query projections device-resident: in the chain, query_rank
-   and the hidden input exist only on the device, so wq_b and weights_proj must
-   run device-to-device. Exact by construction ONLY if the same kernel that
-   backend_.matmul uses is routed, not a differently tiled one
-4  give CudaDsv4PagedAttentionRequest an optional device-candidate input that
-   skips host staging for the compressed region
-5  wire the executor: enqueue prepare -> index-query prep -> select -> resolve
-   -> attention inside the per-layer command sequence
-6  stop forcing the sequential arm: queued_short_context currently goes false
-   whenever any layer has indexer_compressor.ratio != 0
-```
+1. **Pre-leasing every attendable block.** Device selection has no first touch
+   to lease on, so an in-chain layer leases every attendable compressed block
+   and every learned-index block for both ranks. At 2,685 active tokens that is
+   11 blocks per indexed layer and the whole term is inside the `6.183 ms`
+   residual against the below-threshold arm. At the declared context it is
+   **4,096 blocks per indexed layer per rank**. Measure `acquire_device` at
+   that block count before assuming anything: an earlier `6.46 us`-per-lease
+   attribution in this document was measured, extrapolated, and then withdrawn.
+   If it does not scale, the shape of the fix is known -- a full block never
+   receives another append, so only the tail block's lease has to move.
+2. **The enqueue-only page-descriptor upload.** The physical indexer uploads
+   its segment descriptors from a `std::vector` local to the call. For pageable
+   memory CUDA stages the copy before returning, which is correct, but the
+   driver may synchronize the stream to do it, and a per-indexed-layer stream
+   synchronization is exactly what the chain exists to remove. At 4,096
+   descriptors it is also 96 KB per layer per token.
 
-Items 3 to 6 have no intermediate gate. Their partial states do not produce
-valid candidates at all, so the only signal is the end-to-end arm, which
-reports "the answer text differs" without localising which step caused it.
-Budget for several diagnostic cycles.
+### What Step 5 still owes
 
-### The gate
+- `decode_step_seconds` and its JSON surface are **ACTIVE TEMPORARY** in the
+  instrumentation ledger, to be removed after the final acceptance run.
+- The aggregate `rank_local_*_nanoseconds` phase clocks default to REMOVE
+  unless a supported telemetry contract is written for them.
+- `host_callback_wait_event` still has no caller.
+- The extraction manifest classifies `include/strata/deepseek_kv_cache.hpp` and
+  `src/deepseek_kv_cache.cpp` as *excluded* because the `a31ac58` delta on them
+  is replay instrumentation. That still describes the experiment delta, but the
+  landing modifies those files for its own reasons and the manifest should say
+  so.
+- A centralized full-model teacher-forcing and generation comparison against
+  `main` is required for bit identity, and has not been run since Stage 2.
+
+### The gate, unchanged in shape
 
 ```bash
-./build-landing-nccl/strata-deepseek-run --model models/dsv4f \
-  --prompt "$(cat results/dsv4-rank-local-main-landing/step4-sparse-path/prompt-long.txt)" \
-  --max-new 12 --devices 1,2 --max-context 8192 --host-memory 216G \
-  --vram-fraction 0.95 --device-resident-runtime \
-  --decode-topology rank-local-tp2 --detailed-timing --quiet --json
+scripts/run_dsv4_rank_local_sparse_gate.sh <tag>          # both arms
+ARMS=rank-local scripts/run_dsv4_rank_local_sparse_gate.sh <tag>
+python3 scripts/compare_dsv4_sparse_gate.py <baseline>.json <arm>.json
 ```
 
 Required, all of them:
@@ -1746,21 +1752,35 @@ Required, all of them:
 prompt_tokens                     2,673   (active 2,685, above the 2,048 gate)
 generated token IDs               identical to rank-local-lazypos.json
 answer text                       identical
-attention_index_cuda_dispatches   231
 attention_index_scalar_dispatches 0
 decode_checkpoint_read_bytes      0
-steady median                     <= 158.353 ms/token
+steady median                     <= 115.795 ms/token
 ```
 
 An arm whose `prompt_tokens` falls below about 2,036 has not engaged the
-indexer and proves nothing; check it before reading any other number.
+indexer and proves nothing; check it before reading any other number. The index
+selection trace hash is **no longer comparable across the topology change**:
+the host performs 231 fewer selections per arm because they moved onto the
+device, so the running hash necessarily differs. Generated tokens are the
+binding gate; a differing hash at an equal entry count is still a real failure,
+and the comparison script distinguishes the two.
 
 ### Traps found the hard way
 
+- **First-touch leasing and device selection are mutually exclusive.** The host
+  numbers and leases a page when a selected row first names it; a selection the
+  host never sees has no first touch. An unleased slot in a positional page
+  array is an empty page the command would name.
 - **Leases block appends.** `rank_local_prepare_layer` clears a layer's leases
   before candidate resolution because a leased block cannot receive the next
   token's row. Any scheme that holds compressed leases across tokens is
   silently defeated there, which is how the prefix cache came to measure zero.
+- **Rank 1 owns no compressor.** It is one logical replicated KV stream and
+  rank 0 owns it. Anything rank 1 needs that was a side effect of a compressor
+  projection has to be asked for explicitly.
+- **A bounded workspace sized from its request spans.** The physical indexer
+  reserved zero bytes for a query that arrives on the device rather than in a
+  span. An unused API is not a tested one.
 - **A vector load inherits its allocator's alignment.** The pivot's `uint4`
   read needed 16-byte alignment the histogram region did not have; the symptom
   was 21 failing tests, including a *valid* request being rejected.
@@ -1771,25 +1791,3 @@ indexer and proves nothing; check it before reading any other number.
   index-query contract is half-up, and the difference changes selection.
 - **Costs measured at 2,685 tokens do not transfer to 1M**, and one
   extrapolation in this document was already withdrawn for exactly that reason.
-
-### Step 5 prerequisites now due
-
-- `decode_step_seconds` and its JSON surface are marked **ACTIVE TEMPORARY;
-  remove after the final performance acceptance run** in the instrumentation
-  ledger. That run is the matrix above, so the trigger has fired: this surface
-  must not appear in the promotion diff.
-- The extraction manifest classifies `include/strata/deepseek_kv_cache.hpp` and
-  `src/deepseek_kv_cache.cpp` as *excluded* on the grounds that the `a31ac58`
-  delta on them is replay instrumentation. That classification still holds --
-  it describes the experiment delta, not this branch -- but the landing now
-  modifies those files for its own reasons (`block_table_into`, removal of the
-  dead `device_resident` field) and the manifest should say so.
-- **No result commit exists.** The entire landing, Steps 1--4, is uncommitted
-  worktree state.
-
-- The binding short-path figure for budget derivation stays the better-supported
-  `111.177092 ms/token` from the larger-spread matrix only if a single number is
-  needed; taking the two matrices together the corrected short path is about
-  `111.2--111.7 ms/token`, and the permitted index budget is about
-  `15.3--15.8 ms/token`. The `4.1x` exact-scorer requirement is unchanged by
-  this arm.

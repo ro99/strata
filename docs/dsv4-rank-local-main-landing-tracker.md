@@ -1375,6 +1375,27 @@ That caching is now a prerequisite of Stage 2 rather than an optimization of it,
 and it was invisible at the short-context operating point where the same code
 costs three milliseconds.
 
+> **RETRACTED the same day by the experiment it motivated.** The prefix cache
+> was built, gated -- token IDs and answer text identical -- and measured at
+> `161.399 ms/token` against the uncached `161.338`. It removed `-0.061 ms`,
+> which is nothing. If the `+2.985 ms` had been per-lease cost, caching the
+> leases across tokens would have removed nearly all of it. **The per-lease
+> attribution is therefore false, and the `1.11 s/token` extrapolation built on
+> it is withdrawn.**
+>
+> The `+2.985 ms` is real and reproducible but **not yet attributed**. It is not
+> repeated leasing. A plausible remaining cause is that positional numbering
+> changes the order in which the attention kernel walks its pages, where the
+> lazy scheme happened to number them in selection order; that is a hypothesis
+> and is recorded as one, not as a finding.
+>
+> The cache is retained rather than reverted, on a structural argument rather
+> than a measured one: at the declared context a layer leases 4,096 blocks
+> instead of 11, so the per-token lease count rises from 462 to about 172,000
+> across the 21 indexed layers. That is a 372x increase in work whose unit cost
+> is small but unmeasured. Retaining it is insurance, its benefit here is zero,
+> and it must not be described as a measured improvement.
+
 ### How B8 should be sequenced so it stays gateable
 
 B8 cannot be screened in isolation -- it changes what the attention kernel

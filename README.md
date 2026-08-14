@@ -92,11 +92,17 @@ admission today, so an over-large `--context-size` is accepted, loads, and then
 fails at the first affected layer. Either way nothing silently falls back to a
 slower or less exact path.
 
+`-DSTRATA_ENABLE_NCCL=ON` locates NCCL itself. It looks in the active Python
+environment (`nvidia-nccl-cu12`), `NCCL_HOME`, a tar install under
+`/usr/local/nccl*` or `/opt/nccl*`, the distribution packages under `/usr`, and
+the CUDA toolkit — printing the header and library it chose, both taken from the
+same installation. If you have none of these, install NCCL by
+[NVIDIA's guide](https://docs.nvidia.com/deeplearning/nccl/install-guide/index.html)
+or `pip install nvidia-nccl-cu12`; to point at a specific copy, pass
+`-DSTRATA_NCCL_INCLUDE_DIR=` and `-DSTRATA_NCCL_LIBRARY=` together.
+
 ```bash
-cmake -S . -B build-nccl -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_NCCL=ON \
-  -DSTRATA_NCCL_INCLUDE_DIR=/path/to/nccl/include \
-  -DSTRATA_NCCL_LIBRARY=/path/to/nccl/lib/libnccl.so.2
+cmake -S . -B build-nccl -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_NCCL=ON
 cmake --build build-nccl --target strata-server -j
 
 # Pin the device order: CUDA does not enumerate GPUs the way nvidia-smi does,

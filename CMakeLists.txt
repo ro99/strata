@@ -195,14 +195,101 @@ if(STRATA_HAS_CUDA)
     target_link_libraries(strata_core PUBLIC CUDA::cublas)
 
     if(STRATA_ENABLE_NCCL)
-        if(NOT STRATA_NCCL_INCLUDE_DIR OR NOT EXISTS "${STRATA_NCCL_INCLUDE_DIR}/nccl.h")
+        # NCCL is rarely installed system-wide. In practice it arrives with the
+        # CUDA toolkit or as the nvidia-nccl-cu12 wheel inside a Python
+        # environment, so search those before asking the user to locate it by
+        # hand.
+        #
+        # Detection resolves a header and a library from the *same* root and
+        # never mixes two installations: a glob over python* matches every
+        # interpreter version present, and pairing one version's header with
+        # another's library is an ABI mismatch that would surface as a link or
+        # runtime failure rather than as a configure error.
+        #
+        # Auto-detection runs only when neither option is set. Supplying one
+        # half is a user decision that detection must not complete, for the
+        # same mismatch reason.
+        if(STRATA_NCCL_INCLUDE_DIR AND NOT STRATA_NCCL_LIBRARY)
             message(FATAL_ERROR
-                "STRATA_ENABLE_NCCL requires STRATA_NCCL_INCLUDE_DIR to contain nccl.h")
+                "STRATA_NCCL_INCLUDE_DIR is set but STRATA_NCCL_LIBRARY is not. "
+                "Set both, from the same NCCL installation, or neither to "
+                "auto-detect.")
         endif()
-        if(NOT STRATA_NCCL_LIBRARY OR NOT EXISTS "${STRATA_NCCL_LIBRARY}")
+        if(STRATA_NCCL_LIBRARY AND NOT STRATA_NCCL_INCLUDE_DIR)
             message(FATAL_ERROR
-                "STRATA_ENABLE_NCCL requires STRATA_NCCL_LIBRARY to name the NCCL shared library")
+                "STRATA_NCCL_LIBRARY is set but STRATA_NCCL_INCLUDE_DIR is not. "
+                "Set both, from the same NCCL installation, or neither to "
+                "auto-detect.")
         endif()
+        if(NOT STRATA_NCCL_INCLUDE_DIR AND NOT STRATA_NCCL_LIBRARY)
+            # Ordered most specific first: an environment the user has
+            # deliberately activated outranks a system-wide install.
+            #
+            #   nvidia-nccl-cu12 wheel   <env>/lib/python*/site-packages/nvidia/nccl
+            #   NCCL tar / "local installer"  NCCL_HOME, /usr/local/nccl*, /opt/nccl*
+            #   apt or yum packages (libnccl2, libnccl-dev)   /usr
+            #   CUDA toolkit bundle      CUDA_HOME, /usr/local/cuda*
+            #
+            # See the NCCL installation guide for the package and tar layouts.
+            file(GLOB STRATA_NCCL_ROOTS
+                "$ENV{VIRTUAL_ENV}/lib/python*/site-packages/nvidia/nccl"
+                "$ENV{CONDA_PREFIX}/lib/python*/site-packages/nvidia/nccl")
+            list(APPEND STRATA_NCCL_ROOTS "$ENV{NCCL_HOME}" "$ENV{CUDA_HOME}")
+            file(GLOB STRATA_NCCL_TARBALL_ROOTS
+                "/usr/local/nccl*" "/opt/nccl*")
+            list(APPEND STRATA_NCCL_ROOTS ${STRATA_NCCL_TARBALL_ROOTS})
+            list(APPEND STRATA_NCCL_ROOTS
+                "${CUDAToolkit_LIBRARY_ROOT}" "/usr/local/cuda")
+            file(GLOB STRATA_NCCL_CUDA_ROOTS "/usr/local/cuda-*")
+            list(APPEND STRATA_NCCL_ROOTS ${STRATA_NCCL_CUDA_ROOTS})
+            list(APPEND STRATA_NCCL_ROOTS "/usr/local" "/usr")
+            foreach(nccl_root IN LISTS STRATA_NCCL_ROOTS)
+                if(NOT nccl_root OR NOT EXISTS "${nccl_root}/include/nccl.h")
+                    continue()
+                endif()
+                # The wheel ships only the versioned soname, with no
+                # unversioned libnccl.so symlink, so the bare "nccl" name that
+                # find_library derives is not enough on its own. The distro
+                # packages do ship the symlink but place it in the multiarch
+                # directory, which CMAKE_LIBRARY_ARCHITECTURE names for
+                # whichever architecture this is -- x86_64 and aarch64 both
+                # matter here, since NCCL ships for Grace and Jetson too.
+                unset(STRATA_NCCL_ROOT_LIBRARY CACHE)
+                find_library(STRATA_NCCL_ROOT_LIBRARY
+                    NAMES nccl libnccl.so.2
+                    HINTS "${nccl_root}/lib" "${nccl_root}/lib64"
+                          "${nccl_root}/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+                          "${nccl_root}/targets/${CMAKE_SYSTEM_PROCESSOR}-linux/lib"
+                    NO_DEFAULT_PATH)
+                if(STRATA_NCCL_ROOT_LIBRARY)
+                    set(STRATA_NCCL_INCLUDE_DIR "${nccl_root}/include")
+                    set(STRATA_NCCL_LIBRARY "${STRATA_NCCL_ROOT_LIBRARY}")
+                    break()
+                endif()
+            endforeach()
+            unset(STRATA_NCCL_ROOT_LIBRARY CACHE)
+        endif()
+        # One diagnosis for both halves, naming what was searched and how to
+        # override it. Reporting only "requires STRATA_NCCL_INCLUDE_DIR" leaves
+        # a reader who has never installed NCCL with nowhere to go.
+        if(NOT STRATA_NCCL_INCLUDE_DIR OR NOT EXISTS "${STRATA_NCCL_INCLUDE_DIR}/nccl.h"
+           OR NOT STRATA_NCCL_LIBRARY OR NOT EXISTS "${STRATA_NCCL_LIBRARY}")
+            message(FATAL_ERROR
+                "STRATA_ENABLE_NCCL=ON but NCCL was not found.\n"
+                "  header: ${STRATA_NCCL_INCLUDE_DIR}\n"
+                "  library: ${STRATA_NCCL_LIBRARY}\n"
+                "Searched the active Python environment, the CUDA toolkit, "
+                "NCCL_HOME, and CUDA_HOME.\n"
+                "Install it with 'pip install nvidia-nccl-cu12', or point at an "
+                "existing copy:\n"
+                "  -DSTRATA_NCCL_INCLUDE_DIR=<dir containing nccl.h>\n"
+                "  -DSTRATA_NCCL_LIBRARY=<path to libnccl.so>\n"
+                "Both must come from the same NCCL installation. Configure "
+                "without -DSTRATA_ENABLE_NCCL=ON to build everything except "
+                "rank-local TP2 decode.")
+        endif()
+        message(STATUS "NCCL header: ${STRATA_NCCL_INCLUDE_DIR}")
+        message(STATUS "NCCL library: ${STRATA_NCCL_LIBRARY}")
         get_filename_component(STRATA_NCCL_LIBRARY_DIR "${STRATA_NCCL_LIBRARY}" DIRECTORY)
         # Compiled into strata_core rather than a separate archive: the executor
         # needs CudaBackend and the runtime needs the executor, so a distinct

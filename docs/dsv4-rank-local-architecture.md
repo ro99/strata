@@ -594,9 +594,16 @@ reaches its throughput gate only at a short context has not produced a usable
 model. The relevant question is therefore whether `tau` holds at the model's
 declared 1,048,576-token context and whether its exact residency fits. The
 residency now fits under enforced admission; end-to-end `tau(1M)` remains
-unmeasured because the original Step 4 sharding mechanism was falsified by the
-component lower bound below. Short-context acceptance is not full-context
-support.
+unmeasured. Short-context acceptance is not full-context support.
+
+> **The device attention path cannot execute above 65,536 tokens.** Measured on
+> 2026-08-14 and tracked as [issue #22](https://github.com/ro99/strata/issues/22).
+> Both attention entry points reject more than 640 candidates, and a ratio-128
+> layer needs `roundup(context/128, 128) + 128`, which crosses 640 at 65,537
+> tokens and reaches 8,320 at the declared context. See "The 65,536-token
+> ceiling" below. Every 1M figure in this section is therefore a component
+> measurement or a projection; none of it is reachable end to end today, and the
+> supported context ceiling of this runtime is **65,536 tokens**.
 
 ### Measured admission plan
 
@@ -653,6 +660,56 @@ about `13 MB` to about `105 MB` — still small against HBM bandwidth, but the
 per-candidate host work in `physical_paged_attention`'s `locate()` is a linear
 block-table search per candidate and does not have that excuse.
 
+### The 65,536-token ceiling
+
+That dense growth is not merely expensive at 1M; above 65,536 tokens it does not
+run. `dsv4_paged_attention` and `dsv4_paged_attention_to_mhc` both validate
+`candidates > 640U` as invalid, and a ratio-128 layer assembles
+`roundup(context/128, 128) + 128` candidates. That equals 640 at exactly 65,536
+tokens and 8,320 at the declared context. `sliding_window` is `128`, so the
+ratio-4 and ratio-0 layers are already at their 1M widths — `640` and `128` — in
+every short-context arm, and the 20 ratio-128 layers are the entire
+context-dependent attention term.
+
+`strata-dsv4-attention-probe` measures that term at the production page geometry
+across every width the kernel accepts, and is rejected at every width above it.
+Medians of three interleaved runs of nine repetitions on an idle 3090:
+
+```text
+context    comp rows   cands   pages   ms/layer   ms/token   kernel ms   status
+    4,096         32     256      17      0.159      3.188       0.043   ok
+   16,384        128     256      65      0.158      3.167       0.043   ok
+   32,768        256     384     129      0.170      3.400       0.049   ok
+   49,152        384     512     193      0.177      3.537       0.056   ok
+   65,536        512     640     257      0.186      3.729       0.064   ok
+  131,072      1,024   1,152     513          -          -           -   REJECTED
+  262,144      2,048   2,176   1,025          -          -           -   REJECTED
+1,048,576      8,192   8,320   4,097          -          -           -   REJECTED
+```
+
+The five passing rows are the control: identical queries, sinks, scale and entry
+point throughout, and `1,152` is a valid multiple of the required `128`, so the
+candidate cap is the only clause that can fire.
+
+A second ceiling sits behind the first. The kernel stages KV as
+`candidates * 512 * sizeof(uint16)` and production configures a `4 MiB`
+workspace: `655 KB` at 640 candidates, `8.52 MB` at 8,320. Lifting the candidate
+cap alone moves the rejection rather than removing it.
+
+Nothing between the configured `maximum_context_tokens` and the attention call
+bounds the context, so a run above the ceiling does not fail admission — it
+reaches the first ratio-128 layer and reports *"request shape, BF16 query,
+scale, or sink is invalid"*. It fails closed, which is the contract, but names
+the query for what is an unsupported context length.
+
+This is unrelated to the indexer, in-chain selection, and rank-local decode: the
+index path selects 512 candidates at any context and never approaches the cap,
+and both topologies are affected identically. It is also unrelated to prefill
+throughput — the rejection fires on the first decoded token however the context
+was populated. Resolving it is a kernel design task: tiled or multi-pass dense
+attention over an unbounded compressed history with an online softmax, carrying
+the declared accumulation order through the rescaling.
+
 **Indexer scoring, measured.** It must score all `L/ratio` compressed
 candidates to select its top `512`: at 1M, `262,144` candidates per layer over
 the 21 ratio-4 layers. `strata-dsv4-index-probe` on one 3090:
@@ -703,33 +760,41 @@ unchanged-chain navigation total        145.269092 ms/token
 
 The permitted complete index budget, derived from the corrected short path
 rather than assumed, is `127.000000 - 111.177092 = 15.822908 ms/token` at the
-review ceiling, or `13.822908 ms/token` against the strict target. A single
-replicated indexer therefore still does not fit, and candidate sharding is
-required rather than optional. With scoring halved across the two ranks and the
-fixed-cost terms unchanged:
+review ceiling, or `13.822908 ms/token` against the strict target.
+
+**Candidate sharding was the answer to the wrong question.** The projection this
+document previously carried assumed a perfect 2x score shard with free exchange
+and free merge, reaching `130.087 ms/token`. What the queued chain actually
+needed was not a cheaper score but no host boundary: in-chain selection removed
+`43.878 ms/token` on the rank-local arm with both ranks scoring the *whole*
+candidate set concurrently on their own device. The two ranks read identical
+inputs with deterministic kernels, so they agree by construction, no exchange or
+deterministic merge enters the critical path, and neither is implemented.
+
+The current arithmetic, with each term's provenance stated:
 
 ```text
-scoring / 2                                  13.940000 ms/token
-pivot, fixed at 65,536 bins per rank          0.990000 ms/token
-histogram and remaining select, halved        1.250000 ms/token
-outside (host launch and synchronization)     2.730000 ms/token
-                                            ---------------------
-sharded index projection                     18.910000 ms/token
-corrected short path                        111.177092 ms/token
-projected tau(1M)                           130.087092 ms/token
-review ceiling                              127.000000 ms/token
-remaining gap                                 3.087092 ms/token
+below-threshold queued base, measured at ~2,000 tokens     109.612   does not describe 1M
+1M in-chain index, measured at 1M page geometry            +31.362   34.092 less the 2.730 host term
+ratio-128 growth, extrapolated 13x beyond measurement        +8.8    not a result
+                                                          ---------
+                                                            149.8
+review ceiling                                              127.000
 ```
 
-The gap stood at `29.66 ms/token` when this landing was handed over. The largest
-named remaining term is the `2.73 ms/token` of host launch and synchronization,
-which the full-context design must remove in any case by moving selection inside
-the queued chain.
+This remains a **projection, not a measurement**, and it is now a projection of
+something that cannot run: above 65,536 tokens the ratio-128 layers are rejected
+outright (see "The 65,536-token ceiling"). The `+8.8` is a linear extrapolation
+13x beyond the widths that were measurable, and at 8,320 candidates the kernel's
+staging no longer fits the workspace it is written against, so whatever
+eventually runs at that width will not be this kernel unmodified.
 
-This remains a **projection, not a measurement**. The exchange, the
-deterministic merge, the ratio-128 dense attention growth and the linear host
-`locate()` are unmeasured and are charged nowhere in it. No 1M throughput claim
-follows from these component figures, and none is made.
+Pre-leasing at 4,096 blocks per indexed layer per rank, the page-descriptor
+upload (4,097 descriptors per ratio-128 layer at 1M against 257 at 65,536), and
+the growth of the base terms themselves are charged nowhere above. Lifting the
+attention ceiling is necessary for any 1M claim; on present evidence it is not
+sufficient. No 1M throughput claim follows from these component figures, and
+none is made.
 
 Two further 1M terms remain **unmeasured and are not charged above**: the
 ratio-128 dense attention growth to `8,192` rows across 20 layers, and

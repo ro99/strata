@@ -151,6 +151,27 @@ queue depth.
 labelled in-source as "Stage-4 replay instrumentation". It exists to snapshot a
 physical block for capture. Production has no caller.
 
+**The disposition is about the experiment delta, not about the files.** These
+three paths are classified against `main...a31ac58`, which is what this manifest
+traces, and none of `read_physical_block` was landed. The landing does modify
+`deepseek_kv_cache.hpp` and `deepseek_kv_cache.cpp` for reasons of its own,
+which originate in this landing rather than in the experiment and so are outside
+this manifest's scope:
+
+- `block_table_into()`, filling caller-owned storage. The decode path calls
+  `block_table()` once per kind per layer per token, and at the declared context
+  a compressed table holds 4,096 blocks — roughly 176,000 block infos per
+  decoded token. Returning by value both allocates on the timed path, which the
+  steady-state contract forbids, and cost measured milliseconds.
+  `block_table()` is retained as a thin wrapper over it, so existing callers are
+  unchanged.
+- Removal of the unused `Dsv4KvBlockInfo::device_resident` vector.
+- Failure-path detail added to two physical-append error strings. Error paths
+  only; no steady-state cost.
+
+Read the row in the classification index as "nothing from the experiment delta
+landed here", which remains true.
+
 ### Dependent-state capture hook — partial, in `src/deepseek_runtime.cpp`
 
 **Reason.** The M1 `.d4c` capture hook (`dependent_replay_directory`,

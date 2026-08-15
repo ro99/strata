@@ -126,16 +126,24 @@ contract on the centralized topology. Both flags work identically on
 
 ##### Prompt processing
 
-The device-resident path processes the prompt a page at a time, 64 rows by
-default. A page runs layer-major with one fused device mHC state per row, so
-the rows that picked the same expert share one decode of its FP4 weights
-instead of decoding them once per token. On the reference pair a 580-token
-prompt runs at **9.17 tok/s against 7.65**, and the routed-expert term itself
-is 2.18x faster. Nothing about the model changes: generated tokens, logits,
-layer and operation hashes, and the route trace including its coefficients are
-all bit-equal to row-at-a-time prompt processing, which
-`--prefill-page-tokens 1` restores. See
-[experiment 0095](docs/experiments/0095-dsv4-page-major-tp2-prefill-2026-08-15.md).
+The device-resident path processes the prompt a page at a time. A page runs
+layer-major with one fused device mHC state per row, and its routed experts
+execute **on the GPU**, reading the same transformed shards the host expert
+kernels read — the routed experts are 156 GB and exist in host memory in one
+layout, so the device reads that layout rather than requiring a second copy.
+Decode is unchanged and keeps the experts in the two NUMA-local CPU shards,
+which is where a one-row step wants them.
+
+On the reference pair a 677-token prompt runs at **10.5 tok/s against 7.6**
+for row-at-a-time prompt processing, which `--prefill-page-tokens 1` restores.
+
+Prefill and decode therefore use different expert kernels, as they do in every
+CPU-GPU hybrid stack. The prefill kernel is held to the scalar oracle within
+one BF16 mantissa step per output rather than to bit equality with the CPU
+one; page-major execution itself remains bit-exact, and routes, precision,
+top-k, expert count and mHC semantics are unchanged. See experiments
+[0095](docs/experiments/0095-dsv4-page-major-tp2-prefill-2026-08-15.md) and
+[0096](docs/experiments/0096-dsv4-gpu-prefill-experts-2026-08-15.md).
 
 Measured on 2× RTX 3090, an 18-token prompt and 31 decode steps including
 warm-up:

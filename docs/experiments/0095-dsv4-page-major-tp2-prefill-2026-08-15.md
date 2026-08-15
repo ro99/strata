@@ -1,13 +1,18 @@
 # Experiment 0095 — page-major TP2 prefill
 
-Status: **accepted.** Physical-device prompt processing executes layer-major
-over a page of rows, each row owning its own fused device mHC state, and the
-page's rows are grouped by expert before the routed FP4 weights are decoded.
-The result is bit-equal to the accepted page-1 path and 1.204x faster at the
-production operating point. `--prefill-page-tokens 64` is now a supported TP2
-prompt setting.
+Status: **page-major execution accepted; CPU row grouping superseded by
+experiment 0096.** Physical-device prompt processing executes layer-major over
+a page of rows, each row owning its own fused device mHC state. That part
+stands and is the prerequisite everything since has been built on, and it
+closes the prerequisite that rejected experiment 0094.
 
-This closes the prerequisite that rejected experiment 0094.
+Grouping a page's rows by expert *on the CPU*, which is what the 1.204x below
+measures, is superseded. It optimised the right term by the wrong placement:
+the reference stack executes prefill's routed experts on the GPU, and the
+arithmetic says a Broadwell AVX2 host caps CPU prefill near 100 tok/s however
+well the grouping is written. 0096 moved them to the GPU and removed
+`prepare_page_routed_partials`. The 1.204x is real and reproducible on the code
+as it stood; it should not be counted toward the prompt-throughput target.
 
 ## The bottleneck, instantiated
 

@@ -1600,8 +1600,13 @@ struct DeepSeekV4Runtime::Impl {
     // reach the indexer, which is the only consumer.
     std::vector<float> rank_local_attention_input;
     Dsv4SequenceHandle active_sequence{};
-    std::array<PhysicalAttentionContext, kLayers>
-        physical_attention_contexts{};
+    // Token-major execution reaches one of these per layer within a token;
+    // page-major prompt execution reaches one per row within a layer. Either
+    // way the pending set is what the collect boundary drains. A raw pointer
+    // to an element is handed to a CUDA host callback, so growing the table
+    // must not move the elements that are already in flight.
+    std::vector<std::unique_ptr<PhysicalAttentionContext>>
+        physical_attention_contexts;
     // Reused block tables for candidate resolution. Both topologies rebuild
     // these once per kind per layer per decoded token; at the declared context
     // a compressed table is 4,096 blocks, so returning them by value allocated
@@ -1616,8 +1621,14 @@ struct DeepSeekV4Runtime::Impl {
     // recomputed on the device so the two agree bit for bit.
     std::vector<float> index_rope_cosines;
     std::vector<float> index_rope_sines;
-    std::array<HostMoeContext, kLayers> host_moe_contexts{};
+    std::vector<std::unique_ptr<HostMoeContext>> host_moe_contexts;
     std::uint32_t host_moe_pending{};
+    // Page-major prompt execution enqueues the CPU-MoE chain once per row
+    // inside one layer rather than once per layer inside one token. The chain
+    // index is what keeps the callback contexts distinct and keeps the order
+    // guard meaningful; token-major execution leaves this empty and indexes by
+    // layer exactly as before.
+    std::optional<std::uint32_t> host_moe_chain_row;
     std::uint64_t host_moe_routed_cpu_before{};
     DeviceHeadContext device_head_context{};
     std::vector<Dsv4KvDeviceLease> pending_attention_leases;
@@ -1648,6 +1659,21 @@ struct DeepSeekV4Runtime::Impl {
     std::array<float, kExperts> combined_router_logits{};
     bool completed_router_projection{};
     bool deferred_attention_moe_input{};
+    // The fused physical branch carries state across the attention or MoE call
+    // it wraps: whether the next attention command also performs the pending
+    // mHC transition, and what a fused command already produced for the MoE
+    // that follows it. Token-major execution needs one copy because one token
+    // is in flight. Page-major execution interleaves rows between those two
+    // points, so each row parks its own copy here between visits.
+    struct FusedBranchState {
+        bool pending_mhc_attention_transition{};
+        bool completed_attention_mhc_transition{};
+        bool completed_router_projection{};
+        bool deferred_attention_moe_input{};
+        std::array<float, kHidden> combined_attention_mhc_input{};
+        std::array<float, kExperts> combined_router_logits{};
+    };
+    std::vector<FusedBranchState> page_branch_states;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
     std::vector<std::uint32_t> cached_token_ids;
@@ -1957,6 +1983,11 @@ struct DeepSeekV4Runtime::Impl {
         std::span<const float> router_logits,
         std::span<float> rank_partials);
     ValidationResult collect_host_routed_moe_chain();
+    // Grow-on-demand accessors for the two pending-callback tables. Both are
+    // addressed by layer in token-major execution and by page row in
+    // page-major prompt execution, so neither bound is known at construction.
+    PhysicalAttentionContext& physical_attention_context(std::size_t index);
+    HostMoeContext& host_moe_context(std::size_t index);
     ValidationResult host_routed_moe_impl(
         std::uint32_t layer, const Dsv4Route* route,
         std::span<const float> input, std::span<float> output,
@@ -1991,6 +2022,14 @@ struct DeepSeekV4Runtime::Impl {
     ValidationResult device_mhc_forward_hidden(
         std::uint32_t token, std::uint32_t position,
         std::span<float> hidden, std::vector<float>* fused_logits);
+    // Same fused device graph as device_mhc_forward_hidden, visited
+    // branch-outermost over a page of prompt rows instead of token by token.
+    // Each row owns an mHC slot, so its command sequence is unchanged; only
+    // the order in which rows reach each command differs. The caller has
+    // already embedded every row and must exclude any row that needs logits.
+    ValidationResult device_mhc_forward_prefill_page(
+        std::span<const std::uint32_t> tokens, std::uint32_t position_base,
+        std::span<float> hidden);
     static bool device_head_callback(
         void* opaque, std::span<const std::uint16_t> encoded_hidden,
         std::span<float> reduced);
@@ -3277,7 +3316,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention(
         }
         std::vector<float> query_rank(kQueryRank);
         std::vector<float> kv(kHeadDim);
-        auto& deferred_context = physical_attention_contexts[layer];
+        auto& deferred_context = physical_attention_context(
+            host_moe_chain_row.value_or(layer));
         std::vector<CudaDsv4AttentionPageWrite> page_writes;
         if (deferred_page_update) {
             deferred_context.owner = this;
@@ -4253,7 +4293,8 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_from_device_input(
 ValidationResult DeepSeekV4Runtime::Impl::enqueue_host_routed_moe(
     std::uint32_t layer, std::uint32_t token, std::uint32_t position) {
     ValidationResult result;
-    if (layer >= kLayers || host_moe_pending != layer ||
+    const auto chain = host_moe_chain_row.value_or(layer);
+    if (layer >= kLayers || host_moe_pending != chain ||
         expert_workers == nullptr) {
         result.errors.emplace_back(
             "DeepSeek fixed CPU-MoE command order is invalid");
@@ -4263,7 +4304,7 @@ ValidationResult DeepSeekV4Runtime::Impl::enqueue_host_routed_moe(
         host_moe_routed_cpu_before =
             device_moe_stats.routed_cpu_nanoseconds;
     }
-    auto& context = host_moe_contexts[layer];
+    auto& context = host_moe_context(chain);
     context.owner = this;
     context.layer = layer;
     context.token = token;
@@ -4546,6 +4587,23 @@ bool DeepSeekV4Runtime::Impl::execute_host_routed_moe_callback(
     return context.accepted;
 }
 
+DeepSeekV4Runtime::Impl::PhysicalAttentionContext&
+DeepSeekV4Runtime::Impl::physical_attention_context(std::size_t index) {
+    while (physical_attention_contexts.size() <= index) {
+        physical_attention_contexts.push_back(
+            std::make_unique<PhysicalAttentionContext>());
+    }
+    return *physical_attention_contexts[index];
+}
+
+DeepSeekV4Runtime::Impl::HostMoeContext&
+DeepSeekV4Runtime::Impl::host_moe_context(std::size_t index) {
+    while (host_moe_contexts.size() <= index) {
+        host_moe_contexts.push_back(std::make_unique<HostMoeContext>());
+    }
+    return *host_moe_contexts[index];
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
     ValidationResult result;
     if (host_moe_pending == 0U) return result;
@@ -4556,8 +4614,8 @@ ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
         append_errors(result, std::move(collected.errors),
                       "DeepSeek fixed CPU/shared MoE collect");
     }
-    for (std::uint32_t layer = 0U; layer < host_moe_pending; ++layer) {
-        auto& context = host_moe_contexts[layer];
+    for (std::uint32_t pending = 0U; pending < host_moe_pending; ++pending) {
+        auto& context = host_moe_context(pending);
         if (context.invoked) ++device_moe_stats.host_callback_batches;
         if (!context.invoked || !context.accepted) {
             ++device_moe_stats.host_callback_failures;
@@ -4580,13 +4638,15 @@ ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
     host_moe_routed_cpu_before = 0U;
     pending_attention_leases.clear();
     pending_attention_weights.clear();
-    for (auto& context : host_moe_contexts) {
+    for (auto& entry : host_moe_contexts) {
+        auto& context = *entry;
         context.shared = {};
         for (auto& lease : context.shared_leases) {
             lease = Dsv4WeightCache::Lease{};
         }
     }
-    for (auto& context : physical_attention_contexts) {
+    for (auto& entry : physical_attention_contexts) {
+        auto& context = *entry;
         if (!context.result.ok()) {
             append_errors(
                 result, std::move(context.result.errors),
@@ -7283,6 +7343,186 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_hidden(
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
+    std::span<const std::uint32_t> tokens, std::uint32_t position_base,
+    std::span<float> hidden) {
+    ValidationResult result;
+    const auto rows = tokens.size();
+    const auto stride = static_cast<std::size_t>(kMhc) * kHidden;
+    if (rows == 0U || rows > config.prefill_page_tokens ||
+        hidden.size() != rows * stride ||
+        position_base > config.maximum_context_tokens - rows) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC prefill page has incompatible dimensions");
+        return result;
+    }
+    const auto device = devices[mhc_slot];
+    result = cuda.dsv4_mhc_reserve_slots(
+        device, static_cast<std::uint32_t>(rows));
+    if (!result.ok()) return result;
+
+    const bool trace = config.enable_layer_hash_trace;
+    std::vector<std::vector<float>> layer_inputs(
+        rows, std::vector<float>(kHidden));
+    std::vector<std::vector<float>> weighted(
+        rows, std::vector<float>(trace ? kHidden : 0U));
+    page_branch_states.assign(rows, FusedBranchState{});
+
+    const auto select = [&](std::size_t row) {
+        return cuda.dsv4_mhc_select_slot(
+            device, static_cast<std::uint32_t>(row));
+    };
+    const auto load_branch_state = [&](std::size_t row) {
+        const auto& saved = page_branch_states[row];
+        pending_mhc_attention_transition =
+            saved.pending_mhc_attention_transition;
+        completed_attention_mhc_transition =
+            saved.completed_attention_mhc_transition;
+        completed_router_projection = saved.completed_router_projection;
+        deferred_attention_moe_input = saved.deferred_attention_moe_input;
+        combined_attention_mhc_input = saved.combined_attention_mhc_input;
+        combined_router_logits = saved.combined_router_logits;
+    };
+    const auto store_branch_state = [&](std::size_t row) {
+        auto& saved = page_branch_states[row];
+        saved.pending_mhc_attention_transition =
+            pending_mhc_attention_transition;
+        saved.completed_attention_mhc_transition =
+            completed_attention_mhc_transition;
+        saved.completed_router_projection = completed_router_projection;
+        saved.deferred_attention_moe_input = deferred_attention_moe_input;
+        saved.combined_attention_mhc_input = combined_attention_mhc_input;
+        saved.combined_router_logits = combined_router_logits;
+    };
+
+    for (std::size_t row = 0U; row < rows; ++row) {
+        result = select(row);
+        if (!result.ok()) return result;
+        const auto hidden_row = hidden.subspan(row * stride, stride);
+        const auto phase_started = std::chrono::steady_clock::now();
+        result = trace
+            ? cuda.dsv4_mhc_begin(device, device_mhc_weights[0U][0U],
+                                  hidden_row, weighted[row], layer_inputs[row])
+            : cuda.dsv4_mhc_begin_device(device, device_mhc_weights[0U][0U],
+                                         hidden_row);
+        graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
+        if (!result.ok()) return result;
+    }
+
+    constexpr std::uint32_t branch_count = 2U * kLayers;
+    for (std::uint32_t flat = 0U; flat < branch_count; ++flat) {
+        const auto layer = flat / 2U;
+        const auto branch_index = flat % 2U;
+        const std::string branch = branch_index == 0U ? "attn" : "ffn";
+        for (std::size_t row = 0U; row < rows; ++row) {
+            result = select(row);
+            if (!result.ok()) return result;
+            load_branch_state(row);
+            // Both pending-callback tables are addressed by row for as long as
+            // one layer is being swept across the page.
+            host_moe_chain_row = static_cast<std::uint32_t>(row);
+            const auto position =
+                position_base + static_cast<std::uint32_t>(row);
+            const auto hidden_row = hidden.subspan(row * stride, stride);
+            if (trace) {
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_mhc_pre", weighted[row]);
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_norm", layer_inputs[row]);
+            }
+
+            std::vector<float> branch_output(trace ? kHidden : 0U);
+            auto phase_started = std::chrono::steady_clock::now();
+            if (branch_index == 0U) {
+                result = attention(layer, layer_inputs[row], position,
+                                   branch_output);
+                graph_stats.attention_nanoseconds +=
+                    elapsed_nanoseconds(phase_started);
+            } else {
+                result = moe(layer, tokens[row], layer_inputs[row],
+                             branch_output, position);
+                graph_stats.moe_nanoseconds +=
+                    elapsed_nanoseconds(phase_started);
+            }
+            if (!result.ok()) return result;
+            if (trace) {
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_output", branch_output);
+            }
+
+            phase_started = std::chrono::steady_clock::now();
+            if (completed_attention_mhc_transition) {
+                if (branch_index != 0U || trace) {
+                    result.errors.emplace_back(
+                        "DeepSeek combined attention transition is out of order");
+                } else {
+                    if (!deferred_attention_moe_input) {
+                        std::copy(combined_attention_mhc_input.begin(),
+                                  combined_attention_mhc_input.end(),
+                                  layer_inputs[row].begin());
+                    }
+                    completed_attention_mhc_transition = false;
+                }
+            } else if (flat + 1U < branch_count) {
+                const auto next = flat + 1U;
+                const auto next_layer = next / 2U;
+                const auto next_branch = next % 2U;
+                const bool combine_with_attention =
+                    branch_index == 1U && next_branch == 0U && !trace &&
+                    attention_state[next_layer].indexer_compressor.ratio == 0U;
+                if (combine_with_attention) {
+                    if (pending_mhc_attention_transition) {
+                        result.errors.emplace_back(
+                            "DeepSeek mHC attention transition is already pending");
+                    } else {
+                        pending_mhc_attention_transition = true;
+                    }
+                } else {
+                    auto post_output = trace ? hidden_row : std::span<float>{};
+                    result = cuda.dsv4_mhc_transition_device(
+                        device, device_mhc_weights[next_layer][next_branch],
+                        weighted[row], layer_inputs[row], post_output);
+                }
+            } else {
+                result = cuda.dsv4_mhc_finish_device(device, hidden_row);
+            }
+            graph_stats.mhc_post_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+            if (trace) {
+                record_operation_hash(position, tokens[row], layer,
+                                      branch + "_mhc_post", hidden_row);
+                if (branch_index == 1U) {
+                    record_layer_hash(position, tokens[row], layer, hidden_row);
+                }
+            }
+            store_branch_state(row);
+        }
+        host_moe_chain_row.reset();
+        if (branch_index == 1U) {
+            // One collect per layer drains the page's routed-MoE callbacks and
+            // the deferred attention appends the same layer reserved.
+            auto collected = collect_host_routed_moe_chain();
+            if (!collected.ok()) {
+                append_errors(result, std::move(collected.errors));
+                return result;
+            }
+        }
+    }
+
+    for (std::size_t row = 0U; row < rows; ++row) {
+        if (page_branch_states[row].pending_mhc_attention_transition) {
+            result.errors.emplace_back(
+                "DeepSeek mHC attention transition remained pending");
+            return result;
+        }
+    }
+    result = select(0U);
+    if (!result.ok()) return result;
+    graph_stats.forward_tokens += rows;
+    return result;
+}
+
 ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_token(
     std::uint32_t token, std::uint32_t position, bool logits_required) {
     ParseResult<std::uint32_t> result;
@@ -7592,8 +7832,63 @@ ParseResult<std::uint32_t> DeepSeekV4Runtime::Impl::forward_prefill(
         return result;
     }
     const auto hidden_stride = static_cast<std::size_t>(kMhc) * kHidden;
-    if (config.prefill_page_tokens == 1U ||
-        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+    const bool physical =
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice;
+    if (physical && config.prefill_page_tokens > 1U && tokens.size() > 1U) {
+        // Page-major over every prompt row but the last. The last row keeps
+        // the token-major path because it is the only one that may need
+        // logits, and the fused output head is defined only there.
+        defer_prefill_observability = true;
+        const auto paged_tokens = tokens.size() - 1U;
+        const auto fail = [&](ValidationResult&& status) {
+            defer_prefill_observability = false;
+            result.errors = std::move(status.errors);
+            return result;
+        };
+        for (std::size_t page_begin = 0U; page_begin < paged_tokens;
+             page_begin += config.prefill_page_tokens) {
+            const auto page_rows = std::min<std::size_t>(
+                config.prefill_page_tokens, paged_tokens - page_begin);
+            std::vector<float> hidden(page_rows * hidden_stride);
+            for (std::size_t row = 0U; row < page_rows; ++row) {
+                const auto embedding_started = std::chrono::steady_clock::now();
+                auto embedded = embed(
+                    tokens[page_begin + row],
+                    std::span<float>(hidden).subspan(
+                        row * hidden_stride, hidden_stride));
+                graph_stats.embedding_nanoseconds +=
+                    elapsed_nanoseconds(embedding_started);
+                if (!embedded.ok()) return fail(std::move(embedded));
+            }
+            ++graph_stats.prefill_pages;
+            graph_stats.prefill_max_page_tokens = std::max<std::uint64_t>(
+                graph_stats.prefill_max_page_tokens, page_rows);
+            graph_stats.prefill_max_workspace_bytes =
+                std::max<std::uint64_t>(
+                    graph_stats.prefill_max_workspace_bytes,
+                    static_cast<std::uint64_t>(page_rows) * hidden_stride *
+                        sizeof(float));
+            auto executed = device_mhc_forward_prefill_page(
+                tokens.subspan(page_begin, page_rows),
+                position_base + static_cast<std::uint32_t>(page_begin),
+                hidden);
+            if (!executed.ok()) return fail(std::move(executed));
+        }
+        defer_prefill_observability = false;
+        auto flushed = flush_prefill_observability();
+        if (!flushed.ok()) {
+            result.errors = std::move(flushed.errors);
+            return result;
+        }
+        ++graph_stats.prefill_pages;
+        graph_stats.prefill_max_page_tokens = std::max<std::uint64_t>(
+            graph_stats.prefill_max_page_tokens, 1U);
+        return forward_token(
+            tokens.back(),
+            position_base + static_cast<std::uint32_t>(tokens.size() - 1U),
+            true);
+    }
+    if (config.prefill_page_tokens == 1U || physical) {
         for (std::size_t position = 0U; position < tokens.size(); ++position) {
             ++graph_stats.prefill_pages;
             graph_stats.prefill_max_page_tokens = 1U;

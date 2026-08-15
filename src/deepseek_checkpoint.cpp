@@ -253,11 +253,6 @@ ValidationResult Dsv4ResidentWeightStore::pin(CudaBackend& backend) {
         return result;
     }
     if (pinned_) return result;
-    if (tiled_experts_) {
-        result.errors.emplace_back(
-            "host-routed experts are CPU-only and cannot be page-locked for H2D");
-        return result;
-    }
     // stage() seals the arena with mprotect(PROT_READ). cudaHostRegister
     // refuses a read-only mapping with cudaErrorInvalidValue, and
     // cudaHostRegisterReadOnly is not an escape here: all three devices report

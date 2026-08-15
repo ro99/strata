@@ -13,6 +13,7 @@ pages=${PAGES:-"64 512 4096"}
 prompt_words=${PROMPT_WORDS:-420}
 context=${CONTEXT:-16384}
 extra=${EXTRA:-}
+vram_fraction=${VRAM_FRACTION:-0.95}
 
 mkdir -p "${result_dir}"
 
@@ -37,7 +38,7 @@ for page in ${pages}; do
         --model "${model_dir}" \
         --devices "${devices}" \
         --host-memory 216G \
-        --vram-fraction 0.95 \
+        --vram-fraction "${vram_fraction}" \
         --max-context "${context}" \
         --device-resident-runtime \
         --decode-topology rank-local-tp2 \

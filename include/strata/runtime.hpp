@@ -47,6 +47,11 @@ struct RuntimeConfig {
     // NCCL build and exactly two devices, and implies the device-resident
     // contract above.
     bool deepseek_rank_local_decode{};
+    // Prompt rows per prefill page. Zero keeps the runtime default. The
+    // device-resident path executes a page layer-major over one mHC slot per
+    // row and groups the page's rows by expert; 1 restores row-at-a-time
+    // prompt processing.
+    std::uint32_t deepseek_prefill_page_tokens{};
     bool pin_resident_arena{};
     bool prepack_mhc_projection{true};
     // Placement plan cache. An empty directory selects the default location;

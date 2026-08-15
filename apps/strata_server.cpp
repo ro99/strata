@@ -46,6 +46,10 @@ struct Options {
     bool device_resident_runtime{};
     bool rank_local_decode{};
     bool pin_resident_arena{};
+    // Prompt rows per prefill page. The device-resident path executes a page
+    // layer-major and groups its rows by expert, which is exact and faster;
+    // 1 restores row-at-a-time prompt processing.
+    std::uint32_t prefill_page_tokens{};
     std::string plan_cache;
     bool dry_run{};
     bool use_plan_cache{true};
@@ -77,6 +81,7 @@ void usage() {
         << "                     [--pin-resident-arena]\n"
         << "                     [--device-resident-runtime]\n"
         << "                     [--decode-topology centralized|rank-local-tp2]\n"
+        << "                     [--prefill-page-tokens N]\n"
         << "                     [--dry-run] [--replan]\n"
         << "                     [--plan-cache DIR] [--no-plan-cache]\n\n"
         << "--device-resident-runtime is the DeepSeek device-resident decode\n"
@@ -156,6 +161,12 @@ bool parse_options(int argc, char** argv, Options& options) {
                 options.device_resident_runtime = true;
                 options.flash_attention = true;
             } else {
+                return false;
+            }
+        }
+        else if (argument == "--prefill-page-tokens") {
+            if (!strata::cli::parse_positive_u32(
+                    next(), options.prefill_page_tokens)) {
                 return false;
             }
         }
@@ -837,6 +848,7 @@ int main(int argc, char** argv) {
         options.model_type == "laguna";
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
+    config.deepseek_prefill_page_tokens = options.prefill_page_tokens;
     config.deepseek_rank_local_decode = options.rank_local_decode;
     config.pin_resident_arena = options.pin_resident_arena;
     config.verbose = options.model_type == "deepseek";

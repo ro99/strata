@@ -124,6 +124,19 @@ experts come with it. Pass `--device-resident-runtime` alone for the same
 contract on the centralized topology. Both flags work identically on
 `strata-chat` and are rejected by every non-DeepSeek `--model-type`.
 
+##### Prompt processing
+
+The device-resident path processes the prompt a page at a time, 64 rows by
+default. A page runs layer-major with one fused device mHC state per row, so
+the rows that picked the same expert share one decode of its FP4 weights
+instead of decoding them once per token. On the reference pair a 580-token
+prompt runs at **9.17 tok/s against 7.65**, and the routed-expert term itself
+is 2.18x faster. Nothing about the model changes: generated tokens, logits,
+layer and operation hashes, and the route trace including its coefficients are
+all bit-equal to row-at-a-time prompt processing, which
+`--prefill-page-tokens 1` restores. See
+[experiment 0095](docs/experiments/0095-dsv4-page-major-tp2-prefill-2026-08-15.md).
+
 Measured on 2× RTX 3090, an 18-token prompt and 31 decode steps including
 warm-up:
 

@@ -1840,40 +1840,6 @@ struct DeepSeekFp4PageGroup {
     std::uint32_t row_count{};
 };
 
-// Where one output row of a transformed shard starts, and how far apart its
-// consecutive entries are. The transform blocks output rows by 32 and
-// interleaves them, so a row's entries are 32 bytes apart instead of adjacent;
-// expressing that as a base and a stride lets both layouts share one inner
-// loop, which is what keeps the accumulation order identical.
-struct DeepSeekFp4TiledRow {
-    const unsigned char* packed{};
-    const unsigned char* scales{};
-    std::uint64_t packed_stride{1U};
-    // Each canonical group-32 scale is stored twice, once per group-16 half,
-    // so stepping a canonical group means stepping two transformed ones.
-    std::uint64_t scale_stride{1U};
-};
-
-__device__ __forceinline__ DeepSeekFp4TiledRow deepseek_fp4_tiled_row(
-    const unsigned char* shard, std::uint64_t output_row,
-    std::uint64_t region_columns, std::uint64_t scale_region_columns,
-    std::uint64_t scale_offset) {
-    const std::uint64_t block = output_row >> 5U;
-    const std::uint64_t within = output_row & 31U;
-    DeepSeekFp4TiledRow row;
-    row.packed = shard + block * region_columns * 32U + within;
-    row.scales =
-        shard + scale_offset + block * scale_region_columns * 32U + within;
-    row.packed_stride = 32U;
-    row.scale_stride = 64U;
-    return row;
-}
-
-// Per (expert, output column, row tile). The group's weight row is decoded once
-// per 32-weight group and applied to every row in the tile, so a group serving
-// `n` rows reads its weights once instead of `n` times. Each row's accumulation
-// visits the same groups in the same order as the single-row kernel, so every
-// row's result is bit-identical to issuing that row on its own.
 __global__ void deepseek_fp4_page_gate_up_kernel(
     float* activations, const float* hidden, const std::uint32_t* work_rows,
     const float* work_coefficients, const DeepSeekFp4PageGroup* groups,
@@ -1889,29 +1855,8 @@ __global__ void deepseek_fp4_page_gate_up_kernel(
     const std::uint32_t tile_rows =
         min(kDeepSeekPageRowTile, group.row_count - tile_begin);
 
-    DeepSeekFp4TiledRow gate_row;
-    DeepSeekFp4TiledRow up_row;
-    if (group.shard_intermediate != 0U) {
-        const std::uint64_t shard_intermediate = group.shard_intermediate;
-        const std::uint32_t shard =
-            static_cast<std::uint32_t>(output_row / shard_intermediate);
-        const std::uint64_t row_in_shard =
-            output_row - static_cast<std::uint64_t>(shard) * shard_intermediate;
-        const std::uint64_t scale_offset =
-            2U * shard_intermediate * (columns / 2U);
-        gate_row = deepseek_fp4_tiled_row(group.tiled[shard], row_in_shard,
-                                          columns / 2U, columns / 16U,
-                                          scale_offset);
-        up_row = deepseek_fp4_tiled_row(group.tiled[shard],
-                                        shard_intermediate + row_in_shard,
-                                        columns / 2U, columns / 16U,
-                                        scale_offset);
-    } else {
-        gate_row.packed = group.w1_weights + output_row * packed_columns;
-        gate_row.scales = group.w1_scales + output_row * scale_columns;
-        up_row.packed = group.w3_weights + output_row * packed_columns;
-        up_row.scales = group.w3_scales + output_row * scale_columns;
-    }
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
     const std::uint32_t lane = threadIdx.x & 31U;
     const std::uint32_t warp = threadIdx.x >> 5U;
     float gate[kDeepSeekPageRowTile];
@@ -1925,22 +1870,18 @@ __global__ void deepseek_fp4_page_gate_up_kernel(
          group_column += 8U) {
         float gate_scale =
             lane == 0U
-                ? fp8_e8m0_scale_bits(
-                      gate_row.scales[group_column * gate_row.scale_stride])
+                ? fp8_e8m0_scale_bits(group.w1_scales[scale_base + group_column])
                 : 0.0F;
         float up_scale =
             lane == 0U
-                ? fp8_e8m0_scale_bits(
-                      up_row.scales[group_column * up_row.scale_stride])
+                ? fp8_e8m0_scale_bits(group.w3_scales[scale_base + group_column])
                 : 0.0F;
         gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
         up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
         const std::uint64_t column = group_column * 32U + lane;
         if (column >= columns) continue;
-        const unsigned char gate_packed =
-            gate_row.packed[(column / 2U) * gate_row.packed_stride];
-        const unsigned char up_packed =
-            up_row.packed[(column / 2U) * up_row.packed_stride];
+        const unsigned char gate_packed = group.w1_weights[packed_base + column / 2U];
+        const unsigned char up_packed = group.w3_weights[packed_base + column / 2U];
         const unsigned int gate_encoded =
             column % 2U == 0U ? gate_packed & 0x0FU : gate_packed >> 4U;
         const unsigned int up_encoded =
@@ -2015,41 +1956,14 @@ __global__ void deepseek_fp4_page_down_kernel(
 
     for (std::uint64_t group_column = warp; group_column < scale_columns;
          group_column += 8U) {
-        // Down reduces over the intermediate dimension, which is what the
-        // transform shards, so the shard follows the column rather than the
-        // output row. A shard width is a multiple of 32, so a scale group
-        // never straddles two of them.
-        DeepSeekFp4TiledRow weight_row;
-        std::uint64_t shard_group = group_column;
-        std::uint64_t shard_column_base = 0U;
-        if (group.shard_intermediate != 0U) {
-            const std::uint64_t shard_intermediate = group.shard_intermediate;
-            const std::uint32_t shard = static_cast<std::uint32_t>(
-                group_column * 32U / shard_intermediate);
-            shard_column_base =
-                static_cast<std::uint64_t>(shard) * shard_intermediate;
-            shard_group = group_column - shard_column_base / 32U;
-            const std::uint64_t packed_offset =
-                2U * shard_intermediate * (rows / 2U) +
-                2U * shard_intermediate * (rows / 16U);
-            weight_row = deepseek_fp4_tiled_row(
-                group.tiled[shard] + packed_offset, output_row,
-                shard_intermediate / 2U, shard_intermediate / 16U,
-                rows * (shard_intermediate / 2U));
-        } else {
-            weight_row.packed = group.w2_weights + packed_base;
-            weight_row.scales = group.w2_scales + scale_base;
-        }
         float scale =
             lane == 0U
-                ? fp8_e8m0_scale_bits(
-                      weight_row.scales[shard_group * weight_row.scale_stride])
+                ? fp8_e8m0_scale_bits(group.w2_scales[scale_base + group_column])
                 : 0.0F;
         scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
         const std::uint64_t column = group_column * 32U + lane;
         if (column >= columns) continue;
-        const unsigned char packed = weight_row.packed
-            [((column - shard_column_base) / 2U) * weight_row.packed_stride];
+        const unsigned char packed = group.w2_weights[packed_base + column / 2U];
         const unsigned int encoded =
             column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
         const float weight = fp4_e2m1_value(encoded);
@@ -2068,6 +1982,203 @@ __global__ void deepseek_fp4_page_down_kernel(
         if (threadIdx.x != 0U || index >= tile_rows) continue;
         const std::uint64_t slot = group.row_offset + tile_begin + index;
         output[slot * rows + output_row] = bf16_round(reduced);
+    }
+}
+
+// The transformed layout puts 32 consecutive output rows of one block in 32
+// consecutive bytes, so a warp that owns those rows reads a whole sector per
+// fetch. The canonical decomposition cannot: its block owns one output row and
+// spreads 256 threads across the reduction, so it uses a thirty-second of
+// every sector it pulls -- measured at 2.87x on the kernel.
+//
+// Owning the block instead means one lane per output row, and each lane sums
+// its own row over the whole reduction in increasing column order. That is a
+// reassociation of the canonical 256-partial tree, not a different
+// computation: the same terms, the same per-term
+// `fma(input * fp4_value, scale, accumulator)`, summed in a different order.
+// It is therefore gated against the scalar oracle rather than against the
+// canonical kernel bit for bit.
+constexpr std::uint32_t kDeepSeekTiledWarps = 8U;
+constexpr std::uint32_t kDeepSeekTiledRowTile = 8U;
+
+__global__ void deepseek_fp4_tiled_page_gate_up_kernel(
+    float* activations, const float* hidden, const std::uint32_t* work_rows,
+    const float* work_coefficients, const DeepSeekFp4PageGroup* groups,
+    std::uint32_t group_count, std::uint64_t columns,
+    std::uint64_t intermediate, float swiglu_limit, const float* bf16_silu,
+    unsigned int* error_flag) {
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint64_t output_block =
+        static_cast<std::uint64_t>(blockIdx.x) * kDeepSeekTiledWarps + warp;
+    const std::uint32_t group_index = blockIdx.y;
+    const std::uint64_t output_row = output_block * 32U + lane;
+    if (output_row >= intermediate || group_index >= group_count) return;
+    const DeepSeekFp4PageGroup group = groups[group_index];
+    const std::uint32_t tile_begin = blockIdx.z * kDeepSeekTiledRowTile;
+    if (tile_begin >= group.row_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekTiledRowTile, group.row_count - tile_begin);
+
+    const std::uint64_t shard_intermediate = group.shard_intermediate;
+    const std::uint32_t shard =
+        static_cast<std::uint32_t>(output_row / shard_intermediate);
+    const std::uint64_t row_in_shard =
+        output_row - static_cast<std::uint64_t>(shard) * shard_intermediate;
+    const unsigned char* base = group.tiled[shard];
+    const unsigned char* scales_base =
+        base + 2U * shard_intermediate * (columns / 2U);
+    // A shard width is a multiple of 32, so every lane of the warp shares the
+    // transform block and differs only in `within` -- which is the lane index.
+    // That is what makes each fetch one contiguous 32-byte run.
+    const std::uint64_t gate_block = row_in_shard >> 5U;
+    const std::uint64_t up_block = (shard_intermediate + row_in_shard) >> 5U;
+    const unsigned char* gate_packed =
+        base + gate_block * (columns / 2U) * 32U + lane;
+    const unsigned char* up_packed =
+        base + up_block * (columns / 2U) * 32U + lane;
+    const unsigned char* gate_scales =
+        scales_base + gate_block * (columns / 16U) * 32U + lane;
+    const unsigned char* up_scales =
+        scales_base + up_block * (columns / 16U) * 32U + lane;
+
+    float gate[kDeepSeekTiledRowTile];
+    float up[kDeepSeekTiledRowTile];
+    std::uint64_t input_base[kDeepSeekTiledRowTile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        gate[index] = 0.0F;
+        up[index] = 0.0F;
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        input_base[index] =
+            static_cast<std::uint64_t>(
+                work_rows[group.row_offset + tile_begin + local]) *
+            columns;
+    }
+
+    float gate_scale = 0.0F;
+    float up_scale = 0.0F;
+    for (std::uint64_t pair = 0U; pair < columns / 2U; ++pair) {
+        const std::uint64_t column = pair * 2U;
+        if ((column & 31U) == 0U) {
+            // Each canonical group-32 scale is stored twice, once per group-16
+            // half; the first copy is taken.
+            const std::uint64_t slot = (column >> 5U) * 64U;
+            gate_scale = fp8_e8m0_scale_bits(gate_scales[slot]);
+            up_scale = fp8_e8m0_scale_bits(up_scales[slot]);
+        }
+        const unsigned char gate_byte = gate_packed[pair * 32U];
+        const unsigned char up_byte = up_packed[pair * 32U];
+        const float gate_low = fp4_e2m1_value(gate_byte & 0x0FU);
+        const float gate_high = fp4_e2m1_value(gate_byte >> 4U);
+        const float up_low = fp4_e2m1_value(up_byte & 0x0FU);
+        const float up_high = fp4_e2m1_value(up_byte >> 4U);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+            const float first = hidden[input_base[index] + column];
+            const float second = hidden[input_base[index] + column + 1U];
+            gate[index] = fmaf(first * gate_low, gate_scale, gate[index]);
+            gate[index] = fmaf(second * gate_high, gate_scale, gate[index]);
+            up[index] = fmaf(first * up_low, up_scale, up[index]);
+            up[index] = fmaf(second * up_high, up_scale, up[index]);
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        if (index >= tile_rows) continue;
+        const std::uint32_t slot = group.row_offset + tile_begin + index;
+        const std::uint64_t destination =
+            static_cast<std::uint64_t>(slot) * intermediate + output_row;
+        const float rounded_gate = bf16_round(gate[index]);
+        const float rounded_up = bf16_round(up[index]);
+        if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+            atomicExch(error_flag, 1U);
+            activations[destination] = __uint_as_float(0x7FC0'0000U);
+            continue;
+        }
+        const float limited_gate = fminf(rounded_gate, swiglu_limit);
+        const float limited_up =
+            fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+        const auto gate_bits =
+            static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+        float activated = bf16_silu[gate_bits] * limited_up;
+        activated *= work_coefficients[slot];
+        activations[destination] = bf16_round(activated);
+    }
+}
+
+__global__ void deepseek_fp4_tiled_page_down_kernel(
+    float* output, const float* activations,
+    const DeepSeekFp4PageGroup* groups, std::uint32_t group_count,
+    std::uint64_t columns, std::uint64_t rows) {
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint64_t output_block =
+        static_cast<std::uint64_t>(blockIdx.x) * kDeepSeekTiledWarps + warp;
+    const std::uint32_t group_index = blockIdx.y;
+    const std::uint64_t output_row = output_block * 32U + lane;
+    if (output_row >= rows || group_index >= group_count) return;
+    const DeepSeekFp4PageGroup group = groups[group_index];
+    const std::uint32_t tile_begin = blockIdx.z * kDeepSeekTiledRowTile;
+    if (tile_begin >= group.row_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekTiledRowTile, group.row_count - tile_begin);
+
+    const std::uint64_t shard_intermediate = group.shard_intermediate;
+    const std::uint64_t block = output_block;
+    float sum[kDeepSeekTiledRowTile];
+    std::uint64_t input_base[kDeepSeekTiledRowTile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        sum[index] = 0.0F;
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        input_base[index] =
+            static_cast<std::uint64_t>(
+                group.row_offset + tile_begin + local) * columns;
+    }
+
+    // Down reduces over the intermediate dimension, which is what the
+    // transform shards, so the shards are visited in order and each supplies a
+    // contiguous run of the reduction.
+    for (std::uint32_t shard = 0U; shard < kCudaDsv4TiledShards; ++shard) {
+        const std::uint64_t shard_base =
+            static_cast<std::uint64_t>(shard) * shard_intermediate;
+        if (shard_base >= columns) break;
+        const unsigned char* base = group.tiled[shard] +
+            2U * shard_intermediate * (rows / 2U) +
+            2U * shard_intermediate * (rows / 16U);
+        const unsigned char* packed =
+            base + block * (shard_intermediate / 2U) * 32U + lane;
+        const unsigned char* scales = base +
+            rows * (shard_intermediate / 2U) +
+            block * (shard_intermediate / 16U) * 32U + lane;
+        float scale = 0.0F;
+        for (std::uint64_t pair = 0U; pair < shard_intermediate / 2U; ++pair) {
+            const std::uint64_t local_column = pair * 2U;
+            if ((local_column & 31U) == 0U) {
+                scale = fp8_e8m0_scale_bits(scales[(local_column >> 5U) * 64U]);
+            }
+            const unsigned char byte = packed[pair * 32U];
+            const float low = fp4_e2m1_value(byte & 0x0FU);
+            const float high = fp4_e2m1_value(byte >> 4U);
+            const std::uint64_t column = shard_base + local_column;
+#pragma unroll
+            for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile;
+                 ++index) {
+                const float first = activations[input_base[index] + column];
+                const float second = activations[input_base[index] + column + 1U];
+                sum[index] = fmaf(first * low, scale, sum[index]);
+                sum[index] = fmaf(second * high, scale, sum[index]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        if (index >= tile_rows) continue;
+        const std::uint64_t slot = group.row_offset + tile_begin + index;
+        output[slot * rows + output_row] = bf16_round(sum[index]);
     }
 }
 
@@ -14261,17 +14372,36 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
         const auto gate_scale_columns = (hidden_columns + 31U) / 32U;
         const auto down_packed_columns = (intermediate_columns + 1U) / 2U;
         const auto down_scale_columns = (intermediate_columns + 31U) / 32U;
+        const bool tiled = shard_intermediate != 0U;
+        const auto row_tile =
+            tiled ? kDeepSeekTiledRowTile : kDeepSeekPageRowTile;
         const auto row_tiles = static_cast<unsigned int>(
-            (maximum_group_rows + kDeepSeekPageRowTile - 1U) /
-            kDeepSeekPageRowTile);
-        const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
-                             static_cast<unsigned int>(groups.size()), row_tiles);
-        deepseek_fp4_page_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
-            state.moe_activations, state.moe_hidden, state.moe_page_rows,
-            state.moe_page_coefficients, device_groups,
-            static_cast<std::uint32_t>(groups.size()), hidden_columns,
-            intermediate_columns, gate_packed_columns, gate_scale_columns,
-            swiglu_limit, state.moe_bf16_silu, state.moe_error);
+            (maximum_group_rows + row_tile - 1U) / row_tile);
+        // The transformed kernel gives one warp a whole 32-row transform block
+        // and one output row to each of its lanes.
+        const auto tiled_output_blocks = static_cast<unsigned int>(
+            (intermediate_columns / 32U + kDeepSeekTiledWarps - 1U) /
+            kDeepSeekTiledWarps);
+        const dim3 gate_grid(
+            tiled ? tiled_output_blocks
+                  : static_cast<unsigned int>(intermediate_columns),
+            static_cast<unsigned int>(groups.size()), row_tiles);
+        if (tiled) {
+            deepseek_fp4_tiled_page_gate_up_kernel<<<
+                gate_grid, threads, 0U, state.stream>>>(
+                state.moe_activations, state.moe_hidden, state.moe_page_rows,
+                state.moe_page_coefficients, device_groups,
+                static_cast<std::uint32_t>(groups.size()), hidden_columns,
+                intermediate_columns, swiglu_limit, state.moe_bf16_silu,
+                state.moe_error);
+        } else {
+            deepseek_fp4_page_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+                state.moe_activations, state.moe_hidden, state.moe_page_rows,
+                state.moe_page_coefficients, device_groups,
+                static_cast<std::uint32_t>(groups.size()), hidden_columns,
+                intermediate_columns, gate_packed_columns, gate_scale_columns,
+                swiglu_limit, state.moe_bf16_silu, state.moe_error);
+        }
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek FP4 page W1/W3 SwiGLU");
@@ -14290,12 +14420,25 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
                           "launch DeepSeek page routed activation quantization");
             return result;
         }
-        const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
-                             static_cast<unsigned int>(groups.size()), row_tiles);
-        deepseek_fp4_page_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
-            state.moe_output, state.moe_activations, device_groups,
-            static_cast<std::uint32_t>(groups.size()), intermediate_columns,
-            hidden_columns, down_packed_columns, down_scale_columns);
+        const auto tiled_down_blocks = static_cast<unsigned int>(
+            (hidden_columns / 32U + kDeepSeekTiledWarps - 1U) /
+            kDeepSeekTiledWarps);
+        const dim3 down_grid(
+            tiled ? tiled_down_blocks
+                  : static_cast<unsigned int>(hidden_columns),
+            static_cast<unsigned int>(groups.size()), row_tiles);
+        if (tiled) {
+            deepseek_fp4_tiled_page_down_kernel<<<
+                down_grid, threads, 0U, state.stream>>>(
+                state.moe_output, state.moe_activations, device_groups,
+                static_cast<std::uint32_t>(groups.size()),
+                intermediate_columns, hidden_columns);
+        } else {
+            deepseek_fp4_page_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+                state.moe_output, state.moe_activations, device_groups,
+                static_cast<std::uint32_t>(groups.size()), intermediate_columns,
+                hidden_columns, down_packed_columns, down_scale_columns);
+        }
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek FP4 page W2");

@@ -747,9 +747,8 @@ public:
         auto result = ensure(slot, base, output_columns, input_columns,
                              LoadKind::Demand, entry);
         if (!result.ok()) return result;
-        result = backend_.matmul(entry->weight, input, rows, output);
-        if (result.ok() && bf16_output) round_bf16(output);
-        return result;
+        return backend_.matmul(entry->weight, input, rows, output,
+                               bf16_output);
     }
 
     ValidationResult grouped(std::size_t slot, std::string_view base,
@@ -4148,30 +4147,34 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     result = linear_rows(slot, prefix + "wq_b", query_stride, kQueryRank,
                          query_rank, rows, queries);
     if (!result.ok()) return result;
-    const auto normalize_query = [&](std::size_t task) {
-        const auto row = task / kHeads;
-        const auto head = task % kHeads;
-        auto query = std::span<float>(queries).subspan(
-            row * query_stride + head * kHeadDim, kHeadDim);
-        double square_sum = 0.0;
-        for (const float value : query) {
-            square_sum += static_cast<double>(value) * value;
+    // One task per row rather than per (row, head). A head is about 1,500
+    // flops, so at 64 heads a page of 677 rows dispatched 1.86 million tasks
+    // across 43 layers and spent 11.2 s in pool overhead for work that is
+    // nowhere near that size.
+    const auto normalize_query_row = [&](std::size_t row) {
+        for (std::uint32_t head = 0U; head < kHeads; ++head) {
+            auto query = std::span<float>(queries).subspan(
+                row * query_stride + head * kHeadDim, kHeadDim);
+            double square_sum = 0.0;
+            for (const float value : query) {
+                square_sum += static_cast<double>(value) * value;
+            }
+            const float reciprocal = 1.0F / std::sqrt(
+                static_cast<float>(square_sum / kHeadDim) + kRmsEpsilon);
+            for (auto& value : query) value = round_bf16(value * reciprocal);
+            apply_rope(query.last(kRopeDim),
+                       position_base + static_cast<std::uint32_t>(row),
+                       attention_state[layer].frequencies);
+            round_bf16(query.last(kRopeDim));
         }
-        const float reciprocal = 1.0F / std::sqrt(
-            static_cast<float>(square_sum / kHeadDim) + kRmsEpsilon);
-        for (auto& value : query) value = round_bf16(value * reciprocal);
-        apply_rope(query.last(kRopeDim),
-                   position_base + static_cast<std::uint32_t>(row),
-                   attention_state[layer].frequencies);
-        round_bf16(query.last(kRopeDim));
     };
-    if (attention_workers != nullptr) {
-        result = attention_workers->parallel_for(
-            row_count * kHeads, normalize_query);
+    if (attention_workers != nullptr && row_count > 1U) {
+        result = attention_workers->parallel_for(row_count,
+                                                 normalize_query_row);
         if (!result.ok()) return result;
     } else {
-        for (std::size_t task = 0U; task < row_count * kHeads; ++task) {
-            normalize_query(task);
+        for (std::size_t row = 0U; row < row_count; ++row) {
+            normalize_query_row(row);
         }
     }
     graph_stats.attention_query_nanoseconds += elapsed_nanoseconds(subphase_started);

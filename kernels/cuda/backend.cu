@@ -224,30 +224,59 @@ __global__ void expand_bf16_activation_kernel(
     if (index < columns) destination[index] = __bfloat162float(source[index]);
 }
 
+// A block owns one output row and a tile of input rows. One block per (output
+// row, input row) reads the whole weight row again for every input row, which
+// for the 32,768 by 1,536 query projection is 263 GB a layer at a 2,612-token
+// page -- 11.3 TB over the prompt, for 11.3 TFLOP of arithmetic. Tiling the
+// input rows reads the weight once for the tile and leaves each output's
+// reduction exactly as it was: the same block-wide tree over the same terms.
+constexpr std::uint32_t kPlainMatmulRowTile = 16U;
+
+template <std::uint32_t Tile>
 __global__ void plain_matmul_kernel(float* output, const float* input,
                                     const void* weights, int dtype,
                                     std::uint32_t batch, std::uint64_t columns,
                                     std::uint64_t rows, std::uint32_t groups,
                                     std::uint64_t rows_per_group) {
     const std::uint64_t output_row = blockIdx.x;
-    const std::uint32_t batch_row = blockIdx.y;
-    if (output_row >= rows || batch_row >= batch) return;
-    float sum = 0.0F;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
     const std::uint64_t weight_base = output_row * columns;
-    const std::uint64_t input_row = groups == 0U
-                                        ? batch_row
-                                        : static_cast<std::uint64_t>(batch_row) *
-                                              groups +
-                                              output_row / rows_per_group;
-    const std::uint64_t input_base = input_row * columns;
-    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
-        sum += plain_value(weights, dtype, weight_base + column) * input[input_base + column];
+    float sum[Tile];
+    std::uint64_t input_base[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        sum[index] = 0.0F;
+        // Rows past the tail recompute row zero and are never written, which
+        // keeps the accumulators statically indexed and in registers.
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        const std::uint64_t batch_row = tile_begin + local;
+        const std::uint64_t input_row = groups == 0U
+                                            ? batch_row
+                                            : batch_row * groups +
+                                                  output_row / rows_per_group;
+        input_base[index] = input_row * columns;
     }
-    sum = reduce_block(sum);
-    if (threadIdx.x == 0) {
+    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        const float weight = plain_value(weights, dtype, weight_base + column);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            sum[index] += weight * input[input_base[index] + column];
+        }
+    }
+    // `tile_rows` is uniform across the block, so skipping the tail skips the
+    // barrier for every thread alike. A batch of one therefore pays exactly
+    // one reduction, as it did before the tile existed.
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        if (index >= tile_rows) continue;
+        __syncthreads();
+        const float reduced = reduce_block(sum[index]);
+        if (threadIdx.x != 0U) continue;
         const std::uint64_t output_index =
-            static_cast<std::uint64_t>(batch_row) * rows + output_row;
-        output[output_index] = sum;
+            static_cast<std::uint64_t>(tile_begin + index) * rows + output_row;
+        output[output_index] = reduced;
     }
 }
 
@@ -403,6 +432,56 @@ __global__ void bf16_matvec_kernel(
             sum, __shfl_down_sync(0xFFFF'FFFFU, sum, offset));
     }
     if (lane == 0U) output[output_row] = sum;
+}
+
+// bf16_matvec_kernel over a tile of input rows. The 256-thread block kernel is
+// shaped for a long reduction: at the 32,768 by 1,024 query projection it gives
+// each thread four columns and then runs a block-wide tree per output, so the
+// reductions cost more than the arithmetic. One warp per output row keeps the
+// same __fadd_rn/__fmul_rn accumulation and the same shuffle tree as the
+// batch-of-one path, so a row of this is bit-identical to a call of that.
+constexpr std::uint32_t kBf16MatvecRowTile = 16U;
+
+template <std::uint32_t Tile>
+__global__ void bf16_matvec_rows_kernel(
+    float* output, const float* input, const __nv_bfloat16* weights,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x) *
+                                warps_per_block + warp;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
+
+    const auto base = output_row * columns;
+    float sum[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) sum[index] = 0.0F;
+    for (std::uint64_t column = lane; column < columns; column += warpSize) {
+        const float weight = __bfloat162float(weights[base + column]);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const auto input_base =
+                static_cast<std::uint64_t>(tile_begin + local) * columns;
+            sum[index] = __fadd_rn(
+                sum[index], __fmul_rn(input[input_base + column], weight));
+        }
+    }
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        float value = sum[index];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = __fadd_rn(
+                value, __shfl_down_sync(0xFFFF'FFFFU, value, offset));
+        }
+        if (lane == 0U && index < tile_rows) {
+            output[static_cast<std::uint64_t>(tile_begin + index) * rows +
+                   output_row] = value;
+        }
+    }
 }
 
 // Same accumulation contract as bf16_matvec_kernel, with an already-resident
@@ -6028,8 +6107,10 @@ ValidationResult CudaBackend::gemma4_decode_layers(
 ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::span<const float> input,
                                      std::uint32_t rows,
-                                     std::span<float> output) {
-    return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F);
+                                     std::span<float> output,
+                                     bool round_bf16_output) {
+    return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F,
+                       round_bf16_output);
 }
 
 ValidationResult CudaBackend::matmul_softcap(
@@ -10059,7 +10140,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
             1U, a.columns, a.rows, output_groups, 1024U);
     } else {
-        plain_matmul_kernel<<<output_rank_elements, threads, 0U, state.stream>>>(
+        plain_matmul_kernel<1U><<<output_rank_elements, threads, 0U, state.stream>>>(
             device_output_rank, device_decoded, output_a->impl_->weights,
             static_cast<int>(a.dtype), 1U, a.columns, a.rows,
             output_groups, 1024U);
@@ -12113,7 +12194,7 @@ ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
             static_cast<const __nv_bfloat16*>(head.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
-        plain_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+        plain_matmul_kernel<1U><<<grid, threads, 0U, state.stream>>>(
             state.dsv4_mhc_head_output, state.dsv4_mhc_head_input,
             head.impl_->weights, static_cast<int>(descriptor.dtype), 1U,
             descriptor.columns, descriptor.rows, 0U, 0U);
@@ -12528,7 +12609,8 @@ ValidationResult CudaBackend::glm_absorbed_attention(
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
-    std::uint64_t rows_per_group, std::span<float> output, float softcap) {
+    std::uint64_t rows_per_group, std::span<float> output, float softcap,
+    bool round_output) {
     ValidationResult result;
     if (!weight.valid()) {
         result.errors.emplace_back("CUDA matmul received an invalid weight");
@@ -12645,6 +12727,11 @@ ValidationResult CudaBackend::matmul_impl(
             state.input, descriptor.columns, input_rows);
     }
     const dim3 grid(static_cast<unsigned int>(descriptor.rows), rows, 1U);
+    // Only the plain kernel tiles its input rows; every other encoding here
+    // still takes one block per (output row, input row).
+    const dim3 plain_grid(
+        static_cast<unsigned int>(descriptor.rows),
+        (rows + kPlainMatmulRowTile - 1U) / kPlainMatmulRowTile, 1U);
     constexpr unsigned int threads = 256U;
     if (descriptor.encoding == CudaWeightEncoding::Plain &&
         descriptor.dtype == SafetensorsDtype::Bf16 && rows == 1U &&
@@ -12657,7 +12744,24 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const __nv_bfloat16*>(weight.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
-        plain_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+        if (rows == 1U) {
+            plain_matmul_kernel<1U><<<grid, threads, 0, state.stream>>>(
+                state.output, state.input, weight.impl_->weights,
+                static_cast<int>(descriptor.dtype), rows, descriptor.columns,
+                descriptor.rows, groups, rows_per_group);
+        } else if (descriptor.dtype == SafetensorsDtype::Bf16 && groups == 0U) {
+            constexpr unsigned int warps_per_block = threads / 32U;
+            const dim3 matvec_grid(
+                static_cast<unsigned int>(
+                    (descriptor.rows + warps_per_block - 1U) / warps_per_block),
+                (rows + kBf16MatvecRowTile - 1U) / kBf16MatvecRowTile, 1U);
+            bf16_matvec_rows_kernel<kBf16MatvecRowTile><<<
+                matvec_grid, threads, 0, state.stream>>>(
+                state.output, state.input,
+                static_cast<const __nv_bfloat16*>(weight.impl_->weights), rows,
+                descriptor.columns, descriptor.rows);
+        } else
+        plain_matmul_kernel<kPlainMatmulRowTile><<<plain_grid, threads, 0, state.stream>>>(
             state.output, state.input, weight.impl_->weights,
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
             descriptor.rows, groups, rows_per_group);
@@ -12712,6 +12816,19 @@ ValidationResult CudaBackend::matmul_impl(
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch CUDA matmul");
+    }
+    if (round_output) {
+        // The caller's BF16 boundary, applied where the values already are.
+        // Rounding on the host is a single-threaded pass over the whole
+        // activation: the 32,768-wide query projection alone is 954 million
+        // floats over a 677-token prompt.
+        const auto rounded_blocks = static_cast<unsigned int>(
+            (output.size() + threads - 1U) / threads);
+        dsv4_round_float_bf16<<<rounded_blocks, threads, 0, state.stream>>>(
+            state.output, output.size());
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(status, "launch CUDA activation rounding");
+        }
     }
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.kernel_finished, state.stream);

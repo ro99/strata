@@ -784,9 +784,12 @@ public:
         int device, std::span<const CudaGemma4DecodeLayer> layers,
         std::span<const float> input, std::uint32_t position,
         std::span<float> output);
+    // `round_bf16_output` applies the caller's BF16 boundary on the device,
+    // before the download, instead of in a host pass over the result.
     [[nodiscard]] ValidationResult matmul(
         const CudaWeight& weight, std::span<const float> input,
-        std::uint32_t rows, std::span<float> output);
+        std::uint32_t rows, std::span<float> output,
+        bool round_bf16_output = false);
     [[nodiscard]] ValidationResult matmul_softcap(
         const CudaWeight& weight, std::span<const float> input,
         float softcap, std::span<float> output);
@@ -1067,7 +1070,7 @@ private:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,
         std::uint64_t rows_per_group, std::span<float> output,
-        float softcap);
+        float softcap, bool round_output = false);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

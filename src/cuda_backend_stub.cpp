@@ -162,6 +162,14 @@ ValidationResult CudaBackend::upload_dsv4_mhc_weights(
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_mhc_select_slot(int, std::uint32_t) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::dsv4_mhc_reserve_slots(int, std::uint32_t) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::dsv4_mhc_begin(
     int, const CudaDsv4MhcWeights&, std::span<const float>,
     std::span<float>, std::span<float>) {

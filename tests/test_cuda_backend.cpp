@@ -1660,6 +1660,128 @@ TEST_CASE("native CUDA DeepSeek paged attention reads persistent physical pages"
                 2U * sizeof(unsigned int));
 }
 
+TEST_CASE("native CUDA DeepSeek device mHC slots interleave rows exactly") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const auto device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_devices{device};
+    REQUIRE(backend.initialize(selected_devices, true).ok());
+    if (!backend.validate_dsv4_mhc_device(device).ok()) return;
+
+    constexpr std::size_t hidden = 4096U;
+    constexpr std::size_t multiplier = 4U;
+    constexpr std::size_t mixes = 24U;
+    constexpr std::size_t rows = 3U;
+    constexpr std::size_t transitions = 2U;
+
+    // A degenerate all-ones state cannot distinguish an exact swap from a
+    // stale one, so every input is a distinct deterministic value.
+    std::uint32_t seed = 0x5eed1234U;
+    const auto next_value = [&seed]() {
+        seed = seed * 1'664'525U + 1'013'904'223U;
+        return static_cast<float>(static_cast<std::int32_t>(seed >> 8U) %
+                                  2'048) / 4'096.0F;
+    };
+    std::vector<float> projection(mixes * multiplier * hidden);
+    for (auto& value : projection) value = next_value();
+    std::array<float, 3> scale{0.5F, 1.25F, 0.75F};
+    std::array<float, mixes> base{};
+    for (auto& value : base) value = next_value();
+    std::vector<float> norm(hidden);
+    for (auto& value : norm) value = 1.0F + next_value();
+    strata::CudaDsv4MhcWeights weights;
+    REQUIRE(backend.upload_dsv4_mhc_weights(
+        device, projection, scale, base, norm, weights).ok());
+
+    std::vector<std::vector<float>> initial(rows);
+    std::vector<std::array<std::vector<float>, transitions + 1U>> branches(rows);
+    for (std::size_t row = 0U; row < rows; ++row) {
+        initial[row].resize(multiplier * hidden);
+        for (auto& value : initial[row]) value = next_value();
+        for (auto& branch : branches[row]) {
+            branch.resize(hidden);
+            for (auto& value : branch) value = next_value();
+        }
+    }
+
+    const auto bits = [](const std::vector<float>& values) {
+        std::vector<std::uint32_t> encoded(values.size());
+        for (std::size_t index = 0U; index < values.size(); ++index) {
+            encoded[index] = std::bit_cast<std::uint32_t>(values[index]);
+        }
+        return encoded;
+    };
+
+    // Reference: every row runs to completion before the next one starts,
+    // which is the accepted token-major order.
+    std::vector<std::vector<std::uint32_t>> reference_inputs;
+    std::vector<std::vector<std::uint32_t>> reference_residuals;
+    for (std::size_t row = 0U; row < rows; ++row) {
+        std::vector<float> layer_input(hidden);
+        std::vector<float> residual(multiplier * hidden);
+        REQUIRE(backend.dsv4_mhc_begin(
+            device, weights, initial[row], std::span<float>{},
+            layer_input).ok());
+        reference_inputs.push_back(bits(layer_input));
+        for (std::size_t step = 0U; step < transitions; ++step) {
+            REQUIRE(backend.dsv4_mhc_transition(
+                device, weights, branches[row][step], std::span<float>{},
+                layer_input).ok());
+            reference_inputs.push_back(bits(layer_input));
+        }
+        REQUIRE(backend.dsv4_mhc_finish(
+            device, branches[row][transitions], residual).ok());
+        reference_residuals.push_back(bits(residual));
+    }
+
+    // Candidate: one slot per row, advanced step by step across all rows.
+    REQUIRE(backend.dsv4_mhc_reserve_slots(device, rows).ok());
+    std::vector<std::vector<std::uint32_t>> candidate_inputs(
+        rows * (transitions + 1U));
+    std::vector<std::vector<std::uint32_t>> candidate_residuals(rows);
+    std::vector<std::vector<float>> layer_inputs(
+        rows, std::vector<float>(hidden));
+    std::vector<std::vector<float>> residuals(
+        rows, std::vector<float>(multiplier * hidden));
+    for (std::size_t row = 0U; row < rows; ++row) {
+        REQUIRE(backend.dsv4_mhc_select_slot(
+            device, static_cast<std::uint32_t>(row)).ok());
+        REQUIRE(backend.dsv4_mhc_begin(
+            device, weights, initial[row], std::span<float>{},
+            layer_inputs[row]).ok());
+        candidate_inputs[row * (transitions + 1U)] = bits(layer_inputs[row]);
+    }
+    for (std::size_t step = 0U; step < transitions; ++step) {
+        for (std::size_t row = 0U; row < rows; ++row) {
+            REQUIRE(backend.dsv4_mhc_select_slot(
+                device, static_cast<std::uint32_t>(row)).ok());
+            REQUIRE(backend.dsv4_mhc_transition(
+                device, weights, branches[row][step], std::span<float>{},
+                layer_inputs[row]).ok());
+            candidate_inputs[row * (transitions + 1U) + step + 1U] =
+                bits(layer_inputs[row]);
+        }
+    }
+    for (std::size_t row = 0U; row < rows; ++row) {
+        REQUIRE(backend.dsv4_mhc_select_slot(
+            device, static_cast<std::uint32_t>(row)).ok());
+        REQUIRE(backend.dsv4_mhc_finish(
+            device, branches[row][transitions], residuals[row]).ok());
+        candidate_residuals[row] = bits(residuals[row]);
+    }
+    REQUIRE(backend.dsv4_mhc_select_slot(device, 0U).ok());
+
+    REQUIRE(candidate_inputs == reference_inputs);
+    REQUIRE(candidate_residuals == reference_residuals);
+
+    // Out-of-range and out-of-order selections must be refused rather than
+    // silently binding another row's state.
+    REQUIRE(!backend.dsv4_mhc_select_slot(device, 256U).ok());
+    REQUIRE(!backend.dsv4_mhc_reserve_slots(device, 0U).ok());
+    REQUIRE(!backend.dsv4_mhc_reserve_slots(device, 257U).ok());
+}
+
 TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

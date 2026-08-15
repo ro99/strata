@@ -3928,6 +3928,22 @@ struct alignas(256) Dsv4MhcWorkspace {
     unsigned int failure{};
 };
 
+// One prompt row's fused mHC state. The device workspace holds the residual
+// pair, branch, weighted, layer input, partial reductions, pre/post, the
+// Sinkhorn combination, and the router logits; the three scalars are the host
+// half of the same state machine. Together they are the complete state a
+// transition reads and writes, which is what makes swapping slots exact.
+struct Dsv4MhcSlotState {
+    Dsv4MhcWorkspace* workspace{};
+    std::uint32_t stage{};
+    std::uint32_t residual_index{};
+    bool branch_ready{};
+};
+
+// A page cannot exceed the prompt page bound the runtime admits. This only
+// bounds the slot table itself; each slot costs one workspace.
+constexpr std::uint32_t kDsv4MhcMaximumSlots = 256U;
+
 constexpr std::uint64_t kDsv4MhcMaximumHostStagingBytes =
     static_cast<std::uint64_t>(
         kDsv4MhcMultiplier * kDsv4MhcHidden + 2U * kDsv4MhcHidden) *
@@ -4311,6 +4327,13 @@ struct CudaBackend::Impl {
         std::uint32_t dsv4_mhc_stage{};
         std::uint32_t dsv4_mhc_residual_index{};
         bool dsv4_mhc_branch_ready{};
+        // Saved fused mHC state of every slot that is not currently selected.
+        // The four fields above are the selected slot's live copy; selecting a
+        // different slot writes them back here and loads that slot's copy.
+        // `dsv4_mhc_saved_slots[dsv4_mhc_active_slot]` is therefore stale by
+        // construction and must never be freed.
+        std::vector<Dsv4MhcSlotState> dsv4_mhc_saved_slots{};
+        std::uint32_t dsv4_mhc_active_slot{};
         bool dsv4_mhc_failed{};
         float* dsv4_mhc_head_input{};
         float* dsv4_mhc_head_output{};
@@ -4426,6 +4449,14 @@ struct CudaBackend::Impl {
             }
             if (state.dsv4_mhc_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_mhc_workspace));
+            }
+            for (std::size_t slot = 0U;
+                 slot < state.dsv4_mhc_saved_slots.size(); ++slot) {
+                if (slot == state.dsv4_mhc_active_slot) continue;
+                auto* workspace = state.dsv4_mhc_saved_slots[slot].workspace;
+                if (workspace != nullptr) {
+                    static_cast<void>(cudaFree(workspace));
+                }
             }
             if (state.gemma_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.gemma_workspace));
@@ -10532,6 +10563,105 @@ ValidationResult CudaBackend::upload_dsv4_mhc_weights(
             target->auxiliary.device_bytes();
     }
     output.impl_ = std::move(target);
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_select_slot(
+    int device, std::uint32_t slot) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || slot >= kDsv4MhcMaximumSlots) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection is out of range");
+        return result;
+    }
+    if (state.moe_in_flight || state.dsv4_mhc_head_in_flight) {
+        // A slot swap rebinds what every later command reads. Doing it while
+        // asynchronous work still owns the current workspace would let that
+        // work land in another row's state.
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection is out of order");
+        return result;
+    }
+    if (slot == state.dsv4_mhc_active_slot) return result;
+    const auto required = static_cast<std::size_t>(
+        std::max(slot, state.dsv4_mhc_active_slot)) + 1U;
+    if (state.dsv4_mhc_saved_slots.size() < required) {
+        state.dsv4_mhc_saved_slots.resize(required);
+    }
+    auto& outgoing = state.dsv4_mhc_saved_slots[state.dsv4_mhc_active_slot];
+    outgoing.workspace = state.dsv4_mhc_workspace;
+    outgoing.stage = state.dsv4_mhc_stage;
+    outgoing.residual_index = state.dsv4_mhc_residual_index;
+    outgoing.branch_ready = state.dsv4_mhc_branch_ready;
+    const auto& incoming = state.dsv4_mhc_saved_slots[slot];
+    state.dsv4_mhc_workspace = incoming.workspace;
+    state.dsv4_mhc_stage = incoming.stage;
+    state.dsv4_mhc_residual_index = incoming.residual_index;
+    state.dsv4_mhc_branch_ready = incoming.branch_ready;
+    state.dsv4_mhc_workspace_bytes =
+        incoming.workspace == nullptr ? 0U : sizeof(Dsv4MhcWorkspace);
+    state.dsv4_mhc_active_slot = slot;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
+    int device, std::uint32_t slots) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot reservation targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || slots == 0U ||
+        slots > kDsv4MhcMaximumSlots) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot reservation is out of range");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for device mHC slot reservation");
+    }
+    if (state.dsv4_mhc_saved_slots.size() < slots) {
+        state.dsv4_mhc_saved_slots.resize(slots);
+    }
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    for (std::uint32_t slot = 0U; slot < slots; ++slot) {
+        auto*& workspace = slot == state.dsv4_mhc_active_slot
+            ? state.dsv4_mhc_workspace
+            : state.dsv4_mhc_saved_slots[slot].workspace;
+        if (workspace != nullptr) continue;
+        void* allocation = nullptr;
+        if (auto status = cudaMalloc(&allocation, sizeof(Dsv4MhcWorkspace));
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "allocate DeepSeek device mHC slot workspace");
+        }
+        workspace = static_cast<Dsv4MhcWorkspace*>(allocation);
+        ++allocation_calls;
+        allocation_bytes += sizeof(Dsv4MhcWorkspace);
+    }
+    if (state.dsv4_mhc_workspace != nullptr) {
+        state.dsv4_mhc_workspace_bytes = sizeof(Dsv4MhcWorkspace);
+    }
+    if (allocation_calls != 0U) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+    }
     return result;
 }
 

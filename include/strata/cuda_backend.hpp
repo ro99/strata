@@ -828,6 +828,17 @@ public:
         int device, std::span<const float> projection,
         std::span<const float> scale, std::span<const float> base,
         std::span<const float> norm_weight, CudaDsv4MhcWeights& output);
+    // Page-major prompt execution keeps one independent fused mHC state per
+    // prompt row. A slot owns its own workspace and its own stage/residual
+    // /branch bookkeeping; selecting one swaps which state every later mHC,
+    // attention, and MoE command binds to. No device memory is copied and no
+    // kernel changes shape, so a row's command sequence is byte-identical to
+    // the token-major sequence it replaces. Slot 0 is the implicit default and
+    // is exactly the pre-existing single-state behaviour.
+    [[nodiscard]] ValidationResult dsv4_mhc_select_slot(
+        int device, std::uint32_t slot);
+    [[nodiscard]] ValidationResult dsv4_mhc_reserve_slots(
+        int device, std::uint32_t slots);
     [[nodiscard]] ValidationResult dsv4_mhc_begin(
         int device, const CudaDsv4MhcWeights& weights,
         std::span<const float> hidden, std::span<float> weighted,

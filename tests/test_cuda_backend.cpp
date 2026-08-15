@@ -1777,9 +1777,9 @@ TEST_CASE("native CUDA DeepSeek device mHC slots interleave rows exactly") {
 
     // Out-of-range and out-of-order selections must be refused rather than
     // silently binding another row's state.
-    REQUIRE(!backend.dsv4_mhc_select_slot(device, 256U).ok());
+    REQUIRE(!backend.dsv4_mhc_select_slot(device, 8192U).ok());
     REQUIRE(!backend.dsv4_mhc_reserve_slots(device, 0U).ok());
-    REQUIRE(!backend.dsv4_mhc_reserve_slots(device, 257U).ok());
+    REQUIRE(!backend.dsv4_mhc_reserve_slots(device, 8193U).ok());
 }
 
 TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions") {

@@ -83,7 +83,11 @@ constexpr std::uint32_t kVocabulary = kDeepSeekV4ExecutionContract.vocabulary_si
 constexpr std::uint32_t kMhc = kDeepSeekV4ExecutionContract.mhc_multiplier;
 constexpr std::uint32_t kMix = kDeepSeekV4ExecutionContract.mix_width;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 256ULL << 20U;
-constexpr std::uint32_t kMaximumPrefillPageTokens = 512U;
+// A page is what a routed expert's upload is amortised over, so the bound is
+// the working set a page needs, not a dispatch limit. At 8,192 rows that is
+// 537 MB of mHC state plus 402 MB of layer input, branch and MoE rows, all
+// host-side and inside the admitted ceiling.
+constexpr std::uint32_t kMaximumPrefillPageTokens = 8192U;
 constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 static_assert(kHeads == 2U * kPhysicalPagedHeads);
@@ -7598,6 +7602,14 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
     }
     std::vector<float> router_logits(rows * kExperts);
     std::vector<Dsv4Route> routes(rows);
+    // Prefill puts the routed experts on the GPU once a page is wide enough to
+    // pay for uploading each distinct expert: one upload then serves every row
+    // that chose it, instead of every row reading the weights out of host DRAM
+    // again. Decode never reaches here and keeps the CPU shards.
+    const bool page_moe_on_device =
+        config.prefill_device_moe_minimum_rows != 0U &&
+        rows >= config.prefill_device_moe_minimum_rows;
+    std::vector<float> moe_outputs(page_moe_on_device ? rows * kHidden : 0U);
     std::vector<std::vector<float>> weighted(
         rows, std::vector<float>(trace ? kHidden : 0U));
     const auto layer_input_row = [&](std::size_t row) {
@@ -7680,7 +7692,20 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
             }
             graph_stats.moe_router_nanoseconds +=
                 elapsed_nanoseconds(router_started);
-            result = prepare_page_routed_partials(layer, routes, layer_inputs);
+            const auto phase_started = std::chrono::steady_clock::now();
+            if (page_moe_on_device) {
+                // Prefill places the routed experts on the GPU: each distinct
+                // expert of the page is uploaded once and applied to all its
+                // rows as a matmul. Decode keeps them in the NUMA-local CPU
+                // shards, where the weights already live and a step has six
+                // experts and one row.
+                result = execute_moe_page(layer, routes, layer_inputs,
+                                          moe_outputs);
+            } else {
+                result = prepare_page_routed_partials(layer, routes,
+                                                      layer_inputs);
+            }
+            graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
             if (!result.ok()) return result;
         }
         for (std::size_t row = 0U; row < rows; ++row) {
@@ -7699,15 +7724,18 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
                                       "attn_norm", layer_input_row(row));
             }
 
-            // The attention branch was already computed for the whole page and
-            // its result crosses back through the host; the MoE branch leaves
-            // its result in this row's device workspace.
+            // The attention branch left its result in this row's device
+            // workspace. The routed experts, when they run on the GPU, produce
+            // a host row instead, which the transition below uploads.
             const auto attended = std::span<const float>(branch_outputs)
                 .subspan(row * kHidden, kHidden);
+            const auto page_moe_row = std::span<const float>(moe_outputs)
+                .subspan(row * kHidden, kHidden);
             std::vector<float> branch_output(
-                trace && branch_index == 1U ? kHidden : 0U);
+                trace && branch_index == 1U && !page_moe_on_device ? kHidden
+                                                                   : 0U);
             auto phase_started = std::chrono::steady_clock::now();
-            if (branch_index == 1U) {
+            if (branch_index == 1U && !page_moe_on_device) {
                 // The page was routed above, so this joins the row's shared
                 // expert with the routed partial the precompute produced.
                 result = execute_moe(layer, routes[row], layer_input_row(row),
@@ -7719,20 +7747,30 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
             if (trace) {
                 record_operation_hash(
                     position, tokens[row], layer, branch + "_output",
-                    branch_index == 0U
-                        ? attended
+                    branch_index == 0U ? attended
+                    : page_moe_on_device
+                        ? page_moe_row
                         : std::span<const float>(branch_output));
             }
 
             phase_started = std::chrono::steady_clock::now();
             const auto post_output = trace ? hidden_row : std::span<float>{};
+            const bool host_branch = branch_index == 1U && page_moe_on_device;
             if (flat + 1U < branch_count) {
                 const auto next = flat + 1U;
-                result = cuda.dsv4_mhc_transition_device(
-                    device, device_mhc_weights[next / 2U][next % 2U],
-                    weighted[row], layer_input_row(row), post_output);
+                const auto& next_weights =
+                    device_mhc_weights[next / 2U][next % 2U];
+                result = host_branch
+                    ? cuda.dsv4_mhc_transition(
+                          device, next_weights, page_moe_row, weighted[row],
+                          layer_input_row(row), post_output)
+                    : cuda.dsv4_mhc_transition_device(
+                          device, next_weights, weighted[row],
+                          layer_input_row(row), post_output);
             } else {
-                result = cuda.dsv4_mhc_finish_device(device, hidden_row);
+                result = host_branch
+                    ? cuda.dsv4_mhc_finish(device, page_moe_row, hidden_row)
+                    : cuda.dsv4_mhc_finish_device(device, hidden_row);
             }
             graph_stats.mhc_post_nanoseconds +=
                 elapsed_nanoseconds(phase_started);
@@ -8341,7 +8379,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     if (config.prefill_page_tokens == 0U ||
         config.prefill_page_tokens > kMaximumPrefillPageTokens) {
         result.errors.emplace_back(
-            "DeepSeek prefill page must be within [1, 512] tokens");
+            "DeepSeek prefill page must be within [1, 8192] tokens");
         return result;
     }
     if (config.prefill_layer_tile_tokens != 0U &&

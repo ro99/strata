@@ -637,6 +637,82 @@ std::span<const std::byte> Dsv4ResidentWeightStore::find_tiled_expert(
     return {arena_ + offset, static_cast<std::size_t>(shard_bytes)};
 }
 
+namespace {
+
+// `layers.<layer>.ffn.experts.<expert>.<w1|w3|w2>`, which is the only name the
+// resident store holds in transformed rather than canonical form.
+bool parse_routed_expert_matrix(std::string_view name, std::uint32_t& layer,
+                                std::uint32_t& expert,
+                                Dsv4ExpertMatrix& matrix) noexcept {
+    constexpr std::string_view layers_prefix = "layers.";
+    constexpr std::string_view experts_infix = ".ffn.experts.";
+    if (!name.starts_with(layers_prefix)) return false;
+    auto rest = name.substr(layers_prefix.size());
+    const auto layer_end = rest.find('.');
+    if (layer_end == std::string_view::npos) return false;
+    const auto infix = rest.find(experts_infix, layer_end);
+    if (infix != layer_end) return false;
+    const auto parse = [](std::string_view text, std::uint32_t& value) {
+        if (text.empty() || text.size() > 10U) return false;
+        std::uint64_t parsed = 0U;
+        for (const char character : text) {
+            if (character < '0' || character > '9') return false;
+            parsed = parsed * 10U + static_cast<std::uint64_t>(character - '0');
+        }
+        if (parsed > std::numeric_limits<std::uint32_t>::max()) return false;
+        value = static_cast<std::uint32_t>(parsed);
+        return true;
+    };
+    if (!parse(rest.substr(0U, layer_end), layer)) return false;
+    rest = rest.substr(layer_end + experts_infix.size());
+    const auto expert_end = rest.find('.');
+    if (expert_end == std::string_view::npos) return false;
+    if (!parse(rest.substr(0U, expert_end), expert)) return false;
+    const auto operation = rest.substr(expert_end + 1U);
+    if (operation == "w1") matrix = Dsv4ExpertMatrix::Gate;
+    else if (operation == "w3") matrix = Dsv4ExpertMatrix::Up;
+    else if (operation == "w2") matrix = Dsv4ExpertMatrix::Down;
+    else return false;
+    return true;
+}
+
+// Rebuilds a routed expert's canonical bytes from the resident transformed
+// shards. Only one layout of 156 GB fits in host memory, and decode needs the
+// transformed one, so prefill's device upload reconstructs instead of reading
+// the checkpoint again. Returns false when this is not a routed expert or the
+// store is not holding transformed shards.
+bool rebuild_resident_expert(const Dsv4ResidentWeightStore& resident,
+                             std::string_view base_name,
+                             std::uint64_t expected_rows,
+                             std::uint64_t expected_columns,
+                             std::vector<std::byte>& packed,
+                             std::vector<std::byte>& scales) {
+    std::uint32_t layer = 0U;
+    std::uint32_t expert = 0U;
+    Dsv4ExpertMatrix matrix{};
+    if (!parse_routed_expert_matrix(base_name, layer, expert, matrix)) {
+        return false;
+    }
+    constexpr std::size_t shards = 2U;
+    std::array<std::span<const std::byte>, shards> views{};
+    for (std::uint32_t shard = 0U; shard < shards; ++shard) {
+        views[shard] = resident.find_tiled_expert(layer, expert, shard);
+        if (views[shard].empty()) return false;
+    }
+    const auto hidden = matrix == Dsv4ExpertMatrix::Down ? expected_rows
+                                                         : expected_columns;
+    const auto intermediate = matrix == Dsv4ExpertMatrix::Down
+        ? expected_columns : expected_rows;
+    packed.resize(
+        static_cast<std::size_t>(expected_rows * (expected_columns / 2U)));
+    scales.resize(
+        static_cast<std::size_t>(expected_rows * (expected_columns / 32U)));
+    return dsv4_untile_expert_matrix(packed, scales, views, matrix, hidden,
+                                     intermediate).ok();
+}
+
+}  // namespace
+
 ValidationResult load_dsv4_cuda_linear(
     const Dsv4CheckpointReader& checkpoint,
     const Dsv4ResidentWeightStore* resident_weights,
@@ -660,8 +736,17 @@ ValidationResult load_dsv4_cuda_linear(
         return result;
     }
     std::vector<std::byte> owned_weight;
+    std::vector<std::byte> owned_scale;
     std::span<const std::byte> weight_data;
+    std::span<const std::byte> scale_data;
     if (resident_weights != nullptr) weight_data = resident_weights->find(weight_name);
+    if (weight_data.empty() && resident_weights != nullptr &&
+        weight->encoding == Dsv4TensorEncoding::Fp4E2m1Group32 &&
+        rebuild_resident_expert(*resident_weights, base_name, expected_rows,
+                                expected_columns, owned_weight, owned_scale)) {
+        weight_data = owned_weight;
+        scale_data = owned_scale;
+    }
     if (weight_data.empty()) {
         auto loaded = checkpoint.read(weight_name, weight->source_bytes);
         if (!loaded.ok()) {
@@ -676,8 +761,6 @@ ValidationResult load_dsv4_cuda_linear(
     descriptor.dtype = weight->source_dtype;
     descriptor.rows = expected_rows;
     descriptor.columns = expected_columns;
-    std::vector<std::byte> owned_scale;
-    std::span<const std::byte> scale_data;
     if (weight->encoding == Dsv4TensorEncoding::Plain) {
         descriptor.encoding = CudaWeightEncoding::Plain;
     } else {

@@ -164,7 +164,7 @@ bool parse_options(int argc, char** argv, Options& options) {
             if (value == nullptr || !strata::cli::parse_u32(
                     value, options.prefill_page_tokens) ||
                 options.prefill_page_tokens == 0U ||
-                options.prefill_page_tokens > 512U) return false;
+                options.prefill_page_tokens > 8192U) return false;
         } else if (argument == "--prefill-layer-tile") {
             const auto* value = next(argument);
             if (value == nullptr || !strata::cli::parse_u32(

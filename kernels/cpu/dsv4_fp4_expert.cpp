@@ -433,6 +433,117 @@ ValidationResult dsv4_transform_tiled_expert_shard(
     return result;
 }
 
+ValidationResult dsv4_untile_expert_matrix(
+    std::span<std::byte> packed, std::span<std::byte> scales,
+    std::span<const std::span<const std::byte>> shards,
+    Dsv4ExpertMatrix matrix, std::uint64_t hidden,
+    std::uint64_t intermediate) {
+    ValidationResult result;
+    const auto shard_count = static_cast<std::uint64_t>(shards.size());
+    const auto shard_bytes = dsv4_tiled_expert_shard_bytes(
+        hidden, intermediate, shard_count);
+    const bool down = matrix == Dsv4ExpertMatrix::Down;
+    const auto rows = down ? hidden : intermediate;
+    const auto columns = down ? intermediate : hidden;
+    if (shard_count == 0U || shard_bytes == 0U ||
+        packed.size() != rows * (columns / 2U) ||
+        scales.size() != rows * (columns / 32U) ||
+        std::any_of(shards.begin(), shards.end(),
+                    [shard_bytes](std::span<const std::byte> storage) {
+                        return storage.size() != shard_bytes;
+                    })) {
+        result.errors.emplace_back(
+            "DeepSeek tiled expert reconstruction has incompatible extents");
+        return result;
+    }
+    constexpr std::uint64_t block_rows = 32U;
+    const auto shard_intermediate = intermediate / shard_count;
+    const auto w13_packed_bytes = 2U * shard_intermediate * (hidden / 2U);
+    const auto w13_scale_bytes = 2U * shard_intermediate * (hidden / 16U);
+    const auto w2_packed_bytes = hidden * (shard_intermediate / 2U);
+    auto* destination_packed = reinterpret_cast<std::uint8_t*>(packed.data());
+    auto* destination_scales = reinterpret_cast<std::uint8_t*>(scales.data());
+    for (std::uint64_t shard = 0U; shard < shard_count; ++shard) {
+        const auto* base =
+            reinterpret_cast<const std::uint8_t*>(shards[shard].data());
+        // The transformed side is walked in address order and the canonical
+        // side is written through 32 row cursors. Walking the canonical side
+        // instead reads the transform with a 32-byte stride, which costs a
+        // cache line per byte and made the rebuild slower than re-reading the
+        // checkpoint it replaces.
+        // Transposed a cache line at a time. Writing a byte per row per column
+        // instead costs 0.29 GB/s: the canonical row stride is a power of two,
+        // so all 32 rows of a block land in one L1 set and evict each other on
+        // every column. Buffering 64 columns turns that into one full-line
+        // store per row per tile.
+        constexpr std::uint64_t line = 64U;
+        const auto scatter = [line](std::uint8_t* destination,
+                                std::uint64_t destination_stride,
+                                const std::uint8_t* source,
+                                std::uint64_t source_columns,
+                                std::uint64_t source_stride,
+                                std::uint64_t blocks, std::uint64_t columns,
+                                std::uint64_t first_row) {
+            std::array<std::uint8_t, block_rows * line> buffer{};
+            for (std::uint64_t block = 0U; block < blocks; ++block) {
+                const auto* tile = source + block * source_columns *
+                                                block_rows;
+                auto* rows_base = destination +
+                    (first_row + block * block_rows) * destination_stride;
+                for (std::uint64_t base = 0U; base < columns; base += line) {
+                    const auto width = std::min(line, columns - base);
+                    for (std::uint64_t column = 0U; column < width; ++column) {
+                        const auto* entry = tile + (base + column) *
+                                                       source_stride *
+                                                       block_rows;
+                        for (std::uint64_t within = 0U; within < block_rows;
+                             ++within) {
+                            buffer[within * line + column] = entry[within];
+                        }
+                    }
+                    for (std::uint64_t within = 0U; within < block_rows;
+                         ++within) {
+                        std::memcpy(
+                            rows_base + within * destination_stride + base,
+                            buffer.data() + within * line,
+                            static_cast<std::size_t>(width));
+                    }
+                }
+            }
+        };
+        if (!down) {
+            const auto* packed13 = base;
+            const auto* scales13 = base + w13_packed_bytes;
+            const auto projection =
+                matrix == Dsv4ExpertMatrix::Gate ? 0U : 1U;
+            const auto blocks = shard_intermediate / block_rows;
+            const auto skip = projection * shard_intermediate;
+            scatter(destination_packed, hidden / 2U,
+                    packed13 + (skip / block_rows) * (hidden / 2U) * block_rows,
+                    hidden / 2U, 1U, blocks, hidden / 2U,
+                    shard * shard_intermediate);
+            // Each canonical group-32 scale is stored twice, once per group-16
+            // half; the first copy is taken and the second skipped.
+            scatter(destination_scales, hidden / 32U,
+                    scales13 + (skip / block_rows) * (hidden / 16U) *
+                                   block_rows,
+                    hidden / 16U, 2U, blocks, hidden / 32U,
+                    shard * shard_intermediate);
+            continue;
+        }
+        const auto* packed2 = base + w13_packed_bytes + w13_scale_bytes;
+        const auto* scales2 = packed2 + w2_packed_bytes;
+        const auto blocks = hidden / block_rows;
+        scatter(destination_packed + shard * (shard_intermediate / 2U),
+                intermediate / 2U, packed2, shard_intermediate / 2U, 1U, blocks,
+                shard_intermediate / 2U, 0U);
+        scatter(destination_scales + shard * (shard_intermediate / 32U),
+                intermediate / 32U, scales2, shard_intermediate / 16U, 2U,
+                blocks, shard_intermediate / 32U, 0U);
+    }
+    return result;
+}
+
 namespace {
 
 [[maybe_unused]] void tiled_matvec16_scalar(

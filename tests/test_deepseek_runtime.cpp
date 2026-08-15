@@ -100,7 +100,7 @@ TEST_CASE("DeepSeek device-resident runtime requires physical page geometry") {
 TEST_CASE("DeepSeek runtime rejects an unbounded prefill page") {
     strata::DeepSeekV4Runtime runtime;
     strata::Dsv4RuntimeConfig config;
-    config.prefill_page_tokens = 513U;
+    config.prefill_page_tokens = 8193U;
     const auto initialized = runtime.initialize("not-used", config);
     REQUIRE(!initialized.ok());
     REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),

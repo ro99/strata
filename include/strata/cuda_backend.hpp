@@ -27,6 +27,15 @@ enum class CudaWeightEncoding : std::uint8_t {
     // stays FP32; this is a W4A16 path, not the W4A4 form the checkpoint's
     // input_global_scale tensors would allow.
     Nvfp4Group16,
+    // One intermediate-dimension TP shard of one routed expert, in the host
+    // expert's decode layout: w13 packed, w13 scales, w2 packed, w2 scales,
+    // concatenated, with output rows blocked by 32 and each group-32 scale
+    // duplicated across the two group-16 halves. This is the only layout the
+    // routed experts exist in on the host -- 156 GB of them, and the canonical
+    // copy does not also fit -- so the device reads it rather than requiring a
+    // second one. `rows` is the hidden size and `columns` this shard's
+    // intermediate width; there is no separate scale payload.
+    Fp4E2m1Tiled32,
 };
 
 struct CudaWeightDescriptor {
@@ -647,10 +656,19 @@ using CudaDsv4MhcHeadCallback = bool (*)(
 // group. `rows` indexes the page's hidden rows and `coefficients` carries that
 // row's router coefficient in the same order; both spans must have equal size
 // and stay alive until collection completes.
+// The two intermediate-dimension TP shards a routed expert is transformed into.
+inline constexpr std::size_t kCudaDsv4TiledShards = 2U;
+
 struct CudaDeepSeekMoeRowGroup {
     const CudaWeight* w1{};
     const CudaWeight* w3{};
     const CudaWeight* w2{};
+    // Transformed alternative to w1/w3/w2: this expert's shards, both on the
+    // group's device. When the first is set the canonical three are unused and
+    // the kernel derives every region from the shard geometry. Same bytes for
+    // the same (row, column), so the accumulation order and the result are
+    // unchanged either way.
+    std::array<const CudaWeight*, kCudaDsv4TiledShards> tiled_shards{};
     std::span<const std::uint32_t> rows;
     std::span<const float> coefficients;
 };

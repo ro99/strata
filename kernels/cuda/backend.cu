@@ -1819,7 +1819,7 @@ __global__ void deepseek_fp4_down_kernel(
 // Row tile of the page-batched FP4 path. Eight rows hold sixteen accumulators
 // per thread, which fits without spilling at 256 threads, and amortises each
 // 32-weight group's nibble and scale decode across eight rows instead of one.
-constexpr std::uint32_t kDeepSeekPageRowTile = 8U;
+constexpr std::uint32_t kDeepSeekPageRowTile = 32U;
 
 // One routed expert of a page and the slice of the work list it owns. The work
 // list is flattened group-major; `row_offset` is where this group's rows begin
@@ -1831,9 +1831,43 @@ struct DeepSeekFp4PageGroup {
     const unsigned char* w3_scales{};
     const unsigned char* w2_weights{};
     const unsigned char* w2_scales{};
+    // Transformed shards of this expert, one per intermediate-dimension TP
+    // shard. Set together with a non-zero shard_intermediate, and then the six
+    // canonical pointers above are unused.
+    const unsigned char* tiled[kCudaDsv4TiledShards]{};
+    std::uint32_t shard_intermediate{};
     std::uint32_t row_offset{};
     std::uint32_t row_count{};
 };
+
+// Where one output row of a transformed shard starts, and how far apart its
+// consecutive entries are. The transform blocks output rows by 32 and
+// interleaves them, so a row's entries are 32 bytes apart instead of adjacent;
+// expressing that as a base and a stride lets both layouts share one inner
+// loop, which is what keeps the accumulation order identical.
+struct DeepSeekFp4TiledRow {
+    const unsigned char* packed{};
+    const unsigned char* scales{};
+    std::uint64_t packed_stride{1U};
+    // Each canonical group-32 scale is stored twice, once per group-16 half,
+    // so stepping a canonical group means stepping two transformed ones.
+    std::uint64_t scale_stride{1U};
+};
+
+__device__ __forceinline__ DeepSeekFp4TiledRow deepseek_fp4_tiled_row(
+    const unsigned char* shard, std::uint64_t output_row,
+    std::uint64_t region_columns, std::uint64_t scale_region_columns,
+    std::uint64_t scale_offset) {
+    const std::uint64_t block = output_row >> 5U;
+    const std::uint64_t within = output_row & 31U;
+    DeepSeekFp4TiledRow row;
+    row.packed = shard + block * region_columns * 32U + within;
+    row.scales =
+        shard + scale_offset + block * scale_region_columns * 32U + within;
+    row.packed_stride = 32U;
+    row.scale_stride = 64U;
+    return row;
+}
 
 // Per (expert, output column, row tile). The group's weight row is decoded once
 // per 32-weight group and applied to every row in the tile, so a group serving
@@ -1855,8 +1889,29 @@ __global__ void deepseek_fp4_page_gate_up_kernel(
     const std::uint32_t tile_rows =
         min(kDeepSeekPageRowTile, group.row_count - tile_begin);
 
-    const std::uint64_t packed_base = output_row * packed_columns;
-    const std::uint64_t scale_base = output_row * scale_columns;
+    DeepSeekFp4TiledRow gate_row;
+    DeepSeekFp4TiledRow up_row;
+    if (group.shard_intermediate != 0U) {
+        const std::uint64_t shard_intermediate = group.shard_intermediate;
+        const std::uint32_t shard =
+            static_cast<std::uint32_t>(output_row / shard_intermediate);
+        const std::uint64_t row_in_shard =
+            output_row - static_cast<std::uint64_t>(shard) * shard_intermediate;
+        const std::uint64_t scale_offset =
+            2U * shard_intermediate * (columns / 2U);
+        gate_row = deepseek_fp4_tiled_row(group.tiled[shard], row_in_shard,
+                                          columns / 2U, columns / 16U,
+                                          scale_offset);
+        up_row = deepseek_fp4_tiled_row(group.tiled[shard],
+                                        shard_intermediate + row_in_shard,
+                                        columns / 2U, columns / 16U,
+                                        scale_offset);
+    } else {
+        gate_row.packed = group.w1_weights + output_row * packed_columns;
+        gate_row.scales = group.w1_scales + output_row * scale_columns;
+        up_row.packed = group.w3_weights + output_row * packed_columns;
+        up_row.scales = group.w3_scales + output_row * scale_columns;
+    }
     const std::uint32_t lane = threadIdx.x & 31U;
     const std::uint32_t warp = threadIdx.x >> 5U;
     float gate[kDeepSeekPageRowTile];
@@ -1870,18 +1925,22 @@ __global__ void deepseek_fp4_page_gate_up_kernel(
          group_column += 8U) {
         float gate_scale =
             lane == 0U
-                ? fp8_e8m0_scale_bits(group.w1_scales[scale_base + group_column])
+                ? fp8_e8m0_scale_bits(
+                      gate_row.scales[group_column * gate_row.scale_stride])
                 : 0.0F;
         float up_scale =
             lane == 0U
-                ? fp8_e8m0_scale_bits(group.w3_scales[scale_base + group_column])
+                ? fp8_e8m0_scale_bits(
+                      up_row.scales[group_column * up_row.scale_stride])
                 : 0.0F;
         gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
         up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
         const std::uint64_t column = group_column * 32U + lane;
         if (column >= columns) continue;
-        const unsigned char gate_packed = group.w1_weights[packed_base + column / 2U];
-        const unsigned char up_packed = group.w3_weights[packed_base + column / 2U];
+        const unsigned char gate_packed =
+            gate_row.packed[(column / 2U) * gate_row.packed_stride];
+        const unsigned char up_packed =
+            up_row.packed[(column / 2U) * up_row.packed_stride];
         const unsigned int gate_encoded =
             column % 2U == 0U ? gate_packed & 0x0FU : gate_packed >> 4U;
         const unsigned int up_encoded =
@@ -1956,14 +2015,41 @@ __global__ void deepseek_fp4_page_down_kernel(
 
     for (std::uint64_t group_column = warp; group_column < scale_columns;
          group_column += 8U) {
+        // Down reduces over the intermediate dimension, which is what the
+        // transform shards, so the shard follows the column rather than the
+        // output row. A shard width is a multiple of 32, so a scale group
+        // never straddles two of them.
+        DeepSeekFp4TiledRow weight_row;
+        std::uint64_t shard_group = group_column;
+        std::uint64_t shard_column_base = 0U;
+        if (group.shard_intermediate != 0U) {
+            const std::uint64_t shard_intermediate = group.shard_intermediate;
+            const std::uint32_t shard = static_cast<std::uint32_t>(
+                group_column * 32U / shard_intermediate);
+            shard_column_base =
+                static_cast<std::uint64_t>(shard) * shard_intermediate;
+            shard_group = group_column - shard_column_base / 32U;
+            const std::uint64_t packed_offset =
+                2U * shard_intermediate * (rows / 2U) +
+                2U * shard_intermediate * (rows / 16U);
+            weight_row = deepseek_fp4_tiled_row(
+                group.tiled[shard] + packed_offset, output_row,
+                shard_intermediate / 2U, shard_intermediate / 16U,
+                rows * (shard_intermediate / 2U));
+        } else {
+            weight_row.packed = group.w2_weights + packed_base;
+            weight_row.scales = group.w2_scales + scale_base;
+        }
         float scale =
             lane == 0U
-                ? fp8_e8m0_scale_bits(group.w2_scales[scale_base + group_column])
+                ? fp8_e8m0_scale_bits(
+                      weight_row.scales[shard_group * weight_row.scale_stride])
                 : 0.0F;
         scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
         const std::uint64_t column = group_column * 32U + lane;
         if (column >= columns) continue;
-        const unsigned char packed = group.w2_weights[packed_base + column / 2U];
+        const unsigned char packed = weight_row.packed
+            [((column - shard_column_base) / 2U) * weight_row.packed_stride];
         const unsigned int encoded =
             column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
         const float weight = fp4_e2m1_value(encoded);
@@ -4972,6 +5058,23 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid native FP4 CUDA weight descriptor");
             return result;
         }
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Tiled32) {
+        // One blob, no separate scale payload: the four regions are contiguous
+        // and the kernels index into them. `rows` is hidden, `columns` is this
+        // shard's intermediate width.
+        const bool shaped =
+            descriptor.rows % 32U == 0U && descriptor.columns % 32U == 0U;
+        if (!shaped || descriptor.dtype != SafetensorsDtype::I8 ||
+            descriptor.group_size != 32U || descriptor.packed_columns != 0U ||
+            descriptor.scale_columns != 0U || !scales.empty()) {
+            result.errors.emplace_back(
+                "invalid transformed FP4 expert shard descriptor");
+            return result;
+        }
+        expected_weights = 2U * descriptor.columns * (descriptor.rows / 2U) +
+                           2U * descriptor.columns * (descriptor.rows / 16U) +
+                           descriptor.rows * (descriptor.columns / 2U) +
+                           descriptor.rows * (descriptor.columns / 16U);
     } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
         const auto expected_packed_columns = (descriptor.columns + 1U) / 2U;
         const auto expected_scale_columns =
@@ -13738,10 +13841,62 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
         return true;
     };
 
+    // A transformed expert arrives as its TP shards instead of a triplet. The
+    // shards carry the same values, so they must agree with the triplets on
+    // the activation shape they all share.
+    std::uint64_t shard_intermediate = 0U;
+    const auto validate_shards = [&](const CudaDeepSeekMoeRowGroup& group) {
+        for (const auto* shard : group.tiled_shards) {
+            if (shard == nullptr || !shard->valid()) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page command contains an invalid expert shard");
+                return false;
+            }
+            if (shard->impl_->device != device ||
+                shard->impl_->descriptor.encoding !=
+                    CudaWeightEncoding::Fp4E2m1Tiled32) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page expert shard has the wrong device or encoding");
+                return false;
+            }
+        }
+        const auto& first = group.tiled_shards.front()->impl_->descriptor;
+        for (const auto* shard : group.tiled_shards) {
+            const auto& descriptor = shard->impl_->descriptor;
+            if (descriptor.rows != first.rows ||
+                descriptor.columns != first.columns) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page expert shards disagree on shape");
+                return false;
+            }
+        }
+        const auto shards =
+            static_cast<std::uint64_t>(group.tiled_shards.size());
+        if (hidden_columns == 0U) {
+            hidden_columns = first.rows;
+            intermediate_columns = first.columns * shards;
+        } else if (hidden_columns != first.rows ||
+                   intermediate_columns != first.columns * shards) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page experts do not share one exact activation shape");
+            return false;
+        }
+        if (shard_intermediate == 0U) {
+            shard_intermediate = first.columns;
+        } else if (shard_intermediate != first.columns) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page expert shards disagree on width");
+            return false;
+        }
+        return true;
+    };
+
     std::uint64_t work_count = 0U;
     for (const auto& group : groups) {
-        if (!validate_triplet(group.w1, group.w3, group.w2,
-                              CudaWeightEncoding::Fp4E2m1Group32)) {
+        const bool tiled = group.tiled_shards.front() != nullptr;
+        if (tiled ? !validate_shards(group)
+                  : !validate_triplet(group.w1, group.w3, group.w2,
+                                      CudaWeightEncoding::Fp4E2m1Group32)) {
             return result;
         }
         if (group.rows.empty() || group.rows.size() != group.coefficients.size()) {
@@ -13963,12 +14118,22 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     std::uint32_t maximum_group_rows = 0U;
     for (const auto& group : groups) {
         DeepSeekFp4PageGroup entry;
-        entry.w1_weights = static_cast<const unsigned char*>(group.w1->impl_->weights);
-        entry.w1_scales = static_cast<const unsigned char*>(group.w1->impl_->scales);
-        entry.w3_weights = static_cast<const unsigned char*>(group.w3->impl_->weights);
-        entry.w3_scales = static_cast<const unsigned char*>(group.w3->impl_->scales);
-        entry.w2_weights = static_cast<const unsigned char*>(group.w2->impl_->weights);
-        entry.w2_scales = static_cast<const unsigned char*>(group.w2->impl_->scales);
+        if (group.tiled_shards.front() != nullptr) {
+            for (std::size_t shard = 0U; shard < group.tiled_shards.size();
+                 ++shard) {
+                entry.tiled[shard] = static_cast<const unsigned char*>(
+                    group.tiled_shards[shard]->impl_->weights);
+            }
+            entry.shard_intermediate =
+                static_cast<std::uint32_t>(shard_intermediate);
+        } else {
+            entry.w1_weights = static_cast<const unsigned char*>(group.w1->impl_->weights);
+            entry.w1_scales = static_cast<const unsigned char*>(group.w1->impl_->scales);
+            entry.w3_weights = static_cast<const unsigned char*>(group.w3->impl_->weights);
+            entry.w3_scales = static_cast<const unsigned char*>(group.w3->impl_->scales);
+            entry.w2_weights = static_cast<const unsigned char*>(group.w2->impl_->weights);
+            entry.w2_scales = static_cast<const unsigned char*>(group.w2->impl_->scales);
+        }
         entry.row_offset = static_cast<std::uint32_t>(host_rows.size());
         entry.row_count = static_cast<std::uint32_t>(group.rows.size());
         maximum_group_rows = std::max(maximum_group_rows, entry.row_count);
@@ -13982,6 +14147,12 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     state.moe_weights.clear();
     state.moe_weights.reserve((groups.size() + 1U) * 3U);
     for (const auto& group : groups) {
+        if (group.tiled_shards.front() != nullptr) {
+            for (const auto* shard : group.tiled_shards) {
+                state.moe_weights.push_back(shard->impl_);
+            }
+            continue;
+        }
         state.moe_weights.push_back(group.w1->impl_);
         state.moe_weights.push_back(group.w3->impl_);
         state.moe_weights.push_back(group.w2->impl_);
@@ -14083,8 +14254,13 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     const auto* device_groups =
         static_cast<const DeepSeekFp4PageGroup*>(state.moe_page_groups);
     if (!groups.empty()) {
-        const auto& w1 = groups.front().w1->impl_->descriptor;
-        const auto& w2 = groups.front().w2->impl_->descriptor;
+        // Derived rather than read off a descriptor: a transformed group has
+        // no canonical triplet to read, and the canonical one would carry
+        // exactly these values anyway.
+        const auto gate_packed_columns = (hidden_columns + 1U) / 2U;
+        const auto gate_scale_columns = (hidden_columns + 31U) / 32U;
+        const auto down_packed_columns = (intermediate_columns + 1U) / 2U;
+        const auto down_scale_columns = (intermediate_columns + 31U) / 32U;
         const auto row_tiles = static_cast<unsigned int>(
             (maximum_group_rows + kDeepSeekPageRowTile - 1U) /
             kDeepSeekPageRowTile);
@@ -14094,7 +14270,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
             state.moe_activations, state.moe_hidden, state.moe_page_rows,
             state.moe_page_coefficients, device_groups,
             static_cast<std::uint32_t>(groups.size()), hidden_columns,
-            intermediate_columns, w1.packed_columns, w1.scale_columns,
+            intermediate_columns, gate_packed_columns, gate_scale_columns,
             swiglu_limit, state.moe_bf16_silu, state.moe_error);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
@@ -14119,7 +14295,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
         deepseek_fp4_page_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
             state.moe_output, state.moe_activations, device_groups,
             static_cast<std::uint32_t>(groups.size()), intermediate_columns,
-            hidden_columns, w2.packed_columns, w2.scale_columns);
+            hidden_columns, down_packed_columns, down_scale_columns);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek FP4 page W2");

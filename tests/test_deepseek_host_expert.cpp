@@ -152,60 +152,6 @@ TEST_CASE("DeepSeek tiled expert transform preserves every matrix value") {
     }
 }
 
-TEST_CASE("DeepSeek expert reconstruction inverts the tiled transform") {
-    // The device reads canonical bytes and the host kernels read transformed
-    // ones. Only one copy of 156 GB fits, so prefill rebuilds what it uploads
-    // from the resident shards; the rebuild has to be exact, byte for byte,
-    // or the two placements are different models.
-    constexpr std::uint64_t hidden = 128U;
-    constexpr std::uint64_t intermediate = 192U;
-    constexpr std::uint64_t shards = 2U;
-    const auto w1 = make_fp4(intermediate, hidden, 3U);
-    const auto w3 = make_fp4(intermediate, hidden, 9U);
-    const auto w2 = make_fp4(hidden, intermediate, 17U);
-    const auto canonical = view(w1, w3, w2);
-
-    const auto shard_bytes = strata::dsv4_tiled_expert_shard_bytes(
-        hidden, intermediate, shards);
-    REQUIRE(shard_bytes != 0U);
-    std::array<std::vector<std::byte>, shards> storage;
-    std::array<std::span<const std::byte>, shards> views{};
-    for (std::uint64_t shard = 0U; shard < shards; ++shard) {
-        storage[shard].resize(static_cast<std::size_t>(shard_bytes));
-        REQUIRE(strata::dsv4_transform_tiled_expert_shard(
-                    storage[shard], canonical, hidden, intermediate, shard,
-                    shards).ok());
-        views[shard] = storage[shard];
-    }
-
-    const auto check = [&](strata::Dsv4ExpertMatrix matrix,
-                           std::span<const std::byte> expected_packed,
-                           std::span<const std::byte> expected_scales,
-                           std::uint64_t rows, std::uint64_t columns) {
-        std::vector<std::byte> packed(
-            static_cast<std::size_t>(rows * (columns / 2U)));
-        std::vector<std::byte> scales(
-            static_cast<std::size_t>(rows * (columns / 32U)));
-        REQUIRE(strata::dsv4_untile_expert_matrix(
-                    packed, scales, views, matrix, hidden, intermediate).ok());
-        REQUIRE(std::equal(packed.begin(), packed.end(),
-                           expected_packed.begin(), expected_packed.end()));
-        REQUIRE(std::equal(scales.begin(), scales.end(),
-                           expected_scales.begin(), expected_scales.end()));
-    };
-    check(strata::Dsv4ExpertMatrix::Gate, canonical.w1_packed,
-          canonical.w1_scales, intermediate, hidden);
-    check(strata::Dsv4ExpertMatrix::Up, canonical.w3_packed,
-          canonical.w3_scales, intermediate, hidden);
-    check(strata::Dsv4ExpertMatrix::Down, canonical.w2_packed,
-          canonical.w2_scales, hidden, intermediate);
-
-    std::vector<std::byte> undersized(4U);
-    REQUIRE(!strata::dsv4_untile_expert_matrix(
-                undersized, undersized, views, strata::Dsv4ExpertMatrix::Gate,
-                hidden, intermediate).ok());
-}
-
 TEST_CASE("DeepSeek tiled expert row batch holds at the production shape") {
     // The 64-wide case below cannot see a reduction that only differs once
     // the column loop is long enough to be blocked, and the runtime drives

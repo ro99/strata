@@ -59,6 +59,9 @@ namespace strata {
 namespace {
 
 constexpr std::uint32_t kHidden = kDeepSeekV4ExecutionContract.hidden_size;
+// Intermediate-dimension TP shards the resident arena transforms each routed
+// expert into. The device reads the same shards.
+constexpr std::uint32_t kResidentExpertShards = 2U;
 constexpr std::uint32_t kLayers = kDeepSeekV4ExecutionContract.layer_count;
 constexpr std::uint32_t kHeads = kDeepSeekV4ExecutionContract.attention_heads;
 constexpr std::uint32_t kHeadDim = kDeepSeekV4ExecutionContract.head_dim;
@@ -640,6 +643,29 @@ public:
         return result;
     }
 
+    // Acquires one routed expert's transformed shard straight out of the
+    // resident arena. The canonical triplet would have to be re-read from the
+    // checkpoint, because host memory holds only the transformed copy.
+    ValidationResult acquire_tiled_expert(std::size_t slot, std::uint32_t layer,
+                                          std::uint32_t expert,
+                                          std::uint32_t shard, Lease& output) {
+        auto demand_guard = demand();
+        output.reset();
+        const auto key = "layers." + std::to_string(layer) +
+                         ".ffn.experts." + std::to_string(expert) +
+                         ".shard." + std::to_string(shard);
+        const TiledShardKey tiled{layer, expert, shard};
+        Entry* entry = nullptr;
+        auto result = ensure(slot, key, kHidden,
+                             kExpertIntermediate / kResidentExpertShards,
+                             LoadKind::Demand, entry, &tiled);
+        if (!result.ok()) return result;
+        ++entry->leases;
+        ++lease_acquires_;
+        output = Lease(this, entry);
+        return result;
+    }
+
     ValidationResult validate_atomic_expert_capacity(
         std::uint64_t required_bytes) const {
         ValidationResult result;
@@ -966,9 +992,20 @@ private:
         return state.entries.end();
     }
 
+    // One routed expert's transformed TP shard, addressed the way the resident
+    // arena holds it. This is the only copy of the routed experts on the host,
+    // so prefill uploads it as it stands rather than reconstructing a second
+    // layout that would not fit beside it.
+    struct TiledShardKey {
+        std::uint32_t layer{};
+        std::uint32_t expert{};
+        std::uint32_t shard{};
+    };
+
     ValidationResult ensure(std::size_t slot, std::string_view base,
                             std::uint64_t rows, std::uint64_t columns,
-                            LoadKind kind, Entry*& output) {
+                            LoadKind kind, Entry*& output,
+                            const TiledShardKey* tiled = nullptr) {
         ValidationResult result;
         if (slot >= states_.size()) {
             result.errors.emplace_back("DeepSeek linear targets an invalid CUDA slot");
@@ -998,7 +1035,13 @@ private:
             output = &found->second;
             return result;
         }
-        const auto bytes = linear_bytes(checkpoint_, base);
+        const auto shard_payload_bytes = tiled == nullptr
+            ? 0U
+            : dsv4_tiled_expert_shard_bytes(kHidden, kExpertIntermediate,
+                                            kResidentExpertShards);
+        const auto bytes = tiled == nullptr
+            ? linear_bytes(checkpoint_, base)
+            : CudaBackend::weight_storage_bytes(shard_payload_bytes, 0U);
         if (bytes == 0U || bytes > state.capacity) {
             result.errors.emplace_back("DeepSeek linear is absent or exceeds device cache: " +
                                        key);
@@ -1034,11 +1077,31 @@ private:
         // temporary, which the loader refuses to defer anyway.
         const bool defer = upload_batch_open_ && kind == LoadKind::Demand;
         const auto load_started = std::chrono::steady_clock::now();
-        result = load_dsv4_cuda_linear(checkpoint_,
-                                        kind == LoadKind::Preload ? nullptr : &resident_,
-                                        base, rows, columns,
-                                        devices_[slot], backend_, entry.weight,
-                                        defer);
+        if (tiled != nullptr) {
+            const auto storage = resident_.find_tiled_expert(
+                tiled->layer, tiled->expert, tiled->shard);
+            if (storage.size() != shard_payload_bytes) {
+                result.errors.emplace_back(
+                    "DeepSeek transformed expert shard is not resident: " + key);
+                return result;
+            }
+            CudaWeightDescriptor descriptor;
+            descriptor.encoding = CudaWeightEncoding::Fp4E2m1Tiled32;
+            descriptor.dtype = SafetensorsDtype::I8;
+            descriptor.rows = kHidden;
+            descriptor.columns =
+                kExpertIntermediate / kResidentExpertShards;
+            descriptor.group_size = 32U;
+            result = backend_.upload(
+                devices_[slot], descriptor, storage, {}, entry.weight,
+                defer ? CudaBackend::UploadCompletion::Deferred
+                      : CudaBackend::UploadCompletion::Synchronous);
+        } else {
+            result = load_dsv4_cuda_linear(
+                checkpoint_, kind == LoadKind::Preload ? nullptr : &resident_,
+                base, rows, columns, devices_[slot], backend_, entry.weight,
+                defer);
+        }
         if (!result.ok()) return result;
         if (defer) deferred_upload_slots_[slot] = 1U;
         entry.last_use = state.clock;
@@ -1626,17 +1689,6 @@ struct DeepSeekV4Runtime::Impl {
     std::vector<float> index_rope_cosines;
     std::vector<float> index_rope_sines;
     std::vector<std::unique_ptr<HostMoeContext>> host_moe_contexts;
-    // One page's routed-expert result, already reduced over the top-k, laid
-    // out row-major as [row][shard][hidden]. When this covers the layer a
-    // per-row CPU-MoE callback is running, the callback only publishes its own
-    // slice instead of decoding that row's six experts again.
-    struct PageRoutedPartials {
-        std::uint32_t layer{};
-        std::size_t rows{};
-        std::vector<float> values;
-        bool valid{};
-    };
-    PageRoutedPartials page_routed;
     std::uint32_t host_moe_pending{};
     // Page-major prompt execution enqueues the CPU-MoE chain once per row
     // inside one layer rather than once per layer inside one token. The chain
@@ -1655,10 +1707,6 @@ struct DeepSeekV4Runtime::Impl {
     std::array<std::vector<std::size_t>, 2U> expert_node_lanes;
     std::vector<float> tiled_activation;
     std::vector<float> tiled_routed;
-    // Page-wide scratch for the grouped routed pass, laid out by expert group
-    // so a group's members are a contiguous run of rows in both.
-    std::vector<float> page_activation;
-    std::vector<float> page_routed_values;
     std::array<std::atomic<std::uint64_t>, 48U> tiled_lane_next{};
     std::array<std::uint64_t, 48U> tiled_lane_end{};
     Dsv4DiagnosticTrace diagnostics;
@@ -2066,28 +2114,6 @@ struct DeepSeekV4Runtime::Impl {
             }
         }
         return dispatched;
-    }
-    // Compute every row of one page's routed-expert partials in one pass,
-    // grouping the page's (row, rank) selections by expert so an FP4/E8M0
-    // weight tile is decoded once for a group of rows instead of once per
-    // row. Each row keeps the exact column and FMA order of the per-row path.
-    ValidationResult prepare_page_routed_partials(
-        std::uint32_t layer, std::span<const Dsv4Route> routes,
-        std::span<const float> inputs);
-    // The current row's slice of that precompute, if one covers this layer
-    // and this row. Empty on the token-major path, which has no page.
-    [[nodiscard]] std::optional<std::span<const float>>
-    page_routed_partial_for_row(std::uint32_t layer) const {
-        constexpr std::size_t shards = 2U;
-        if (!page_routed.valid || page_routed.layer != layer ||
-            !host_moe_chain_row.has_value() ||
-            *host_moe_chain_row >= page_routed.rows) {
-            return std::nullopt;
-        }
-        return std::span<const float>(page_routed.values)
-            .subspan(static_cast<std::size_t>(*host_moe_chain_row) * shards *
-                         kHidden,
-                     shards * kHidden);
     }
     ValidationResult host_routed_moe_impl(
         std::uint32_t layer, const Dsv4Route* route,
@@ -4728,223 +4754,6 @@ ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
     return result;
 }
 
-ValidationResult DeepSeekV4Runtime::Impl::prepare_page_routed_partials(
-    std::uint32_t layer, std::span<const Dsv4Route> routes,
-    std::span<const float> inputs) {
-    ValidationResult result;
-    constexpr std::size_t shards = 2U;
-    constexpr std::size_t shard_intermediate = kExpertIntermediate / shards;
-    constexpr std::size_t block = 32U;
-    constexpr auto intermediate_blocks = shard_intermediate / block;
-    constexpr auto hidden_blocks = kHidden / block;
-    // One call of the multi-row primitive decodes each tile once per four
-    // rows, so the chunk width costs nothing beyond bounding the scratch.
-    constexpr std::size_t chunk = 16U;
-    page_routed.valid = false;
-    const auto rows = routes.size();
-    if (layer >= kLayers || rows == 0U || inputs.size() != rows * kHidden ||
-        expert_workers == nullptr ||
-        expert_lane_nodes.size() != expert_workers->size()) {
-        result.errors.emplace_back(
-            "DeepSeek page routed precompute state is invalid");
-        return result;
-    }
-
-    // Group the page's (row, rank) selections by expert. Groups are ordered by
-    // expert identity and members within a group by (row, rank), so the
-    // schedule is a function of the routes alone.
-    const auto prepare_started = std::chrono::steady_clock::now();
-    std::array<std::uint32_t, kExperts> counts{};
-    for (const auto& route : routes) {
-        if (route.experts.size() != kTopK || route.weights.size() != kTopK) {
-            result.errors.emplace_back(
-                "DeepSeek page routed precompute route is invalid");
-            return result;
-        }
-        for (const auto expert_id : route.experts) {
-            if (expert_id >= kExperts) {
-                result.errors.emplace_back(
-                    "DeepSeek page routed precompute route is invalid");
-                return result;
-            }
-            ++counts[expert_id];
-        }
-    }
-    std::vector<std::uint32_t> group_expert;
-    std::vector<std::size_t> group_begin;
-    group_expert.reserve(kExperts);
-    group_begin.reserve(kExperts + 1U);
-    std::array<std::size_t, kExperts> group_of_expert{};
-    std::size_t members = 0U;
-    for (std::uint32_t expert_id = 0U; expert_id < kExperts; ++expert_id) {
-        if (counts[expert_id] == 0U) continue;
-        group_of_expert[expert_id] = group_expert.size();
-        group_expert.push_back(expert_id);
-        group_begin.push_back(members);
-        members += counts[expert_id];
-    }
-    group_begin.push_back(members);
-    const auto groups = group_expert.size();
-
-    std::vector<std::uint32_t> member_row(members);
-    std::vector<std::size_t> member_of(rows * kTopK);
-    {
-        std::vector<std::size_t> cursor(group_begin.begin(),
-                                        group_begin.end() - 1);
-        for (std::size_t row = 0U; row < rows; ++row) {
-            for (std::size_t rank = 0U; rank < kTopK; ++rank) {
-                const auto group = group_of_expert[routes[row].experts[rank]];
-                const auto slot = cursor[group]++;
-                member_row[slot] = static_cast<std::uint32_t>(row);
-                member_of[row * kTopK + rank] = slot;
-            }
-        }
-    }
-
-    std::array<std::vector<Dsv4TiledExpertWeights>, shards> tiled;
-    for (std::size_t shard = 0U; shard < shards; ++shard) {
-        tiled[shard].resize(groups);
-        for (std::size_t group = 0U; group < groups; ++group) {
-            auto viewed = dsv4_tiled_expert_weights(
-                resident.find_tiled_expert(
-                    layer, group_expert[group],
-                    static_cast<std::uint32_t>(shard)),
-                kHidden, kExpertIntermediate, shards);
-            if (!viewed.ok()) {
-                append_errors(result, std::move(viewed.errors));
-                return result;
-            }
-            tiled[shard][group] = viewed.value;
-        }
-    }
-
-    page_activation.assign(shards * members * shard_intermediate, 0.0F);
-    page_routed_values.assign(shards * members * kHidden, 0.0F);
-    page_routed.values.assign(rows * shards * kHidden, 0.0F);
-    graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
-
-    const auto routed_started = std::chrono::steady_clock::now();
-    auto phase_started = routed_started;
-    result = run_expert_ranges(groups * intermediate_blocks,
-                               [&](std::size_t shard, std::uint64_t task) {
-        const auto group = static_cast<std::size_t>(task / intermediate_blocks);
-        const auto offset = (task % intermediate_blocks) * block;
-        const auto first = group_begin[group];
-        const auto count = group_begin[group + 1U] - first;
-        std::array<float, chunk * block> gate{};
-        std::array<float, chunk * block> up{};
-        for (std::size_t begin = 0U; begin < count; begin += chunk) {
-            const auto width = std::min(chunk, count - begin);
-            const auto selected = std::span<const std::uint32_t>(
-                member_row).subspan(first + begin, width);
-            const auto span_of = [&](std::array<float, chunk * block>& values,
-                                     std::size_t half) {
-                return std::span<float>(values).subspan(half * 16U);
-            };
-            for (std::size_t half = 0U; half < 2U; ++half) {
-                dsv4_tiled_expert_matvec16_rows(
-                    span_of(gate, half), block, inputs, kHidden, selected,
-                    tiled[shard][group].w13_packed,
-                    tiled[shard][group].w13_scales, 2U * shard_intermediate,
-                    offset + half * 16U);
-                dsv4_tiled_expert_matvec16_rows(
-                    span_of(up, half), block, inputs, kHidden, selected,
-                    tiled[shard][group].w13_packed,
-                    tiled[shard][group].w13_scales, 2U * shard_intermediate,
-                    shard_intermediate + offset + half * 16U);
-            }
-            for (std::size_t member = 0U; member < width; ++member) {
-                auto* destination = page_activation.data() +
-                    (shard * members + first + begin + member) *
-                        shard_intermediate + offset;
-                const auto* gate_row = gate.data() + member * block;
-                const auto* up_row = up.data() + member * block;
-                for (std::size_t index = 0U; index < block; ++index) {
-                    destination[index] = gate_row[index] /
-                        (1.0F + std::exp(-gate_row[index])) * up_row[index];
-                }
-            }
-        }
-    }, true);
-    device_moe_stats.routed_gate_up_nanoseconds +=
-        elapsed_nanoseconds(phase_started);
-
-    phase_started = std::chrono::steady_clock::now();
-    if (result.ok()) {
-        result = run_expert_ranges(groups * hidden_blocks,
-                                   [&](std::size_t shard, std::uint64_t task) {
-            const auto group = static_cast<std::size_t>(task / hidden_blocks);
-            const auto offset = (task % hidden_blocks) * block;
-            const auto first = group_begin[group];
-            const auto count = group_begin[group + 1U] - first;
-            // A group's members are consecutive, so the activations they read
-            // and the rows they write are both contiguous runs.
-            const auto activation = std::span<const float>(page_activation)
-                .subspan(shard * members * shard_intermediate,
-                         members * shard_intermediate);
-            std::array<std::uint32_t, chunk> selected{};
-            for (std::size_t begin = 0U; begin < count; begin += chunk) {
-                const auto width = std::min(chunk, count - begin);
-                for (std::size_t member = 0U; member < width; ++member) {
-                    selected[member] = static_cast<std::uint32_t>(
-                        first + begin + member);
-                }
-                auto destination = std::span<float>(page_routed_values)
-                    .subspan((shard * members + first + begin) * kHidden +
-                                 offset,
-                             (width - 1U) * kHidden + block);
-                for (std::size_t half = 0U; half < 2U; ++half) {
-                    dsv4_tiled_expert_matvec16_rows(
-                        destination.subspan(half * 16U), kHidden, activation,
-                        shard_intermediate,
-                        std::span<const std::uint32_t>(selected).first(width),
-                        tiled[shard][group].w2_packed,
-                        tiled[shard][group].w2_scales, kHidden,
-                        offset + half * 16U);
-                }
-            }
-        }, true);
-    }
-    device_moe_stats.routed_down_nanoseconds +=
-        elapsed_nanoseconds(phase_started);
-
-    phase_started = std::chrono::steady_clock::now();
-    if (result.ok()) {
-        result = run_expert_ranges(rows * hidden_blocks,
-                                   [&](std::size_t shard, std::uint64_t task) {
-            const auto row = static_cast<std::size_t>(task / hidden_blocks);
-            const auto offset = (task % hidden_blocks) * block;
-            auto* destination = page_routed.values.data() +
-                (row * shards + shard) * kHidden + offset;
-            const auto& weights_of_row = routes[row].weights;
-            const auto* source = page_routed_values.data() +
-                (shard * members + member_of[row * kTopK]) * kHidden + offset;
-            for (std::size_t index = 0U; index < block; ++index) {
-                destination[index] = source[index] * weights_of_row[0];
-            }
-            for (std::size_t rank = 1U; rank < kTopK; ++rank) {
-                const auto* ranked = page_routed_values.data() +
-                    (shard * members + member_of[row * kTopK + rank]) *
-                        kHidden + offset;
-                for (std::size_t index = 0U; index < block; ++index) {
-                    destination[index] = std::fma(
-                        ranked[index], weights_of_row[rank],
-                        destination[index]);
-                }
-            }
-        }, false);
-    }
-    device_moe_stats.routed_reduce_nanoseconds +=
-        elapsed_nanoseconds(phase_started);
-    device_moe_stats.routed_cpu_nanoseconds +=
-        elapsed_nanoseconds(routed_started);
-    if (!result.ok()) return result;
-    page_routed.layer = layer;
-    page_routed.rows = rows;
-    page_routed.valid = true;
-    return result;
-}
-
 ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
     std::uint32_t layer, const Dsv4Route* route,
     std::span<const float> input, std::span<float> output,
@@ -4993,10 +4802,7 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
         }
         return true;
     };
-    // A page precompute already resolved and decoded this row's experts.
-    const auto page_routed_slice = page_routed_partial_for_row(layer);
-    if (!device_input && !page_routed_slice.has_value() &&
-        !resolve_tiled(*route)) {
+    if (!device_input && !resolve_tiled(*route)) {
         if (result.ok()) {
                 result.errors.emplace_back(
                     "DeepSeek host-routed MoE route is invalid");
@@ -5045,19 +4851,6 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
         callback_finished = std::chrono::steady_clock::now();
         return false;
     }
-    if (page_routed_slice.has_value()) {
-        // The whole page's routed experts were already computed with each
-        // weight tile decoded once for the rows that share it. Publishing the
-        // slice is all that is left.
-        std::copy(page_routed_slice->begin(), page_routed_slice->end(),
-                  rank_partials.begin());
-        device_moe_stats.routed_cpu_nanoseconds +=
-            elapsed_nanoseconds(routed_started);
-        callback_finished = std::chrono::steady_clock::now();
-        callback_accepted = true;
-        return true;
-    }
-
     constexpr std::size_t block = 32U;
     constexpr auto intermediate_blocks = shard_intermediate / block;
     auto routed_phase_started = std::chrono::steady_clock::now();
@@ -5744,19 +5537,42 @@ ValidationResult DeepSeekV4Runtime::Impl::execute_moe_page(
             auto& pending_device = pending[slot];
             auto found = pending_device.expert_slot.find(expert_id);
             if (found == pending_device.expert_slot.end()) {
-                CudaDeepSeekMoeExpert descriptor;
-                const auto prefix =
-                    routed_prefix + std::to_string(expert_id) + ".";
-                if (!acquire_triplet(slot, prefix, pending_device, descriptor)) {
-                    return result;
+                CudaDeepSeekMoeRowGroup group;
+                if (resident.tiled_experts()) {
+                    // The transformed shards are the resident copy, so this
+                    // uploads them as they stand. Reading the canonical
+                    // triplet instead means re-reading the checkpoint for
+                    // weights that are already in host memory.
+                    for (std::uint32_t shard = 0U;
+                         shard < kResidentExpertShards; ++shard) {
+                        pending_device.leases.emplace_back();
+                        auto acquired = weights->acquire_tiled_expert(
+                            slot, layer, expert_id, shard,
+                            pending_device.leases.back());
+                        if (!acquired.ok()) {
+                            append_errors(result, std::move(acquired.errors),
+                                          "DeepSeek transformed expert shard");
+                            pending_device.leases.pop_back();
+                            return result;
+                        }
+                        group.tiled_shards[shard] =
+                            &pending_device.leases.back().weight();
+                    }
+                } else {
+                    CudaDeepSeekMoeExpert descriptor;
+                    const auto prefix =
+                        routed_prefix + std::to_string(expert_id) + ".";
+                    if (!acquire_triplet(slot, prefix, pending_device,
+                                         descriptor)) {
+                        return result;
+                    }
+                    group.w1 = descriptor.w1;
+                    group.w3 = descriptor.w3;
+                    group.w2 = descriptor.w2;
                 }
                 const auto group_index = pending_device.groups.size();
                 pending_device.group_rows.emplace_back();
                 pending_device.group_coefficients.emplace_back();
-                CudaDeepSeekMoeRowGroup group;
-                group.w1 = descriptor.w1;
-                group.w3 = descriptor.w3;
-                group.w2 = descriptor.w2;
                 pending_device.groups.push_back(group);
                 found = pending_device.expert_slot
                             .emplace(expert_id, group_index).first;
@@ -7692,21 +7508,19 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
             }
             graph_stats.moe_router_nanoseconds +=
                 elapsed_nanoseconds(router_started);
-            const auto phase_started = std::chrono::steady_clock::now();
             if (page_moe_on_device) {
                 // Prefill places the routed experts on the GPU: each distinct
                 // expert of the page is uploaded once and applied to all its
                 // rows as a matmul. Decode keeps them in the NUMA-local CPU
                 // shards, where the weights already live and a step has six
                 // experts and one row.
+                const auto phase_started = std::chrono::steady_clock::now();
                 result = execute_moe_page(layer, routes, layer_inputs,
                                           moe_outputs);
-            } else {
-                result = prepare_page_routed_partials(layer, routes,
-                                                      layer_inputs);
+                graph_stats.moe_nanoseconds +=
+                    elapsed_nanoseconds(phase_started);
+                if (!result.ok()) return result;
             }
-            graph_stats.moe_nanoseconds += elapsed_nanoseconds(phase_started);
-            if (!result.ok()) return result;
         }
         for (std::size_t row = 0U; row < rows; ++row) {
             result = select(row);
@@ -7799,7 +7613,6 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
         }
     }
 
-    page_routed.valid = false;
     result = select(0U);
     if (!result.ok()) return result;
     graph_stats.forward_tokens += rows;

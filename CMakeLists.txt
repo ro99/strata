@@ -157,9 +157,6 @@ add_executable(strata-dsv4-expert-row-batch-probe
     apps/strata_dsv4_expert_row_batch_probe.cpp)
 target_link_libraries(strata-dsv4-expert-row-batch-probe PRIVATE strata_core)
 
-add_executable(strata-dsv4-untile-probe apps/strata_dsv4_untile_probe.cpp)
-target_link_libraries(strata-dsv4-untile-probe PRIVATE strata_core)
-
 add_executable(strata-mhc-prepack-probe apps/strata_mhc_prepack_probe.cpp)
 target_link_libraries(strata-mhc-prepack-probe PRIVATE strata_core)
 

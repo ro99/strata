@@ -2,6 +2,7 @@
 
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/deepseek_host_expert.hpp"
 #include "strata/deepseek_ops.hpp"
 #include "strata/dsv4_attention_kv.hpp"
 #include "strata/numerics.hpp"
@@ -1658,6 +1659,153 @@ TEST_CASE("native CUDA DeepSeek paged attention reads persistent physical pages"
                 before.dsv4_paged_attention_d2h_bytes ==
             output.size() * sizeof(std::uint16_t) +
                 2U * sizeof(unsigned int));
+}
+
+TEST_CASE("native CUDA DeepSeek transformed expert shards match the canonical ones") {
+    // Prefill uploads the routed experts in the host expert's decode layout,
+    // because that is the only copy of them host memory holds. The kernels
+    // therefore address two layouts, and the whole point is that they read the
+    // same byte for the same (row, column): same accumulation order, same
+    // bits, not a tolerance.
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const auto device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_devices{device};
+    REQUIRE(backend.initialize(selected_devices, true).ok());
+
+    constexpr std::uint64_t hidden = 128U;
+    constexpr std::uint64_t intermediate = 192U;
+    constexpr std::uint64_t shards = strata::kCudaDsv4TiledShards;
+    constexpr std::uint32_t rows = 5U;
+    constexpr float swiglu_limit = 10.0F;
+
+    // Same bytes for both layouts, generated exactly as upload_fp4 does so the
+    // canonical upload and the transform describe one expert.
+    struct Payload {
+        std::vector<std::byte> packed;
+        std::vector<std::byte> scales;
+    };
+    const auto make_payload = [](std::uint64_t weight_rows,
+                                 std::uint64_t columns, std::uint8_t seed) {
+        Payload payload;
+        const auto packed_columns = (columns + 1U) / 2U;
+        const auto scale_columns = (columns + 31U) / 32U;
+        payload.packed.resize(
+            static_cast<std::size_t>(weight_rows * packed_columns));
+        for (std::uint64_t row = 0U; row < weight_rows; ++row) {
+            for (std::uint64_t packed = 0U; packed < packed_columns; ++packed) {
+                const auto low = static_cast<std::uint8_t>(
+                    (seed + row * 3U + packed * 5U) & 0x0FU);
+                const auto high = static_cast<std::uint8_t>(
+                    (seed + row * 7U + packed * 11U + 1U) & 0x0FU);
+                payload.packed[static_cast<std::size_t>(
+                    row * packed_columns + packed)] = static_cast<std::byte>(
+                    low | static_cast<std::uint8_t>(high << 4U));
+            }
+        }
+        payload.scales.resize(
+            static_cast<std::size_t>(weight_rows * scale_columns));
+        for (std::size_t index = 0U; index < payload.scales.size(); ++index) {
+            payload.scales[index] = static_cast<std::byte>(
+                0x78U + static_cast<std::uint8_t>((index + seed) % 3U));
+        }
+        return payload;
+    };
+    const auto w1 = make_payload(intermediate, hidden, 5U);
+    const auto w3 = make_payload(intermediate, hidden, 12U);
+    const auto w2 = make_payload(hidden, intermediate, 21U);
+
+    strata::Dsv4HostExpertWeights canonical;
+    canonical.w1_packed = w1.packed;
+    canonical.w1_scales = w1.scales;
+    canonical.w3_packed = w3.packed;
+    canonical.w3_scales = w3.scales;
+    canonical.w2_packed = w2.packed;
+    canonical.w2_scales = w2.scales;
+
+    const auto upload_canonical = [&](std::uint64_t weight_rows,
+                                      std::uint64_t columns,
+                                      const Payload& source) {
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::Fp4E2m1Group32;
+        descriptor.dtype = strata::SafetensorsDtype::I8;
+        descriptor.rows = weight_rows;
+        descriptor.columns = columns;
+        descriptor.packed_columns = (columns + 1U) / 2U;
+        descriptor.scale_columns = (columns + 31U) / 32U;
+        descriptor.group_size = 32U;
+        strata::CudaWeight weight;
+        REQUIRE(backend.upload(device, descriptor, source.packed, source.scales,
+                               weight).ok());
+        return weight;
+    };
+    const auto canonical_w1 = upload_canonical(intermediate, hidden, w1);
+    const auto canonical_w3 = upload_canonical(intermediate, hidden, w3);
+    const auto canonical_w2 = upload_canonical(hidden, intermediate, w2);
+
+    const auto shard_bytes = strata::dsv4_tiled_expert_shard_bytes(
+        hidden, intermediate, shards);
+    REQUIRE(shard_bytes != 0U);
+    std::array<strata::CudaWeight, shards> shard_weights;
+    for (std::uint64_t shard = 0U; shard < shards; ++shard) {
+        std::vector<std::byte> storage(static_cast<std::size_t>(shard_bytes));
+        REQUIRE(strata::dsv4_transform_tiled_expert_shard(
+                    storage, canonical, hidden, intermediate, shard, shards)
+                    .ok());
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::Fp4E2m1Tiled32;
+        descriptor.dtype = strata::SafetensorsDtype::I8;
+        descriptor.rows = hidden;
+        descriptor.columns = intermediate / shards;
+        descriptor.group_size = 32U;
+        REQUIRE(backend.upload(device, descriptor, storage, {},
+                               shard_weights[shard]).ok());
+    }
+
+    std::vector<float> hidden_state(rows * static_cast<std::size_t>(hidden));
+    std::uint32_t seed = 0x51a7c3U;
+    for (auto& value : hidden_state) {
+        seed = seed * 1'664'525U + 1'013'904'223U;
+        value = static_cast<float>(
+                    static_cast<std::int32_t>((seed >> 10U) % 2'048U) - 1'024) /
+                4'096.0F;
+    }
+    const std::array<std::uint32_t, rows> group_rows{0U, 3U, 1U, 4U, 2U};
+    const std::array<float, rows> coefficients{
+        0.5F, 1.25F, 0.125F, 0.875F, 1.5F};
+
+    const auto run = [&](bool tiled) {
+        strata::CudaDeepSeekMoeRowGroup group;
+        if (tiled) {
+            for (std::size_t shard = 0U; shard < shards; ++shard) {
+                group.tiled_shards[shard] = &shard_weights[shard];
+            }
+        } else {
+            group.w1 = &canonical_w1;
+            group.w3 = &canonical_w3;
+            group.w2 = &canonical_w2;
+        }
+        group.rows = group_rows;
+        group.coefficients = coefficients;
+        const std::array<strata::CudaDeepSeekMoeRowGroup, 1> page{group};
+        REQUIRE(backend.enqueue_deepseek_moe_rows(
+                    device, hidden_state, rows, page, nullptr, {},
+                    swiglu_limit).ok());
+        std::vector<float> routed(rows * static_cast<std::size_t>(hidden));
+        REQUIRE(backend.collect_deepseek_moe_rows(device, routed, {}).ok());
+        return routed;
+    };
+
+    const auto expected = run(false);
+    const auto actual = run(true);
+    REQUIRE(expected.size() == actual.size());
+    for (std::size_t index = 0U; index < expected.size(); ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) ==
+                std::bit_cast<std::uint32_t>(expected[index]));
+    }
+    REQUIRE(std::any_of(expected.begin(), expected.end(),
+                        [](float value) { return value != 0.0F; }));
 }
 
 TEST_CASE("native CUDA DeepSeek device mHC slots interleave rows exactly") {

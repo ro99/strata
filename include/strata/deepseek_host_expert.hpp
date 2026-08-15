@@ -103,24 +103,6 @@ struct Dsv4TiledExpertWeights {
     std::uint64_t hidden, std::uint64_t intermediate, std::uint64_t shard,
     std::uint64_t shards = 2U);
 
-// Which canonical matrix of an expert to rebuild from the transformed shards.
-enum class Dsv4ExpertMatrix : std::uint8_t { Gate, Up, Down };
-
-// Rebuilds one canonical expert matrix from the transformed shards, so the
-// device can be fed the same resident bytes the host kernels read instead of
-// re-reading the checkpoint. The transform is a permutation whose only
-// non-injective step duplicates each group-32 E8M0 scale across two group-16
-// slots, so taking either copy inverts it exactly.
-//
-// `packed` and `scales` receive the checkpoint's own layout: [intermediate,
-// hidden] for Gate and Up, [hidden, intermediate] for Down, FP4 E2M1 two per
-// byte with one scale byte per 32 columns.
-[[nodiscard]] ValidationResult dsv4_untile_expert_matrix(
-    std::span<std::byte> packed, std::span<std::byte> scales,
-    std::span<const std::span<const std::byte>> shards,
-    Dsv4ExpertMatrix matrix, std::uint64_t hidden,
-    std::uint64_t intermediate);
-
 // Computes 16 adjacent outputs from one transformed matrix tile. Shapes are
 // validated when the view is created, outside this decode inner loop.
 void dsv4_tiled_expert_matvec16(

@@ -1622,6 +1622,17 @@ struct DeepSeekV4Runtime::Impl {
     std::vector<float> index_rope_cosines;
     std::vector<float> index_rope_sines;
     std::vector<std::unique_ptr<HostMoeContext>> host_moe_contexts;
+    // One page's routed-expert result, already reduced over the top-k, laid
+    // out row-major as [row][shard][hidden]. When this covers the layer a
+    // per-row CPU-MoE callback is running, the callback only publishes its own
+    // slice instead of decoding that row's six experts again.
+    struct PageRoutedPartials {
+        std::uint32_t layer{};
+        std::size_t rows{};
+        std::vector<float> values;
+        bool valid{};
+    };
+    PageRoutedPartials page_routed;
     std::uint32_t host_moe_pending{};
     // Page-major prompt execution enqueues the CPU-MoE chain once per row
     // inside one layer rather than once per layer inside one token. The chain
@@ -1640,6 +1651,10 @@ struct DeepSeekV4Runtime::Impl {
     std::array<std::vector<std::size_t>, 2U> expert_node_lanes;
     std::vector<float> tiled_activation;
     std::vector<float> tiled_routed;
+    // Page-wide scratch for the grouped routed pass, laid out by expert group
+    // so a group's members are a contiguous run of rows in both.
+    std::vector<float> page_activation;
+    std::vector<float> page_routed_values;
     std::array<std::atomic<std::uint64_t>, 48U> tiled_lane_next{};
     std::array<std::uint64_t, 48U> tiled_lane_end{};
     Dsv4DiagnosticTrace diagnostics;
@@ -1979,6 +1994,97 @@ struct DeepSeekV4Runtime::Impl {
     // page-major prompt execution, so neither bound is known at construction.
     PhysicalAttentionContext& physical_attention_context(std::size_t index);
     HostMoeContext& host_moe_context(std::size_t index);
+    // Dispatch `tasks` shard-local tasks across the NUMA-addressed expert
+    // pool. Every lane runs the whole range for its own shard; `steal` lets a
+    // finished lane claim work from another lane on the same shard.
+    template <typename Operation>
+    ValidationResult run_expert_ranges(
+        std::uint64_t tasks, Operation&& operation, bool steal) {
+        constexpr std::size_t shards = 2U;
+        const auto lanes = expert_workers->size();
+        if (steal) {
+            for (std::size_t lane = 0U; lane < lanes; ++lane) {
+                const auto shard = static_cast<std::size_t>(
+                    expert_lane_nodes[lane]);
+                const auto position = expert_lane_positions[lane];
+                const auto workers = expert_node_lanes[shard].size();
+                tiled_lane_next[lane].store(
+                    tasks * position / workers, std::memory_order_relaxed);
+                tiled_lane_end[lane] = tasks * (position + 1U) / workers;
+            }
+        }
+        auto dispatched = expert_workers->parallel_for_addressed(
+            lanes, [&](std::size_t lane) {
+                const auto shard = static_cast<std::size_t>(
+                    expert_lane_nodes[lane]);
+                if (shard >= shards || expert_node_lanes[shard].empty()) return;
+                const auto position = expert_lane_positions[lane];
+                const auto& node_lanes = expert_node_lanes[shard];
+                if (!steal) {
+                    const auto begin = tasks * position / node_lanes.size();
+                    const auto end = tasks * (position + 1U) /
+                                     node_lanes.size();
+                    for (auto task = begin; task < end; ++task) {
+                        operation(shard, task);
+                    }
+                    return;
+                }
+                const auto claim = [&](std::size_t owner) {
+                    const auto task = tiled_lane_next[owner].fetch_add(
+                        1U, std::memory_order_relaxed);
+                    if (task >= tiled_lane_end[owner]) return false;
+                    operation(shard, task);
+                    return true;
+                };
+                while (claim(lane)) {}
+                for (;;) {
+                    bool stole = false;
+                    for (std::size_t offset = 1U;
+                         offset < node_lanes.size(); ++offset) {
+                        const auto owner = node_lanes[
+                            (position + offset) % node_lanes.size()];
+                        if (claim(owner)) {
+                            stole = true;
+                            break;
+                        }
+                    }
+                    if (!stole) break;
+                }
+            });
+        if (dispatched.ok() && steal) {
+            for (std::size_t lane = 0U; lane < lanes; ++lane) {
+                if (tiled_lane_next[lane].load(std::memory_order_relaxed) <
+                    tiled_lane_end[lane]) {
+                    dispatched.errors.emplace_back(
+                        "DeepSeek host-routed MoE left a lane range unfinished");
+                    break;
+                }
+            }
+        }
+        return dispatched;
+    }
+    // Compute every row of one page's routed-expert partials in one pass,
+    // grouping the page's (row, rank) selections by expert so an FP4/E8M0
+    // weight tile is decoded once for a group of rows instead of once per
+    // row. Each row keeps the exact column and FMA order of the per-row path.
+    ValidationResult prepare_page_routed_partials(
+        std::uint32_t layer, std::span<const Dsv4Route> routes,
+        std::span<const float> inputs);
+    // The current row's slice of that precompute, if one covers this layer
+    // and this row. Empty on the token-major path, which has no page.
+    [[nodiscard]] std::optional<std::span<const float>>
+    page_routed_partial_for_row(std::uint32_t layer) const {
+        constexpr std::size_t shards = 2U;
+        if (!page_routed.valid || page_routed.layer != layer ||
+            !host_moe_chain_row.has_value() ||
+            *host_moe_chain_row >= page_routed.rows) {
+            return std::nullopt;
+        }
+        return std::span<const float>(page_routed.values)
+            .subspan(static_cast<std::size_t>(*host_moe_chain_row) * shards *
+                         kHidden,
+                     shards * kHidden);
+    }
     ValidationResult host_routed_moe_impl(
         std::uint32_t layer, const Dsv4Route* route,
         std::span<const float> input, std::span<float> output,
@@ -4421,75 +4527,11 @@ bool DeepSeekV4Runtime::Impl::execute_host_routed_moe_callback(
         }
     }
 
-    const auto lanes = expert_workers->size();
-    const auto run_ranges = [&]<typename Operation>(
-        std::uint64_t tasks, Operation&& operation, bool steal) {
-        if (steal) {
-            for (std::size_t lane = 0U; lane < lanes; ++lane) {
-                const auto shard = static_cast<std::size_t>(
-                    expert_lane_nodes[lane]);
-                const auto position = expert_lane_positions[lane];
-                const auto workers = expert_node_lanes[shard].size();
-                tiled_lane_next[lane].store(
-                    tasks * position / workers, std::memory_order_relaxed);
-                tiled_lane_end[lane] = tasks * (position + 1U) / workers;
-            }
-        }
-        auto dispatched = expert_workers->parallel_for_addressed(
-            lanes, [&](std::size_t lane) {
-                const auto shard = static_cast<std::size_t>(
-                    expert_lane_nodes[lane]);
-                if (shard >= shards || expert_node_lanes[shard].empty()) return;
-                const auto position = expert_lane_positions[lane];
-                const auto& node_lanes = expert_node_lanes[shard];
-                if (!steal) {
-                    const auto begin = tasks * position / node_lanes.size();
-                    const auto end = tasks * (position + 1U) /
-                                     node_lanes.size();
-                    for (auto task = begin; task < end; ++task) {
-                        operation(shard, task);
-                    }
-                    return;
-                }
-                const auto claim = [&](std::size_t owner) {
-                    const auto task = tiled_lane_next[owner].fetch_add(
-                        1U, std::memory_order_relaxed);
-                    if (task >= tiled_lane_end[owner]) return false;
-                    operation(shard, task);
-                    return true;
-                };
-                while (claim(lane)) {}
-                for (;;) {
-                    bool stole = false;
-                    for (std::size_t offset = 1U;
-                         offset < node_lanes.size(); ++offset) {
-                        const auto owner = node_lanes[
-                            (position + offset) % node_lanes.size()];
-                        if (claim(owner)) {
-                            stole = true;
-                            break;
-                        }
-                    }
-                    if (!stole) break;
-                }
-            });
-        if (dispatched.ok() && steal) {
-            for (std::size_t lane = 0U; lane < lanes; ++lane) {
-                if (tiled_lane_next[lane].load(std::memory_order_relaxed) <
-                    tiled_lane_end[lane]) {
-                    dispatched.errors.emplace_back(
-                        "DeepSeek host-routed MoE left a lane range unfinished");
-                    break;
-                }
-            }
-        }
-        return dispatched;
-    };
 
     constexpr std::size_t block = 32U;
     constexpr auto intermediate_blocks = shard_intermediate / block;
     auto phase_started = std::chrono::steady_clock::now();
-    context.result = run_ranges(
+    context.result = run_expert_ranges(
         kTopK * intermediate_blocks,
         [&](std::size_t shard, std::uint64_t task) {
             const auto rank = static_cast<std::size_t>(
@@ -4528,7 +4570,7 @@ bool DeepSeekV4Runtime::Impl::execute_host_routed_moe_callback(
     phase_started = std::chrono::steady_clock::now();
     if (context.result.ok()) {
         constexpr auto hidden_blocks = kHidden / block;
-        context.result = run_ranges(
+        context.result = run_expert_ranges(
             kTopK * hidden_blocks,
             [&](std::size_t shard, std::uint64_t task) {
                 const auto rank = static_cast<std::size_t>(
@@ -4557,7 +4599,7 @@ bool DeepSeekV4Runtime::Impl::execute_host_routed_moe_callback(
     phase_started = std::chrono::steady_clock::now();
     if (context.result.ok()) {
         constexpr auto hidden_blocks = kHidden / block;
-        context.result = run_ranges(
+        context.result = run_expert_ranges(
             hidden_blocks,
             [&](std::size_t shard, std::uint64_t task) {
                 const auto offset = task * block;
@@ -4682,6 +4724,223 @@ ValidationResult DeepSeekV4Runtime::Impl::collect_host_routed_moe_chain() {
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::prepare_page_routed_partials(
+    std::uint32_t layer, std::span<const Dsv4Route> routes,
+    std::span<const float> inputs) {
+    ValidationResult result;
+    constexpr std::size_t shards = 2U;
+    constexpr std::size_t shard_intermediate = kExpertIntermediate / shards;
+    constexpr std::size_t block = 32U;
+    constexpr auto intermediate_blocks = shard_intermediate / block;
+    constexpr auto hidden_blocks = kHidden / block;
+    // One call of the multi-row primitive decodes each tile once per four
+    // rows, so the chunk width costs nothing beyond bounding the scratch.
+    constexpr std::size_t chunk = 16U;
+    page_routed.valid = false;
+    const auto rows = routes.size();
+    if (layer >= kLayers || rows == 0U || inputs.size() != rows * kHidden ||
+        expert_workers == nullptr ||
+        expert_lane_nodes.size() != expert_workers->size()) {
+        result.errors.emplace_back(
+            "DeepSeek page routed precompute state is invalid");
+        return result;
+    }
+
+    // Group the page's (row, rank) selections by expert. Groups are ordered by
+    // expert identity and members within a group by (row, rank), so the
+    // schedule is a function of the routes alone.
+    const auto prepare_started = std::chrono::steady_clock::now();
+    std::array<std::uint32_t, kExperts> counts{};
+    for (const auto& route : routes) {
+        if (route.experts.size() != kTopK || route.weights.size() != kTopK) {
+            result.errors.emplace_back(
+                "DeepSeek page routed precompute route is invalid");
+            return result;
+        }
+        for (const auto expert_id : route.experts) {
+            if (expert_id >= kExperts) {
+                result.errors.emplace_back(
+                    "DeepSeek page routed precompute route is invalid");
+                return result;
+            }
+            ++counts[expert_id];
+        }
+    }
+    std::vector<std::uint32_t> group_expert;
+    std::vector<std::size_t> group_begin;
+    group_expert.reserve(kExperts);
+    group_begin.reserve(kExperts + 1U);
+    std::array<std::size_t, kExperts> group_of_expert{};
+    std::size_t members = 0U;
+    for (std::uint32_t expert_id = 0U; expert_id < kExperts; ++expert_id) {
+        if (counts[expert_id] == 0U) continue;
+        group_of_expert[expert_id] = group_expert.size();
+        group_expert.push_back(expert_id);
+        group_begin.push_back(members);
+        members += counts[expert_id];
+    }
+    group_begin.push_back(members);
+    const auto groups = group_expert.size();
+
+    std::vector<std::uint32_t> member_row(members);
+    std::vector<std::size_t> member_of(rows * kTopK);
+    {
+        std::vector<std::size_t> cursor(group_begin.begin(),
+                                        group_begin.end() - 1);
+        for (std::size_t row = 0U; row < rows; ++row) {
+            for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+                const auto group = group_of_expert[routes[row].experts[rank]];
+                const auto slot = cursor[group]++;
+                member_row[slot] = static_cast<std::uint32_t>(row);
+                member_of[row * kTopK + rank] = slot;
+            }
+        }
+    }
+
+    std::array<std::vector<Dsv4TiledExpertWeights>, shards> tiled;
+    for (std::size_t shard = 0U; shard < shards; ++shard) {
+        tiled[shard].resize(groups);
+        for (std::size_t group = 0U; group < groups; ++group) {
+            auto viewed = dsv4_tiled_expert_weights(
+                resident.find_tiled_expert(
+                    layer, group_expert[group],
+                    static_cast<std::uint32_t>(shard)),
+                kHidden, kExpertIntermediate, shards);
+            if (!viewed.ok()) {
+                append_errors(result, std::move(viewed.errors));
+                return result;
+            }
+            tiled[shard][group] = viewed.value;
+        }
+    }
+
+    page_activation.assign(shards * members * shard_intermediate, 0.0F);
+    page_routed_values.assign(shards * members * kHidden, 0.0F);
+    page_routed.values.assign(rows * shards * kHidden, 0.0F);
+    graph_stats.moe_prepare_nanoseconds += elapsed_nanoseconds(prepare_started);
+
+    const auto routed_started = std::chrono::steady_clock::now();
+    auto phase_started = routed_started;
+    result = run_expert_ranges(groups * intermediate_blocks,
+                               [&](std::size_t shard, std::uint64_t task) {
+        const auto group = static_cast<std::size_t>(task / intermediate_blocks);
+        const auto offset = (task % intermediate_blocks) * block;
+        const auto first = group_begin[group];
+        const auto count = group_begin[group + 1U] - first;
+        std::array<float, chunk * block> gate{};
+        std::array<float, chunk * block> up{};
+        for (std::size_t begin = 0U; begin < count; begin += chunk) {
+            const auto width = std::min(chunk, count - begin);
+            const auto selected = std::span<const std::uint32_t>(
+                member_row).subspan(first + begin, width);
+            const auto span_of = [&](std::array<float, chunk * block>& values,
+                                     std::size_t half) {
+                return std::span<float>(values).subspan(half * 16U);
+            };
+            for (std::size_t half = 0U; half < 2U; ++half) {
+                dsv4_tiled_expert_matvec16_rows(
+                    span_of(gate, half), block, inputs, kHidden, selected,
+                    tiled[shard][group].w13_packed,
+                    tiled[shard][group].w13_scales, 2U * shard_intermediate,
+                    offset + half * 16U);
+                dsv4_tiled_expert_matvec16_rows(
+                    span_of(up, half), block, inputs, kHidden, selected,
+                    tiled[shard][group].w13_packed,
+                    tiled[shard][group].w13_scales, 2U * shard_intermediate,
+                    shard_intermediate + offset + half * 16U);
+            }
+            for (std::size_t member = 0U; member < width; ++member) {
+                auto* destination = page_activation.data() +
+                    (shard * members + first + begin + member) *
+                        shard_intermediate + offset;
+                const auto* gate_row = gate.data() + member * block;
+                const auto* up_row = up.data() + member * block;
+                for (std::size_t index = 0U; index < block; ++index) {
+                    destination[index] = gate_row[index] /
+                        (1.0F + std::exp(-gate_row[index])) * up_row[index];
+                }
+            }
+        }
+    }, true);
+    device_moe_stats.routed_gate_up_nanoseconds +=
+        elapsed_nanoseconds(phase_started);
+
+    phase_started = std::chrono::steady_clock::now();
+    if (result.ok()) {
+        result = run_expert_ranges(groups * hidden_blocks,
+                                   [&](std::size_t shard, std::uint64_t task) {
+            const auto group = static_cast<std::size_t>(task / hidden_blocks);
+            const auto offset = (task % hidden_blocks) * block;
+            const auto first = group_begin[group];
+            const auto count = group_begin[group + 1U] - first;
+            // A group's members are consecutive, so the activations they read
+            // and the rows they write are both contiguous runs.
+            const auto activation = std::span<const float>(page_activation)
+                .subspan(shard * members * shard_intermediate,
+                         members * shard_intermediate);
+            std::array<std::uint32_t, chunk> selected{};
+            for (std::size_t begin = 0U; begin < count; begin += chunk) {
+                const auto width = std::min(chunk, count - begin);
+                for (std::size_t member = 0U; member < width; ++member) {
+                    selected[member] = static_cast<std::uint32_t>(
+                        first + begin + member);
+                }
+                auto destination = std::span<float>(page_routed_values)
+                    .subspan((shard * members + first + begin) * kHidden +
+                                 offset,
+                             (width - 1U) * kHidden + block);
+                for (std::size_t half = 0U; half < 2U; ++half) {
+                    dsv4_tiled_expert_matvec16_rows(
+                        destination.subspan(half * 16U), kHidden, activation,
+                        shard_intermediate,
+                        std::span<const std::uint32_t>(selected).first(width),
+                        tiled[shard][group].w2_packed,
+                        tiled[shard][group].w2_scales, kHidden,
+                        offset + half * 16U);
+                }
+            }
+        }, true);
+    }
+    device_moe_stats.routed_down_nanoseconds +=
+        elapsed_nanoseconds(phase_started);
+
+    phase_started = std::chrono::steady_clock::now();
+    if (result.ok()) {
+        result = run_expert_ranges(rows * hidden_blocks,
+                                   [&](std::size_t shard, std::uint64_t task) {
+            const auto row = static_cast<std::size_t>(task / hidden_blocks);
+            const auto offset = (task % hidden_blocks) * block;
+            auto* destination = page_routed.values.data() +
+                (row * shards + shard) * kHidden + offset;
+            const auto& weights_of_row = routes[row].weights;
+            const auto* source = page_routed_values.data() +
+                (shard * members + member_of[row * kTopK]) * kHidden + offset;
+            for (std::size_t index = 0U; index < block; ++index) {
+                destination[index] = source[index] * weights_of_row[0];
+            }
+            for (std::size_t rank = 1U; rank < kTopK; ++rank) {
+                const auto* ranked = page_routed_values.data() +
+                    (shard * members + member_of[row * kTopK + rank]) *
+                        kHidden + offset;
+                for (std::size_t index = 0U; index < block; ++index) {
+                    destination[index] = std::fma(
+                        ranked[index], weights_of_row[rank],
+                        destination[index]);
+                }
+            }
+        }, false);
+    }
+    device_moe_stats.routed_reduce_nanoseconds +=
+        elapsed_nanoseconds(phase_started);
+    device_moe_stats.routed_cpu_nanoseconds +=
+        elapsed_nanoseconds(routed_started);
+    if (!result.ok()) return result;
+    page_routed.layer = layer;
+    page_routed.rows = rows;
+    page_routed.valid = true;
+    return result;
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
     std::uint32_t layer, const Dsv4Route* route,
     std::span<const float> input, std::span<float> output,
@@ -4730,7 +4989,10 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
         }
         return true;
     };
-    if (!device_input && !resolve_tiled(*route)) {
+    // A page precompute already resolved and decoded this row's experts.
+    const auto page_routed_slice = page_routed_partial_for_row(layer);
+    if (!device_input && !page_routed_slice.has_value() &&
+        !resolve_tiled(*route)) {
         if (result.ok()) {
                 result.errors.emplace_back(
                     "DeepSeek host-routed MoE route is invalid");
@@ -4779,75 +5041,23 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
         callback_finished = std::chrono::steady_clock::now();
         return false;
     }
+    if (page_routed_slice.has_value()) {
+        // The whole page's routed experts were already computed with each
+        // weight tile decoded once for the rows that share it. Publishing the
+        // slice is all that is left.
+        std::copy(page_routed_slice->begin(), page_routed_slice->end(),
+                  rank_partials.begin());
+        device_moe_stats.routed_cpu_nanoseconds +=
+            elapsed_nanoseconds(routed_started);
+        callback_finished = std::chrono::steady_clock::now();
+        callback_accepted = true;
+        return true;
+    }
 
-    const auto lanes = expert_workers->size();
-    const auto run_ranges = [&]<typename Operation>(
-        std::uint64_t tasks, Operation&& operation, bool steal) {
-        if (steal) {
-            for (std::size_t lane = 0U; lane < lanes; ++lane) {
-                const auto shard = static_cast<std::size_t>(
-                    expert_lane_nodes[lane]);
-                const auto position = expert_lane_positions[lane];
-                const auto workers = expert_node_lanes[shard].size();
-                tiled_lane_next[lane].store(
-                    tasks * position / workers, std::memory_order_relaxed);
-                tiled_lane_end[lane] = tasks * (position + 1U) / workers;
-            }
-        }
-        auto dispatched = expert_workers->parallel_for_addressed(
-            lanes, [&](std::size_t lane) {
-                const auto shard = static_cast<std::size_t>(
-                    expert_lane_nodes[lane]);
-                if (shard >= shards || expert_node_lanes[shard].empty()) return;
-                const auto position = expert_lane_positions[lane];
-                const auto& node_lanes = expert_node_lanes[shard];
-                if (!steal) {
-                    const auto begin = tasks * position / node_lanes.size();
-                    const auto end = tasks * (position + 1U) /
-                                     node_lanes.size();
-                    for (auto task = begin; task < end; ++task) {
-                        operation(shard, task);
-                    }
-                    return;
-                }
-                const auto claim = [&](std::size_t owner) {
-                    const auto task = tiled_lane_next[owner].fetch_add(
-                        1U, std::memory_order_relaxed);
-                    if (task >= tiled_lane_end[owner]) return false;
-                    operation(shard, task);
-                    return true;
-                };
-                while (claim(lane)) {}
-                for (;;) {
-                    bool stole = false;
-                    for (std::size_t offset = 1U; offset < node_lanes.size();
-                         ++offset) {
-                        const auto owner = node_lanes[
-                            (position + offset) % node_lanes.size()];
-                        if (claim(owner)) {
-                            stole = true;
-                            break;
-                        }
-                    }
-                    if (!stole) break;
-                }
-            });
-        if (dispatched.ok() && steal) {
-            for (std::size_t lane = 0U; lane < lanes; ++lane) {
-                if (tiled_lane_next[lane].load(std::memory_order_relaxed) <
-                    tiled_lane_end[lane]) {
-                    dispatched.errors.emplace_back(
-                        "DeepSeek host-routed MoE left a lane range unfinished");
-                    break;
-                }
-            }
-        }
-        return dispatched;
-    };
     constexpr std::size_t block = 32U;
     constexpr auto intermediate_blocks = shard_intermediate / block;
     auto routed_phase_started = std::chrono::steady_clock::now();
-    result = run_ranges(kTopK * intermediate_blocks,
+    result = run_expert_ranges(kTopK * intermediate_blocks,
                         [&](std::size_t shard, std::uint64_t task) {
         const auto rank = static_cast<std::size_t>(task / intermediate_blocks);
         const auto offset = (task % intermediate_blocks) * block;
@@ -4879,7 +5089,7 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
     routed_phase_started = std::chrono::steady_clock::now();
     if (result.ok()) {
         constexpr auto hidden_blocks = kHidden / block;
-        result = run_ranges(kTopK * hidden_blocks,
+        result = run_expert_ranges(kTopK * hidden_blocks,
                             [&](std::size_t shard, std::uint64_t task) {
             const auto rank = static_cast<std::size_t>(task / hidden_blocks);
             const auto offset = (task % hidden_blocks) * block;
@@ -4903,7 +5113,7 @@ ValidationResult DeepSeekV4Runtime::Impl::host_routed_moe_impl(
     routed_phase_started = std::chrono::steady_clock::now();
     if (result.ok()) {
         constexpr auto hidden_blocks = kHidden / block;
-        result = run_ranges(hidden_blocks,
+        result = run_expert_ranges(hidden_blocks,
                             [&](std::size_t shard, std::uint64_t task) {
             const auto offset = task * block;
             auto* destination = rank_partials.data() + shard * kHidden + offset;
@@ -7386,6 +7596,8 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
     for (std::size_t row = 0U; row < rows; ++row) {
         row_slots[row] = static_cast<std::uint32_t>(row);
     }
+    std::vector<float> router_logits(rows * kExperts);
+    std::vector<Dsv4Route> routes(rows);
     std::vector<std::vector<float>> weighted(
         rows, std::vector<float>(trace ? kHidden : 0U));
     const auto layer_input_row = [&](std::size_t row) {
@@ -7433,6 +7645,43 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
             graph_stats.attention_nanoseconds +=
                 elapsed_nanoseconds(phase_started);
             if (!result.ok()) return result;
+        } else {
+            // Route the page in one batched projection, then decode each
+            // selected expert's weight tile once for every row that chose it.
+            // The whole page must be routed before any of it is executed, so
+            // each row's mHC-pre and norm records are emitted here to keep a
+            // row's operation order the same as the token-major path's.
+            // The router stays per row. Its logits are not rounded to BF16,
+            // and the row-batched projection reassociates the accumulation:
+            // the selection is unchanged but the coefficients move by a ULP,
+            // which is a different model.
+            const auto router_started = std::chrono::steady_clock::now();
+            for (std::size_t row = 0U; row < rows; ++row) {
+                const auto position =
+                    position_base + static_cast<std::uint32_t>(row);
+                auto logits = std::span<float>(router_logits)
+                    .subspan(row * kExperts, kExperts);
+                result = linear(layer_device(layer),
+                                layer_prefix(layer) + "ffn.gate", kExperts,
+                                kHidden, layer_input_row(row), logits, false);
+                if (!result.ok()) return result;
+                if (trace) {
+                    record_operation_hash(position, tokens[row], layer,
+                                          "ffn_mhc_pre", weighted[row]);
+                    record_operation_hash(position, tokens[row], layer,
+                                          "ffn_norm", layer_input_row(row));
+                }
+                result = route_moe(
+                    layer, tokens[row],
+                    std::span<const float>(router_logits)
+                        .subspan(row * kExperts, kExperts),
+                    position, routes[row]);
+                if (!result.ok()) return result;
+            }
+            graph_stats.moe_router_nanoseconds +=
+                elapsed_nanoseconds(router_started);
+            result = prepare_page_routed_partials(layer, routes, layer_inputs);
+            if (!result.ok()) return result;
         }
         for (std::size_t row = 0U; row < rows; ++row) {
             result = select(row);
@@ -7443,11 +7692,11 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
             const auto position =
                 position_base + static_cast<std::uint32_t>(row);
             const auto hidden_row = hidden.subspan(row * stride, stride);
-            if (trace) {
+            if (trace && branch_index == 0U) {
                 record_operation_hash(position, tokens[row], layer,
-                                      branch + "_mhc_pre", weighted[row]);
+                                      "attn_mhc_pre", weighted[row]);
                 record_operation_hash(position, tokens[row], layer,
-                                      branch + "_norm", layer_input_row(row));
+                                      "attn_norm", layer_input_row(row));
             }
 
             // The attention branch was already computed for the whole page and
@@ -7459,8 +7708,10 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
                 trace && branch_index == 1U ? kHidden : 0U);
             auto phase_started = std::chrono::steady_clock::now();
             if (branch_index == 1U) {
-                result = moe(layer, tokens[row], layer_input_row(row),
-                             branch_output, position);
+                // The page was routed above, so this joins the row's shared
+                // expert with the routed partial the precompute produced.
+                result = execute_moe(layer, routes[row], layer_input_row(row),
+                                     branch_output);
                 graph_stats.moe_nanoseconds +=
                     elapsed_nanoseconds(phase_started);
                 if (!result.ok()) return result;
@@ -7510,6 +7761,7 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
         }
     }
 
+    page_routed.valid = false;
     result = select(0U);
     if (!result.ok()) return result;
     graph_stats.forward_tokens += rows;

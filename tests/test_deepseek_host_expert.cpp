@@ -152,6 +152,73 @@ TEST_CASE("DeepSeek tiled expert transform preserves every matrix value") {
     }
 }
 
+TEST_CASE("DeepSeek tiled expert row batch holds at the production shape") {
+    // The 64-wide case below cannot see a reduction that only differs once
+    // the column loop is long enough to be blocked, and the runtime drives
+    // this primitive at 4,096 input columns for gate/up and 1,024 for down.
+    const auto check = [](std::uint64_t hidden, std::uint64_t intermediate,
+                          std::size_t rows, std::size_t members) {
+        const auto w1 = make_fp4(intermediate, hidden, 1U);
+        const auto w3 = make_fp4(intermediate, hidden, 6U);
+        const auto w2 = make_fp4(hidden, intermediate, 11U);
+        const auto canonical = view(w1, w3, w2);
+        const auto shard_bytes = strata::dsv4_tiled_expert_shard_bytes(
+            hidden, intermediate);
+        std::vector<std::byte> storage(static_cast<std::size_t>(shard_bytes));
+        REQUIRE(strata::dsv4_transform_tiled_expert_shard(
+                    storage, canonical, hidden, intermediate, 0U).ok());
+        auto tiled = strata::dsv4_tiled_expert_weights(
+            storage, hidden, intermediate);
+        REQUIRE(tiled.ok());
+
+        std::vector<float> input(rows * static_cast<std::size_t>(hidden));
+        std::uint32_t seed = 0x2f6e21U;
+        for (auto& value : input) {
+            seed = seed * 1'664'525U + 1'013'904'223U;
+            value = static_cast<float>(static_cast<std::int32_t>(
+                        (seed >> 9U) % 4'096U) - 2'048) / 8'192.0F;
+        }
+        std::vector<std::uint32_t> selected(members);
+        for (std::size_t index = 0U; index < members; ++index) {
+            selected[index] = static_cast<std::uint32_t>((index * 5U + 1U) % rows);
+        }
+        // The runtime writes 16 outputs at a time into a 32-wide scratch, so
+        // the strided half-block layout is part of what has to match.
+        constexpr std::uint64_t block = 32U;
+        std::vector<float> expected(members * block);
+        std::vector<float> actual(members * block);
+        for (std::uint64_t offset = 0U; offset + block <= intermediate;
+             offset += block) {
+            for (std::size_t member = 0U; member < members; ++member) {
+                for (std::uint64_t half = 0U; half < 2U; ++half) {
+                    strata::dsv4_tiled_expert_matvec16(
+                        std::span<float>(expected)
+                            .subspan(member * block + half * 16U, 16U)
+                            .first<16U>(),
+                        std::span<const float>(input).subspan(
+                            static_cast<std::size_t>(selected[member]) * hidden,
+                            static_cast<std::size_t>(hidden)),
+                        tiled.value.w13_packed, tiled.value.w13_scales,
+                        2U * intermediate, offset + half * 16U);
+                }
+            }
+            for (std::uint64_t half = 0U; half < 2U; ++half) {
+                strata::dsv4_tiled_expert_matvec16_rows(
+                    std::span<float>(actual).subspan(half * 16U), block, input,
+                    hidden, selected, tiled.value.w13_packed,
+                    tiled.value.w13_scales, 2U * intermediate,
+                    offset + half * 16U);
+            }
+            for (std::size_t index = 0U; index < expected.size(); ++index) {
+                REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) ==
+                        std::bit_cast<std::uint32_t>(expected[index]));
+            }
+        }
+    };
+    check(4096U, 1024U, 7U, 5U);
+    check(1024U, 4096U, 7U, 4U);
+}
+
 TEST_CASE("DeepSeek tiled expert row batch is bit-identical to scalar rows") {
     constexpr std::uint64_t hidden = 64U;
     constexpr std::uint64_t intermediate = 64U;

@@ -110,6 +110,18 @@ void dsv4_tiled_expert_matvec16(
     std::span<const std::byte> packed, std::span<const std::byte> scales,
     std::uint64_t outputs, std::uint64_t output_begin) noexcept;
 
+// Computes the same 16 adjacent outputs for several selected input rows while
+// decoding each FP4/E8M0 weight tile once per four rows. `row_indices` select
+// rows from `input` (stride `input_columns`); outputs are dense in the same
+// order with `output_stride` floats between rows. Every row retains the exact
+// column/FMA order of dsv4_tiled_expert_matvec16.
+void dsv4_tiled_expert_matvec16_rows(
+    std::span<float> output, std::uint64_t output_stride,
+    std::span<const float> input, std::uint64_t input_columns,
+    std::span<const std::uint32_t> row_indices,
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    std::uint64_t outputs, std::uint64_t output_begin) noexcept;
+
 // Runs gate/up, the clamped SwiGLU, the routed coefficient and the down
 // projection for one expert. `scratch` must hold `intermediate` floats and is
 // overwritten. `output` receives `hidden` floats and is overwritten, not

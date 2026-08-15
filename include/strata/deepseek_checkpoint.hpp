@@ -115,6 +115,9 @@ public:
     // a failure is reported and left unpinned rather than aborting the run.
     [[nodiscard]] ValidationResult pin(CudaBackend& backend);
     [[nodiscard]] bool pinned() const noexcept { return pinned_; }
+    // True when the routed experts are staged in the host expert's decode
+    // layout, which is the only layout they exist in when it is.
+    [[nodiscard]] bool tiled_experts() const noexcept { return tiled_experts_; }
     [[nodiscard]] Dsv4ResidentStageStats stats() const noexcept { return stats_; }
 
 private:

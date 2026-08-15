@@ -224,30 +224,59 @@ __global__ void expand_bf16_activation_kernel(
     if (index < columns) destination[index] = __bfloat162float(source[index]);
 }
 
+// A block owns one output row and a tile of input rows. One block per (output
+// row, input row) reads the whole weight row again for every input row, which
+// for the 32,768 by 1,536 query projection is 263 GB a layer at a 2,612-token
+// page -- 11.3 TB over the prompt, for 11.3 TFLOP of arithmetic. Tiling the
+// input rows reads the weight once for the tile and leaves each output's
+// reduction exactly as it was: the same block-wide tree over the same terms.
+constexpr std::uint32_t kPlainMatmulRowTile = 16U;
+
+template <std::uint32_t Tile>
 __global__ void plain_matmul_kernel(float* output, const float* input,
                                     const void* weights, int dtype,
                                     std::uint32_t batch, std::uint64_t columns,
                                     std::uint64_t rows, std::uint32_t groups,
                                     std::uint64_t rows_per_group) {
     const std::uint64_t output_row = blockIdx.x;
-    const std::uint32_t batch_row = blockIdx.y;
-    if (output_row >= rows || batch_row >= batch) return;
-    float sum = 0.0F;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
     const std::uint64_t weight_base = output_row * columns;
-    const std::uint64_t input_row = groups == 0U
-                                        ? batch_row
-                                        : static_cast<std::uint64_t>(batch_row) *
-                                              groups +
-                                              output_row / rows_per_group;
-    const std::uint64_t input_base = input_row * columns;
-    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
-        sum += plain_value(weights, dtype, weight_base + column) * input[input_base + column];
+    float sum[Tile];
+    std::uint64_t input_base[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        sum[index] = 0.0F;
+        // Rows past the tail recompute row zero and are never written, which
+        // keeps the accumulators statically indexed and in registers.
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        const std::uint64_t batch_row = tile_begin + local;
+        const std::uint64_t input_row = groups == 0U
+                                            ? batch_row
+                                            : batch_row * groups +
+                                                  output_row / rows_per_group;
+        input_base[index] = input_row * columns;
     }
-    sum = reduce_block(sum);
-    if (threadIdx.x == 0) {
+    for (std::uint64_t column = threadIdx.x; column < columns; column += blockDim.x) {
+        const float weight = plain_value(weights, dtype, weight_base + column);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            sum[index] += weight * input[input_base[index] + column];
+        }
+    }
+    // `tile_rows` is uniform across the block, so skipping the tail skips the
+    // barrier for every thread alike. A batch of one therefore pays exactly
+    // one reduction, as it did before the tile existed.
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        if (index >= tile_rows) continue;
+        __syncthreads();
+        const float reduced = reduce_block(sum[index]);
+        if (threadIdx.x != 0U) continue;
         const std::uint64_t output_index =
-            static_cast<std::uint64_t>(batch_row) * rows + output_row;
-        output[output_index] = sum;
+            static_cast<std::uint64_t>(tile_begin + index) * rows + output_row;
+        output[output_index] = reduced;
     }
 }
 
@@ -403,6 +432,56 @@ __global__ void bf16_matvec_kernel(
             sum, __shfl_down_sync(0xFFFF'FFFFU, sum, offset));
     }
     if (lane == 0U) output[output_row] = sum;
+}
+
+// bf16_matvec_kernel over a tile of input rows. The 256-thread block kernel is
+// shaped for a long reduction: at the 32,768 by 1,024 query projection it gives
+// each thread four columns and then runs a block-wide tree per output, so the
+// reductions cost more than the arithmetic. One warp per output row keeps the
+// same __fadd_rn/__fmul_rn accumulation and the same shuffle tree as the
+// batch-of-one path, so a row of this is bit-identical to a call of that.
+constexpr std::uint32_t kBf16MatvecRowTile = 16U;
+
+template <std::uint32_t Tile>
+__global__ void bf16_matvec_rows_kernel(
+    float* output, const float* input, const __nv_bfloat16* weights,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x) *
+                                warps_per_block + warp;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
+
+    const auto base = output_row * columns;
+    float sum[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) sum[index] = 0.0F;
+    for (std::uint64_t column = lane; column < columns; column += warpSize) {
+        const float weight = __bfloat162float(weights[base + column]);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const auto input_base =
+                static_cast<std::uint64_t>(tile_begin + local) * columns;
+            sum[index] = __fadd_rn(
+                sum[index], __fmul_rn(input[input_base + column], weight));
+        }
+    }
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        float value = sum[index];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = __fadd_rn(
+                value, __shfl_down_sync(0xFFFF'FFFFU, value, offset));
+        }
+        if (lane == 0U && index < tile_rows) {
+            output[static_cast<std::uint64_t>(tile_begin + index) * rows +
+                   output_row] = value;
+        }
+    }
 }
 
 // Same accumulation contract as bf16_matvec_kernel, with an already-resident
@@ -1819,7 +1898,7 @@ __global__ void deepseek_fp4_down_kernel(
 // Row tile of the page-batched FP4 path. Eight rows hold sixteen accumulators
 // per thread, which fits without spilling at 256 threads, and amortises each
 // 32-weight group's nibble and scale decode across eight rows instead of one.
-constexpr std::uint32_t kDeepSeekPageRowTile = 8U;
+constexpr std::uint32_t kDeepSeekPageRowTile = 32U;
 
 // One routed expert of a page and the slice of the work list it owns. The work
 // list is flattened group-major; `row_offset` is where this group's rows begin
@@ -1831,15 +1910,15 @@ struct DeepSeekFp4PageGroup {
     const unsigned char* w3_scales{};
     const unsigned char* w2_weights{};
     const unsigned char* w2_scales{};
+    // Transformed shards of this expert, one per intermediate-dimension TP
+    // shard. Set together with a non-zero shard_intermediate, and then the six
+    // canonical pointers above are unused.
+    const unsigned char* tiled[kCudaDsv4TiledShards]{};
+    std::uint32_t shard_intermediate{};
     std::uint32_t row_offset{};
     std::uint32_t row_count{};
 };
 
-// Per (expert, output column, row tile). The group's weight row is decoded once
-// per 32-weight group and applied to every row in the tile, so a group serving
-// `n` rows reads its weights once instead of `n` times. Each row's accumulation
-// visits the same groups in the same order as the single-row kernel, so every
-// row's result is bit-identical to issuing that row on its own.
 __global__ void deepseek_fp4_page_gate_up_kernel(
     float* activations, const float* hidden, const std::uint32_t* work_rows,
     const float* work_coefficients, const DeepSeekFp4PageGroup* groups,
@@ -1982,6 +2061,203 @@ __global__ void deepseek_fp4_page_down_kernel(
         if (threadIdx.x != 0U || index >= tile_rows) continue;
         const std::uint64_t slot = group.row_offset + tile_begin + index;
         output[slot * rows + output_row] = bf16_round(reduced);
+    }
+}
+
+// The transformed layout puts 32 consecutive output rows of one block in 32
+// consecutive bytes, so a warp that owns those rows reads a whole sector per
+// fetch. The canonical decomposition cannot: its block owns one output row and
+// spreads 256 threads across the reduction, so it uses a thirty-second of
+// every sector it pulls -- measured at 2.87x on the kernel.
+//
+// Owning the block instead means one lane per output row, and each lane sums
+// its own row over the whole reduction in increasing column order. That is a
+// reassociation of the canonical 256-partial tree, not a different
+// computation: the same terms, the same per-term
+// `fma(input * fp4_value, scale, accumulator)`, summed in a different order.
+// It is therefore gated against the scalar oracle rather than against the
+// canonical kernel bit for bit.
+constexpr std::uint32_t kDeepSeekTiledWarps = 8U;
+constexpr std::uint32_t kDeepSeekTiledRowTile = 8U;
+
+__global__ void deepseek_fp4_tiled_page_gate_up_kernel(
+    float* activations, const float* hidden, const std::uint32_t* work_rows,
+    const float* work_coefficients, const DeepSeekFp4PageGroup* groups,
+    std::uint32_t group_count, std::uint64_t columns,
+    std::uint64_t intermediate, float swiglu_limit, const float* bf16_silu,
+    unsigned int* error_flag) {
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint64_t output_block =
+        static_cast<std::uint64_t>(blockIdx.x) * kDeepSeekTiledWarps + warp;
+    const std::uint32_t group_index = blockIdx.y;
+    const std::uint64_t output_row = output_block * 32U + lane;
+    if (output_row >= intermediate || group_index >= group_count) return;
+    const DeepSeekFp4PageGroup group = groups[group_index];
+    const std::uint32_t tile_begin = blockIdx.z * kDeepSeekTiledRowTile;
+    if (tile_begin >= group.row_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekTiledRowTile, group.row_count - tile_begin);
+
+    const std::uint64_t shard_intermediate = group.shard_intermediate;
+    const std::uint32_t shard =
+        static_cast<std::uint32_t>(output_row / shard_intermediate);
+    const std::uint64_t row_in_shard =
+        output_row - static_cast<std::uint64_t>(shard) * shard_intermediate;
+    const unsigned char* base = group.tiled[shard];
+    const unsigned char* scales_base =
+        base + 2U * shard_intermediate * (columns / 2U);
+    // A shard width is a multiple of 32, so every lane of the warp shares the
+    // transform block and differs only in `within` -- which is the lane index.
+    // That is what makes each fetch one contiguous 32-byte run.
+    const std::uint64_t gate_block = row_in_shard >> 5U;
+    const std::uint64_t up_block = (shard_intermediate + row_in_shard) >> 5U;
+    const unsigned char* gate_packed =
+        base + gate_block * (columns / 2U) * 32U + lane;
+    const unsigned char* up_packed =
+        base + up_block * (columns / 2U) * 32U + lane;
+    const unsigned char* gate_scales =
+        scales_base + gate_block * (columns / 16U) * 32U + lane;
+    const unsigned char* up_scales =
+        scales_base + up_block * (columns / 16U) * 32U + lane;
+
+    float gate[kDeepSeekTiledRowTile];
+    float up[kDeepSeekTiledRowTile];
+    std::uint64_t input_base[kDeepSeekTiledRowTile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        gate[index] = 0.0F;
+        up[index] = 0.0F;
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        input_base[index] =
+            static_cast<std::uint64_t>(
+                work_rows[group.row_offset + tile_begin + local]) *
+            columns;
+    }
+
+    float gate_scale = 0.0F;
+    float up_scale = 0.0F;
+    for (std::uint64_t pair = 0U; pair < columns / 2U; ++pair) {
+        const std::uint64_t column = pair * 2U;
+        if ((column & 31U) == 0U) {
+            // Each canonical group-32 scale is stored twice, once per group-16
+            // half; the first copy is taken.
+            const std::uint64_t slot = (column >> 5U) * 64U;
+            gate_scale = fp8_e8m0_scale_bits(gate_scales[slot]);
+            up_scale = fp8_e8m0_scale_bits(up_scales[slot]);
+        }
+        const unsigned char gate_byte = gate_packed[pair * 32U];
+        const unsigned char up_byte = up_packed[pair * 32U];
+        const float gate_low = fp4_e2m1_value(gate_byte & 0x0FU);
+        const float gate_high = fp4_e2m1_value(gate_byte >> 4U);
+        const float up_low = fp4_e2m1_value(up_byte & 0x0FU);
+        const float up_high = fp4_e2m1_value(up_byte >> 4U);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+            const float first = hidden[input_base[index] + column];
+            const float second = hidden[input_base[index] + column + 1U];
+            gate[index] = fmaf(first * gate_low, gate_scale, gate[index]);
+            gate[index] = fmaf(second * gate_high, gate_scale, gate[index]);
+            up[index] = fmaf(first * up_low, up_scale, up[index]);
+            up[index] = fmaf(second * up_high, up_scale, up[index]);
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        if (index >= tile_rows) continue;
+        const std::uint32_t slot = group.row_offset + tile_begin + index;
+        const std::uint64_t destination =
+            static_cast<std::uint64_t>(slot) * intermediate + output_row;
+        const float rounded_gate = bf16_round(gate[index]);
+        const float rounded_up = bf16_round(up[index]);
+        if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+            atomicExch(error_flag, 1U);
+            activations[destination] = __uint_as_float(0x7FC0'0000U);
+            continue;
+        }
+        const float limited_gate = fminf(rounded_gate, swiglu_limit);
+        const float limited_up =
+            fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+        const auto gate_bits =
+            static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+        float activated = bf16_silu[gate_bits] * limited_up;
+        activated *= work_coefficients[slot];
+        activations[destination] = bf16_round(activated);
+    }
+}
+
+__global__ void deepseek_fp4_tiled_page_down_kernel(
+    float* output, const float* activations,
+    const DeepSeekFp4PageGroup* groups, std::uint32_t group_count,
+    std::uint64_t columns, std::uint64_t rows) {
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint64_t output_block =
+        static_cast<std::uint64_t>(blockIdx.x) * kDeepSeekTiledWarps + warp;
+    const std::uint32_t group_index = blockIdx.y;
+    const std::uint64_t output_row = output_block * 32U + lane;
+    if (output_row >= rows || group_index >= group_count) return;
+    const DeepSeekFp4PageGroup group = groups[group_index];
+    const std::uint32_t tile_begin = blockIdx.z * kDeepSeekTiledRowTile;
+    if (tile_begin >= group.row_count) return;
+    const std::uint32_t tile_rows =
+        min(kDeepSeekTiledRowTile, group.row_count - tile_begin);
+
+    const std::uint64_t shard_intermediate = group.shard_intermediate;
+    const std::uint64_t block = output_block;
+    float sum[kDeepSeekTiledRowTile];
+    std::uint64_t input_base[kDeepSeekTiledRowTile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        sum[index] = 0.0F;
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        input_base[index] =
+            static_cast<std::uint64_t>(
+                group.row_offset + tile_begin + local) * columns;
+    }
+
+    // Down reduces over the intermediate dimension, which is what the
+    // transform shards, so the shards are visited in order and each supplies a
+    // contiguous run of the reduction.
+    for (std::uint32_t shard = 0U; shard < kCudaDsv4TiledShards; ++shard) {
+        const std::uint64_t shard_base =
+            static_cast<std::uint64_t>(shard) * shard_intermediate;
+        if (shard_base >= columns) break;
+        const unsigned char* base = group.tiled[shard] +
+            2U * shard_intermediate * (rows / 2U) +
+            2U * shard_intermediate * (rows / 16U);
+        const unsigned char* packed =
+            base + block * (shard_intermediate / 2U) * 32U + lane;
+        const unsigned char* scales = base +
+            rows * (shard_intermediate / 2U) +
+            block * (shard_intermediate / 16U) * 32U + lane;
+        float scale = 0.0F;
+        for (std::uint64_t pair = 0U; pair < shard_intermediate / 2U; ++pair) {
+            const std::uint64_t local_column = pair * 2U;
+            if ((local_column & 31U) == 0U) {
+                scale = fp8_e8m0_scale_bits(scales[(local_column >> 5U) * 64U]);
+            }
+            const unsigned char byte = packed[pair * 32U];
+            const float low = fp4_e2m1_value(byte & 0x0FU);
+            const float high = fp4_e2m1_value(byte >> 4U);
+            const std::uint64_t column = shard_base + local_column;
+#pragma unroll
+            for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile;
+                 ++index) {
+                const float first = activations[input_base[index] + column];
+                const float second = activations[input_base[index] + column + 1U];
+                sum[index] = fmaf(first * low, scale, sum[index]);
+                sum[index] = fmaf(second * high, scale, sum[index]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kDeepSeekTiledRowTile; ++index) {
+        if (index >= tile_rows) continue;
+        const std::uint64_t slot = group.row_offset + tile_begin + index;
+        output[slot * rows + output_row] = bf16_round(sum[index]);
     }
 }
 
@@ -3928,6 +4204,22 @@ struct alignas(256) Dsv4MhcWorkspace {
     unsigned int failure{};
 };
 
+// One prompt row's fused mHC state. The device workspace holds the residual
+// pair, branch, weighted, layer input, partial reductions, pre/post, the
+// Sinkhorn combination, and the router logits; the three scalars are the host
+// half of the same state machine. Together they are the complete state a
+// transition reads and writes, which is what makes swapping slots exact.
+// Workspaces live in one arena, so a slot is an index rather than an
+// allocation and a wide page costs a single cudaMalloc.
+struct Dsv4MhcSlotState {
+    std::uint32_t stage{};
+    std::uint32_t residual_index{};
+    bool branch_ready{};
+};
+
+// One slot per prompt row of the widest admitted page, at 95 KB each.
+constexpr std::uint32_t kDsv4MhcMaximumSlots = 8192U;
+
 constexpr std::uint64_t kDsv4MhcMaximumHostStagingBytes =
     static_cast<std::uint64_t>(
         kDsv4MhcMultiplier * kDsv4MhcHidden + 2U * kDsv4MhcHidden) *
@@ -4311,6 +4603,15 @@ struct CudaBackend::Impl {
         std::uint32_t dsv4_mhc_stage{};
         std::uint32_t dsv4_mhc_residual_index{};
         bool dsv4_mhc_branch_ready{};
+        // Saved fused mHC state of every slot that is not currently selected.
+        // The three scalars above are the selected slot's live copy; selecting
+        // a different slot writes them back here and loads that slot's copy.
+        // The workspace pointer is the arena base plus the slot index, so it
+        // is derived rather than stored.
+        std::vector<Dsv4MhcSlotState> dsv4_mhc_saved_slots{};
+        std::uint32_t dsv4_mhc_active_slot{};
+        Dsv4MhcWorkspace* dsv4_mhc_slot_arena{};
+        std::uint32_t dsv4_mhc_slot_capacity{};
         bool dsv4_mhc_failed{};
         float* dsv4_mhc_head_input{};
         float* dsv4_mhc_head_output{};
@@ -4424,7 +4725,9 @@ struct CudaBackend::Impl {
                 static_cast<void>(
                     cudaFree(state.dsv4_attention_prepare_workspace));
             }
-            if (state.dsv4_mhc_workspace != nullptr) {
+            if (state.dsv4_mhc_slot_arena != nullptr) {
+                static_cast<void>(cudaFree(state.dsv4_mhc_slot_arena));
+            } else if (state.dsv4_mhc_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_mhc_workspace));
             }
             if (state.gemma_workspace != nullptr) {
@@ -4945,6 +5248,23 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid native FP4 CUDA weight descriptor");
             return result;
         }
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Tiled32) {
+        // One blob, no separate scale payload: the four regions are contiguous
+        // and the kernels index into them. `rows` is hidden, `columns` is this
+        // shard's intermediate width.
+        const bool shaped =
+            descriptor.rows % 32U == 0U && descriptor.columns % 32U == 0U;
+        if (!shaped || descriptor.dtype != SafetensorsDtype::I8 ||
+            descriptor.group_size != 32U || descriptor.packed_columns != 0U ||
+            descriptor.scale_columns != 0U || !scales.empty()) {
+            result.errors.emplace_back(
+                "invalid transformed FP4 expert shard descriptor");
+            return result;
+        }
+        expected_weights = 2U * descriptor.columns * (descriptor.rows / 2U) +
+                           2U * descriptor.columns * (descriptor.rows / 16U) +
+                           descriptor.rows * (descriptor.columns / 2U) +
+                           descriptor.rows * (descriptor.columns / 16U);
     } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
         const auto expected_packed_columns = (descriptor.columns + 1U) / 2U;
         const auto expected_scale_columns =
@@ -5787,8 +6107,10 @@ ValidationResult CudaBackend::gemma4_decode_layers(
 ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::span<const float> input,
                                      std::uint32_t rows,
-                                     std::span<float> output) {
-    return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F);
+                                     std::span<float> output,
+                                     bool round_bf16_output) {
+    return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F,
+                       round_bf16_output);
 }
 
 ValidationResult CudaBackend::matmul_softcap(
@@ -9818,7 +10140,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
             1U, a.columns, a.rows, output_groups, 1024U);
     } else {
-        plain_matmul_kernel<<<output_rank_elements, threads, 0U, state.stream>>>(
+        plain_matmul_kernel<1U><<<output_rank_elements, threads, 0U, state.stream>>>(
             device_output_rank, device_decoded, output_a->impl_->weights,
             static_cast<int>(a.dtype), 1U, a.columns, a.rows,
             output_groups, 1024U);
@@ -10532,6 +10854,119 @@ ValidationResult CudaBackend::upload_dsv4_mhc_weights(
             target->auxiliary.device_bytes();
     }
     output.impl_ = std::move(target);
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_select_slot(
+    int device, std::uint32_t slot) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || slot >= kDsv4MhcMaximumSlots) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection is out of range");
+        return result;
+    }
+    if (state.moe_in_flight || state.dsv4_mhc_head_in_flight) {
+        // A slot swap rebinds what every later command reads. Doing it while
+        // asynchronous work still owns the current workspace would let that
+        // work land in another row's state.
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection is out of order");
+        return result;
+    }
+    if (slot == state.dsv4_mhc_active_slot) return result;
+    if (slot >= state.dsv4_mhc_slot_capacity) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot selection exceeds the reservation");
+        return result;
+    }
+    const auto required = static_cast<std::size_t>(
+        std::max(slot, state.dsv4_mhc_active_slot)) + 1U;
+    if (state.dsv4_mhc_saved_slots.size() < required) {
+        state.dsv4_mhc_saved_slots.resize(required);
+    }
+    auto& outgoing = state.dsv4_mhc_saved_slots[state.dsv4_mhc_active_slot];
+    outgoing.stage = state.dsv4_mhc_stage;
+    outgoing.residual_index = state.dsv4_mhc_residual_index;
+    outgoing.branch_ready = state.dsv4_mhc_branch_ready;
+    const auto& incoming = state.dsv4_mhc_saved_slots[slot];
+    state.dsv4_mhc_workspace = state.dsv4_mhc_slot_arena + slot;
+    state.dsv4_mhc_stage = incoming.stage;
+    state.dsv4_mhc_residual_index = incoming.residual_index;
+    state.dsv4_mhc_branch_ready = incoming.branch_ready;
+    state.dsv4_mhc_workspace_bytes = sizeof(Dsv4MhcWorkspace);
+    state.dsv4_mhc_active_slot = slot;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
+    int device, std::uint32_t slots) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot reservation targets an uninitialized device");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || slots == 0U ||
+        slots > kDsv4MhcMaximumSlots) {
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot reservation is out of range");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for device mHC slot reservation");
+    }
+    if (state.dsv4_mhc_stage != 0U || state.moe_in_flight) {
+        // Growing the arena moves every slot, so no row may be mid-flight.
+        result.errors.emplace_back(
+            "DeepSeek device mHC slot reservation is out of order");
+        return result;
+    }
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    if (slots > state.dsv4_mhc_slot_capacity) {
+        void* allocation = nullptr;
+        const auto bytes = static_cast<std::size_t>(slots) *
+                           sizeof(Dsv4MhcWorkspace);
+        if (auto status = cudaMalloc(&allocation, bytes);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "allocate DeepSeek device mHC slot arena");
+        }
+        if (state.dsv4_mhc_slot_arena != nullptr) {
+            static_cast<void>(cudaFree(state.dsv4_mhc_slot_arena));
+        } else if (state.dsv4_mhc_workspace != nullptr) {
+            // The single-state allocation the token-major path made.
+            static_cast<void>(cudaFree(state.dsv4_mhc_workspace));
+        }
+        state.dsv4_mhc_slot_arena = static_cast<Dsv4MhcWorkspace*>(allocation);
+        state.dsv4_mhc_slot_capacity = slots;
+        ++allocation_calls;
+        allocation_bytes += bytes;
+    }
+    if (state.dsv4_mhc_saved_slots.size() < slots) {
+        state.dsv4_mhc_saved_slots.resize(slots);
+    }
+    state.dsv4_mhc_workspace =
+        state.dsv4_mhc_slot_arena + state.dsv4_mhc_active_slot;
+    state.dsv4_mhc_workspace_bytes = sizeof(Dsv4MhcWorkspace);
+    if (allocation_calls != 0U) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+    }
     return result;
 }
 
@@ -11759,7 +12194,7 @@ ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
             static_cast<const __nv_bfloat16*>(head.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
-        plain_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+        plain_matmul_kernel<1U><<<grid, threads, 0U, state.stream>>>(
             state.dsv4_mhc_head_output, state.dsv4_mhc_head_input,
             head.impl_->weights, static_cast<int>(descriptor.dtype), 1U,
             descriptor.columns, descriptor.rows, 0U, 0U);
@@ -12174,7 +12609,8 @@ ValidationResult CudaBackend::glm_absorbed_attention(
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
-    std::uint64_t rows_per_group, std::span<float> output, float softcap) {
+    std::uint64_t rows_per_group, std::span<float> output, float softcap,
+    bool round_output) {
     ValidationResult result;
     if (!weight.valid()) {
         result.errors.emplace_back("CUDA matmul received an invalid weight");
@@ -12291,6 +12727,11 @@ ValidationResult CudaBackend::matmul_impl(
             state.input, descriptor.columns, input_rows);
     }
     const dim3 grid(static_cast<unsigned int>(descriptor.rows), rows, 1U);
+    // Only the plain kernel tiles its input rows; every other encoding here
+    // still takes one block per (output row, input row).
+    const dim3 plain_grid(
+        static_cast<unsigned int>(descriptor.rows),
+        (rows + kPlainMatmulRowTile - 1U) / kPlainMatmulRowTile, 1U);
     constexpr unsigned int threads = 256U;
     if (descriptor.encoding == CudaWeightEncoding::Plain &&
         descriptor.dtype == SafetensorsDtype::Bf16 && rows == 1U &&
@@ -12303,7 +12744,24 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const __nv_bfloat16*>(weight.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
-        plain_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+        if (rows == 1U) {
+            plain_matmul_kernel<1U><<<grid, threads, 0, state.stream>>>(
+                state.output, state.input, weight.impl_->weights,
+                static_cast<int>(descriptor.dtype), rows, descriptor.columns,
+                descriptor.rows, groups, rows_per_group);
+        } else if (descriptor.dtype == SafetensorsDtype::Bf16 && groups == 0U) {
+            constexpr unsigned int warps_per_block = threads / 32U;
+            const dim3 matvec_grid(
+                static_cast<unsigned int>(
+                    (descriptor.rows + warps_per_block - 1U) / warps_per_block),
+                (rows + kBf16MatvecRowTile - 1U) / kBf16MatvecRowTile, 1U);
+            bf16_matvec_rows_kernel<kBf16MatvecRowTile><<<
+                matvec_grid, threads, 0, state.stream>>>(
+                state.output, state.input,
+                static_cast<const __nv_bfloat16*>(weight.impl_->weights), rows,
+                descriptor.columns, descriptor.rows);
+        } else
+        plain_matmul_kernel<kPlainMatmulRowTile><<<plain_grid, threads, 0, state.stream>>>(
             state.output, state.input, weight.impl_->weights,
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
             descriptor.rows, groups, rows_per_group);
@@ -12358,6 +12816,19 @@ ValidationResult CudaBackend::matmul_impl(
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch CUDA matmul");
+    }
+    if (round_output) {
+        // The caller's BF16 boundary, applied where the values already are.
+        // Rounding on the host is a single-threaded pass over the whole
+        // activation: the 32,768-wide query projection alone is 954 million
+        // floats over a 677-token prompt.
+        const auto rounded_blocks = static_cast<unsigned int>(
+            (output.size() + threads - 1U) / threads);
+        dsv4_round_float_bf16<<<rounded_blocks, threads, 0, state.stream>>>(
+            state.output, output.size());
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(status, "launch CUDA activation rounding");
+        }
     }
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
@@ -13598,10 +14069,62 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
         return true;
     };
 
+    // A transformed expert arrives as its TP shards instead of a triplet. The
+    // shards carry the same values, so they must agree with the triplets on
+    // the activation shape they all share.
+    std::uint64_t shard_intermediate = 0U;
+    const auto validate_shards = [&](const CudaDeepSeekMoeRowGroup& group) {
+        for (const auto* shard : group.tiled_shards) {
+            if (shard == nullptr || !shard->valid()) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page command contains an invalid expert shard");
+                return false;
+            }
+            if (shard->impl_->device != device ||
+                shard->impl_->descriptor.encoding !=
+                    CudaWeightEncoding::Fp4E2m1Tiled32) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page expert shard has the wrong device or encoding");
+                return false;
+            }
+        }
+        const auto& first = group.tiled_shards.front()->impl_->descriptor;
+        for (const auto* shard : group.tiled_shards) {
+            const auto& descriptor = shard->impl_->descriptor;
+            if (descriptor.rows != first.rows ||
+                descriptor.columns != first.columns) {
+                result.errors.emplace_back(
+                    "DeepSeek MoE page expert shards disagree on shape");
+                return false;
+            }
+        }
+        const auto shards =
+            static_cast<std::uint64_t>(group.tiled_shards.size());
+        if (hidden_columns == 0U) {
+            hidden_columns = first.rows;
+            intermediate_columns = first.columns * shards;
+        } else if (hidden_columns != first.rows ||
+                   intermediate_columns != first.columns * shards) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page experts do not share one exact activation shape");
+            return false;
+        }
+        if (shard_intermediate == 0U) {
+            shard_intermediate = first.columns;
+        } else if (shard_intermediate != first.columns) {
+            result.errors.emplace_back(
+                "DeepSeek MoE page expert shards disagree on width");
+            return false;
+        }
+        return true;
+    };
+
     std::uint64_t work_count = 0U;
     for (const auto& group : groups) {
-        if (!validate_triplet(group.w1, group.w3, group.w2,
-                              CudaWeightEncoding::Fp4E2m1Group32)) {
+        const bool tiled = group.tiled_shards.front() != nullptr;
+        if (tiled ? !validate_shards(group)
+                  : !validate_triplet(group.w1, group.w3, group.w2,
+                                      CudaWeightEncoding::Fp4E2m1Group32)) {
             return result;
         }
         if (group.rows.empty() || group.rows.size() != group.coefficients.size()) {
@@ -13823,12 +14346,22 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     std::uint32_t maximum_group_rows = 0U;
     for (const auto& group : groups) {
         DeepSeekFp4PageGroup entry;
-        entry.w1_weights = static_cast<const unsigned char*>(group.w1->impl_->weights);
-        entry.w1_scales = static_cast<const unsigned char*>(group.w1->impl_->scales);
-        entry.w3_weights = static_cast<const unsigned char*>(group.w3->impl_->weights);
-        entry.w3_scales = static_cast<const unsigned char*>(group.w3->impl_->scales);
-        entry.w2_weights = static_cast<const unsigned char*>(group.w2->impl_->weights);
-        entry.w2_scales = static_cast<const unsigned char*>(group.w2->impl_->scales);
+        if (group.tiled_shards.front() != nullptr) {
+            for (std::size_t shard = 0U; shard < group.tiled_shards.size();
+                 ++shard) {
+                entry.tiled[shard] = static_cast<const unsigned char*>(
+                    group.tiled_shards[shard]->impl_->weights);
+            }
+            entry.shard_intermediate =
+                static_cast<std::uint32_t>(shard_intermediate);
+        } else {
+            entry.w1_weights = static_cast<const unsigned char*>(group.w1->impl_->weights);
+            entry.w1_scales = static_cast<const unsigned char*>(group.w1->impl_->scales);
+            entry.w3_weights = static_cast<const unsigned char*>(group.w3->impl_->weights);
+            entry.w3_scales = static_cast<const unsigned char*>(group.w3->impl_->scales);
+            entry.w2_weights = static_cast<const unsigned char*>(group.w2->impl_->weights);
+            entry.w2_scales = static_cast<const unsigned char*>(group.w2->impl_->scales);
+        }
         entry.row_offset = static_cast<std::uint32_t>(host_rows.size());
         entry.row_count = static_cast<std::uint32_t>(group.rows.size());
         maximum_group_rows = std::max(maximum_group_rows, entry.row_count);
@@ -13842,6 +14375,12 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     state.moe_weights.clear();
     state.moe_weights.reserve((groups.size() + 1U) * 3U);
     for (const auto& group : groups) {
+        if (group.tiled_shards.front() != nullptr) {
+            for (const auto* shard : group.tiled_shards) {
+                state.moe_weights.push_back(shard->impl_);
+            }
+            continue;
+        }
         state.moe_weights.push_back(group.w1->impl_);
         state.moe_weights.push_back(group.w3->impl_);
         state.moe_weights.push_back(group.w2->impl_);
@@ -13943,19 +14482,43 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
     const auto* device_groups =
         static_cast<const DeepSeekFp4PageGroup*>(state.moe_page_groups);
     if (!groups.empty()) {
-        const auto& w1 = groups.front().w1->impl_->descriptor;
-        const auto& w2 = groups.front().w2->impl_->descriptor;
+        // Derived rather than read off a descriptor: a transformed group has
+        // no canonical triplet to read, and the canonical one would carry
+        // exactly these values anyway.
+        const auto gate_packed_columns = (hidden_columns + 1U) / 2U;
+        const auto gate_scale_columns = (hidden_columns + 31U) / 32U;
+        const auto down_packed_columns = (intermediate_columns + 1U) / 2U;
+        const auto down_scale_columns = (intermediate_columns + 31U) / 32U;
+        const bool tiled = shard_intermediate != 0U;
+        const auto row_tile =
+            tiled ? kDeepSeekTiledRowTile : kDeepSeekPageRowTile;
         const auto row_tiles = static_cast<unsigned int>(
-            (maximum_group_rows + kDeepSeekPageRowTile - 1U) /
-            kDeepSeekPageRowTile);
-        const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
-                             static_cast<unsigned int>(groups.size()), row_tiles);
-        deepseek_fp4_page_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
-            state.moe_activations, state.moe_hidden, state.moe_page_rows,
-            state.moe_page_coefficients, device_groups,
-            static_cast<std::uint32_t>(groups.size()), hidden_columns,
-            intermediate_columns, w1.packed_columns, w1.scale_columns,
-            swiglu_limit, state.moe_bf16_silu, state.moe_error);
+            (maximum_group_rows + row_tile - 1U) / row_tile);
+        // The transformed kernel gives one warp a whole 32-row transform block
+        // and one output row to each of its lanes.
+        const auto tiled_output_blocks = static_cast<unsigned int>(
+            (intermediate_columns / 32U + kDeepSeekTiledWarps - 1U) /
+            kDeepSeekTiledWarps);
+        const dim3 gate_grid(
+            tiled ? tiled_output_blocks
+                  : static_cast<unsigned int>(intermediate_columns),
+            static_cast<unsigned int>(groups.size()), row_tiles);
+        if (tiled) {
+            deepseek_fp4_tiled_page_gate_up_kernel<<<
+                gate_grid, threads, 0U, state.stream>>>(
+                state.moe_activations, state.moe_hidden, state.moe_page_rows,
+                state.moe_page_coefficients, device_groups,
+                static_cast<std::uint32_t>(groups.size()), hidden_columns,
+                intermediate_columns, swiglu_limit, state.moe_bf16_silu,
+                state.moe_error);
+        } else {
+            deepseek_fp4_page_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+                state.moe_activations, state.moe_hidden, state.moe_page_rows,
+                state.moe_page_coefficients, device_groups,
+                static_cast<std::uint32_t>(groups.size()), hidden_columns,
+                intermediate_columns, gate_packed_columns, gate_scale_columns,
+                swiglu_limit, state.moe_bf16_silu, state.moe_error);
+        }
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek FP4 page W1/W3 SwiGLU");
@@ -13974,12 +14537,25 @@ ValidationResult CudaBackend::enqueue_deepseek_moe_rows(
                           "launch DeepSeek page routed activation quantization");
             return result;
         }
-        const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
-                             static_cast<unsigned int>(groups.size()), row_tiles);
-        deepseek_fp4_page_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
-            state.moe_output, state.moe_activations, device_groups,
-            static_cast<std::uint32_t>(groups.size()), intermediate_columns,
-            hidden_columns, w2.packed_columns, w2.scale_columns);
+        const auto tiled_down_blocks = static_cast<unsigned int>(
+            (hidden_columns / 32U + kDeepSeekTiledWarps - 1U) /
+            kDeepSeekTiledWarps);
+        const dim3 down_grid(
+            tiled ? tiled_down_blocks
+                  : static_cast<unsigned int>(hidden_columns),
+            static_cast<unsigned int>(groups.size()), row_tiles);
+        if (tiled) {
+            deepseek_fp4_tiled_page_down_kernel<<<
+                down_grid, threads, 0U, state.stream>>>(
+                state.moe_output, state.moe_activations, device_groups,
+                static_cast<std::uint32_t>(groups.size()),
+                intermediate_columns, hidden_columns);
+        } else {
+            deepseek_fp4_page_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+                state.moe_output, state.moe_activations, device_groups,
+                static_cast<std::uint32_t>(groups.size()), intermediate_columns,
+                hidden_columns, down_packed_columns, down_scale_columns);
+        }
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek FP4 page W2");

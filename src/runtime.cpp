@@ -260,6 +260,9 @@ ValidationResult RuntimeSession::initialize(
                                          : Dsv4KvCacheMode::ScalarOracle;
     concrete.kv_block_rows = config.deepseek_device_resident_runtime
         ? kDsv4PhysicalKvBlockRows : kDsv4KvBlockRows;
+    if (config.deepseek_prefill_page_tokens != 0U) {
+        concrete.prefill_page_tokens = config.deepseek_prefill_page_tokens;
+    }
     if (config.deepseek_device_resident_runtime) {
         // The device-resident decode contract is a bundle, not a knob. Leaving
         // any member of it to the caller lets a run report the accepted

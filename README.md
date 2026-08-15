@@ -124,6 +124,27 @@ experts come with it. Pass `--device-resident-runtime` alone for the same
 contract on the centralized topology. Both flags work identically on
 `strata-chat` and are rejected by every non-DeepSeek `--model-type`.
 
+##### Prompt processing
+
+The device-resident path processes the prompt a page at a time. A page runs
+layer-major with one fused device mHC state per row, and its routed experts
+execute **on the GPU**, reading the same transformed shards the host expert
+kernels read — the routed experts are 156 GB and exist in host memory in one
+layout, so the device reads that layout rather than requiring a second copy.
+Decode is unchanged and keeps the experts in the two NUMA-local CPU shards,
+which is where a one-row step wants them.
+
+On the reference pair a 677-token prompt runs at **10.5 tok/s against 7.6**
+for row-at-a-time prompt processing, which `--prefill-page-tokens 1` restores.
+
+Prefill and decode therefore use different expert kernels, as they do in every
+CPU-GPU hybrid stack. The prefill kernel is held to the scalar oracle within
+one BF16 mantissa step per output rather than to bit equality with the CPU
+one; page-major execution itself remains bit-exact, and routes, precision,
+top-k, expert count and mHC semantics are unchanged. See experiments
+[0095](docs/experiments/0095-dsv4-page-major-tp2-prefill-2026-08-15.md) and
+[0096](docs/experiments/0096-dsv4-gpu-prefill-experts-2026-08-15.md).
+
 Measured on 2× RTX 3090, an 18-token prompt and 31 decode steps including
 warm-up:
 

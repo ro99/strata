@@ -452,6 +452,37 @@ namespace {
     }
 }
 
+template <std::size_t Rows>
+[[maybe_unused]] void tiled_matvec16_rows_scalar(
+    float* output, std::uint64_t output_stride, const float* input,
+    std::uint64_t input_columns, const std::uint32_t* row_indices,
+    const std::uint8_t* packed, const std::uint8_t* scales) noexcept {
+    for (std::size_t row = 0U; row < Rows; ++row) {
+        std::fill_n(output + row * output_stride, 16U, 0.0F);
+    }
+    for (std::uint64_t column = 0U; column < input_columns; ++column) {
+        const auto* weights = packed + (column / 2U) * 32U;
+        const auto* scale = scales + (column / 16U) * 32U;
+        for (std::size_t batch_row = 0U; batch_row < Rows; ++batch_row) {
+            auto* destination = output + batch_row * output_stride;
+            const auto value = input[
+                static_cast<std::uint64_t>(row_indices[batch_row]) *
+                    input_columns +
+                column];
+            for (std::uint64_t output_row = 0U; output_row < 16U;
+                 ++output_row) {
+                const auto encoded = column % 2U == 0U
+                    ? weights[output_row] & 0x0FU
+                    : weights[output_row] >> 4U;
+                destination[output_row] = std::fma(
+                    value,
+                    kFp4Value[encoded] * e8m0_scale(scale[output_row]),
+                    destination[output_row]);
+            }
+        }
+    }
+}
+
 #if STRATA_DSV4_EXPERT_AVX2
 __attribute__((target("avx2,fma")))
 __m256 tiled_decode_fp4(__m256i bytes, __m256 magnitude) noexcept {
@@ -518,6 +549,63 @@ void tiled_matvec16_avx2(float* output, const float* input,
     _mm256_storeu_ps(output, sum0);
     _mm256_storeu_ps(output + 8U, sum1);
 }
+
+template <std::size_t Rows>
+__attribute__((target("avx2,fma")))
+void tiled_matvec16_rows_avx2(
+    float* output, std::uint64_t output_stride, const float* input,
+    std::uint64_t input_columns, const std::uint32_t* row_indices,
+    const std::uint8_t* packed, const std::uint8_t* scales) noexcept {
+    const __m256 magnitude = _mm256_loadu_ps(kFp4Magnitude.data());
+    __m256 sum0[Rows];
+    __m256 sum1[Rows];
+    for (std::size_t row = 0U; row < Rows; ++row) {
+        sum0[row] = _mm256_setzero_ps();
+        sum1[row] = _mm256_setzero_ps();
+    }
+    for (std::uint64_t group = 0U; group < input_columns / 16U; ++group) {
+        const auto raw_scale = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(scales + group * 32U));
+        const __m256 scale0 =
+            tiled_decode_e8m0(_mm256_cvtepu8_epi32(raw_scale));
+        const __m256 scale1 = tiled_decode_e8m0(
+            _mm256_cvtepu8_epi32(_mm_srli_si128(raw_scale, 8)));
+        for (std::uint64_t pair = 0U; pair < 8U; ++pair) {
+            const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
+                packed + (group * 8U + pair) * 32U));
+            const auto bytes0 = _mm256_cvtepu8_epi32(raw);
+            const auto bytes1 =
+                _mm256_cvtepu8_epi32(_mm_srli_si128(raw, 8));
+            const auto weight_even0 = _mm256_mul_ps(
+                tiled_decode_fp4(bytes0, magnitude), scale0);
+            const auto weight_even1 = _mm256_mul_ps(
+                tiled_decode_fp4(bytes1, magnitude), scale1);
+            const auto weight_odd0 = _mm256_mul_ps(
+                tiled_decode_fp4(_mm256_srli_epi32(bytes0, 4), magnitude),
+                scale0);
+            const auto weight_odd1 = _mm256_mul_ps(
+                tiled_decode_fp4(_mm256_srli_epi32(bytes1, 4), magnitude),
+                scale1);
+            for (std::size_t row = 0U; row < Rows; ++row) {
+                const auto* row_input = input +
+                    static_cast<std::uint64_t>(row_indices[row]) *
+                        input_columns;
+                const __m256 even = _mm256_set1_ps(
+                    row_input[group * 16U + pair * 2U]);
+                const __m256 odd = _mm256_set1_ps(
+                    row_input[group * 16U + pair * 2U + 1U]);
+                sum0[row] = _mm256_fmadd_ps(weight_even0, even, sum0[row]);
+                sum1[row] = _mm256_fmadd_ps(weight_even1, even, sum1[row]);
+                sum0[row] = _mm256_fmadd_ps(weight_odd0, odd, sum0[row]);
+                sum1[row] = _mm256_fmadd_ps(weight_odd1, odd, sum1[row]);
+            }
+        }
+    }
+    for (std::size_t row = 0U; row < Rows; ++row) {
+        _mm256_storeu_ps(output + row * output_stride, sum0[row]);
+        _mm256_storeu_ps(output + row * output_stride + 8U, sum1[row]);
+    }
+}
 #endif
 
 }  // namespace
@@ -544,6 +632,89 @@ void dsv4_tiled_expert_matvec16(
 #endif
     tiled_matvec16_scalar(output.data(), input.data(), packed_data, scale_data,
                           input.size());
+}
+
+void dsv4_tiled_expert_matvec16_rows(
+    std::span<float> output, std::uint64_t output_stride,
+    std::span<const float> input, std::uint64_t input_columns,
+    std::span<const std::uint32_t> row_indices,
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    std::uint64_t outputs, std::uint64_t output_begin) noexcept {
+    constexpr std::uint64_t block_rows = 32U;
+    constexpr std::size_t row_tile = 4U;
+    if (row_indices.empty() || input_columns == 0U ||
+        input.size() % input_columns != 0U || output_stride < 16U ||
+        output.size() < (row_indices.size() - 1U) * output_stride + 16U ||
+        output_begin + 16U > outputs || output_begin % 16U != 0U) {
+        return;
+    }
+    const auto input_rows = input.size() / input_columns;
+    if (std::any_of(row_indices.begin(), row_indices.end(),
+                    [input_rows](std::uint32_t row) {
+                        return row >= input_rows;
+                    })) {
+        return;
+    }
+    const auto block = output_begin / block_rows;
+    const auto within = output_begin % block_rows;
+    const auto* packed_data = reinterpret_cast<const std::uint8_t*>(
+        packed.data() + block * (input_columns / 2U) * block_rows + within);
+    const auto* scale_data = reinterpret_cast<const std::uint8_t*>(
+        scales.data() + block * (input_columns / 16U) * block_rows + within);
+    for (std::size_t begin = 0U; begin < row_indices.size(); begin += row_tile) {
+        const auto rows = std::min(row_tile, row_indices.size() - begin);
+        auto* output_begin_ptr = output.data() + begin * output_stride;
+        const auto* index_begin = row_indices.data() + begin;
+#if STRATA_DSV4_EXPERT_AVX2
+        static const bool vector = dsv4_host_expert_avx2_supported();
+        if (vector) {
+            switch (rows) {
+                case 4U:
+                    tiled_matvec16_rows_avx2<4U>(
+                        output_begin_ptr, output_stride, input.data(),
+                        input_columns, index_begin, packed_data, scale_data);
+                    continue;
+                case 3U:
+                    tiled_matvec16_rows_avx2<3U>(
+                        output_begin_ptr, output_stride, input.data(),
+                        input_columns, index_begin, packed_data, scale_data);
+                    continue;
+                case 2U:
+                    tiled_matvec16_rows_avx2<2U>(
+                        output_begin_ptr, output_stride, input.data(),
+                        input_columns, index_begin, packed_data, scale_data);
+                    continue;
+                default:
+                    tiled_matvec16_rows_avx2<1U>(
+                        output_begin_ptr, output_stride, input.data(),
+                        input_columns, index_begin, packed_data, scale_data);
+                    continue;
+            }
+        }
+#endif
+        switch (rows) {
+            case 4U:
+                tiled_matvec16_rows_scalar<4U>(
+                    output_begin_ptr, output_stride, input.data(), input_columns,
+                    index_begin, packed_data, scale_data);
+                break;
+            case 3U:
+                tiled_matvec16_rows_scalar<3U>(
+                    output_begin_ptr, output_stride, input.data(), input_columns,
+                    index_begin, packed_data, scale_data);
+                break;
+            case 2U:
+                tiled_matvec16_rows_scalar<2U>(
+                    output_begin_ptr, output_stride, input.data(), input_columns,
+                    index_begin, packed_data, scale_data);
+                break;
+            default:
+                tiled_matvec16_rows_scalar<1U>(
+                    output_begin_ptr, output_stride, input.data(), input_columns,
+                    index_begin, packed_data, scale_data);
+                break;
+        }
+    }
 }
 
 namespace {

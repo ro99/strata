@@ -253,11 +253,6 @@ ValidationResult Dsv4ResidentWeightStore::pin(CudaBackend& backend) {
         return result;
     }
     if (pinned_) return result;
-    if (tiled_experts_) {
-        result.errors.emplace_back(
-            "host-routed experts are CPU-only and cannot be page-locked for H2D");
-        return result;
-    }
     // stage() seals the arena with mprotect(PROT_READ). cudaHostRegister
     // refuses a read-only mapping with cudaErrorInvalidValue, and
     // cudaHostRegisterReadOnly is not an escape here: all three devices report
@@ -660,7 +655,9 @@ ValidationResult load_dsv4_cuda_linear(
         return result;
     }
     std::vector<std::byte> owned_weight;
+    std::vector<std::byte> owned_scale;
     std::span<const std::byte> weight_data;
+    std::span<const std::byte> scale_data;
     if (resident_weights != nullptr) weight_data = resident_weights->find(weight_name);
     if (weight_data.empty()) {
         auto loaded = checkpoint.read(weight_name, weight->source_bytes);
@@ -676,8 +673,6 @@ ValidationResult load_dsv4_cuda_linear(
     descriptor.dtype = weight->source_dtype;
     descriptor.rows = expected_rows;
     descriptor.columns = expected_columns;
-    std::vector<std::byte> owned_scale;
-    std::span<const std::byte> scale_data;
     if (weight->encoding == Dsv4TensorEncoding::Plain) {
         descriptor.encoding = CudaWeightEncoding::Plain;
     } else {

@@ -45,6 +45,13 @@ struct Dsv4RuntimeConfig {
     // page-major nest. Costs tile_tokens * mhc_multiplier * hidden_size * 4
     // bytes of resident activation.
     std::uint32_t prefill_layer_tile_tokens{};
+    // Rows a physical prefill page needs before its routed experts execute on
+    // the GPU instead of the NUMA-local CPU shards. A page uploads each
+    // distinct expert once and applies it to every row that chose it, so the
+    // upload is worth paying for as soon as a page holds more than a couple of
+    // rows; decode never reaches this path and always keeps the CPU shards.
+    // Zero keeps prefill on the CPU as well.
+    std::uint32_t prefill_device_moe_minimum_rows{2U};
     std::uint32_t logit_trace_top_k{20U};
     std::uint32_t host_attention_threads{28U};
     bool enable_flash_attention{};

@@ -152,6 +152,59 @@ TEST_CASE("DeepSeek tiled expert transform preserves every matrix value") {
     }
 }
 
+TEST_CASE("DeepSeek tiled expert row batch is bit-identical to scalar rows") {
+    constexpr std::uint64_t hidden = 64U;
+    constexpr std::uint64_t intermediate = 64U;
+    const auto w1 = make_fp4(intermediate, hidden, 1U);
+    const auto w3 = make_fp4(intermediate, hidden, 6U);
+    const auto w2 = make_fp4(hidden, intermediate, 11U);
+    const auto canonical = view(w1, w3, w2);
+    const auto shard_bytes = strata::dsv4_tiled_expert_shard_bytes(
+        hidden, intermediate);
+    std::vector<std::byte> storage(static_cast<std::size_t>(shard_bytes));
+    REQUIRE(strata::dsv4_transform_tiled_expert_shard(
+                storage, canonical, hidden, intermediate, 0U)
+                .ok());
+    auto tiled = strata::dsv4_tiled_expert_weights(
+        storage, hidden, intermediate);
+    REQUIRE(tiled.ok());
+
+    constexpr std::size_t rows = 7U;
+    std::vector<float> input(rows * hidden);
+    for (std::size_t row = 0U; row < rows; ++row) {
+        auto generated = make_hidden_dim(hidden);
+        for (std::size_t column = 0U; column < hidden; ++column) {
+            input[row * hidden + column] =
+                generated[column] + static_cast<float>(row) * 0.03125F;
+        }
+    }
+    const std::array<std::uint32_t, 5U> selected{6U, 1U, 4U, 0U, 3U};
+    std::vector<float> expected(selected.size() * intermediate);
+    std::vector<float> actual(selected.size() * intermediate);
+    for (std::size_t row = 0U; row < selected.size(); ++row) {
+        for (std::uint64_t offset = 0U; offset < intermediate; offset += 16U) {
+            strata::dsv4_tiled_expert_matvec16(
+                std::span<float>(expected)
+                    .subspan(row * intermediate + offset, 16U)
+                    .first<16U>(),
+                std::span<const float>(input).subspan(
+                    static_cast<std::size_t>(selected[row]) * hidden, hidden),
+                tiled.value.w13_packed, tiled.value.w13_scales,
+                intermediate, offset);
+        }
+    }
+    for (std::uint64_t offset = 0U; offset < intermediate; offset += 16U) {
+        strata::dsv4_tiled_expert_matvec16_rows(
+            std::span<float>(actual).subspan(offset), intermediate, input,
+            hidden, selected, tiled.value.w13_packed,
+            tiled.value.w13_scales, intermediate, offset);
+    }
+    for (std::size_t index = 0U; index < expected.size(); ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) ==
+                std::bit_cast<std::uint32_t>(expected[index]));
+    }
+}
+
 TEST_CASE("DeepSeek host FP4 expert AVX2 path is bit-identical to its scalar path") {
     const auto w1 = make_fp4(kIntermediate, kHidden, 1U);
     const auto w3 = make_fp4(kIntermediate, kHidden, 6U);

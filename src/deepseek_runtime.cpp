@@ -1659,21 +1659,6 @@ struct DeepSeekV4Runtime::Impl {
     std::array<float, kExperts> combined_router_logits{};
     bool completed_router_projection{};
     bool deferred_attention_moe_input{};
-    // The fused physical branch carries state across the attention or MoE call
-    // it wraps: whether the next attention command also performs the pending
-    // mHC transition, and what a fused command already produced for the MoE
-    // that follows it. Token-major execution needs one copy because one token
-    // is in flight. Page-major execution interleaves rows between those two
-    // points, so each row parks its own copy here between visits.
-    struct FusedBranchState {
-        bool pending_mhc_attention_transition{};
-        bool completed_attention_mhc_transition{};
-        bool completed_router_projection{};
-        bool deferred_attention_moe_input{};
-        std::array<float, kHidden> combined_attention_mhc_input{};
-        std::array<float, kExperts> combined_router_logits{};
-    };
-    std::vector<FusedBranchState> page_branch_states;
     std::unordered_map<std::string, std::vector<std::byte>> host_raw;
     std::array<AttentionState, kLayers> attention_state;
     std::vector<std::uint32_t> cached_token_ids;
@@ -1952,10 +1937,16 @@ struct DeepSeekV4Runtime::Impl {
         std::span<const float> index_compressor_values = {},
         std::span<const float> index_compressor_scores = {},
         bool device_prepared_source = false);
+    // `row_slots`, when given, names the device mHC slot each row belongs to.
+    // The physical attention command publishes its branch into the selected
+    // slot's workspace, so a page must point it at the right row before every
+    // per-row attention. It must be empty on the token-major path, which owns
+    // exactly one slot.
     ValidationResult attention_page(std::uint32_t layer,
                                     std::span<const float> input,
                                     std::uint32_t position_base,
-                                    std::span<float> output);
+                                    std::span<float> output,
+                                    std::span<const std::uint32_t> row_slots = {});
     ValidationResult expert(std::uint32_t layer, std::uint32_t expert_id,
                             float routed_coefficient,
                             std::span<const float> input, std::span<float> output);
@@ -2028,6 +2019,9 @@ struct DeepSeekV4Runtime::Impl {
     // the order in which rows reach each command differs. The caller has
     // already embedded every row and must exclude any row that needs logits.
     ValidationResult device_mhc_forward_prefill_page(
+        std::span<const std::uint32_t> tokens, std::uint32_t position_base,
+        std::span<float> hidden);
+    ValidationResult device_mhc_forward_prefill_page_impl(
         std::span<const std::uint32_t> tokens, std::uint32_t position_base,
         std::span<float> hidden);
     static bool device_head_callback(
@@ -3974,10 +3968,12 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
 
 ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     std::uint32_t layer, std::span<const float> input,
-    std::uint32_t position_base, std::span<float> output) {
+    std::uint32_t position_base, std::span<float> output,
+    std::span<const std::uint32_t> row_slots) {
     ValidationResult result;
     if (input.empty() || input.size() % kHidden != 0U ||
-        output.size() != input.size()) {
+        output.size() != input.size() ||
+        (!row_slots.empty() && row_slots.size() != input.size() / kHidden)) {
         result.errors.emplace_back(
             "DeepSeek attention page spans have incompatible sizes");
         return result;
@@ -4228,6 +4224,11 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     }
 
     for (std::uint32_t row = 0U; row < rows; ++row) {
+        if (!row_slots.empty()) {
+            result = cuda.dsv4_mhc_select_slot(
+                devices[mhc_slot], row_slots[row]);
+            if (!result.ok()) return result;
+        }
         const auto input_row = input.subspan(
             static_cast<std::size_t>(row) * kHidden, kHidden);
         const auto query_rank_row = std::span<const float>(query_rank).subspan(
@@ -7346,6 +7347,17 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_hidden(
 ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
     std::span<const std::uint32_t> tokens, std::uint32_t position_base,
     std::span<float> hidden) {
+    auto result = device_mhc_forward_prefill_page_impl(
+        tokens, position_base, hidden);
+    // A failure can leave the chain index set; the token-major path must
+    // find it empty.
+    host_moe_chain_row.reset();
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page_impl(
+    std::span<const std::uint32_t> tokens, std::uint32_t position_base,
+    std::span<float> hidden) {
     ValidationResult result;
     const auto rows = tokens.size();
     const auto stride = static_cast<std::size_t>(kMhc) * kHidden;
@@ -7362,37 +7374,35 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
     if (!result.ok()) return result;
 
     const bool trace = config.enable_layer_hash_trace;
-    std::vector<std::vector<float>> layer_inputs(
-        rows, std::vector<float>(kHidden));
+    // A non-empty attention output selects the unfused physical attention
+    // command. The fused one cannot be used here: it defers the MoE input and
+    // holds the layer's KV device leases until the collect, and a block
+    // refuses to be appended to while any lease is outstanding, so the second
+    // row of any page would fail. The branch itself still reaches the mHC
+    // workspace on the device either way.
+    std::vector<float> layer_inputs(rows * kHidden);
+    std::vector<float> branch_outputs(rows * kHidden);
+    std::vector<std::uint32_t> row_slots(rows);
+    for (std::size_t row = 0U; row < rows; ++row) {
+        row_slots[row] = static_cast<std::uint32_t>(row);
+    }
     std::vector<std::vector<float>> weighted(
         rows, std::vector<float>(trace ? kHidden : 0U));
-    page_branch_states.assign(rows, FusedBranchState{});
+    const auto layer_input_row = [&](std::size_t row) {
+        return std::span<float>(layer_inputs).subspan(row * kHidden, kHidden);
+    };
 
     const auto select = [&](std::size_t row) {
         return cuda.dsv4_mhc_select_slot(
             device, static_cast<std::uint32_t>(row));
     };
-    const auto load_branch_state = [&](std::size_t row) {
-        const auto& saved = page_branch_states[row];
-        pending_mhc_attention_transition =
-            saved.pending_mhc_attention_transition;
-        completed_attention_mhc_transition =
-            saved.completed_attention_mhc_transition;
-        completed_router_projection = saved.completed_router_projection;
-        deferred_attention_moe_input = saved.deferred_attention_moe_input;
-        combined_attention_mhc_input = saved.combined_attention_mhc_input;
-        combined_router_logits = saved.combined_router_logits;
-    };
-    const auto store_branch_state = [&](std::size_t row) {
-        auto& saved = page_branch_states[row];
-        saved.pending_mhc_attention_transition =
-            pending_mhc_attention_transition;
-        saved.completed_attention_mhc_transition =
-            completed_attention_mhc_transition;
-        saved.completed_router_projection = completed_router_projection;
-        saved.deferred_attention_moe_input = deferred_attention_moe_input;
-        saved.combined_attention_mhc_input = combined_attention_mhc_input;
-        saved.combined_router_logits = combined_router_logits;
+    // Neither branch here is the fused command that carries state across a
+    // row's attention or MoE call, so none of those flags may be set. They
+    // would otherwise leak from one row into the next.
+    const auto fused_state_is_clear = [this]() {
+        return !pending_mhc_attention_transition &&
+               !completed_attention_mhc_transition &&
+               !completed_router_projection && !deferred_attention_moe_input;
     };
 
     for (std::size_t row = 0U; row < rows; ++row) {
@@ -7400,11 +7410,9 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
         if (!result.ok()) return result;
         const auto hidden_row = hidden.subspan(row * stride, stride);
         const auto phase_started = std::chrono::steady_clock::now();
-        result = trace
-            ? cuda.dsv4_mhc_begin(device, device_mhc_weights[0U][0U],
-                                  hidden_row, weighted[row], layer_inputs[row])
-            : cuda.dsv4_mhc_begin_device(device, device_mhc_weights[0U][0U],
-                                         hidden_row);
+        result = cuda.dsv4_mhc_begin(
+            device, device_mhc_weights[0U][0U], hidden_row, weighted[row],
+            layer_input_row(row));
         graph_stats.mhc_pre_nanoseconds += elapsed_nanoseconds(phase_started);
         if (!result.ok()) return result;
     }
@@ -7414,10 +7422,21 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
         const auto layer = flat / 2U;
         const auto branch_index = flat % 2U;
         const std::string branch = branch_index == 0U ? "attn" : "ffn";
+        if (branch_index == 0U) {
+            // One call attends the whole page: the query, key/value and output
+            // projections become three row-batched matmuls instead of three
+            // per row, and each row still appends and attends in position
+            // order behind them.
+            const auto phase_started = std::chrono::steady_clock::now();
+            result = attention_page(layer, layer_inputs, position_base,
+                                    branch_outputs, row_slots);
+            graph_stats.attention_nanoseconds +=
+                elapsed_nanoseconds(phase_started);
+            if (!result.ok()) return result;
+        }
         for (std::size_t row = 0U; row < rows; ++row) {
             result = select(row);
             if (!result.ok()) return result;
-            load_branch_state(row);
             // Both pending-callback tables are addressed by row for as long as
             // one layer is being swept across the page.
             host_moe_chain_row = static_cast<std::uint32_t>(row);
@@ -7428,61 +7447,39 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
                 record_operation_hash(position, tokens[row], layer,
                                       branch + "_mhc_pre", weighted[row]);
                 record_operation_hash(position, tokens[row], layer,
-                                      branch + "_norm", layer_inputs[row]);
+                                      branch + "_norm", layer_input_row(row));
             }
 
-            std::vector<float> branch_output(trace ? kHidden : 0U);
+            // The attention branch was already computed for the whole page and
+            // its result crosses back through the host; the MoE branch leaves
+            // its result in this row's device workspace.
+            const auto attended = std::span<const float>(branch_outputs)
+                .subspan(row * kHidden, kHidden);
+            std::vector<float> branch_output(
+                trace && branch_index == 1U ? kHidden : 0U);
             auto phase_started = std::chrono::steady_clock::now();
-            if (branch_index == 0U) {
-                result = attention(layer, layer_inputs[row], position,
-                                   branch_output);
-                graph_stats.attention_nanoseconds +=
-                    elapsed_nanoseconds(phase_started);
-            } else {
-                result = moe(layer, tokens[row], layer_inputs[row],
+            if (branch_index == 1U) {
+                result = moe(layer, tokens[row], layer_input_row(row),
                              branch_output, position);
                 graph_stats.moe_nanoseconds +=
                     elapsed_nanoseconds(phase_started);
+                if (!result.ok()) return result;
             }
-            if (!result.ok()) return result;
             if (trace) {
-                record_operation_hash(position, tokens[row], layer,
-                                      branch + "_output", branch_output);
+                record_operation_hash(
+                    position, tokens[row], layer, branch + "_output",
+                    branch_index == 0U
+                        ? attended
+                        : std::span<const float>(branch_output));
             }
 
             phase_started = std::chrono::steady_clock::now();
-            if (completed_attention_mhc_transition) {
-                if (branch_index != 0U || trace) {
-                    result.errors.emplace_back(
-                        "DeepSeek combined attention transition is out of order");
-                } else {
-                    if (!deferred_attention_moe_input) {
-                        std::copy(combined_attention_mhc_input.begin(),
-                                  combined_attention_mhc_input.end(),
-                                  layer_inputs[row].begin());
-                    }
-                    completed_attention_mhc_transition = false;
-                }
-            } else if (flat + 1U < branch_count) {
+            const auto post_output = trace ? hidden_row : std::span<float>{};
+            if (flat + 1U < branch_count) {
                 const auto next = flat + 1U;
-                const auto next_layer = next / 2U;
-                const auto next_branch = next % 2U;
-                const bool combine_with_attention =
-                    branch_index == 1U && next_branch == 0U && !trace &&
-                    attention_state[next_layer].indexer_compressor.ratio == 0U;
-                if (combine_with_attention) {
-                    if (pending_mhc_attention_transition) {
-                        result.errors.emplace_back(
-                            "DeepSeek mHC attention transition is already pending");
-                    } else {
-                        pending_mhc_attention_transition = true;
-                    }
-                } else {
-                    auto post_output = trace ? hidden_row : std::span<float>{};
-                    result = cuda.dsv4_mhc_transition_device(
-                        device, device_mhc_weights[next_layer][next_branch],
-                        weighted[row], layer_inputs[row], post_output);
-                }
+                result = cuda.dsv4_mhc_transition_device(
+                    device, device_mhc_weights[next / 2U][next % 2U],
+                    weighted[row], layer_input_row(row), post_output);
             } else {
                 result = cuda.dsv4_mhc_finish_device(device, hidden_row);
             }
@@ -7496,12 +7493,15 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
                     record_layer_hash(position, tokens[row], layer, hidden_row);
                 }
             }
-            store_branch_state(row);
+            if (!fused_state_is_clear()) {
+                result.errors.emplace_back(
+                    "DeepSeek page-major branch left fused state behind");
+                return result;
+            }
         }
         host_moe_chain_row.reset();
         if (branch_index == 1U) {
-            // One collect per layer drains the page's routed-MoE callbacks and
-            // the deferred attention appends the same layer reserved.
+            // One collect per layer drains the page's routed-MoE callbacks.
             auto collected = collect_host_routed_moe_chain();
             if (!collected.ok()) {
                 append_errors(result, std::move(collected.errors));
@@ -7510,13 +7510,6 @@ ValidationResult DeepSeekV4Runtime::Impl::device_mhc_forward_prefill_page(
         }
     }
 
-    for (std::size_t row = 0U; row < rows; ++row) {
-        if (page_branch_states[row].pending_mhc_attention_transition) {
-            result.errors.emplace_back(
-                "DeepSeek mHC attention transition remained pending");
-            return result;
-        }
-    }
     result = select(0U);
     if (!result.ok()) return result;
     graph_stats.forward_tokens += rows;

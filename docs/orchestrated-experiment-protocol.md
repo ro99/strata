@@ -39,6 +39,30 @@ most valuable function, not an exception path.
 
 The executor stopping to say "your premise is wrong" is a success. Budget for it.
 
+### Choosing the executor model
+
+Executor time is the expensive resource. Match the model to the task, and say
+which you chose and why in the brief.
+
+| Task shape | Model |
+| --- | --- |
+| Measurement runs, no code change; running an existing binary or script; collecting and tabulating counters; reproducing a known configuration; routine reporting | **luna** |
+| Runtime or kernel changes; designing instrumentation; numerical-contract reasoning; anything where a wrong premise must be caught from source; landing and merge work | **sol** |
+
+The test is not how *important* the task is, it is how much reasoning is
+required to do it correctly. A two-point throughput measurement that decides the
+direction of a whole programme is still a measurement: give it to luna. A
+fifty-line kernel change is still hard: give it to sol.
+
+Switch an existing agent's model in place rather than spawning a fresh one when
+the accumulated context is worth keeping — a measurement executor that already
+knows the operating point, the scripts and the counters is far more useful than
+a cold one. In codex: `/model`, select the model, then the effort level.
+
+**Name the agent for its role, not its model.** Models get switched mid-session;
+a pane named after a model it is no longer running is a standing source of
+confusion, and the name is the address you send to.
+
 ---
 
 ## 2. Environment

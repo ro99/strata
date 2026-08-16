@@ -40,6 +40,7 @@ struct Options {
     bool serial_expert_upload{};
     bool row_major_moe_page{};
     bool dsv4_fp8_tensor_page{true};
+    bool dsv4_batched_page_attention{true};
     bool prepack_mhc{true};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
@@ -88,6 +89,7 @@ void usage() {
         << "       [--decode-topology centralized|rank-local-tp2]\n"
         << "       [--row-major-moe-page]\n"
         << "       [--dsv4-fp8-tensor-page|--no-dsv4-fp8-tensor-page]\n"
+        << "       [--dsv4-batched-page-attention|--no-dsv4-batched-page-attention]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -218,6 +220,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.dsv4_fp8_tensor_page = true;
         } else if (argument == "--no-dsv4-fp8-tensor-page") {
             options.dsv4_fp8_tensor_page = false;
+        } else if (argument == "--dsv4-batched-page-attention") {
+            options.dsv4_batched_page_attention = true;
+        } else if (argument == "--no-dsv4-batched-page-attention") {
+            options.dsv4_batched_page_attention = false;
         } else if (argument == "--prepack-mhc") {
             options.prepack_mhc = true;
         } else if (argument == "--no-prepack-mhc") {
@@ -1209,6 +1215,8 @@ int main(int argc, char** argv) {
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.prefill_page_tokens = options.prefill_page_tokens;
     config.enable_dsv4_fp8_tensor_page = options.dsv4_fp8_tensor_page;
+    config.enable_dsv4_batched_page_attention =
+        options.dsv4_batched_page_attention;
     config.prefill_layer_tile_tokens = options.prefill_layer_tile_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
     config.host_attention_threads = options.host_attention_threads;
@@ -1279,6 +1287,8 @@ int main(int argc, char** argv) {
                   << metrics.prefill_page_tokens
                   << ",\"dsv4_fp8_tensor_page\":"
                   << (options.dsv4_fp8_tensor_page ? "true" : "false")
+                  << ",\"dsv4_batched_page_attention\":"
+                  << (options.dsv4_batched_page_attention ? "true" : "false")
                   << ",\"prefill_layer_tile_tokens\":"
                   << metrics.prefill_layer_tile_tokens
                   << ",\"flash_attention\":"

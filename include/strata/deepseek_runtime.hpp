@@ -42,6 +42,10 @@ struct Dsv4RuntimeConfig {
     // projections. Unsupported devices and all single-row calls retain the
     // incumbent native FP8 kernel.
     bool enable_dsv4_fp8_tensor_page{true};
+    // Batch physical prefill attention across every row in a page. Disabling
+    // this retains the mainline per-row scoring path for same-build research
+    // comparisons; decode is single-row and is unaffected either way.
+    bool enable_dsv4_batched_page_attention{true};
     // Prefill visits layers outermost over a tile of this many tokens, so a
     // layer's routed experts are streamed once per tile rather than once per
     // page. Zero tiles the whole prefill range, which is the minimum possible

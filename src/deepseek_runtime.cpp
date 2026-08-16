@@ -4721,7 +4721,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     const auto maximum_score_rows =
         std::min(last_position + 1U, kWindow) +
         (ratio == 0U ? 0U : (last_position + 1U) / ratio);
-    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+        config.enable_dsv4_batched_page_attention) {
         // A physical KV block rejects mutation while any device lease is
         // outstanding. Append every row (including both compressor states)
         // before resolving or leasing a page, then attend the rows in order

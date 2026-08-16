@@ -97,7 +97,7 @@ ValidationResult CudaBackend::download_buffer(
 
 ValidationResult CudaBackend::matmul(const CudaWeight&, std::span<const float>,
                                      std::uint32_t, std::span<float>, bool,
-                                     CudaMatmulProfile*) {
+                                     CudaMatmulProfile*, bool) {
     return {{"CUDA support was not compiled into this build"}};
 }
 
@@ -124,6 +124,10 @@ ValidationResult CudaBackend::validate_flash_attention_device(int) const {
 
 ValidationResult CudaBackend::validate_lightning_index_device(int) const {
     return {{"Lightning Indexer requires a CUDA-enabled build"}};
+}
+
+bool CudaBackend::dsv4_fp8_tensor_page_supported(int) const noexcept {
+    return false;
 }
 
 ValidationResult CudaBackend::validate_dsv4_mhc_device(int) const {

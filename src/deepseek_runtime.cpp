@@ -798,7 +798,8 @@ public:
                             std::uint64_t input_columns,
                             std::span<const float> input, std::uint32_t rows,
                             std::span<float> output, bool bf16_output = true,
-                            CudaMatmulProfile* profile = nullptr) {
+                            CudaMatmulProfile* profile = nullptr,
+                            bool dsv4_fp8_tensor_page = false) {
         const auto acquisition_started = std::chrono::steady_clock::now();
         auto demand_guard = demand();
         Entry* entry = nullptr;
@@ -808,7 +809,8 @@ public:
         const auto acquisition_nanoseconds =
             elapsed_nanoseconds(acquisition_started);
         result = backend_.matmul(entry->weight, input, rows, output,
-                                 bf16_output, profile);
+                                 bf16_output, profile,
+                                 dsv4_fp8_tensor_page);
         if (profile != nullptr) {
             profile->weight_acquisition_nanoseconds =
                 acquisition_nanoseconds;
@@ -1882,9 +1884,11 @@ struct DeepSeekV4Runtime::Impl {
                                  std::uint32_t rows,
                                  std::span<float> output,
                                  bool bf16_output = true,
-                                 CudaMatmulProfile* profile = nullptr) {
+                                 CudaMatmulProfile* profile = nullptr,
+                                 bool dsv4_fp8_tensor_page = false) {
         return weights->matmul(slot, base, outputs, inputs, input, rows,
-                               output, bf16_output, profile);
+                               output, bf16_output, profile,
+                               dsv4_fp8_tensor_page);
     }
 
     ValidationResult norm(std::span<float> output, std::span<const float> input,
@@ -4571,7 +4575,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     graph_stats.attention_projection_matmul_rows += rows;
     CudaMatmulProfile query_a_profile;
     result = linear_rows(slot, prefix + "wq_a", kQueryRank, kHidden, input,
-                         rows, query_rank, true, &query_a_profile);
+                         rows, query_rank, true, &query_a_profile,
+                         config.enable_dsv4_fp8_tensor_page);
     if (!result.ok()) return result;
     add_matmul_profile(
         query_a_profile,
@@ -4598,7 +4603,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     graph_stats.attention_projection_matmul_rows += rows;
     CudaMatmulProfile query_b_profile;
     result = linear_rows(slot, prefix + "wq_b", query_stride, kQueryRank,
-                         query_rank, rows, queries, true, &query_b_profile);
+                         query_rank, rows, queries, true, &query_b_profile,
+                         config.enable_dsv4_fp8_tensor_page);
     if (!result.ok()) return result;
     add_matmul_profile(
         query_b_profile,
@@ -4669,7 +4675,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     graph_stats.attention_projection_matmul_rows += rows;
     CudaMatmulProfile kv_profile;
     result = linear_rows(slot, prefix + "wkv", kHeadDim, kHidden, input, rows,
-                         kv, true, &kv_profile);
+                         kv, true, &kv_profile,
+                         config.enable_dsv4_fp8_tensor_page);
     if (!result.ok()) return result;
     add_matmul_profile(
         kv_profile, graph_stats.attention_kv_weight_acquisition_nanoseconds,

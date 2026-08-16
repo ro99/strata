@@ -38,6 +38,10 @@ struct Dsv4RuntimeConfig {
     // Prefill is executed in bounded layer-major pages. Page 64 is the
     // accepted measured default; a value of one retains the oracle traversal.
     std::uint32_t prefill_page_tokens{64U};
+    // SM86-only tensor-core implementation for multi-row FP8 attention-page
+    // projections. Unsupported devices and all single-row calls retain the
+    // incumbent native FP8 kernel.
+    bool enable_dsv4_fp8_tensor_page{true};
     // Prefill visits layers outermost over a tile of this many tokens, so a
     // layer's routed experts are streamed once per tile rather than once per
     // page. Zero tiles the whole prefill range, which is the minimum possible

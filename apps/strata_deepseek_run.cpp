@@ -39,6 +39,7 @@ struct Options {
     bool pin_resident_arena{};
     bool serial_expert_upload{};
     bool row_major_moe_page{};
+    bool dsv4_fp8_tensor_page{true};
     bool prepack_mhc{true};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
@@ -86,6 +87,7 @@ void usage() {
         << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
         << "       [--decode-topology centralized|rank-local-tp2]\n"
         << "       [--row-major-moe-page]\n"
+        << "       [--dsv4-fp8-tensor-page|--no-dsv4-fp8-tensor-page]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -212,6 +214,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.serial_expert_upload = true;
         } else if (argument == "--row-major-moe-page") {
             options.row_major_moe_page = true;
+        } else if (argument == "--dsv4-fp8-tensor-page") {
+            options.dsv4_fp8_tensor_page = true;
+        } else if (argument == "--no-dsv4-fp8-tensor-page") {
+            options.dsv4_fp8_tensor_page = false;
         } else if (argument == "--prepack-mhc") {
             options.prepack_mhc = true;
         } else if (argument == "--no-prepack-mhc") {
@@ -1202,6 +1208,7 @@ int main(int argc, char** argv) {
     config.device_kv_cache_bytes = options.device_kv_cache_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.prefill_page_tokens = options.prefill_page_tokens;
+    config.enable_dsv4_fp8_tensor_page = options.dsv4_fp8_tensor_page;
     config.prefill_layer_tile_tokens = options.prefill_layer_tile_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
     config.host_attention_threads = options.host_attention_threads;
@@ -1270,6 +1277,8 @@ int main(int argc, char** argv) {
                   << metrics.host_attention_threads
                   << ",\"prefill_page_tokens\":"
                   << metrics.prefill_page_tokens
+                  << ",\"dsv4_fp8_tensor_page\":"
+                  << (options.dsv4_fp8_tensor_page ? "true" : "false")
                   << ",\"prefill_layer_tile_tokens\":"
                   << metrics.prefill_layer_tile_tokens
                   << ",\"flash_attention\":"

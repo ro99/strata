@@ -840,7 +840,8 @@ public:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::span<float> output,
         bool round_bf16_output = false,
-        CudaMatmulProfile* profile = nullptr);
+        CudaMatmulProfile* profile = nullptr,
+        bool dsv4_fp8_tensor_page = false);
     [[nodiscard]] ValidationResult matmul_softcap(
         const CudaWeight& weight, std::span<const float> input,
         float softcap, std::span<float> output);
@@ -859,6 +860,10 @@ public:
         int device) const;
     [[nodiscard]] ValidationResult validate_lightning_index_device(
         int device) const;
+    // True only on devices where the explicitly requested DeepSeek page
+    // projection can use the SM86 BF16-WMMA path. Other capabilities retain
+    // the native FP8 CUDA-core kernel as a numerical fallback.
+    [[nodiscard]] bool dsv4_fp8_tensor_page_supported(int device) const noexcept;
     [[nodiscard]] ValidationResult validate_dsv4_mhc_device(
         int device) const;
     // Executes the model-neutral forward attention primitive under the
@@ -1122,7 +1127,8 @@ private:
         std::uint32_t rows, std::uint32_t groups,
         std::uint64_t rows_per_group, std::span<float> output,
         float softcap, bool round_output = false,
-        CudaMatmulProfile* profile = nullptr);
+        CudaMatmulProfile* profile = nullptr,
+        bool dsv4_fp8_tensor_page = false);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

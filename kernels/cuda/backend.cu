@@ -207,6 +207,26 @@ __device__ float quantize_e4m3_value(float value) {
     return copysignf(quantized, value);
 }
 
+__device__ unsigned char encode_e4m3_value(float value) {
+    const unsigned char sign = signbit(value) ? 0x80U : 0U;
+    const float magnitude = fabsf(value);
+    if (magnitude == 0.0F) return sign;
+    if (magnitude < 0.015625F) {
+        const auto mantissa = static_cast<unsigned int>(
+            rintf(ldexpf(magnitude, 9)));
+        return static_cast<unsigned char>(sign | min(mantissa, 7U));
+    }
+    int exponent = 0;
+    const float fraction = frexpf(magnitude, &exponent);
+    const auto encoded_exponent = static_cast<unsigned int>(exponent + 6);
+    const auto mantissa = static_cast<unsigned int>(
+        rintf((fraction * 2.0F - 1.0F) * 8.0F));
+    const auto maximum_mantissa = encoded_exponent == 15U ? 6U : 7U;
+    return static_cast<unsigned char>(
+        sign | (min(encoded_exponent, 15U) << 3U) |
+        min(mantissa, maximum_mantissa));
+}
+
 __global__ void quantize_activation_e4m3_kernel(float* values,
                                                 std::uint64_t columns,
                                                 std::uint32_t rows) {
@@ -232,6 +252,49 @@ __global__ void quantize_activation_e4m3_kernel(float* values,
     if (maximum[0] > 0.0F) scale = exp2f(ceilf(log2f(maximum[0] / 448.0F)));
     auto& value = values[static_cast<std::uint64_t>(row) * columns + index];
     value = quantize_e4m3_value(value / scale) * scale;
+}
+
+// Compact form of the same activation simulation. The value byte is the
+// unscaled E4M3 code and one E8M0 byte carries the per-row, per-K128 scale.
+// Decoding code*scale reproduces quantize_activation_e4m3_kernel exactly but
+// avoids retaining its four-byte encoded-value workspace beside the tensor
+// projection output.
+__global__ void quantize_activation_e4m3_bytes_kernel(
+    unsigned char* values, unsigned char* scales, const float* source,
+    std::uint64_t columns, std::uint32_t rows) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint64_t group_begin =
+        static_cast<std::uint64_t>(blockIdx.x) * 128U;
+    if (row >= rows || group_begin >= columns) return;
+    const std::uint64_t index = group_begin + threadIdx.x;
+    const float value = index < columns
+                            ? source[static_cast<std::uint64_t>(row) * columns +
+                                     index]
+                            : 0.0F;
+    __shared__ float maximum[128];
+    maximum[threadIdx.x] = fabsf(value);
+    __syncthreads();
+    for (unsigned int stride = 64U; stride != 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) {
+            maximum[threadIdx.x] = fmaxf(maximum[threadIdx.x],
+                                         maximum[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    int scale_exponent = 0;
+    float scale = 1.0F;
+    if (maximum[0] > 0.0F) {
+        scale_exponent = static_cast<int>(ceilf(log2f(maximum[0] / 448.0F)));
+        scale = exp2f(static_cast<float>(scale_exponent));
+    }
+    if (threadIdx.x == 0U) {
+        scales[static_cast<std::uint64_t>(row) * gridDim.x + blockIdx.x] =
+            static_cast<unsigned char>(scale_exponent + 127);
+    }
+    if (index < columns) {
+        values[static_cast<std::uint64_t>(row) * columns + index] =
+            encode_e4m3_value(quantize_e4m3_value(value / scale));
+    }
 }
 
 // The persistent mHC workspace stores its layer input as BF16. Decode and
@@ -821,6 +884,130 @@ __global__ void native_fp8_matmul_kernel(
         const std::uint64_t output_index =
             static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
+    }
+}
+
+constexpr std::uint32_t kDsv4Fp8TensorBlockM = 64U;
+constexpr std::uint32_t kDsv4Fp8TensorBlockN = 128U;
+constexpr std::uint32_t kDsv4Fp8TensorBlockK = 128U;
+
+// SM86 page-projection path. Both operands remain byte FP8 in global memory;
+// each tile widens them exactly to BF16 in shared memory and uses BF16 WMMA.
+// Activation scales are powers of two and are applied during the exact widen;
+// the weight block scale is applied after each K128 tensor dot, matching the
+// block-scaled checkpoint arithmetic screened in experiments 0103/0104.
+__global__ void dsv4_fp8_decode_bf16_tensor_kernel(
+    float* output, const unsigned char* input,
+    const unsigned char* input_scales, const unsigned char* weights,
+    const unsigned char* weight_scales, std::uint32_t batch,
+    std::uint32_t columns, std::uint32_t rows) {
+    using namespace nvcuda;
+    __shared__ __nv_bfloat16 shared_a[
+        kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockK];
+    __shared__ __nv_bfloat16 shared_b[
+        kDsv4Fp8TensorBlockK * kDsv4Fp8TensorBlockN];
+
+    const std::uint32_t tile_m = blockIdx.y * kDsv4Fp8TensorBlockM;
+    const std::uint32_t tile_n = blockIdx.x * kDsv4Fp8TensorBlockN;
+    const std::uint32_t warp = threadIdx.x / warpSize;
+    const std::uint32_t warp_m = warp & 3U;
+    const std::uint32_t warp_n_group = warp >> 2U;
+    constexpr std::uint32_t fragments_per_warp = 4U;
+    float totals[fragments_per_warp][8]{};
+    const std::uint32_t scale_columns = columns / kDsv4Fp8TensorBlockK;
+
+    for (std::uint32_t tile_k = 0U; tile_k < columns;
+         tile_k += kDsv4Fp8TensorBlockK) {
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockK;
+             index += blockDim.x) {
+            const std::uint32_t local_m = index / kDsv4Fp8TensorBlockK;
+            const std::uint32_t local_k = index % kDsv4Fp8TensorBlockK;
+            const std::uint32_t global_m = tile_m + local_m;
+            float value = 0.0F;
+            if (global_m < batch) {
+                const auto encoded = input[
+                    static_cast<std::uint64_t>(global_m) * columns + tile_k +
+                    local_k];
+                const auto scale = input_scales[
+                    static_cast<std::uint64_t>(global_m) * scale_columns +
+                    tile_k / kDsv4Fp8TensorBlockK];
+                value = fp8_e4m3_value(encoded) * fp8_e8m0_scale(scale);
+            }
+            shared_a[index] = __float2bfloat16_rn(value);
+        }
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockK * kDsv4Fp8TensorBlockN;
+             index += blockDim.x) {
+            const std::uint32_t local_k = index / kDsv4Fp8TensorBlockN;
+            const std::uint32_t local_n = index % kDsv4Fp8TensorBlockN;
+            const std::uint32_t global_n = tile_n + local_n;
+            const auto encoded = weights[
+                static_cast<std::uint64_t>(global_n) * columns + tile_k +
+                local_k];
+            shared_b[index] = __float2bfloat16_rn(fp8_e4m3_value(encoded));
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> a_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> b_fragment;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+            accumulators[fragments_per_warp];
+        for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+             ++fragment) {
+            wmma::fill_fragment(accumulators[fragment], 0.0F);
+        }
+        for (std::uint32_t local_k = 0U;
+             local_k < kDsv4Fp8TensorBlockK; local_k += 16U) {
+            wmma::load_matrix_sync(
+                a_fragment,
+                shared_a + warp_m * 16U * kDsv4Fp8TensorBlockK + local_k,
+                kDsv4Fp8TensorBlockK);
+            for (std::uint32_t fragment = 0U;
+                 fragment < fragments_per_warp; ++fragment) {
+                const std::uint32_t fragment_n =
+                    warp_n_group * fragments_per_warp + fragment;
+                wmma::load_matrix_sync(
+                    b_fragment,
+                    shared_b + local_k * kDsv4Fp8TensorBlockN +
+                        fragment_n * 16U,
+                    kDsv4Fp8TensorBlockN);
+                wmma::mma_sync(accumulators[fragment], a_fragment, b_fragment,
+                               accumulators[fragment]);
+            }
+        }
+        const float scale = fp8_e8m0_scale(weight_scales[
+            (tile_n / kDsv4Fp8TensorBlockN) * scale_columns +
+            tile_k / kDsv4Fp8TensorBlockK]);
+        for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+             ++fragment) {
+#pragma unroll
+            for (std::uint32_t element = 0U;
+                 element < accumulators[fragment].num_elements; ++element) {
+                totals[fragment][element] +=
+                    accumulators[fragment].x[element] * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+         ++fragment) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> result;
+#pragma unroll
+        for (std::uint32_t element = 0U;
+             element < result.num_elements; ++element) {
+            result.x[element] = totals[fragment][element];
+        }
+        const std::uint32_t fragment_n =
+            warp_n_group * fragments_per_warp + fragment;
+        float* destination = output +
+            static_cast<std::uint64_t>(tile_m + warp_m * 16U) * rows +
+            tile_n + fragment_n * 16U;
+        wmma::store_matrix_sync(destination, result, rows,
+                                wmma::mem_row_major);
     }
 }
 
@@ -4802,6 +4989,7 @@ struct CudaBackend::Impl {
         bool dsv4_paged_attention_supported{};
         bool dsv4_mhc_supported{};
         bool lightning_index_supported{};
+        bool dsv4_fp8_tensor_page_supported{};
     };
 
     std::unordered_map<int, DeviceState> devices;
@@ -5102,6 +5290,8 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         state.dsv4_mhc_supported =
             properties.major == 8 && properties.minor == 6;
         state.lightning_index_supported = state.flash_attention_supported;
+        state.dsv4_fp8_tensor_page_supported =
+            properties.major == 8 && properties.minor == 6;
         if (auto status = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
@@ -6217,9 +6407,11 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::uint32_t rows,
                                      std::span<float> output,
                                      bool round_bf16_output,
-                                     CudaMatmulProfile* profile) {
+                                     CudaMatmulProfile* profile,
+                                     bool dsv4_fp8_tensor_page) {
     return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F,
-                       round_bf16_output, profile);
+                       round_bf16_output, profile,
+                       dsv4_fp8_tensor_page);
 }
 
 ValidationResult CudaBackend::matmul_softcap(
@@ -6268,6 +6460,12 @@ ValidationResult CudaBackend::validate_lightning_index_device(int device) const 
             "Lightning Indexer CUDA kernel supports only SM86 and SM120 devices");
     }
     return result;
+}
+
+bool CudaBackend::dsv4_fp8_tensor_page_supported(int device) const noexcept {
+    const auto found = impl_->devices.find(device);
+    return found != impl_->devices.end() &&
+           found->second.dsv4_fp8_tensor_page_supported;
 }
 
 ValidationResult CudaBackend::validate_dsv4_mhc_device(int device) const {
@@ -12982,7 +13180,8 @@ ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
     std::uint64_t rows_per_group, std::span<float> output, float softcap,
-    bool round_output, CudaMatmulProfile* profile) {
+    bool round_output, CudaMatmulProfile* profile,
+    bool dsv4_fp8_tensor_page) {
     ValidationResult result;
     if (profile != nullptr) *profile = {};
     if (!weight.valid()) {
@@ -13015,27 +13214,65 @@ ValidationResult CudaBackend::matmul_impl(
     }
     const auto input_bytes = static_cast<std::uint64_t>(input.size_bytes());
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    const bool tensor_page =
+        dsv4_fp8_tensor_page &&
+        state.dsv4_fp8_tensor_page_supported && rows > 1U && groups == 0U &&
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
+        descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
+        descriptor.rows % kDsv4Fp8TensorBlockN == 0U &&
+        descriptor.columns <= std::numeric_limits<std::uint32_t>::max() &&
+        descriptor.rows <= std::numeric_limits<std::uint32_t>::max();
+    const auto input_scale_bytes = tensor_page
+        ? static_cast<std::uint64_t>(rows) * descriptor.scale_columns
+        : 0U;
+    const auto compact_input_bytes = tensor_page
+        ? static_cast<std::uint64_t>(input.size()) + input_scale_bytes
+        : input_bytes;
+    const auto padded_rows = tensor_page
+        ? (static_cast<std::uint64_t>(rows) + kDsv4Fp8TensorBlockM - 1U) /
+              kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockM
+        : static_cast<std::uint64_t>(rows);
+    if (tensor_page &&
+        descriptor.rows > std::numeric_limits<std::uint64_t>::max() /
+                              padded_rows / sizeof(float)) {
+        result.errors.emplace_back(
+            "DeepSeek FP8 tensor page output workspace overflows");
+        return result;
+    }
+    const auto tensor_output_bytes = tensor_page
+        ? padded_rows * descriptor.rows * sizeof(float)
+        : output_bytes;
+    const auto required_input_bytes = compact_input_bytes;
+    // The original FP32 activation is uploaded into the eventual result
+    // buffer, compacted into state.input, and then overwritten by the tensor
+    // result. This keeps one compact encoded activation plus one reused output
+    // allocation, never the incumbent four-byte encoded activation beside it.
+    const auto required_output_bytes = tensor_page
+        ? std::max(input_bytes, tensor_output_bytes)
+        : output_bytes;
     std::uint64_t workspace_allocation_calls = 0U;
     std::uint64_t workspace_allocation_bytes = 0U;
-    if (input_bytes > state.input_bytes) {
+    if (required_input_bytes > state.input_bytes) {
         if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
-        if (auto status = cudaMalloc(&state.input, static_cast<std::size_t>(input_bytes));
+        if (auto status = cudaMalloc(
+                &state.input, static_cast<std::size_t>(required_input_bytes));
             status != cudaSuccess) {
             return cuda_error(status, "allocate CUDA input workspace");
         }
-        state.input_bytes = input_bytes;
+        state.input_bytes = required_input_bytes;
         ++workspace_allocation_calls;
-        workspace_allocation_bytes += input_bytes;
+        workspace_allocation_bytes += required_input_bytes;
     }
-    if (output_bytes > state.output_bytes) {
+    if (required_output_bytes > state.output_bytes) {
         if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
-        if (auto status = cudaMalloc(&state.output, static_cast<std::size_t>(output_bytes));
+        if (auto status = cudaMalloc(
+                &state.output, static_cast<std::size_t>(required_output_bytes));
             status != cudaSuccess) {
             return cuda_error(status, "allocate CUDA output workspace");
         }
-        state.output_bytes = output_bytes;
+        state.output_bytes = required_output_bytes;
         ++workspace_allocation_calls;
-        workspace_allocation_bytes += output_bytes;
+        workspace_allocation_bytes += required_output_bytes;
     }
     // Grown geometrically and kept, so a decode step that repeats the same
     // shapes allocates nothing. Past the ceiling the copy falls back to the
@@ -13072,7 +13309,8 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     if (auto status = cudaMemcpyAsync(
-            state.input,
+            tensor_page ? static_cast<void*>(state.output)
+                        : static_cast<void*>(state.input),
             stage_input ? static_cast<const void*>(state.matmul_host_input)
                         : static_cast<const void*>(input.data()),
             input.size_bytes(), cudaMemcpyHostToDevice, state.stream);
@@ -13091,7 +13329,16 @@ ValidationResult CudaBackend::matmul_impl(
         descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
         rows == 1U && groups == 0U && descriptor.group_size == 32U &&
         descriptor.columns % 32U == 0U;
-    if (native) {
+    if (tensor_page) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>(descriptor.scale_columns), rows, 1U);
+        auto* compact_values = reinterpret_cast<unsigned char*>(state.input);
+        auto* compact_scales = compact_values + input.size();
+        quantize_activation_e4m3_bytes_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            compact_values, compact_scales, state.output,
+            descriptor.columns, rows);
+    } else if (native) {
         const auto input_rows = groups == 0U ? rows : rows * groups;
         const dim3 quantize_grid(
             static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
@@ -13166,6 +13413,22 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.global_scale, descriptor.packed_columns,
             descriptor.scale_columns, descriptor.group_size, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    } else if (tensor_page) {
+        const dim3 tensor_grid(
+            static_cast<unsigned int>(
+                descriptor.rows / kDsv4Fp8TensorBlockN),
+            static_cast<unsigned int>(
+                padded_rows / kDsv4Fp8TensorBlockM), 1U);
+        const auto* compact_values =
+            reinterpret_cast<const unsigned char*>(state.input);
+        const auto* compact_scales = compact_values + input.size();
+        dsv4_fp8_decode_bf16_tensor_kernel<<<
+            tensor_grid, threads, 0U, state.stream>>>(
+            state.output, compact_values, compact_scales,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales), rows,
+            static_cast<std::uint32_t>(descriptor.columns),
+            static_cast<std::uint32_t>(descriptor.rows));
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,

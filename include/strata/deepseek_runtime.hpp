@@ -174,6 +174,22 @@ struct Dsv4GraphStats {
     std::uint64_t attention_index_scalar_dispatches{};
     std::uint64_t attention_cuda_dispatches{};
     std::uint64_t attention_scalar_dispatches{};
+    // Physical-attention host metadata attribution. A page-set build is one
+    // container lifetime; pages counts the map entries populated in those
+    // sets. Candidate resolution is the row-local block-table search plus
+    // page-map lookup, excluding the measured map-miss build interval.
+    std::uint64_t attention_page_set_builds{};
+    std::uint64_t attention_page_set_pages{};
+    std::uint64_t attention_page_set_build_nanoseconds{};
+    std::uint64_t attention_candidate_resolutions{};
+    std::uint64_t attention_candidate_resolution_nanoseconds{};
+    // Row-batched physical-attention remainder attribution. Index preparation
+    // is selection against the compressor state already advanced by append;
+    // it must never include a second compressor pass.
+    std::uint64_t attention_page_index_selection_nanoseconds{};
+    std::uint64_t attention_page_weight_acquire_nanoseconds{};
+    std::uint64_t attention_page_branch_handoff_nanoseconds{};
+    std::uint64_t attention_page_stream_sync_nanoseconds{};
     std::uint64_t attention_score_nanoseconds{};
     std::uint64_t attention_output_nanoseconds{};
     std::uint64_t moe_nanoseconds{};

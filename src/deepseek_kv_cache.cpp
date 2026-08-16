@@ -970,7 +970,8 @@ ValidationResult Dsv4KvCache::release_sequence(Dsv4SequenceHandle sequence) {
 ValidationResult Dsv4KvCache::append(
     Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
     std::uint32_t layer, std::uint32_t compression_ratio,
-    std::uint64_t logical_row, std::span<const float> values) {
+    std::uint64_t logical_row, std::span<const float> values,
+    std::uint64_t sliding_retention_floor) {
     ValidationResult result;
     auto* target = state_->sequence(sequence);
     if (target == nullptr) {
@@ -1129,8 +1130,11 @@ ValidationResult Dsv4KvCache::append(
     target->tokens = std::max(target->tokens,
                               table.end_row * compression_ratio);
     if (kind == Dsv4KvBlockKind::Sliding) {
-        table.minimum_row = table.end_row > state_->config.sliding_window_rows
-            ? table.end_row - state_->config.sliding_window_rows : 0U;
+        const auto natural_minimum =
+            table.end_row > state_->config.sliding_window_rows
+                ? table.end_row - state_->config.sliding_window_rows : 0U;
+        table.minimum_row = std::min(natural_minimum,
+                                     sliding_retention_floor);
         while (!table.blocks.empty()) {
             const auto id = table.blocks.front();
             const auto& first = state_->blocks.at(id);

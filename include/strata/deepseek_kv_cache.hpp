@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -205,7 +206,13 @@ public:
     [[nodiscard]] ValidationResult append(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,
         std::uint32_t layer, std::uint32_t compression_ratio,
-        std::uint64_t logical_row, std::span<const float> values);
+        std::uint64_t logical_row, std::span<const float> values,
+        // A physical prefill page may append several rows before it attends
+        // the first one. Keep the page's earliest causal sliding row visible
+        // until that page's attend loop completes. The default preserves the
+        // ordinary end-of-append sliding eviction rule.
+        std::uint64_t sliding_retention_floor =
+            std::numeric_limits<std::uint64_t>::max());
     [[nodiscard]] ParseResult<Dsv4KvPhysicalAppend>
     reserve_physical_append(
         Dsv4SequenceHandle sequence, Dsv4KvBlockKind kind,

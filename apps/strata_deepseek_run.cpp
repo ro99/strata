@@ -746,6 +746,24 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.attention_cuda_dispatches
            << ",\"attention_scalar_dispatches\":"
            << stats.attention_scalar_dispatches
+           << ",\"attention_page_set_builds\":"
+           << stats.attention_page_set_builds
+           << ",\"attention_page_set_pages\":"
+           << stats.attention_page_set_pages
+           << ",\"attention_page_set_build_seconds\":"
+           << seconds(stats.attention_page_set_build_nanoseconds)
+           << ",\"attention_candidate_resolutions\":"
+           << stats.attention_candidate_resolutions
+           << ",\"attention_candidate_resolution_seconds\":"
+           << seconds(stats.attention_candidate_resolution_nanoseconds)
+           << ",\"attention_page_index_selection_seconds\":"
+           << seconds(stats.attention_page_index_selection_nanoseconds)
+           << ",\"attention_page_weight_acquire_seconds\":"
+           << seconds(stats.attention_page_weight_acquire_nanoseconds)
+           << ",\"attention_page_branch_handoff_seconds\":"
+           << seconds(stats.attention_page_branch_handoff_nanoseconds)
+           << ",\"attention_page_stream_sync_seconds\":"
+           << seconds(stats.attention_page_stream_sync_nanoseconds)
            << ",\"attention_score_seconds\":"
            << seconds(stats.attention_score_nanoseconds)
            << ",\"attention_output_seconds\":"

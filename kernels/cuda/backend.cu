@@ -3025,7 +3025,7 @@ constexpr std::uint32_t kDsv4PagedCandidatesPerGroup = 32U;
 struct Dsv4DevicePhysicalPage {
     const std::uint8_t* data{};
     std::uint32_t rows{};
-    std::uint32_t reserved{};
+    std::uint32_t flat_begin{};
 };
 
 struct Dsv4DeviceAttentionCandidate {
@@ -3160,40 +3160,33 @@ __device__ __forceinline__ float dsv4_decode_e4m3fn(
 
 __global__ void dsv4_materialize_physical_pages(
     const Dsv4DevicePhysicalPage* pages, std::uint32_t page_count,
-    const Dsv4DeviceAttentionCandidate* candidates,
-    std::uint32_t candidate_count, __nv_bfloat16* kv,
+    __nv_bfloat16* kv,
     unsigned int* failure) {
-    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
-                       threadIdx.x;
-    const auto count = static_cast<std::uint64_t>(candidate_count) *
+    const auto page_index = static_cast<std::uint32_t>(blockIdx.y);
+    if (page_index >= page_count) return;
+    const auto page = pages[page_index];
+    const auto local_index = static_cast<std::uint64_t>(blockIdx.x) *
+                                 blockDim.x + threadIdx.x;
+    const auto count = static_cast<std::uint64_t>(page.rows) *
                        kDsv4PagedHeadDim;
-    if (index >= count) return;
+    if (local_index >= count) return;
+    const auto index = static_cast<std::uint64_t>(page.flat_begin) *
+                           kDsv4PagedHeadDim + local_index;
     auto* output_bits = reinterpret_cast<std::uint16_t*>(kv);
-    const auto candidate_index = static_cast<std::uint32_t>(
-        index / kDsv4PagedHeadDim);
+    const auto row = static_cast<std::uint32_t>(
+        local_index / kDsv4PagedHeadDim);
     const auto dimension = static_cast<std::uint32_t>(
-        index % kDsv4PagedHeadDim);
-    const auto candidate = candidates[candidate_index];
-    if (candidate.valid == 0U) {
-        output_bits[index] = 0U;
-        return;
-    }
-    if (candidate.page >= page_count) {
-        atomicExch(failure, 2U);
-        output_bits[index] = 0U;
-        return;
-    }
-    const auto page = pages[candidate.page];
-    if (page.data == nullptr || candidate.row >= page.rows) {
+        local_index % kDsv4PagedHeadDim);
+    if (page.data == nullptr || row >= page.rows) {
         atomicExch(failure, 3U);
         output_bits[index] = 0U;
         return;
     }
-    const auto data_offset = static_cast<std::uint64_t>(candidate.row) * 576U;
+    const auto data_offset = static_cast<std::uint64_t>(row) * 576U;
     if (dimension < 448U) {
         const auto scale_code =
             page.data[static_cast<std::uint64_t>(page.rows) * 576U +
-                      static_cast<std::uint64_t>(candidate.row) * 8U +
+                      static_cast<std::uint64_t>(row) * 8U +
                       dimension / 64U];
         if (scale_code == 255U) {
             atomicExch(failure, 4U);
@@ -3232,10 +3225,14 @@ __device__ __forceinline__ float dsv4_warp_max(float value) {
 
 __global__ void dsv4_finish_maximums(
     const __nv_bfloat16* scores,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* sink,
     float* maximums, std::uint32_t candidate_count,
-    std::uint32_t boundaries) {
+    std::uint32_t score_width, std::uint32_t boundaries) {
     const auto head = blockIdx.x;
+    const auto row = blockIdx.y;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
     const auto lane = threadIdx.x & 31U;
     const auto warp = threadIdx.x >> 5U;
     __shared__ float warp_maximums[4];
@@ -3247,9 +3244,12 @@ __global__ void dsv4_finish_maximums(
                                threadIdx.x;
         float value = __int_as_float(0xff80'0000);
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
+            const auto descriptor = candidates[candidate];
+            const auto flat = pages[descriptor.page].flat_begin +
+                              descriptor.row;
             value = __bfloat162float(
-                scores[static_cast<std::uint64_t>(head) * candidate_count +
-                       candidate]);
+                scores[(static_cast<std::uint64_t>(row) *
+                            kDsv4PagedHeads + head) * score_width + flat]);
         }
         value = dsv4_warp_max(value);
         if (lane == 0U) warp_maximums[warp] = value;
@@ -3275,10 +3275,16 @@ __device__ __forceinline__ float dsv4_triton_exp(float value) {
 
 __global__ void dsv4_finish_denominators(
     const __nv_bfloat16* scores,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* sink,
     const float* maximums, float* denominators,
-    std::uint32_t candidate_count, std::uint32_t boundaries) {
+    std::uint32_t candidate_count, std::uint32_t score_width,
+    std::uint32_t boundaries) {
     const auto head = blockIdx.x;
+    const auto row = blockIdx.y;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
+    denominators += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
     const auto lane = threadIdx.x & 31U;
     const auto warp = threadIdx.x >> 5U;
     __shared__ float warp_sums[4];
@@ -3292,9 +3298,12 @@ __global__ void dsv4_finish_denominators(
                                threadIdx.x;
         float weight = 0.0F;
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
+            const auto descriptor = candidates[candidate];
+            const auto flat = pages[descriptor.page].flat_begin +
+                              descriptor.row;
             const auto score = __bfloat162float(
-                scores[static_cast<std::uint64_t>(head) * candidate_count +
-                       candidate]);
+                scores[(static_cast<std::uint64_t>(row) *
+                            kDsv4PagedHeads + head) * score_width + flat]);
             weight = dsv4_triton_exp(score - maximums[head]);
         }
         for (int offset = 16; offset > 0; offset /= 2) {
@@ -3313,42 +3322,54 @@ __global__ void dsv4_finish_denominators(
 
 __device__ __forceinline__ float dsv4_candidate_value(
     const __nv_bfloat16* kv,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates,
     std::uint32_t candidate, std::uint32_t dimension) {
     if (candidates[candidate].valid == 0U) return 0.0F;
+    const auto descriptor = candidates[candidate];
+    const auto flat = pages[descriptor.page].flat_begin + descriptor.row;
     return __bfloat162float(
-        kv[static_cast<std::uint64_t>(candidate) * kDsv4PagedHeadDim +
+        kv[static_cast<std::uint64_t>(flat) * kDsv4PagedHeadDim +
            dimension]);
 }
 
 __device__ __forceinline__ float dsv4_candidate_group_sum(
-    const __nv_bfloat16* kv, const float* weights,
+    const __nv_bfloat16* kv, const Dsv4DevicePhysicalPage* pages,
+    const float* weights,
     const Dsv4DeviceAttentionCandidate* candidates, std::uint32_t dimension,
     std::uint32_t group) {
     const auto second = group + kDsv4PagedCandidateGroups;
     float sum = __fmul_rn(
         weights[second],
-        dsv4_candidate_value(kv, candidates, second, dimension));
+        dsv4_candidate_value(kv, pages, candidates, second, dimension));
     sum = __fmaf_rn(
         weights[group],
-        dsv4_candidate_value(kv, candidates, group, dimension), sum);
+        dsv4_candidate_value(kv, pages, candidates, group, dimension), sum);
 #pragma unroll
     for (std::uint32_t index = 2U;
          index < kDsv4PagedCandidatesPerGroup; ++index) {
         const auto offset = group + kDsv4PagedCandidateGroups * index;
         sum = __fmaf_rn(
             weights[offset],
-            dsv4_candidate_value(kv, candidates, offset, dimension), sum);
+            dsv4_candidate_value(
+                kv, pages, candidates, offset, dimension), sum);
     }
     return sum;
 }
 
 __global__ void dsv4_finish_values(
     const __nv_bfloat16* scores,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* maximums,
     const __nv_bfloat16* kv, float* values,
-    std::uint32_t candidate_count, std::uint32_t boundaries) {
+    std::uint32_t candidate_count, std::uint32_t score_width,
+    std::uint32_t boundaries) {
     const auto head = blockIdx.x;
+    const auto row = blockIdx.z;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
+    values += static_cast<std::uint64_t>(row) * kDsv4PagedHeads *
+              kDsv4PagedHeadDim;
     const auto dimension = blockIdx.y * kDsv4PagedDimensionsPerBlock +
                            threadIdx.x;
     __shared__ float weights[kDsv4PagedCandidateBlock];
@@ -3363,9 +3384,11 @@ __global__ void dsv4_finish_values(
                 ? candidates[candidate] : Dsv4DeviceAttentionCandidate{};
             block_candidates[threadIdx.x] = descriptor;
             if (descriptor.valid != 0U) {
+                const auto flat = pages[descriptor.page].flat_begin +
+                                  descriptor.row;
                 const auto score = __bfloat162float(
-                    scores[static_cast<std::uint64_t>(head) * candidate_count +
-                           candidate]);
+                    scores[(static_cast<std::uint64_t>(row) *
+                                kDsv4PagedHeads + head) * score_width + flat]);
                 weights[threadIdx.x] = dsv4_triton_exp(
                     score - maximums[head]);
             } else {
@@ -3373,16 +3396,14 @@ __global__ void dsv4_finish_values(
             }
         }
         __syncthreads();
-        const auto* block_kv = kv +
-            static_cast<std::uint64_t>(candidate_start) * kDsv4PagedHeadDim;
         const auto group0 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 0U);
+            kv, pages, weights, block_candidates, dimension, 0U);
         const auto group1 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 1U);
+            kv, pages, weights, block_candidates, dimension, 1U);
         const auto group2 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 2U);
+            kv, pages, weights, block_candidates, dimension, 2U);
         const auto group3 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 3U);
+            kv, pages, weights, block_candidates, dimension, 3U);
         const auto pair02 = __fadd_rn(group0, group2);
         const auto pair13 = __fadd_rn(group1, group3);
         running_value = __fadd_rn(
@@ -3395,32 +3416,40 @@ __global__ void dsv4_finish_values(
 
 __global__ void dsv4_divide_and_store(
     const float* values, const float* denominators,
-    __nv_bfloat16* output) {
+    __nv_bfloat16* output, std::uint64_t elements,
+    std::uint64_t row_elements, std::uint64_t output_row_stride,
+    std::uint64_t output_group_offset) {
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
-    if (index >= static_cast<std::uint64_t>(kDsv4PagedHeads) *
-                     kDsv4PagedHeadDim) {
-        return;
-    }
-    const auto head = static_cast<std::uint32_t>(index / kDsv4PagedHeadDim);
+    if (index >= elements) return;
+    const auto row_offset = index % row_elements;
+    const auto row = index / row_elements;
+    const auto head = static_cast<std::uint32_t>(
+        row_offset / kDsv4PagedHeadDim);
     float divided;
     asm("div.full.f32 %0, %1, %2;"
         : "=f"(divided)
-        : "f"(values[index]), "f"(denominators[head]));
-    output[index] = __float2bfloat16_rn(divided);
+        : "f"(values[index]),
+          "f"(denominators[row * kDsv4PagedHeads + head]));
+    output[row * output_row_stride + output_group_offset + row_offset] =
+        __float2bfloat16_rn(divided);
 }
 
 __global__ void dsv4_inverse_rope_decode(
     const __nv_bfloat16* attended, const float* cosines,
-    const float* sines, float* output, std::uint32_t heads) {
+    const float* sines, float* output, std::uint32_t rows,
+    std::uint32_t heads) {
     constexpr std::uint32_t rope = 64U;
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
-    const auto elements = static_cast<std::uint64_t>(heads) *
-                          kDsv4PagedHeadDim;
+    const auto row_elements = static_cast<std::uint64_t>(heads) *
+                              kDsv4PagedHeadDim;
+    const auto elements = static_cast<std::uint64_t>(rows) *
+                          row_elements;
     if (index >= elements) return;
     const auto dimension = static_cast<std::uint32_t>(
         index % kDsv4PagedHeadDim);
+    const auto row = index / row_elements;
     if (dimension < kDsv4PagedHeadDim - rope) {
         output[index] = __bfloat162float(attended[index]);
         return;
@@ -3430,8 +3459,8 @@ __global__ void dsv4_inverse_rope_decode(
     const auto pair_begin = index - rope_dimension + pair * 2U;
     const float first = __bfloat162float(attended[pair_begin]);
     const float second = __bfloat162float(attended[pair_begin + 1U]);
-    const float cosine = cosines[pair];
-    const float sine = sines[pair];
+    const float cosine = cosines[row * (rope / 2U) + pair];
+    const float sine = sines[row * (rope / 2U) + pair];
     const float value = (rope_dimension & 1U) == 0U
         ? __fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))
         : __fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine));
@@ -4203,6 +4232,35 @@ struct alignas(256) Dsv4MhcWorkspace {
     float router_logits[kDsv4MhcRouterLogits];
     unsigned int failure{};
 };
+
+__global__ void dsv4_store_mhc_page_branches(
+    const float* values, __nv_bfloat16* diagnostic,
+    Dsv4MhcWorkspace* slot_arena, const std::uint32_t* slots,
+    std::uint32_t rows) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const auto elements = static_cast<std::uint64_t>(rows) * kDsv4MhcHidden;
+    if (index >= elements) return;
+    const auto row = static_cast<std::uint32_t>(index / kDsv4MhcHidden);
+    const auto column = static_cast<std::uint32_t>(index % kDsv4MhcHidden);
+    const auto encoded = __float2bfloat16_rn(values[index]);
+    diagnostic[index] = encoded;
+    if (slot_arena != nullptr) {
+        slot_arena[slots[row]].branch[column] = encoded;
+    }
+}
+
+__global__ void dsv4_scatter_encoded_mhc_page_branches(
+    const __nv_bfloat16* branches, Dsv4MhcWorkspace* slot_arena,
+    const std::uint32_t* slots, std::uint32_t rows) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const auto elements = static_cast<std::uint64_t>(rows) * kDsv4MhcHidden;
+    if (index >= elements) return;
+    const auto row = static_cast<std::uint32_t>(index / kDsv4MhcHidden);
+    const auto column = static_cast<std::uint32_t>(index % kDsv4MhcHidden);
+    slot_arena[slots[row]].branch[column] = branches[index];
+}
 
 // One prompt row's fused mHC state. The device workspace holds the residual
 // pair, branch, weighted, layer input, partial reductions, pre/post, the
@@ -7856,11 +7914,18 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     int device, const CudaDsv4PagedAttentionRequest& request,
     std::span<float> output) {
     ValidationResult result;
-    constexpr std::uint64_t output_elements =
+    constexpr std::uint64_t row_output_elements =
         static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
-    const auto candidates = static_cast<std::uint32_t>(
-        request.candidates.size());
-    if (request.queries.size() != output_elements ||
+    const auto rows = request.rows;
+    const auto candidates = request.candidate_width == 0U && rows == 1U
+        ? static_cast<std::uint32_t>(request.candidates.size())
+        : request.candidate_width;
+    const auto total_candidates = static_cast<std::uint64_t>(rows) *
+                                  candidates;
+    const auto output_elements = static_cast<std::uint64_t>(rows) *
+                                 row_output_elements;
+    if (rows == 0U || request.candidates.size() != total_candidates ||
+        request.queries.size() != output_elements ||
         request.head_sinks.size() != kDsv4PagedHeads ||
         output.size() != output_elements || request.pages.empty() ||
         request.pages.size() > std::numeric_limits<std::uint32_t>::max() ||
@@ -7902,6 +7967,8 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     }
 
     std::uint64_t page_bytes = 0U;
+    std::uint64_t flat_rows64 = 0U;
+    std::uint32_t maximum_page_rows = 0U;
     for (const auto& page : request.pages) {
         if (page.buffer == nullptr || !page.buffer->valid() ||
             page.buffer->device() != device ||
@@ -7915,7 +7982,16 @@ ValidationResult CudaBackend::dsv4_paged_attention(
             return result;
         }
         page_bytes += page.buffer->device_bytes();
+        flat_rows64 += page.rows;
+        maximum_page_rows = std::max(maximum_page_rows, page.rows);
     }
+    if (flat_rows64 == 0U ||
+        flat_rows64 > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek paged attention flat page extent overflows");
+        return result;
+    }
+    const auto flat_rows = static_cast<std::uint32_t>(flat_rows64);
     for (const auto& candidate : request.candidates) {
         if (candidate.valid &&
             (candidate.page >= request.pages.size() ||
@@ -7948,7 +8024,7 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     if (!checked_bytes(request.pages.size(), 1U,
                        sizeof(Dsv4DevicePhysicalPage),
                        page_descriptor_bytes) ||
-        !checked_bytes(request.candidates.size(), 1U,
+        !checked_bytes(total_candidates, 1U,
                        sizeof(Dsv4DeviceAttentionCandidate),
                        candidate_bytes) ||
         !checked_bytes(output_elements, 1U, sizeof(std::uint16_t),
@@ -7976,11 +8052,12 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     std::uint64_t maximum_bytes = 0U;
     std::uint64_t value_bytes = 0U;
     std::uint64_t output_bytes = 0U;
-    if (!checked_bytes(candidates, kDsv4PagedHeadDim,
+    if (!checked_bytes(flat_rows, kDsv4PagedHeadDim,
                        sizeof(std::uint16_t), kv_bytes) ||
-        !checked_bytes(kDsv4PagedHeads, candidates,
+        !checked_bytes(rows, static_cast<std::uint64_t>(kDsv4PagedHeads) *
+                                 flat_rows,
                        sizeof(std::uint16_t), score_bytes) ||
-        !checked_bytes(kDsv4PagedHeads, 1U, sizeof(float), maximum_bytes) ||
+        !checked_bytes(rows, kDsv4PagedHeads, sizeof(float), maximum_bytes) ||
         !checked_bytes(output_elements, 1U, sizeof(float), value_bytes) ||
         !checked_bytes(output_elements, 1U, sizeof(std::uint16_t),
                        output_bytes) ||
@@ -8055,11 +8132,13 @@ ValidationResult CudaBackend::dsv4_paged_attention(
 
     auto* host_pages = reinterpret_cast<Dsv4DevicePhysicalPage*>(
         state.dsv4_attention_host_upload + page_offset);
+    std::uint32_t flat_begin = 0U;
     for (std::size_t index = 0U; index < request.pages.size(); ++index) {
         const auto& page = request.pages[index];
         host_pages[index] = {
             static_cast<const std::uint8_t*>(page.buffer->impl_->data),
-            page.rows, 0U};
+            page.rows, flat_begin};
+        flat_begin += page.rows;
     }
     auto* host_candidates =
         reinterpret_cast<Dsv4DeviceAttentionCandidate*>(
@@ -8128,13 +8207,14 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         return cuda_error(status, "clear DeepSeek paged attention status");
     }
     constexpr std::uint32_t threads = 256U;
-    const auto kv_elements = static_cast<std::uint64_t>(candidates) *
-                             kDsv4PagedHeadDim;
-    const auto kv_blocks = static_cast<std::uint32_t>(
-        (kv_elements + threads - 1U) / threads);
-    dsv4_materialize_physical_pages<<<kv_blocks, threads, 0U, state.stream>>>(
+    const auto page_elements = static_cast<std::uint64_t>(maximum_page_rows) *
+                               kDsv4PagedHeadDim;
+    const dim3 kv_grid(
+        static_cast<unsigned int>((page_elements + threads - 1U) / threads),
+        static_cast<unsigned int>(request.pages.size()));
+    dsv4_materialize_physical_pages<<<kv_grid, threads, 0U, state.stream>>>(
         device_pages, static_cast<std::uint32_t>(request.pages.size()),
-        device_candidates, candidates, device_kv, device_failure);
+        device_kv, device_failure);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch DeepSeek physical-page materialization");
@@ -8143,45 +8223,48 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     constexpr float beta = 0.0F;
     if (auto status = cublasGemmEx(
             state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-            static_cast<int>(candidates),
-            static_cast<int>(kDsv4PagedHeads),
+            static_cast<int>(flat_rows),
+            static_cast<int>(rows * kDsv4PagedHeads),
             static_cast<int>(kDsv4PagedHeadDim), &alpha,
             device_kv, CUDA_R_16BF,
             static_cast<int>(kDsv4PagedHeadDim),
             device_query, CUDA_R_16BF,
             static_cast<int>(kDsv4PagedHeadDim), &beta,
-            device_scores, CUDA_R_16BF, static_cast<int>(candidates),
+            device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         status != CUBLAS_STATUS_SUCCESS) {
         return cublas_error(status,
                             "execute DeepSeek paged attention BF16 scores");
     }
     const auto score_elements = static_cast<std::uint64_t>(
-        kDsv4PagedHeads) * candidates;
+        rows) * kDsv4PagedHeads * flat_rows;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
         device_scores, score_elements, request.scale);
     const auto boundaries = candidates / kDsv4PagedCandidateBlock;
-    dsv4_finish_maximums<<<kDsv4PagedHeads,
+    dsv4_finish_maximums<<<dim3{kDsv4PagedHeads, rows},
                            kDsv4PagedCandidateBlock, 0U, state.stream>>>(
-        device_scores, device_candidates, device_sink, device_maximums,
-        candidates, boundaries);
-    dsv4_finish_denominators<<<kDsv4PagedHeads,
+        device_scores, device_pages, device_candidates, device_sink,
+        device_maximums, candidates, flat_rows, boundaries);
+    dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                               kDsv4PagedCandidateBlock, 0U, state.stream>>>(
-        device_scores, device_candidates, device_sink, device_maximums,
-        device_denominators, candidates, boundaries);
+        device_scores, device_pages, device_candidates, device_sink,
+        device_maximums, device_denominators, candidates, flat_rows,
+        boundaries);
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
-                              kDsv4PagedDimensionsPerBlock);
+                              kDsv4PagedDimensionsPerBlock,
+                          rows);
     dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                          0U, state.stream>>>(
-        device_scores, device_candidates, device_maximums, device_kv,
-        device_values, candidates, boundaries);
+        device_scores, device_pages, device_candidates, device_maximums,
+        device_kv, device_values, candidates, flat_rows, boundaries);
     const auto output_blocks = static_cast<std::uint32_t>(
         (output_elements + threads - 1U) / threads);
     dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-        device_values, device_denominators, device_output);
+        device_values, device_denominators, device_output, output_elements,
+        row_output_elements, row_output_elements, 0U);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch DeepSeek paged attention finish kernels");
@@ -9546,18 +9629,29 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     int device, const CudaDsv4PagedAttentionMhcRequest& request,
     std::span<float> diagnostic_branch) {
     ValidationResult result;
+    const auto rows = request.attention.rows;
     const std::uint32_t total_heads = request.rank_local ? 32U : 64U;
     const std::uint32_t output_groups = request.rank_local ? 4U : 8U;
     constexpr std::uint32_t rope_pairs = 32U;
-    const std::uint64_t attended_elements =
+    const std::uint64_t attended_row_elements =
         static_cast<std::uint64_t>(total_heads) * kDsv4PagedHeadDim;
+    const std::uint64_t attended_elements =
+        static_cast<std::uint64_t>(rows) * attended_row_elements;
     constexpr std::uint64_t group_elements =
         static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
-    const std::uint64_t output_rank_elements =
+    const std::uint64_t output_rank_row_elements =
         static_cast<std::uint64_t>(output_groups) * 1024U;
-    constexpr std::uint64_t branch_elements = kDsv4MhcHidden;
-    const auto candidates = static_cast<std::uint32_t>(
-        request.attention.candidates.size());
+    const std::uint64_t output_rank_elements =
+        static_cast<std::uint64_t>(rows) * output_rank_row_elements;
+    constexpr std::uint64_t branch_row_elements = kDsv4MhcHidden;
+    const std::uint64_t branch_elements =
+        static_cast<std::uint64_t>(rows) * branch_row_elements;
+    const auto candidates = request.attention.candidate_width == 0U &&
+            rows == 1U
+        ? static_cast<std::uint32_t>(request.attention.candidates.size())
+        : request.attention.candidate_width;
+    const auto total_candidates = static_cast<std::uint64_t>(rows) *
+                                  candidates;
     const auto* output_a = request.output_a;
     const auto* output_b = request.output_b;
     const auto source_found = impl_->devices.find(device);
@@ -9567,8 +9661,16 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const bool project_router = request.router != nullptr;
     const bool defer_host_moe_input = request.defer_host_moe_input;
     const bool fixed_command_staging = defer_host_moe_input || request.rank_local;
+    const bool page_request = rows > 1U;
     if (source_found == impl_->devices.end() ||
         target_found == impl_->devices.end() ||
+        rows == 0U || request.attention.candidates.size() != total_candidates ||
+        (page_request &&
+         (request.rank_local || use_prepared_query || transition_mhc ||
+          project_router || defer_host_moe_input ||
+          request.attention.resolution != nullptr ||
+          request.mhc_slots.size() != rows || diagnostic_branch.empty())) ||
+        (!page_request && !request.mhc_slots.empty()) ||
         (use_prepared_query
              ? (!source_found->second.dsv4_attention_prepared ||
                 source_found->second.dsv4_prepared_queries == nullptr)
@@ -9589,8 +9691,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         !std::isfinite(request.attention.scale) ||
         request.attention.scale <= 0.0F ||
         request.attention.maximum_workspace_bytes == 0U ||
-        request.inverse_rope_cosines.size() != rope_pairs ||
-        request.inverse_rope_sines.size() != rope_pairs ||
+        request.inverse_rope_cosines.size() !=
+            static_cast<std::size_t>(rows) * rope_pairs ||
+        request.inverse_rope_sines.size() !=
+            static_cast<std::size_t>(rows) * rope_pairs ||
         output_a == nullptr || output_b == nullptr ||
         !output_a->valid() || !output_b->valid() ||
         output_a->device() != device || output_b->device() != device ||
@@ -9600,7 +9704,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 request.mhc_transition->device() != request.mhc_device ||
                 (defer_host_moe_input
                      ? !request.mhc_layer_input.empty()
-                     : request.mhc_layer_input.size() != branch_elements) ||
+                     : request.mhc_layer_input.size() != branch_row_elements) ||
                 !diagnostic_branch.empty())
              : !request.mhc_layer_input.empty()) ||
         (project_router
@@ -9648,11 +9752,12 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         ? &request.router->impl_->descriptor : nullptr;
     if (a.encoding != CudaWeightEncoding::Plain ||
         a.dtype != SafetensorsDtype::Bf16 ||
-        a.rows != output_rank_elements || a.columns != 4096U ||
+        a.rows != output_rank_row_elements || a.columns != 4096U ||
         (!((b.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
             b.dtype == SafetensorsDtype::F8E4M3 && b.group_size == 128U) ||
            expanded_output_b)) ||
-        b.rows != branch_elements || b.columns != output_rank_elements) {
+        b.rows != branch_row_elements ||
+        b.columns != output_rank_row_elements) {
         result.errors.emplace_back(
             "DeepSeek attention output weights violate the accepted mixed BF16/FP8 contract");
         return result;
@@ -9673,7 +9778,11 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     if (state.moe_in_flight || target.moe_in_flight ||
         !state.dsv4_paged_attention_supported ||
         !target.dsv4_mhc_supported || target.dsv4_mhc_workspace == nullptr ||
-        target.dsv4_mhc_stage != 1U || target.dsv4_mhc_branch_ready ||
+        (!page_request &&
+         (target.dsv4_mhc_stage != 1U || target.dsv4_mhc_branch_ready)) ||
+        (page_request &&
+         (target.dsv4_mhc_slot_arena == nullptr ||
+          target.dsv4_mhc_slot_capacity < rows)) ||
         target.dsv4_host_moe_input_pending ||
         (fixed_command_staging &&
          state.dsv4_deferred_attention_command_count >=
@@ -9682,9 +9791,33 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             "DeepSeek attention-to-mHC command order or device support is invalid");
         return result;
     }
+    if (page_request) {
+        for (const auto slot : request.mhc_slots) {
+            if (slot >= target.dsv4_mhc_slot_capacity) {
+                result.errors.emplace_back(
+                    "DeepSeek attention page mHC slot is out of range");
+                return result;
+            }
+            const auto stage = slot == target.dsv4_mhc_active_slot
+                ? target.dsv4_mhc_stage
+                : slot < target.dsv4_mhc_saved_slots.size()
+                    ? target.dsv4_mhc_saved_slots[slot].stage : 0U;
+            const auto branch_ready = slot == target.dsv4_mhc_active_slot
+                ? target.dsv4_mhc_branch_ready
+                : slot < target.dsv4_mhc_saved_slots.size() &&
+                    target.dsv4_mhc_saved_slots[slot].branch_ready;
+            if (stage != 1U || branch_ready) {
+                result.errors.emplace_back(
+                    "DeepSeek attention page mHC slot state is invalid");
+                return result;
+            }
+        }
+    }
     if (use_prepared_query) state.dsv4_attention_prepared = false;
 
     std::uint64_t page_bytes = 0U;
+    std::uint64_t flat_rows64 = 0U;
+    std::uint32_t maximum_page_rows = 0U;
     for (const auto& page : request.attention.pages) {
         if (page.buffer == nullptr || !page.buffer->valid() ||
             page.buffer->device() != device ||
@@ -9698,7 +9831,16 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             return result;
         }
         page_bytes += page.buffer->device_bytes();
+        flat_rows64 += page.rows;
+        maximum_page_rows = std::max(maximum_page_rows, page.rows);
     }
+    if (flat_rows64 == 0U ||
+        flat_rows64 > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek attention-to-mHC flat page extent overflows");
+        return result;
+    }
+    const auto flat_rows = static_cast<std::uint32_t>(flat_rows64);
     // The resolved region is checked on the device against these same page
     // descriptors, because the host has not seen the selection that fills it.
     const auto* resolution = request.attention.resolution;
@@ -9780,21 +9922,23 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     };
     std::uint64_t page_offset{}, candidate_offset{}, query_offset{};
     std::uint64_t sink_offset{}, cosine_offset{}, sine_offset{};
-    std::uint64_t block_offset{};
+    std::uint64_t slot_offset{}, block_offset{};
     std::uint64_t page_descriptor_bytes{}, candidate_bytes{}, query_bytes{};
-    std::uint64_t block_bytes{};
+    std::uint64_t slot_bytes{}, block_bytes{};
     const std::uint64_t sink_bytes =
         static_cast<std::uint64_t>(total_heads) * sizeof(float);
-    constexpr std::uint64_t rope_bytes =
-        static_cast<std::uint64_t>(rope_pairs) * sizeof(float);
+    const std::uint64_t rope_bytes = static_cast<std::uint64_t>(rows) *
+        rope_pairs * sizeof(float);
     if (!checked_bytes(request.attention.pages.size(), 1U,
                        sizeof(Dsv4DevicePhysicalPage),
                        page_descriptor_bytes) ||
-        !checked_bytes(request.attention.candidates.size(), 1U,
+        !checked_bytes(total_candidates, 1U,
                        sizeof(Dsv4DeviceAttentionCandidate),
                        candidate_bytes) ||
         !checked_bytes(use_prepared_query ? 0U : attended_elements, 1U,
                        sizeof(std::uint16_t), query_bytes) ||
+        !checked_bytes(request.mhc_slots.size(), 1U,
+                       sizeof(std::uint32_t), slot_bytes) ||
         !checked_bytes(resolution == nullptr ? 0U : resolution->blocks.size(),
                        1U, sizeof(Dsv4DeviceKvBlock), block_bytes) ||
         !region(page_descriptor_bytes, 16U, page_offset) ||
@@ -9803,6 +9947,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         !region(sink_bytes, 16U, sink_offset) ||
         !region(rope_bytes, 16U, cosine_offset) ||
         !region(rope_bytes, 16U, sine_offset) ||
+        !region(slot_bytes, 16U, slot_offset) ||
         !region(block_bytes, 16U, block_offset)) {
         result.errors.emplace_back(
             "DeepSeek attention-to-mHC upload layout overflows");
@@ -9816,16 +9961,20 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     std::uint64_t encoded_branch_offset{}, router_logits_offset{};
     std::uint64_t failure_offset{};
     std::uint64_t kv_bytes{}, score_bytes{};
-    if (!checked_bytes(candidates, kDsv4PagedHeadDim,
+    if (!checked_bytes(flat_rows, kDsv4PagedHeadDim,
                        sizeof(std::uint16_t), kv_bytes) ||
-        !checked_bytes(kDsv4PagedHeads, candidates,
+        !checked_bytes(rows, static_cast<std::uint64_t>(kDsv4PagedHeads) *
+                                 flat_rows,
                        sizeof(std::uint16_t), score_bytes) ||
         !region(kv_bytes, 16U, kv_offset) ||
         !region(score_bytes, 16U, score_offset) ||
-        !region(kDsv4PagedHeads * sizeof(float), 16U, maximum_offset) ||
-        !region(kDsv4PagedHeads * sizeof(float), 16U,
+        !region(static_cast<std::uint64_t>(rows) * kDsv4PagedHeads *
+                    sizeof(float), 16U, maximum_offset) ||
+        !region(static_cast<std::uint64_t>(rows) * kDsv4PagedHeads *
+                    sizeof(float), 16U,
                 denominator_offset) ||
-        !region(group_elements * sizeof(float), 16U, value_offset) ||
+        !region(static_cast<std::uint64_t>(rows) * group_elements *
+                    sizeof(float), 16U, value_offset) ||
         !region(attended_elements * sizeof(std::uint16_t), 16U,
                 attended_offset) ||
         !region(attended_elements * sizeof(float), 16U, decoded_offset) ||
@@ -9871,6 +10020,43 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         state.dsv4_attention_workspace_bytes = target_bytes;
         ++allocation_calls;
         allocation_bytes += target_bytes;
+    }
+    const auto cross_page_branch_bytes = page_request &&
+            request.mhc_device != device
+        ? branch_elements * sizeof(std::uint16_t) : 0U;
+    const auto cross_page_slot_offset =
+        (cross_page_branch_bytes + alignof(std::uint32_t) - 1U) &
+        ~(static_cast<std::uint64_t>(alignof(std::uint32_t)) - 1U);
+    const auto cross_page_staging_bytes = cross_page_slot_offset +
+        (page_request && request.mhc_device != device
+             ? static_cast<std::uint64_t>(rows) * sizeof(std::uint32_t)
+             : 0U);
+    if (cross_page_staging_bytes > target.dsv4_attention_workspace_bytes) {
+        if (auto status = cudaSetDevice(request.mhc_device);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "select target for attention page staging");
+        }
+        std::byte* replacement = nullptr;
+        if (auto status = cudaMalloc(
+                &replacement,
+                static_cast<std::size_t>(cross_page_staging_bytes));
+            status != cudaSuccess) {
+            static_cast<void>(cudaSetDevice(device));
+            return cuda_error(status,
+                              "allocate cross-device attention page staging");
+        }
+        if (target.dsv4_attention_workspace != nullptr) {
+            static_cast<void>(cudaFree(target.dsv4_attention_workspace));
+        }
+        target.dsv4_attention_workspace = replacement;
+        target.dsv4_attention_workspace_bytes = cross_page_staging_bytes;
+        ++allocation_calls;
+        allocation_bytes += cross_page_staging_bytes;
+        if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+            return cuda_error(status,
+                              "restore source after attention page allocation");
+        }
     }
     const auto ensure_host = [&](std::byte*& pointer,
                                  std::uint64_t& capacity,
@@ -9937,12 +10123,14 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
 
     auto* host_pages = reinterpret_cast<Dsv4DevicePhysicalPage*>(
         command_host_upload + page_offset);
+    std::uint32_t flat_begin = 0U;
     for (std::size_t index = 0U;
          index < request.attention.pages.size(); ++index) {
         const auto& page = request.attention.pages[index];
         host_pages[index] = {
             static_cast<const std::uint8_t*>(page.buffer->impl_->data),
-            page.rows, 0U};
+            page.rows, flat_begin};
+        flat_begin += page.rows;
     }
     auto* host_candidates =
         reinterpret_cast<Dsv4DeviceAttentionCandidate*>(
@@ -9956,9 +10144,21 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     if (!use_prepared_query) {
         auto* host_query = reinterpret_cast<std::uint16_t*>(
             command_host_upload + query_offset);
-        for (std::size_t index = 0U;
-             index < request.attention.queries.size(); ++index) {
-            host_query[index] = bf16_encode(request.attention.queries[index]);
+        const auto group_count = request.rank_local ? 1U : 2U;
+        for (std::uint32_t group = 0U; group < group_count; ++group) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto source = static_cast<std::uint64_t>(row) *
+                        attended_row_elements +
+                    static_cast<std::uint64_t>(group) * group_elements;
+                const auto destination =
+                    (static_cast<std::uint64_t>(group) * rows + row) *
+                    group_elements;
+                for (std::uint64_t index = 0U; index < group_elements;
+                     ++index) {
+                    host_query[destination + index] = bf16_encode(
+                        request.attention.queries[source + index]);
+                }
+            }
         }
     }
     std::memcpy(command_host_upload + sink_offset,
@@ -9967,6 +10167,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 request.inverse_rope_cosines.data(), rope_bytes);
     std::memcpy(command_host_upload + sine_offset,
                 request.inverse_rope_sines.data(), rope_bytes);
+    if (slot_bytes != 0U) {
+        std::memcpy(command_host_upload + slot_offset,
+                    request.mhc_slots.data(), slot_bytes);
+    }
     if (resolution != nullptr) {
         auto* host_blocks = reinterpret_cast<Dsv4DeviceKvBlock*>(
             command_host_upload + block_offset);
@@ -9992,6 +10196,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     auto* device_sink = reinterpret_cast<float*>(workspace + sink_offset);
     auto* device_cosines = reinterpret_cast<float*>(workspace + cosine_offset);
     auto* device_sines = reinterpret_cast<float*>(workspace + sine_offset);
+    auto* device_slots = reinterpret_cast<std::uint32_t*>(
+        workspace + slot_offset);
     auto* device_kv = reinterpret_cast<__nv_bfloat16*>(workspace + kv_offset);
     auto* device_scores = reinterpret_cast<__nv_bfloat16*>(
         workspace + score_offset);
@@ -10067,43 +10273,44 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                               "launch DeepSeek device candidate resolution");
         }
     }
-    const auto kv_elements = static_cast<std::uint64_t>(candidates) *
-                             kDsv4PagedHeadDim;
-    const auto kv_blocks = static_cast<std::uint32_t>(
-        (kv_elements + threads - 1U) / threads);
-    dsv4_materialize_physical_pages<<<kv_blocks, threads, 0U, state.stream>>>(
+    const auto page_elements = static_cast<std::uint64_t>(maximum_page_rows) *
+                               kDsv4PagedHeadDim;
+    const dim3 kv_grid(
+        static_cast<unsigned int>((page_elements + threads - 1U) / threads),
+        static_cast<unsigned int>(request.attention.pages.size()));
+    dsv4_materialize_physical_pages<<<kv_grid, threads, 0U, state.stream>>>(
         device_pages,
         static_cast<std::uint32_t>(request.attention.pages.size()),
-        device_candidates, candidates, device_kv, device_failure);
+        device_kv, device_failure);
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
     const auto boundaries = candidates / kDsv4PagedCandidateBlock;
-    const auto score_elements = static_cast<std::uint64_t>(
-        kDsv4PagedHeads) * candidates;
+    const auto score_elements = static_cast<std::uint64_t>(rows) *
+        kDsv4PagedHeads * flat_rows;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     const auto output_blocks = static_cast<std::uint32_t>(
-        (group_elements + threads - 1U) / threads);
+        (static_cast<std::uint64_t>(rows) * group_elements + threads - 1U) /
+        threads);
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
-                              kDsv4PagedDimensionsPerBlock);
+                              kDsv4PagedDimensionsPerBlock,
+                          rows);
     const auto group_count = request.rank_local ? 1U : 2U;
     for (std::uint32_t group = 0U; group < group_count; ++group) {
         auto* group_query = device_query +
-            static_cast<std::uint64_t>(group) * group_elements;
+            static_cast<std::uint64_t>(group) * rows * group_elements;
         auto* group_sink = device_sink + group * kDsv4PagedHeads;
-        auto* group_output = device_attended +
-            static_cast<std::uint64_t>(group) * group_elements;
         if (auto status = cublasGemmEx(
                 state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                static_cast<int>(candidates),
-                static_cast<int>(kDsv4PagedHeads),
+                static_cast<int>(flat_rows),
+                static_cast<int>(rows * kDsv4PagedHeads),
                 static_cast<int>(kDsv4PagedHeadDim), &alpha,
                 device_kv, CUDA_R_16BF,
                 static_cast<int>(kDsv4PagedHeadDim),
                 group_query, CUDA_R_16BF,
                 static_cast<int>(kDsv4PagedHeadDim), &beta,
-                device_scores, CUDA_R_16BF, static_cast<int>(candidates),
+                device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             status != CUBLAS_STATUS_SUCCESS) {
             return cublas_error(
@@ -10111,38 +10318,47 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         }
         dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
             device_scores, score_elements, request.attention.scale);
-        dsv4_finish_maximums<<<kDsv4PagedHeads,
+        dsv4_finish_maximums<<<dim3{kDsv4PagedHeads, rows},
                                kDsv4PagedCandidateBlock, 0U,
                                state.stream>>>(
-            device_scores, device_candidates, group_sink, device_maximums,
-            candidates, boundaries);
-        dsv4_finish_denominators<<<kDsv4PagedHeads,
+            device_scores, device_pages, device_candidates, group_sink,
+            device_maximums, candidates, flat_rows, boundaries);
+        dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                                    kDsv4PagedCandidateBlock, 0U,
                                    state.stream>>>(
-            device_scores, device_candidates, group_sink, device_maximums,
-            device_denominators, candidates, boundaries);
+            device_scores, device_pages, device_candidates, group_sink,
+            device_maximums, device_denominators, candidates, flat_rows,
+            boundaries);
         dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                              0U, state.stream>>>(
-            device_scores, device_candidates, device_maximums,
-            device_kv,
-            device_values, candidates, boundaries);
+            device_scores, device_pages, device_candidates, device_maximums,
+            device_kv, device_values, candidates, flat_rows, boundaries);
         dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-            device_values, device_denominators, group_output);
+            device_values, device_denominators, device_attended,
+            static_cast<std::uint64_t>(rows) * group_elements,
+            group_elements, attended_row_elements,
+            static_cast<std::uint64_t>(group) * group_elements);
     }
     const auto attended_blocks = static_cast<std::uint32_t>(
         (attended_elements + threads - 1U) / threads);
     dsv4_inverse_rope_decode<<<attended_blocks, threads, 0U, state.stream>>>(
         device_attended, device_cosines, device_sines, device_decoded,
-        total_heads);
+        rows, total_heads);
     if (request.rank_local) {
         dsv4_rank_bf16_matmul<<<output_rank_elements, rank_threads, 0U, state.stream>>>(
             device_output_rank, device_decoded,
             static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
             1U, a.columns, a.rows, output_groups, 1024U);
     } else {
-        plain_matmul_kernel<1U><<<output_rank_elements, threads, 0U, state.stream>>>(
+        const dim3 output_a_grid(
+            static_cast<unsigned int>(a.rows),
+            static_cast<unsigned int>(
+                (rows + kPlainMatmulRowTile - 1U) /
+                kPlainMatmulRowTile));
+        plain_matmul_kernel<kPlainMatmulRowTile>
+            <<<output_a_grid, threads, 0U, state.stream>>>(
             device_output_rank, device_decoded, output_a->impl_->weights,
-            static_cast<int>(a.dtype), 1U, a.columns, a.rows,
+            static_cast<int>(a.dtype), rows, a.columns, a.rows,
             output_groups, 1024U);
     }
     const auto output_rank_blocks = static_cast<std::uint32_t>(
@@ -10150,10 +10366,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     dsv4_round_float_bf16<<<output_rank_blocks, threads, 0U, state.stream>>>(
         device_output_rank, output_rank_elements);
     const dim3 output_rank_quantize_grid(
-        static_cast<unsigned int>(output_rank_elements / 128U), 1U, 1U);
+        static_cast<unsigned int>(output_rank_row_elements / 128U), rows, 1U);
     quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
                                       state.stream>>>(
-        device_output_rank, output_rank_elements, 1U);
+        device_output_rank, output_rank_row_elements, rows);
     auto* raw_branch_output = request.rank_local
         ? request.rank_local_raw_fp32_reduction : device_branch;
     if (expanded_output_b) {
@@ -10162,17 +10378,27 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<const __nv_bfloat16*>(output_b->impl_->weights),
             1U, b.columns, b.rows, 0U, 0U);
     } else {
-        native_fp8_matmul_kernel<<<branch_elements, threads, 0U, state.stream>>>(
+        native_fp8_matmul_kernel<<<dim3{
+            static_cast<unsigned int>(branch_row_elements), rows},
+            threads, 0U, state.stream>>>(
             raw_branch_output, device_output_rank,
             static_cast<const unsigned char*>(output_b->impl_->weights),
             static_cast<const unsigned char*>(output_b->impl_->scales),
-            b.scale_columns, 1U, b.columns, b.rows, 0U, 0U);
+            b.scale_columns, rows, b.columns, b.rows, 0U, 0U);
     }
     const auto branch_blocks = static_cast<std::uint32_t>(
         (branch_elements + threads - 1U) / threads);
-    dsv4_store_mhc_branch<<<branch_blocks, threads, 0U, state.stream>>>(
-        raw_branch_output, device_encoded_branch,
-        branch_elements);
+    if (page_request) {
+        auto* slot_arena = request.mhc_device == device
+            ? target.dsv4_mhc_slot_arena : nullptr;
+        dsv4_store_mhc_page_branches<<<branch_blocks, threads, 0U,
+                                        state.stream>>>(
+            raw_branch_output, device_encoded_branch, slot_arena,
+            device_slots, rows);
+    } else {
+        dsv4_store_mhc_branch<<<branch_blocks, threads, 0U, state.stream>>>(
+            raw_branch_output, device_encoded_branch, branch_elements);
+    }
     const auto cross_device = request.mhc_device != device;
     const auto cross_transition = cross_device && transition_mhc;
     const auto needs_branch_download = cross_device ||
@@ -10182,7 +10408,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     auto* staged_router = staged_layer + transition_layer_bytes;
     auto* staged_failure = command_host_download + download_branch_bytes +
                            transition_layer_bytes + router_download_bytes;
-    if (!cross_device) {
+    if (!cross_device && !page_request) {
         if (auto status = cudaMemcpyAsync(
                 target.dsv4_mhc_workspace->branch, device_encoded_branch,
                 static_cast<std::size_t>(branch_elements *
@@ -10537,12 +10763,41 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             return cuda_error(status,
                               "select mHC device for attention branch handoff");
         }
-        if (auto status = cudaMemcpyAsync(
-                target.dsv4_mhc_workspace->branch, staged_branch,
-                static_cast<std::size_t>(branch_elements *
-                                         sizeof(std::uint16_t)),
-                cudaMemcpyHostToDevice, target.stream);
-            status != cudaSuccess) {
+        if (page_request) {
+            auto* target_encoded = reinterpret_cast<__nv_bfloat16*>(
+                target.dsv4_attention_workspace);
+            auto* target_slots = reinterpret_cast<std::uint32_t*>(
+                target.dsv4_attention_workspace + cross_page_slot_offset);
+            if (auto status = cudaMemcpyAsync(
+                    target_encoded, staged_branch,
+                    static_cast<std::size_t>(cross_page_branch_bytes),
+                    cudaMemcpyHostToDevice, target.stream);
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "upload cross-device attention page branches");
+            }
+            if (auto status = cudaMemcpyAsync(
+                    target_slots, request.mhc_slots.data(),
+                    static_cast<std::size_t>(rows) * sizeof(std::uint32_t),
+                    cudaMemcpyHostToDevice, target.stream);
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "upload cross-device attention page slots");
+            }
+            dsv4_scatter_encoded_mhc_page_branches<<<
+                branch_blocks, threads, 0U, target.stream>>>(
+                target_encoded, target.dsv4_mhc_slot_arena,
+                target_slots, rows);
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(
+                    status, "scatter cross-device attention page branches");
+            }
+        } else if (auto status = cudaMemcpyAsync(
+                       target.dsv4_mhc_workspace->branch, staged_branch,
+                       static_cast<std::size_t>(branch_elements *
+                                                sizeof(std::uint16_t)),
+                       cudaMemcpyHostToDevice, target.stream);
+                   status != cudaSuccess) {
             return cuda_error(status,
                               "upload cross-device attention branch to mHC");
         }
@@ -10563,6 +10818,19 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         }
         target.dsv4_mhc_residual_index ^= 1U;
         target.dsv4_mhc_branch_ready = false;
+    } else if (page_request) {
+        if (target.dsv4_mhc_saved_slots.size() <
+            target.dsv4_mhc_slot_capacity) {
+            target.dsv4_mhc_saved_slots.resize(
+                target.dsv4_mhc_slot_capacity);
+        }
+        for (const auto slot : request.mhc_slots) {
+            if (slot == target.dsv4_mhc_active_slot) {
+                target.dsv4_mhc_branch_ready = true;
+            } else {
+                target.dsv4_mhc_saved_slots[slot].branch_ready = true;
+            }
+        }
     } else {
         target.dsv4_mhc_branch_ready = true;
     }
@@ -10708,7 +10976,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
         ++stats.dsv4_paged_attention_calls;
-        stats.dsv4_paged_attention_kernel_launches += 19U;
+        stats.dsv4_paged_attention_kernel_launches +=
+            19U + static_cast<std::uint64_t>(page_request && cross_device);
         stats.dsv4_paged_attention_h2d_bytes += upload_bytes;
         stats.dsv4_paged_attention_d2h_bytes +=
             download_branch_bytes + sizeof(unsigned int);

@@ -341,6 +341,11 @@ struct CudaDsv4PagedAttentionRequest {
     std::span<const float> head_sinks;
     std::span<const CudaDsv4PhysicalPage> pages;
     std::span<const CudaDsv4AttentionCandidate> candidates;
+    // Row-major page request. Queries are [rows, 32, 512] and candidates are
+    // [rows, candidate_width]. Pages and head sinks are shared by every row.
+    // The single-row defaults preserve the decode request contract.
+    std::uint32_t rows{1U};
+    std::uint32_t candidate_width{};
     // When set, the compressed region of `candidates` is ignored and resolved
     // on the device instead, after the upload and before scoring.
     const CudaDsv4DeviceCandidateResolution* resolution{};
@@ -408,6 +413,9 @@ using CudaDsv4AttentionPrepareHostCallback = bool (*)(
 // may be requested by the caller without changing the device computation.
 struct CudaDsv4PagedAttentionMhcRequest {
     CudaDsv4PagedAttentionRequest attention;
+    // Optional per-row mHC arena slots for a page request. Empty selects the
+    // active single-row workspace; otherwise its extent equals attention.rows.
+    std::span<const std::uint32_t> mhc_slots;
     std::span<const float> inverse_rope_cosines;
     std::span<const float> inverse_rope_sines;
     const CudaWeight* output_a{};

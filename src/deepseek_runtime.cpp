@@ -339,6 +339,22 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             before.attention_index_scalar_dispatches,
         after.attention_cuda_dispatches - before.attention_cuda_dispatches,
         after.attention_scalar_dispatches - before.attention_scalar_dispatches,
+        after.attention_page_set_builds - before.attention_page_set_builds,
+        after.attention_page_set_pages - before.attention_page_set_pages,
+        after.attention_page_set_build_nanoseconds -
+            before.attention_page_set_build_nanoseconds,
+        after.attention_candidate_resolutions -
+            before.attention_candidate_resolutions,
+        after.attention_candidate_resolution_nanoseconds -
+            before.attention_candidate_resolution_nanoseconds,
+        after.attention_page_index_selection_nanoseconds -
+            before.attention_page_index_selection_nanoseconds,
+        after.attention_page_weight_acquire_nanoseconds -
+            before.attention_page_weight_acquire_nanoseconds,
+        after.attention_page_branch_handoff_nanoseconds -
+            before.attention_page_branch_handoff_nanoseconds,
+        after.attention_page_stream_sync_nanoseconds -
+            before.attention_page_stream_sync_nanoseconds,
         after.attention_score_nanoseconds - before.attention_score_nanoseconds,
         after.attention_output_nanoseconds - before.attention_output_nanoseconds,
         after.moe_nanoseconds - before.moe_nanoseconds,
@@ -1537,6 +1553,16 @@ struct SpeculativeState {
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
+    // Physical page metadata is shared by every row in one prefill page.
+    // Device leases are moved into pending_attention_leases after each
+    // successful command, so the buffers remain resident until the matching
+    // MoE collect while this context keeps only the stable page numbering.
+    struct PhysicalAttentionPageSet {
+        std::vector<Dsv4KvDeviceLease> leases;
+        std::vector<CudaDsv4PhysicalPage> pages;
+        std::unordered_map<std::uint64_t, std::uint32_t> page_indices;
+    };
+
     struct PhysicalAttentionContext {
         Impl* owner{};
         std::uint32_t layer{};
@@ -1992,7 +2018,31 @@ struct DeepSeekV4Runtime::Impl {
         std::uint32_t layer, std::span<const float> queries,
         std::span<const float> sinks, std::uint32_t position,
         std::span<const std::uint32_t> indexed_positions,
-        std::span<float> diagnostic_branch);
+        std::span<float> diagnostic_branch,
+        PhysicalAttentionPageSet* page_set = nullptr);
+    ValidationResult physical_paged_attention_page(
+        std::uint32_t layer, std::span<const float> input,
+        std::span<const float> query_rank, std::span<const float> queries,
+        std::span<const float> sinks, std::uint32_t position_base,
+        std::span<const std::uint32_t> row_slots,
+        std::span<float> diagnostic_branches);
+    ValidationResult attention_append_prepared(
+        std::uint32_t layer, std::span<const float> input,
+        std::span<const float> kv, std::uint32_t position,
+        std::span<const float> compressor_values = {},
+        std::span<const float> compressor_scores = {},
+        std::span<const float> index_compressor_values = {},
+        std::span<const float> index_compressor_scores = {},
+        bool append_index_compressor = false,
+        std::uint64_t sliding_retention_floor =
+            std::numeric_limits<std::uint64_t>::max());
+    ValidationResult attention_attend_prepared(
+        std::uint32_t layer, std::span<const float> input,
+        std::span<const float> query_rank, std::span<const float> queries,
+        std::uint32_t position, std::span<float> output,
+        bool index_compressor_prepared = false,
+        bool device_prepared_source = false,
+        PhysicalAttentionPageSet* page_set = nullptr);
     ValidationResult attention_prepared(
         std::uint32_t layer, std::span<const float> input,
         std::span<const float> query_rank, std::span<const float> queries,
@@ -3177,7 +3227,11 @@ ValidationResult DeepSeekV4Runtime::Impl::index_select(
                 active_sequence, Dsv4KvBlockKind::LearnedIndex, layer,
                 logical_row, slot);
             if (!lease.ok()) {
-                append_errors(result, std::move(lease.errors));
+                append_errors(
+                    result, std::move(lease.errors),
+                    "DeepSeek physical index page lease layer " +
+                        std::to_string(layer) + " logical row " +
+                        std::to_string(logical_row));
                 return result;
             }
             const auto rows = std::min(remaining, block.used_rows);
@@ -3655,7 +3709,8 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
     std::uint32_t layer, std::span<const float> queries,
     std::span<const float> sinks, std::uint32_t position,
     std::span<const std::uint32_t> indexed_positions,
-    std::span<float> diagnostic_branch) {
+    std::span<float> diagnostic_branch,
+    PhysicalAttentionPageSet* page_set) {
     ValidationResult result;
     if (kv_cache == nullptr ||
         config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice) {
@@ -3681,9 +3736,28 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         if (!result.ok()) return result;
     }
 
-    std::vector<Dsv4KvDeviceLease> leases;
-    std::vector<CudaDsv4PhysicalPage> pages;
-    std::unordered_map<std::uint64_t, std::uint32_t> page_indices;
+    std::uint64_t page_set_build_nanoseconds = 0U;
+    const bool builds_page_set =
+        page_set == nullptr || page_set->pages.empty();
+    if (builds_page_set) ++graph_stats.attention_page_set_builds;
+    const auto page_set_setup_started = std::chrono::steady_clock::now();
+    std::vector<Dsv4KvDeviceLease> local_leases;
+    std::vector<CudaDsv4PhysicalPage> local_pages;
+    std::unordered_map<std::uint64_t, std::uint32_t> local_page_indices;
+    auto& leases = page_set != nullptr ? page_set->leases : local_leases;
+    auto& pages = page_set != nullptr ? page_set->pages : local_pages;
+    auto& page_indices = page_set != nullptr
+        ? page_set->page_indices : local_page_indices;
+    if (page_set != nullptr && page_set->pages.empty()) {
+        const auto reserve = sliding.size() + compressed.size();
+        page_set->leases.reserve(reserve);
+        page_set->pages.reserve(reserve);
+        page_set->page_indices.reserve(reserve);
+    }
+    if (builds_page_set) {
+        page_set_build_nanoseconds +=
+            elapsed_nanoseconds(page_set_setup_started);
+    }
     const auto locate = [&](Dsv4KvBlockKind kind,
                             const std::vector<Dsv4KvBlockInfo>& table,
                             std::uint32_t logical_row,
@@ -3698,16 +3772,25 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         const auto begin = found->logical_begin / found->compression_ratio;
         auto page = page_indices.find(found->id);
         if (page == page_indices.end()) {
+            const auto page_build_started = std::chrono::steady_clock::now();
             auto lease = kv_cache->acquire_device(
                 active_sequence, kind, layer, logical_row, slot);
             if (!lease.ok()) {
-                append_errors(result, std::move(lease.errors));
+                append_errors(
+                    result, std::move(lease.errors),
+                    "DeepSeek physical attention page lease layer " +
+                        std::to_string(layer) + " kind " +
+                        std::to_string(static_cast<unsigned>(kind)) +
+                        " logical row " + std::to_string(logical_row));
                 return;
             }
             const auto index = static_cast<std::uint32_t>(pages.size());
             leases.push_back(std::move(lease.value));
             pages.push_back({leases.back().buffer(), found->capacity_rows});
             page = page_indices.emplace(found->id, index).first;
+            ++graph_stats.attention_page_set_pages;
+            page_set_build_nanoseconds +=
+                elapsed_nanoseconds(page_build_started);
         }
         candidate.page = page->second;
         candidate.row = static_cast<std::uint32_t>(logical_row - begin);
@@ -3732,6 +3815,9 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
             "DeepSeek physical attention compressed candidates exceed their fixed region");
         return result;
     }
+    const auto candidate_resolution_started = std::chrono::steady_clock::now();
+    graph_stats.attention_candidate_resolutions +=
+        static_cast<std::uint64_t>(attended_compressed);
     for (std::uint32_t item = 0U; item < attended_compressed; ++item) {
         const auto logical_row = sparse ? indexed_positions[item] : item;
         locate(attention_state[layer].compressor.kind, compressed,
@@ -3739,12 +3825,21 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         if (!result.ok()) return result;
     }
     const auto window_count = std::min(position + 1U, kWindow);
+    graph_stats.attention_candidate_resolutions += window_count;
     for (std::uint32_t item = 0U; item < window_count; ++item) {
         const auto logical_row = position + 1U - window_count + item;
         locate(Dsv4KvBlockKind::Sliding, sliding, logical_row,
                candidates[static_cast<std::size_t>(compressed_width) + item]);
         if (!result.ok()) return result;
     }
+    const auto candidate_resolution_nanoseconds =
+        elapsed_nanoseconds(candidate_resolution_started);
+    graph_stats.attention_page_set_build_nanoseconds +=
+        page_set_build_nanoseconds;
+    graph_stats.attention_candidate_resolution_nanoseconds +=
+        candidate_resolution_nanoseconds > page_set_build_nanoseconds
+            ? candidate_resolution_nanoseconds - page_set_build_nanoseconds
+            : 0U;
 
     const auto prefix = layer_prefix(layer) + "attn.";
     Dsv4WeightCache::Lease output_a;
@@ -3807,37 +3902,257 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
     return result;
 }
 
-ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
+ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
     std::uint32_t layer, std::span<const float> input,
     std::span<const float> query_rank, std::span<const float> queries,
+    std::span<const float> sinks, std::uint32_t position_base,
+    std::span<const std::uint32_t> row_slots,
+    std::span<float> diagnostic_branches) {
+    ValidationResult result;
+    const auto rows64 = input.size() / kHidden;
+    const auto query_stride = static_cast<std::size_t>(kHeads) * kHeadDim;
+    if (kv_cache == nullptr ||
+        config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice ||
+        rows64 < 2U || rows64 > std::numeric_limits<std::uint32_t>::max() ||
+        input.size() != rows64 * kHidden ||
+        query_rank.size() != rows64 * kQueryRank ||
+        queries.size() != rows64 * query_stride ||
+        sinks.size() != kHeads || row_slots.size() != rows64 ||
+        diagnostic_branches.size() != rows64 * kHidden) {
+        result.errors.emplace_back(
+            "DeepSeek physical attention page spans are incompatible");
+        return result;
+    }
+    const auto rows = static_cast<std::uint32_t>(rows64);
+    const auto slot = layer_device(layer);
+    auto& layer_state = attention_state[layer];
+    const auto ratio = layer_state.compressor.ratio;
+    const auto last_position = position_base + rows - 1U;
+
+    auto& sliding = physical_sliding_blocks;
+    auto& compressed = physical_compressed_blocks;
+    result = kv_cache->block_table_into(
+        active_sequence, Dsv4KvBlockKind::Sliding, layer, sliding);
+    if (!result.ok()) return result;
+    compressed.clear();
+    if (ratio != 0U) {
+        result = kv_cache->block_table_into(
+            active_sequence, layer_state.compressor.kind, layer, compressed);
+        if (!result.ok()) return result;
+    }
+
+    ++graph_stats.attention_page_set_builds;
+    const auto page_build_started = std::chrono::steady_clock::now();
+    std::vector<Dsv4KvDeviceLease> leases;
+    std::vector<CudaDsv4PhysicalPage> pages;
+    std::unordered_map<std::uint64_t, std::uint32_t> page_indices;
+    const auto reserve = compressed.size() + sliding.size();
+    leases.reserve(reserve);
+    pages.reserve(reserve);
+    page_indices.reserve(reserve);
+    const auto lease_table = [&](Dsv4KvBlockKind kind,
+                                 const std::vector<Dsv4KvBlockInfo>& table) {
+        for (const auto& block : table) {
+            if (block.compression_ratio == 0U) {
+                result.errors.emplace_back(
+                    "DeepSeek physical attention page has a zero-ratio block");
+                return;
+            }
+            const auto logical_row = static_cast<std::uint32_t>(
+                block.logical_begin / block.compression_ratio);
+            auto lease = kv_cache->acquire_device(
+                active_sequence, kind, layer, logical_row, slot);
+            if (!lease.ok()) {
+                append_errors(result, std::move(lease.errors));
+                return;
+            }
+            const auto page = static_cast<std::uint32_t>(pages.size());
+            leases.push_back(std::move(lease.value));
+            pages.push_back({leases.back().buffer(), block.capacity_rows});
+            page_indices.emplace(block.id, page);
+            ++graph_stats.attention_page_set_pages;
+        }
+    };
+    if (ratio != 0U) lease_table(layer_state.compressor.kind, compressed);
+    if (!result.ok()) return result;
+    lease_table(Dsv4KvBlockKind::Sliding, sliding);
+    if (!result.ok()) return result;
+    graph_stats.attention_page_set_build_nanoseconds +=
+        elapsed_nanoseconds(page_build_started);
+
+    const auto compressed_count = ratio == 0U
+        ? 0U : (last_position + 1U) / ratio;
+    const bool sparse = ratio == 4U &&
+        layer_state.indexer_compressor.ratio == 4U;
+    const auto compressed_width = ratio == 0U ? 0U : ratio == 4U
+        ? kIndexTopK
+        : ((std::max(1U, compressed_count) + 127U) / 128U) * 128U;
+    constexpr std::uint32_t sliding_width = kWindow;
+    const auto candidate_width = compressed_width + sliding_width;
+    std::vector<CudaDsv4AttentionCandidate> candidates(
+        static_cast<std::size_t>(rows) * candidate_width);
+
+    const auto locate = [&](Dsv4KvBlockKind kind,
+                            const std::vector<Dsv4KvBlockInfo>& table,
+                            std::uint32_t logical_row,
+                            CudaDsv4AttentionCandidate& candidate) {
+        const auto located = locate_physical_kv_block(table, logical_row);
+        if (located == table.size()) {
+            result.errors.emplace_back(
+                "DeepSeek physical attention page candidate is unavailable");
+            return;
+        }
+        const auto& block = table[located];
+        const auto found = page_indices.find(block.id);
+        if (found == page_indices.end()) {
+            result.errors.emplace_back(
+                "DeepSeek physical attention page lease is unavailable");
+            return;
+        }
+        const auto begin = block.logical_begin / block.compression_ratio;
+        candidate.page = found->second;
+        candidate.row = static_cast<std::uint32_t>(logical_row - begin);
+        candidate.valid = true;
+        static_cast<void>(kind);
+    };
+
+    const auto candidate_started = std::chrono::steady_clock::now();
+    std::uint64_t selection_nanoseconds = 0U;
+    std::vector<std::uint32_t> selected;
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        const auto position = position_base + row;
+        const auto row_compressed_count = ratio == 0U
+            ? 0U : (position + 1U) / ratio;
+        if (sparse) {
+            const auto selection_started = std::chrono::steady_clock::now();
+            result = index_select(
+                layer,
+                input.subspan(static_cast<std::size_t>(row) * kHidden,
+                              kHidden),
+                query_rank.subspan(
+                    static_cast<std::size_t>(row) * kQueryRank, kQueryRank),
+                position, selected, false);
+            selection_nanoseconds += elapsed_nanoseconds(selection_started);
+            if (!result.ok()) return result;
+        } else {
+            selected.resize(row_compressed_count);
+            std::iota(selected.begin(), selected.end(), 0U);
+        }
+        if (selected.size() > compressed_width) {
+            result.errors.emplace_back(
+                "DeepSeek physical attention page selection exceeds its region");
+            return result;
+        }
+        auto row_candidates = std::span<CudaDsv4AttentionCandidate>(candidates)
+            .subspan(static_cast<std::size_t>(row) * candidate_width,
+                     candidate_width);
+        graph_stats.attention_candidate_resolutions += selected.size();
+        for (std::size_t item = 0U; item < selected.size(); ++item) {
+            locate(layer_state.compressor.kind, compressed, selected[item],
+                   row_candidates[item]);
+            if (!result.ok()) return result;
+        }
+        const auto window_count = std::min(position + 1U, kWindow);
+        graph_stats.attention_candidate_resolutions += window_count;
+        for (std::uint32_t item = 0U; item < window_count; ++item) {
+            const auto logical_row = position + 1U - window_count + item;
+            locate(Dsv4KvBlockKind::Sliding, sliding, logical_row,
+                   row_candidates[compressed_width + item]);
+            if (!result.ok()) return result;
+        }
+    }
+    graph_stats.attention_page_index_selection_nanoseconds +=
+        selection_nanoseconds;
+    graph_stats.attention_candidate_resolution_nanoseconds +=
+        elapsed_nanoseconds(candidate_started) - selection_nanoseconds;
+
+    const auto prefix = layer_prefix(layer) + "attn.";
+    const auto weight_started = std::chrono::steady_clock::now();
+    Dsv4WeightCache::Lease output_a;
+    Dsv4WeightCache::Lease output_b;
+    result = weights->acquire(
+        slot, prefix + "wo_a", kOutputGroups * kOutputRank,
+        kHeads * kHeadDim / kOutputGroups, output_a);
+    if (!result.ok()) return result;
+    result = weights->acquire(
+        slot, prefix + "wo_b", kHidden,
+        kOutputGroups * kOutputRank, output_b);
+    if (!result.ok()) return result;
+    graph_stats.attention_page_weight_acquire_nanoseconds +=
+        elapsed_nanoseconds(weight_started);
+
+    std::vector<float> cosines(static_cast<std::size_t>(rows) * kRopeDim / 2U);
+    std::vector<float> sines(cosines.size());
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        const auto position = position_base + row;
+        for (std::size_t index = 0U; index < kRopeDim / 2U; ++index) {
+            const float angle = static_cast<float>(position) *
+                                layer_state.frequencies[index] * -1.0F;
+            cosines[static_cast<std::size_t>(row) * kRopeDim / 2U + index] =
+                std::cos(angle);
+            sines[static_cast<std::size_t>(row) * kRopeDim / 2U + index] =
+                std::sin(angle);
+        }
+    }
+
+    CudaDsv4PagedAttentionMhcRequest request;
+    request.attention.queries = queries;
+    request.attention.head_sinks = sinks;
+    request.attention.pages = pages;
+    request.attention.candidates = candidates;
+    request.attention.rows = rows;
+    request.attention.candidate_width = candidate_width;
+    request.attention.scale = kAttentionScale;
+    // The 677-row production page requires about 310 MiB. Keeping the hard
+    // limit below 384 MiB prevents bit_ceil from reserving the 512 MiB seen in
+    // experiment 0098 while retaining a strict admission failure above it.
+    request.attention.maximum_workspace_bytes = 384ULL << 20U;
+    request.mhc_slots = row_slots;
+    request.inverse_rope_cosines = cosines;
+    request.inverse_rope_sines = sines;
+    request.output_a = &output_a.weight();
+    request.output_b = &output_b.weight();
+    request.mhc_device = devices[mhc_slot];
+
+    const auto before = cuda.stats();
+    const auto handoff_started = std::chrono::steady_clock::now();
+    result = cuda.dsv4_paged_attention_to_mhc(
+        devices[slot], request, diagnostic_branches);
+    const auto handoff_nanoseconds = elapsed_nanoseconds(handoff_started);
+    const auto after = cuda.stats();
+    const auto sync_nanoseconds = after.synchronization_nanoseconds >=
+            before.synchronization_nanoseconds
+        ? after.synchronization_nanoseconds - before.synchronization_nanoseconds
+        : 0U;
+    graph_stats.attention_page_stream_sync_nanoseconds += sync_nanoseconds;
+    graph_stats.attention_page_branch_handoff_nanoseconds +=
+        handoff_nanoseconds > sync_nanoseconds
+            ? handoff_nanoseconds - sync_nanoseconds : 0U;
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::attention_append_prepared(
+    std::uint32_t layer, std::span<const float> input,
     std::span<const float> kv, std::uint32_t position,
-    std::span<float> output,
     std::span<const float> compressor_values,
     std::span<const float> compressor_scores,
     std::span<const float> index_compressor_values,
     std::span<const float> index_compressor_scores,
-    bool device_prepared_source) {
+    bool append_index_compressor,
+    std::uint64_t sliding_retention_floor) {
     ValidationResult result;
-    if (input.size() != kHidden || query_rank.size() != kQueryRank ||
-        (queries.size() != static_cast<std::size_t>(kHeads) * kHeadDim &&
-         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
-           queries.empty())) ||
-        kv.size() != kHeadDim ||
-        (output.size() != kHidden &&
-         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
-           output.empty()))) {
-        result.errors.emplace_back(
-            "DeepSeek prepared attention spans have incompatible sizes");
+    if (input.size() != kHidden || kv.size() != kHeadDim) {
+        result.errors.emplace_back("DeepSeek prepared attention append spans have incompatible sizes");
         return result;
     }
-    const auto slot = layer_device(layer);
     const auto prefix = layer_prefix(layer) + "attn.";
     auto subphase_started = std::chrono::steady_clock::now();
     auto& layer_state = attention_state[layer];
     if (kv_cache != nullptr) {
         result = kv_cache->append(active_sequence,
                                   Dsv4KvBlockKind::Sliding, layer,
-                                  1U, position, kv);
+                                  1U, position, kv,
+                                  sliding_retention_floor);
         if (!result.ok()) return result;
     } else {
         std::copy(kv.begin(), kv.end(),
@@ -3848,17 +4163,55 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
                         compressor_values, compressor_scores);
     if (!result.ok()) return result;
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
+    if (append_index_compressor && layer_state.indexer_compressor.ratio != 0U) {
+        subphase_started = std::chrono::steady_clock::now();
+        result = compress_state(
+            layer, layer_state.indexer_compressor,
+            layer_prefix(layer) + "attn.indexer.compressor.", input, position,
+            layer_state.frequencies, index_compressor_values,
+            index_compressor_scores);
+        if (!result.ok()) return result;
+        graph_stats.attention_index_nanoseconds +=
+            elapsed_nanoseconds(subphase_started);
+    }
+    return result;
+}
+
+ValidationResult DeepSeekV4Runtime::Impl::attention_attend_prepared(
+    std::uint32_t layer, std::span<const float> input,
+    std::span<const float> query_rank, std::span<const float> queries,
+    std::uint32_t position, std::span<float> output,
+    bool index_compressor_prepared, bool device_prepared_source,
+    PhysicalAttentionPageSet* page_set) {
+    ValidationResult result;
+    if (input.size() != kHidden || query_rank.size() != kQueryRank ||
+        (queries.size() != static_cast<std::size_t>(kHeads) * kHeadDim &&
+         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+           queries.empty())) ||
+        (output.size() != kHidden &&
+         !(config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+           output.empty()))) {
+        result.errors.emplace_back(
+            "DeepSeek prepared attention spans have incompatible sizes");
+        return result;
+    }
+    const auto slot = layer_device(layer);
+    const auto prefix = layer_prefix(layer) + "attn.";
+    auto& layer_state = attention_state[layer];
     std::vector<std::uint32_t> indexed_positions;
     const bool use_sparse_indexer =
         layer_state.compressor.ratio == 4U &&
         layer_state.indexer_compressor.ratio == 4U;
     if (use_sparse_indexer) {
-        subphase_started = std::chrono::steady_clock::now();
-        result = index_positions(layer, input, query_rank, position,
-                                 indexed_positions,
-                                 index_compressor_values,
-                                 index_compressor_scores,
-                                 device_prepared_source);
+        const auto subphase_started = std::chrono::steady_clock::now();
+        if (index_compressor_prepared) {
+            result = index_select(layer, input, query_rank, position,
+                                  indexed_positions, device_prepared_source);
+        } else {
+            result = index_positions(layer, input, query_rank, position,
+                                     indexed_positions, {}, {},
+                                     device_prepared_source);
+        }
         if (!result.ok()) return result;
         graph_stats.attention_index_nanoseconds +=
             elapsed_nanoseconds(subphase_started);
@@ -3908,13 +4261,13 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     const bool use_cuda_attention = should_dispatch_flash_attention_cuda(
         config.enable_flash_attention, score_stride,
         config.flash_attention_minimum_rows);
-    subphase_started = std::chrono::steady_clock::now();
+    auto subphase_started = std::chrono::steady_clock::now();
     if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
         auto cuda_demand = weights->demand();
         ++graph_stats.attention_cuda_dispatches;
         result = physical_paged_attention(
             layer, queries, *sink.value, position, indexed_positions,
-            output);
+            output, page_set);
         if (!result.ok()) return result;
     } else if (use_cuda_attention) {
         auto cuda_demand = weights->demand();
@@ -4101,6 +4454,25 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
     return result;
 }
 
+ValidationResult DeepSeekV4Runtime::Impl::attention_prepared(
+    std::uint32_t layer, std::span<const float> input,
+    std::span<const float> query_rank, std::span<const float> queries,
+    std::span<const float> kv, std::uint32_t position,
+    std::span<float> output,
+    std::span<const float> compressor_values,
+    std::span<const float> compressor_scores,
+    std::span<const float> index_compressor_values,
+    std::span<const float> index_compressor_scores,
+    bool device_prepared_source) {
+    auto result = attention_append_prepared(
+        layer, input, kv, position, compressor_values, compressor_scores,
+        index_compressor_values, index_compressor_scores, true);
+    if (!result.ok()) return result;
+    return attention_attend_prepared(
+        layer, input, query_rank, queries, position, output, true,
+        device_prepared_source);
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     std::uint32_t layer, std::span<const float> input,
     std::uint32_t position_base, std::span<float> output,
@@ -4215,6 +4587,63 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     const auto maximum_score_rows =
         std::min(last_position + 1U, kWindow) +
         (ratio == 0U ? 0U : (last_position + 1U) / ratio);
+    if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+        // A physical KV block rejects mutation while any device lease is
+        // outstanding. Append every row (including both compressor states)
+        // before resolving or leasing a page, then attend the rows in order
+        // against one page-set/map. The candidates remain row-local, so
+        // causality and candidate order are unchanged.
+        PhysicalAttentionPageSet page_set;
+        const auto sliding_retention_floor =
+            position_base + 1U > kWindow
+                ? static_cast<std::uint64_t>(position_base + 1U - kWindow)
+                : 0U;
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto input_row = input.subspan(
+                static_cast<std::size_t>(row) * kHidden, kHidden);
+            const auto kv_row_values = std::span<const float>(kv).subspan(
+                static_cast<std::size_t>(row) * kHeadDim, kHeadDim);
+            result = attention_append_prepared(
+                layer, input_row, kv_row_values,
+                position_base + row, {}, {}, {}, {}, true,
+                sliding_retention_floor);
+            if (!result.ok()) return result;
+        }
+        if (rows > 1U && !row_slots.empty()) {
+            auto sink = host_tensor(prefix + "attn_sink", kHeads);
+            if (!sink.ok()) {
+                append_errors(result, std::move(sink.errors));
+                return result;
+            }
+            subphase_started = std::chrono::steady_clock::now();
+            result = physical_paged_attention_page(
+                layer, input, query_rank, queries, *sink.value,
+                position_base, row_slots, output);
+            graph_stats.attention_score_nanoseconds +=
+                elapsed_nanoseconds(subphase_started);
+            return result;
+        }
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            if (!row_slots.empty()) {
+                result = cuda.dsv4_mhc_select_slot(
+                    devices[mhc_slot], row_slots[row]);
+                if (!result.ok()) return result;
+            }
+            const auto input_row = input.subspan(
+                static_cast<std::size_t>(row) * kHidden, kHidden);
+            const auto query_rank_row = std::span<const float>(query_rank)
+                .subspan(static_cast<std::size_t>(row) * kQueryRank, kQueryRank);
+            const auto queries_row = std::span<const float>(queries).subspan(
+                static_cast<std::size_t>(row) * query_stride, query_stride);
+            auto output_row = output.subspan(
+                static_cast<std::size_t>(row) * kHidden, kHidden);
+            result = attention_attend_prepared(
+                layer, input_row, query_rank_row, queries_row,
+                position_base + row, output_row, true, false, &page_set);
+            if (!result.ok()) return result;
+        }
+        return result;
+    }
     const bool batch_cuda =
         config.kv_cache_mode != Dsv4KvCacheMode::PhysicalDevice &&
         rows > 1U && kv_cache != nullptr &&

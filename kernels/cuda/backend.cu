@@ -3654,19 +3654,24 @@ __device__ __forceinline__ float dsv4_candidate_group_sum(
     return sum;
 }
 
+// Divides by the denominator and stores BF16 in place of writing an FP32
+// accumulator the next kernel would immediately consume. The division, its
+// div.full.f32 form and the BF16 rounding are exactly what dsv4_divide_and_store
+// performed, so the stored values are unchanged; only the 62 MB intermediate
+// region disappears.
 __global__ void dsv4_finish_values(
     const __nv_bfloat16* scores,
     const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* maximums,
-    const __nv_bfloat16* kv, float* values,
+    const __nv_bfloat16* kv, const float* denominators,
+    __nv_bfloat16* attended, std::uint64_t attended_row_stride,
+    std::uint64_t attended_group_offset,
     std::uint32_t candidate_count, std::uint32_t score_width,
     std::uint32_t boundaries) {
     const auto head = blockIdx.x;
     const auto row = blockIdx.z;
     candidates += static_cast<std::uint64_t>(row) * candidate_count;
     maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
-    values += static_cast<std::uint64_t>(row) * kDsv4PagedHeads *
-              kDsv4PagedHeadDim;
     const auto dimension = blockIdx.y * kDsv4PagedDimensionsPerBlock +
                            threadIdx.x;
     __shared__ float weights[kDsv4PagedCandidateBlock];
@@ -3706,8 +3711,16 @@ __global__ void dsv4_finish_values(
             running_value, __fadd_rn(pair02, pair13));
         __syncthreads();
     }
-    values[static_cast<std::uint64_t>(head) * kDsv4PagedHeadDim +
-           dimension] = running_value;
+    float divided;
+    asm("div.full.f32 %0, %1, %2;"
+        : "=f"(divided)
+        : "f"(running_value),
+          "f"(denominators[static_cast<std::uint64_t>(row) *
+                               kDsv4PagedHeads + head]));
+    attended[static_cast<std::uint64_t>(row) * attended_row_stride +
+             attended_group_offset +
+             static_cast<std::uint64_t>(head) * kDsv4PagedHeadDim +
+             dimension] = __float2bfloat16_rn(divided);
 }
 
 __global__ void dsv4_divide_and_store(
@@ -4735,7 +4748,7 @@ bool dsv4_attention_mhc_workspace_layout(
     if (!checked_bytes(rows, kDsv4PagedHeads, sizeof(float), maximum_bytes) ||
         !checked_bytes(rows, kDsv4PagedHeads, sizeof(float),
                        denominator_bytes) ||
-        !checked_bytes(rows, group_elements, sizeof(float), value_bytes) ||
+        !checked_bytes(0U, group_elements, sizeof(float), value_bytes) ||
         !checked_bytes(attended_elements, 1U, sizeof(std::uint16_t),
                        attended_bytes) ||
         !checked_bytes(attended_elements, 1U, sizeof(float), decoded_bytes) ||
@@ -8722,12 +8735,9 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                          0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_maximums,
-        device_kv, device_values, candidates, candidates, boundaries);
-    const auto output_blocks = static_cast<std::uint32_t>(
-        (output_elements + threads - 1U) / threads);
-    dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-        device_values, device_denominators, device_output, output_elements,
-        row_output_elements, row_output_elements, 0U);
+        device_kv, device_denominators, device_output,
+        static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim, 0U,
+        candidates, candidates, boundaries);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch DeepSeek paged attention finish kernels");
@@ -10849,12 +10859,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                              0U, state.stream>>>(
             device_scores, device_pages, device_candidates, device_maximums,
-            device_kv, device_values, candidates, candidates, boundaries);
-        dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-            device_values, device_denominators, device_attended,
-            static_cast<std::uint64_t>(rows) * group_elements,
-            group_elements, attended_row_elements,
-            static_cast<std::uint64_t>(group) * group_elements);
+            device_kv, device_denominators, device_attended,
+            attended_row_elements,
+            static_cast<std::uint64_t>(group) * group_elements,
+            candidates, candidates, boundaries);
     }
     const auto attended_blocks = static_cast<std::uint32_t>(
         (attended_elements + threads - 1U) / threads);

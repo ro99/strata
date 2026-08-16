@@ -1,0 +1,4 @@
+arm page8192-w420
+  page8192-w420: 677 tok  53.79 s  12.6 tok/s
+    attention 22.38  moe 27.15  routed_cpu 0.13  mhc_post 2.74
+    expert H2D 74.4 GB  wait 17.22 s  misses 10512  evictions 7888  max page 676

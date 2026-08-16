@@ -1,0 +1,1 @@
+error: rank-local decode was requested but this build has no NCCL support; rebuild with -DSTRATA_ENABLE_NCCL=ON

@@ -2,6 +2,8 @@
 #include "strata/numerics.hpp"
 
 #include <cublas_v2.h>
+#include <cstdio>
+#include <atomic>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -345,6 +347,65 @@ __global__ void expand_bf16_activation_kernel(
 // reduction exactly as it was: the same block-wide tree over the same terms.
 constexpr std::uint32_t kPlainMatmulRowTile = 16U;
 
+// BF16-activation twin of plain_matmul_kernel for the attention output
+// projection, whose input region is now BF16.
+template <unsigned int Tile>
+__global__ void plain_matmul_kernel_bf16_input(
+    float* output, const __nv_bfloat16* input, const void* weights, int dtype,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
+    const std::uint64_t weight_base = output_row * columns;
+    float sum[Tile];
+    std::uint64_t input_base[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        sum[index] = 0.0F;
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        const std::uint64_t batch_row = tile_begin + local;
+        const std::uint64_t input_row = groups == 0U
+            ? batch_row
+            : batch_row * groups + output_row / rows_per_group;
+        input_base[index] = input_row * columns;
+    }
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float weight = plain_value(weights, dtype, weight_base + column);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            sum[index] = fmaf(
+                __bfloat162float(input[input_base[index] + column]), weight,
+                sum[index]);
+        }
+    }
+    __shared__ float reduction[Tile][32];
+    const auto lane = threadIdx.x & 31U;
+    const auto warp = threadIdx.x >> 5U;
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        float value = sum[index];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffff'ffffU, value, offset);
+        }
+        if (lane == 0U) reduction[index][warp] = value;
+    }
+    __syncthreads();
+    if (threadIdx.x < Tile) {
+        const auto warps = (blockDim.x + 31U) / 32U;
+        float total = 0.0F;
+        for (std::uint32_t index = 0U; index < warps; ++index) {
+            total += reduction[threadIdx.x][index];
+        }
+        if (threadIdx.x < tile_rows) {
+            output[(static_cast<std::uint64_t>(tile_begin) + threadIdx.x) *
+                       rows + output_row] = total;
+        }
+    }
+}
+
 template <std::uint32_t Tile>
 __global__ void plain_matmul_kernel(float* output, const float* input,
                                     const void* weights, int dtype,
@@ -398,6 +459,56 @@ __global__ void plain_matmul_kernel(float* output, const float* input,
 // supplies the expanded form; the native FP8 path below is intentionally not
 // substituted because its unrounded product association is a different
 // fixture contract.
+// Reads a BF16 activation instead of FP32. Used for the attention output
+// projection, whose input is the RoPE-decoded attention result: holding that
+// as BF16 rather than FP32 halves the largest region in the page workspace.
+__global__ void dsv4_rank_bf16_matmul_bf16_input(
+    float* output, const __nv_bfloat16* input, const __nv_bfloat16* weights,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x);
+    const auto batch_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (output_row >= rows || batch_row >= batch) return;
+    const auto input_row = groups == 0U
+        ? batch_row
+        : static_cast<std::uint64_t>(batch_row) * groups +
+              output_row / rows_per_group;
+    const auto input_base = input_row * columns;
+    const auto weight_base = output_row * columns;
+    float low = 0.0F;
+    float high = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += 256U) {
+        low += __bfloat162float(input[input_base + column]) *
+               __bfloat162float(weights[weight_base + column]);
+    }
+    for (std::uint64_t column = threadIdx.x + 128U; column < columns;
+         column += 256U) {
+        high += __bfloat162float(input[input_base + column]) *
+                __bfloat162float(weights[weight_base + column]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        low += __shfl_down_sync(0xffff'ffffU, low, offset);
+        high += __shfl_down_sync(0xffff'ffffU, high, offset);
+    }
+    __shared__ float warps[8];
+    const auto lane = threadIdx.x & 31U;
+    const auto warp = threadIdx.x >> 5U;
+    if (lane == 0U) {
+        warps[warp] = low;
+        warps[warp + 4U] = high;
+    }
+    __syncthreads();
+    float reduced = threadIdx.x < 8U ? warps[lane] : 0.0F;
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        reduced += __shfl_down_sync(0xffff'ffffU, reduced, offset);
+    }
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] =
+            reduced;
+    }
+}
+
 __global__ void dsv4_rank_bf16_matmul(
     float* output, const float* input, const __nv_bfloat16* weights,
     std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
@@ -3746,7 +3857,7 @@ __global__ void dsv4_divide_and_store(
 
 __global__ void dsv4_inverse_rope_decode(
     const __nv_bfloat16* attended, const float* cosines,
-    const float* sines, float* output, std::uint32_t rows,
+    const float* sines, __nv_bfloat16* output, std::uint32_t rows,
     std::uint32_t heads) {
     constexpr std::uint32_t rope = 64U;
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
@@ -3760,7 +3871,7 @@ __global__ void dsv4_inverse_rope_decode(
         index % kDsv4PagedHeadDim);
     const auto row = index / row_elements;
     if (dimension < kDsv4PagedHeadDim - rope) {
-        output[index] = __bfloat162float(attended[index]);
+        output[index] = attended[index];
         return;
     }
     const auto rope_dimension = dimension - (kDsv4PagedHeadDim - rope);
@@ -3773,7 +3884,10 @@ __global__ void dsv4_inverse_rope_decode(
     const float value = (rope_dimension & 1U) == 0U
         ? __fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))
         : __fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine));
-    output[index] = bf16_round(value);
+    // The value was already rounded to BF16 here before being widened into an
+    // FP32 region, so storing BF16 is lossless and halves the largest region
+    // in the page workspace.
+    output[index] = __float2bfloat16_rn(bf16_round(value));
 }
 
 __global__ void dsv4_bf16_to_fp32(
@@ -4751,7 +4865,8 @@ bool dsv4_attention_mhc_workspace_layout(
         !checked_bytes(0U, group_elements, sizeof(float), value_bytes) ||
         !checked_bytes(attended_elements, 1U, sizeof(std::uint16_t),
                        attended_bytes) ||
-        !checked_bytes(attended_elements, 1U, sizeof(float), decoded_bytes) ||
+        !checked_bytes(attended_elements, 1U, sizeof(std::uint16_t),
+                       decoded_bytes) ||
         !checked_bytes(output_rank_elements, 1U, sizeof(float),
                        output_rank_bytes) ||
         !checked_bytes(branch_capacity_elements, 1U, sizeof(float),
@@ -4775,6 +4890,27 @@ bool dsv4_attention_mhc_workspace_layout(
         return false;
     }
     layout.workspace_bytes = cursor;
+    if (const char* trace = std::getenv("STRATA_TRACE_ATTENTION_LAYOUT");
+        trace != nullptr && *trace == '1') {
+        static std::atomic<int> emitted{0};
+        if (emitted.fetch_add(1) < 2) {
+            std::fprintf(
+                stderr,
+                "attention layout rows=%llu flat_rows=%llu candidates=%llu "
+                "total=%.2f MB | kv=%.2f score=%.2f value=%.2f attended=%.2f "
+                "decoded=%.2f output_rank=%.2f branch=%.2f encoded=%.2f "
+                "router=%.2f cand=%.2f query=%.2f\n",
+                (unsigned long long)rows, (unsigned long long)flat_rows,
+                (unsigned long long)candidates, cursor / 1048576.0,
+                layout.kv_bytes / 1048576.0, layout.score_bytes / 1048576.0,
+                value_bytes / 1048576.0, attended_bytes / 1048576.0,
+                decoded_bytes / 1048576.0, output_rank_bytes / 1048576.0,
+                branch_bytes / 1048576.0, encoded_branch_bytes / 1048576.0,
+                router_logits_bytes / 1048576.0,
+                layout.candidate_bytes / 1048576.0,
+                layout.query_bytes / 1048576.0);
+        }
+    }
     return true;
 }
 
@@ -10741,7 +10877,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     auto* device_values = reinterpret_cast<float*>(workspace + value_offset);
     auto* device_attended = reinterpret_cast<__nv_bfloat16*>(
         workspace + attended_offset);
-    auto* device_decoded = reinterpret_cast<float*>(workspace + decoded_offset);
+    auto* device_decoded =
+        reinterpret_cast<__nv_bfloat16*>(workspace + decoded_offset);
     auto* device_output_rank = reinterpret_cast<float*>(
         workspace + output_rank_offset);
     auto* device_branch = reinterpret_cast<float*>(workspace + branch_offset);
@@ -10870,7 +11007,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         device_attended, device_cosines, device_sines, device_decoded,
         rows, total_heads);
     if (request.rank_local) {
-        dsv4_rank_bf16_matmul<<<output_rank_elements, rank_threads, 0U, state.stream>>>(
+        dsv4_rank_bf16_matmul_bf16_input<<<
+            output_rank_elements, rank_threads, 0U, state.stream>>>(
             device_output_rank, device_decoded,
             static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
             1U, a.columns, a.rows, output_groups, 1024U);
@@ -10880,7 +11018,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<unsigned int>(
                 (rows + kPlainMatmulRowTile - 1U) /
                 kPlainMatmulRowTile));
-        plain_matmul_kernel<kPlainMatmulRowTile>
+        plain_matmul_kernel_bf16_input<kPlainMatmulRowTile>
             <<<output_a_grid, threads, 0U, state.stream>>>(
             device_output_rank, device_decoded, output_a->impl_->weights,
             static_cast<int>(a.dtype), rows, a.columns, a.rows,

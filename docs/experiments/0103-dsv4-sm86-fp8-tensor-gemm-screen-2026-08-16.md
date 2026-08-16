@@ -1,7 +1,9 @@
 # Experiment 0103 — DSV4 SM86 FP8 tensor GEMM screen
 
-Status: **performance and traffic mechanism confirmed; numerical no-worse gate
-failed, so no production work was started.** A tile-local E4M3-to-BF16
+Status: **performance and traffic mechanism confirmed; its FP32 numerical
+screen failed, and experiment 0104 subsequently showed that both paths are
+equivalent against the oracle after the actual production BF16 boundary.** No
+production work was started. A tile-local E4M3-to-BF16
 tensor-core tile is 6.50--23.62x faster than the production FP8 kernel at the
 three 677-row shapes, but it is materially worse than the incumbent in maximum
 absolute and RMS oracle error for `wq_a` and `wkv`.

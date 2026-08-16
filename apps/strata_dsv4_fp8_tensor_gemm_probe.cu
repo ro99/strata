@@ -261,18 +261,39 @@ struct ErrorMetrics {
     double rms = 0.0;
 };
 
+struct BoundaryMetrics {
+    ErrorMetrics error;
+    std::uint64_t mismatches = 0U;
+};
+
+struct OracleMetrics {
+    ErrorMetrics fp32;
+    BoundaryMetrics bf16;
+};
+
 struct Measurement {
     Shape shape;
     float current_milliseconds = 0.0F;
     float tensor_milliseconds = 0.0F;
-    ErrorMetrics current_error;
-    ErrorMetrics tensor_error;
+    OracleMetrics current_error;
+    OracleMetrics tensor_error;
     std::uint64_t current_weight_read_bytes = 0U;
     std::uint64_t tensor_weight_read_bytes = 0U;
     std::uint64_t one_read_weight_bytes = 0U;
     std::uint64_t maximum_device_bytes = 0U;
-    bool tensor_no_worse = false;
+    bool tensor_no_worse_fp32 = false;
+    bool tensor_no_worse_bf16 = false;
 };
+
+std::uint16_t float_to_bf16_bits(float value) {
+    const auto bits = std::bit_cast<std::uint32_t>(value);
+    const auto rounded = bits + 0x7FFFU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>(rounded >> 16U);
+}
+
+float bf16_bits_to_float(std::uint16_t bits) {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16U);
+}
 
 std::vector<std::uint64_t> oracle_indices(std::uint64_t elements,
                                           std::uint32_t seed) {
@@ -295,7 +316,7 @@ std::vector<std::uint64_t> oracle_indices(std::uint64_t elements,
     return result;
 }
 
-ErrorMetrics compare_oracle(
+OracleMetrics compare_oracle(
     const Shape& shape, const std::vector<std::uint8_t>& input,
     const std::vector<std::uint8_t>& weights,
     const std::vector<std::uint8_t>& scales,
@@ -303,7 +324,9 @@ ErrorMetrics compare_oracle(
     const std::vector<std::uint64_t>& indices) {
     long double absolute_sum = 0.0;
     long double squared_sum = 0.0;
-    ErrorMetrics result;
+    long double boundary_absolute_sum = 0.0;
+    long double boundary_squared_sum = 0.0;
+    OracleMetrics result;
     const std::uint32_t scale_columns = shape.k / kBlockK;
     for (const auto index : indices) {
         const std::uint32_t row = static_cast<std::uint32_t>(index / shape.n);
@@ -320,15 +343,39 @@ ErrorMetrics compare_oracle(
         }
         const double absolute = std::abs(static_cast<double>(output[index]) - oracle);
         const double relative = absolute / std::max(std::abs(oracle), 1.0e-9);
-        result.maximum_absolute = std::max(result.maximum_absolute, absolute);
-        result.maximum_relative = std::max(result.maximum_relative, relative);
+        result.fp32.maximum_absolute = std::max(
+            result.fp32.maximum_absolute, absolute);
+        result.fp32.maximum_relative = std::max(
+            result.fp32.maximum_relative, relative);
         absolute_sum += absolute;
         squared_sum += absolute * absolute;
+
+        // The runtime carries projection output in FP32 only as an ABI. It
+        // rounds that value to BF16 on-device before any query/KV consumer.
+        // The oracle follows the same FP32-carrier then BF16 boundary.
+        const auto actual_bits = float_to_bf16_bits(output[index]);
+        const auto oracle_bits = float_to_bf16_bits(static_cast<float>(oracle));
+        const double actual_bf16 = bf16_bits_to_float(actual_bits);
+        const double oracle_bf16 = bf16_bits_to_float(oracle_bits);
+        const double boundary_absolute = std::abs(actual_bf16 - oracle_bf16);
+        const double boundary_relative = boundary_absolute /
+            std::max(std::abs(oracle_bf16), 1.0e-9);
+        result.bf16.error.maximum_absolute = std::max(
+            result.bf16.error.maximum_absolute, boundary_absolute);
+        result.bf16.error.maximum_relative = std::max(
+            result.bf16.error.maximum_relative, boundary_relative);
+        boundary_absolute_sum += boundary_absolute;
+        boundary_squared_sum += boundary_absolute * boundary_absolute;
+        if (actual_bits != oracle_bits) ++result.bf16.mismatches;
     }
-    result.mean_absolute = static_cast<double>(
+    result.fp32.mean_absolute = static_cast<double>(
         absolute_sum / static_cast<long double>(indices.size()));
-    result.rms = std::sqrt(static_cast<double>(
+    result.fp32.rms = std::sqrt(static_cast<double>(
         squared_sum / static_cast<long double>(indices.size())));
+    result.bf16.error.mean_absolute = static_cast<double>(
+        boundary_absolute_sum / static_cast<long double>(indices.size()));
+    result.bf16.error.rms = std::sqrt(static_cast<double>(
+        boundary_squared_sum / static_cast<long double>(indices.size())));
     return result;
 }
 
@@ -470,10 +517,19 @@ Measurement run_shape(const Shape& shape, cudaStream_t stream) {
     result.one_read_weight_bytes = weight_elements;
     result.maximum_device_bytes = input_elements * (1U + sizeof(float)) +
         weight_elements + scale_elements + output_elements * sizeof(float);
-    result.tensor_no_worse =
-        result.tensor_error.maximum_absolute <=
-            result.current_error.maximum_absolute &&
-        result.tensor_error.rms <= result.current_error.rms;
+    result.tensor_no_worse_fp32 =
+        result.tensor_error.fp32.maximum_absolute <=
+            result.current_error.fp32.maximum_absolute &&
+        result.tensor_error.fp32.rms <= result.current_error.fp32.rms;
+    result.tensor_no_worse_bf16 =
+        result.tensor_error.bf16.error.maximum_absolute <=
+            result.current_error.bf16.error.maximum_absolute &&
+        result.tensor_error.bf16.error.maximum_relative <=
+            result.current_error.bf16.error.maximum_relative &&
+        result.tensor_error.bf16.error.rms <=
+            result.current_error.bf16.error.rms &&
+        result.tensor_error.bf16.mismatches <=
+            result.current_error.bf16.mismatches;
     return result;
 }
 
@@ -486,6 +542,22 @@ void print_error(const char* prefix, const ErrorMetrics& error) {
               << error.mean_absolute << ",\n"
               << "      \"" << prefix << "_rms_error\": "
               << error.rms << ",\n";
+}
+
+void print_boundary(const char* prefix, const BoundaryMetrics& boundary) {
+    std::cout << "      \"" << prefix << "_bf16_maximum_absolute_error\": "
+              << boundary.error.maximum_absolute << ",\n"
+              << "      \"" << prefix << "_bf16_maximum_relative_error_floor_1e_9\": "
+              << boundary.error.maximum_relative << ",\n"
+              << "      \"" << prefix << "_bf16_mean_absolute_error\": "
+              << boundary.error.mean_absolute << ",\n"
+              << "      \"" << prefix << "_bf16_rms_error\": "
+              << boundary.error.rms << ",\n"
+              << "      \"" << prefix << "_bf16_mismatches\": "
+              << boundary.mismatches << ",\n"
+              << "      \"" << prefix << "_bf16_mismatch_rate\": "
+              << static_cast<double>(boundary.mismatches) / kOracleSamples
+              << ",\n";
 }
 
 void print_measurement(const Measurement& value, bool final) {
@@ -518,10 +590,14 @@ void print_measurement(const Measurement& value, bool final) {
               << value.tensor_weight_read_bytes << ",\n"
               << "      \"one_read_weight_bytes\": "
               << value.one_read_weight_bytes << ",\n";
-    print_error("current", value.current_error);
-    print_error("tensor", value.tensor_error);
-    std::cout << "      \"tensor_no_worse_max_and_rms\": "
-              << (value.tensor_no_worse ? "true" : "false") << ",\n"
+    print_error("current", value.current_error.fp32);
+    print_error("tensor", value.tensor_error.fp32);
+    print_boundary("current", value.current_error.bf16);
+    print_boundary("tensor", value.tensor_error.bf16);
+    std::cout << "      \"tensor_no_worse_fp32_max_and_rms\": "
+              << (value.tensor_no_worse_fp32 ? "true" : "false") << ",\n"
+              << "      \"tensor_no_worse_bf16_all_metrics\": "
+              << (value.tensor_no_worse_bf16 ? "true" : "false") << ",\n"
               << "      \"oracle_samples\": " << kOracleSamples << ",\n"
               << "      \"maximum_device_bytes\": "
               << value.maximum_device_bytes << "\n"

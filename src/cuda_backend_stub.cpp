@@ -96,7 +96,8 @@ ValidationResult CudaBackend::download_buffer(
 }
 
 ValidationResult CudaBackend::matmul(const CudaWeight&, std::span<const float>,
-                                     std::uint32_t, std::span<float>) {
+                                     std::uint32_t, std::span<float>, bool,
+                                     CudaMatmulProfile*) {
     return {{"CUDA support was not compiled into this build"}};
 }
 
@@ -326,7 +327,8 @@ ValidationResult CudaBackend::collect_moe(
 
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight&, std::span<const float>, std::uint32_t,
-    std::uint32_t, std::uint64_t, std::span<float>, float) {
+    std::uint32_t, std::uint64_t, std::span<float>, float, bool,
+    CudaMatmulProfile*) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

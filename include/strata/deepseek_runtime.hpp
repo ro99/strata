@@ -164,6 +164,31 @@ struct Dsv4GraphStats {
     std::uint64_t attention_nanoseconds{};
     std::uint64_t attention_query_nanoseconds{};
     std::uint64_t attention_kv_nanoseconds{};
+    // Projection-specific wall attribution for page prefill. Matmul device
+    // intervals are nested inside the synchronization wait; host RMS/RoPE
+    // work is measured separately from that wait.
+    std::uint64_t attention_query_allocation_nanoseconds{};
+    std::uint64_t attention_query_weight_acquisition_nanoseconds{};
+    std::uint64_t attention_query_matmul_issue_nanoseconds{};
+    std::uint64_t attention_query_matmul_finish_nanoseconds{};
+    std::uint64_t attention_query_matmul_sync_nanoseconds{};
+    std::uint64_t attention_query_matmul_h2d_nanoseconds{};
+    std::uint64_t attention_query_matmul_kernel_nanoseconds{};
+    std::uint64_t attention_query_matmul_d2h_nanoseconds{};
+    std::uint64_t attention_query_rank_norm_nanoseconds{};
+    std::uint64_t attention_query_finish_nanoseconds{};
+    std::uint64_t attention_query_rms_cpu_nanoseconds{};
+    std::uint64_t attention_query_rope_cpu_nanoseconds{};
+    std::uint64_t attention_kv_allocation_nanoseconds{};
+    std::uint64_t attention_kv_weight_acquisition_nanoseconds{};
+    std::uint64_t attention_kv_matmul_issue_nanoseconds{};
+    std::uint64_t attention_kv_matmul_finish_nanoseconds{};
+    std::uint64_t attention_kv_matmul_sync_nanoseconds{};
+    std::uint64_t attention_kv_matmul_h2d_nanoseconds{};
+    std::uint64_t attention_kv_matmul_kernel_nanoseconds{};
+    std::uint64_t attention_kv_matmul_d2h_nanoseconds{};
+    std::uint64_t attention_kv_norm_nanoseconds{};
+    std::uint64_t attention_kv_rope_nanoseconds{};
     std::uint64_t attention_projection_matmul_calls{};
     std::uint64_t attention_projection_matmul_rows{};
     std::uint64_t attention_index_nanoseconds{};

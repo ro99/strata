@@ -341,6 +341,30 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << ",\"synchronization_calls\":" << stats.synchronization_calls
            << ",\"critical_path_synchronization_seconds\":"
            << static_cast<double>(stats.synchronization_nanoseconds) / 1.0e9
+           << ",\"weight_synchronization_calls\":"
+           << stats.weight_synchronization.calls
+           << ",\"critical_path_weight_synchronization_seconds\":"
+           << static_cast<double>(stats.weight_synchronization.nanoseconds) / 1.0e9
+           << ",\"attention_synchronization_calls\":"
+           << stats.attention_synchronization.calls
+           << ",\"critical_path_attention_synchronization_seconds\":"
+           << static_cast<double>(stats.attention_synchronization.nanoseconds) / 1.0e9
+           << ",\"projection_synchronization_calls\":"
+           << stats.projection_synchronization.calls
+           << ",\"critical_path_projection_synchronization_seconds\":"
+           << static_cast<double>(stats.projection_synchronization.nanoseconds) / 1.0e9
+           << ",\"mhc_synchronization_calls\":"
+           << stats.mhc_synchronization.calls
+           << ",\"critical_path_mhc_synchronization_seconds\":"
+           << static_cast<double>(stats.mhc_synchronization.nanoseconds) / 1.0e9
+           << ",\"moe_synchronization_calls\":"
+           << stats.moe_synchronization.calls
+           << ",\"critical_path_moe_synchronization_seconds\":"
+           << static_cast<double>(stats.moe_synchronization.nanoseconds) / 1.0e9
+           << ",\"other_synchronization_calls\":"
+           << stats.other_synchronization.calls
+           << ",\"critical_path_other_synchronization_seconds\":"
+           << static_cast<double>(stats.other_synchronization.nanoseconds) / 1.0e9
            << ",\"critical_path_upload_wait_seconds\":"
            << static_cast<double>(stats.upload_wait_nanoseconds) / 1.0e9
            << ",\"critical_path_activation_h2d_seconds\":"
@@ -437,6 +461,12 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.dsv4_mhc_d2h_nanoseconds) / 1.0e9
            << ",\"maximum_device_dsv4_mhc_seconds\":"
            << static_cast<double>(stats.dsv4_mhc_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_device_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_device_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_host_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_host_nanoseconds) / 1.0e9
+           << ",\"dsv4_mhc_timing_clamped_samples\":"
+           << stats.dsv4_mhc_timing_clamped_samples
            << ",\"lightning_index_calls\":" << stats.lightning_index_calls
            << ",\"lightning_index_kernel_launches\":"
            << stats.lightning_index_kernel_launches
@@ -474,6 +504,30 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"synchronization_calls\":" << device.synchronization_calls
                << ",\"synchronization_seconds\":"
                << static_cast<double>(device.synchronization_nanoseconds) / 1.0e9
+               << ",\"weight_synchronization_calls\":"
+               << device.weight_synchronization.calls
+               << ",\"weight_synchronization_seconds\":"
+               << static_cast<double>(device.weight_synchronization.nanoseconds) / 1.0e9
+               << ",\"attention_synchronization_calls\":"
+               << device.attention_synchronization.calls
+               << ",\"attention_synchronization_seconds\":"
+               << static_cast<double>(device.attention_synchronization.nanoseconds) / 1.0e9
+               << ",\"projection_synchronization_calls\":"
+               << device.projection_synchronization.calls
+               << ",\"projection_synchronization_seconds\":"
+               << static_cast<double>(device.projection_synchronization.nanoseconds) / 1.0e9
+               << ",\"mhc_synchronization_calls\":"
+               << device.mhc_synchronization.calls
+               << ",\"mhc_synchronization_seconds\":"
+               << static_cast<double>(device.mhc_synchronization.nanoseconds) / 1.0e9
+               << ",\"moe_synchronization_calls\":"
+               << device.moe_synchronization.calls
+               << ",\"moe_synchronization_seconds\":"
+               << static_cast<double>(device.moe_synchronization.nanoseconds) / 1.0e9
+               << ",\"other_synchronization_calls\":"
+               << device.other_synchronization.calls
+               << ",\"other_synchronization_seconds\":"
+               << static_cast<double>(device.other_synchronization.nanoseconds) / 1.0e9
                << ",\"upload_wait_seconds\":"
                << static_cast<double>(device.upload_wait_nanoseconds) / 1.0e9
                << ",\"matmul_issue_seconds\":"
@@ -580,6 +634,12 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.dsv4_mhc_d2h_nanoseconds) / 1.0e9
                << ",\"dsv4_mhc_seconds\":"
                << static_cast<double>(device.dsv4_mhc_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_device_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_device_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_host_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_host_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_timing_clamped_samples\":"
+               << device.dsv4_mhc_timing_clamped_samples
                << ",\"lightning_index_calls\":"
                << device.lightning_index_calls
                << ",\"lightning_index_kernel_launches\":"
@@ -724,6 +784,50 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.attention_query_nanoseconds)
            << ",\"attention_kv_seconds\":"
            << seconds(stats.attention_kv_nanoseconds)
+           << ",\"attention_query_allocation_seconds\":"
+           << seconds(stats.attention_query_allocation_nanoseconds)
+           << ",\"attention_query_weight_acquisition_seconds\":"
+           << seconds(stats.attention_query_weight_acquisition_nanoseconds)
+           << ",\"attention_query_matmul_issue_seconds\":"
+           << seconds(stats.attention_query_matmul_issue_nanoseconds)
+           << ",\"attention_query_matmul_finish_seconds\":"
+           << seconds(stats.attention_query_matmul_finish_nanoseconds)
+           << ",\"attention_query_matmul_sync_seconds\":"
+           << seconds(stats.attention_query_matmul_sync_nanoseconds)
+           << ",\"attention_query_matmul_h2d_seconds\":"
+           << seconds(stats.attention_query_matmul_h2d_nanoseconds)
+           << ",\"attention_query_matmul_kernel_seconds\":"
+           << seconds(stats.attention_query_matmul_kernel_nanoseconds)
+           << ",\"attention_query_matmul_d2h_seconds\":"
+           << seconds(stats.attention_query_matmul_d2h_nanoseconds)
+           << ",\"attention_query_rank_norm_seconds\":"
+           << seconds(stats.attention_query_rank_norm_nanoseconds)
+           << ",\"attention_query_finish_seconds\":"
+           << seconds(stats.attention_query_finish_nanoseconds)
+           << ",\"attention_query_rms_cpu_seconds\":"
+           << seconds(stats.attention_query_rms_cpu_nanoseconds)
+           << ",\"attention_query_rope_cpu_seconds\":"
+           << seconds(stats.attention_query_rope_cpu_nanoseconds)
+           << ",\"attention_kv_allocation_seconds\":"
+           << seconds(stats.attention_kv_allocation_nanoseconds)
+           << ",\"attention_kv_weight_acquisition_seconds\":"
+           << seconds(stats.attention_kv_weight_acquisition_nanoseconds)
+           << ",\"attention_kv_matmul_issue_seconds\":"
+           << seconds(stats.attention_kv_matmul_issue_nanoseconds)
+           << ",\"attention_kv_matmul_finish_seconds\":"
+           << seconds(stats.attention_kv_matmul_finish_nanoseconds)
+           << ",\"attention_kv_matmul_sync_seconds\":"
+           << seconds(stats.attention_kv_matmul_sync_nanoseconds)
+           << ",\"attention_kv_matmul_h2d_seconds\":"
+           << seconds(stats.attention_kv_matmul_h2d_nanoseconds)
+           << ",\"attention_kv_matmul_kernel_seconds\":"
+           << seconds(stats.attention_kv_matmul_kernel_nanoseconds)
+           << ",\"attention_kv_matmul_d2h_seconds\":"
+           << seconds(stats.attention_kv_matmul_d2h_nanoseconds)
+           << ",\"attention_kv_norm_seconds\":"
+           << seconds(stats.attention_kv_norm_nanoseconds)
+           << ",\"attention_kv_rope_seconds\":"
+           << seconds(stats.attention_kv_rope_nanoseconds)
            << ",\"attention_projection_matmul_calls\":"
            << stats.attention_projection_matmul_calls
            << ",\"attention_projection_matmul_rows\":"

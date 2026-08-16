@@ -34,6 +34,56 @@ std::uint64_t elapsed_nanoseconds_since(
             std::chrono::steady_clock::now() - started).count());
 }
 
+enum class SynchronizationSubsystem {
+    Weight,
+    Attention,
+    Projection,
+    Mhc,
+    Moe,
+    Other,
+};
+
+void record_synchronization(CudaBackendStats::Device& stats,
+                            SynchronizationSubsystem subsystem,
+                            std::uint64_t calls,
+                            std::uint64_t nanoseconds) noexcept {
+    stats.synchronization_calls += calls;
+    stats.synchronization_nanoseconds += nanoseconds;
+    CudaSynchronizationStats* target = nullptr;
+    switch (subsystem) {
+        case SynchronizationSubsystem::Weight:
+            target = &stats.weight_synchronization;
+            break;
+        case SynchronizationSubsystem::Attention:
+            target = &stats.attention_synchronization;
+            break;
+        case SynchronizationSubsystem::Projection:
+            target = &stats.projection_synchronization;
+            break;
+        case SynchronizationSubsystem::Mhc:
+            target = &stats.mhc_synchronization;
+            break;
+        case SynchronizationSubsystem::Moe:
+            target = &stats.moe_synchronization;
+            break;
+        case SynchronizationSubsystem::Other:
+            target = &stats.other_synchronization;
+            break;
+    }
+    target->calls += calls;
+    target->nanoseconds += nanoseconds;
+}
+
+std::uint64_t event_milliseconds_to_nanoseconds(
+    float milliseconds, std::uint64_t& clamped_samples) noexcept {
+    if (!std::isfinite(milliseconds) || milliseconds < 0.0F) {
+        ++clamped_samples;
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(std::llround(
+        static_cast<double>(milliseconds) * 1.0e6));
+}
+
 ValidationResult cuda_error(cudaError_t status, const char* operation) {
     ValidationResult result;
     if (status != cudaSuccess) {
@@ -5476,8 +5526,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         if (allocation_calls != 0U) {
             device_stats.weight_allocation_bytes += payload_bytes;
         }
-        device_stats.synchronization_calls += synchronizations;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(device_stats, SynchronizationSubsystem::Weight,
+                               synchronizations, wait_nanoseconds);
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
         device_stats.weight_allocation_nanoseconds += allocation_nanoseconds;
         device_stats.weight_copy_nanoseconds += copy_nanoseconds;
@@ -5525,8 +5575,8 @@ ValidationResult CudaBackend::synchronize_uploads(int device) {
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(device_stats, SynchronizationSubsystem::Weight,
+                               1U, wait_nanoseconds);
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
     }
     return result;
@@ -5583,8 +5633,8 @@ ValidationResult CudaBackend::upload_buffer(
         stats.activation_h2d_nanoseconds += wait_nanoseconds;
         ++stats.workspace_allocation_calls;
         stats.workspace_allocation_bytes += bytes.size();
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
+                               wait_nanoseconds);
     }
     output.impl_ = std::move(target);
     return result;
@@ -6153,8 +6203,8 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         stats.matmul_calls += matmul_calls;
         stats.flash_attention_calls += layers.size();
         stats.flash_attention_kernel_launches += layers.size();
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
+                               wait_nanoseconds);
     }
     if (numerical_error != 0U) {
         result.errors.emplace_back("Gemma 4 CUDA decode produced a non-finite value");
@@ -6166,9 +6216,10 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::span<const float> input,
                                      std::uint32_t rows,
                                      std::span<float> output,
-                                     bool round_bf16_output) {
+                                     bool round_bf16_output,
+                                     CudaMatmulProfile* profile) {
     return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F,
-                       round_bf16_output);
+                       round_bf16_output, profile);
 }
 
 ValidationResult CudaBackend::matmul_softcap(
@@ -6582,8 +6633,8 @@ ValidationResult CudaBackend::lightning_index(
         stats.activation_d2h_bytes += output_bytes + sizeof(host_error);
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -7420,8 +7471,8 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
         stats.activation_d2h_bytes += output_bytes + sizeof(host_error);
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -7892,8 +7943,8 @@ ValidationResult CudaBackend::flash_attention(
         stats.flash_attention_nanoseconds += operation_nanoseconds;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
     }
     if (numerical_error != 0U) {
         result.errors.emplace_back(
@@ -8375,8 +8426,8 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -9467,6 +9518,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     std::uint64_t d2h_nanoseconds = 0U;
     std::uint64_t mhc_transition_nanoseconds = 0U;
     std::uint64_t mhc_transition_d2h_nanoseconds = 0U;
+    std::uint64_t mhc_timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -9518,12 +9570,12 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
                         status, "restore attention device after transition timing");
                 }
                 mhc_transition_d2h_nanoseconds =
-                    static_cast<std::uint64_t>(std::llround(
-                        static_cast<double>(mhc_d2h_ms) * 1.0e6));
+                    event_milliseconds_to_nanoseconds(
+                        mhc_d2h_ms, mhc_timing_clamped_samples);
             }
             mhc_transition_nanoseconds =
-                static_cast<std::uint64_t>(std::llround(
-                    static_cast<double>(mhc_ms) * 1.0e6));
+                event_milliseconds_to_nanoseconds(
+                    mhc_ms, mhc_timing_clamped_samples);
         }
         h2d_nanoseconds = static_cast<std::uint64_t>(std::llround(
             static_cast<double>(h2d_ms) * 1.0e6));
@@ -9551,11 +9603,15 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             stats.dsv4_mhc_kernel_nanoseconds +=
                 mhc_transition_nanoseconds;
             stats.dsv4_mhc_nanoseconds += mhc_transition_nanoseconds;
+            stats.dsv4_mhc_device_nanoseconds +=
+                mhc_transition_nanoseconds;
+            stats.dsv4_mhc_timing_clamped_samples +=
+                mhc_timing_clamped_samples;
         }
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention,
+                               1U, wait_nanoseconds);
         if (transition_mhc && request.mhc_device != device) {
             auto& target_stats = *std::find_if(
                 impl_->stats.devices.begin(), impl_->stats.devices.end(),
@@ -9575,6 +9631,11 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             target_stats.dsv4_mhc_nanoseconds +=
                 mhc_transition_nanoseconds +
                 mhc_transition_d2h_nanoseconds;
+            target_stats.dsv4_mhc_device_nanoseconds +=
+                mhc_transition_nanoseconds +
+                mhc_transition_d2h_nanoseconds;
+            target_stats.dsv4_mhc_timing_clamped_samples +=
+                mhc_timing_clamped_samples;
             target_stats.activation_d2h_bytes += layer_bytes;
             target_stats.activation_d2h_nanoseconds +=
                 mhc_transition_d2h_nanoseconds;
@@ -10872,6 +10933,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     std::uint64_t attention_kernel_nanoseconds = 0U;
     std::uint64_t mhc_transition_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t mhc_timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float source_h2d_ms = 0.0F;
         if (auto status = cudaEventElapsedTime(
@@ -10926,8 +10988,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 static_cast<std::uint64_t>(std::llround(
                     static_cast<double>(attention_ms) * 1.0e6));
             mhc_transition_nanoseconds =
-                static_cast<std::uint64_t>(std::llround(
-                    static_cast<double>(mhc_ms) * 1.0e6));
+                event_milliseconds_to_nanoseconds(
+                    mhc_ms, mhc_timing_clamped_samples);
             kernel_nanoseconds = static_cast<std::uint64_t>(std::llround(
                 static_cast<double>(attention_ms + target_kernel_ms) *
                 1.0e6));
@@ -10970,8 +11032,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                     static_cast<std::uint64_t>(std::llround(
                         static_cast<double>(attention_ms) * 1.0e6));
                 mhc_transition_nanoseconds =
-                    static_cast<std::uint64_t>(std::llround(
-                        static_cast<double>(mhc_ms) * 1.0e6));
+                    event_milliseconds_to_nanoseconds(
+                        mhc_ms, mhc_timing_clamped_samples);
             }
             d2h_nanoseconds = static_cast<std::uint64_t>(std::llround(
                 static_cast<double>(d2h_ms) * 1.0e6));
@@ -11017,9 +11079,13 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
             stats.dsv4_mhc_nanoseconds +=
                 mhc_transition_nanoseconds + d2h_nanoseconds;
+            stats.dsv4_mhc_device_nanoseconds +=
+                mhc_transition_nanoseconds + d2h_nanoseconds;
+            stats.dsv4_mhc_timing_clamped_samples +=
+                mhc_timing_clamped_samples;
         }
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention,
+                               1U, wait_nanoseconds);
         if (request.mhc_device != device) {
             auto& target_stats = *std::find_if(
                 impl_->stats.devices.begin(), impl_->stats.devices.end(),
@@ -11127,8 +11193,8 @@ ValidationResult CudaBackend::upload_dsv4_mhc_weights(
         stats.weight_allocation_bytes += auxiliary.size();
         stats.weight_allocation_nanoseconds += allocation_nanoseconds;
         stats.weight_copy_nanoseconds += copy_nanoseconds;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Weight,
+                               1U, wait_nanoseconds);
         stats.upload_wait_nanoseconds += wait_nanoseconds;
         stats.dsv4_mhc_resident_weight_bytes +=
             target->projection.device_bytes() +
@@ -11409,6 +11475,7 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         stats.dsv4_mhc_kernel_launches += 4U;
         stats.dsv4_mhc_h2d_bytes += h2d_bytes;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds += operation_nanoseconds;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
@@ -11465,6 +11532,7 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
     std::uint64_t h2d_nanoseconds = 0U;
     std::uint64_t kernel_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -11479,17 +11547,18 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
                 "measure DeepSeek device mHC begin failed");
             return result;
         }
-        h2d_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
-        kernel_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
-        d2h_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+        h2d_nanoseconds = event_milliseconds_to_nanoseconds(
+            h2d_ms, timing_clamped_samples);
+        kernel_nanoseconds = event_milliseconds_to_nanoseconds(
+            kernel_ms, timing_clamped_samples);
+        d2h_nanoseconds = event_milliseconds_to_nanoseconds(
+            d2h_ms, timing_clamped_samples);
     }
     state.dsv4_mhc_stage = 1U;
     state.dsv4_mhc_residual_index = 0U;
     state.dsv4_mhc_branch_ready = false;
     state.dsv4_mhc_failed = false;
+    const auto call_nanoseconds = elapsed_nanoseconds_since(operation_started);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -11504,6 +11573,12 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         stats.dsv4_mhc_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_device_nanoseconds +=
+            h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_mhc_timing_clamped_samples += timing_clamped_samples;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.activation_d2h_bytes += d2h_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
@@ -11511,8 +11586,8 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Mhc,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -11724,6 +11799,7 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
     std::uint64_t h2d_nanoseconds = 0U;
     std::uint64_t kernel_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -11739,13 +11815,14 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
                 "measure DeepSeek device mHC transition failed");
             return result;
         }
-        h2d_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
-        kernel_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
-        d2h_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+        h2d_nanoseconds = event_milliseconds_to_nanoseconds(
+            h2d_ms, timing_clamped_samples);
+        kernel_nanoseconds = event_milliseconds_to_nanoseconds(
+            kernel_ms, timing_clamped_samples);
+        d2h_nanoseconds = event_milliseconds_to_nanoseconds(
+            d2h_ms, timing_clamped_samples);
     }
+    const auto call_nanoseconds = elapsed_nanoseconds_since(operation_started);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -11760,13 +11837,19 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
         stats.dsv4_mhc_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_device_nanoseconds +=
+            h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_mhc_timing_clamped_samples += timing_clamped_samples;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.activation_d2h_bytes += d2h_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Mhc,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -12248,6 +12331,7 @@ ValidationResult CudaBackend::dsv4_mhc_finish_impl(
     std::uint64_t h2d_nanoseconds = 0U;
     std::uint64_t kernel_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -12262,13 +12346,14 @@ ValidationResult CudaBackend::dsv4_mhc_finish_impl(
                 "measure DeepSeek device mHC finish failed");
             return result;
         }
-        h2d_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
-        kernel_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
-        d2h_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+        h2d_nanoseconds = event_milliseconds_to_nanoseconds(
+            h2d_ms, timing_clamped_samples);
+        kernel_nanoseconds = event_milliseconds_to_nanoseconds(
+            kernel_ms, timing_clamped_samples);
+        d2h_nanoseconds = event_milliseconds_to_nanoseconds(
+            d2h_ms, timing_clamped_samples);
     }
+    const auto call_nanoseconds = elapsed_nanoseconds_since(operation_started);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -12283,13 +12368,19 @@ ValidationResult CudaBackend::dsv4_mhc_finish_impl(
         stats.dsv4_mhc_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_device_nanoseconds +=
+            h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_mhc_timing_clamped_samples += timing_clamped_samples;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.activation_d2h_bytes += d2h_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Mhc,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -12859,8 +12950,8 @@ ValidationResult CudaBackend::glm_absorbed_attention(
         stats.matmul_calls += 2U;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Other,
+                               1U, wait_nanoseconds);
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -12891,8 +12982,9 @@ ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
     std::uint64_t rows_per_group, std::span<float> output, float softcap,
-    bool round_output) {
+    bool round_output, CudaMatmulProfile* profile) {
     ValidationResult result;
+    if (profile != nullptr) *profile = {};
     if (!weight.valid()) {
         result.errors.emplace_back("CUDA matmul received an invalid weight");
         return result;
@@ -13138,7 +13230,11 @@ ValidationResult CudaBackend::matmul_impl(
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA matmul");
     }
-    const auto finish_started = std::chrono::steady_clock::now();
+    const auto synchronized = std::chrono::steady_clock::now();
+    const auto synchronization_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            synchronized - wait_started).count());
+    const auto finish_started = synchronized;
     if (stage_output) {
         std::memcpy(output.data(), state.matmul_host_output,
                     output.size_bytes());
@@ -13175,6 +13271,15 @@ ValidationResult CudaBackend::matmul_impl(
         activation_d2h_nanoseconds = static_cast<std::uint64_t>(
             std::llround(static_cast<double>(d2h_milliseconds) * 1.0e6));
     }
+    const auto finish_nanoseconds = elapsed_nanoseconds_since(finish_started);
+    if (profile != nullptr) {
+        profile->issue_nanoseconds = issue_nanoseconds;
+        profile->finish_nanoseconds = finish_nanoseconds;
+        profile->synchronization_nanoseconds = synchronization_nanoseconds;
+        profile->h2d_nanoseconds = activation_h2d_nanoseconds;
+        profile->kernel_nanoseconds = kernel_nanoseconds;
+        profile->d2h_nanoseconds = activation_d2h_nanoseconds;
+    }
     {
         std::scoped_lock lock(impl_->mutex);
         auto& device_stats = *std::find_if(
@@ -13185,12 +13290,14 @@ ValidationResult CudaBackend::matmul_impl(
         ++device_stats.matmul_calls;
         device_stats.workspace_allocation_calls += workspace_allocation_calls;
         device_stats.workspace_allocation_bytes += workspace_allocation_bytes;
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        // Keep the historical synchronization total stable: it includes the
+        // pinned-output memcpy after cudaStreamSynchronize. The exact stream
+        // wait and post-wait finish are separately exposed in the profile.
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Projection, 1U,
+                               wait_nanoseconds);
         device_stats.matmul_issue_nanoseconds += issue_nanoseconds;
-        device_stats.matmul_finish_nanoseconds += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - finish_started).count());
+        device_stats.matmul_finish_nanoseconds += finish_nanoseconds;
         device_stats.activation_h2d_nanoseconds += activation_h2d_nanoseconds;
         device_stats.kernel_nanoseconds += kernel_nanoseconds;
         device_stats.activation_d2h_nanoseconds += activation_d2h_nanoseconds;
@@ -15613,11 +15720,14 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                     return static_cast<std::uint64_t>(std::llround(
                         static_cast<double>(milliseconds) * 1.0e6));
                 };
+                std::uint64_t mhc_timing_clamped_samples = 0U;
                 const auto h2d_nanoseconds =
                     to_nanoseconds(source_h2d_ms);
                 const auto attention_nanoseconds =
                     to_nanoseconds(attention_ms);
-                const auto mhc_nanoseconds = to_nanoseconds(mhc_ms);
+                const auto mhc_nanoseconds =
+                    event_milliseconds_to_nanoseconds(
+                        mhc_ms, mhc_timing_clamped_samples);
                 const auto kernel_nanoseconds = to_nanoseconds(kernel_ms);
                 const auto d2h_nanoseconds = to_nanoseconds(d2h_ms);
                 std::scoped_lock lock(impl_->mutex);
@@ -15642,6 +15752,10 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                 source_stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
                 source_stats.dsv4_mhc_nanoseconds +=
                     mhc_nanoseconds + d2h_nanoseconds;
+                source_stats.dsv4_mhc_device_nanoseconds +=
+                    mhc_nanoseconds + d2h_nanoseconds;
+                source_stats.dsv4_mhc_timing_clamped_samples +=
+                    mhc_timing_clamped_samples;
             }
         }
         state.dsv4_deferred_attention_source_device = -1;
@@ -15755,8 +15869,9 @@ ValidationResult CudaBackend::collect_deepseek_moe(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
         device_stats.activation_d2h_bytes += downloaded_bytes;
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Moe, 1U,
+                               wait_nanoseconds);
         device_stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         device_stats.kernel_nanoseconds += kernel_nanoseconds;
         device_stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -15975,8 +16090,9 @@ ValidationResult CudaBackend::synchronize(int device) {
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += elapsed;
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Other, 1U,
+                               elapsed);
     }
     return cuda_error(status, "synchronize CUDA device");
 }
@@ -15994,8 +16110,35 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.workspace_allocation_calls += device.workspace_allocation_calls;
         result.workspace_allocation_bytes += device.workspace_allocation_bytes;
         result.synchronization_calls += device.synchronization_calls;
-        result.synchronization_nanoseconds = std::max(
-            result.synchronization_nanoseconds, device.synchronization_nanoseconds);
+        result.weight_synchronization.calls +=
+            device.weight_synchronization.calls;
+        result.attention_synchronization.calls +=
+            device.attention_synchronization.calls;
+        result.projection_synchronization.calls +=
+            device.projection_synchronization.calls;
+        result.mhc_synchronization.calls +=
+            device.mhc_synchronization.calls;
+        result.moe_synchronization.calls +=
+            device.moe_synchronization.calls;
+        result.other_synchronization.calls +=
+            device.other_synchronization.calls;
+        if (device.synchronization_nanoseconds >
+            result.synchronization_nanoseconds) {
+            result.synchronization_nanoseconds =
+                device.synchronization_nanoseconds;
+            result.weight_synchronization.nanoseconds =
+                device.weight_synchronization.nanoseconds;
+            result.attention_synchronization.nanoseconds =
+                device.attention_synchronization.nanoseconds;
+            result.projection_synchronization.nanoseconds =
+                device.projection_synchronization.nanoseconds;
+            result.mhc_synchronization.nanoseconds =
+                device.mhc_synchronization.nanoseconds;
+            result.moe_synchronization.nanoseconds =
+                device.moe_synchronization.nanoseconds;
+            result.other_synchronization.nanoseconds =
+                device.other_synchronization.nanoseconds;
+        }
         result.upload_wait_nanoseconds = std::max(
             result.upload_wait_nanoseconds, device.upload_wait_nanoseconds);
         result.weight_allocation_nanoseconds = std::max(
@@ -16101,6 +16244,14 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.dsv4_mhc_nanoseconds = std::max(
             result.dsv4_mhc_nanoseconds,
             device.dsv4_mhc_nanoseconds);
+        result.dsv4_mhc_device_nanoseconds = std::max(
+            result.dsv4_mhc_device_nanoseconds,
+            device.dsv4_mhc_device_nanoseconds);
+        result.dsv4_mhc_host_nanoseconds = std::max(
+            result.dsv4_mhc_host_nanoseconds,
+            device.dsv4_mhc_host_nanoseconds);
+        result.dsv4_mhc_timing_clamped_samples +=
+            device.dsv4_mhc_timing_clamped_samples;
         result.lightning_index_calls += device.lightning_index_calls;
         result.lightning_index_kernel_launches +=
             device.lightning_index_kernel_launches;

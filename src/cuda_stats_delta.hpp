@@ -21,6 +21,17 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(workspace_allocation_bytes);
     STRATA_CUDA_DEVICE_DELTA(synchronization_calls);
     STRATA_CUDA_DEVICE_DELTA(synchronization_nanoseconds);
+#define STRATA_CUDA_SYNC_DELTA(field)                                      \
+    result.field.calls = after.field.calls - before.field.calls;           \
+    result.field.nanoseconds =                                             \
+        after.field.nanoseconds - before.field.nanoseconds
+    STRATA_CUDA_SYNC_DELTA(weight_synchronization);
+    STRATA_CUDA_SYNC_DELTA(attention_synchronization);
+    STRATA_CUDA_SYNC_DELTA(projection_synchronization);
+    STRATA_CUDA_SYNC_DELTA(mhc_synchronization);
+    STRATA_CUDA_SYNC_DELTA(moe_synchronization);
+    STRATA_CUDA_SYNC_DELTA(other_synchronization);
+#undef STRATA_CUDA_SYNC_DELTA
     STRATA_CUDA_DEVICE_DELTA(matmul_issue_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(matmul_finish_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(upload_wait_nanoseconds);
@@ -74,6 +85,9 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_d2h_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_device_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_host_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_timing_clamped_samples);
     STRATA_CUDA_DEVICE_DELTA(lightning_index_calls);
     STRATA_CUDA_DEVICE_DELTA(lightning_index_kernel_launches);
     STRATA_CUDA_DEVICE_DELTA(lightning_index_candidates);
@@ -104,6 +118,17 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(workspace_allocation_bytes);
     STRATA_CUDA_DELTA(synchronization_calls);
     STRATA_CUDA_DELTA(synchronization_nanoseconds);
+#define STRATA_CUDA_SYNC_DELTA(field)                                      \
+    result.field.calls = after.field.calls - before.field.calls;           \
+    result.field.nanoseconds =                                             \
+        after.field.nanoseconds - before.field.nanoseconds
+    STRATA_CUDA_SYNC_DELTA(weight_synchronization);
+    STRATA_CUDA_SYNC_DELTA(attention_synchronization);
+    STRATA_CUDA_SYNC_DELTA(projection_synchronization);
+    STRATA_CUDA_SYNC_DELTA(mhc_synchronization);
+    STRATA_CUDA_SYNC_DELTA(moe_synchronization);
+    STRATA_CUDA_SYNC_DELTA(other_synchronization);
+#undef STRATA_CUDA_SYNC_DELTA
     STRATA_CUDA_DELTA(matmul_issue_nanoseconds);
     STRATA_CUDA_DELTA(matmul_finish_nanoseconds);
     STRATA_CUDA_DELTA(upload_wait_nanoseconds);
@@ -157,6 +182,9 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(dsv4_mhc_kernel_nanoseconds);
     STRATA_CUDA_DELTA(dsv4_mhc_d2h_nanoseconds);
     STRATA_CUDA_DELTA(dsv4_mhc_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_device_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_host_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_mhc_timing_clamped_samples);
     STRATA_CUDA_DELTA(lightning_index_calls);
     STRATA_CUDA_DELTA(lightning_index_kernel_launches);
     STRATA_CUDA_DELTA(lightning_index_candidates);
@@ -175,6 +203,12 @@ inline void assign_cuda_delta(CudaBackendStats& result,
 
 inline void clear_cuda_critical_path(CudaBackendStats& result) noexcept {
     result.synchronization_nanoseconds = 0U;
+    result.weight_synchronization.nanoseconds = 0U;
+    result.attention_synchronization.nanoseconds = 0U;
+    result.projection_synchronization.nanoseconds = 0U;
+    result.mhc_synchronization.nanoseconds = 0U;
+    result.moe_synchronization.nanoseconds = 0U;
+    result.other_synchronization.nanoseconds = 0U;
     result.upload_wait_nanoseconds = 0U;
     result.weight_allocation_nanoseconds = 0U;
     result.weight_copy_nanoseconds = 0U;
@@ -197,12 +231,28 @@ inline void clear_cuda_critical_path(CudaBackendStats& result) noexcept {
     result.dsv4_mhc_kernel_nanoseconds = 0U;
     result.dsv4_mhc_d2h_nanoseconds = 0U;
     result.dsv4_mhc_nanoseconds = 0U;
+    result.dsv4_mhc_device_nanoseconds = 0U;
+    result.dsv4_mhc_host_nanoseconds = 0U;
 }
 
 inline void accumulate_cuda_critical_path(CudaBackendStats& result,
                                           const CudaBackendStats::Device& delta) noexcept {
-    result.synchronization_nanoseconds = std::max(
-        result.synchronization_nanoseconds, delta.synchronization_nanoseconds);
+    if (delta.synchronization_nanoseconds >
+        result.synchronization_nanoseconds) {
+        result.synchronization_nanoseconds = delta.synchronization_nanoseconds;
+        result.weight_synchronization.nanoseconds =
+            delta.weight_synchronization.nanoseconds;
+        result.attention_synchronization.nanoseconds =
+            delta.attention_synchronization.nanoseconds;
+        result.projection_synchronization.nanoseconds =
+            delta.projection_synchronization.nanoseconds;
+        result.mhc_synchronization.nanoseconds =
+            delta.mhc_synchronization.nanoseconds;
+        result.moe_synchronization.nanoseconds =
+            delta.moe_synchronization.nanoseconds;
+        result.other_synchronization.nanoseconds =
+            delta.other_synchronization.nanoseconds;
+    }
     result.upload_wait_nanoseconds = std::max(
         result.upload_wait_nanoseconds, delta.upload_wait_nanoseconds);
     result.weight_allocation_nanoseconds = std::max(
@@ -255,6 +305,12 @@ inline void accumulate_cuda_critical_path(CudaBackendStats& result,
     result.dsv4_mhc_nanoseconds = std::max(
         result.dsv4_mhc_nanoseconds,
         delta.dsv4_mhc_nanoseconds);
+    result.dsv4_mhc_device_nanoseconds = std::max(
+        result.dsv4_mhc_device_nanoseconds,
+        delta.dsv4_mhc_device_nanoseconds);
+    result.dsv4_mhc_host_nanoseconds = std::max(
+        result.dsv4_mhc_host_nanoseconds,
+        delta.dsv4_mhc_host_nanoseconds);
 }
 
 inline CudaBackendStats cuda_delta(const CudaBackendStats& after,

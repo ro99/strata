@@ -1001,9 +1001,12 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
 
     const std::array<float, 4> input{1.0F, 2.0F, 3.0F, 4.0F};
     std::array<float, 2> output{};
-    REQUIRE(backend.matmul(weight, input, 1U, output).ok());
+    strata::CudaMatmulProfile profile;
+    REQUIRE(backend.matmul(weight, input, 1U, output, false, &profile).ok());
     REQUIRE(output[0] == -60.0F);
     REQUIRE(output[1] == 10.0F);
+    REQUIRE(profile.synchronization_nanoseconds > 0U);
+    REQUIRE(profile.kernel_nanoseconds > 0U);
     const auto first_stats = backend.stats();
     REQUIRE(first_stats.matmul_calls == 1U);
     REQUIRE(first_stats.weight_upload_bytes == 12U);
@@ -1015,6 +1018,23 @@ TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when avai
     REQUIRE(first_stats.devices.size() == 1U);
     REQUIRE(first_stats.devices[0].device == devices.front());
     REQUIRE(first_stats.devices[0].kernel_nanoseconds > 0U);
+    const auto& first_device = first_stats.devices[0];
+    REQUIRE(first_device.synchronization_calls ==
+            first_device.weight_synchronization.calls +
+                first_device.attention_synchronization.calls +
+                first_device.projection_synchronization.calls +
+                first_device.mhc_synchronization.calls +
+                first_device.moe_synchronization.calls +
+                first_device.other_synchronization.calls);
+    REQUIRE(first_device.synchronization_nanoseconds ==
+            first_device.weight_synchronization.nanoseconds +
+                first_device.attention_synchronization.nanoseconds +
+                first_device.projection_synchronization.nanoseconds +
+                first_device.mhc_synchronization.nanoseconds +
+                first_device.moe_synchronization.nanoseconds +
+                first_device.other_synchronization.nanoseconds);
+    REQUIRE(first_device.weight_synchronization.calls == 1U);
+    REQUIRE(first_device.projection_synchronization.calls == 1U);
 
     std::array<std::byte, 8> plain{};
     const std::array<float, 4> plain_values{1.0F, 2.0F, 3.0F, 4.0F};
@@ -2249,6 +2269,16 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
             49'152U);
     REQUIRE(after.dsv4_mhc_d2h_bytes - before.dsv4_mhc_d2h_bytes ==
             98'304U);
+    REQUIRE(after.dsv4_mhc_kernel_nanoseconds -
+                before.dsv4_mhc_kernel_nanoseconds < 60'000'000'000U);
+    REQUIRE(after.dsv4_mhc_device_nanoseconds -
+                before.dsv4_mhc_device_nanoseconds > 0U);
+    REQUIRE(after.dsv4_mhc_device_nanoseconds -
+                before.dsv4_mhc_device_nanoseconds < 60'000'000'000U);
+    REQUIRE(after.dsv4_mhc_host_nanoseconds -
+                before.dsv4_mhc_host_nanoseconds > 0U);
+    REQUIRE(after.mhc_synchronization.calls -
+                before.mhc_synchronization.calls == 3U);
 
     const auto production_before = backend.stats();
     REQUIRE(backend.dsv4_mhc_begin(

@@ -50,6 +50,25 @@ struct CudaWeightDescriptor {
     float global_scale{1.0F};
 };
 
+// Host/device attribution for one synchronous generic matmul. Device event
+// intervals are contained inside synchronization_nanoseconds; they are kept
+// separate so a caller can identify what the wait contained without double
+// counting it as additional wall time.
+struct CudaMatmulProfile {
+    std::uint64_t weight_acquisition_nanoseconds{};
+    std::uint64_t issue_nanoseconds{};
+    std::uint64_t finish_nanoseconds{};
+    std::uint64_t synchronization_nanoseconds{};
+    std::uint64_t h2d_nanoseconds{};
+    std::uint64_t kernel_nanoseconds{};
+    std::uint64_t d2h_nanoseconds{};
+};
+
+struct CudaSynchronizationStats {
+    std::uint64_t calls{};
+    std::uint64_t nanoseconds{};
+};
+
 struct CudaBackendStats {
     // Byte and event totals sum devices. Aggregate durations are the maximum
     // per-device service duration so concurrent device work is not double-counted.
@@ -65,6 +84,14 @@ struct CudaBackendStats {
         std::uint64_t workspace_allocation_bytes{};
         std::uint64_t synchronization_calls{};
         std::uint64_t synchronization_nanoseconds{};
+        // These six categories are exhaustive and non-overlapping. Their sum
+        // must equal the two synchronization totals above on every device.
+        CudaSynchronizationStats weight_synchronization{};
+        CudaSynchronizationStats attention_synchronization{};
+        CudaSynchronizationStats projection_synchronization{};
+        CudaSynchronizationStats mhc_synchronization{};
+        CudaSynchronizationStats moe_synchronization{};
+        CudaSynchronizationStats other_synchronization{};
         // matmul_impl split on the host clock: everything before the stream
         // synchronize, and everything after it. Separates driver submission
         // cost from time genuinely spent waiting on the device.
@@ -129,6 +156,9 @@ struct CudaBackendStats {
         std::uint64_t dsv4_mhc_kernel_nanoseconds{};
         std::uint64_t dsv4_mhc_d2h_nanoseconds{};
         std::uint64_t dsv4_mhc_nanoseconds{};
+        std::uint64_t dsv4_mhc_device_nanoseconds{};
+        std::uint64_t dsv4_mhc_host_nanoseconds{};
+        std::uint64_t dsv4_mhc_timing_clamped_samples{};
         std::uint64_t lightning_index_calls{};
         std::uint64_t lightning_index_kernel_launches{};
         std::uint64_t lightning_index_candidates{};
@@ -154,6 +184,12 @@ struct CudaBackendStats {
     std::uint64_t workspace_allocation_bytes{};
     std::uint64_t synchronization_calls{};
     std::uint64_t synchronization_nanoseconds{};
+    CudaSynchronizationStats weight_synchronization{};
+    CudaSynchronizationStats attention_synchronization{};
+    CudaSynchronizationStats projection_synchronization{};
+    CudaSynchronizationStats mhc_synchronization{};
+    CudaSynchronizationStats moe_synchronization{};
+    CudaSynchronizationStats other_synchronization{};
     std::uint64_t matmul_issue_nanoseconds{};
     std::uint64_t matmul_finish_nanoseconds{};
     std::uint64_t upload_wait_nanoseconds{};
@@ -207,6 +243,9 @@ struct CudaBackendStats {
     std::uint64_t dsv4_mhc_kernel_nanoseconds{};
     std::uint64_t dsv4_mhc_d2h_nanoseconds{};
     std::uint64_t dsv4_mhc_nanoseconds{};
+    std::uint64_t dsv4_mhc_device_nanoseconds{};
+    std::uint64_t dsv4_mhc_host_nanoseconds{};
+    std::uint64_t dsv4_mhc_timing_clamped_samples{};
     std::uint64_t lightning_index_calls{};
     std::uint64_t lightning_index_kernel_launches{};
     std::uint64_t lightning_index_candidates{};
@@ -801,7 +840,8 @@ public:
     [[nodiscard]] ValidationResult matmul(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::span<float> output,
-        bool round_bf16_output = false);
+        bool round_bf16_output = false,
+        CudaMatmulProfile* profile = nullptr);
     [[nodiscard]] ValidationResult matmul_softcap(
         const CudaWeight& weight, std::span<const float> input,
         float softcap, std::span<float> output);
@@ -1082,7 +1122,8 @@ private:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,
         std::uint64_t rows_per_group, std::span<float> output,
-        float softcap, bool round_output = false);
+        float softcap, bool round_output = false,
+        CudaMatmulProfile* profile = nullptr);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -1,9 +1,9 @@
 # Experiment 0100 — DSV4 page projection residency screen
 
-Status: **stopped before implementation because the required source and
-counter audit falsified the dispatch-collapse premise.** No runtime code or
-model arm belongs to this experiment. Experiment 0099 remains preserved at
-`abded32` and is not relitigated or rolled back.
+Status: **re-scoped to attribution after the required source and counter audit
+falsified the original dispatch-collapse premise.** The original mechanism was
+not implemented. Experiment 0099 remains preserved at `abded32` and is not
+relitigated or rolled back.
 
 ## Proposed contract
 
@@ -118,4 +118,53 @@ it no longer targets per-row dispatch collapse.
 Raw evidence is the preserved 0099 JSON under
 `results/dsv4-0099-prepared-selection-gate/candidate.json`, accepted experiment
 0016, rejected experiment 0018, current runtime/backend source, and the local
-Lvllmds4-x checkout. The final `make check` passed 2/2 tests.
+Lvllmds4-x checkout. The pre-implementation `make check` passed 2/2 tests.
+
+## Authorized attribution revision
+
+The user accepted the falsification and authorized continuing experiment 0100
+as measurement only. There is no candidate mechanism and no value gate. The
+deliverable is one untraced 677-token, page-8192 arm that attributes:
+
+- the 10.3379 s query and 3.9079 s KV buckets among batched matmul device
+  execution, host RMS/RoPE, matmul issue, matmul finish and exact stream wait;
+- the prior 143,995 synchronization calls and 10.599 s critical-path recorded
+  synchronization time by attention, projection, mHC, MoE, weight and other
+  subsystems;
+- mHC device, host and synchronization time after preventing a negative CUDA
+  event interval from wrapping to approximately 18.4 billion seconds.
+
+Success requires every counter to be traceable to a source site and no query,
+KV or synchronization residual larger than approximately 1 s to be silently
+distributed. Any larger residual must be reported explicitly and sized.
+Instrumentation must preserve the executed graph and the 384 MiB/device page
+attention workspace ceiling.
+
+The instrumentation adds no commands or stream synchronization. Generic
+matmul reports its existing issue, stream-wait, pinned-output-finish and CUDA
+event intervals to the page caller. Query RMS and RoPE CPU work are timed
+inside the existing per-row worker task; KV norm and RoPE retain their existing
+boundaries. Every existing backend synchronization site is assigned exactly
+one subsystem, and per-device category sums are required to reproduce the
+historical global total.
+
+Source inspection found a necessary reporting distinction: generic matmul's
+historical `synchronization_nanoseconds` stops after the pinned output is copied
+to the caller, so it contains both the true `cudaStreamSynchronize` wait and
+host finish. That historical definition is preserved so the prior 10.599 s can
+be attributed without changing the baseline metric. New projection-specific
+counters separately stop at stream completion and after host finish.
+
+The mHC fix converts only finite, non-negative CUDA event intervals to unsigned
+nanoseconds. Invalid intervals become zero and increment
+`dsv4_mhc_timing_clamped_samples`; they can no longer silently wrap. Direct mHC
+commands additionally report device event time, host-exclusive call time and
+their already-existing synchronization wait.
+
+Arm budget: one untraced 677-token page-8192 arm, approximately four minutes of
+model time, with no baseline, repetition, 2,612-token arm or fixed/marginal fit.
+The arm is not authorized until the build, focused CUDA fixtures, full
+`make check`, experiment-record amendment and instrumentation commit pass.
+
+Instrumentation checkpoint: the focused native CUDA fixture suite passed, and
+the required full `make check` passed 2/2 CTest targets before commit.

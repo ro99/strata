@@ -325,6 +325,50 @@ void apply_rope(std::span<float> values, std::uint64_t position,
         after.attention_nanoseconds - before.attention_nanoseconds,
         after.attention_query_nanoseconds - before.attention_query_nanoseconds,
         after.attention_kv_nanoseconds - before.attention_kv_nanoseconds,
+        after.attention_query_allocation_nanoseconds -
+            before.attention_query_allocation_nanoseconds,
+        after.attention_query_weight_acquisition_nanoseconds -
+            before.attention_query_weight_acquisition_nanoseconds,
+        after.attention_query_matmul_issue_nanoseconds -
+            before.attention_query_matmul_issue_nanoseconds,
+        after.attention_query_matmul_finish_nanoseconds -
+            before.attention_query_matmul_finish_nanoseconds,
+        after.attention_query_matmul_sync_nanoseconds -
+            before.attention_query_matmul_sync_nanoseconds,
+        after.attention_query_matmul_h2d_nanoseconds -
+            before.attention_query_matmul_h2d_nanoseconds,
+        after.attention_query_matmul_kernel_nanoseconds -
+            before.attention_query_matmul_kernel_nanoseconds,
+        after.attention_query_matmul_d2h_nanoseconds -
+            before.attention_query_matmul_d2h_nanoseconds,
+        after.attention_query_rank_norm_nanoseconds -
+            before.attention_query_rank_norm_nanoseconds,
+        after.attention_query_finish_nanoseconds -
+            before.attention_query_finish_nanoseconds,
+        after.attention_query_rms_cpu_nanoseconds -
+            before.attention_query_rms_cpu_nanoseconds,
+        after.attention_query_rope_cpu_nanoseconds -
+            before.attention_query_rope_cpu_nanoseconds,
+        after.attention_kv_allocation_nanoseconds -
+            before.attention_kv_allocation_nanoseconds,
+        after.attention_kv_weight_acquisition_nanoseconds -
+            before.attention_kv_weight_acquisition_nanoseconds,
+        after.attention_kv_matmul_issue_nanoseconds -
+            before.attention_kv_matmul_issue_nanoseconds,
+        after.attention_kv_matmul_finish_nanoseconds -
+            before.attention_kv_matmul_finish_nanoseconds,
+        after.attention_kv_matmul_sync_nanoseconds -
+            before.attention_kv_matmul_sync_nanoseconds,
+        after.attention_kv_matmul_h2d_nanoseconds -
+            before.attention_kv_matmul_h2d_nanoseconds,
+        after.attention_kv_matmul_kernel_nanoseconds -
+            before.attention_kv_matmul_kernel_nanoseconds,
+        after.attention_kv_matmul_d2h_nanoseconds -
+            before.attention_kv_matmul_d2h_nanoseconds,
+        after.attention_kv_norm_nanoseconds -
+            before.attention_kv_norm_nanoseconds,
+        after.attention_kv_rope_nanoseconds -
+            before.attention_kv_rope_nanoseconds,
         after.attention_projection_matmul_calls -
             before.attention_projection_matmul_calls,
         after.attention_projection_matmul_rows -
@@ -753,14 +797,23 @@ public:
                             std::uint64_t output_columns,
                             std::uint64_t input_columns,
                             std::span<const float> input, std::uint32_t rows,
-                            std::span<float> output, bool bf16_output = true) {
+                            std::span<float> output, bool bf16_output = true,
+                            CudaMatmulProfile* profile = nullptr) {
+        const auto acquisition_started = std::chrono::steady_clock::now();
         auto demand_guard = demand();
         Entry* entry = nullptr;
         auto result = ensure(slot, base, output_columns, input_columns,
                              LoadKind::Demand, entry);
         if (!result.ok()) return result;
-        return backend_.matmul(entry->weight, input, rows, output,
-                               bf16_output);
+        const auto acquisition_nanoseconds =
+            elapsed_nanoseconds(acquisition_started);
+        result = backend_.matmul(entry->weight, input, rows, output,
+                                 bf16_output, profile);
+        if (profile != nullptr) {
+            profile->weight_acquisition_nanoseconds =
+                acquisition_nanoseconds;
+        }
+        return result;
     }
 
     ValidationResult grouped(std::size_t slot, std::string_view base,
@@ -1828,9 +1881,10 @@ struct DeepSeekV4Runtime::Impl {
                                  std::span<const float> input,
                                  std::uint32_t rows,
                                  std::span<float> output,
-                                 bool bf16_output = true) {
+                                 bool bf16_output = true,
+                                 CudaMatmulProfile* profile = nullptr) {
         return weights->matmul(slot, base, outputs, inputs, input, rows,
-                               output, bf16_output);
+                               output, bf16_output, profile);
     }
 
     ValidationResult norm(std::span<float> output, std::span<const float> input,
@@ -4492,29 +4546,77 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
 
     const auto slot = layer_device(layer);
     const auto prefix = layer_prefix(layer) + "attn.";
+    const auto add_matmul_profile = [](const CudaMatmulProfile& profile,
+                                       std::uint64_t& weight_acquisition,
+                                       std::uint64_t& issue,
+                                       std::uint64_t& finish,
+                                       std::uint64_t& synchronization,
+                                       std::uint64_t& h2d,
+                                       std::uint64_t& kernel,
+                                       std::uint64_t& d2h) {
+        weight_acquisition += profile.weight_acquisition_nanoseconds;
+        issue += profile.issue_nanoseconds;
+        finish += profile.finish_nanoseconds;
+        synchronization += profile.synchronization_nanoseconds;
+        h2d += profile.h2d_nanoseconds;
+        kernel += profile.kernel_nanoseconds;
+        d2h += profile.d2h_nanoseconds;
+    };
     auto subphase_started = std::chrono::steady_clock::now();
+    auto allocation_started = std::chrono::steady_clock::now();
     std::vector<float> query_rank(row_count * kQueryRank);
+    graph_stats.attention_query_allocation_nanoseconds +=
+        elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
     graph_stats.attention_projection_matmul_rows += rows;
+    CudaMatmulProfile query_a_profile;
     result = linear_rows(slot, prefix + "wq_a", kQueryRank, kHidden, input,
-                         rows, query_rank);
+                         rows, query_rank, true, &query_a_profile);
     if (!result.ok()) return result;
+    add_matmul_profile(
+        query_a_profile,
+        graph_stats.attention_query_weight_acquisition_nanoseconds,
+        graph_stats.attention_query_matmul_issue_nanoseconds,
+        graph_stats.attention_query_matmul_finish_nanoseconds,
+        graph_stats.attention_query_matmul_sync_nanoseconds,
+        graph_stats.attention_query_matmul_h2d_nanoseconds,
+        graph_stats.attention_query_matmul_kernel_nanoseconds,
+        graph_stats.attention_query_matmul_d2h_nanoseconds);
+    const auto query_rank_norm_started = std::chrono::steady_clock::now();
     result = norm_rows(query_rank, query_rank, rows, kQueryRank,
                        prefix + "q_norm.weight");
     if (!result.ok()) return result;
+    graph_stats.attention_query_rank_norm_nanoseconds +=
+        elapsed_nanoseconds(query_rank_norm_started);
 
     const auto query_stride = static_cast<std::size_t>(kHeads) * kHeadDim;
+    allocation_started = std::chrono::steady_clock::now();
     std::vector<float> queries(row_count * query_stride);
+    graph_stats.attention_query_allocation_nanoseconds +=
+        elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
     graph_stats.attention_projection_matmul_rows += rows;
+    CudaMatmulProfile query_b_profile;
     result = linear_rows(slot, prefix + "wq_b", query_stride, kQueryRank,
-                         query_rank, rows, queries);
+                         query_rank, rows, queries, true, &query_b_profile);
     if (!result.ok()) return result;
+    add_matmul_profile(
+        query_b_profile,
+        graph_stats.attention_query_weight_acquisition_nanoseconds,
+        graph_stats.attention_query_matmul_issue_nanoseconds,
+        graph_stats.attention_query_matmul_finish_nanoseconds,
+        graph_stats.attention_query_matmul_sync_nanoseconds,
+        graph_stats.attention_query_matmul_h2d_nanoseconds,
+        graph_stats.attention_query_matmul_kernel_nanoseconds,
+        graph_stats.attention_query_matmul_d2h_nanoseconds);
     // One task per row rather than per (row, head). A head is about 1,500
     // flops, so at 64 heads a page of 677 rows dispatched 1.86 million tasks
     // across 43 layers and spent 11.2 s in pool overhead for work that is
     // nowhere near that size.
+    std::atomic<std::uint64_t> query_rms_cpu_nanoseconds{0U};
+    std::atomic<std::uint64_t> query_rope_cpu_nanoseconds{0U};
     const auto normalize_query_row = [&](std::size_t row) {
+        auto cpu_started = std::chrono::steady_clock::now();
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
             auto query = std::span<float>(queries).subspan(
                 row * query_stride + head * kHeadDim, kHeadDim);
@@ -4525,12 +4627,22 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
             const float reciprocal = 1.0F / std::sqrt(
                 static_cast<float>(square_sum / kHeadDim) + kRmsEpsilon);
             for (auto& value : query) value = round_bf16(value * reciprocal);
+        }
+        query_rms_cpu_nanoseconds.fetch_add(
+            elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
+        cpu_started = std::chrono::steady_clock::now();
+        for (std::uint32_t head = 0U; head < kHeads; ++head) {
+            auto query = std::span<float>(queries).subspan(
+                row * query_stride + head * kHeadDim, kHeadDim);
             apply_rope(query.last(kRopeDim),
                        position_base + static_cast<std::uint32_t>(row),
                        attention_state[layer].frequencies);
             round_bf16(query.last(kRopeDim));
         }
+        query_rope_cpu_nanoseconds.fetch_add(
+            elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
     };
+    const auto query_finish_started = std::chrono::steady_clock::now();
     if (attention_workers != nullptr && row_count > 1U) {
         result = attention_workers->parallel_for(row_count,
                                                  normalize_query_row);
@@ -4540,17 +4652,38 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
             normalize_query_row(row);
         }
     }
+    graph_stats.attention_query_finish_nanoseconds +=
+        elapsed_nanoseconds(query_finish_started);
+    graph_stats.attention_query_rms_cpu_nanoseconds +=
+        query_rms_cpu_nanoseconds.load(std::memory_order_relaxed);
+    graph_stats.attention_query_rope_cpu_nanoseconds +=
+        query_rope_cpu_nanoseconds.load(std::memory_order_relaxed);
     graph_stats.attention_query_nanoseconds += elapsed_nanoseconds(subphase_started);
 
     subphase_started = std::chrono::steady_clock::now();
+    allocation_started = std::chrono::steady_clock::now();
     std::vector<float> kv(row_count * kHeadDim);
+    graph_stats.attention_kv_allocation_nanoseconds +=
+        elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
     graph_stats.attention_projection_matmul_rows += rows;
+    CudaMatmulProfile kv_profile;
     result = linear_rows(slot, prefix + "wkv", kHeadDim, kHidden, input, rows,
-                         kv);
+                         kv, true, &kv_profile);
     if (!result.ok()) return result;
+    add_matmul_profile(
+        kv_profile, graph_stats.attention_kv_weight_acquisition_nanoseconds,
+        graph_stats.attention_kv_matmul_issue_nanoseconds,
+        graph_stats.attention_kv_matmul_finish_nanoseconds,
+        graph_stats.attention_kv_matmul_sync_nanoseconds,
+        graph_stats.attention_kv_matmul_h2d_nanoseconds,
+        graph_stats.attention_kv_matmul_kernel_nanoseconds,
+        graph_stats.attention_kv_matmul_d2h_nanoseconds);
+    const auto kv_norm_started = std::chrono::steady_clock::now();
     result = norm_rows(kv, kv, rows, kHeadDim, prefix + "kv_norm.weight");
     if (!result.ok()) return result;
+    graph_stats.attention_kv_norm_nanoseconds +=
+        elapsed_nanoseconds(kv_norm_started);
     const auto finish_kv = [&](std::size_t row) {
         auto kv_row = std::span<float>(kv).subspan(row * kHeadDim, kHeadDim);
         apply_rope(kv_row.last(kRopeDim),
@@ -4562,12 +4695,15 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
                 kv_row.first(kHeadDim - kRopeDim), 64U);
         }
     };
+    const auto kv_rope_started = std::chrono::steady_clock::now();
     if (attention_workers != nullptr && rows > 1U) {
         result = attention_workers->parallel_for(rows, finish_kv);
         if (!result.ok()) return result;
     } else {
         for (std::uint32_t row = 0U; row < rows; ++row) finish_kv(row);
     }
+    graph_stats.attention_kv_rope_nanoseconds +=
+        elapsed_nanoseconds(kv_rope_started);
     graph_stats.attention_kv_nanoseconds += elapsed_nanoseconds(subphase_started);
 
     auto& layer_state = attention_state[layer];

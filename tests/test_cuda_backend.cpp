@@ -1409,12 +1409,18 @@ TEST_CASE("SM86 DeepSeek FP8 page projections match at the BF16 boundary") {
 
         const auto output_elements =
             static_cast<std::size_t>(rows) * shape.outputs;
-        std::vector<float> incumbent(output_elements);
-        std::vector<float> tensor(output_elements);
+        std::vector<float> incumbent(
+            output_elements, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> tensor(
+            output_elements, std::numeric_limits<float>::quiet_NaN());
         REQUIRE(backend.matmul(weight, input, rows, incumbent, true, nullptr,
                                false).ok());
         REQUIRE(backend.matmul(weight, input, rows, tensor, true, nullptr,
                                true).ok());
+        REQUIRE(std::all_of(incumbent.begin(), incumbent.end(),
+                            [](float value) { return std::isfinite(value); }));
+        REQUIRE(std::all_of(tensor.begin(), tensor.end(),
+                            [](float value) { return std::isfinite(value); }));
         std::uint64_t path_mismatches = 0U;
         for (std::size_t index = 0U; index < output_elements; ++index) {
             if (std::bit_cast<std::uint32_t>(tensor[index]) !=

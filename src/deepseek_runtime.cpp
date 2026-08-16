@@ -1604,6 +1604,23 @@ struct SpeculativeState {
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
+    // Page projections overwrite every output element before returning. Keep
+    // their largest admitted host extents for the runtime lifetime and avoid
+    // std::vector(size), whose value-initialization zeroed hundreds of MiB per
+    // layer before CUDA immediately overwrote it.
+    struct UninitializedFloatScratch {
+        std::span<float> acquire(std::size_t elements) {
+            if (elements > capacity) {
+                data = std::make_unique_for_overwrite<float[]>(elements);
+                capacity = elements;
+            }
+            return {data.get(), elements};
+        }
+
+        std::unique_ptr<float[]> data;
+        std::size_t capacity{};
+    };
+
     // Physical page metadata is shared by every row in one prefill page.
     // Device leases are moved into pending_attention_leases after each
     // successful command, so the buffers remain resident until the matching
@@ -1764,6 +1781,9 @@ struct DeepSeekV4Runtime::Impl {
     // recomputed on the device so the two agree bit for bit.
     std::vector<float> index_rope_cosines;
     std::vector<float> index_rope_sines;
+    UninitializedFloatScratch attention_page_query_rank_scratch;
+    UninitializedFloatScratch attention_page_query_scratch;
+    UninitializedFloatScratch attention_page_kv_scratch;
     std::vector<std::unique_ptr<HostMoeContext>> host_moe_contexts;
     std::uint32_t host_moe_pending{};
     // Page-major prompt execution enqueues the CPU-MoE chain once per row
@@ -4604,7 +4624,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     };
     auto subphase_started = std::chrono::steady_clock::now();
     auto allocation_started = std::chrono::steady_clock::now();
-    std::vector<float> query_rank(row_count * kQueryRank);
+    auto query_rank = attention_page_query_rank_scratch.acquire(
+        row_count * kQueryRank);
     graph_stats.attention_query_allocation_nanoseconds +=
         elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
@@ -4632,7 +4653,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
 
     const auto query_stride = static_cast<std::size_t>(kHeads) * kHeadDim;
     allocation_started = std::chrono::steady_clock::now();
-    std::vector<float> queries(row_count * query_stride);
+    auto queries = attention_page_query_scratch.acquire(
+        row_count * query_stride);
     graph_stats.attention_query_allocation_nanoseconds +=
         elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
@@ -4660,7 +4682,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     const auto normalize_query_row = [&](std::size_t row) {
         auto cpu_started = std::chrono::steady_clock::now();
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            auto query = std::span<float>(queries).subspan(
+            auto query = queries.subspan(
                 row * query_stride + head * kHeadDim, kHeadDim);
             double square_sum = 0.0;
             for (const float value : query) {
@@ -4674,7 +4696,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
             elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
         cpu_started = std::chrono::steady_clock::now();
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            auto query = std::span<float>(queries).subspan(
+            auto query = queries.subspan(
                 row * query_stride + head * kHeadDim, kHeadDim);
             apply_rope(query.last(kRopeDim),
                        position_base + static_cast<std::uint32_t>(row),
@@ -4704,7 +4726,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
 
     subphase_started = std::chrono::steady_clock::now();
     allocation_started = std::chrono::steady_clock::now();
-    std::vector<float> kv(row_count * kHeadDim);
+    auto kv = attention_page_kv_scratch.acquire(row_count * kHeadDim);
     graph_stats.attention_kv_allocation_nanoseconds +=
         elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;

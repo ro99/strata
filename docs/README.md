@@ -25,6 +25,15 @@ benchmark must not be used as evidence of current behavior.
 These files must be updated when a change alters user-visible behavior or makes a
 previous “not implemented” statement false.
 
+## How to run the work
+
+- `orchestrated-experiment-protocol.md` — operating manual for running
+  performance investigations as an orchestrator driving a coding agent in a
+  herdr pane: roles, the executor's standing protocol, gate design, measuring
+  the noise floor before setting thresholds, verifying a claim before acting on
+  it, budgets, and landing rules. Derived from the August 2026 DSV4 prefill
+  session. `../CLAUDE.md` remains the research charter and outranks it.
+
 ## Contracts and plans
 
 - `architecture.md` — target expert-ticket architecture; it is not an

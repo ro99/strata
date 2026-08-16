@@ -3442,6 +3442,70 @@ __global__ void dsv4_materialize_physical_pages(
     }
 }
 
+// Scores only the candidates a row actually attends, instead of every gathered
+// KV row. The dense form computed rows x heads x flat_rows and then discarded
+// all but 640 entries per row, which is both quadratic in context and the
+// reason the score workspace forced sub-chunking. One block owns one row and
+// kDsv4SparseScoreHeads heads; the KV row is staged once in shared and every
+// warp in the block dots its own head against it.
+constexpr std::uint32_t kDsv4SparseScoreHeads = 8U;
+__global__ void dsv4_sparse_scores_kernel(
+    __nv_bfloat16* scores, const __nv_bfloat16* queries,
+    const __nv_bfloat16* kv, const Dsv4DevicePhysicalPage* pages,
+    const Dsv4DeviceAttentionCandidate* candidates,
+    std::uint32_t candidate_count, std::uint32_t group_offset) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t head = blockIdx.y * kDsv4SparseScoreHeads +
+                               (threadIdx.x >> 5U);
+    const std::uint32_t lane = threadIdx.x & 31U;
+    if (head >= kDsv4PagedHeads) return;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(group_offset) +
+         static_cast<std::uint64_t>(row)) *
+            kDsv4PagedHeads * kDsv4PagedHeadDim +
+        static_cast<std::uint64_t>(head) * kDsv4PagedHeadDim;
+    constexpr std::uint32_t kPerLane = kDsv4PagedHeadDim / 32U;
+    float own[kPerLane];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kPerLane; ++index) {
+        own[index] = __bfloat162float(query[lane * kPerLane + index]);
+    }
+    __shared__ __nv_bfloat16 staged[kDsv4PagedHeadDim];
+    auto* base = scores +
+        (static_cast<std::uint64_t>(row) * kDsv4PagedHeads + head) *
+            candidate_count;
+    for (std::uint32_t candidate = 0U; candidate < candidate_count;
+         ++candidate) {
+        const auto descriptor = candidates[candidate];
+        if (descriptor.valid == 0U) {
+            if (lane == 0U) base[candidate] = __float2bfloat16_rn(0.0F);
+            __syncthreads();
+            continue;
+        }
+        const auto flat = static_cast<std::uint64_t>(
+            pages[descriptor.page].flat_begin + descriptor.row);
+        const auto* source = kv + flat * kDsv4PagedHeadDim;
+        for (std::uint32_t index = threadIdx.x; index < kDsv4PagedHeadDim;
+             index += blockDim.x) {
+            staged[index] = source[index];
+        }
+        __syncthreads();
+        float sum = 0.0F;
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kPerLane; ++index) {
+            sum = __fmaf_rn(own[index],
+                            __bfloat162float(staged[lane * kPerLane + index]),
+                            sum);
+        }
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum += __shfl_xor_sync(0xffff'ffffU, sum, offset);
+        }
+        if (lane == 0U) base[candidate] = __float2bfloat16_rn(sum);
+        __syncthreads();
+    }
+}
+
 __global__ void dsv4_scale_scores(__nv_bfloat16* scores,
                                   std::uint64_t count, float scale) {
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
@@ -3481,12 +3545,10 @@ __global__ void dsv4_finish_maximums(
                                threadIdx.x;
         float value = __int_as_float(0xff80'0000);
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
-            const auto descriptor = candidates[candidate];
-            const auto flat = pages[descriptor.page].flat_begin +
-                              descriptor.row;
             value = __bfloat162float(
                 scores[(static_cast<std::uint64_t>(row) *
-                            kDsv4PagedHeads + head) * score_width + flat]);
+                            kDsv4PagedHeads + head) * score_width +
+                       candidate]);
         }
         value = dsv4_warp_max(value);
         if (lane == 0U) warp_maximums[warp] = value;
@@ -3535,12 +3597,10 @@ __global__ void dsv4_finish_denominators(
                                threadIdx.x;
         float weight = 0.0F;
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
-            const auto descriptor = candidates[candidate];
-            const auto flat = pages[descriptor.page].flat_begin +
-                              descriptor.row;
             const auto score = __bfloat162float(
                 scores[(static_cast<std::uint64_t>(row) *
-                            kDsv4PagedHeads + head) * score_width + flat]);
+                            kDsv4PagedHeads + head) * score_width +
+                       candidate]);
             weight = dsv4_triton_exp(score - maximums[head]);
         }
         for (int offset = 16; offset > 0; offset /= 2) {
@@ -3621,11 +3681,10 @@ __global__ void dsv4_finish_values(
                 ? candidates[candidate] : Dsv4DeviceAttentionCandidate{};
             block_candidates[threadIdx.x] = descriptor;
             if (descriptor.valid != 0U) {
-                const auto flat = pages[descriptor.page].flat_begin +
-                                  descriptor.row;
                 const auto score = __bfloat162float(
                     scores[(static_cast<std::uint64_t>(row) *
-                                kDsv4PagedHeads + head) * score_width + flat]);
+                                kDsv4PagedHeads + head) * score_width +
+                           candidate]);
                 weights[threadIdx.x] = dsv4_triton_exp(
                     score - maximums[head]);
             } else {
@@ -4622,7 +4681,7 @@ bool dsv4_attention_mhc_workspace_layout(
         !checked_bytes(flat_rows, kDsv4PagedHeadDim,
                        sizeof(std::uint16_t), layout.kv_bytes) ||
         !checked_bytes(rows,
-                       static_cast<std::uint64_t>(kDsv4PagedHeads) * flat_rows,
+                       static_cast<std::uint64_t>(kDsv4PagedHeads) * candidates,
                        sizeof(std::uint16_t), layout.score_bytes)) {
         return false;
     }
@@ -8632,25 +8691,16 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         return cuda_error(status,
                           "launch DeepSeek physical-page materialization");
     }
-    constexpr float alpha = 1.0F;
-    constexpr float beta = 0.0F;
-    if (auto status = cublasGemmEx(
-            state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-            static_cast<int>(flat_rows),
-            static_cast<int>(rows * kDsv4PagedHeads),
-            static_cast<int>(kDsv4PagedHeadDim), &alpha,
-            device_kv, CUDA_R_16BF,
-            static_cast<int>(kDsv4PagedHeadDim),
-            device_query, CUDA_R_16BF,
-            static_cast<int>(kDsv4PagedHeadDim), &beta,
-            device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        status != CUBLAS_STATUS_SUCCESS) {
-        return cublas_error(status,
-                            "execute DeepSeek paged attention BF16 scores");
+    dsv4_sparse_scores_kernel<<<
+        dim3{rows, kDsv4PagedHeads / kDsv4SparseScoreHeads},
+        kDsv4SparseScoreHeads * 32U, 0U, state.stream>>>(
+        device_scores, device_query, device_kv, device_pages,
+        device_candidates, candidates, 0U);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch DeepSeek sparse attention scores");
     }
     const auto score_elements = static_cast<std::uint64_t>(
-        rows) * kDsv4PagedHeads * flat_rows;
+        rows) * kDsv4PagedHeads * candidates;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
@@ -8659,11 +8709,11 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     dsv4_finish_maximums<<<dim3{kDsv4PagedHeads, rows},
                            kDsv4PagedCandidateBlock, 0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_sink,
-        device_maximums, candidates, flat_rows, boundaries);
+        device_maximums, candidates, candidates, boundaries);
     dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                               kDsv4PagedCandidateBlock, 0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_sink,
-        device_maximums, device_denominators, candidates, flat_rows,
+        device_maximums, device_denominators, candidates, candidates,
         boundaries);
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
@@ -8672,7 +8722,7 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                          0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_maximums,
-        device_kv, device_values, candidates, flat_rows, boundaries);
+        device_kv, device_values, candidates, candidates, boundaries);
     const auto output_blocks = static_cast<std::uint32_t>(
         (output_elements + threads - 1U) / threads);
     dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
@@ -10759,7 +10809,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     constexpr float beta = 0.0F;
     const auto boundaries = candidates / kDsv4PagedCandidateBlock;
     const auto score_elements = static_cast<std::uint64_t>(rows) *
-        kDsv4PagedHeads * flat_rows;
+        kDsv4PagedHeads * candidates;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     const auto output_blocks = static_cast<std::uint32_t>(
@@ -10774,20 +10824,14 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         auto* group_query = device_query +
             static_cast<std::uint64_t>(group) * rows * group_elements;
         auto* group_sink = device_sink + group * kDsv4PagedHeads;
-        if (auto status = cublasGemmEx(
-                state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                static_cast<int>(flat_rows),
-                static_cast<int>(rows * kDsv4PagedHeads),
-                static_cast<int>(kDsv4PagedHeadDim), &alpha,
-                device_kv, CUDA_R_16BF,
-                static_cast<int>(kDsv4PagedHeadDim),
-                group_query, CUDA_R_16BF,
-                static_cast<int>(kDsv4PagedHeadDim), &beta,
-                device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            status != CUBLAS_STATUS_SUCCESS) {
-            return cublas_error(
-                status, "execute attention-to-mHC BF16 scores");
+        dsv4_sparse_scores_kernel<<<
+            dim3{rows, kDsv4PagedHeads / kDsv4SparseScoreHeads},
+            kDsv4SparseScoreHeads * 32U, 0U, state.stream>>>(
+            device_scores, group_query, device_kv, device_pages,
+            device_candidates, candidates, 0U);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(
+                status, "launch attention-to-mHC sparse scores");
         }
         dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
             device_scores, score_elements, request.attention.scale);
@@ -10795,17 +10839,17 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                                kDsv4PagedCandidateBlock, 0U,
                                state.stream>>>(
             device_scores, device_pages, device_candidates, group_sink,
-            device_maximums, candidates, flat_rows, boundaries);
+            device_maximums, candidates, candidates, boundaries);
         dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                                    kDsv4PagedCandidateBlock, 0U,
                                    state.stream>>>(
             device_scores, device_pages, device_candidates, group_sink,
-            device_maximums, device_denominators, candidates, flat_rows,
+            device_maximums, device_denominators, candidates, candidates,
             boundaries);
         dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                              0U, state.stream>>>(
             device_scores, device_pages, device_candidates, device_maximums,
-            device_kv, device_values, candidates, flat_rows, boundaries);
+            device_kv, device_values, candidates, candidates, boundaries);
         dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
             device_values, device_denominators, device_attended,
             static_cast<std::uint64_t>(rows) * group_elements,

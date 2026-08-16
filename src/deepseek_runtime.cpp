@@ -4978,7 +4978,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
         if (!result.ok()) return result;
         result = linear_rows(slot, prefix + "wo_b", kHidden,
                              kOutputGroups * kOutputRank, output_rank,
-                             rows, output);
+                             rows, output, true, nullptr,
+                             config.enable_dsv4_fp8_tensor_page);
         graph_stats.attention_output_nanoseconds +=
             elapsed_nanoseconds(subphase_started);
         return result;
@@ -6041,7 +6042,8 @@ ValidationResult DeepSeekV4Runtime::Impl::moe_page(
     const auto router_started = std::chrono::steady_clock::now();
     std::vector<float> logits(static_cast<std::size_t>(rows) * kExperts);
     result = linear_rows(layer_device(layer), layer_prefix(layer) + "ffn.gate",
-                         kExperts, kHidden, input, rows, logits, false);
+                         kExperts, kHidden, input, rows, logits, false,
+                         nullptr, config.enable_dsv4_fp8_tensor_page);
     if (!result.ok()) return result;
     std::vector<Dsv4Route> routes(rows);
     for (std::uint32_t row = 0U; row < rows; ++row) {

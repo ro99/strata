@@ -4560,6 +4560,10 @@ struct Dsv4AttentionMhcWorkspaceLayout {
     std::uint64_t attended_offset{};
     std::uint64_t decoded_offset{};
     std::uint64_t output_rank_offset{};
+    // Compact E4M3 activation for the SM86 tensor output projection: one
+    // value byte per element plus one E8M0 byte per row/K128 group.
+    std::uint64_t tensor_values_offset{};
+    std::uint64_t tensor_scales_offset{};
     std::uint64_t branch_offset{};
     std::uint64_t encoded_branch_offset{};
     std::uint64_t router_logits_offset{};
@@ -4652,6 +4656,23 @@ bool dsv4_attention_mhc_workspace_layout(
     std::uint64_t output_rank_bytes{};
     std::uint64_t branch_bytes{};
     std::uint64_t encoded_branch_bytes{};
+    // The tensor output projection writes whole 64-row tiles, so the branch
+    // region is sized to the padded row count while branch_elements keeps its
+    // exact meaning for the caller-facing contracts.
+    const auto tensor_padded_rows =
+        (static_cast<std::uint64_t>(rows) + kDsv4Fp8TensorBlockM - 1U) /
+        kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockM;
+    std::uint64_t branch_capacity_elements{};
+    std::uint64_t tensor_values_bytes{};
+    std::uint64_t tensor_scales_bytes{};
+    if (!checked_bytes(tensor_padded_rows, branch_row_elements, 1U,
+                       branch_capacity_elements) ||
+        !checked_bytes(rows, output_rank_row_elements, 1U,
+                       tensor_values_bytes) ||
+        !checked_bytes(rows, output_rank_row_elements / 128U, 1U,
+                       tensor_scales_bytes)) {
+        return false;
+    }
     if (!checked_bytes(rows, kDsv4PagedHeads, sizeof(float), maximum_bytes) ||
         !checked_bytes(rows, kDsv4PagedHeads, sizeof(float),
                        denominator_bytes) ||
@@ -4661,7 +4682,8 @@ bool dsv4_attention_mhc_workspace_layout(
         !checked_bytes(attended_elements, 1U, sizeof(float), decoded_bytes) ||
         !checked_bytes(output_rank_elements, 1U, sizeof(float),
                        output_rank_bytes) ||
-        !checked_bytes(branch_elements, 1U, sizeof(float), branch_bytes) ||
+        !checked_bytes(branch_capacity_elements, 1U, sizeof(float),
+                       branch_bytes) ||
         !checked_bytes(branch_elements, 1U, sizeof(std::uint16_t),
                        encoded_branch_bytes) ||
         !region(layout.kv_bytes, 16U, layout.kv_offset) ||
@@ -4672,6 +4694,8 @@ bool dsv4_attention_mhc_workspace_layout(
         !region(attended_bytes, 16U, layout.attended_offset) ||
         !region(decoded_bytes, 16U, layout.decoded_offset) ||
         !region(output_rank_bytes, 16U, layout.output_rank_offset) ||
+        !region(tensor_values_bytes, 16U, layout.tensor_values_offset) ||
+        !region(tensor_scales_bytes, 16U, layout.tensor_scales_offset) ||
         !region(branch_bytes, 16U, layout.branch_offset) ||
         !region(encoded_branch_bytes, 16U, layout.encoded_branch_offset) ||
         !region(router_logits_bytes, 16U, layout.router_logits_offset) ||
@@ -10432,6 +10456,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const auto attended_offset = layout.attended_offset;
     const auto decoded_offset = layout.decoded_offset;
     const auto output_rank_offset = layout.output_rank_offset;
+    const auto tensor_values_offset = layout.tensor_values_offset;
+    const auto tensor_scales_offset = layout.tensor_scales_offset;
     const auto branch_offset = layout.branch_offset;
     const auto encoded_branch_offset = layout.encoded_branch_offset;
     const auto router_logits_offset = layout.router_logits_offset;
@@ -10814,17 +10840,63 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         device_output_rank, output_rank_elements);
     const dim3 output_rank_quantize_grid(
         static_cast<unsigned int>(output_rank_row_elements / 128U), rows, 1U);
-    quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
-                                      state.stream>>>(
-        device_output_rank, output_rank_row_elements, rows);
     auto* raw_branch_output = request.rank_local
         ? request.rank_local_raw_fp32_reduction : device_branch;
+    // The output projection is the largest remaining native_fp8_matmul_kernel
+    // launch on the page path: its grid is one block per (output row, batch
+    // row), so every batch row re-reads the whole 4096-row weight. Route the
+    // multi-row case through the same SM86 tensor path accepted in experiment
+    // 0105. It writes whole 64-row tiles, so it targets the padded branch
+    // region and the exact rows are copied out when the caller owns the
+    // destination.
+    const bool tensor_output_b =
+        !expanded_output_b && page_request &&
+        state.dsv4_fp8_tensor_page_supported &&
+        b.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
+        b.columns % kDsv4Fp8TensorBlockK == 0U &&
+        b.rows % kDsv4Fp8TensorBlockN == 0U;
     if (expanded_output_b) {
         dsv4_rank_bf16_matmul<<<branch_elements, rank_threads, 0U, state.stream>>>(
             raw_branch_output, device_output_rank,
             static_cast<const __nv_bfloat16*>(output_b->impl_->weights),
             1U, b.columns, b.rows, 0U, 0U);
+    } else if (tensor_output_b) {
+        auto* tensor_values = reinterpret_cast<unsigned char*>(
+            workspace + tensor_values_offset);
+        auto* tensor_scales = reinterpret_cast<unsigned char*>(
+            workspace + tensor_scales_offset);
+        quantize_activation_e4m3_bytes_kernel<<<
+            output_rank_quantize_grid, 128U, 0U, state.stream>>>(
+            tensor_values, tensor_scales, device_output_rank,
+            output_rank_row_elements, rows);
+        const auto tensor_padded_rows =
+            (static_cast<std::uint64_t>(rows) + kDsv4Fp8TensorBlockM - 1U) /
+            kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockM;
+        const dim3 output_b_tensor_grid(
+            static_cast<unsigned int>(b.rows / kDsv4Fp8TensorBlockN),
+            static_cast<unsigned int>(
+                tensor_padded_rows / kDsv4Fp8TensorBlockM), 1U);
+        dsv4_fp8_decode_bf16_tensor_kernel<<<
+            output_b_tensor_grid, threads, 0U, state.stream>>>(
+            device_branch, tensor_values, tensor_scales,
+            static_cast<const unsigned char*>(output_b->impl_->weights),
+            static_cast<const unsigned char*>(output_b->impl_->scales), rows,
+            static_cast<std::uint32_t>(b.columns),
+            static_cast<std::uint32_t>(b.rows));
+        if (raw_branch_output != device_branch) {
+            if (auto status = cudaMemcpyAsync(
+                    raw_branch_output, device_branch,
+                    static_cast<std::size_t>(branch_elements) * sizeof(float),
+                    cudaMemcpyDeviceToDevice, state.stream);
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "copy tensor output projection to its destination");
+            }
+        }
     } else {
+        quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            device_output_rank, output_rank_row_elements, rows);
         native_fp8_matmul_kernel<<<dim3{
             static_cast<unsigned int>(branch_row_elements), rows},
             threads, 0U, state.stream>>>(

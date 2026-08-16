@@ -4181,6 +4181,25 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
         pages, rows, candidate_width, maximum_workspace_bytes);
     if (!admitted.ok()) return {std::move(admitted.errors)};
     const auto maximum_rows = admitted.value;
+    if (const char* trace = std::getenv("STRATA_TRACE_ATTENTION_LAYOUT");
+        trace != nullptr && *trace == '1') {
+        static std::atomic<int> emitted{0};
+        if (emitted.fetch_add(1) < 2) {
+            auto at = [&](std::uint32_t probe) -> std::uint64_t {
+                auto bytes = cuda
+                    .dsv4_paged_attention_to_mhc_page_workspace_bytes(
+                        pages, probe, candidate_width);
+                return bytes.ok() ? bytes.value : 0U;
+            };
+            std::fprintf(stderr,
+                "page admission: requested=%u admitted=%u chunks=%u "
+                "ws(admitted)=%.2f MB ws(requested)=%.2f MB cap=%.2f MB\n",
+                rows, maximum_rows,
+                (rows + maximum_rows - 1U) / maximum_rows,
+                at(maximum_rows) / 1048576.0, at(rows) / 1048576.0,
+                maximum_workspace_bytes / 1048576.0);
+        }
+    }
 
     const auto rope_stride = static_cast<std::size_t>(kRopeDim) / 2U;
     std::uint32_t begin = 0U;
@@ -4978,7 +4997,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
         if (!result.ok()) return result;
         result = linear_rows(slot, prefix + "wo_b", kHidden,
                              kOutputGroups * kOutputRank, output_rank,
-                             rows, output);
+                             rows, output, true, nullptr,
+                             config.enable_dsv4_fp8_tensor_page);
         graph_stats.attention_output_nanoseconds +=
             elapsed_nanoseconds(subphase_started);
         return result;
@@ -6041,7 +6061,8 @@ ValidationResult DeepSeekV4Runtime::Impl::moe_page(
     const auto router_started = std::chrono::steady_clock::now();
     std::vector<float> logits(static_cast<std::size_t>(rows) * kExperts);
     result = linear_rows(layer_device(layer), layer_prefix(layer) + "ffn.gate",
-                         kExperts, kHidden, input, rows, logits, false);
+                         kExperts, kHidden, input, rows, logits, false,
+                         nullptr, config.enable_dsv4_fp8_tensor_page);
     if (!result.ok()) return result;
     std::vector<Dsv4Route> routes(rows);
     for (std::uint32_t row = 0U; row < rows; ++row) {

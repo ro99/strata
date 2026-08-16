@@ -2,6 +2,8 @@
 #include "strata/numerics.hpp"
 
 #include <cublas_v2.h>
+#include <cstdio>
+#include <atomic>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -345,6 +347,65 @@ __global__ void expand_bf16_activation_kernel(
 // reduction exactly as it was: the same block-wide tree over the same terms.
 constexpr std::uint32_t kPlainMatmulRowTile = 16U;
 
+// BF16-activation twin of plain_matmul_kernel for the attention output
+// projection, whose input region is now BF16.
+template <unsigned int Tile>
+__global__ void plain_matmul_kernel_bf16_input(
+    float* output, const __nv_bfloat16* input, const void* weights, int dtype,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
+    const std::uint64_t weight_base = output_row * columns;
+    float sum[Tile];
+    std::uint64_t input_base[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        sum[index] = 0.0F;
+        const std::uint32_t local = index < tile_rows ? index : 0U;
+        const std::uint64_t batch_row = tile_begin + local;
+        const std::uint64_t input_row = groups == 0U
+            ? batch_row
+            : batch_row * groups + output_row / rows_per_group;
+        input_base[index] = input_row * columns;
+    }
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float weight = plain_value(weights, dtype, weight_base + column);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            sum[index] = fmaf(
+                __bfloat162float(input[input_base[index] + column]), weight,
+                sum[index]);
+        }
+    }
+    __shared__ float reduction[Tile][32];
+    const auto lane = threadIdx.x & 31U;
+    const auto warp = threadIdx.x >> 5U;
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        float value = sum[index];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffff'ffffU, value, offset);
+        }
+        if (lane == 0U) reduction[index][warp] = value;
+    }
+    __syncthreads();
+    if (threadIdx.x < Tile) {
+        const auto warps = (blockDim.x + 31U) / 32U;
+        float total = 0.0F;
+        for (std::uint32_t index = 0U; index < warps; ++index) {
+            total += reduction[threadIdx.x][index];
+        }
+        if (threadIdx.x < tile_rows) {
+            output[(static_cast<std::uint64_t>(tile_begin) + threadIdx.x) *
+                       rows + output_row] = total;
+        }
+    }
+}
+
 template <std::uint32_t Tile>
 __global__ void plain_matmul_kernel(float* output, const float* input,
                                     const void* weights, int dtype,
@@ -398,6 +459,56 @@ __global__ void plain_matmul_kernel(float* output, const float* input,
 // supplies the expanded form; the native FP8 path below is intentionally not
 // substituted because its unrounded product association is a different
 // fixture contract.
+// Reads a BF16 activation instead of FP32. Used for the attention output
+// projection, whose input is the RoPE-decoded attention result: holding that
+// as BF16 rather than FP32 halves the largest region in the page workspace.
+__global__ void dsv4_rank_bf16_matmul_bf16_input(
+    float* output, const __nv_bfloat16* input, const __nv_bfloat16* weights,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x);
+    const auto batch_row = static_cast<std::uint32_t>(blockIdx.y);
+    if (output_row >= rows || batch_row >= batch) return;
+    const auto input_row = groups == 0U
+        ? batch_row
+        : static_cast<std::uint64_t>(batch_row) * groups +
+              output_row / rows_per_group;
+    const auto input_base = input_row * columns;
+    const auto weight_base = output_row * columns;
+    float low = 0.0F;
+    float high = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += 256U) {
+        low += __bfloat162float(input[input_base + column]) *
+               __bfloat162float(weights[weight_base + column]);
+    }
+    for (std::uint64_t column = threadIdx.x + 128U; column < columns;
+         column += 256U) {
+        high += __bfloat162float(input[input_base + column]) *
+                __bfloat162float(weights[weight_base + column]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        low += __shfl_down_sync(0xffff'ffffU, low, offset);
+        high += __shfl_down_sync(0xffff'ffffU, high, offset);
+    }
+    __shared__ float warps[8];
+    const auto lane = threadIdx.x & 31U;
+    const auto warp = threadIdx.x >> 5U;
+    if (lane == 0U) {
+        warps[warp] = low;
+        warps[warp + 4U] = high;
+    }
+    __syncthreads();
+    float reduced = threadIdx.x < 8U ? warps[lane] : 0.0F;
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        reduced += __shfl_down_sync(0xffff'ffffU, reduced, offset);
+    }
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] =
+            reduced;
+    }
+}
+
 __global__ void dsv4_rank_bf16_matmul(
     float* output, const float* input, const __nv_bfloat16* weights,
     std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
@@ -3442,6 +3553,70 @@ __global__ void dsv4_materialize_physical_pages(
     }
 }
 
+// Scores only the candidates a row actually attends, instead of every gathered
+// KV row. The dense form computed rows x heads x flat_rows and then discarded
+// all but 640 entries per row, which is both quadratic in context and the
+// reason the score workspace forced sub-chunking. One block owns one row and
+// kDsv4SparseScoreHeads heads; the KV row is staged once in shared and every
+// warp in the block dots its own head against it.
+constexpr std::uint32_t kDsv4SparseScoreHeads = 8U;
+__global__ void dsv4_sparse_scores_kernel(
+    __nv_bfloat16* scores, const __nv_bfloat16* queries,
+    const __nv_bfloat16* kv, const Dsv4DevicePhysicalPage* pages,
+    const Dsv4DeviceAttentionCandidate* candidates,
+    std::uint32_t candidate_count, std::uint32_t group_offset) {
+    const std::uint32_t row = blockIdx.x;
+    const std::uint32_t head = blockIdx.y * kDsv4SparseScoreHeads +
+                               (threadIdx.x >> 5U);
+    const std::uint32_t lane = threadIdx.x & 31U;
+    if (head >= kDsv4PagedHeads) return;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(group_offset) +
+         static_cast<std::uint64_t>(row)) *
+            kDsv4PagedHeads * kDsv4PagedHeadDim +
+        static_cast<std::uint64_t>(head) * kDsv4PagedHeadDim;
+    constexpr std::uint32_t kPerLane = kDsv4PagedHeadDim / 32U;
+    float own[kPerLane];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < kPerLane; ++index) {
+        own[index] = __bfloat162float(query[lane * kPerLane + index]);
+    }
+    __shared__ __nv_bfloat16 staged[kDsv4PagedHeadDim];
+    auto* base = scores +
+        (static_cast<std::uint64_t>(row) * kDsv4PagedHeads + head) *
+            candidate_count;
+    for (std::uint32_t candidate = 0U; candidate < candidate_count;
+         ++candidate) {
+        const auto descriptor = candidates[candidate];
+        if (descriptor.valid == 0U) {
+            if (lane == 0U) base[candidate] = __float2bfloat16_rn(0.0F);
+            __syncthreads();
+            continue;
+        }
+        const auto flat = static_cast<std::uint64_t>(
+            pages[descriptor.page].flat_begin + descriptor.row);
+        const auto* source = kv + flat * kDsv4PagedHeadDim;
+        for (std::uint32_t index = threadIdx.x; index < kDsv4PagedHeadDim;
+             index += blockDim.x) {
+            staged[index] = source[index];
+        }
+        __syncthreads();
+        float sum = 0.0F;
+#pragma unroll
+        for (std::uint32_t index = 0U; index < kPerLane; ++index) {
+            sum = __fmaf_rn(own[index],
+                            __bfloat162float(staged[lane * kPerLane + index]),
+                            sum);
+        }
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum += __shfl_xor_sync(0xffff'ffffU, sum, offset);
+        }
+        if (lane == 0U) base[candidate] = __float2bfloat16_rn(sum);
+        __syncthreads();
+    }
+}
+
 __global__ void dsv4_scale_scores(__nv_bfloat16* scores,
                                   std::uint64_t count, float scale) {
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
@@ -3481,12 +3656,10 @@ __global__ void dsv4_finish_maximums(
                                threadIdx.x;
         float value = __int_as_float(0xff80'0000);
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
-            const auto descriptor = candidates[candidate];
-            const auto flat = pages[descriptor.page].flat_begin +
-                              descriptor.row;
             value = __bfloat162float(
                 scores[(static_cast<std::uint64_t>(row) *
-                            kDsv4PagedHeads + head) * score_width + flat]);
+                            kDsv4PagedHeads + head) * score_width +
+                       candidate]);
         }
         value = dsv4_warp_max(value);
         if (lane == 0U) warp_maximums[warp] = value;
@@ -3535,12 +3708,10 @@ __global__ void dsv4_finish_denominators(
                                threadIdx.x;
         float weight = 0.0F;
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
-            const auto descriptor = candidates[candidate];
-            const auto flat = pages[descriptor.page].flat_begin +
-                              descriptor.row;
             const auto score = __bfloat162float(
                 scores[(static_cast<std::uint64_t>(row) *
-                            kDsv4PagedHeads + head) * score_width + flat]);
+                            kDsv4PagedHeads + head) * score_width +
+                       candidate]);
             weight = dsv4_triton_exp(score - maximums[head]);
         }
         for (int offset = 16; offset > 0; offset /= 2) {
@@ -3594,19 +3765,24 @@ __device__ __forceinline__ float dsv4_candidate_group_sum(
     return sum;
 }
 
+// Divides by the denominator and stores BF16 in place of writing an FP32
+// accumulator the next kernel would immediately consume. The division, its
+// div.full.f32 form and the BF16 rounding are exactly what dsv4_divide_and_store
+// performed, so the stored values are unchanged; only the 62 MB intermediate
+// region disappears.
 __global__ void dsv4_finish_values(
     const __nv_bfloat16* scores,
     const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* maximums,
-    const __nv_bfloat16* kv, float* values,
+    const __nv_bfloat16* kv, const float* denominators,
+    __nv_bfloat16* attended, std::uint64_t attended_row_stride,
+    std::uint64_t attended_group_offset,
     std::uint32_t candidate_count, std::uint32_t score_width,
     std::uint32_t boundaries) {
     const auto head = blockIdx.x;
     const auto row = blockIdx.z;
     candidates += static_cast<std::uint64_t>(row) * candidate_count;
     maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
-    values += static_cast<std::uint64_t>(row) * kDsv4PagedHeads *
-              kDsv4PagedHeadDim;
     const auto dimension = blockIdx.y * kDsv4PagedDimensionsPerBlock +
                            threadIdx.x;
     __shared__ float weights[kDsv4PagedCandidateBlock];
@@ -3621,11 +3797,10 @@ __global__ void dsv4_finish_values(
                 ? candidates[candidate] : Dsv4DeviceAttentionCandidate{};
             block_candidates[threadIdx.x] = descriptor;
             if (descriptor.valid != 0U) {
-                const auto flat = pages[descriptor.page].flat_begin +
-                                  descriptor.row;
                 const auto score = __bfloat162float(
                     scores[(static_cast<std::uint64_t>(row) *
-                                kDsv4PagedHeads + head) * score_width + flat]);
+                                kDsv4PagedHeads + head) * score_width +
+                           candidate]);
                 weights[threadIdx.x] = dsv4_triton_exp(
                     score - maximums[head]);
             } else {
@@ -3647,8 +3822,16 @@ __global__ void dsv4_finish_values(
             running_value, __fadd_rn(pair02, pair13));
         __syncthreads();
     }
-    values[static_cast<std::uint64_t>(head) * kDsv4PagedHeadDim +
-           dimension] = running_value;
+    float divided;
+    asm("div.full.f32 %0, %1, %2;"
+        : "=f"(divided)
+        : "f"(running_value),
+          "f"(denominators[static_cast<std::uint64_t>(row) *
+                               kDsv4PagedHeads + head]));
+    attended[static_cast<std::uint64_t>(row) * attended_row_stride +
+             attended_group_offset +
+             static_cast<std::uint64_t>(head) * kDsv4PagedHeadDim +
+             dimension] = __float2bfloat16_rn(divided);
 }
 
 __global__ void dsv4_divide_and_store(
@@ -3674,7 +3857,7 @@ __global__ void dsv4_divide_and_store(
 
 __global__ void dsv4_inverse_rope_decode(
     const __nv_bfloat16* attended, const float* cosines,
-    const float* sines, float* output, std::uint32_t rows,
+    const float* sines, __nv_bfloat16* output, std::uint32_t rows,
     std::uint32_t heads) {
     constexpr std::uint32_t rope = 64U;
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
@@ -3688,7 +3871,7 @@ __global__ void dsv4_inverse_rope_decode(
         index % kDsv4PagedHeadDim);
     const auto row = index / row_elements;
     if (dimension < kDsv4PagedHeadDim - rope) {
-        output[index] = __bfloat162float(attended[index]);
+        output[index] = attended[index];
         return;
     }
     const auto rope_dimension = dimension - (kDsv4PagedHeadDim - rope);
@@ -3701,7 +3884,10 @@ __global__ void dsv4_inverse_rope_decode(
     const float value = (rope_dimension & 1U) == 0U
         ? __fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))
         : __fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine));
-    output[index] = bf16_round(value);
+    // The value was already rounded to BF16 here before being widened into an
+    // FP32 region, so storing BF16 is lossless and halves the largest region
+    // in the page workspace.
+    output[index] = __float2bfloat16_rn(bf16_round(value));
 }
 
 __global__ void dsv4_bf16_to_fp32(
@@ -4560,6 +4746,10 @@ struct Dsv4AttentionMhcWorkspaceLayout {
     std::uint64_t attended_offset{};
     std::uint64_t decoded_offset{};
     std::uint64_t output_rank_offset{};
+    // Compact E4M3 activation for the SM86 tensor output projection: one
+    // value byte per element plus one E8M0 byte per row/K128 group.
+    std::uint64_t tensor_values_offset{};
+    std::uint64_t tensor_scales_offset{};
     std::uint64_t branch_offset{};
     std::uint64_t encoded_branch_offset{};
     std::uint64_t router_logits_offset{};
@@ -4618,7 +4808,7 @@ bool dsv4_attention_mhc_workspace_layout(
         !checked_bytes(flat_rows, kDsv4PagedHeadDim,
                        sizeof(std::uint16_t), layout.kv_bytes) ||
         !checked_bytes(rows,
-                       static_cast<std::uint64_t>(kDsv4PagedHeads) * flat_rows,
+                       static_cast<std::uint64_t>(kDsv4PagedHeads) * candidates,
                        sizeof(std::uint16_t), layout.score_bytes)) {
         return false;
     }
@@ -4652,16 +4842,35 @@ bool dsv4_attention_mhc_workspace_layout(
     std::uint64_t output_rank_bytes{};
     std::uint64_t branch_bytes{};
     std::uint64_t encoded_branch_bytes{};
+    // The tensor output projection writes whole 64-row tiles, so the branch
+    // region is sized to the padded row count while branch_elements keeps its
+    // exact meaning for the caller-facing contracts.
+    const auto tensor_padded_rows =
+        (static_cast<std::uint64_t>(rows) + kDsv4Fp8TensorBlockM - 1U) /
+        kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockM;
+    std::uint64_t branch_capacity_elements{};
+    std::uint64_t tensor_values_bytes{};
+    std::uint64_t tensor_scales_bytes{};
+    if (!checked_bytes(tensor_padded_rows, branch_row_elements, 1U,
+                       branch_capacity_elements) ||
+        !checked_bytes(rows, output_rank_row_elements, 1U,
+                       tensor_values_bytes) ||
+        !checked_bytes(rows, output_rank_row_elements / 128U, 1U,
+                       tensor_scales_bytes)) {
+        return false;
+    }
     if (!checked_bytes(rows, kDsv4PagedHeads, sizeof(float), maximum_bytes) ||
         !checked_bytes(rows, kDsv4PagedHeads, sizeof(float),
                        denominator_bytes) ||
-        !checked_bytes(rows, group_elements, sizeof(float), value_bytes) ||
+        !checked_bytes(0U, group_elements, sizeof(float), value_bytes) ||
         !checked_bytes(attended_elements, 1U, sizeof(std::uint16_t),
                        attended_bytes) ||
-        !checked_bytes(attended_elements, 1U, sizeof(float), decoded_bytes) ||
+        !checked_bytes(attended_elements, 1U, sizeof(std::uint16_t),
+                       decoded_bytes) ||
         !checked_bytes(output_rank_elements, 1U, sizeof(float),
                        output_rank_bytes) ||
-        !checked_bytes(branch_elements, 1U, sizeof(float), branch_bytes) ||
+        !checked_bytes(branch_capacity_elements, 1U, sizeof(float),
+                       branch_bytes) ||
         !checked_bytes(branch_elements, 1U, sizeof(std::uint16_t),
                        encoded_branch_bytes) ||
         !region(layout.kv_bytes, 16U, layout.kv_offset) ||
@@ -4672,6 +4881,8 @@ bool dsv4_attention_mhc_workspace_layout(
         !region(attended_bytes, 16U, layout.attended_offset) ||
         !region(decoded_bytes, 16U, layout.decoded_offset) ||
         !region(output_rank_bytes, 16U, layout.output_rank_offset) ||
+        !region(tensor_values_bytes, 16U, layout.tensor_values_offset) ||
+        !region(tensor_scales_bytes, 16U, layout.tensor_scales_offset) ||
         !region(branch_bytes, 16U, layout.branch_offset) ||
         !region(encoded_branch_bytes, 16U, layout.encoded_branch_offset) ||
         !region(router_logits_bytes, 16U, layout.router_logits_offset) ||
@@ -4679,6 +4890,27 @@ bool dsv4_attention_mhc_workspace_layout(
         return false;
     }
     layout.workspace_bytes = cursor;
+    if (const char* trace = std::getenv("STRATA_TRACE_ATTENTION_LAYOUT");
+        trace != nullptr && *trace == '1') {
+        static std::atomic<int> emitted{0};
+        if (emitted.fetch_add(1) < 2) {
+            std::fprintf(
+                stderr,
+                "attention layout rows=%llu flat_rows=%llu candidates=%llu "
+                "total=%.2f MB | kv=%.2f score=%.2f value=%.2f attended=%.2f "
+                "decoded=%.2f output_rank=%.2f branch=%.2f encoded=%.2f "
+                "router=%.2f cand=%.2f query=%.2f\n",
+                (unsigned long long)rows, (unsigned long long)flat_rows,
+                (unsigned long long)candidates, cursor / 1048576.0,
+                layout.kv_bytes / 1048576.0, layout.score_bytes / 1048576.0,
+                value_bytes / 1048576.0, attended_bytes / 1048576.0,
+                decoded_bytes / 1048576.0, output_rank_bytes / 1048576.0,
+                branch_bytes / 1048576.0, encoded_branch_bytes / 1048576.0,
+                router_logits_bytes / 1048576.0,
+                layout.candidate_bytes / 1048576.0,
+                layout.query_bytes / 1048576.0);
+        }
+    }
     return true;
 }
 
@@ -8608,25 +8840,16 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         return cuda_error(status,
                           "launch DeepSeek physical-page materialization");
     }
-    constexpr float alpha = 1.0F;
-    constexpr float beta = 0.0F;
-    if (auto status = cublasGemmEx(
-            state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-            static_cast<int>(flat_rows),
-            static_cast<int>(rows * kDsv4PagedHeads),
-            static_cast<int>(kDsv4PagedHeadDim), &alpha,
-            device_kv, CUDA_R_16BF,
-            static_cast<int>(kDsv4PagedHeadDim),
-            device_query, CUDA_R_16BF,
-            static_cast<int>(kDsv4PagedHeadDim), &beta,
-            device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        status != CUBLAS_STATUS_SUCCESS) {
-        return cublas_error(status,
-                            "execute DeepSeek paged attention BF16 scores");
+    dsv4_sparse_scores_kernel<<<
+        dim3{rows, kDsv4PagedHeads / kDsv4SparseScoreHeads},
+        kDsv4SparseScoreHeads * 32U, 0U, state.stream>>>(
+        device_scores, device_query, device_kv, device_pages,
+        device_candidates, candidates, 0U);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch DeepSeek sparse attention scores");
     }
     const auto score_elements = static_cast<std::uint64_t>(
-        rows) * kDsv4PagedHeads * flat_rows;
+        rows) * kDsv4PagedHeads * candidates;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
@@ -8635,11 +8858,11 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     dsv4_finish_maximums<<<dim3{kDsv4PagedHeads, rows},
                            kDsv4PagedCandidateBlock, 0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_sink,
-        device_maximums, candidates, flat_rows, boundaries);
+        device_maximums, candidates, candidates, boundaries);
     dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                               kDsv4PagedCandidateBlock, 0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_sink,
-        device_maximums, device_denominators, candidates, flat_rows,
+        device_maximums, device_denominators, candidates, candidates,
         boundaries);
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
@@ -8648,12 +8871,9 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                          0U, state.stream>>>(
         device_scores, device_pages, device_candidates, device_maximums,
-        device_kv, device_values, candidates, flat_rows, boundaries);
-    const auto output_blocks = static_cast<std::uint32_t>(
-        (output_elements + threads - 1U) / threads);
-    dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-        device_values, device_denominators, device_output, output_elements,
-        row_output_elements, row_output_elements, 0U);
+        device_kv, device_denominators, device_output,
+        static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim, 0U,
+        candidates, candidates, boundaries);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch DeepSeek paged attention finish kernels");
@@ -10432,6 +10652,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const auto attended_offset = layout.attended_offset;
     const auto decoded_offset = layout.decoded_offset;
     const auto output_rank_offset = layout.output_rank_offset;
+    const auto tensor_values_offset = layout.tensor_values_offset;
+    const auto tensor_scales_offset = layout.tensor_scales_offset;
     const auto branch_offset = layout.branch_offset;
     const auto encoded_branch_offset = layout.encoded_branch_offset;
     const auto router_logits_offset = layout.router_logits_offset;
@@ -10655,7 +10877,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     auto* device_values = reinterpret_cast<float*>(workspace + value_offset);
     auto* device_attended = reinterpret_cast<__nv_bfloat16*>(
         workspace + attended_offset);
-    auto* device_decoded = reinterpret_cast<float*>(workspace + decoded_offset);
+    auto* device_decoded =
+        reinterpret_cast<__nv_bfloat16*>(workspace + decoded_offset);
     auto* device_output_rank = reinterpret_cast<float*>(
         workspace + output_rank_offset);
     auto* device_branch = reinterpret_cast<float*>(workspace + branch_offset);
@@ -10733,7 +10956,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     constexpr float beta = 0.0F;
     const auto boundaries = candidates / kDsv4PagedCandidateBlock;
     const auto score_elements = static_cast<std::uint64_t>(rows) *
-        kDsv4PagedHeads * flat_rows;
+        kDsv4PagedHeads * candidates;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     const auto output_blocks = static_cast<std::uint32_t>(
@@ -10748,20 +10971,14 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         auto* group_query = device_query +
             static_cast<std::uint64_t>(group) * rows * group_elements;
         auto* group_sink = device_sink + group * kDsv4PagedHeads;
-        if (auto status = cublasGemmEx(
-                state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                static_cast<int>(flat_rows),
-                static_cast<int>(rows * kDsv4PagedHeads),
-                static_cast<int>(kDsv4PagedHeadDim), &alpha,
-                device_kv, CUDA_R_16BF,
-                static_cast<int>(kDsv4PagedHeadDim),
-                group_query, CUDA_R_16BF,
-                static_cast<int>(kDsv4PagedHeadDim), &beta,
-                device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            status != CUBLAS_STATUS_SUCCESS) {
-            return cublas_error(
-                status, "execute attention-to-mHC BF16 scores");
+        dsv4_sparse_scores_kernel<<<
+            dim3{rows, kDsv4PagedHeads / kDsv4SparseScoreHeads},
+            kDsv4SparseScoreHeads * 32U, 0U, state.stream>>>(
+            device_scores, group_query, device_kv, device_pages,
+            device_candidates, candidates, 0U);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(
+                status, "launch attention-to-mHC sparse scores");
         }
         dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
             device_scores, score_elements, request.attention.scale);
@@ -10769,22 +10986,20 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                                kDsv4PagedCandidateBlock, 0U,
                                state.stream>>>(
             device_scores, device_pages, device_candidates, group_sink,
-            device_maximums, candidates, flat_rows, boundaries);
+            device_maximums, candidates, candidates, boundaries);
         dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                                    kDsv4PagedCandidateBlock, 0U,
                                    state.stream>>>(
             device_scores, device_pages, device_candidates, group_sink,
-            device_maximums, device_denominators, candidates, flat_rows,
+            device_maximums, device_denominators, candidates, candidates,
             boundaries);
         dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                              0U, state.stream>>>(
             device_scores, device_pages, device_candidates, device_maximums,
-            device_kv, device_values, candidates, flat_rows, boundaries);
-        dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-            device_values, device_denominators, device_attended,
-            static_cast<std::uint64_t>(rows) * group_elements,
-            group_elements, attended_row_elements,
-            static_cast<std::uint64_t>(group) * group_elements);
+            device_kv, device_denominators, device_attended,
+            attended_row_elements,
+            static_cast<std::uint64_t>(group) * group_elements,
+            candidates, candidates, boundaries);
     }
     const auto attended_blocks = static_cast<std::uint32_t>(
         (attended_elements + threads - 1U) / threads);
@@ -10792,7 +11007,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         device_attended, device_cosines, device_sines, device_decoded,
         rows, total_heads);
     if (request.rank_local) {
-        dsv4_rank_bf16_matmul<<<output_rank_elements, rank_threads, 0U, state.stream>>>(
+        dsv4_rank_bf16_matmul_bf16_input<<<
+            output_rank_elements, rank_threads, 0U, state.stream>>>(
             device_output_rank, device_decoded,
             static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
             1U, a.columns, a.rows, output_groups, 1024U);
@@ -10802,7 +11018,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<unsigned int>(
                 (rows + kPlainMatmulRowTile - 1U) /
                 kPlainMatmulRowTile));
-        plain_matmul_kernel<kPlainMatmulRowTile>
+        plain_matmul_kernel_bf16_input<kPlainMatmulRowTile>
             <<<output_a_grid, threads, 0U, state.stream>>>(
             device_output_rank, device_decoded, output_a->impl_->weights,
             static_cast<int>(a.dtype), rows, a.columns, a.rows,
@@ -10814,17 +11030,63 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         device_output_rank, output_rank_elements);
     const dim3 output_rank_quantize_grid(
         static_cast<unsigned int>(output_rank_row_elements / 128U), rows, 1U);
-    quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
-                                      state.stream>>>(
-        device_output_rank, output_rank_row_elements, rows);
     auto* raw_branch_output = request.rank_local
         ? request.rank_local_raw_fp32_reduction : device_branch;
+    // The output projection is the largest remaining native_fp8_matmul_kernel
+    // launch on the page path: its grid is one block per (output row, batch
+    // row), so every batch row re-reads the whole 4096-row weight. Route the
+    // multi-row case through the same SM86 tensor path accepted in experiment
+    // 0105. It writes whole 64-row tiles, so it targets the padded branch
+    // region and the exact rows are copied out when the caller owns the
+    // destination.
+    const bool tensor_output_b =
+        !expanded_output_b && page_request &&
+        state.dsv4_fp8_tensor_page_supported &&
+        b.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
+        b.columns % kDsv4Fp8TensorBlockK == 0U &&
+        b.rows % kDsv4Fp8TensorBlockN == 0U;
     if (expanded_output_b) {
         dsv4_rank_bf16_matmul<<<branch_elements, rank_threads, 0U, state.stream>>>(
             raw_branch_output, device_output_rank,
             static_cast<const __nv_bfloat16*>(output_b->impl_->weights),
             1U, b.columns, b.rows, 0U, 0U);
+    } else if (tensor_output_b) {
+        auto* tensor_values = reinterpret_cast<unsigned char*>(
+            workspace + tensor_values_offset);
+        auto* tensor_scales = reinterpret_cast<unsigned char*>(
+            workspace + tensor_scales_offset);
+        quantize_activation_e4m3_bytes_kernel<<<
+            output_rank_quantize_grid, 128U, 0U, state.stream>>>(
+            tensor_values, tensor_scales, device_output_rank,
+            output_rank_row_elements, rows);
+        const auto tensor_padded_rows =
+            (static_cast<std::uint64_t>(rows) + kDsv4Fp8TensorBlockM - 1U) /
+            kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockM;
+        const dim3 output_b_tensor_grid(
+            static_cast<unsigned int>(b.rows / kDsv4Fp8TensorBlockN),
+            static_cast<unsigned int>(
+                tensor_padded_rows / kDsv4Fp8TensorBlockM), 1U);
+        dsv4_fp8_decode_bf16_tensor_kernel<<<
+            output_b_tensor_grid, threads, 0U, state.stream>>>(
+            device_branch, tensor_values, tensor_scales,
+            static_cast<const unsigned char*>(output_b->impl_->weights),
+            static_cast<const unsigned char*>(output_b->impl_->scales), rows,
+            static_cast<std::uint32_t>(b.columns),
+            static_cast<std::uint32_t>(b.rows));
+        if (raw_branch_output != device_branch) {
+            if (auto status = cudaMemcpyAsync(
+                    raw_branch_output, device_branch,
+                    static_cast<std::size_t>(branch_elements) * sizeof(float),
+                    cudaMemcpyDeviceToDevice, state.stream);
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "copy tensor output projection to its destination");
+            }
+        }
     } else {
+        quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            device_output_rank, output_rank_row_elements, rows);
         native_fp8_matmul_kernel<<<dim3{
             static_cast<unsigned int>(branch_row_elements), rows},
             threads, 0U, state.stream>>>(

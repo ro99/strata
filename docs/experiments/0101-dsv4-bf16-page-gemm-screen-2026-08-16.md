@@ -1,11 +1,15 @@
 # Experiment 0101 — DSV4 BF16 page GEMM mechanism screen
 
-Status: **standalone mechanism screen positive; production work is not
-authorized and was not started.** The current plain-BF16 row kernel is
+Status: **standalone plain-BF16 mechanism screen positive, but superseded as a
+DeepSeek V4 production screen by experiment 0102.** The actual `wq_a`, `wq_b`
+and `wkv` checkpoint tensors are FP8 E4M3 block-128, and production dispatches
+`native_fp8_matmul_kernel`, not the plain-BF16 kernel measured here. Production
+work was not started. The current plain-BF16 row kernel is
 13.19--20.06x slower than the already-linked tensor-op cuBLAS path at the exact
-677-row projection shapes. Numerical reassociation is small in absolute terms
-but is not covered uniformly by the repository's existing reassociation-test
-formula, so a production numerical contract remains a decision point.
+677-row projection dimensions, but that ratio does not describe the production
+projection encoding or kernel. Numerical reassociation is small in absolute
+terms but is not covered uniformly by the repository's existing
+reassociation-test formula.
 
 ## Predeclared contract and budget
 
@@ -112,7 +116,9 @@ not a result silently inherited from the existing cuBLAS sites.
 
 ## Decision
 
-The compute hypothesis survives the cheapest falsifying test by a large margin.
+The plain-BF16 compute hypothesis survives its isolated test by a large margin,
+but experiment 0102 found that it was not instantiated on the production weight
+encoding. It therefore makes no production-speed claim.
 No production kernel, runtime path, model arm, query allocation, attention host
 remainder, append/compressor path or MoE work was touched. The next decision is
 whether to authorize a production candidate and which numerical oracle contract

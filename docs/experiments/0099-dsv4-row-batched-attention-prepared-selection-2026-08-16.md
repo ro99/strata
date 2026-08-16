@@ -1,7 +1,9 @@
 # Experiment 0099 — row-batched attention with prepared index selection
 
-Status: **implementation and isolated correctness gates complete; production
-mechanism gate pending.** No model arm has been launched from this experiment.
+Status: **rejected at the unchanged 677-token production timing gate.** The
+row-batched structure and correctness gates passed, but removing the duplicate
+compressor pass left `attention_score_seconds` at 14.159 s against the binding
+`< 12 s` gate. The candidate and all measurements are preserved.
 
 This is the second attempt at experiment 0098's mechanism. The operating
 point, structural expectations and `attention_score_seconds < 12 s` gate are
@@ -108,20 +110,71 @@ selection against its scalar oracle at 513 candidates and at the declared
 1,048,576-token maximum. The local test binary reported 276 passed and 34
 fixture-dependent skips.
 
-No production counter or timing number belongs to 0099 yet. The next action is
-the predeclared two-arm mechanism check, but it requires a budget check-in
-before launch.
+## Production mechanism gate
 
-## Planned production mechanism check
+The authorized budget was one untraced baseline and one untraced candidate at
+677 tokens and `--prefill-page-tokens 8192`, approximately four minutes each
+and eight minutes total. The candidate ran first so its deterministic
+structural counters could gate further model work. It completed in 2:53 wall
+time, including 104.528 s of initialization. Its result was:
 
-One baseline and one candidate arm, each untraced, at 677 tokens and
-`--prefill-page-tokens 8192`. Expected wall time is approximately four minutes
-per arm after the model is resident/loaded as accounted by the existing
-script, eight minutes measured-arm total. No repetition, 2,612-token arm or
-fixed/marginal fit is authorized at this stage.
+| Metric | 0098 candidate | 0099 candidate | Gate / reading |
+|---|---:|---:|---|
+| Prefill | 59.833 s | 60.195 s | 11.247 tok/s; single runs, not a timing comparison |
+| Attention total | — | 28.794 s | query 10.338 s, KV 3.908 s, score 14.159 s |
+| Attention score | 13.945 s | **14.159 s** | **fail: required < 12 s** |
+| Maximum device attention | 4.140 s | 4.108 s | device kernels are not the residual |
+| Score minus device | 9.805 s | **10.051 s** | did not fall well below 0098 |
+| Paged-attention calls | 86 | **86** | structural pass |
+| Kernel launches | 1,677 | **1,655** | structural pass, order 10^3 |
+| Page bytes | 30.564 MB | **30.564 MB** | structural pass |
+| Prepared index selection | — | **0.000 s** | identity regime at 677 tokens |
+| Output-weight acquisition | — | **0.000390 s** | negligible |
+| Backend host remainder | — | **6.234 s** | staging/dispatch/handoff/scatter aggregate |
+| Backend stream synchronization | — | **7.620 s** | includes the 4.108 s device interval |
 
-The production JSON must report the structural counters, score and maximum
-device-attention seconds, the four new remainder counters, expert H2D bytes,
-cache misses/evictions, decode checkpoint reads, decode rate, RSS and per-GPU
-VRAM. The unsigned-underflow mHC maximum counter remains a separate known
-defect and is not used.
+The launch count is 22 below 0098's 1,677 because the reconstructed counter
+charges the extra page-scatter launch only when a cross-device scatter is
+actually issued. Calls, launches and page bytes nevertheless prove the same
+row-batched structure; this is not a relaxation of the structural gate.
+
+The remainder counters explain the second failure sufficiently to reject the
+stated correction: prepared index selection was exactly zero at this operating
+point, weight acquisition was 0.390 ms, and
+`6.234 + (7.620 - 4.108) = 9.746 s` of backend host work plus synchronization
+accounts for nearly all of the measured 10.051 s score-minus-device remainder.
+The removed duplicate compressor therefore was not the dominant 0098 residual.
+This is a negative result against the same threshold, prompt and page size, not
+a gate change or a friendlier regime.
+
+The baseline arm was not launched. Once the candidate's unchanged timing gate
+failed, the standing protocol required a stop before spending the second arm;
+there is consequently no 0099 A/B timing claim and no baseline remainder split.
+The two preflight attempts that failed before model loading (one NCCL-disabled
+build and one incorrect model path) remain preserved under the result directory
+and consumed no measured arm.
+
+## Correctness and resource accounting
+
+The production arm generated token IDs `2107, 8777, 1277, 440`, matching the
+0098 gate arms. Decode checkpoint reads remained zero. Four generated tokens
+took 0.440 s; under the runner's existing first-token accounting this is 6.819
+decode tok/s, versus 0098's 6.798 baseline, so this single run shows no decode
+regression but is not a throughput-win claim.
+
+Prefill expert demand H2D was 74,083,499,520 bytes, with 10,470 cache misses
+and 7,842 evictions. RSS was 158,858,715,136 bytes. Per-GPU used VRAM was
+22,994,354,176 and 22,916,759,552 bytes. Relative to 0098's candidate this is
+226,492,416 bytes less on each GPU; relative to 0098's baseline it is
+310,378,496 bytes more on each GPU. The latter is the admitted row-batched
+workspace cost and remains below the explicit 384 MiB-per-attention-device
+ceiling. It did not grow further.
+
+The known `maximum_device_dsv4_mhc_kernel_seconds = 18446744070` unsigned
+underflow is present and was not used. The final `make check` passed 2/2 tests.
+
+Raw candidate JSON, system capture and full `/usr/bin/time -v` log are under
+`results/dsv4-0099-prepared-selection-gate/`. No repetition, 2,612-token arm,
+fixed/marginal fit, query/KV projection work or MoE work was run. Per the
+standing protocol, the experiment stops here with its code and data preserved;
+the next mechanism requires explicit direction.

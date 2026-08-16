@@ -50,6 +50,24 @@ struct CudaWeightDescriptor {
     float global_scale{1.0F};
 };
 
+// Host/device attribution for one synchronous generic matmul. Device event
+// intervals can overlap host issue and stream wait, so they are service-time
+// evidence rather than additional wall-time terms.
+struct CudaMatmulProfile {
+    std::uint64_t weight_acquisition_nanoseconds{};
+    std::uint64_t issue_nanoseconds{};
+    std::uint64_t finish_nanoseconds{};
+    std::uint64_t synchronization_nanoseconds{};
+    std::uint64_t h2d_nanoseconds{};
+    std::uint64_t kernel_nanoseconds{};
+    std::uint64_t d2h_nanoseconds{};
+};
+
+struct CudaSynchronizationStats {
+    std::uint64_t calls{};
+    std::uint64_t nanoseconds{};
+};
+
 struct CudaBackendStats {
     // Byte and event totals sum devices. Aggregate durations are the maximum
     // per-device service duration so concurrent device work is not double-counted.
@@ -65,6 +83,14 @@ struct CudaBackendStats {
         std::uint64_t workspace_allocation_bytes{};
         std::uint64_t synchronization_calls{};
         std::uint64_t synchronization_nanoseconds{};
+        // These six categories are exhaustive and non-overlapping. Their sum
+        // must equal the two synchronization totals above on every device.
+        CudaSynchronizationStats weight_synchronization{};
+        CudaSynchronizationStats attention_synchronization{};
+        CudaSynchronizationStats projection_synchronization{};
+        CudaSynchronizationStats mhc_synchronization{};
+        CudaSynchronizationStats moe_synchronization{};
+        CudaSynchronizationStats other_synchronization{};
         // matmul_impl split on the host clock: everything before the stream
         // synchronize, and everything after it. Separates driver submission
         // cost from time genuinely spent waiting on the device.
@@ -115,6 +141,8 @@ struct CudaBackendStats {
         std::uint64_t dsv4_paged_attention_kernel_nanoseconds{};
         std::uint64_t dsv4_paged_attention_d2h_nanoseconds{};
         std::uint64_t dsv4_paged_attention_nanoseconds{};
+        std::uint64_t dsv4_paged_attention_host_remainder_nanoseconds{};
+        std::uint64_t dsv4_paged_attention_stream_sync_nanoseconds{};
         std::uint64_t dsv4_mhc_calls{};
         std::uint64_t dsv4_mhc_standalone_calls{};
         std::uint64_t dsv4_mhc_transition_calls{};
@@ -127,6 +155,9 @@ struct CudaBackendStats {
         std::uint64_t dsv4_mhc_kernel_nanoseconds{};
         std::uint64_t dsv4_mhc_d2h_nanoseconds{};
         std::uint64_t dsv4_mhc_nanoseconds{};
+        std::uint64_t dsv4_mhc_device_nanoseconds{};
+        std::uint64_t dsv4_mhc_host_nanoseconds{};
+        std::uint64_t dsv4_mhc_timing_clamped_samples{};
         std::uint64_t lightning_index_calls{};
         std::uint64_t lightning_index_kernel_launches{};
         std::uint64_t lightning_index_candidates{};
@@ -152,6 +183,12 @@ struct CudaBackendStats {
     std::uint64_t workspace_allocation_bytes{};
     std::uint64_t synchronization_calls{};
     std::uint64_t synchronization_nanoseconds{};
+    CudaSynchronizationStats weight_synchronization{};
+    CudaSynchronizationStats attention_synchronization{};
+    CudaSynchronizationStats projection_synchronization{};
+    CudaSynchronizationStats mhc_synchronization{};
+    CudaSynchronizationStats moe_synchronization{};
+    CudaSynchronizationStats other_synchronization{};
     std::uint64_t matmul_issue_nanoseconds{};
     std::uint64_t matmul_finish_nanoseconds{};
     std::uint64_t upload_wait_nanoseconds{};
@@ -191,6 +228,8 @@ struct CudaBackendStats {
     std::uint64_t dsv4_paged_attention_kernel_nanoseconds{};
     std::uint64_t dsv4_paged_attention_d2h_nanoseconds{};
     std::uint64_t dsv4_paged_attention_nanoseconds{};
+    std::uint64_t dsv4_paged_attention_host_remainder_nanoseconds{};
+    std::uint64_t dsv4_paged_attention_stream_sync_nanoseconds{};
     std::uint64_t dsv4_mhc_calls{};
     std::uint64_t dsv4_mhc_standalone_calls{};
     std::uint64_t dsv4_mhc_transition_calls{};
@@ -203,6 +242,9 @@ struct CudaBackendStats {
     std::uint64_t dsv4_mhc_kernel_nanoseconds{};
     std::uint64_t dsv4_mhc_d2h_nanoseconds{};
     std::uint64_t dsv4_mhc_nanoseconds{};
+    std::uint64_t dsv4_mhc_device_nanoseconds{};
+    std::uint64_t dsv4_mhc_host_nanoseconds{};
+    std::uint64_t dsv4_mhc_timing_clamped_samples{};
     std::uint64_t lightning_index_calls{};
     std::uint64_t lightning_index_kernel_launches{};
     std::uint64_t lightning_index_candidates{};
@@ -341,6 +383,11 @@ struct CudaDsv4PagedAttentionRequest {
     std::span<const float> head_sinks;
     std::span<const CudaDsv4PhysicalPage> pages;
     std::span<const CudaDsv4AttentionCandidate> candidates;
+    // Row-major page request. Queries are [rows, 32, 512] and candidates are
+    // [rows, candidate_width]. Pages and head sinks are shared by every row.
+    // The single-row defaults preserve the decode request contract.
+    std::uint32_t rows{1U};
+    std::uint32_t candidate_width{};
     // When set, the compressed region of `candidates` is ignored and resolved
     // on the device instead, after the upload and before scoring.
     const CudaDsv4DeviceCandidateResolution* resolution{};
@@ -408,6 +455,9 @@ using CudaDsv4AttentionPrepareHostCallback = bool (*)(
 // may be requested by the caller without changing the device computation.
 struct CudaDsv4PagedAttentionMhcRequest {
     CudaDsv4PagedAttentionRequest attention;
+    // Optional per-row mHC arena slots for a page request. Empty selects the
+    // active single-row workspace; otherwise its extent equals attention.rows.
+    std::span<const std::uint32_t> mhc_slots;
     std::span<const float> inverse_rope_cosines;
     std::span<const float> inverse_rope_sines;
     const CudaWeight* output_a{};
@@ -789,7 +839,9 @@ public:
     [[nodiscard]] ValidationResult matmul(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::span<float> output,
-        bool round_bf16_output = false);
+        bool round_bf16_output = false,
+        CudaMatmulProfile* profile = nullptr,
+        bool dsv4_fp8_tensor_page = false);
     [[nodiscard]] ValidationResult matmul_softcap(
         const CudaWeight& weight, std::span<const float> input,
         float softcap, std::span<float> output);
@@ -808,6 +860,10 @@ public:
         int device) const;
     [[nodiscard]] ValidationResult validate_lightning_index_device(
         int device) const;
+    // True only on devices where the explicitly requested DeepSeek page
+    // projection can use the SM86 BF16-WMMA path. Other capabilities retain
+    // the native FP8 CUDA-core kernel as a numerical fallback.
+    [[nodiscard]] bool dsv4_fp8_tensor_page_supported(int device) const noexcept;
     [[nodiscard]] ValidationResult validate_dsv4_mhc_device(
         int device) const;
     // Executes the model-neutral forward attention primitive under the
@@ -1070,7 +1126,9 @@ private:
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,
         std::uint64_t rows_per_group, std::span<float> output,
-        float softcap, bool round_output = false);
+        float softcap, bool round_output = false,
+        CudaMatmulProfile* profile = nullptr,
+        bool dsv4_fp8_tensor_page = false);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

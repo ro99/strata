@@ -233,6 +233,49 @@ TEST_CASE("DeepSeek physical KV encoder writes accepted physical planes") {
     REQUIRE(query[3] == 448.0F);
 }
 
+TEST_CASE("DeepSeek physical prefill page keeps its earliest causal window") {
+    strata::Dsv4KvCacheConfig config;
+    config.block_rows = strata::kDsv4PhysicalKvBlockRows;
+    config.sliding_window_rows = 128U;
+    config.host_capacity_bytes = 1U << 20U;
+    config.physical_layout = true;
+    strata::Dsv4KvCache cache(config);
+    REQUIRE(cache.validate().ok());
+    const auto sequence = cache.create_sequence();
+    REQUIRE(sequence.ok());
+    const auto values = row(
+        strata::kDeepSeekV4ExecutionContract.head_dim, 1.0F);
+
+    for (std::uint64_t position = 0U; position < 128U; ++position) {
+        REQUIRE(cache.append(sequence.value,
+                             strata::Dsv4KvBlockKind::Sliding,
+                             0U, 1U, position, values).ok());
+    }
+    // A page beginning at position 128 attends row 128 against rows 1..128,
+    // even though appending the entire page would ordinarily advance the
+    // sliding floor to 64 before the first attend call.
+    for (std::uint64_t position = 128U; position < 192U; ++position) {
+        REQUIRE(cache.append(sequence.value,
+                             strata::Dsv4KvBlockKind::Sliding,
+                             0U, 1U, position, values, 1U).ok());
+    }
+    REQUIRE(!cache.row(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                       0U, 0U).ok());
+    REQUIRE(cache.row(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                      0U, 1U).ok());
+    REQUIRE(cache.row(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                      0U, 128U).ok());
+
+    // The next ordinary append advances the floor to the normal 128-row
+    // window; the page-scoped retention does not leak into decode semantics.
+    REQUIRE(cache.append(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                         0U, 1U, 192U, values).ok());
+    REQUIRE(!cache.row(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                       0U, 1U).ok());
+    REQUIRE(cache.row(sequence.value, strata::Dsv4KvBlockKind::Sliding,
+                      0U, 65U).ok());
+}
+
 TEST_CASE("DeepSeek live cache retains physical page boundaries") {
     strata::Dsv4KvCacheConfig invalid;
     invalid.physical_layout = true;

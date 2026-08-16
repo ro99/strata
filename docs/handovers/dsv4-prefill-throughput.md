@@ -4,8 +4,12 @@ Goal: get rank-local TP2 prompt processing to roughly the external reference's
 numbers. Everything below is measured on the reference pair (devices 1,2) with
 `models/dsv4f`.
 
-`main` is at `20de4e9`. `make check` 100%, CUDA suite 307/308 with one opt-in
-skip. Read `docs/experiments/0095` and `0096` before touching anything.
+This handover was written at `20de4e9`. Read `docs/experiments/0095` and `0096`
+for that baseline, but also read 0100, 0106 and 0107 before acting on its cost
+model. Two original diagnoses below were corrected in place after direct
+measurement: candidate metadata was not the attention bottleneck (0100), and
+the production tiled expert arena did not lack a NUMA policy (0106). Experiment
+0107 is the promotion measurement for the mechanisms that followed.
 
 ## Where we are
 
@@ -54,36 +58,50 @@ At 2,612 tokens attention is 144.8 s of 226 s and gets *worse* per token
 tokens, 112,316 at 2,612. **Two thirds of it is host, not device** — at 2,612
 tokens `maximum_device_dsv4_paged_attention_seconds` is 24.4 s of the 73.4 s.
 
-The host cost is candidate resolution: 640 entries per row (kWindow=128 sliding
-plus kIndexTopK=512 compressed), each doing a table search plus an
-`unordered_map` lookup into a page set that is **rebuilt from scratch every
-row**, with fresh `leases`/`pages` vectors. 71.9M of those at 2,612 tokens.
+**Corrected by experiment 0100:** the original attribution to candidate
+resolution and page-set construction was false. At 677 tokens, candidate
+resolution measured 0.209 s and page-set construction 0.072 s out of an
+approximately 18.5 s scoring bucket. The dominant defect was structural:
+29,111 per-(row, layer) paged-attention calls caused 553,109 kernel launches and
+6,989,956,736 bytes of page reads for a roughly 30 MB physical-page working
+set. Metadata was about 1.5% of the bucket; dispatch, synchronization and
+redundant device reads were the work to remove.
 
-Hoist the page set to per (layer, page). The obstacle is real and is why it was
-not done: KV read leases held across rows block the next row's append (a block
-refuses to be appended to while any lease is outstanding). The fix is to split
-`attention_prepared` into "project and append" and "attend", and run the layer
-as two loops — append every row's KV first, then attend them all against one
-shared page set. That is exactly the shape `attention_page`'s `batch_cuda`
-branch already uses for the Block cache, and causality is preserved because each
-row's candidate list is bounded by its own position.
+The KV-lease obstacle described by the original handover was real: appends must
+finish before any shared read lease is held. The landed implementation keeps
+the append/attend split, then gives `CudaDsv4PagedAttentionRequest` a row
+dimension and issues one physical attention request per page and layer.
+Experiment 0107 measured 86 calls, 1,655 launches and 30,564,224 page bytes,
+with median scoring falling from 27.618 s on the same-build main-equivalent arm
+to 14.320 s. The page-set hoist was a prerequisite, not the performance
+mechanism by itself.
 
-After that, the device 24.4 s wants one call per (layer, page) instead of per
-(layer, row), which means a row dimension on `CudaDsv4PagedAttentionRequest`.
-That is the bigger, later piece.
+### 2. Expert arena locality and variance — policy exists; cause remains open
 
-### 2. Expert upload NUMA placement — worth ~16 s of pure variance
+**Corrected by experiment 0106:** production rank-local TP2 prefill does not
+consume the bare unbound resident allocation. It consumes the tiled arena from
+`Dsv4ResidentWeightStore::stage`, which binds shard 0 to NUMA node 0 and shard
+1 to node 1 before first touch. Live `numa_maps` accounting found exactly
+77,913,391,104 bytes on each bound node with no expert page on the wrong node.
+The separate bare `MAP_PRIVATE|MAP_ANONYMOUS` allocation still exists, but it
+is not the source used by this production path.
 
-Three runs of identical code moved the identical 73.8 GB in 15.50, 16.11 and
-**32.38** s. `Dsv4ResidentWeightStore::stage` allocates
-`MAP_PRIVATE|MAP_ANONYMOUS` with no NUMA policy; experiments 0026 and 0050 both
-flagged this and it has never been fixed. Which half of the 156 GB arena lands
-on the far node relative to each GPU's PCIe root is decided by first-touch and
-varies per run. Bind the arena per node and re-measure. Cheap, and it also makes
-every other measurement on this path trustworthy.
+Both reference GPUs are NUMA-affine to node 1, so approximately half of every
+expert upload is deterministically remote. Each node has only about 129 GB for
+a roughly 156 GB tiled arena, making full node-1 locality impossible. Whether a
+capacity-aware asymmetric policy can improve mean upload service is a real open
+question, but it is distinct from run-to-run variance and must account for what
+becomes less local.
 
-**Until this is fixed, do not compare total prefill seconds between runs.**
-Compare per-phase terms; attention held to 1% across the same three runs.
+The 15.50/16.11/32.38 s figures quoted by the original handover came from
+page-64 runs moving approximately 468 GB, not the page-8192 production point.
+Do not reuse them as a production-page noise floor. Experiment 0107 measured
+three interleaved pairs at 677 tokens and page 8192: the main-equivalent arm
+ranged over 13.53 s total prefill, while the candidate ranged over 2.63 s. The
+spread was concentrated in expert demand wait; attention itself remained
+stable. Its cause is open because 0106 ruled out variable arena page placement.
+Use the spread measured in the campaign and operating point under test rather
+than carrying either range to another page size or build.
 
 ### 3. Activation residency — 10.3 s of attention's query term
 

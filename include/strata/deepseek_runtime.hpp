@@ -38,6 +38,14 @@ struct Dsv4RuntimeConfig {
     // Prefill is executed in bounded layer-major pages. Page 64 is the
     // accepted measured default; a value of one retains the oracle traversal.
     std::uint32_t prefill_page_tokens{64U};
+    // SM86-only tensor-core implementation for multi-row FP8 attention-page
+    // projections. Unsupported devices and all single-row calls retain the
+    // incumbent native FP8 kernel.
+    bool enable_dsv4_fp8_tensor_page{true};
+    // Batch physical prefill attention across every row in a page. Disabling
+    // this retains the mainline per-row scoring path for same-build research
+    // comparisons; decode is single-row and is unaffected either way.
+    bool enable_dsv4_batched_page_attention{true};
     // Prefill visits layers outermost over a tile of this many tokens, so a
     // layer's routed experts are streamed once per tile rather than once per
     // page. Zero tiles the whole prefill range, which is the minimum possible
@@ -164,6 +172,31 @@ struct Dsv4GraphStats {
     std::uint64_t attention_nanoseconds{};
     std::uint64_t attention_query_nanoseconds{};
     std::uint64_t attention_kv_nanoseconds{};
+    // Projection-specific wall attribution for page prefill. Matmul device
+    // intervals can overlap issue and synchronization; host RMS/RoPE work is
+    // measured separately from those wall intervals.
+    std::uint64_t attention_query_allocation_nanoseconds{};
+    std::uint64_t attention_query_weight_acquisition_nanoseconds{};
+    std::uint64_t attention_query_matmul_issue_nanoseconds{};
+    std::uint64_t attention_query_matmul_finish_nanoseconds{};
+    std::uint64_t attention_query_matmul_sync_nanoseconds{};
+    std::uint64_t attention_query_matmul_h2d_nanoseconds{};
+    std::uint64_t attention_query_matmul_kernel_nanoseconds{};
+    std::uint64_t attention_query_matmul_d2h_nanoseconds{};
+    std::uint64_t attention_query_rank_norm_nanoseconds{};
+    std::uint64_t attention_query_finish_nanoseconds{};
+    std::uint64_t attention_query_rms_cpu_nanoseconds{};
+    std::uint64_t attention_query_rope_cpu_nanoseconds{};
+    std::uint64_t attention_kv_allocation_nanoseconds{};
+    std::uint64_t attention_kv_weight_acquisition_nanoseconds{};
+    std::uint64_t attention_kv_matmul_issue_nanoseconds{};
+    std::uint64_t attention_kv_matmul_finish_nanoseconds{};
+    std::uint64_t attention_kv_matmul_sync_nanoseconds{};
+    std::uint64_t attention_kv_matmul_h2d_nanoseconds{};
+    std::uint64_t attention_kv_matmul_kernel_nanoseconds{};
+    std::uint64_t attention_kv_matmul_d2h_nanoseconds{};
+    std::uint64_t attention_kv_norm_nanoseconds{};
+    std::uint64_t attention_kv_rope_nanoseconds{};
     std::uint64_t attention_projection_matmul_calls{};
     std::uint64_t attention_projection_matmul_rows{};
     std::uint64_t attention_index_nanoseconds{};
@@ -174,6 +207,20 @@ struct Dsv4GraphStats {
     std::uint64_t attention_index_scalar_dispatches{};
     std::uint64_t attention_cuda_dispatches{};
     std::uint64_t attention_scalar_dispatches{};
+    // Physical-attention host metadata attribution. A page-set build is one
+    // container lifetime; pages counts the map entries populated in those
+    // sets. Candidate resolution is the row-local block-table search plus
+    // page-map lookup, excluding the measured map-miss build interval.
+    std::uint64_t attention_page_set_builds{};
+    std::uint64_t attention_page_set_pages{};
+    std::uint64_t attention_page_set_build_nanoseconds{};
+    std::uint64_t attention_candidate_resolutions{};
+    std::uint64_t attention_candidate_resolution_nanoseconds{};
+    // Row-batched physical-attention remainder attribution. Index preparation
+    // is selection against the compressor state already advanced by append;
+    // it must never include a second compressor pass.
+    std::uint64_t attention_page_index_selection_nanoseconds{};
+    std::uint64_t attention_page_weight_acquire_nanoseconds{};
     std::uint64_t attention_score_nanoseconds{};
     std::uint64_t attention_output_nanoseconds{};
     std::uint64_t moe_nanoseconds{};

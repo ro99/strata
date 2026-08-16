@@ -34,6 +34,56 @@ std::uint64_t elapsed_nanoseconds_since(
             std::chrono::steady_clock::now() - started).count());
 }
 
+enum class SynchronizationSubsystem {
+    Weight,
+    Attention,
+    Projection,
+    Mhc,
+    Moe,
+    Other,
+};
+
+void record_synchronization(CudaBackendStats::Device& stats,
+                            SynchronizationSubsystem subsystem,
+                            std::uint64_t calls,
+                            std::uint64_t nanoseconds) noexcept {
+    stats.synchronization_calls += calls;
+    stats.synchronization_nanoseconds += nanoseconds;
+    CudaSynchronizationStats* target = nullptr;
+    switch (subsystem) {
+        case SynchronizationSubsystem::Weight:
+            target = &stats.weight_synchronization;
+            break;
+        case SynchronizationSubsystem::Attention:
+            target = &stats.attention_synchronization;
+            break;
+        case SynchronizationSubsystem::Projection:
+            target = &stats.projection_synchronization;
+            break;
+        case SynchronizationSubsystem::Mhc:
+            target = &stats.mhc_synchronization;
+            break;
+        case SynchronizationSubsystem::Moe:
+            target = &stats.moe_synchronization;
+            break;
+        case SynchronizationSubsystem::Other:
+            target = &stats.other_synchronization;
+            break;
+    }
+    target->calls += calls;
+    target->nanoseconds += nanoseconds;
+}
+
+std::uint64_t event_milliseconds_to_nanoseconds(
+    float milliseconds, std::uint64_t& clamped_samples) noexcept {
+    if (!std::isfinite(milliseconds) || milliseconds < 0.0F) {
+        ++clamped_samples;
+        return 0U;
+    }
+    return static_cast<std::uint64_t>(std::llround(
+        static_cast<double>(milliseconds) * 1.0e6));
+}
+
 ValidationResult cuda_error(cudaError_t status, const char* operation) {
     ValidationResult result;
     if (status != cudaSuccess) {
@@ -157,6 +207,26 @@ __device__ float quantize_e4m3_value(float value) {
     return copysignf(quantized, value);
 }
 
+__device__ unsigned char encode_e4m3_value(float value) {
+    const unsigned char sign = signbit(value) ? 0x80U : 0U;
+    const float magnitude = fabsf(value);
+    if (magnitude == 0.0F) return sign;
+    if (magnitude < 0.015625F) {
+        const auto mantissa = static_cast<unsigned int>(
+            rintf(ldexpf(magnitude, 9)));
+        return static_cast<unsigned char>(sign | min(mantissa, 7U));
+    }
+    int exponent = 0;
+    const float fraction = frexpf(magnitude, &exponent);
+    const auto encoded_exponent = static_cast<unsigned int>(exponent + 6);
+    const auto mantissa = static_cast<unsigned int>(
+        rintf((fraction * 2.0F - 1.0F) * 8.0F));
+    const auto maximum_mantissa = encoded_exponent == 15U ? 6U : 7U;
+    return static_cast<unsigned char>(
+        sign | (min(encoded_exponent, 15U) << 3U) |
+        min(mantissa, maximum_mantissa));
+}
+
 __global__ void quantize_activation_e4m3_kernel(float* values,
                                                 std::uint64_t columns,
                                                 std::uint32_t rows) {
@@ -182,6 +252,49 @@ __global__ void quantize_activation_e4m3_kernel(float* values,
     if (maximum[0] > 0.0F) scale = exp2f(ceilf(log2f(maximum[0] / 448.0F)));
     auto& value = values[static_cast<std::uint64_t>(row) * columns + index];
     value = quantize_e4m3_value(value / scale) * scale;
+}
+
+// Compact form of the same activation simulation. The value byte is the
+// unscaled E4M3 code and one E8M0 byte carries the per-row, per-K128 scale.
+// Decoding code*scale reproduces quantize_activation_e4m3_kernel exactly but
+// avoids retaining its four-byte encoded-value workspace beside the tensor
+// projection output.
+__global__ void quantize_activation_e4m3_bytes_kernel(
+    unsigned char* values, unsigned char* scales, const float* source,
+    std::uint64_t columns, std::uint32_t rows) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint64_t group_begin =
+        static_cast<std::uint64_t>(blockIdx.x) * 128U;
+    if (row >= rows || group_begin >= columns) return;
+    const std::uint64_t index = group_begin + threadIdx.x;
+    const float value = index < columns
+                            ? source[static_cast<std::uint64_t>(row) * columns +
+                                     index]
+                            : 0.0F;
+    __shared__ float maximum[128];
+    maximum[threadIdx.x] = fabsf(value);
+    __syncthreads();
+    for (unsigned int stride = 64U; stride != 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) {
+            maximum[threadIdx.x] = fmaxf(maximum[threadIdx.x],
+                                         maximum[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    int scale_exponent = 0;
+    float scale = 1.0F;
+    if (maximum[0] > 0.0F) {
+        scale_exponent = static_cast<int>(ceilf(log2f(maximum[0] / 448.0F)));
+        scale = exp2f(static_cast<float>(scale_exponent));
+    }
+    if (threadIdx.x == 0U) {
+        scales[static_cast<std::uint64_t>(row) * gridDim.x + blockIdx.x] =
+            static_cast<unsigned char>(scale_exponent + 127);
+    }
+    if (index < columns) {
+        values[static_cast<std::uint64_t>(row) * columns + index] =
+            encode_e4m3_value(quantize_e4m3_value(value / scale));
+    }
 }
 
 // The persistent mHC workspace stores its layer input as BF16. Decode and
@@ -771,6 +884,130 @@ __global__ void native_fp8_matmul_kernel(
         const std::uint64_t output_index =
             static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
+    }
+}
+
+constexpr std::uint32_t kDsv4Fp8TensorBlockM = 64U;
+constexpr std::uint32_t kDsv4Fp8TensorBlockN = 128U;
+constexpr std::uint32_t kDsv4Fp8TensorBlockK = 128U;
+
+// SM86 page-projection path. Both operands remain byte FP8 in global memory;
+// each tile widens them exactly to BF16 in shared memory and uses BF16 WMMA.
+// Activation scales are powers of two and are applied during the exact widen;
+// the weight block scale is applied after each K128 tensor dot, matching the
+// block-scaled checkpoint arithmetic screened in experiments 0103/0104.
+__global__ void dsv4_fp8_decode_bf16_tensor_kernel(
+    float* output, const unsigned char* input,
+    const unsigned char* input_scales, const unsigned char* weights,
+    const unsigned char* weight_scales, std::uint32_t batch,
+    std::uint32_t columns, std::uint32_t rows) {
+    using namespace nvcuda;
+    __shared__ __nv_bfloat16 shared_a[
+        kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockK];
+    __shared__ __nv_bfloat16 shared_b[
+        kDsv4Fp8TensorBlockK * kDsv4Fp8TensorBlockN];
+
+    const std::uint32_t tile_m = blockIdx.y * kDsv4Fp8TensorBlockM;
+    const std::uint32_t tile_n = blockIdx.x * kDsv4Fp8TensorBlockN;
+    const std::uint32_t warp = threadIdx.x / warpSize;
+    const std::uint32_t warp_m = warp & 3U;
+    const std::uint32_t warp_n_group = warp >> 2U;
+    constexpr std::uint32_t fragments_per_warp = 4U;
+    float totals[fragments_per_warp][8]{};
+    const std::uint32_t scale_columns = columns / kDsv4Fp8TensorBlockK;
+
+    for (std::uint32_t tile_k = 0U; tile_k < columns;
+         tile_k += kDsv4Fp8TensorBlockK) {
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockK;
+             index += blockDim.x) {
+            const std::uint32_t local_m = index / kDsv4Fp8TensorBlockK;
+            const std::uint32_t local_k = index % kDsv4Fp8TensorBlockK;
+            const std::uint32_t global_m = tile_m + local_m;
+            float value = 0.0F;
+            if (global_m < batch) {
+                const auto encoded = input[
+                    static_cast<std::uint64_t>(global_m) * columns + tile_k +
+                    local_k];
+                const auto scale = input_scales[
+                    static_cast<std::uint64_t>(global_m) * scale_columns +
+                    tile_k / kDsv4Fp8TensorBlockK];
+                value = fp8_e4m3_value(encoded) * fp8_e8m0_scale(scale);
+            }
+            shared_a[index] = __float2bfloat16_rn(value);
+        }
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockK * kDsv4Fp8TensorBlockN;
+             index += blockDim.x) {
+            const std::uint32_t local_k = index / kDsv4Fp8TensorBlockN;
+            const std::uint32_t local_n = index % kDsv4Fp8TensorBlockN;
+            const std::uint32_t global_n = tile_n + local_n;
+            const auto encoded = weights[
+                static_cast<std::uint64_t>(global_n) * columns + tile_k +
+                local_k];
+            shared_b[index] = __float2bfloat16_rn(fp8_e4m3_value(encoded));
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> a_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> b_fragment;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+            accumulators[fragments_per_warp];
+        for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+             ++fragment) {
+            wmma::fill_fragment(accumulators[fragment], 0.0F);
+        }
+        for (std::uint32_t local_k = 0U;
+             local_k < kDsv4Fp8TensorBlockK; local_k += 16U) {
+            wmma::load_matrix_sync(
+                a_fragment,
+                shared_a + warp_m * 16U * kDsv4Fp8TensorBlockK + local_k,
+                kDsv4Fp8TensorBlockK);
+            for (std::uint32_t fragment = 0U;
+                 fragment < fragments_per_warp; ++fragment) {
+                const std::uint32_t fragment_n =
+                    warp_n_group * fragments_per_warp + fragment;
+                wmma::load_matrix_sync(
+                    b_fragment,
+                    shared_b + local_k * kDsv4Fp8TensorBlockN +
+                        fragment_n * 16U,
+                    kDsv4Fp8TensorBlockN);
+                wmma::mma_sync(accumulators[fragment], a_fragment, b_fragment,
+                               accumulators[fragment]);
+            }
+        }
+        const float scale = fp8_e8m0_scale(weight_scales[
+            (tile_n / kDsv4Fp8TensorBlockN) * scale_columns +
+            tile_k / kDsv4Fp8TensorBlockK]);
+        for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+             ++fragment) {
+#pragma unroll
+            for (std::uint32_t element = 0U;
+                 element < accumulators[fragment].num_elements; ++element) {
+                totals[fragment][element] +=
+                    accumulators[fragment].x[element] * scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+         ++fragment) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> result;
+#pragma unroll
+        for (std::uint32_t element = 0U;
+             element < result.num_elements; ++element) {
+            result.x[element] = totals[fragment][element];
+        }
+        const std::uint32_t fragment_n =
+            warp_n_group * fragments_per_warp + fragment;
+        float* destination = output +
+            static_cast<std::uint64_t>(tile_m + warp_m * 16U) * rows +
+            tile_n + fragment_n * 16U;
+        wmma::store_matrix_sync(destination, result, rows,
+                                wmma::mem_row_major);
     }
 }
 
@@ -3025,7 +3262,7 @@ constexpr std::uint32_t kDsv4PagedCandidatesPerGroup = 32U;
 struct Dsv4DevicePhysicalPage {
     const std::uint8_t* data{};
     std::uint32_t rows{};
-    std::uint32_t reserved{};
+    std::uint32_t flat_begin{};
 };
 
 struct Dsv4DeviceAttentionCandidate {
@@ -3160,40 +3397,33 @@ __device__ __forceinline__ float dsv4_decode_e4m3fn(
 
 __global__ void dsv4_materialize_physical_pages(
     const Dsv4DevicePhysicalPage* pages, std::uint32_t page_count,
-    const Dsv4DeviceAttentionCandidate* candidates,
-    std::uint32_t candidate_count, __nv_bfloat16* kv,
+    __nv_bfloat16* kv,
     unsigned int* failure) {
-    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
-                       threadIdx.x;
-    const auto count = static_cast<std::uint64_t>(candidate_count) *
+    const auto page_index = static_cast<std::uint32_t>(blockIdx.y);
+    if (page_index >= page_count) return;
+    const auto page = pages[page_index];
+    const auto local_index = static_cast<std::uint64_t>(blockIdx.x) *
+                                 blockDim.x + threadIdx.x;
+    const auto count = static_cast<std::uint64_t>(page.rows) *
                        kDsv4PagedHeadDim;
-    if (index >= count) return;
+    if (local_index >= count) return;
+    const auto index = static_cast<std::uint64_t>(page.flat_begin) *
+                           kDsv4PagedHeadDim + local_index;
     auto* output_bits = reinterpret_cast<std::uint16_t*>(kv);
-    const auto candidate_index = static_cast<std::uint32_t>(
-        index / kDsv4PagedHeadDim);
+    const auto row = static_cast<std::uint32_t>(
+        local_index / kDsv4PagedHeadDim);
     const auto dimension = static_cast<std::uint32_t>(
-        index % kDsv4PagedHeadDim);
-    const auto candidate = candidates[candidate_index];
-    if (candidate.valid == 0U) {
-        output_bits[index] = 0U;
-        return;
-    }
-    if (candidate.page >= page_count) {
-        atomicExch(failure, 2U);
-        output_bits[index] = 0U;
-        return;
-    }
-    const auto page = pages[candidate.page];
-    if (page.data == nullptr || candidate.row >= page.rows) {
+        local_index % kDsv4PagedHeadDim);
+    if (page.data == nullptr || row >= page.rows) {
         atomicExch(failure, 3U);
         output_bits[index] = 0U;
         return;
     }
-    const auto data_offset = static_cast<std::uint64_t>(candidate.row) * 576U;
+    const auto data_offset = static_cast<std::uint64_t>(row) * 576U;
     if (dimension < 448U) {
         const auto scale_code =
             page.data[static_cast<std::uint64_t>(page.rows) * 576U +
-                      static_cast<std::uint64_t>(candidate.row) * 8U +
+                      static_cast<std::uint64_t>(row) * 8U +
                       dimension / 64U];
         if (scale_code == 255U) {
             atomicExch(failure, 4U);
@@ -3232,10 +3462,14 @@ __device__ __forceinline__ float dsv4_warp_max(float value) {
 
 __global__ void dsv4_finish_maximums(
     const __nv_bfloat16* scores,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* sink,
     float* maximums, std::uint32_t candidate_count,
-    std::uint32_t boundaries) {
+    std::uint32_t score_width, std::uint32_t boundaries) {
     const auto head = blockIdx.x;
+    const auto row = blockIdx.y;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
     const auto lane = threadIdx.x & 31U;
     const auto warp = threadIdx.x >> 5U;
     __shared__ float warp_maximums[4];
@@ -3247,9 +3481,12 @@ __global__ void dsv4_finish_maximums(
                                threadIdx.x;
         float value = __int_as_float(0xff80'0000);
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
+            const auto descriptor = candidates[candidate];
+            const auto flat = pages[descriptor.page].flat_begin +
+                              descriptor.row;
             value = __bfloat162float(
-                scores[static_cast<std::uint64_t>(head) * candidate_count +
-                       candidate]);
+                scores[(static_cast<std::uint64_t>(row) *
+                            kDsv4PagedHeads + head) * score_width + flat]);
         }
         value = dsv4_warp_max(value);
         if (lane == 0U) warp_maximums[warp] = value;
@@ -3275,10 +3512,16 @@ __device__ __forceinline__ float dsv4_triton_exp(float value) {
 
 __global__ void dsv4_finish_denominators(
     const __nv_bfloat16* scores,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* sink,
     const float* maximums, float* denominators,
-    std::uint32_t candidate_count, std::uint32_t boundaries) {
+    std::uint32_t candidate_count, std::uint32_t score_width,
+    std::uint32_t boundaries) {
     const auto head = blockIdx.x;
+    const auto row = blockIdx.y;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
+    denominators += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
     const auto lane = threadIdx.x & 31U;
     const auto warp = threadIdx.x >> 5U;
     __shared__ float warp_sums[4];
@@ -3292,9 +3535,12 @@ __global__ void dsv4_finish_denominators(
                                threadIdx.x;
         float weight = 0.0F;
         if (candidate < candidate_count && candidates[candidate].valid != 0U) {
+            const auto descriptor = candidates[candidate];
+            const auto flat = pages[descriptor.page].flat_begin +
+                              descriptor.row;
             const auto score = __bfloat162float(
-                scores[static_cast<std::uint64_t>(head) * candidate_count +
-                       candidate]);
+                scores[(static_cast<std::uint64_t>(row) *
+                            kDsv4PagedHeads + head) * score_width + flat]);
             weight = dsv4_triton_exp(score - maximums[head]);
         }
         for (int offset = 16; offset > 0; offset /= 2) {
@@ -3313,42 +3559,54 @@ __global__ void dsv4_finish_denominators(
 
 __device__ __forceinline__ float dsv4_candidate_value(
     const __nv_bfloat16* kv,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates,
     std::uint32_t candidate, std::uint32_t dimension) {
     if (candidates[candidate].valid == 0U) return 0.0F;
+    const auto descriptor = candidates[candidate];
+    const auto flat = pages[descriptor.page].flat_begin + descriptor.row;
     return __bfloat162float(
-        kv[static_cast<std::uint64_t>(candidate) * kDsv4PagedHeadDim +
+        kv[static_cast<std::uint64_t>(flat) * kDsv4PagedHeadDim +
            dimension]);
 }
 
 __device__ __forceinline__ float dsv4_candidate_group_sum(
-    const __nv_bfloat16* kv, const float* weights,
+    const __nv_bfloat16* kv, const Dsv4DevicePhysicalPage* pages,
+    const float* weights,
     const Dsv4DeviceAttentionCandidate* candidates, std::uint32_t dimension,
     std::uint32_t group) {
     const auto second = group + kDsv4PagedCandidateGroups;
     float sum = __fmul_rn(
         weights[second],
-        dsv4_candidate_value(kv, candidates, second, dimension));
+        dsv4_candidate_value(kv, pages, candidates, second, dimension));
     sum = __fmaf_rn(
         weights[group],
-        dsv4_candidate_value(kv, candidates, group, dimension), sum);
+        dsv4_candidate_value(kv, pages, candidates, group, dimension), sum);
 #pragma unroll
     for (std::uint32_t index = 2U;
          index < kDsv4PagedCandidatesPerGroup; ++index) {
         const auto offset = group + kDsv4PagedCandidateGroups * index;
         sum = __fmaf_rn(
             weights[offset],
-            dsv4_candidate_value(kv, candidates, offset, dimension), sum);
+            dsv4_candidate_value(
+                kv, pages, candidates, offset, dimension), sum);
     }
     return sum;
 }
 
 __global__ void dsv4_finish_values(
     const __nv_bfloat16* scores,
+    const Dsv4DevicePhysicalPage* pages,
     const Dsv4DeviceAttentionCandidate* candidates, const float* maximums,
     const __nv_bfloat16* kv, float* values,
-    std::uint32_t candidate_count, std::uint32_t boundaries) {
+    std::uint32_t candidate_count, std::uint32_t score_width,
+    std::uint32_t boundaries) {
     const auto head = blockIdx.x;
+    const auto row = blockIdx.z;
+    candidates += static_cast<std::uint64_t>(row) * candidate_count;
+    maximums += static_cast<std::uint64_t>(row) * kDsv4PagedHeads;
+    values += static_cast<std::uint64_t>(row) * kDsv4PagedHeads *
+              kDsv4PagedHeadDim;
     const auto dimension = blockIdx.y * kDsv4PagedDimensionsPerBlock +
                            threadIdx.x;
     __shared__ float weights[kDsv4PagedCandidateBlock];
@@ -3363,9 +3621,11 @@ __global__ void dsv4_finish_values(
                 ? candidates[candidate] : Dsv4DeviceAttentionCandidate{};
             block_candidates[threadIdx.x] = descriptor;
             if (descriptor.valid != 0U) {
+                const auto flat = pages[descriptor.page].flat_begin +
+                                  descriptor.row;
                 const auto score = __bfloat162float(
-                    scores[static_cast<std::uint64_t>(head) * candidate_count +
-                           candidate]);
+                    scores[(static_cast<std::uint64_t>(row) *
+                                kDsv4PagedHeads + head) * score_width + flat]);
                 weights[threadIdx.x] = dsv4_triton_exp(
                     score - maximums[head]);
             } else {
@@ -3373,16 +3633,14 @@ __global__ void dsv4_finish_values(
             }
         }
         __syncthreads();
-        const auto* block_kv = kv +
-            static_cast<std::uint64_t>(candidate_start) * kDsv4PagedHeadDim;
         const auto group0 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 0U);
+            kv, pages, weights, block_candidates, dimension, 0U);
         const auto group1 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 1U);
+            kv, pages, weights, block_candidates, dimension, 1U);
         const auto group2 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 2U);
+            kv, pages, weights, block_candidates, dimension, 2U);
         const auto group3 = dsv4_candidate_group_sum(
-            block_kv, weights, block_candidates, dimension, 3U);
+            kv, pages, weights, block_candidates, dimension, 3U);
         const auto pair02 = __fadd_rn(group0, group2);
         const auto pair13 = __fadd_rn(group1, group3);
         running_value = __fadd_rn(
@@ -3395,32 +3653,40 @@ __global__ void dsv4_finish_values(
 
 __global__ void dsv4_divide_and_store(
     const float* values, const float* denominators,
-    __nv_bfloat16* output) {
+    __nv_bfloat16* output, std::uint64_t elements,
+    std::uint64_t row_elements, std::uint64_t output_row_stride,
+    std::uint64_t output_group_offset) {
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
-    if (index >= static_cast<std::uint64_t>(kDsv4PagedHeads) *
-                     kDsv4PagedHeadDim) {
-        return;
-    }
-    const auto head = static_cast<std::uint32_t>(index / kDsv4PagedHeadDim);
+    if (index >= elements) return;
+    const auto row_offset = index % row_elements;
+    const auto row = index / row_elements;
+    const auto head = static_cast<std::uint32_t>(
+        row_offset / kDsv4PagedHeadDim);
     float divided;
     asm("div.full.f32 %0, %1, %2;"
         : "=f"(divided)
-        : "f"(values[index]), "f"(denominators[head]));
-    output[index] = __float2bfloat16_rn(divided);
+        : "f"(values[index]),
+          "f"(denominators[row * kDsv4PagedHeads + head]));
+    output[row * output_row_stride + output_group_offset + row_offset] =
+        __float2bfloat16_rn(divided);
 }
 
 __global__ void dsv4_inverse_rope_decode(
     const __nv_bfloat16* attended, const float* cosines,
-    const float* sines, float* output, std::uint32_t heads) {
+    const float* sines, float* output, std::uint32_t rows,
+    std::uint32_t heads) {
     constexpr std::uint32_t rope = 64U;
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
-    const auto elements = static_cast<std::uint64_t>(heads) *
-                          kDsv4PagedHeadDim;
+    const auto row_elements = static_cast<std::uint64_t>(heads) *
+                              kDsv4PagedHeadDim;
+    const auto elements = static_cast<std::uint64_t>(rows) *
+                          row_elements;
     if (index >= elements) return;
     const auto dimension = static_cast<std::uint32_t>(
         index % kDsv4PagedHeadDim);
+    const auto row = index / row_elements;
     if (dimension < kDsv4PagedHeadDim - rope) {
         output[index] = __bfloat162float(attended[index]);
         return;
@@ -3430,8 +3696,8 @@ __global__ void dsv4_inverse_rope_decode(
     const auto pair_begin = index - rope_dimension + pair * 2U;
     const float first = __bfloat162float(attended[pair_begin]);
     const float second = __bfloat162float(attended[pair_begin + 1U]);
-    const float cosine = cosines[pair];
-    const float sine = sines[pair];
+    const float cosine = cosines[row * (rope / 2U) + pair];
+    const float sine = sines[row * (rope / 2U) + pair];
     const float value = (rope_dimension & 1U) == 0U
         ? __fsub_rn(__fmul_rn(first, cosine), __fmul_rn(second, sine))
         : __fadd_rn(__fmul_rn(second, cosine), __fmul_rn(first, sine));
@@ -4204,6 +4470,35 @@ struct alignas(256) Dsv4MhcWorkspace {
     unsigned int failure{};
 };
 
+__global__ void dsv4_store_mhc_page_branches(
+    const float* values, __nv_bfloat16* diagnostic,
+    Dsv4MhcWorkspace* slot_arena, const std::uint32_t* slots,
+    std::uint32_t rows) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const auto elements = static_cast<std::uint64_t>(rows) * kDsv4MhcHidden;
+    if (index >= elements) return;
+    const auto row = static_cast<std::uint32_t>(index / kDsv4MhcHidden);
+    const auto column = static_cast<std::uint32_t>(index % kDsv4MhcHidden);
+    const auto encoded = __float2bfloat16_rn(values[index]);
+    diagnostic[index] = encoded;
+    if (slot_arena != nullptr) {
+        slot_arena[slots[row]].branch[column] = encoded;
+    }
+}
+
+__global__ void dsv4_scatter_encoded_mhc_page_branches(
+    const __nv_bfloat16* branches, Dsv4MhcWorkspace* slot_arena,
+    const std::uint32_t* slots, std::uint32_t rows) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const auto elements = static_cast<std::uint64_t>(rows) * kDsv4MhcHidden;
+    if (index >= elements) return;
+    const auto row = static_cast<std::uint32_t>(index / kDsv4MhcHidden);
+    const auto column = static_cast<std::uint32_t>(index % kDsv4MhcHidden);
+    slot_arena[slots[row]].branch[column] = branches[index];
+}
+
 // One prompt row's fused mHC state. The device workspace holds the residual
 // pair, branch, weighted, layer input, partial reductions, pre/post, the
 // Sinkhorn combination, and the router logits; the three scalars are the host
@@ -4694,6 +4989,7 @@ struct CudaBackend::Impl {
         bool dsv4_paged_attention_supported{};
         bool dsv4_mhc_supported{};
         bool lightning_index_supported{};
+        bool dsv4_fp8_tensor_page_supported{};
     };
 
     std::unordered_map<int, DeviceState> devices;
@@ -4994,6 +5290,8 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         state.dsv4_mhc_supported =
             properties.major == 8 && properties.minor == 6;
         state.lightning_index_supported = state.flash_attention_supported;
+        state.dsv4_fp8_tensor_page_supported =
+            properties.major == 8 && properties.minor == 6;
         if (auto status = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
@@ -5418,8 +5716,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         if (allocation_calls != 0U) {
             device_stats.weight_allocation_bytes += payload_bytes;
         }
-        device_stats.synchronization_calls += synchronizations;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(device_stats, SynchronizationSubsystem::Weight,
+                               synchronizations, wait_nanoseconds);
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
         device_stats.weight_allocation_nanoseconds += allocation_nanoseconds;
         device_stats.weight_copy_nanoseconds += copy_nanoseconds;
@@ -5467,8 +5765,8 @@ ValidationResult CudaBackend::synchronize_uploads(int device) {
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(device_stats, SynchronizationSubsystem::Weight,
+                               1U, wait_nanoseconds);
         device_stats.upload_wait_nanoseconds += wait_nanoseconds;
     }
     return result;
@@ -5525,8 +5823,8 @@ ValidationResult CudaBackend::upload_buffer(
         stats.activation_h2d_nanoseconds += wait_nanoseconds;
         ++stats.workspace_allocation_calls;
         stats.workspace_allocation_bytes += bytes.size();
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
+                               wait_nanoseconds);
     }
     output.impl_ = std::move(target);
     return result;
@@ -6095,8 +6393,8 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         stats.matmul_calls += matmul_calls;
         stats.flash_attention_calls += layers.size();
         stats.flash_attention_kernel_launches += layers.size();
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
+                               wait_nanoseconds);
     }
     if (numerical_error != 0U) {
         result.errors.emplace_back("Gemma 4 CUDA decode produced a non-finite value");
@@ -6108,9 +6406,12 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                                      std::span<const float> input,
                                      std::uint32_t rows,
                                      std::span<float> output,
-                                     bool round_bf16_output) {
+                                     bool round_bf16_output,
+                                     CudaMatmulProfile* profile,
+                                     bool dsv4_fp8_tensor_page) {
     return matmul_impl(weight, input, rows, 0U, 0U, output, 0.0F,
-                       round_bf16_output);
+                       round_bf16_output, profile,
+                       dsv4_fp8_tensor_page);
 }
 
 ValidationResult CudaBackend::matmul_softcap(
@@ -6159,6 +6460,12 @@ ValidationResult CudaBackend::validate_lightning_index_device(int device) const 
             "Lightning Indexer CUDA kernel supports only SM86 and SM120 devices");
     }
     return result;
+}
+
+bool CudaBackend::dsv4_fp8_tensor_page_supported(int device) const noexcept {
+    const auto found = impl_->devices.find(device);
+    return found != impl_->devices.end() &&
+           found->second.dsv4_fp8_tensor_page_supported;
 }
 
 ValidationResult CudaBackend::validate_dsv4_mhc_device(int device) const {
@@ -6524,8 +6831,8 @@ ValidationResult CudaBackend::lightning_index(
         stats.activation_d2h_bytes += output_bytes + sizeof(host_error);
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -7362,8 +7669,8 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
         stats.activation_d2h_bytes += output_bytes + sizeof(host_error);
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -7834,8 +8141,8 @@ ValidationResult CudaBackend::flash_attention(
         stats.flash_attention_nanoseconds += operation_nanoseconds;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
     }
     if (numerical_error != 0U) {
         result.errors.emplace_back(
@@ -7856,11 +8163,19 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     int device, const CudaDsv4PagedAttentionRequest& request,
     std::span<float> output) {
     ValidationResult result;
-    constexpr std::uint64_t output_elements =
+    const auto call_started = std::chrono::steady_clock::now();
+    constexpr std::uint64_t row_output_elements =
         static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
-    const auto candidates = static_cast<std::uint32_t>(
-        request.candidates.size());
-    if (request.queries.size() != output_elements ||
+    const auto rows = request.rows;
+    const auto candidates = request.candidate_width == 0U && rows == 1U
+        ? static_cast<std::uint32_t>(request.candidates.size())
+        : request.candidate_width;
+    const auto total_candidates = static_cast<std::uint64_t>(rows) *
+                                  candidates;
+    const auto output_elements = static_cast<std::uint64_t>(rows) *
+                                 row_output_elements;
+    if (rows == 0U || request.candidates.size() != total_candidates ||
+        request.queries.size() != output_elements ||
         request.head_sinks.size() != kDsv4PagedHeads ||
         output.size() != output_elements || request.pages.empty() ||
         request.pages.size() > std::numeric_limits<std::uint32_t>::max() ||
@@ -7902,6 +8217,8 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     }
 
     std::uint64_t page_bytes = 0U;
+    std::uint64_t flat_rows64 = 0U;
+    std::uint32_t maximum_page_rows = 0U;
     for (const auto& page : request.pages) {
         if (page.buffer == nullptr || !page.buffer->valid() ||
             page.buffer->device() != device ||
@@ -7915,7 +8232,16 @@ ValidationResult CudaBackend::dsv4_paged_attention(
             return result;
         }
         page_bytes += page.buffer->device_bytes();
+        flat_rows64 += page.rows;
+        maximum_page_rows = std::max(maximum_page_rows, page.rows);
     }
+    if (flat_rows64 == 0U ||
+        flat_rows64 > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek paged attention flat page extent overflows");
+        return result;
+    }
+    const auto flat_rows = static_cast<std::uint32_t>(flat_rows64);
     for (const auto& candidate : request.candidates) {
         if (candidate.valid &&
             (candidate.page >= request.pages.size() ||
@@ -7948,7 +8274,7 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     if (!checked_bytes(request.pages.size(), 1U,
                        sizeof(Dsv4DevicePhysicalPage),
                        page_descriptor_bytes) ||
-        !checked_bytes(request.candidates.size(), 1U,
+        !checked_bytes(total_candidates, 1U,
                        sizeof(Dsv4DeviceAttentionCandidate),
                        candidate_bytes) ||
         !checked_bytes(output_elements, 1U, sizeof(std::uint16_t),
@@ -7976,11 +8302,12 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     std::uint64_t maximum_bytes = 0U;
     std::uint64_t value_bytes = 0U;
     std::uint64_t output_bytes = 0U;
-    if (!checked_bytes(candidates, kDsv4PagedHeadDim,
+    if (!checked_bytes(flat_rows, kDsv4PagedHeadDim,
                        sizeof(std::uint16_t), kv_bytes) ||
-        !checked_bytes(kDsv4PagedHeads, candidates,
+        !checked_bytes(rows, static_cast<std::uint64_t>(kDsv4PagedHeads) *
+                                 flat_rows,
                        sizeof(std::uint16_t), score_bytes) ||
-        !checked_bytes(kDsv4PagedHeads, 1U, sizeof(float), maximum_bytes) ||
+        !checked_bytes(rows, kDsv4PagedHeads, sizeof(float), maximum_bytes) ||
         !checked_bytes(output_elements, 1U, sizeof(float), value_bytes) ||
         !checked_bytes(output_elements, 1U, sizeof(std::uint16_t),
                        output_bytes) ||
@@ -8055,11 +8382,13 @@ ValidationResult CudaBackend::dsv4_paged_attention(
 
     auto* host_pages = reinterpret_cast<Dsv4DevicePhysicalPage*>(
         state.dsv4_attention_host_upload + page_offset);
+    std::uint32_t flat_begin = 0U;
     for (std::size_t index = 0U; index < request.pages.size(); ++index) {
         const auto& page = request.pages[index];
         host_pages[index] = {
             static_cast<const std::uint8_t*>(page.buffer->impl_->data),
-            page.rows, 0U};
+            page.rows, flat_begin};
+        flat_begin += page.rows;
     }
     auto* host_candidates =
         reinterpret_cast<Dsv4DeviceAttentionCandidate*>(
@@ -8128,13 +8457,14 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         return cuda_error(status, "clear DeepSeek paged attention status");
     }
     constexpr std::uint32_t threads = 256U;
-    const auto kv_elements = static_cast<std::uint64_t>(candidates) *
-                             kDsv4PagedHeadDim;
-    const auto kv_blocks = static_cast<std::uint32_t>(
-        (kv_elements + threads - 1U) / threads);
-    dsv4_materialize_physical_pages<<<kv_blocks, threads, 0U, state.stream>>>(
+    const auto page_elements = static_cast<std::uint64_t>(maximum_page_rows) *
+                               kDsv4PagedHeadDim;
+    const dim3 kv_grid(
+        static_cast<unsigned int>((page_elements + threads - 1U) / threads),
+        static_cast<unsigned int>(request.pages.size()));
+    dsv4_materialize_physical_pages<<<kv_grid, threads, 0U, state.stream>>>(
         device_pages, static_cast<std::uint32_t>(request.pages.size()),
-        device_candidates, candidates, device_kv, device_failure);
+        device_kv, device_failure);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch DeepSeek physical-page materialization");
@@ -8143,45 +8473,48 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     constexpr float beta = 0.0F;
     if (auto status = cublasGemmEx(
             state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-            static_cast<int>(candidates),
-            static_cast<int>(kDsv4PagedHeads),
+            static_cast<int>(flat_rows),
+            static_cast<int>(rows * kDsv4PagedHeads),
             static_cast<int>(kDsv4PagedHeadDim), &alpha,
             device_kv, CUDA_R_16BF,
             static_cast<int>(kDsv4PagedHeadDim),
             device_query, CUDA_R_16BF,
             static_cast<int>(kDsv4PagedHeadDim), &beta,
-            device_scores, CUDA_R_16BF, static_cast<int>(candidates),
+            device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         status != CUBLAS_STATUS_SUCCESS) {
         return cublas_error(status,
                             "execute DeepSeek paged attention BF16 scores");
     }
     const auto score_elements = static_cast<std::uint64_t>(
-        kDsv4PagedHeads) * candidates;
+        rows) * kDsv4PagedHeads * flat_rows;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
         device_scores, score_elements, request.scale);
     const auto boundaries = candidates / kDsv4PagedCandidateBlock;
-    dsv4_finish_maximums<<<kDsv4PagedHeads,
+    dsv4_finish_maximums<<<dim3{kDsv4PagedHeads, rows},
                            kDsv4PagedCandidateBlock, 0U, state.stream>>>(
-        device_scores, device_candidates, device_sink, device_maximums,
-        candidates, boundaries);
-    dsv4_finish_denominators<<<kDsv4PagedHeads,
+        device_scores, device_pages, device_candidates, device_sink,
+        device_maximums, candidates, flat_rows, boundaries);
+    dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                               kDsv4PagedCandidateBlock, 0U, state.stream>>>(
-        device_scores, device_candidates, device_sink, device_maximums,
-        device_denominators, candidates, boundaries);
+        device_scores, device_pages, device_candidates, device_sink,
+        device_maximums, device_denominators, candidates, flat_rows,
+        boundaries);
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
-                              kDsv4PagedDimensionsPerBlock);
+                              kDsv4PagedDimensionsPerBlock,
+                          rows);
     dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                          0U, state.stream>>>(
-        device_scores, device_candidates, device_maximums, device_kv,
-        device_values, candidates, boundaries);
+        device_scores, device_pages, device_candidates, device_maximums,
+        device_kv, device_values, candidates, flat_rows, boundaries);
     const auto output_blocks = static_cast<std::uint32_t>(
         (output_elements + threads - 1U) / threads);
     dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-        device_values, device_denominators, device_output);
+        device_values, device_denominators, device_output, output_elements,
+        row_output_elements, row_output_elements, 0U);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status,
                           "launch DeepSeek paged attention finish kernels");
@@ -8279,6 +8612,11 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         stats.dsv4_paged_attention_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_paged_attention_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_paged_attention_nanoseconds += operation_nanoseconds;
+        const auto call_nanoseconds = elapsed_nanoseconds_since(call_started);
+        stats.dsv4_paged_attention_host_remainder_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_paged_attention_stream_sync_nanoseconds += wait_nanoseconds;
         stats.activation_h2d_bytes += upload_bytes;
         stats.activation_d2h_bytes += download_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
@@ -8286,8 +8624,8 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -9378,6 +9716,7 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
     std::uint64_t d2h_nanoseconds = 0U;
     std::uint64_t mhc_transition_nanoseconds = 0U;
     std::uint64_t mhc_transition_d2h_nanoseconds = 0U;
+    std::uint64_t mhc_timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -9429,12 +9768,12 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
                         status, "restore attention device after transition timing");
                 }
                 mhc_transition_d2h_nanoseconds =
-                    static_cast<std::uint64_t>(std::llround(
-                        static_cast<double>(mhc_d2h_ms) * 1.0e6));
+                    event_milliseconds_to_nanoseconds(
+                        mhc_d2h_ms, mhc_timing_clamped_samples);
             }
             mhc_transition_nanoseconds =
-                static_cast<std::uint64_t>(std::llround(
-                    static_cast<double>(mhc_ms) * 1.0e6));
+                event_milliseconds_to_nanoseconds(
+                    mhc_ms, mhc_timing_clamped_samples);
         }
         h2d_nanoseconds = static_cast<std::uint64_t>(std::llround(
             static_cast<double>(h2d_ms) * 1.0e6));
@@ -9462,11 +9801,15 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             stats.dsv4_mhc_kernel_nanoseconds +=
                 mhc_transition_nanoseconds;
             stats.dsv4_mhc_nanoseconds += mhc_transition_nanoseconds;
+            stats.dsv4_mhc_device_nanoseconds +=
+                mhc_transition_nanoseconds;
+            stats.dsv4_mhc_timing_clamped_samples +=
+                mhc_timing_clamped_samples;
         }
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention,
+                               1U, wait_nanoseconds);
         if (transition_mhc && request.mhc_device != device) {
             auto& target_stats = *std::find_if(
                 impl_->stats.devices.begin(), impl_->stats.devices.end(),
@@ -9486,6 +9829,11 @@ ValidationResult CudaBackend::dsv4_prepare_attention(
             target_stats.dsv4_mhc_nanoseconds +=
                 mhc_transition_nanoseconds +
                 mhc_transition_d2h_nanoseconds;
+            target_stats.dsv4_mhc_device_nanoseconds +=
+                mhc_transition_nanoseconds +
+                mhc_transition_d2h_nanoseconds;
+            target_stats.dsv4_mhc_timing_clamped_samples +=
+                mhc_timing_clamped_samples;
             target_stats.activation_d2h_bytes += layer_bytes;
             target_stats.activation_d2h_nanoseconds +=
                 mhc_transition_d2h_nanoseconds;
@@ -9546,18 +9894,30 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     int device, const CudaDsv4PagedAttentionMhcRequest& request,
     std::span<float> diagnostic_branch) {
     ValidationResult result;
+    const auto call_started = std::chrono::steady_clock::now();
+    const auto rows = request.attention.rows;
     const std::uint32_t total_heads = request.rank_local ? 32U : 64U;
     const std::uint32_t output_groups = request.rank_local ? 4U : 8U;
     constexpr std::uint32_t rope_pairs = 32U;
-    const std::uint64_t attended_elements =
+    const std::uint64_t attended_row_elements =
         static_cast<std::uint64_t>(total_heads) * kDsv4PagedHeadDim;
+    const std::uint64_t attended_elements =
+        static_cast<std::uint64_t>(rows) * attended_row_elements;
     constexpr std::uint64_t group_elements =
         static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
-    const std::uint64_t output_rank_elements =
+    const std::uint64_t output_rank_row_elements =
         static_cast<std::uint64_t>(output_groups) * 1024U;
-    constexpr std::uint64_t branch_elements = kDsv4MhcHidden;
-    const auto candidates = static_cast<std::uint32_t>(
-        request.attention.candidates.size());
+    const std::uint64_t output_rank_elements =
+        static_cast<std::uint64_t>(rows) * output_rank_row_elements;
+    constexpr std::uint64_t branch_row_elements = kDsv4MhcHidden;
+    const std::uint64_t branch_elements =
+        static_cast<std::uint64_t>(rows) * branch_row_elements;
+    const auto candidates = request.attention.candidate_width == 0U &&
+            rows == 1U
+        ? static_cast<std::uint32_t>(request.attention.candidates.size())
+        : request.attention.candidate_width;
+    const auto total_candidates = static_cast<std::uint64_t>(rows) *
+                                  candidates;
     const auto* output_a = request.output_a;
     const auto* output_b = request.output_b;
     const auto source_found = impl_->devices.find(device);
@@ -9567,8 +9927,16 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     const bool project_router = request.router != nullptr;
     const bool defer_host_moe_input = request.defer_host_moe_input;
     const bool fixed_command_staging = defer_host_moe_input || request.rank_local;
+    const bool page_request = rows > 1U;
     if (source_found == impl_->devices.end() ||
         target_found == impl_->devices.end() ||
+        rows == 0U || request.attention.candidates.size() != total_candidates ||
+        (page_request &&
+         (request.rank_local || use_prepared_query || transition_mhc ||
+          project_router || defer_host_moe_input ||
+          request.attention.resolution != nullptr ||
+          request.mhc_slots.size() != rows || diagnostic_branch.empty())) ||
+        (!page_request && !request.mhc_slots.empty()) ||
         (use_prepared_query
              ? (!source_found->second.dsv4_attention_prepared ||
                 source_found->second.dsv4_prepared_queries == nullptr)
@@ -9589,8 +9957,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         !std::isfinite(request.attention.scale) ||
         request.attention.scale <= 0.0F ||
         request.attention.maximum_workspace_bytes == 0U ||
-        request.inverse_rope_cosines.size() != rope_pairs ||
-        request.inverse_rope_sines.size() != rope_pairs ||
+        request.inverse_rope_cosines.size() !=
+            static_cast<std::size_t>(rows) * rope_pairs ||
+        request.inverse_rope_sines.size() !=
+            static_cast<std::size_t>(rows) * rope_pairs ||
         output_a == nullptr || output_b == nullptr ||
         !output_a->valid() || !output_b->valid() ||
         output_a->device() != device || output_b->device() != device ||
@@ -9600,7 +9970,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 request.mhc_transition->device() != request.mhc_device ||
                 (defer_host_moe_input
                      ? !request.mhc_layer_input.empty()
-                     : request.mhc_layer_input.size() != branch_elements) ||
+                     : request.mhc_layer_input.size() != branch_row_elements) ||
                 !diagnostic_branch.empty())
              : !request.mhc_layer_input.empty()) ||
         (project_router
@@ -9648,11 +10018,12 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         ? &request.router->impl_->descriptor : nullptr;
     if (a.encoding != CudaWeightEncoding::Plain ||
         a.dtype != SafetensorsDtype::Bf16 ||
-        a.rows != output_rank_elements || a.columns != 4096U ||
+        a.rows != output_rank_row_elements || a.columns != 4096U ||
         (!((b.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
             b.dtype == SafetensorsDtype::F8E4M3 && b.group_size == 128U) ||
            expanded_output_b)) ||
-        b.rows != branch_elements || b.columns != output_rank_elements) {
+        b.rows != branch_row_elements ||
+        b.columns != output_rank_row_elements) {
         result.errors.emplace_back(
             "DeepSeek attention output weights violate the accepted mixed BF16/FP8 contract");
         return result;
@@ -9673,7 +10044,11 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     if (state.moe_in_flight || target.moe_in_flight ||
         !state.dsv4_paged_attention_supported ||
         !target.dsv4_mhc_supported || target.dsv4_mhc_workspace == nullptr ||
-        target.dsv4_mhc_stage != 1U || target.dsv4_mhc_branch_ready ||
+        (!page_request &&
+         (target.dsv4_mhc_stage != 1U || target.dsv4_mhc_branch_ready)) ||
+        (page_request &&
+         (target.dsv4_mhc_slot_arena == nullptr ||
+          target.dsv4_mhc_slot_capacity < rows)) ||
         target.dsv4_host_moe_input_pending ||
         (fixed_command_staging &&
          state.dsv4_deferred_attention_command_count >=
@@ -9682,9 +10057,33 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             "DeepSeek attention-to-mHC command order or device support is invalid");
         return result;
     }
+    if (page_request) {
+        for (const auto slot : request.mhc_slots) {
+            if (slot >= target.dsv4_mhc_slot_capacity) {
+                result.errors.emplace_back(
+                    "DeepSeek attention page mHC slot is out of range");
+                return result;
+            }
+            const auto stage = slot == target.dsv4_mhc_active_slot
+                ? target.dsv4_mhc_stage
+                : slot < target.dsv4_mhc_saved_slots.size()
+                    ? target.dsv4_mhc_saved_slots[slot].stage : 0U;
+            const auto branch_ready = slot == target.dsv4_mhc_active_slot
+                ? target.dsv4_mhc_branch_ready
+                : slot < target.dsv4_mhc_saved_slots.size() &&
+                    target.dsv4_mhc_saved_slots[slot].branch_ready;
+            if (stage != 1U || branch_ready) {
+                result.errors.emplace_back(
+                    "DeepSeek attention page mHC slot state is invalid");
+                return result;
+            }
+        }
+    }
     if (use_prepared_query) state.dsv4_attention_prepared = false;
 
     std::uint64_t page_bytes = 0U;
+    std::uint64_t flat_rows64 = 0U;
+    std::uint32_t maximum_page_rows = 0U;
     for (const auto& page : request.attention.pages) {
         if (page.buffer == nullptr || !page.buffer->valid() ||
             page.buffer->device() != device ||
@@ -9698,7 +10097,16 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             return result;
         }
         page_bytes += page.buffer->device_bytes();
+        flat_rows64 += page.rows;
+        maximum_page_rows = std::max(maximum_page_rows, page.rows);
     }
+    if (flat_rows64 == 0U ||
+        flat_rows64 > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek attention-to-mHC flat page extent overflows");
+        return result;
+    }
+    const auto flat_rows = static_cast<std::uint32_t>(flat_rows64);
     // The resolved region is checked on the device against these same page
     // descriptors, because the host has not seen the selection that fills it.
     const auto* resolution = request.attention.resolution;
@@ -9780,21 +10188,23 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     };
     std::uint64_t page_offset{}, candidate_offset{}, query_offset{};
     std::uint64_t sink_offset{}, cosine_offset{}, sine_offset{};
-    std::uint64_t block_offset{};
+    std::uint64_t slot_offset{}, block_offset{};
     std::uint64_t page_descriptor_bytes{}, candidate_bytes{}, query_bytes{};
-    std::uint64_t block_bytes{};
+    std::uint64_t slot_bytes{}, block_bytes{};
     const std::uint64_t sink_bytes =
         static_cast<std::uint64_t>(total_heads) * sizeof(float);
-    constexpr std::uint64_t rope_bytes =
-        static_cast<std::uint64_t>(rope_pairs) * sizeof(float);
+    const std::uint64_t rope_bytes = static_cast<std::uint64_t>(rows) *
+        rope_pairs * sizeof(float);
     if (!checked_bytes(request.attention.pages.size(), 1U,
                        sizeof(Dsv4DevicePhysicalPage),
                        page_descriptor_bytes) ||
-        !checked_bytes(request.attention.candidates.size(), 1U,
+        !checked_bytes(total_candidates, 1U,
                        sizeof(Dsv4DeviceAttentionCandidate),
                        candidate_bytes) ||
         !checked_bytes(use_prepared_query ? 0U : attended_elements, 1U,
                        sizeof(std::uint16_t), query_bytes) ||
+        !checked_bytes(request.mhc_slots.size(), 1U,
+                       sizeof(std::uint32_t), slot_bytes) ||
         !checked_bytes(resolution == nullptr ? 0U : resolution->blocks.size(),
                        1U, sizeof(Dsv4DeviceKvBlock), block_bytes) ||
         !region(page_descriptor_bytes, 16U, page_offset) ||
@@ -9803,6 +10213,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         !region(sink_bytes, 16U, sink_offset) ||
         !region(rope_bytes, 16U, cosine_offset) ||
         !region(rope_bytes, 16U, sine_offset) ||
+        !region(slot_bytes, 16U, slot_offset) ||
         !region(block_bytes, 16U, block_offset)) {
         result.errors.emplace_back(
             "DeepSeek attention-to-mHC upload layout overflows");
@@ -9816,16 +10227,20 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     std::uint64_t encoded_branch_offset{}, router_logits_offset{};
     std::uint64_t failure_offset{};
     std::uint64_t kv_bytes{}, score_bytes{};
-    if (!checked_bytes(candidates, kDsv4PagedHeadDim,
+    if (!checked_bytes(flat_rows, kDsv4PagedHeadDim,
                        sizeof(std::uint16_t), kv_bytes) ||
-        !checked_bytes(kDsv4PagedHeads, candidates,
+        !checked_bytes(rows, static_cast<std::uint64_t>(kDsv4PagedHeads) *
+                                 flat_rows,
                        sizeof(std::uint16_t), score_bytes) ||
         !region(kv_bytes, 16U, kv_offset) ||
         !region(score_bytes, 16U, score_offset) ||
-        !region(kDsv4PagedHeads * sizeof(float), 16U, maximum_offset) ||
-        !region(kDsv4PagedHeads * sizeof(float), 16U,
+        !region(static_cast<std::uint64_t>(rows) * kDsv4PagedHeads *
+                    sizeof(float), 16U, maximum_offset) ||
+        !region(static_cast<std::uint64_t>(rows) * kDsv4PagedHeads *
+                    sizeof(float), 16U,
                 denominator_offset) ||
-        !region(group_elements * sizeof(float), 16U, value_offset) ||
+        !region(static_cast<std::uint64_t>(rows) * group_elements *
+                    sizeof(float), 16U, value_offset) ||
         !region(attended_elements * sizeof(std::uint16_t), 16U,
                 attended_offset) ||
         !region(attended_elements * sizeof(float), 16U, decoded_offset) ||
@@ -9871,6 +10286,43 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         state.dsv4_attention_workspace_bytes = target_bytes;
         ++allocation_calls;
         allocation_bytes += target_bytes;
+    }
+    const auto cross_page_branch_bytes = page_request &&
+            request.mhc_device != device
+        ? branch_elements * sizeof(std::uint16_t) : 0U;
+    const auto cross_page_slot_offset =
+        (cross_page_branch_bytes + alignof(std::uint32_t) - 1U) &
+        ~(static_cast<std::uint64_t>(alignof(std::uint32_t)) - 1U);
+    const auto cross_page_staging_bytes = cross_page_slot_offset +
+        (page_request && request.mhc_device != device
+             ? static_cast<std::uint64_t>(rows) * sizeof(std::uint32_t)
+             : 0U);
+    if (cross_page_staging_bytes > target.dsv4_attention_workspace_bytes) {
+        if (auto status = cudaSetDevice(request.mhc_device);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "select target for attention page staging");
+        }
+        std::byte* replacement = nullptr;
+        if (auto status = cudaMalloc(
+                &replacement,
+                static_cast<std::size_t>(cross_page_staging_bytes));
+            status != cudaSuccess) {
+            static_cast<void>(cudaSetDevice(device));
+            return cuda_error(status,
+                              "allocate cross-device attention page staging");
+        }
+        if (target.dsv4_attention_workspace != nullptr) {
+            static_cast<void>(cudaFree(target.dsv4_attention_workspace));
+        }
+        target.dsv4_attention_workspace = replacement;
+        target.dsv4_attention_workspace_bytes = cross_page_staging_bytes;
+        ++allocation_calls;
+        allocation_bytes += cross_page_staging_bytes;
+        if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+            return cuda_error(status,
+                              "restore source after attention page allocation");
+        }
     }
     const auto ensure_host = [&](std::byte*& pointer,
                                  std::uint64_t& capacity,
@@ -9937,12 +10389,14 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
 
     auto* host_pages = reinterpret_cast<Dsv4DevicePhysicalPage*>(
         command_host_upload + page_offset);
+    std::uint32_t flat_begin = 0U;
     for (std::size_t index = 0U;
          index < request.attention.pages.size(); ++index) {
         const auto& page = request.attention.pages[index];
         host_pages[index] = {
             static_cast<const std::uint8_t*>(page.buffer->impl_->data),
-            page.rows, 0U};
+            page.rows, flat_begin};
+        flat_begin += page.rows;
     }
     auto* host_candidates =
         reinterpret_cast<Dsv4DeviceAttentionCandidate*>(
@@ -9956,9 +10410,21 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     if (!use_prepared_query) {
         auto* host_query = reinterpret_cast<std::uint16_t*>(
             command_host_upload + query_offset);
-        for (std::size_t index = 0U;
-             index < request.attention.queries.size(); ++index) {
-            host_query[index] = bf16_encode(request.attention.queries[index]);
+        const auto group_count = request.rank_local ? 1U : 2U;
+        for (std::uint32_t group = 0U; group < group_count; ++group) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto source = static_cast<std::uint64_t>(row) *
+                        attended_row_elements +
+                    static_cast<std::uint64_t>(group) * group_elements;
+                const auto destination =
+                    (static_cast<std::uint64_t>(group) * rows + row) *
+                    group_elements;
+                for (std::uint64_t index = 0U; index < group_elements;
+                     ++index) {
+                    host_query[destination + index] = bf16_encode(
+                        request.attention.queries[source + index]);
+                }
+            }
         }
     }
     std::memcpy(command_host_upload + sink_offset,
@@ -9967,6 +10433,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 request.inverse_rope_cosines.data(), rope_bytes);
     std::memcpy(command_host_upload + sine_offset,
                 request.inverse_rope_sines.data(), rope_bytes);
+    if (slot_bytes != 0U) {
+        std::memcpy(command_host_upload + slot_offset,
+                    request.mhc_slots.data(), slot_bytes);
+    }
     if (resolution != nullptr) {
         auto* host_blocks = reinterpret_cast<Dsv4DeviceKvBlock*>(
             command_host_upload + block_offset);
@@ -9992,6 +10462,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     auto* device_sink = reinterpret_cast<float*>(workspace + sink_offset);
     auto* device_cosines = reinterpret_cast<float*>(workspace + cosine_offset);
     auto* device_sines = reinterpret_cast<float*>(workspace + sine_offset);
+    auto* device_slots = reinterpret_cast<std::uint32_t*>(
+        workspace + slot_offset);
     auto* device_kv = reinterpret_cast<__nv_bfloat16*>(workspace + kv_offset);
     auto* device_scores = reinterpret_cast<__nv_bfloat16*>(
         workspace + score_offset);
@@ -10067,43 +10539,44 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                               "launch DeepSeek device candidate resolution");
         }
     }
-    const auto kv_elements = static_cast<std::uint64_t>(candidates) *
-                             kDsv4PagedHeadDim;
-    const auto kv_blocks = static_cast<std::uint32_t>(
-        (kv_elements + threads - 1U) / threads);
-    dsv4_materialize_physical_pages<<<kv_blocks, threads, 0U, state.stream>>>(
+    const auto page_elements = static_cast<std::uint64_t>(maximum_page_rows) *
+                               kDsv4PagedHeadDim;
+    const dim3 kv_grid(
+        static_cast<unsigned int>((page_elements + threads - 1U) / threads),
+        static_cast<unsigned int>(request.attention.pages.size()));
+    dsv4_materialize_physical_pages<<<kv_grid, threads, 0U, state.stream>>>(
         device_pages,
         static_cast<std::uint32_t>(request.attention.pages.size()),
-        device_candidates, candidates, device_kv, device_failure);
+        device_kv, device_failure);
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
     const auto boundaries = candidates / kDsv4PagedCandidateBlock;
-    const auto score_elements = static_cast<std::uint64_t>(
-        kDsv4PagedHeads) * candidates;
+    const auto score_elements = static_cast<std::uint64_t>(rows) *
+        kDsv4PagedHeads * flat_rows;
     const auto score_blocks = static_cast<std::uint32_t>(
         (score_elements + threads - 1U) / threads);
     const auto output_blocks = static_cast<std::uint32_t>(
-        (group_elements + threads - 1U) / threads);
+        (static_cast<std::uint64_t>(rows) * group_elements + threads - 1U) /
+        threads);
     const dim3 value_grid(kDsv4PagedHeads,
                           kDsv4PagedHeadDim /
-                              kDsv4PagedDimensionsPerBlock);
+                              kDsv4PagedDimensionsPerBlock,
+                          rows);
     const auto group_count = request.rank_local ? 1U : 2U;
     for (std::uint32_t group = 0U; group < group_count; ++group) {
         auto* group_query = device_query +
-            static_cast<std::uint64_t>(group) * group_elements;
+            static_cast<std::uint64_t>(group) * rows * group_elements;
         auto* group_sink = device_sink + group * kDsv4PagedHeads;
-        auto* group_output = device_attended +
-            static_cast<std::uint64_t>(group) * group_elements;
         if (auto status = cublasGemmEx(
                 state.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                static_cast<int>(candidates),
-                static_cast<int>(kDsv4PagedHeads),
+                static_cast<int>(flat_rows),
+                static_cast<int>(rows * kDsv4PagedHeads),
                 static_cast<int>(kDsv4PagedHeadDim), &alpha,
                 device_kv, CUDA_R_16BF,
                 static_cast<int>(kDsv4PagedHeadDim),
                 group_query, CUDA_R_16BF,
                 static_cast<int>(kDsv4PagedHeadDim), &beta,
-                device_scores, CUDA_R_16BF, static_cast<int>(candidates),
+                device_scores, CUDA_R_16BF, static_cast<int>(flat_rows),
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             status != CUBLAS_STATUS_SUCCESS) {
             return cublas_error(
@@ -10111,38 +10584,47 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         }
         dsv4_scale_scores<<<score_blocks, threads, 0U, state.stream>>>(
             device_scores, score_elements, request.attention.scale);
-        dsv4_finish_maximums<<<kDsv4PagedHeads,
+        dsv4_finish_maximums<<<dim3{kDsv4PagedHeads, rows},
                                kDsv4PagedCandidateBlock, 0U,
                                state.stream>>>(
-            device_scores, device_candidates, group_sink, device_maximums,
-            candidates, boundaries);
-        dsv4_finish_denominators<<<kDsv4PagedHeads,
+            device_scores, device_pages, device_candidates, group_sink,
+            device_maximums, candidates, flat_rows, boundaries);
+        dsv4_finish_denominators<<<dim3{kDsv4PagedHeads, rows},
                                    kDsv4PagedCandidateBlock, 0U,
                                    state.stream>>>(
-            device_scores, device_candidates, group_sink, device_maximums,
-            device_denominators, candidates, boundaries);
+            device_scores, device_pages, device_candidates, group_sink,
+            device_maximums, device_denominators, candidates, flat_rows,
+            boundaries);
         dsv4_finish_values<<<value_grid, kDsv4PagedDimensionsPerBlock,
                              0U, state.stream>>>(
-            device_scores, device_candidates, device_maximums,
-            device_kv,
-            device_values, candidates, boundaries);
+            device_scores, device_pages, device_candidates, device_maximums,
+            device_kv, device_values, candidates, flat_rows, boundaries);
         dsv4_divide_and_store<<<output_blocks, threads, 0U, state.stream>>>(
-            device_values, device_denominators, group_output);
+            device_values, device_denominators, device_attended,
+            static_cast<std::uint64_t>(rows) * group_elements,
+            group_elements, attended_row_elements,
+            static_cast<std::uint64_t>(group) * group_elements);
     }
     const auto attended_blocks = static_cast<std::uint32_t>(
         (attended_elements + threads - 1U) / threads);
     dsv4_inverse_rope_decode<<<attended_blocks, threads, 0U, state.stream>>>(
         device_attended, device_cosines, device_sines, device_decoded,
-        total_heads);
+        rows, total_heads);
     if (request.rank_local) {
         dsv4_rank_bf16_matmul<<<output_rank_elements, rank_threads, 0U, state.stream>>>(
             device_output_rank, device_decoded,
             static_cast<const __nv_bfloat16*>(output_a->impl_->weights),
             1U, a.columns, a.rows, output_groups, 1024U);
     } else {
-        plain_matmul_kernel<1U><<<output_rank_elements, threads, 0U, state.stream>>>(
+        const dim3 output_a_grid(
+            static_cast<unsigned int>(a.rows),
+            static_cast<unsigned int>(
+                (rows + kPlainMatmulRowTile - 1U) /
+                kPlainMatmulRowTile));
+        plain_matmul_kernel<kPlainMatmulRowTile>
+            <<<output_a_grid, threads, 0U, state.stream>>>(
             device_output_rank, device_decoded, output_a->impl_->weights,
-            static_cast<int>(a.dtype), 1U, a.columns, a.rows,
+            static_cast<int>(a.dtype), rows, a.columns, a.rows,
             output_groups, 1024U);
     }
     const auto output_rank_blocks = static_cast<std::uint32_t>(
@@ -10150,10 +10632,10 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     dsv4_round_float_bf16<<<output_rank_blocks, threads, 0U, state.stream>>>(
         device_output_rank, output_rank_elements);
     const dim3 output_rank_quantize_grid(
-        static_cast<unsigned int>(output_rank_elements / 128U), 1U, 1U);
+        static_cast<unsigned int>(output_rank_row_elements / 128U), rows, 1U);
     quantize_activation_e4m3_kernel<<<output_rank_quantize_grid, 128U, 0U,
                                       state.stream>>>(
-        device_output_rank, output_rank_elements, 1U);
+        device_output_rank, output_rank_row_elements, rows);
     auto* raw_branch_output = request.rank_local
         ? request.rank_local_raw_fp32_reduction : device_branch;
     if (expanded_output_b) {
@@ -10162,17 +10644,27 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<const __nv_bfloat16*>(output_b->impl_->weights),
             1U, b.columns, b.rows, 0U, 0U);
     } else {
-        native_fp8_matmul_kernel<<<branch_elements, threads, 0U, state.stream>>>(
+        native_fp8_matmul_kernel<<<dim3{
+            static_cast<unsigned int>(branch_row_elements), rows},
+            threads, 0U, state.stream>>>(
             raw_branch_output, device_output_rank,
             static_cast<const unsigned char*>(output_b->impl_->weights),
             static_cast<const unsigned char*>(output_b->impl_->scales),
-            b.scale_columns, 1U, b.columns, b.rows, 0U, 0U);
+            b.scale_columns, rows, b.columns, b.rows, 0U, 0U);
     }
     const auto branch_blocks = static_cast<std::uint32_t>(
         (branch_elements + threads - 1U) / threads);
-    dsv4_store_mhc_branch<<<branch_blocks, threads, 0U, state.stream>>>(
-        raw_branch_output, device_encoded_branch,
-        branch_elements);
+    if (page_request) {
+        auto* slot_arena = request.mhc_device == device
+            ? target.dsv4_mhc_slot_arena : nullptr;
+        dsv4_store_mhc_page_branches<<<branch_blocks, threads, 0U,
+                                        state.stream>>>(
+            raw_branch_output, device_encoded_branch, slot_arena,
+            device_slots, rows);
+    } else {
+        dsv4_store_mhc_branch<<<branch_blocks, threads, 0U, state.stream>>>(
+            raw_branch_output, device_encoded_branch, branch_elements);
+    }
     const auto cross_device = request.mhc_device != device;
     const auto cross_transition = cross_device && transition_mhc;
     const auto needs_branch_download = cross_device ||
@@ -10182,7 +10674,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     auto* staged_router = staged_layer + transition_layer_bytes;
     auto* staged_failure = command_host_download + download_branch_bytes +
                            transition_layer_bytes + router_download_bytes;
-    if (!cross_device) {
+    if (!cross_device && !page_request) {
         if (auto status = cudaMemcpyAsync(
                 target.dsv4_mhc_workspace->branch, device_encoded_branch,
                 static_cast<std::size_t>(branch_elements *
@@ -10537,12 +11029,41 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             return cuda_error(status,
                               "select mHC device for attention branch handoff");
         }
-        if (auto status = cudaMemcpyAsync(
-                target.dsv4_mhc_workspace->branch, staged_branch,
-                static_cast<std::size_t>(branch_elements *
-                                         sizeof(std::uint16_t)),
-                cudaMemcpyHostToDevice, target.stream);
-            status != cudaSuccess) {
+        if (page_request) {
+            auto* target_encoded = reinterpret_cast<__nv_bfloat16*>(
+                target.dsv4_attention_workspace);
+            auto* target_slots = reinterpret_cast<std::uint32_t*>(
+                target.dsv4_attention_workspace + cross_page_slot_offset);
+            if (auto status = cudaMemcpyAsync(
+                    target_encoded, staged_branch,
+                    static_cast<std::size_t>(cross_page_branch_bytes),
+                    cudaMemcpyHostToDevice, target.stream);
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "upload cross-device attention page branches");
+            }
+            if (auto status = cudaMemcpyAsync(
+                    target_slots, request.mhc_slots.data(),
+                    static_cast<std::size_t>(rows) * sizeof(std::uint32_t),
+                    cudaMemcpyHostToDevice, target.stream);
+                status != cudaSuccess) {
+                return cuda_error(
+                    status, "upload cross-device attention page slots");
+            }
+            dsv4_scatter_encoded_mhc_page_branches<<<
+                branch_blocks, threads, 0U, target.stream>>>(
+                target_encoded, target.dsv4_mhc_slot_arena,
+                target_slots, rows);
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(
+                    status, "scatter cross-device attention page branches");
+            }
+        } else if (auto status = cudaMemcpyAsync(
+                       target.dsv4_mhc_workspace->branch, staged_branch,
+                       static_cast<std::size_t>(branch_elements *
+                                                sizeof(std::uint16_t)),
+                       cudaMemcpyHostToDevice, target.stream);
+                   status != cudaSuccess) {
             return cuda_error(status,
                               "upload cross-device attention branch to mHC");
         }
@@ -10563,6 +11084,19 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
         }
         target.dsv4_mhc_residual_index ^= 1U;
         target.dsv4_mhc_branch_ready = false;
+    } else if (page_request) {
+        if (target.dsv4_mhc_saved_slots.size() <
+            target.dsv4_mhc_slot_capacity) {
+            target.dsv4_mhc_saved_slots.resize(
+                target.dsv4_mhc_slot_capacity);
+        }
+        for (const auto slot : request.mhc_slots) {
+            if (slot == target.dsv4_mhc_active_slot) {
+                target.dsv4_mhc_branch_ready = true;
+            } else {
+                target.dsv4_mhc_saved_slots[slot].branch_ready = true;
+            }
+        }
     } else {
         target.dsv4_mhc_branch_ready = true;
     }
@@ -10597,6 +11131,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     std::uint64_t attention_kernel_nanoseconds = 0U;
     std::uint64_t mhc_transition_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t mhc_timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float source_h2d_ms = 0.0F;
         if (auto status = cudaEventElapsedTime(
@@ -10651,8 +11186,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                 static_cast<std::uint64_t>(std::llround(
                     static_cast<double>(attention_ms) * 1.0e6));
             mhc_transition_nanoseconds =
-                static_cast<std::uint64_t>(std::llround(
-                    static_cast<double>(mhc_ms) * 1.0e6));
+                event_milliseconds_to_nanoseconds(
+                    mhc_ms, mhc_timing_clamped_samples);
             kernel_nanoseconds = static_cast<std::uint64_t>(std::llround(
                 static_cast<double>(attention_ms + target_kernel_ms) *
                 1.0e6));
@@ -10695,8 +11230,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
                     static_cast<std::uint64_t>(std::llround(
                         static_cast<double>(attention_ms) * 1.0e6));
                 mhc_transition_nanoseconds =
-                    static_cast<std::uint64_t>(std::llround(
-                        static_cast<double>(mhc_ms) * 1.0e6));
+                    event_milliseconds_to_nanoseconds(
+                        mhc_ms, mhc_timing_clamped_samples);
             }
             d2h_nanoseconds = static_cast<std::uint64_t>(std::llround(
                 static_cast<double>(d2h_ms) * 1.0e6));
@@ -10708,7 +11243,8 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
         ++stats.dsv4_paged_attention_calls;
-        stats.dsv4_paged_attention_kernel_launches += 19U;
+        stats.dsv4_paged_attention_kernel_launches +=
+            19U + static_cast<std::uint64_t>(page_request && cross_device);
         stats.dsv4_paged_attention_h2d_bytes += upload_bytes;
         stats.dsv4_paged_attention_d2h_bytes +=
             download_branch_bytes + sizeof(unsigned int);
@@ -10718,6 +11254,11 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             attention_kernel_nanoseconds;
         stats.dsv4_paged_attention_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_paged_attention_nanoseconds += operation_nanoseconds;
+        const auto call_nanoseconds = elapsed_nanoseconds_since(call_started);
+        stats.dsv4_paged_attention_host_remainder_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_paged_attention_stream_sync_nanoseconds += wait_nanoseconds;
         stats.activation_h2d_bytes += upload_bytes;
         stats.activation_d2h_bytes += download_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
@@ -10736,9 +11277,13 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
             stats.dsv4_mhc_nanoseconds +=
                 mhc_transition_nanoseconds + d2h_nanoseconds;
+            stats.dsv4_mhc_device_nanoseconds +=
+                mhc_transition_nanoseconds + d2h_nanoseconds;
+            stats.dsv4_mhc_timing_clamped_samples +=
+                mhc_timing_clamped_samples;
         }
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Attention,
+                               1U, wait_nanoseconds);
         if (request.mhc_device != device) {
             auto& target_stats = *std::find_if(
                 impl_->stats.devices.begin(), impl_->stats.devices.end(),
@@ -10846,8 +11391,8 @@ ValidationResult CudaBackend::upload_dsv4_mhc_weights(
         stats.weight_allocation_bytes += auxiliary.size();
         stats.weight_allocation_nanoseconds += allocation_nanoseconds;
         stats.weight_copy_nanoseconds += copy_nanoseconds;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Weight,
+                               1U, wait_nanoseconds);
         stats.upload_wait_nanoseconds += wait_nanoseconds;
         stats.dsv4_mhc_resident_weight_bytes +=
             target->projection.device_bytes() +
@@ -11128,6 +11673,7 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         stats.dsv4_mhc_kernel_launches += 4U;
         stats.dsv4_mhc_h2d_bytes += h2d_bytes;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds += operation_nanoseconds;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
@@ -11184,6 +11730,7 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
     std::uint64_t h2d_nanoseconds = 0U;
     std::uint64_t kernel_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -11198,17 +11745,18 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
                 "measure DeepSeek device mHC begin failed");
             return result;
         }
-        h2d_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
-        kernel_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
-        d2h_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+        h2d_nanoseconds = event_milliseconds_to_nanoseconds(
+            h2d_ms, timing_clamped_samples);
+        kernel_nanoseconds = event_milliseconds_to_nanoseconds(
+            kernel_ms, timing_clamped_samples);
+        d2h_nanoseconds = event_milliseconds_to_nanoseconds(
+            d2h_ms, timing_clamped_samples);
     }
     state.dsv4_mhc_stage = 1U;
     state.dsv4_mhc_residual_index = 0U;
     state.dsv4_mhc_branch_ready = false;
     state.dsv4_mhc_failed = false;
+    const auto call_nanoseconds = elapsed_nanoseconds_since(operation_started);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -11223,6 +11771,12 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         stats.dsv4_mhc_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_device_nanoseconds +=
+            h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_mhc_timing_clamped_samples += timing_clamped_samples;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.activation_d2h_bytes += d2h_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
@@ -11230,8 +11784,8 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Mhc,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -11443,6 +11997,7 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
     std::uint64_t h2d_nanoseconds = 0U;
     std::uint64_t kernel_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -11458,13 +12013,14 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
                 "measure DeepSeek device mHC transition failed");
             return result;
         }
-        h2d_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
-        kernel_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
-        d2h_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+        h2d_nanoseconds = event_milliseconds_to_nanoseconds(
+            h2d_ms, timing_clamped_samples);
+        kernel_nanoseconds = event_milliseconds_to_nanoseconds(
+            kernel_ms, timing_clamped_samples);
+        d2h_nanoseconds = event_milliseconds_to_nanoseconds(
+            d2h_ms, timing_clamped_samples);
     }
+    const auto call_nanoseconds = elapsed_nanoseconds_since(operation_started);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -11479,13 +12035,19 @@ ValidationResult CudaBackend::dsv4_mhc_transition_impl(
         stats.dsv4_mhc_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_device_nanoseconds +=
+            h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_mhc_timing_clamped_samples += timing_clamped_samples;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.activation_d2h_bytes += d2h_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Mhc,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -11967,6 +12529,7 @@ ValidationResult CudaBackend::dsv4_mhc_finish_impl(
     std::uint64_t h2d_nanoseconds = 0U;
     std::uint64_t kernel_nanoseconds = 0U;
     std::uint64_t d2h_nanoseconds = 0U;
+    std::uint64_t timing_clamped_samples = 0U;
     if (impl_->detailed_timing) {
         float h2d_ms = 0.0F;
         float kernel_ms = 0.0F;
@@ -11981,13 +12544,14 @@ ValidationResult CudaBackend::dsv4_mhc_finish_impl(
                 "measure DeepSeek device mHC finish failed");
             return result;
         }
-        h2d_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
-        kernel_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
-        d2h_nanoseconds = static_cast<std::uint64_t>(
-            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+        h2d_nanoseconds = event_milliseconds_to_nanoseconds(
+            h2d_ms, timing_clamped_samples);
+        kernel_nanoseconds = event_milliseconds_to_nanoseconds(
+            kernel_ms, timing_clamped_samples);
+        d2h_nanoseconds = event_milliseconds_to_nanoseconds(
+            d2h_ms, timing_clamped_samples);
     }
+    const auto call_nanoseconds = elapsed_nanoseconds_since(operation_started);
     {
         std::scoped_lock lock(impl_->mutex);
         auto& stats = *std::find_if(
@@ -12002,13 +12566,19 @@ ValidationResult CudaBackend::dsv4_mhc_finish_impl(
         stats.dsv4_mhc_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_mhc_nanoseconds += operation_nanoseconds;
+        stats.dsv4_mhc_device_nanoseconds +=
+            h2d_nanoseconds + kernel_nanoseconds + d2h_nanoseconds;
+        stats.dsv4_mhc_host_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_mhc_timing_clamped_samples += timing_clamped_samples;
         stats.activation_h2d_bytes += h2d_bytes;
         stats.activation_d2h_bytes += d2h_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Mhc,
+                               1U, wait_nanoseconds);
     }
     return result;
 }
@@ -12578,8 +13148,8 @@ ValidationResult CudaBackend::glm_absorbed_attention(
         stats.matmul_calls += 2U;
         stats.workspace_allocation_calls += allocation_calls;
         stats.workspace_allocation_bytes += allocation_bytes;
-        ++stats.synchronization_calls;
-        stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(stats, SynchronizationSubsystem::Other,
+                               1U, wait_nanoseconds);
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         stats.kernel_nanoseconds += kernel_nanoseconds;
         stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -12610,8 +13180,10 @@ ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
     std::uint64_t rows_per_group, std::span<float> output, float softcap,
-    bool round_output) {
+    bool round_output, CudaMatmulProfile* profile,
+    bool dsv4_fp8_tensor_page) {
     ValidationResult result;
+    if (profile != nullptr) *profile = {};
     if (!weight.valid()) {
         result.errors.emplace_back("CUDA matmul received an invalid weight");
         return result;
@@ -12642,27 +13214,65 @@ ValidationResult CudaBackend::matmul_impl(
     }
     const auto input_bytes = static_cast<std::uint64_t>(input.size_bytes());
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    const bool tensor_page =
+        dsv4_fp8_tensor_page &&
+        state.dsv4_fp8_tensor_page_supported && rows > 1U && groups == 0U &&
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
+        descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
+        descriptor.rows % kDsv4Fp8TensorBlockN == 0U &&
+        descriptor.columns <= std::numeric_limits<std::uint32_t>::max() &&
+        descriptor.rows <= std::numeric_limits<std::uint32_t>::max();
+    const auto input_scale_bytes = tensor_page
+        ? static_cast<std::uint64_t>(rows) * descriptor.scale_columns
+        : 0U;
+    const auto compact_input_bytes = tensor_page
+        ? static_cast<std::uint64_t>(input.size()) + input_scale_bytes
+        : input_bytes;
+    const auto padded_rows = tensor_page
+        ? (static_cast<std::uint64_t>(rows) + kDsv4Fp8TensorBlockM - 1U) /
+              kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockM
+        : static_cast<std::uint64_t>(rows);
+    if (tensor_page &&
+        descriptor.rows > std::numeric_limits<std::uint64_t>::max() /
+                              padded_rows / sizeof(float)) {
+        result.errors.emplace_back(
+            "DeepSeek FP8 tensor page output workspace overflows");
+        return result;
+    }
+    const auto tensor_output_bytes = tensor_page
+        ? padded_rows * descriptor.rows * sizeof(float)
+        : output_bytes;
+    const auto required_input_bytes = compact_input_bytes;
+    // The original FP32 activation is uploaded into the eventual result
+    // buffer, compacted into state.input, and then overwritten by the tensor
+    // result. This keeps one compact encoded activation plus one reused output
+    // allocation, never the incumbent four-byte encoded activation beside it.
+    const auto required_output_bytes = tensor_page
+        ? std::max(input_bytes, tensor_output_bytes)
+        : output_bytes;
     std::uint64_t workspace_allocation_calls = 0U;
     std::uint64_t workspace_allocation_bytes = 0U;
-    if (input_bytes > state.input_bytes) {
+    if (required_input_bytes > state.input_bytes) {
         if (state.input != nullptr) static_cast<void>(cudaFree(state.input));
-        if (auto status = cudaMalloc(&state.input, static_cast<std::size_t>(input_bytes));
+        if (auto status = cudaMalloc(
+                &state.input, static_cast<std::size_t>(required_input_bytes));
             status != cudaSuccess) {
             return cuda_error(status, "allocate CUDA input workspace");
         }
-        state.input_bytes = input_bytes;
+        state.input_bytes = required_input_bytes;
         ++workspace_allocation_calls;
-        workspace_allocation_bytes += input_bytes;
+        workspace_allocation_bytes += required_input_bytes;
     }
-    if (output_bytes > state.output_bytes) {
+    if (required_output_bytes > state.output_bytes) {
         if (state.output != nullptr) static_cast<void>(cudaFree(state.output));
-        if (auto status = cudaMalloc(&state.output, static_cast<std::size_t>(output_bytes));
+        if (auto status = cudaMalloc(
+                &state.output, static_cast<std::size_t>(required_output_bytes));
             status != cudaSuccess) {
             return cuda_error(status, "allocate CUDA output workspace");
         }
-        state.output_bytes = output_bytes;
+        state.output_bytes = required_output_bytes;
         ++workspace_allocation_calls;
-        workspace_allocation_bytes += output_bytes;
+        workspace_allocation_bytes += required_output_bytes;
     }
     // Grown geometrically and kept, so a decode step that repeats the same
     // shapes allocates nothing. Past the ceiling the copy falls back to the
@@ -12699,7 +13309,8 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     if (auto status = cudaMemcpyAsync(
-            state.input,
+            tensor_page ? static_cast<void*>(state.output)
+                        : static_cast<void*>(state.input),
             stage_input ? static_cast<const void*>(state.matmul_host_input)
                         : static_cast<const void*>(input.data()),
             input.size_bytes(), cudaMemcpyHostToDevice, state.stream);
@@ -12718,7 +13329,16 @@ ValidationResult CudaBackend::matmul_impl(
         descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
         rows == 1U && groups == 0U && descriptor.group_size == 32U &&
         descriptor.columns % 32U == 0U;
-    if (native) {
+    if (tensor_page) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>(descriptor.scale_columns), rows, 1U);
+        auto* compact_values = reinterpret_cast<unsigned char*>(state.input);
+        auto* compact_scales = compact_values + input.size();
+        quantize_activation_e4m3_bytes_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            compact_values, compact_scales, state.output,
+            descriptor.columns, rows);
+    } else if (native) {
         const auto input_rows = groups == 0U ? rows : rows * groups;
         const dim3 quantize_grid(
             static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
@@ -12793,6 +13413,22 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.global_scale, descriptor.packed_columns,
             descriptor.scale_columns, descriptor.group_size, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    } else if (tensor_page) {
+        const dim3 tensor_grid(
+            static_cast<unsigned int>(
+                descriptor.rows / kDsv4Fp8TensorBlockN),
+            static_cast<unsigned int>(
+                padded_rows / kDsv4Fp8TensorBlockM), 1U);
+        const auto* compact_values =
+            reinterpret_cast<const unsigned char*>(state.input);
+        const auto* compact_scales = compact_values + input.size();
+        dsv4_fp8_decode_bf16_tensor_kernel<<<
+            tensor_grid, threads, 0U, state.stream>>>(
+            state.output, compact_values, compact_scales,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const unsigned char*>(weight.impl_->scales), rows,
+            static_cast<std::uint32_t>(descriptor.columns),
+            static_cast<std::uint32_t>(descriptor.rows));
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
@@ -12857,7 +13493,11 @@ ValidationResult CudaBackend::matmul_impl(
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA matmul");
     }
-    const auto finish_started = std::chrono::steady_clock::now();
+    const auto synchronized = std::chrono::steady_clock::now();
+    const auto synchronization_nanoseconds = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            synchronized - wait_started).count());
+    const auto finish_started = synchronized;
     if (stage_output) {
         std::memcpy(output.data(), state.matmul_host_output,
                     output.size_bytes());
@@ -12894,6 +13534,15 @@ ValidationResult CudaBackend::matmul_impl(
         activation_d2h_nanoseconds = static_cast<std::uint64_t>(
             std::llround(static_cast<double>(d2h_milliseconds) * 1.0e6));
     }
+    const auto finish_nanoseconds = elapsed_nanoseconds_since(finish_started);
+    if (profile != nullptr) {
+        profile->issue_nanoseconds = issue_nanoseconds;
+        profile->finish_nanoseconds = finish_nanoseconds;
+        profile->synchronization_nanoseconds = synchronization_nanoseconds;
+        profile->h2d_nanoseconds = activation_h2d_nanoseconds;
+        profile->kernel_nanoseconds = kernel_nanoseconds;
+        profile->d2h_nanoseconds = activation_d2h_nanoseconds;
+    }
     {
         std::scoped_lock lock(impl_->mutex);
         auto& device_stats = *std::find_if(
@@ -12904,12 +13553,14 @@ ValidationResult CudaBackend::matmul_impl(
         ++device_stats.matmul_calls;
         device_stats.workspace_allocation_calls += workspace_allocation_calls;
         device_stats.workspace_allocation_bytes += workspace_allocation_bytes;
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        // Keep the historical synchronization total stable: it includes the
+        // pinned-output memcpy after cudaStreamSynchronize. The exact stream
+        // wait and post-wait finish are separately exposed in the profile.
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Projection, 1U,
+                               wait_nanoseconds);
         device_stats.matmul_issue_nanoseconds += issue_nanoseconds;
-        device_stats.matmul_finish_nanoseconds += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - finish_started).count());
+        device_stats.matmul_finish_nanoseconds += finish_nanoseconds;
         device_stats.activation_h2d_nanoseconds += activation_h2d_nanoseconds;
         device_stats.kernel_nanoseconds += kernel_nanoseconds;
         device_stats.activation_d2h_nanoseconds += activation_d2h_nanoseconds;
@@ -15332,11 +15983,14 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                     return static_cast<std::uint64_t>(std::llround(
                         static_cast<double>(milliseconds) * 1.0e6));
                 };
+                std::uint64_t mhc_timing_clamped_samples = 0U;
                 const auto h2d_nanoseconds =
                     to_nanoseconds(source_h2d_ms);
                 const auto attention_nanoseconds =
                     to_nanoseconds(attention_ms);
-                const auto mhc_nanoseconds = to_nanoseconds(mhc_ms);
+                const auto mhc_nanoseconds =
+                    event_milliseconds_to_nanoseconds(
+                        mhc_ms, mhc_timing_clamped_samples);
                 const auto kernel_nanoseconds = to_nanoseconds(kernel_ms);
                 const auto d2h_nanoseconds = to_nanoseconds(d2h_ms);
                 std::scoped_lock lock(impl_->mutex);
@@ -15361,6 +16015,10 @@ ValidationResult CudaBackend::collect_deepseek_moe(
                 source_stats.dsv4_mhc_d2h_nanoseconds += d2h_nanoseconds;
                 source_stats.dsv4_mhc_nanoseconds +=
                     mhc_nanoseconds + d2h_nanoseconds;
+                source_stats.dsv4_mhc_device_nanoseconds +=
+                    mhc_nanoseconds + d2h_nanoseconds;
+                source_stats.dsv4_mhc_timing_clamped_samples +=
+                    mhc_timing_clamped_samples;
             }
         }
         state.dsv4_deferred_attention_source_device = -1;
@@ -15474,8 +16132,9 @@ ValidationResult CudaBackend::collect_deepseek_moe(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
         device_stats.activation_d2h_bytes += downloaded_bytes;
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += wait_nanoseconds;
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Moe, 1U,
+                               wait_nanoseconds);
         device_stats.activation_h2d_nanoseconds += h2d_nanoseconds;
         device_stats.kernel_nanoseconds += kernel_nanoseconds;
         device_stats.activation_d2h_nanoseconds += d2h_nanoseconds;
@@ -15694,8 +16353,9 @@ ValidationResult CudaBackend::synchronize(int device) {
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        ++device_stats.synchronization_calls;
-        device_stats.synchronization_nanoseconds += elapsed;
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Other, 1U,
+                               elapsed);
     }
     return cuda_error(status, "synchronize CUDA device");
 }
@@ -15713,8 +16373,35 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.workspace_allocation_calls += device.workspace_allocation_calls;
         result.workspace_allocation_bytes += device.workspace_allocation_bytes;
         result.synchronization_calls += device.synchronization_calls;
-        result.synchronization_nanoseconds = std::max(
-            result.synchronization_nanoseconds, device.synchronization_nanoseconds);
+        result.weight_synchronization.calls +=
+            device.weight_synchronization.calls;
+        result.attention_synchronization.calls +=
+            device.attention_synchronization.calls;
+        result.projection_synchronization.calls +=
+            device.projection_synchronization.calls;
+        result.mhc_synchronization.calls +=
+            device.mhc_synchronization.calls;
+        result.moe_synchronization.calls +=
+            device.moe_synchronization.calls;
+        result.other_synchronization.calls +=
+            device.other_synchronization.calls;
+        if (device.synchronization_nanoseconds >
+            result.synchronization_nanoseconds) {
+            result.synchronization_nanoseconds =
+                device.synchronization_nanoseconds;
+            result.weight_synchronization.nanoseconds =
+                device.weight_synchronization.nanoseconds;
+            result.attention_synchronization.nanoseconds =
+                device.attention_synchronization.nanoseconds;
+            result.projection_synchronization.nanoseconds =
+                device.projection_synchronization.nanoseconds;
+            result.mhc_synchronization.nanoseconds =
+                device.mhc_synchronization.nanoseconds;
+            result.moe_synchronization.nanoseconds =
+                device.moe_synchronization.nanoseconds;
+            result.other_synchronization.nanoseconds =
+                device.other_synchronization.nanoseconds;
+        }
         result.upload_wait_nanoseconds = std::max(
             result.upload_wait_nanoseconds, device.upload_wait_nanoseconds);
         result.weight_allocation_nanoseconds = std::max(
@@ -15792,6 +16479,10 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.dsv4_paged_attention_nanoseconds = std::max(
             result.dsv4_paged_attention_nanoseconds,
             device.dsv4_paged_attention_nanoseconds);
+        result.dsv4_paged_attention_host_remainder_nanoseconds +=
+            device.dsv4_paged_attention_host_remainder_nanoseconds;
+        result.dsv4_paged_attention_stream_sync_nanoseconds +=
+            device.dsv4_paged_attention_stream_sync_nanoseconds;
         result.dsv4_mhc_calls += device.dsv4_mhc_calls;
         result.dsv4_mhc_standalone_calls +=
             device.dsv4_mhc_standalone_calls;
@@ -15816,6 +16507,14 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.dsv4_mhc_nanoseconds = std::max(
             result.dsv4_mhc_nanoseconds,
             device.dsv4_mhc_nanoseconds);
+        result.dsv4_mhc_device_nanoseconds = std::max(
+            result.dsv4_mhc_device_nanoseconds,
+            device.dsv4_mhc_device_nanoseconds);
+        result.dsv4_mhc_host_nanoseconds = std::max(
+            result.dsv4_mhc_host_nanoseconds,
+            device.dsv4_mhc_host_nanoseconds);
+        result.dsv4_mhc_timing_clamped_samples +=
+            device.dsv4_mhc_timing_clamped_samples;
         result.lightning_index_calls += device.lightning_index_calls;
         result.lightning_index_kernel_launches +=
             device.lightning_index_kernel_launches;

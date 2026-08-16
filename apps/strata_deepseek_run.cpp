@@ -39,6 +39,8 @@ struct Options {
     bool pin_resident_arena{};
     bool serial_expert_upload{};
     bool row_major_moe_page{};
+    bool dsv4_fp8_tensor_page{true};
+    bool dsv4_batched_page_attention{true};
     bool prepack_mhc{true};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
@@ -86,6 +88,8 @@ void usage() {
         << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
         << "       [--decode-topology centralized|rank-local-tp2]\n"
         << "       [--row-major-moe-page]\n"
+        << "       [--dsv4-fp8-tensor-page|--no-dsv4-fp8-tensor-page]\n"
+        << "       [--dsv4-batched-page-attention|--no-dsv4-batched-page-attention]\n"
         << "       [--kv-host-cache BYTES] [--kv-device-cache B0,B1,...]\n"
         << "       [--flash-attention-minimum-rows N]\n"
         << "       [--logit-trace] [--logit-trace-top-k 20] [--layer-hash-trace]\n"
@@ -212,6 +216,14 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.serial_expert_upload = true;
         } else if (argument == "--row-major-moe-page") {
             options.row_major_moe_page = true;
+        } else if (argument == "--dsv4-fp8-tensor-page") {
+            options.dsv4_fp8_tensor_page = true;
+        } else if (argument == "--no-dsv4-fp8-tensor-page") {
+            options.dsv4_fp8_tensor_page = false;
+        } else if (argument == "--dsv4-batched-page-attention") {
+            options.dsv4_batched_page_attention = true;
+        } else if (argument == "--no-dsv4-batched-page-attention") {
+            options.dsv4_batched_page_attention = false;
         } else if (argument == "--prepack-mhc") {
             options.prepack_mhc = true;
         } else if (argument == "--no-prepack-mhc") {
@@ -341,6 +353,30 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << ",\"synchronization_calls\":" << stats.synchronization_calls
            << ",\"critical_path_synchronization_seconds\":"
            << static_cast<double>(stats.synchronization_nanoseconds) / 1.0e9
+           << ",\"weight_synchronization_calls\":"
+           << stats.weight_synchronization.calls
+           << ",\"critical_path_weight_synchronization_seconds\":"
+           << static_cast<double>(stats.weight_synchronization.nanoseconds) / 1.0e9
+           << ",\"attention_synchronization_calls\":"
+           << stats.attention_synchronization.calls
+           << ",\"critical_path_attention_synchronization_seconds\":"
+           << static_cast<double>(stats.attention_synchronization.nanoseconds) / 1.0e9
+           << ",\"projection_synchronization_calls\":"
+           << stats.projection_synchronization.calls
+           << ",\"critical_path_projection_synchronization_seconds\":"
+           << static_cast<double>(stats.projection_synchronization.nanoseconds) / 1.0e9
+           << ",\"mhc_synchronization_calls\":"
+           << stats.mhc_synchronization.calls
+           << ",\"critical_path_mhc_synchronization_seconds\":"
+           << static_cast<double>(stats.mhc_synchronization.nanoseconds) / 1.0e9
+           << ",\"moe_synchronization_calls\":"
+           << stats.moe_synchronization.calls
+           << ",\"critical_path_moe_synchronization_seconds\":"
+           << static_cast<double>(stats.moe_synchronization.nanoseconds) / 1.0e9
+           << ",\"other_synchronization_calls\":"
+           << stats.other_synchronization.calls
+           << ",\"critical_path_other_synchronization_seconds\":"
+           << static_cast<double>(stats.other_synchronization.nanoseconds) / 1.0e9
            << ",\"critical_path_upload_wait_seconds\":"
            << static_cast<double>(stats.upload_wait_nanoseconds) / 1.0e9
            << ",\"critical_path_activation_h2d_seconds\":"
@@ -411,6 +447,12 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << ",\"maximum_device_dsv4_paged_attention_seconds\":"
            << static_cast<double>(stats.dsv4_paged_attention_nanoseconds) /
                   1.0e9
+           << ",\"dsv4_paged_attention_host_remainder_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_host_remainder_nanoseconds) / 1.0e9
+           << ",\"dsv4_paged_attention_stream_sync_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_stream_sync_nanoseconds) / 1.0e9
            << ",\"dsv4_mhc_calls\":" << stats.dsv4_mhc_calls
            << ",\"dsv4_mhc_standalone_calls\":"
            << stats.dsv4_mhc_standalone_calls
@@ -431,6 +473,12 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << static_cast<double>(stats.dsv4_mhc_d2h_nanoseconds) / 1.0e9
            << ",\"maximum_device_dsv4_mhc_seconds\":"
            << static_cast<double>(stats.dsv4_mhc_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_device_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_device_nanoseconds) / 1.0e9
+           << ",\"maximum_device_dsv4_mhc_host_seconds\":"
+           << static_cast<double>(stats.dsv4_mhc_host_nanoseconds) / 1.0e9
+           << ",\"dsv4_mhc_timing_clamped_samples\":"
+           << stats.dsv4_mhc_timing_clamped_samples
            << ",\"lightning_index_calls\":" << stats.lightning_index_calls
            << ",\"lightning_index_kernel_launches\":"
            << stats.lightning_index_kernel_launches
@@ -468,6 +516,30 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"synchronization_calls\":" << device.synchronization_calls
                << ",\"synchronization_seconds\":"
                << static_cast<double>(device.synchronization_nanoseconds) / 1.0e9
+               << ",\"weight_synchronization_calls\":"
+               << device.weight_synchronization.calls
+               << ",\"weight_synchronization_seconds\":"
+               << static_cast<double>(device.weight_synchronization.nanoseconds) / 1.0e9
+               << ",\"attention_synchronization_calls\":"
+               << device.attention_synchronization.calls
+               << ",\"attention_synchronization_seconds\":"
+               << static_cast<double>(device.attention_synchronization.nanoseconds) / 1.0e9
+               << ",\"projection_synchronization_calls\":"
+               << device.projection_synchronization.calls
+               << ",\"projection_synchronization_seconds\":"
+               << static_cast<double>(device.projection_synchronization.nanoseconds) / 1.0e9
+               << ",\"mhc_synchronization_calls\":"
+               << device.mhc_synchronization.calls
+               << ",\"mhc_synchronization_seconds\":"
+               << static_cast<double>(device.mhc_synchronization.nanoseconds) / 1.0e9
+               << ",\"moe_synchronization_calls\":"
+               << device.moe_synchronization.calls
+               << ",\"moe_synchronization_seconds\":"
+               << static_cast<double>(device.moe_synchronization.nanoseconds) / 1.0e9
+               << ",\"other_synchronization_calls\":"
+               << device.other_synchronization.calls
+               << ",\"other_synchronization_seconds\":"
+               << static_cast<double>(device.other_synchronization.nanoseconds) / 1.0e9
                << ",\"upload_wait_seconds\":"
                << static_cast<double>(device.upload_wait_nanoseconds) / 1.0e9
                << ",\"matmul_issue_seconds\":"
@@ -545,6 +617,14 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"dsv4_paged_attention_seconds\":"
                << static_cast<double>(
                       device.dsv4_paged_attention_nanoseconds) / 1.0e9
+               << ",\"dsv4_paged_attention_host_remainder_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_host_remainder_nanoseconds) /
+                      1.0e9
+               << ",\"dsv4_paged_attention_stream_sync_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_stream_sync_nanoseconds) /
+                      1.0e9
                << ",\"dsv4_mhc_calls\":" << device.dsv4_mhc_calls
                << ",\"dsv4_mhc_standalone_calls\":"
                << device.dsv4_mhc_standalone_calls
@@ -566,6 +646,12 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << static_cast<double>(device.dsv4_mhc_d2h_nanoseconds) / 1.0e9
                << ",\"dsv4_mhc_seconds\":"
                << static_cast<double>(device.dsv4_mhc_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_device_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_device_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_host_seconds\":"
+               << static_cast<double>(device.dsv4_mhc_host_nanoseconds) / 1.0e9
+               << ",\"dsv4_mhc_timing_clamped_samples\":"
+               << device.dsv4_mhc_timing_clamped_samples
                << ",\"lightning_index_calls\":"
                << device.lightning_index_calls
                << ",\"lightning_index_kernel_launches\":"
@@ -710,6 +796,50 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.attention_query_nanoseconds)
            << ",\"attention_kv_seconds\":"
            << seconds(stats.attention_kv_nanoseconds)
+           << ",\"attention_query_allocation_seconds\":"
+           << seconds(stats.attention_query_allocation_nanoseconds)
+           << ",\"attention_query_weight_acquisition_seconds\":"
+           << seconds(stats.attention_query_weight_acquisition_nanoseconds)
+           << ",\"attention_query_matmul_issue_seconds\":"
+           << seconds(stats.attention_query_matmul_issue_nanoseconds)
+           << ",\"attention_query_matmul_finish_seconds\":"
+           << seconds(stats.attention_query_matmul_finish_nanoseconds)
+           << ",\"attention_query_matmul_sync_seconds\":"
+           << seconds(stats.attention_query_matmul_sync_nanoseconds)
+           << ",\"attention_query_matmul_h2d_seconds\":"
+           << seconds(stats.attention_query_matmul_h2d_nanoseconds)
+           << ",\"attention_query_matmul_kernel_seconds\":"
+           << seconds(stats.attention_query_matmul_kernel_nanoseconds)
+           << ",\"attention_query_matmul_d2h_seconds\":"
+           << seconds(stats.attention_query_matmul_d2h_nanoseconds)
+           << ",\"attention_query_rank_norm_seconds\":"
+           << seconds(stats.attention_query_rank_norm_nanoseconds)
+           << ",\"attention_query_finish_seconds\":"
+           << seconds(stats.attention_query_finish_nanoseconds)
+           << ",\"attention_query_rms_cpu_seconds\":"
+           << seconds(stats.attention_query_rms_cpu_nanoseconds)
+           << ",\"attention_query_rope_cpu_seconds\":"
+           << seconds(stats.attention_query_rope_cpu_nanoseconds)
+           << ",\"attention_kv_allocation_seconds\":"
+           << seconds(stats.attention_kv_allocation_nanoseconds)
+           << ",\"attention_kv_weight_acquisition_seconds\":"
+           << seconds(stats.attention_kv_weight_acquisition_nanoseconds)
+           << ",\"attention_kv_matmul_issue_seconds\":"
+           << seconds(stats.attention_kv_matmul_issue_nanoseconds)
+           << ",\"attention_kv_matmul_finish_seconds\":"
+           << seconds(stats.attention_kv_matmul_finish_nanoseconds)
+           << ",\"attention_kv_matmul_sync_seconds\":"
+           << seconds(stats.attention_kv_matmul_sync_nanoseconds)
+           << ",\"attention_kv_matmul_h2d_seconds\":"
+           << seconds(stats.attention_kv_matmul_h2d_nanoseconds)
+           << ",\"attention_kv_matmul_kernel_seconds\":"
+           << seconds(stats.attention_kv_matmul_kernel_nanoseconds)
+           << ",\"attention_kv_matmul_d2h_seconds\":"
+           << seconds(stats.attention_kv_matmul_d2h_nanoseconds)
+           << ",\"attention_kv_norm_seconds\":"
+           << seconds(stats.attention_kv_norm_nanoseconds)
+           << ",\"attention_kv_rope_seconds\":"
+           << seconds(stats.attention_kv_rope_nanoseconds)
            << ",\"attention_projection_matmul_calls\":"
            << stats.attention_projection_matmul_calls
            << ",\"attention_projection_matmul_rows\":"
@@ -746,6 +876,20 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << stats.attention_cuda_dispatches
            << ",\"attention_scalar_dispatches\":"
            << stats.attention_scalar_dispatches
+           << ",\"attention_page_set_builds\":"
+           << stats.attention_page_set_builds
+           << ",\"attention_page_set_pages\":"
+           << stats.attention_page_set_pages
+           << ",\"attention_page_set_build_seconds\":"
+           << seconds(stats.attention_page_set_build_nanoseconds)
+           << ",\"attention_candidate_resolutions\":"
+           << stats.attention_candidate_resolutions
+           << ",\"attention_candidate_resolution_seconds\":"
+           << seconds(stats.attention_candidate_resolution_nanoseconds)
+           << ",\"attention_page_index_selection_seconds\":"
+           << seconds(stats.attention_page_index_selection_nanoseconds)
+           << ",\"attention_page_weight_acquire_seconds\":"
+           << seconds(stats.attention_page_weight_acquire_nanoseconds)
            << ",\"attention_score_seconds\":"
            << seconds(stats.attention_score_nanoseconds)
            << ",\"attention_output_seconds\":"
@@ -1070,6 +1214,9 @@ int main(int argc, char** argv) {
     config.device_kv_cache_bytes = options.device_kv_cache_bytes;
     config.maximum_context_tokens = options.maximum_context_tokens;
     config.prefill_page_tokens = options.prefill_page_tokens;
+    config.enable_dsv4_fp8_tensor_page = options.dsv4_fp8_tensor_page;
+    config.enable_dsv4_batched_page_attention =
+        options.dsv4_batched_page_attention;
     config.prefill_layer_tile_tokens = options.prefill_layer_tile_tokens;
     config.logit_trace_top_k = options.logit_trace_top_k;
     config.host_attention_threads = options.host_attention_threads;
@@ -1138,6 +1285,10 @@ int main(int argc, char** argv) {
                   << metrics.host_attention_threads
                   << ",\"prefill_page_tokens\":"
                   << metrics.prefill_page_tokens
+                  << ",\"dsv4_fp8_tensor_page\":"
+                  << (options.dsv4_fp8_tensor_page ? "true" : "false")
+                  << ",\"dsv4_batched_page_attention\":"
+                  << (options.dsv4_batched_page_attention ? "true" : "false")
                   << ",\"prefill_layer_tile_tokens\":"
                   << metrics.prefill_layer_tile_tokens
                   << ",\"flash_attention\":"

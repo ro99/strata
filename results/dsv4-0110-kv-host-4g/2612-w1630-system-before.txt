@@ -1,0 +1,8 @@
+2026-08-16T11:43:19-03:00
+24cdea98cd4cfcbd116541a03fe4338d4b13d1d2
+## exp/dsv4-promotion-campaign
+0058525f5417f4c55776147cd3b8bfd7c69df3c1f54852fd439dd45bde34681a  build/strata-deepseek-run
+index, name, pci.bus_id, memory.free [MiB], memory.total [MiB]
+0, NVIDIA GeForce RTX 5060 Ti, 00000000:03:00.0, 15847 MiB, 16311 MiB
+1, NVIDIA GeForce RTX 3090, 00000000:82:00.0, 24126 MiB, 24576 MiB
+2, NVIDIA GeForce RTX 3090, 00000000:83:00.0, 24126 MiB, 24576 MiB

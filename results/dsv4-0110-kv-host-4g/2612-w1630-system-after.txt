@@ -1,0 +1,6 @@
+2026-08-16T11:48:10-03:00
+index, name, pci.bus_id, memory.free [MiB], memory.total [MiB]
+0, NVIDIA GeForce RTX 5060 Ti, 00000000:03:00.0, 15847 MiB, 16311 MiB
+1, NVIDIA GeForce RTX 3090, 00000000:82:00.0, 24126 MiB, 24576 MiB
+2, NVIDIA GeForce RTX 3090, 00000000:83:00.0, 24126 MiB, 24576 MiB
+exit_status=0

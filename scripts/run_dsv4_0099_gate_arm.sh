@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 arm=${1:?usage: run_dsv4_0099_gate_arm.sh baseline|candidate}
 result_dir=${RESULT_DIR:-"${repo_root}/results/dsv4-0099-prepared-selection-gate"}
-model_dir=${MODEL_DIR:-"${repo_root}/models/dsv4f"}
+model_dir=${MODEL_DIR:-"/home/rodrigo/Developer/strata/models/dsv4f"}
 
 case "${arm}" in
     baseline)

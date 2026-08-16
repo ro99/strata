@@ -4152,27 +4152,63 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
         }
     }
 
-    CudaDsv4PagedAttentionMhcRequest request;
-    request.attention.queries = queries;
-    request.attention.head_sinks = sinks;
-    request.attention.pages = pages;
-    request.attention.candidates = candidates;
-    request.attention.rows = rows;
-    request.attention.candidate_width = candidate_width;
-    request.attention.scale = kAttentionScale;
-    // The 677-row production page requires about 310 MiB. Keeping the hard
-    // limit below 384 MiB prevents bit_ceil from reserving the 512 MiB seen in
-    // experiment 0098 while retaining a strict admission failure above it.
-    request.attention.maximum_workspace_bytes = 384ULL << 20U;
-    request.mhc_slots = row_slots;
-    request.inverse_rope_cosines = cosines;
-    request.inverse_rope_sines = sines;
-    request.output_a = &output_a.weight();
-    request.output_b = &output_b.weight();
-    request.mhc_device = devices[mhc_slot];
+    // A scheduling page may be wider than the bounded CUDA workspace. Derive
+    // its row admission from the backend's exact allocation layout, then slice
+    // only the query dimension. Pages and weights remain shared by every
+    // slice, matching the reference stack's budgeted prefill chunks.
+    constexpr std::uint64_t maximum_workspace_bytes = 384ULL << 20U;
+    auto admitted = cuda.dsv4_paged_attention_to_mhc_page_maximum_rows(
+        pages, rows, candidate_width, maximum_workspace_bytes);
+    if (!admitted.ok()) return {std::move(admitted.errors)};
+    const auto maximum_rows = admitted.value;
 
-    result = cuda.dsv4_paged_attention_to_mhc(
-        devices[slot], request, diagnostic_branches);
+    const auto rope_stride = static_cast<std::size_t>(kRopeDim) / 2U;
+    std::uint32_t begin = 0U;
+    while (begin < rows) {
+        const auto remaining = rows - begin;
+        auto chunk_rows = std::min(maximum_rows, remaining);
+        // The page command uses the single-row path when rows == 1, which has
+        // a different mHC state contract. Rebalance the preceding chunk so
+        // every page slice retains at least two rows.
+        if (remaining - chunk_rows == 1U) --chunk_rows;
+        if (chunk_rows < 2U) {
+            result.errors.emplace_back(
+                "DeepSeek attention page workspace split produced a singleton slice");
+            return result;
+        }
+
+        CudaDsv4PagedAttentionMhcRequest request;
+        request.attention.queries = queries.subspan(
+            static_cast<std::size_t>(begin) * query_stride,
+            static_cast<std::size_t>(chunk_rows) * query_stride);
+        request.attention.head_sinks = sinks;
+        request.attention.pages = pages;
+        request.attention.candidates = std::span<const CudaDsv4AttentionCandidate>(
+            candidates).subspan(
+                static_cast<std::size_t>(begin) * candidate_width,
+                static_cast<std::size_t>(chunk_rows) * candidate_width);
+        request.attention.rows = chunk_rows;
+        request.attention.candidate_width = candidate_width;
+        request.attention.scale = kAttentionScale;
+        request.attention.maximum_workspace_bytes = maximum_workspace_bytes;
+        request.mhc_slots = row_slots.subspan(begin, chunk_rows);
+        request.inverse_rope_cosines = std::span<const float>(cosines).subspan(
+            static_cast<std::size_t>(begin) * rope_stride,
+            static_cast<std::size_t>(chunk_rows) * rope_stride);
+        request.inverse_rope_sines = std::span<const float>(sines).subspan(
+            static_cast<std::size_t>(begin) * rope_stride,
+            static_cast<std::size_t>(chunk_rows) * rope_stride);
+        request.output_a = &output_a.weight();
+        request.output_b = &output_b.weight();
+        request.mhc_device = devices[mhc_slot];
+
+        result = cuda.dsv4_paged_attention_to_mhc(
+            devices[slot], request, diagnostic_branches.subspan(
+                static_cast<std::size_t>(begin) * kHidden,
+                static_cast<std::size_t>(chunk_rows) * kHidden));
+        if (!result.ok()) return result;
+        begin += chunk_rows;
+    }
     return result;
 }
 

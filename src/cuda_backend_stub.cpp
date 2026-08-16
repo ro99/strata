@@ -149,6 +149,20 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     return {{"DeepSeek paged attention requires a CUDA-enabled build"}};
 }
 
+ParseResult<std::uint64_t>
+CudaBackend::dsv4_paged_attention_to_mhc_page_workspace_bytes(
+    std::span<const CudaDsv4PhysicalPage>, std::uint32_t,
+    std::uint32_t) const {
+    return {0U, {"DeepSeek paged attention requires a CUDA-enabled build"}};
+}
+
+ParseResult<std::uint32_t>
+CudaBackend::dsv4_paged_attention_to_mhc_page_maximum_rows(
+    std::span<const CudaDsv4PhysicalPage>, std::uint32_t, std::uint32_t,
+    std::uint64_t) const {
+    return {0U, {"DeepSeek paged attention requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::dsv4_prepare_attention(
     int, const CudaDsv4AttentionPrepareRequest&, std::span<float>,
     std::span<float>, std::span<float>, std::span<float>, std::span<float>,

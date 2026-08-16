@@ -883,6 +883,19 @@ public:
     [[nodiscard]] ValidationResult dsv4_paged_attention_to_mhc(
         int device, const CudaDsv4PagedAttentionMhcRequest& request,
         std::span<float> diagnostic_branch = {});
+    // Returns the exact source-device workspace required by the multi-row
+    // physical-page attention-to-mHC path. Runtime page admission uses this
+    // same layout calculation as execution, so the workspace cap can split a
+    // scheduling page before CUDA allocation rather than rejecting it late.
+    [[nodiscard]] ParseResult<std::uint64_t>
+    dsv4_paged_attention_to_mhc_page_workspace_bytes(
+        std::span<const CudaDsv4PhysicalPage> pages, std::uint32_t rows,
+        std::uint32_t candidate_width) const;
+    [[nodiscard]] ParseResult<std::uint32_t>
+    dsv4_paged_attention_to_mhc_page_maximum_rows(
+        std::span<const CudaDsv4PhysicalPage> pages,
+        std::uint32_t requested_rows, std::uint32_t candidate_width,
+        std::uint64_t maximum_workspace_bytes) const;
     [[nodiscard]] ValidationResult dsv4_prepare_attention(
         int device, const CudaDsv4AttentionPrepareRequest& request,
         std::span<float> query_rank, std::span<float> key_value,

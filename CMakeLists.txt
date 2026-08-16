@@ -198,6 +198,19 @@ if(STRATA_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(strata_core PUBLIC CUDA::cublas)
 
+    add_executable(strata-dsv4-bf16-gemm-probe
+        apps/strata_dsv4_bf16_gemm_probe.cu)
+    target_link_libraries(strata-dsv4-bf16-gemm-probe PRIVATE
+        CUDA::cublas CUDA::cudart)
+    set_property(TARGET strata-dsv4-bf16-gemm-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-bf16-gemm-probe PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-bf16-gemm-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-bf16-gemm-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
     if(STRATA_ENABLE_NCCL)
         # NCCL is rarely installed system-wide. In practice it arrives with the
         # CUDA toolkit or as the nvidia-nccl-cu12 wheel inside a Python

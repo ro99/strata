@@ -1,6 +1,6 @@
 # Experiment 0100 — DSV4 page projection residency screen
 
-Status: **re-scoped to attribution after the required source and counter audit
+Status: **attribution arm complete after the required source and counter audit
 falsified the original dispatch-collapse premise.** The original mechanism was
 not implemented. Experiment 0099 remains preserved at `abded32` and is not
 relitigated or rolled back.
@@ -168,3 +168,137 @@ The arm is not authorized until the build, focused CUDA fixtures, full
 
 Instrumentation checkpoint: the focused native CUDA fixture suite passed, and
 the required full `make check` passed 2/2 CTest targets before commit.
+
+## Attribution result
+
+The sole authorized arm ran untraced at 677 tokens and page 8192 from
+instrumentation commit `7c5fd1d`. It completed successfully in 2:52.89 process
+wall time, below the approximately four-minute model-time budget. Raw output is
+preserved under `results/dsv4-0100-attribution/`.
+
+Correctness and operating-point checks passed:
+
+- generated IDs were exactly `2107, 8777, 1277, 440`;
+- `decode_checkpoint_read_bytes` was zero;
+- decode was 6.773 tok/s versus 0099's one-arm 6.819 tok/s, a 0.7% difference
+  with no material regression claim from one run;
+- page attention retained 86 calls, 1,655 launches and 30,564,224 page bytes;
+- RSS was 158,858,625,024 bytes (147.949 GiB), and GPU 1/GPU 2 VRAM was
+  22,994,354,176 / 22,916,759,552 bytes (21.415 / 21.343 GiB), exactly the
+  same VRAM byte counts as 0099;
+- the maximum page workspace was 44,302,336 bytes, below the declared
+  384 MiB/device ceiling.
+
+This was instrumentation, not an A/B candidate. Total prefill was 64.3285 s or
+10.5241 tok/s. The 0099 arm was 60.1949 s or 11.2468 tok/s, but no timing claim
+is made from that non-interleaved comparison; the current arm's phase split was
+29.9014 s attention, 30.0876 s MoE and 2.8978 s graph mHC pre+post.
+
+### Query attribution
+
+The 10.634712 s query bucket is accounted to 0.015787 s:
+
+| Query component | Seconds | Interpretation |
+|---|---:|---|
+| page vector allocation/zeroing | 2.337584 | host allocation and initialization before projection |
+| weight acquisition | 0.000579 | demand guard and resident-weight lookup |
+| matmul host issue | 7.298632 | submission interval; device work overlaps it |
+| exact stream wait | 0.704693 | time inside `cudaStreamSynchronize` only |
+| host finish | 0.022637 | pinned output copy plus CUDA event reads |
+| query-rank RMS norm wall | 0.023763 | host wall time |
+| query RMS/RoPE worker wall | 0.231037 | existing page worker dispatch |
+| unexplained residual | 0.015787 | subtraction residual |
+
+CUDA event service within the matmuls was 0.088536 s H2D, 7.159487 s kernel
+and 0.651140 s D2H, or 7.899163 s total. Those intervals overlap host issue and
+stream wait and therefore must not be added to the wall decomposition. The
+worker tasks accumulated 4.485757 CPU-seconds of RMS and 1.500354 CPU-seconds
+of RoPE across threads while consuming only 0.231037 s wall time.
+
+The large finding is that the query residual is not dispatch count or PCIe:
+the batched kernel itself consumes 7.159 s of device service, and repeatedly
+allocating/zeroing page-sized host vectors consumes another 2.338 s.
+
+### KV attribution
+
+The projection/normalization portion accounts for only 0.601260 s of the
+4.360476 s historical KV bucket:
+
+| KV component | Seconds |
+|---|---:|
+| page vector allocation/zeroing | 0.025732 |
+| weight acquisition | 0.000293 |
+| matmul host issue | 0.128879 |
+| exact stream wait | 0.406586 |
+| host finish | 0.010974 |
+| host norm | 0.012576 |
+| host RoPE/rounding | 0.016221 |
+| sliding-KV append plus learned compressor | 3.759216 |
+
+CUDA event service for the actual KV projection was 0.069887 s H2D,
+0.324564 s kernel and 0.015820 s D2H. Source inspection explains the 3.759216 s
+remainder: `attention_append_prepared` deliberately adds sliding-cache append
+and `compressor(...)` to `attention_kv_nanoseconds` for every row after the
+page projection. The compressor includes its own two row projections, pooling,
+norm, RoPE and cache publication. The arm does not split those operations
+internally, so 3.759216 s is the explicitly sized unresolved sub-split; it is
+not assigned to the batched KV projection.
+
+### Synchronization attribution
+
+The subsystem counters reconcile exactly on the critical device:
+
+| Subsystem | Calls | Critical-path recorded seconds |
+|---|---:|---:|
+| weights | 170 | 0.057705 |
+| attention | 43 | 3.941541 |
+| generic projections | 84,630 | 1.598877 |
+| mHC | 58,813 | 0.789410 |
+| MoE | 87 | 4.176965 |
+| other | 252 | 0.002243 |
+| **total** | **143,995** | **10.566741** |
+
+Thus the synchronization term is principally MoE collect/wait (4.177 s),
+attention (3.942 s), generic matmul (1.599 s), and mHC (0.789 s). It is not a
+projection-dispatch-count problem.
+
+Generic matmul's historical projection synchronization value includes its
+pinned output copy. On critical GPU 1, exact generic-matmul host finish over all
+41,978 calls was only 0.133939 s. Therefore at least 10.432802 s of the
+historical 10.566741 s global total was genuine stream wait; host finish could
+account for at most 0.133939 s (1.3%). The exact query+KV subset separately
+measured 1.111278 s stream wait and 0.033611 s host finish. A global exact
+matmul-wait accumulator was not persisted, so the remaining global split is a
+0.133939 s bound rather than an invented point estimate.
+
+### mHC attribution and counter correction
+
+mHC reported 58,899 commands and 176,020 launches. On the critical device its
+event service was 1.693445 s: 0.248781 s H2D, 1.054103 s kernels and 0.390561 s
+D2H. Host-exclusive backend time was 1.726688 s and exact mHC stream wait was
+0.789410 s. Device service overlaps host issue/wait and is not additive wall
+time. Graph mHC pre+post was 2.897822 s; host-exclusive plus exact wait accounts
+for 2.516098 s, leaving a 0.381724 s boundary/validation residual.
+
+`maximum_device_dsv4_mhc_kernel_seconds` is now finite at 1.054103 s. One
+negative event sample on GPU 2 was clamped and reported explicitly rather than
+wrapping to 18,446,744,070 s; the clamp counter is one.
+
+## Attribution verdict
+
+The measurement succeeds in locating query and synchronization time with no
+unexplained residual above 0.382 s. It also falsifies the label on the old KV
+bucket: only 0.601 s is page projection/norm/RoPE, while 3.759 s belongs to the
+row-local sliding append and learned compressor. That 3.759 s path is named and
+source-traceable but not internally split by this arm, and is recorded as the
+one material unresolved sub-bucket rather than distributed across projection
+terms.
+
+The cost model at this operating point now names the largest serial waits as
+MoE synchronization (4.177 s) and attention synchronization (3.942 s), while
+the largest query resources are device kernel service (7.159 s) and host page
+allocation/zeroing (2.338 s). Selecting a mechanism or adding a finer
+compressor split is a new decision and is outside this measurement-only scope.
+
+The final required `make check` passed 2/2 CTest targets before the result
+record commit.

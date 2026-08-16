@@ -165,8 +165,8 @@ struct Dsv4GraphStats {
     std::uint64_t attention_query_nanoseconds{};
     std::uint64_t attention_kv_nanoseconds{};
     // Projection-specific wall attribution for page prefill. Matmul device
-    // intervals are nested inside the synchronization wait; host RMS/RoPE
-    // work is measured separately from that wait.
+    // intervals can overlap issue and synchronization; host RMS/RoPE work is
+    // measured separately from those wall intervals.
     std::uint64_t attention_query_allocation_nanoseconds{};
     std::uint64_t attention_query_weight_acquisition_nanoseconds{};
     std::uint64_t attention_query_matmul_issue_nanoseconds{};

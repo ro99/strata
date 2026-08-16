@@ -51,9 +51,8 @@ struct CudaWeightDescriptor {
 };
 
 // Host/device attribution for one synchronous generic matmul. Device event
-// intervals are contained inside synchronization_nanoseconds; they are kept
-// separate so a caller can identify what the wait contained without double
-// counting it as additional wall time.
+// intervals can overlap host issue and stream wait, so they are service-time
+// evidence rather than additional wall-time terms.
 struct CudaMatmulProfile {
     std::uint64_t weight_acquisition_nanoseconds{};
     std::uint64_t issue_nanoseconds{};

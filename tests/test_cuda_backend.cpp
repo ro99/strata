@@ -1409,12 +1409,18 @@ TEST_CASE("SM86 DeepSeek FP8 page projections match at the BF16 boundary") {
 
         const auto output_elements =
             static_cast<std::size_t>(rows) * shape.outputs;
-        std::vector<float> incumbent(output_elements);
-        std::vector<float> tensor(output_elements);
+        std::vector<float> incumbent(
+            output_elements, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> tensor(
+            output_elements, std::numeric_limits<float>::quiet_NaN());
         REQUIRE(backend.matmul(weight, input, rows, incumbent, true, nullptr,
                                false).ok());
         REQUIRE(backend.matmul(weight, input, rows, tensor, true, nullptr,
                                true).ok());
+        REQUIRE(std::all_of(incumbent.begin(), incumbent.end(),
+                            [](float value) { return std::isfinite(value); }));
+        REQUIRE(std::all_of(tensor.begin(), tensor.end(),
+                            [](float value) { return std::isfinite(value); }));
         std::uint64_t path_mismatches = 0U;
         for (std::size_t index = 0U; index < output_elements; ++index) {
             if (std::bit_cast<std::uint32_t>(tensor[index]) !=
@@ -1970,9 +1976,26 @@ TEST_CASE("native CUDA DeepSeek paged attention batches rows bit exactly") {
             }
 
             std::vector<float> batched(queries.size());
+            const auto forced_workspace =
+                backend.dsv4_paged_attention_to_mhc_page_workspace_bytes(
+                    pages, page_size, candidate_width);
+            REQUIRE(forced_workspace.ok());
+            const auto admitted =
+                backend.dsv4_paged_attention_to_mhc_page_maximum_rows(
+                    pages, prompt_size, candidate_width,
+                    forced_workspace.value);
+            REQUIRE(admitted.ok());
+            REQUIRE(admitted.value == std::min(page_size, prompt_size));
+            if (prompt_size > page_size) {
+                const auto unsplit_workspace =
+                    backend.dsv4_paged_attention_to_mhc_page_workspace_bytes(
+                        pages, prompt_size, candidate_width);
+                REQUIRE(unsplit_workspace.ok());
+                REQUIRE(unsplit_workspace.value > forced_workspace.value);
+            }
             for (std::uint32_t begin = 0U; begin < prompt_size;
-                 begin += page_size) {
-                const auto rows = std::min(page_size, prompt_size - begin);
+                 begin += admitted.value) {
+                const auto rows = std::min(admitted.value, prompt_size - begin);
                 strata::CudaDsv4PagedAttentionRequest request;
                 request.queries = std::span<const float>(queries).subspan(
                     static_cast<std::size_t>(begin) * row_query_elements,
@@ -1986,7 +2009,7 @@ TEST_CASE("native CUDA DeepSeek paged attention batches rows bit exactly") {
                             static_cast<std::size_t>(rows) * candidate_width);
                 request.rows = rows;
                 request.candidate_width = candidate_width;
-                request.maximum_workspace_bytes = 384ULL << 20U;
+                request.maximum_workspace_bytes = forced_workspace.value;
                 request.scale = 1.0F / std::sqrt(512.0F);
                 REQUIRE(backend.dsv4_paged_attention(
                     device, request, std::span<float>(batched).subspan(

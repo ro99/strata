@@ -1604,6 +1604,23 @@ struct SpeculativeState {
 }  // namespace
 
 struct DeepSeekV4Runtime::Impl {
+    // Page projections overwrite every output element before returning. Keep
+    // their largest admitted host extents for the runtime lifetime and avoid
+    // std::vector(size), whose value-initialization zeroed hundreds of MiB per
+    // layer before CUDA immediately overwrote it.
+    struct UninitializedFloatScratch {
+        std::span<float> acquire(std::size_t elements) {
+            if (elements > capacity) {
+                data = std::make_unique_for_overwrite<float[]>(elements);
+                capacity = elements;
+            }
+            return {data.get(), elements};
+        }
+
+        std::unique_ptr<float[]> data;
+        std::size_t capacity{};
+    };
+
     // Physical page metadata is shared by every row in one prefill page.
     // Device leases are moved into pending_attention_leases after each
     // successful command, so the buffers remain resident until the matching
@@ -1764,6 +1781,9 @@ struct DeepSeekV4Runtime::Impl {
     // recomputed on the device so the two agree bit for bit.
     std::vector<float> index_rope_cosines;
     std::vector<float> index_rope_sines;
+    UninitializedFloatScratch attention_page_query_rank_scratch;
+    UninitializedFloatScratch attention_page_query_scratch;
+    UninitializedFloatScratch attention_page_kv_scratch;
     std::vector<std::unique_ptr<HostMoeContext>> host_moe_contexts;
     std::uint32_t host_moe_pending{};
     // Page-major prompt execution enqueues the CPU-MoE chain once per row
@@ -4152,27 +4172,63 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
         }
     }
 
-    CudaDsv4PagedAttentionMhcRequest request;
-    request.attention.queries = queries;
-    request.attention.head_sinks = sinks;
-    request.attention.pages = pages;
-    request.attention.candidates = candidates;
-    request.attention.rows = rows;
-    request.attention.candidate_width = candidate_width;
-    request.attention.scale = kAttentionScale;
-    // The 677-row production page requires about 310 MiB. Keeping the hard
-    // limit below 384 MiB prevents bit_ceil from reserving the 512 MiB seen in
-    // experiment 0098 while retaining a strict admission failure above it.
-    request.attention.maximum_workspace_bytes = 384ULL << 20U;
-    request.mhc_slots = row_slots;
-    request.inverse_rope_cosines = cosines;
-    request.inverse_rope_sines = sines;
-    request.output_a = &output_a.weight();
-    request.output_b = &output_b.weight();
-    request.mhc_device = devices[mhc_slot];
+    // A scheduling page may be wider than the bounded CUDA workspace. Derive
+    // its row admission from the backend's exact allocation layout, then slice
+    // only the query dimension. Pages and weights remain shared by every
+    // slice, matching the reference stack's budgeted prefill chunks.
+    constexpr std::uint64_t maximum_workspace_bytes = 384ULL << 20U;
+    auto admitted = cuda.dsv4_paged_attention_to_mhc_page_maximum_rows(
+        pages, rows, candidate_width, maximum_workspace_bytes);
+    if (!admitted.ok()) return {std::move(admitted.errors)};
+    const auto maximum_rows = admitted.value;
 
-    result = cuda.dsv4_paged_attention_to_mhc(
-        devices[slot], request, diagnostic_branches);
+    const auto rope_stride = static_cast<std::size_t>(kRopeDim) / 2U;
+    std::uint32_t begin = 0U;
+    while (begin < rows) {
+        const auto remaining = rows - begin;
+        auto chunk_rows = std::min(maximum_rows, remaining);
+        // The page command uses the single-row path when rows == 1, which has
+        // a different mHC state contract. Rebalance the preceding chunk so
+        // every page slice retains at least two rows.
+        if (remaining - chunk_rows == 1U) --chunk_rows;
+        if (chunk_rows < 2U) {
+            result.errors.emplace_back(
+                "DeepSeek attention page workspace split produced a singleton slice");
+            return result;
+        }
+
+        CudaDsv4PagedAttentionMhcRequest request;
+        request.attention.queries = queries.subspan(
+            static_cast<std::size_t>(begin) * query_stride,
+            static_cast<std::size_t>(chunk_rows) * query_stride);
+        request.attention.head_sinks = sinks;
+        request.attention.pages = pages;
+        request.attention.candidates = std::span<const CudaDsv4AttentionCandidate>(
+            candidates).subspan(
+                static_cast<std::size_t>(begin) * candidate_width,
+                static_cast<std::size_t>(chunk_rows) * candidate_width);
+        request.attention.rows = chunk_rows;
+        request.attention.candidate_width = candidate_width;
+        request.attention.scale = kAttentionScale;
+        request.attention.maximum_workspace_bytes = maximum_workspace_bytes;
+        request.mhc_slots = row_slots.subspan(begin, chunk_rows);
+        request.inverse_rope_cosines = std::span<const float>(cosines).subspan(
+            static_cast<std::size_t>(begin) * rope_stride,
+            static_cast<std::size_t>(chunk_rows) * rope_stride);
+        request.inverse_rope_sines = std::span<const float>(sines).subspan(
+            static_cast<std::size_t>(begin) * rope_stride,
+            static_cast<std::size_t>(chunk_rows) * rope_stride);
+        request.output_a = &output_a.weight();
+        request.output_b = &output_b.weight();
+        request.mhc_device = devices[mhc_slot];
+
+        result = cuda.dsv4_paged_attention_to_mhc(
+            devices[slot], request, diagnostic_branches.subspan(
+                static_cast<std::size_t>(begin) * kHidden,
+                static_cast<std::size_t>(chunk_rows) * kHidden));
+        if (!result.ok()) return result;
+        begin += chunk_rows;
+    }
     return result;
 }
 
@@ -4568,7 +4624,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     };
     auto subphase_started = std::chrono::steady_clock::now();
     auto allocation_started = std::chrono::steady_clock::now();
-    std::vector<float> query_rank(row_count * kQueryRank);
+    auto query_rank = attention_page_query_rank_scratch.acquire(
+        row_count * kQueryRank);
     graph_stats.attention_query_allocation_nanoseconds +=
         elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
@@ -4596,7 +4653,8 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
 
     const auto query_stride = static_cast<std::size_t>(kHeads) * kHeadDim;
     allocation_started = std::chrono::steady_clock::now();
-    std::vector<float> queries(row_count * query_stride);
+    auto queries = attention_page_query_scratch.acquire(
+        row_count * query_stride);
     graph_stats.attention_query_allocation_nanoseconds +=
         elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;
@@ -4624,7 +4682,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
     const auto normalize_query_row = [&](std::size_t row) {
         auto cpu_started = std::chrono::steady_clock::now();
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            auto query = std::span<float>(queries).subspan(
+            auto query = queries.subspan(
                 row * query_stride + head * kHeadDim, kHeadDim);
             double square_sum = 0.0;
             for (const float value : query) {
@@ -4638,7 +4696,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
             elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
         cpu_started = std::chrono::steady_clock::now();
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            auto query = std::span<float>(queries).subspan(
+            auto query = queries.subspan(
                 row * query_stride + head * kHeadDim, kHeadDim);
             apply_rope(query.last(kRopeDim),
                        position_base + static_cast<std::uint32_t>(row),
@@ -4668,7 +4726,7 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
 
     subphase_started = std::chrono::steady_clock::now();
     allocation_started = std::chrono::steady_clock::now();
-    std::vector<float> kv(row_count * kHeadDim);
+    auto kv = attention_page_kv_scratch.acquire(row_count * kHeadDim);
     graph_stats.attention_kv_allocation_nanoseconds +=
         elapsed_nanoseconds(allocation_started);
     ++graph_stats.attention_projection_matmul_calls;

@@ -4543,6 +4543,145 @@ bool align_up(std::uint64_t value, std::uint64_t alignment,
     return true;
 }
 
+struct Dsv4AttentionMhcWorkspaceLayout {
+    std::uint64_t page_offset{};
+    std::uint64_t candidate_offset{};
+    std::uint64_t query_offset{};
+    std::uint64_t sink_offset{};
+    std::uint64_t cosine_offset{};
+    std::uint64_t sine_offset{};
+    std::uint64_t slot_offset{};
+    std::uint64_t block_offset{};
+    std::uint64_t kv_offset{};
+    std::uint64_t score_offset{};
+    std::uint64_t maximum_offset{};
+    std::uint64_t denominator_offset{};
+    std::uint64_t value_offset{};
+    std::uint64_t attended_offset{};
+    std::uint64_t decoded_offset{};
+    std::uint64_t output_rank_offset{};
+    std::uint64_t branch_offset{};
+    std::uint64_t encoded_branch_offset{};
+    std::uint64_t router_logits_offset{};
+    std::uint64_t failure_offset{};
+    std::uint64_t page_descriptor_bytes{};
+    std::uint64_t candidate_bytes{};
+    std::uint64_t query_bytes{};
+    std::uint64_t sink_bytes{};
+    std::uint64_t rope_bytes{};
+    std::uint64_t slot_bytes{};
+    std::uint64_t block_bytes{};
+    std::uint64_t kv_bytes{};
+    std::uint64_t score_bytes{};
+    std::uint64_t upload_bytes{};
+    std::uint64_t workspace_bytes{};
+};
+
+bool dsv4_attention_mhc_workspace_layout(
+    std::uint64_t page_count, std::uint32_t rows,
+    std::uint32_t total_heads, std::uint32_t output_groups,
+    std::uint32_t candidates, std::uint32_t flat_rows,
+    bool use_prepared_query, std::uint64_t mhc_slot_count,
+    std::uint64_t resolution_block_count,
+    std::uint64_t router_logits_bytes,
+    Dsv4AttentionMhcWorkspaceLayout& layout) {
+    constexpr std::uint64_t rope_pairs = 32U;
+    constexpr std::uint64_t group_elements =
+        static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
+    constexpr std::uint64_t branch_row_elements = kDsv4MhcHidden;
+    const auto attended_row_elements =
+        static_cast<std::uint64_t>(total_heads) * kDsv4PagedHeadDim;
+    const auto output_rank_row_elements =
+        static_cast<std::uint64_t>(output_groups) * 1024U;
+    std::uint64_t total_candidates{};
+    std::uint64_t attended_elements{};
+    std::uint64_t output_rank_elements{};
+    std::uint64_t branch_elements{};
+    if (!checked_bytes(rows, candidates, 1U, total_candidates) ||
+        !checked_bytes(rows, attended_row_elements, 1U, attended_elements) ||
+        !checked_bytes(rows, output_rank_row_elements, 1U,
+                       output_rank_elements) ||
+        !checked_bytes(rows, branch_row_elements, 1U, branch_elements) ||
+        !checked_bytes(page_count, 1U, sizeof(Dsv4DevicePhysicalPage),
+                       layout.page_descriptor_bytes) ||
+        !checked_bytes(total_candidates, 1U,
+                       sizeof(Dsv4DeviceAttentionCandidate),
+                       layout.candidate_bytes) ||
+        !checked_bytes(use_prepared_query ? 0U : attended_elements, 1U,
+                       sizeof(std::uint16_t), layout.query_bytes) ||
+        !checked_bytes(total_heads, 1U, sizeof(float), layout.sink_bytes) ||
+        !checked_bytes(rows, rope_pairs, sizeof(float), layout.rope_bytes) ||
+        !checked_bytes(mhc_slot_count, 1U, sizeof(std::uint32_t),
+                       layout.slot_bytes) ||
+        !checked_bytes(resolution_block_count, 1U,
+                       sizeof(Dsv4DeviceKvBlock), layout.block_bytes) ||
+        !checked_bytes(flat_rows, kDsv4PagedHeadDim,
+                       sizeof(std::uint16_t), layout.kv_bytes) ||
+        !checked_bytes(rows,
+                       static_cast<std::uint64_t>(kDsv4PagedHeads) * flat_rows,
+                       sizeof(std::uint16_t), layout.score_bytes)) {
+        return false;
+    }
+    std::uint64_t cursor = 0U;
+    const auto region = [&](std::uint64_t bytes, std::uint64_t alignment,
+                            std::uint64_t& offset) -> bool {
+        if (!align_up(cursor, alignment, offset) ||
+            bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+            return false;
+        }
+        cursor = offset + bytes;
+        return true;
+    };
+    if (!region(layout.page_descriptor_bytes, 16U, layout.page_offset) ||
+        !region(layout.candidate_bytes, 16U, layout.candidate_offset) ||
+        !region(layout.query_bytes, 16U, layout.query_offset) ||
+        !region(layout.sink_bytes, 16U, layout.sink_offset) ||
+        !region(layout.rope_bytes, 16U, layout.cosine_offset) ||
+        !region(layout.rope_bytes, 16U, layout.sine_offset) ||
+        !region(layout.slot_bytes, 16U, layout.slot_offset) ||
+        !region(layout.block_bytes, 16U, layout.block_offset)) {
+        return false;
+    }
+    layout.upload_bytes = cursor;
+
+    std::uint64_t maximum_bytes{};
+    std::uint64_t denominator_bytes{};
+    std::uint64_t value_bytes{};
+    std::uint64_t attended_bytes{};
+    std::uint64_t decoded_bytes{};
+    std::uint64_t output_rank_bytes{};
+    std::uint64_t branch_bytes{};
+    std::uint64_t encoded_branch_bytes{};
+    if (!checked_bytes(rows, kDsv4PagedHeads, sizeof(float), maximum_bytes) ||
+        !checked_bytes(rows, kDsv4PagedHeads, sizeof(float),
+                       denominator_bytes) ||
+        !checked_bytes(rows, group_elements, sizeof(float), value_bytes) ||
+        !checked_bytes(attended_elements, 1U, sizeof(std::uint16_t),
+                       attended_bytes) ||
+        !checked_bytes(attended_elements, 1U, sizeof(float), decoded_bytes) ||
+        !checked_bytes(output_rank_elements, 1U, sizeof(float),
+                       output_rank_bytes) ||
+        !checked_bytes(branch_elements, 1U, sizeof(float), branch_bytes) ||
+        !checked_bytes(branch_elements, 1U, sizeof(std::uint16_t),
+                       encoded_branch_bytes) ||
+        !region(layout.kv_bytes, 16U, layout.kv_offset) ||
+        !region(layout.score_bytes, 16U, layout.score_offset) ||
+        !region(maximum_bytes, 16U, layout.maximum_offset) ||
+        !region(denominator_bytes, 16U, layout.denominator_offset) ||
+        !region(value_bytes, 16U, layout.value_offset) ||
+        !region(attended_bytes, 16U, layout.attended_offset) ||
+        !region(decoded_bytes, 16U, layout.decoded_offset) ||
+        !region(output_rank_bytes, 16U, layout.output_rank_offset) ||
+        !region(branch_bytes, 16U, layout.branch_offset) ||
+        !region(encoded_branch_bytes, 16U, layout.encoded_branch_offset) ||
+        !region(router_logits_bytes, 16U, layout.router_logits_offset) ||
+        !region(sizeof(unsigned int), 16U, layout.failure_offset)) {
+        return false;
+    }
+    layout.workspace_bytes = cursor;
+    return true;
+}
+
 class WeightArena {
 public:
     struct Allocation {
@@ -9890,6 +10029,92 @@ bool dsv4_validate_device_pointer(
 
 }  // namespace
 
+ParseResult<std::uint64_t>
+CudaBackend::dsv4_paged_attention_to_mhc_page_workspace_bytes(
+    std::span<const CudaDsv4PhysicalPage> pages, std::uint32_t rows,
+    std::uint32_t candidate_width) const {
+    ParseResult<std::uint64_t> result{};
+    if (rows < 2U || pages.empty() ||
+        pages.size() > std::numeric_limits<std::uint32_t>::max() ||
+        candidate_width == 0U || candidate_width > 640U ||
+        candidate_width % kDsv4PagedCandidateBlock != 0U) {
+        result.errors.emplace_back(
+            "DeepSeek attention page workspace request is invalid");
+        return result;
+    }
+    std::uint64_t flat_rows64 = 0U;
+    for (const auto& page : pages) {
+        if ((page.rows != 2U && page.rows != 64U && page.rows != 256U) ||
+            page.rows > std::numeric_limits<std::uint64_t>::max() -
+                            flat_rows64) {
+            result.errors.emplace_back(
+                "DeepSeek attention page workspace extent is invalid");
+            return result;
+        }
+        flat_rows64 += page.rows;
+    }
+    if (flat_rows64 == 0U ||
+        flat_rows64 > std::numeric_limits<std::uint32_t>::max()) {
+        result.errors.emplace_back(
+            "DeepSeek attention page workspace extent overflows");
+        return result;
+    }
+    Dsv4AttentionMhcWorkspaceLayout layout;
+    if (!dsv4_attention_mhc_workspace_layout(
+            pages.size(), rows, 64U, 8U, candidate_width,
+            static_cast<std::uint32_t>(flat_rows64), false, rows, 0U, 0U,
+            layout)) {
+        result.errors.emplace_back(
+            "DeepSeek attention page workspace layout overflows");
+        return result;
+    }
+    result.value = layout.workspace_bytes;
+    return result;
+}
+
+ParseResult<std::uint32_t>
+CudaBackend::dsv4_paged_attention_to_mhc_page_maximum_rows(
+    std::span<const CudaDsv4PhysicalPage> pages,
+    std::uint32_t requested_rows, std::uint32_t candidate_width,
+    std::uint64_t maximum_workspace_bytes) const {
+    ParseResult<std::uint32_t> result{};
+    if (requested_rows < 2U || maximum_workspace_bytes == 0U) {
+        result.errors.emplace_back(
+            "DeepSeek attention page row admission request is invalid");
+        return result;
+    }
+    auto minimum = dsv4_paged_attention_to_mhc_page_workspace_bytes(
+        pages, 2U, candidate_width);
+    if (!minimum.ok()) return {0U, std::move(minimum.errors)};
+    if (minimum.value > maximum_workspace_bytes) {
+        result.errors.emplace_back(
+            "DeepSeek attention page cannot fit two rows in its bounded workspace");
+        return result;
+    }
+    auto full = dsv4_paged_attention_to_mhc_page_workspace_bytes(
+        pages, requested_rows, candidate_width);
+    if (!full.ok()) return {0U, std::move(full.errors)};
+    if (full.value <= maximum_workspace_bytes) {
+        result.value = requested_rows;
+        return result;
+    }
+    std::uint32_t lower = 2U;
+    std::uint32_t upper = requested_rows - 1U;
+    while (lower < upper) {
+        const auto middle = lower + (upper - lower + 1U) / 2U;
+        auto workspace = dsv4_paged_attention_to_mhc_page_workspace_bytes(
+            pages, middle, candidate_width);
+        if (!workspace.ok()) return {0U, std::move(workspace.errors)};
+        if (workspace.value <= maximum_workspace_bytes) {
+            lower = middle;
+        } else {
+            upper = middle - 1U;
+        }
+    }
+    result.value = lower;
+    return result;
+}
+
 ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     int device, const CudaDsv4PagedAttentionMhcRequest& request,
     std::span<float> diagnostic_branch) {
@@ -10176,90 +10401,46 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             static_cast<std::byte*>(download);
     }
 
-    std::uint64_t cursor = 0U;
-    const auto region = [&](std::uint64_t bytes, std::uint64_t alignment,
-                            std::uint64_t& offset) -> bool {
-        if (!align_up(cursor, alignment, offset) ||
-            bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
-            return false;
-        }
-        cursor = offset + bytes;
-        return true;
-    };
-    std::uint64_t page_offset{}, candidate_offset{}, query_offset{};
-    std::uint64_t sink_offset{}, cosine_offset{}, sine_offset{};
-    std::uint64_t slot_offset{}, block_offset{};
-    std::uint64_t page_descriptor_bytes{}, candidate_bytes{}, query_bytes{};
-    std::uint64_t slot_bytes{}, block_bytes{};
-    const std::uint64_t sink_bytes =
-        static_cast<std::uint64_t>(total_heads) * sizeof(float);
-    const std::uint64_t rope_bytes = static_cast<std::uint64_t>(rows) *
-        rope_pairs * sizeof(float);
-    if (!checked_bytes(request.attention.pages.size(), 1U,
-                       sizeof(Dsv4DevicePhysicalPage),
-                       page_descriptor_bytes) ||
-        !checked_bytes(total_candidates, 1U,
-                       sizeof(Dsv4DeviceAttentionCandidate),
-                       candidate_bytes) ||
-        !checked_bytes(use_prepared_query ? 0U : attended_elements, 1U,
-                       sizeof(std::uint16_t), query_bytes) ||
-        !checked_bytes(request.mhc_slots.size(), 1U,
-                       sizeof(std::uint32_t), slot_bytes) ||
-        !checked_bytes(resolution == nullptr ? 0U : resolution->blocks.size(),
-                       1U, sizeof(Dsv4DeviceKvBlock), block_bytes) ||
-        !region(page_descriptor_bytes, 16U, page_offset) ||
-        !region(candidate_bytes, 16U, candidate_offset) ||
-        !region(query_bytes, 16U, query_offset) ||
-        !region(sink_bytes, 16U, sink_offset) ||
-        !region(rope_bytes, 16U, cosine_offset) ||
-        !region(rope_bytes, 16U, sine_offset) ||
-        !region(slot_bytes, 16U, slot_offset) ||
-        !region(block_bytes, 16U, block_offset)) {
-        result.errors.emplace_back(
-            "DeepSeek attention-to-mHC upload layout overflows");
-        return result;
-    }
-    const auto upload_bytes = cursor;
-
-    std::uint64_t kv_offset{}, score_offset{}, maximum_offset{};
-    std::uint64_t denominator_offset{}, value_offset{}, attended_offset{};
-    std::uint64_t decoded_offset{}, output_rank_offset{}, branch_offset{};
-    std::uint64_t encoded_branch_offset{}, router_logits_offset{};
-    std::uint64_t failure_offset{};
-    std::uint64_t kv_bytes{}, score_bytes{};
-    if (!checked_bytes(flat_rows, kDsv4PagedHeadDim,
-                       sizeof(std::uint16_t), kv_bytes) ||
-        !checked_bytes(rows, static_cast<std::uint64_t>(kDsv4PagedHeads) *
-                                 flat_rows,
-                       sizeof(std::uint16_t), score_bytes) ||
-        !region(kv_bytes, 16U, kv_offset) ||
-        !region(score_bytes, 16U, score_offset) ||
-        !region(static_cast<std::uint64_t>(rows) * kDsv4PagedHeads *
-                    sizeof(float), 16U, maximum_offset) ||
-        !region(static_cast<std::uint64_t>(rows) * kDsv4PagedHeads *
-                    sizeof(float), 16U,
-                denominator_offset) ||
-        !region(static_cast<std::uint64_t>(rows) * group_elements *
-                    sizeof(float), 16U, value_offset) ||
-        !region(attended_elements * sizeof(std::uint16_t), 16U,
-                attended_offset) ||
-        !region(attended_elements * sizeof(float), 16U, decoded_offset) ||
-        !region(output_rank_elements * sizeof(float), 16U,
-                output_rank_offset) ||
-        !region(branch_elements * sizeof(float), 16U, branch_offset) ||
-        !region(branch_elements * sizeof(std::uint16_t), 16U,
-                encoded_branch_offset) ||
-        !region(project_router && request.mhc_device == device
-                    ? static_cast<std::uint64_t>(
-                          router_descriptor->rows) * sizeof(float)
-                    : 0U,
-                16U, router_logits_offset) ||
-        !region(sizeof(unsigned int), 16U, failure_offset)) {
+    const auto router_logits_bytes = project_router &&
+            request.mhc_device == device
+        ? static_cast<std::uint64_t>(router_descriptor->rows) * sizeof(float)
+        : 0U;
+    Dsv4AttentionMhcWorkspaceLayout layout;
+    if (!dsv4_attention_mhc_workspace_layout(
+            request.attention.pages.size(), rows, total_heads, output_groups,
+            candidates, flat_rows, use_prepared_query,
+            request.mhc_slots.size(),
+            resolution == nullptr ? 0U : resolution->blocks.size(),
+            router_logits_bytes, layout)) {
         result.errors.emplace_back(
             "DeepSeek attention-to-mHC workspace layout overflows");
         return result;
     }
-    const auto workspace_bytes = cursor;
+    const auto page_offset = layout.page_offset;
+    const auto candidate_offset = layout.candidate_offset;
+    const auto query_offset = layout.query_offset;
+    const auto sink_offset = layout.sink_offset;
+    const auto cosine_offset = layout.cosine_offset;
+    const auto sine_offset = layout.sine_offset;
+    const auto slot_offset = layout.slot_offset;
+    const auto block_offset = layout.block_offset;
+    const auto kv_offset = layout.kv_offset;
+    const auto score_offset = layout.score_offset;
+    const auto maximum_offset = layout.maximum_offset;
+    const auto denominator_offset = layout.denominator_offset;
+    const auto value_offset = layout.value_offset;
+    const auto attended_offset = layout.attended_offset;
+    const auto decoded_offset = layout.decoded_offset;
+    const auto output_rank_offset = layout.output_rank_offset;
+    const auto branch_offset = layout.branch_offset;
+    const auto encoded_branch_offset = layout.encoded_branch_offset;
+    const auto router_logits_offset = layout.router_logits_offset;
+    const auto failure_offset = layout.failure_offset;
+    const auto sink_bytes = layout.sink_bytes;
+    const auto rope_bytes = layout.rope_bytes;
+    const auto slot_bytes = layout.slot_bytes;
+    const auto upload_bytes = layout.upload_bytes;
+    const auto workspace_bytes = layout.workspace_bytes;
     if (workspace_bytes > request.attention.maximum_workspace_bytes) {
         result.errors.emplace_back(
             "DeepSeek attention-to-mHC workspace exceeds its bounded contract");

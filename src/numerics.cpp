@@ -83,19 +83,6 @@ float fp4_e2m1_f32(std::uint8_t nibble) noexcept {
     return values[nibble & 0x0FU];
 }
 
-std::uint16_t bf16_encode(float value) noexcept {
-    auto bits = std::bit_cast<std::uint32_t>(value);
-    if ((bits & 0x7F80'0000U) != 0x7F80'0000U) {
-        bits += 0x7FFFU + ((bits >> 16U) & 1U);
-    }
-    return static_cast<std::uint16_t>(bits >> 16U);
-}
-
-float bf16_round_f32(float value) noexcept {
-    return std::bit_cast<float>(
-        static_cast<std::uint32_t>(bf16_encode(value)) << 16U);
-}
-
 float gelu_tanh_f32(float value) noexcept {
     constexpr float coefficient = 0.7978845608028654F;
     return 0.5F * value *

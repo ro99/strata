@@ -11915,8 +11915,13 @@ ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
     }
     if (state.dsv4_mhc_stage != 0U || state.moe_in_flight) {
         // Growing the arena moves every slot, so no row may be mid-flight.
+        // A stage left non-zero by an aborted request is the usual cause, so
+        // report which of the two conditions held.
         result.errors.emplace_back(
-            "DeepSeek device mHC slot reservation is out of order");
+            std::string("DeepSeek device mHC slot reservation is out of order"
+                        " (stage=") +
+            std::to_string(state.dsv4_mhc_stage) + " moe_in_flight=" +
+            (state.moe_in_flight ? "true" : "false") + ")");
         return result;
     }
     std::uint64_t allocation_calls = 0U;

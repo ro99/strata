@@ -4,10 +4,14 @@
 #include "strata/dsv4_attention_kv.hpp"
 #include "strata/model_adapter.hpp"
 
+#include <execinfo.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1457,16 +1461,39 @@ ParseResult<Dsv4KvDeviceLease> Dsv4KvCache::acquire_device(
     std::uint32_t layer, std::uint64_t logical_row,
     std::size_t device_slot) {
     ParseResult<Dsv4KvDeviceLease> result;
+    // The retention window is the first thing to check when a request fails
+    // mid-generation, so the rejection names the row it refused and the window
+    // it was measured against rather than only that one existed.
+    const auto describe = [&](const std::string& reason) {
+        if (const char* trace = std::getenv("STRATA_TRACE_KV_RETENTION");
+            trace != nullptr && *trace == '1') {
+            std::array<void*, 24> frames{};
+            const auto depth = ::backtrace(frames.data(),
+                                           static_cast<int>(frames.size()));
+            std::fprintf(stderr, "kv retention rejection backtrace:\n");
+            ::backtrace_symbols_fd(frames.data(), depth, 2);
+        }
+        return "DeepSeek KV device row is not retained (" + reason +
+               "; kind=" + std::to_string(static_cast<unsigned>(kind)) +
+               " layer=" + std::to_string(layer) +
+               " row=" + std::to_string(logical_row) + ")";
+    };
     auto* target = state_->sequence(sequence);
     if (target == nullptr) {
-        result.errors.emplace_back("DeepSeek KV device row is not retained");
+        result.errors.emplace_back(describe("sequence is unknown"));
         return result;
     }
     const auto table_found = target->tables.find(TableKey{kind, layer});
-    if (table_found == target->tables.end() ||
-        logical_row < table_found->second.minimum_row ||
+    if (table_found == target->tables.end()) {
+        result.errors.emplace_back(describe("no table for this kind/layer"));
+        return result;
+    }
+    if (logical_row < table_found->second.minimum_row ||
         logical_row >= table_found->second.end_row) {
-        result.errors.emplace_back("DeepSeek KV device row is not retained");
+        result.errors.emplace_back(describe(
+            "outside retained window [" +
+            std::to_string(table_found->second.minimum_row) + "," +
+            std::to_string(table_found->second.end_row) + ")"));
         return result;
     }
     auto* block = state_->find_block(table_found->second, logical_row);

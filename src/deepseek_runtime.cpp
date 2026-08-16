@@ -4035,8 +4035,19 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
                     "DeepSeek physical attention page has a zero-ratio block");
                 return;
             }
+            // The lease names a block, not a row: every row inside the block
+            // resolves to the same device buffer. Blocks are retired whole,
+            // 256 rows at a time, while the sliding window retires rows one at
+            // a time, so a block that is still live can already have its first
+            // row outside the retained window -- which is every prefill page
+            // based at or beyond kWindow. Name the block's most recent row
+            // instead; it is retained for exactly as long as the block is.
+            const auto first_row =
+                block.logical_begin / block.compression_ratio;
             const auto logical_row = static_cast<std::uint32_t>(
-                block.logical_begin / block.compression_ratio);
+                block.used_rows == 0U
+                    ? first_row
+                    : first_row + block.used_rows - 1U);
             auto lease = kv_cache->acquire_device(
                 active_sequence, kind, layer, logical_row, slot);
             if (!lease.ok()) {

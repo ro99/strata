@@ -134,8 +134,21 @@ layout, so the device reads that layout rather than requiring a second copy.
 Decode is unchanged and keeps the experts in the two NUMA-local CPU shards,
 which is where a one-row step wants them.
 
-On the reference pair a 677-token prompt runs at **10.5 tok/s against 7.6**
-for row-at-a-time prompt processing, which `--prefill-page-tokens 1` restores.
+Physical attention is batched across all rows in a page: appends complete first
+to satisfy the KV lease contract, then one page request covers every row for a
+layer. On SM86, multi-row E4M3 block-128 query and KV projections decode FP8 in
+registers and use BF16 tensor-core matrix multiplication without expanding the
+persistent weights. Unsupported capabilities and single-row decode retain the
+native kernel.
+
+On the reference 2× RTX 3090 pair, three interleaved 677-token/page-8192 pairs
+improved median total prefill from **81.24 s / 8.33 tok/s** to
+**52.96 s / 12.78 tok/s**, a **1.53×** speedup. Physical-attention dispatches
+fell from 29,111 to 86, kernel launches from 553,109 to 1,655, and page reads
+from 6.99 GB to 30.56 MB. The query projection's device term fell from 7.21 s
+to 0.334 s. The measured total-prefill ranges were 13.53 s for the
+main-equivalent arm and 2.63 s for the candidate, so the median improvement and
+every paired improvement were outside the observed spread.
 
 Prefill and decode therefore use different expert kernels, as they do in every
 CPU-GPU hybrid stack. The prefill kernel is held to the scalar oracle within
@@ -143,7 +156,12 @@ one BF16 mantissa step per output rather than to bit equality with the CPU
 one; page-major execution itself remains bit-exact, and routes, precision,
 top-k, expert count and mHC semantics are unchanged. See experiments
 [0095](docs/experiments/0095-dsv4-page-major-tp2-prefill-2026-08-15.md) and
-[0096](docs/experiments/0096-dsv4-gpu-prefill-experts-2026-08-15.md).
+[0096](docs/experiments/0096-dsv4-gpu-prefill-experts-2026-08-15.md) for the
+page-major and GPU-expert foundation,
+[0105](docs/experiments/0105-dsv4-sm86-fp8-tensor-page-projections-2026-08-16.md)
+for the FP8 projection contract, and
+[0107](docs/experiments/0107-dsv4-promotion-campaign-2026-08-16.md) for the
+promotion campaign.
 
 Measured on 2× RTX 3090, an 18-token prompt and 31 decode steps including
 warm-up:

@@ -60,6 +60,8 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_d2h_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_host_remainder_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(dsv4_paged_attention_stream_sync_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_calls);
     STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_standalone_calls);
     STRATA_CUDA_DEVICE_DELTA(dsv4_mhc_transition_calls);
@@ -141,6 +143,8 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(dsv4_paged_attention_kernel_nanoseconds);
     STRATA_CUDA_DELTA(dsv4_paged_attention_d2h_nanoseconds);
     STRATA_CUDA_DELTA(dsv4_paged_attention_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_host_remainder_nanoseconds);
+    STRATA_CUDA_DELTA(dsv4_paged_attention_stream_sync_nanoseconds);
     STRATA_CUDA_DELTA(dsv4_mhc_calls);
     STRATA_CUDA_DELTA(dsv4_mhc_standalone_calls);
     STRATA_CUDA_DELTA(dsv4_mhc_transition_calls);

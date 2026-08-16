@@ -411,6 +411,12 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
            << ",\"maximum_device_dsv4_paged_attention_seconds\":"
            << static_cast<double>(stats.dsv4_paged_attention_nanoseconds) /
                   1.0e9
+           << ",\"dsv4_paged_attention_host_remainder_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_host_remainder_nanoseconds) / 1.0e9
+           << ",\"dsv4_paged_attention_stream_sync_seconds\":"
+           << static_cast<double>(
+                  stats.dsv4_paged_attention_stream_sync_nanoseconds) / 1.0e9
            << ",\"dsv4_mhc_calls\":" << stats.dsv4_mhc_calls
            << ",\"dsv4_mhc_standalone_calls\":"
            << stats.dsv4_mhc_standalone_calls
@@ -545,6 +551,14 @@ void print_cuda_stats(std::ostream& output, const strata::CudaBackendStats& stat
                << ",\"dsv4_paged_attention_seconds\":"
                << static_cast<double>(
                       device.dsv4_paged_attention_nanoseconds) / 1.0e9
+               << ",\"dsv4_paged_attention_host_remainder_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_host_remainder_nanoseconds) /
+                      1.0e9
+               << ",\"dsv4_paged_attention_stream_sync_seconds\":"
+               << static_cast<double>(
+                      device.dsv4_paged_attention_stream_sync_nanoseconds) /
+                      1.0e9
                << ",\"dsv4_mhc_calls\":" << device.dsv4_mhc_calls
                << ",\"dsv4_mhc_standalone_calls\":"
                << device.dsv4_mhc_standalone_calls
@@ -760,10 +774,6 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.attention_page_index_selection_nanoseconds)
            << ",\"attention_page_weight_acquire_seconds\":"
            << seconds(stats.attention_page_weight_acquire_nanoseconds)
-           << ",\"attention_page_branch_handoff_seconds\":"
-           << seconds(stats.attention_page_branch_handoff_nanoseconds)
-           << ",\"attention_page_stream_sync_seconds\":"
-           << seconds(stats.attention_page_stream_sync_nanoseconds)
            << ",\"attention_score_seconds\":"
            << seconds(stats.attention_score_nanoseconds)
            << ",\"attention_output_seconds\":"

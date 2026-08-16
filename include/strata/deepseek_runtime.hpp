@@ -188,8 +188,6 @@ struct Dsv4GraphStats {
     // it must never include a second compressor pass.
     std::uint64_t attention_page_index_selection_nanoseconds{};
     std::uint64_t attention_page_weight_acquire_nanoseconds{};
-    std::uint64_t attention_page_branch_handoff_nanoseconds{};
-    std::uint64_t attention_page_stream_sync_nanoseconds{};
     std::uint64_t attention_score_nanoseconds{};
     std::uint64_t attention_output_nanoseconds{};
     std::uint64_t moe_nanoseconds{};

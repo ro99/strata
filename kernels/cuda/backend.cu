@@ -7914,6 +7914,7 @@ ValidationResult CudaBackend::dsv4_paged_attention(
     int device, const CudaDsv4PagedAttentionRequest& request,
     std::span<float> output) {
     ValidationResult result;
+    const auto call_started = std::chrono::steady_clock::now();
     constexpr std::uint64_t row_output_elements =
         static_cast<std::uint64_t>(kDsv4PagedHeads) * kDsv4PagedHeadDim;
     const auto rows = request.rows;
@@ -8362,6 +8363,11 @@ ValidationResult CudaBackend::dsv4_paged_attention(
         stats.dsv4_paged_attention_kernel_nanoseconds += kernel_nanoseconds;
         stats.dsv4_paged_attention_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_paged_attention_nanoseconds += operation_nanoseconds;
+        const auto call_nanoseconds = elapsed_nanoseconds_since(call_started);
+        stats.dsv4_paged_attention_host_remainder_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_paged_attention_stream_sync_nanoseconds += wait_nanoseconds;
         stats.activation_h2d_bytes += upload_bytes;
         stats.activation_d2h_bytes += download_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
@@ -9629,6 +9635,7 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
     int device, const CudaDsv4PagedAttentionMhcRequest& request,
     std::span<float> diagnostic_branch) {
     ValidationResult result;
+    const auto call_started = std::chrono::steady_clock::now();
     const auto rows = request.attention.rows;
     const std::uint32_t total_heads = request.rank_local ? 32U : 64U;
     const std::uint32_t output_groups = request.rank_local ? 4U : 8U;
@@ -10987,6 +10994,11 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
             attention_kernel_nanoseconds;
         stats.dsv4_paged_attention_d2h_nanoseconds += d2h_nanoseconds;
         stats.dsv4_paged_attention_nanoseconds += operation_nanoseconds;
+        const auto call_nanoseconds = elapsed_nanoseconds_since(call_started);
+        stats.dsv4_paged_attention_host_remainder_nanoseconds +=
+            call_nanoseconds > wait_nanoseconds
+                ? call_nanoseconds - wait_nanoseconds : 0U;
+        stats.dsv4_paged_attention_stream_sync_nanoseconds += wait_nanoseconds;
         stats.activation_h2d_bytes += upload_bytes;
         stats.activation_d2h_bytes += download_bytes;
         stats.activation_h2d_nanoseconds += h2d_nanoseconds;
@@ -16061,6 +16073,10 @@ CudaBackendStats CudaBackend::stats() const noexcept {
         result.dsv4_paged_attention_nanoseconds = std::max(
             result.dsv4_paged_attention_nanoseconds,
             device.dsv4_paged_attention_nanoseconds);
+        result.dsv4_paged_attention_host_remainder_nanoseconds +=
+            device.dsv4_paged_attention_host_remainder_nanoseconds;
+        result.dsv4_paged_attention_stream_sync_nanoseconds +=
+            device.dsv4_paged_attention_stream_sync_nanoseconds;
         result.dsv4_mhc_calls += device.dsv4_mhc_calls;
         result.dsv4_mhc_standalone_calls +=
             device.dsv4_mhc_standalone_calls;

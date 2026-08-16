@@ -351,10 +351,6 @@ void apply_rope(std::span<float> values, std::uint64_t position,
             before.attention_page_index_selection_nanoseconds,
         after.attention_page_weight_acquire_nanoseconds -
             before.attention_page_weight_acquire_nanoseconds,
-        after.attention_page_branch_handoff_nanoseconds -
-            before.attention_page_branch_handoff_nanoseconds,
-        after.attention_page_stream_sync_nanoseconds -
-            before.attention_page_stream_sync_nanoseconds,
         after.attention_score_nanoseconds - before.attention_score_nanoseconds,
         after.attention_output_nanoseconds - before.attention_output_nanoseconds,
         after.moe_nanoseconds - before.moe_nanoseconds,
@@ -3842,6 +3838,7 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
             : 0U;
 
     const auto prefix = layer_prefix(layer) + "attn.";
+    const auto weight_started = std::chrono::steady_clock::now();
     Dsv4WeightCache::Lease output_a;
     Dsv4WeightCache::Lease output_b;
     Dsv4WeightCache::Lease router;
@@ -3853,6 +3850,8 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention(
         slot, prefix + "wo_b", kHidden,
         kOutputGroups * kOutputRank, output_b);
     if (!result.ok()) return result;
+    graph_stats.attention_page_weight_acquire_nanoseconds +=
+        elapsed_nanoseconds(weight_started);
     std::array<float, kRopeDim / 2U> cosines{};
     std::array<float, kRopeDim / 2U> sines{};
     for (std::size_t index = 0U; index < cosines.size(); ++index) {
@@ -4114,20 +4113,8 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
     request.output_b = &output_b.weight();
     request.mhc_device = devices[mhc_slot];
 
-    const auto before = cuda.stats();
-    const auto handoff_started = std::chrono::steady_clock::now();
     result = cuda.dsv4_paged_attention_to_mhc(
         devices[slot], request, diagnostic_branches);
-    const auto handoff_nanoseconds = elapsed_nanoseconds(handoff_started);
-    const auto after = cuda.stats();
-    const auto sync_nanoseconds = after.synchronization_nanoseconds >=
-            before.synchronization_nanoseconds
-        ? after.synchronization_nanoseconds - before.synchronization_nanoseconds
-        : 0U;
-    graph_stats.attention_page_stream_sync_nanoseconds += sync_nanoseconds;
-    graph_stats.attention_page_branch_handoff_nanoseconds +=
-        handoff_nanoseconds > sync_nanoseconds
-            ? handoff_nanoseconds - sync_nanoseconds : 0U;
     return result;
 }
 
@@ -4213,8 +4200,12 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_attend_prepared(
                                      device_prepared_source);
         }
         if (!result.ok()) return result;
-        graph_stats.attention_index_nanoseconds +=
-            elapsed_nanoseconds(subphase_started);
+        const auto selection_nanoseconds = elapsed_nanoseconds(subphase_started);
+        graph_stats.attention_index_nanoseconds += selection_nanoseconds;
+        if (config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice) {
+            graph_stats.attention_page_index_selection_nanoseconds +=
+                selection_nanoseconds;
+        }
     }
 
     auto sink = host_tensor(prefix + "attn_sink", kHeads);

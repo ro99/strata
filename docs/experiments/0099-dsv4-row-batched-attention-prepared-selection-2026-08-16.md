@@ -83,11 +83,14 @@ The 0099 correction is deliberately narrower: after append has advanced the
 index compressor, each page row calls `index_select` directly. No second
 `compress_state` call remains on the page path.
 
-Four candidate-only counters split the score remainder into prepared learned-
-index selection, output-weight acquisition, branch handoff/scatter host work,
-and stream-synchronization wait. Existing candidate-resolution and device
-attention counters remain available; the branch-handoff counter is the batched
-backend call's host wall remainder after subtracting its measured stream wait.
+Four counters split the score remainder in both mechanisms into prepared
+learned-index selection, output-weight acquisition, paged-attention host
+remainder (staging, dispatch and branch handoff/scatter), and stream-
+synchronization wait. The latter two are recorded inside the backend's existing
+completion boundary, so the 29,111-call baseline does not acquire and copy the
+aggregate stats object once per row. Existing candidate-resolution and device
+attention counters remain available; host remainder is complete backend call
+wall time after subtracting its measured stream wait.
 
 ## Cheapest correctness measurement
 
@@ -122,4 +125,3 @@ device-attention seconds, the four new remainder counters, expert H2D bytes,
 cache misses/evictions, decode checkpoint reads, decode rate, RSS and per-GPU
 VRAM. The unsigned-underflow mHC maximum counter remains a separate known
 defect and is not used.
-

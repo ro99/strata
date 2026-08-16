@@ -115,6 +115,8 @@ struct CudaBackendStats {
         std::uint64_t dsv4_paged_attention_kernel_nanoseconds{};
         std::uint64_t dsv4_paged_attention_d2h_nanoseconds{};
         std::uint64_t dsv4_paged_attention_nanoseconds{};
+        std::uint64_t dsv4_paged_attention_host_remainder_nanoseconds{};
+        std::uint64_t dsv4_paged_attention_stream_sync_nanoseconds{};
         std::uint64_t dsv4_mhc_calls{};
         std::uint64_t dsv4_mhc_standalone_calls{};
         std::uint64_t dsv4_mhc_transition_calls{};
@@ -191,6 +193,8 @@ struct CudaBackendStats {
     std::uint64_t dsv4_paged_attention_kernel_nanoseconds{};
     std::uint64_t dsv4_paged_attention_d2h_nanoseconds{};
     std::uint64_t dsv4_paged_attention_nanoseconds{};
+    std::uint64_t dsv4_paged_attention_host_remainder_nanoseconds{};
+    std::uint64_t dsv4_paged_attention_stream_sync_nanoseconds{};
     std::uint64_t dsv4_mhc_calls{};
     std::uint64_t dsv4_mhc_standalone_calls{};
     std::uint64_t dsv4_mhc_transition_calls{};

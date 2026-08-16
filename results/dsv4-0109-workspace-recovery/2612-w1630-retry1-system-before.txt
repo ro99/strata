@@ -1,0 +1,11 @@
+2026-08-16T11:30:22-03:00
+arm=2612-w1630-retry1
+prompt_words=1630
+ba2418344c720628de7626f86f16c9ed0ecca9d0
+## exp/dsv4-promotion-campaign
+?? scripts/run_dsv4_0109_workspace_recovery.sh
+0058525f5417f4c55776147cd3b8bfd7c69df3c1f54852fd439dd45bde34681a  /home/rodrigo/.herdr/worktrees/strata/worktree-clear-river-6202/build/strata-deepseek-run
+index, name, pci.bus_id, memory.free [MiB], memory.total [MiB]
+0, NVIDIA GeForce RTX 5060 Ti, 00000000:03:00.0, 15847 MiB, 16311 MiB
+1, NVIDIA GeForce RTX 3090, 00000000:82:00.0, 24126 MiB, 24576 MiB
+2, NVIDIA GeForce RTX 3090, 00000000:83:00.0, 24126 MiB, 24576 MiB

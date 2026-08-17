@@ -10,7 +10,15 @@ Two checks, both static (no build required):
    layering violation.
 2. Model-identifier leakage: no file assigned to strata_platform,
    strata_device, strata_kernels, or strata_engine may `#include` a header
-   whose path contains one of MODEL_IDENTIFIERS as a substring.
+   whose path contains one of MODEL_IDENTIFIERS as a substring, *unless* the
+   included header is owned by the same target doing the including. A model
+   identifier in a filename is not itself the violation -- a kernel may be
+   named after the model that first needed it (glm_int4.*, and formerly
+   dsv4_fp4_expert.cpp before A3 reassigned it) without that being a layering
+   problem; the violation is a *different* target reaching for a model it
+   isn't allowed to know about. Checking `owner == target` is exactly the
+   direction check's own ownership resolution, reused here rather than
+   re-derived, so the two checks cannot disagree about who owns what.
 
 Both checks operate on *direct* includes only, parsed by regex, not a real
 preprocessor. That is a deliberate scope choice for this unit: every
@@ -155,7 +163,7 @@ def main() -> int:
                         violations.append(
                             f"{rel} ({target}) includes {included} "
                             f"(owned by {owner}) -- upward dependency")
-                if target in NO_MODEL_TARGETS:
+                if target in NO_MODEL_TARGETS and owner != target:
                     lowered = included.lower()
                     if any(ident in lowered for ident in MODEL_IDENTIFIERS):
                         identifier_hits.append(

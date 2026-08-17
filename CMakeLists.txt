@@ -71,7 +71,7 @@ add_library(strata_core STATIC
     src/deepseek_kv_cache.cpp
     src/dsv4_attention_kv.cpp
     src/deepseek_ops.cpp
-    src/deepseek_diagnostics.cpp
+    src/diagnostics.cpp
     src/deepseek_checkpoint.cpp
     src/deepseek_rank_shard.cpp
     src/dsv4_host_moe_executor.cpp

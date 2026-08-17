@@ -1,8 +1,17 @@
 # 0121 — Phase 1: splitting `strata_core`, and what a 4 → 30 prediction miss means
 
-Status: **CLOSED. Phase 1 gate green: every binary links, `make check-layers` exits clean, `make check`
-(build included) passes for the first time this phase. B1 applied. B2 and B3 deferred to phase 4 with
-recorded, self-checking lint exceptions.**
+Status: **The "CLOSED" verdict this record originally gave was premature.** An
+independent cold-context review found the include-level enforcement this
+record certified never checked the *link*-level symbol graph, and a real
+upward cycle was passing underneath it undetected (F1, blocking). See "Cold
+review remediation (brief 05)" below for the full finding set and what was
+fixed. With that remediation applied: every binary links, `make check-layers`
+and the new `make check-symbols` both exit clean, `make check` (build
+included, both lint layers, and the equivalence oracle) passes. B1 applied.
+B2 and B3 deferred to phase 4 with recorded, self-checking, expiry-enforced
+lint exceptions at both the include and symbol level. **Still not a landing
+candidate on its own** — that remains a separate decision, made by the
+orchestrator, after whatever review comes next.
 
 ## Hypothesis
 
@@ -325,3 +334,112 @@ Per this unit's own instruction: **phase 2 does not start here.** A
 cold-context review sits between this green phase and any landing to `main`;
 that review, and any landing that follows it, is out of scope for the agent
 that did the work.
+
+## Cold review remediation (brief 05)
+
+An independent reviewer with no knowledge of any brief or report in this
+programme read the branch and found four blocking gaps and several smaller
+ones in the enforcement this record certified as done. Every one below was
+independently reproduced before being treated as real, and every fix was
+verified the same way the stale-exception mechanism was originally verified:
+break it deliberately, confirm the check catches the break, then fix it.
+
+**F1 (blocking) — "dependencies point strictly downward" was false at the
+link level.** `check_layers.py` checks `#include` edges; it has no visibility
+into the *symbol* graph a real link produces. `src/placement_model.cpp`
+(`strata_engine`) calls `GlmCheckpointReader::open`, `Dsv4CheckpointReader::open`,
+`Gemma4CheckpointReader::find`, `InklingCheckpointReader::*`,
+`KimiCheckpointReader::open`, and the six `*_spec()` functions — 24 undefined
+symbols, all defined only in `strata_models`, all referenced from exactly one
+object file, `placement_model.cpp.o`. Independently reproduced with `nm` over
+every ordered tier pair: `strata_engine -> strata_models` is the *only*
+upward symbol reference anywhere in the six archives, 24 symbols, one object
+file, matching the review's own count exactly. It built clean anyway, for the
+identical reason this record already names for Cause B and calls "luck, not
+correctness": every executable links through the `strata_core` INTERFACE
+alias, which puts every archive on one link line regardless of declared
+per-target order, and GNU `ld`'s single-pass resolution silently absorbs the
+upward reference. That mechanism was present one tier up from where this
+record originally found it, undetected, because nothing tested any single
+target's link closure in isolation.
+
+Fixed: `scripts/check_symbols.py`, a new nm-based checker reading the same
+`CMakeLists.txt` target definitions `check_layers.py` does, run against the
+built archives. Demonstrated failing on the unmodified tree first (`1 total
+violation(s)`, naming `placement_model.cpp.o` and the exact symbol count)
+*before* any fix landed, per the gate's explicit requirement. The
+`placement-model-inventory-registry` exception (B2) was then widened — not
+narrowed — to state honestly that it forgives this link cycle as well as the
+includes that announce it, with a `symbol_objects: ["placement_model.cpp.o"]`
+entry the new checker consumes the same way `check_layers.py` consumes
+`matches`: forgiven only if the object file genuinely references something
+upward, stale (hard failure) if it stops.
+
+**F2 (blocking, recorded in 0120, not here)** — the equivalence oracle
+nothing ran. See `docs/experiments/0120`'s update for the fix
+(`make check-equivalence`, a guarded ctest entry); noted here only because it
+shares this unit's gate.
+
+**F3 (blocking) — `make check-layers` was not part of `make check`.** One
+line missing turned the charter's "run `make check` before every result
+commit" into "run `make check`, and separately remember to also run the
+layering check, which nothing enforces you remembering." Fixed: `check-layers`
+runs first (static, fails fast, before paying for a build), `check-symbols`
+runs after the build (it needs real archives), both inside the `check:`
+target now, not beside it.
+
+**F4 (blocking) — the device tier was entirely unscanned, and two more latent
+gaps.** `strata_device`'s source list is `${STRATA_CUDA_SOURCE}`, a CMake
+variable, and the NCCL-conditional executor is added via `target_sources()`
+after the `add_library()` call — neither is a literal filename
+`check_layers.py`'s regex could see, so `strata_device` silently contributed
+**zero of the 61 files** the tool's own summary line claimed to have scanned,
+with nothing in that summary saying so. Fixed: `parse_targets` now resolves
+`set(VAR file)` assignments (both branches of the CUDA/no-CUDA `if`, not a
+guess at which one this machine would pick) and `target_sources(target
+PRIVATE ...)` calls, and **raises instead of continuing** if any declared
+`strata_*` target resolves to zero files, or if a `strata_*` target exists in
+`CMakeLists.txt` with no entry in `LAYER_ORDER` (previously silently
+`continue`d past — a 7th target with no declared rank would have vanished
+from every future run's scan with nothing printed). Both failure modes
+verified by feeding synthetic CMake text through `parse_targets` directly and
+confirming the intended `SystemExit`, not by editing the real
+`CMakeLists.txt`.
+
+Also fixed, same finding: the model-identifier check's docstring claimed more
+than its code did. As specified, it only ever looked at *included* headers,
+so a self-contained `kernels/cpu/deepseek_moe_kernel.{hpp,cpp}` sitting in
+`strata_kernels`, referencing nothing outside itself, would produce zero
+violations under the letter of A5's `owner == target` exemption — correct for
+what A5 was fixing (a false positive on `glm_int4.*`), but it left a real gap
+A5 never claimed to close. `check_layers.py` now also flags any file *itself
+named* after a model identifier and assigned to a no-model target, unless the
+file is in an explicit `MODEL_NAMED_FILES_ALLOWED` list (currently
+`glm_int4.hpp`/`.cpp` only, with the C6 rename-deferred-to-phase-8 reason
+attached). Verified by constructing exactly the reviewer's hypothetical
+(`deepseek_moe_kernel.{hpp,cpp}` in a synthetic `strata_kernels`) and
+confirming it is now caught. Angle-bracket includes (`#include <strata/...>`)
+are now matched by the same regex as quoted ones, verified directly against
+the regex object; no such include exists in this codebase today; the risk
+was latent, not exploited.
+
+**F11 (blocking) — `expiry_phase` was read only to print, never enforced.**
+Phase 4 could arrive and pass and all three exceptions would keep applying
+silently forever. Fixed: `layer_exceptions.py` now declares `CURRENT_PHASE`
+explicitly (currently `1`; bumping it is the orchestrator's decision, not a
+side effect of a lint fix landing), and both `check_layers.py` and
+`check_symbols.py` fail any exception whose `expiry_phase <= CURRENT_PHASE`,
+by name, with the recorded phase and the current one both printed. Verified
+by calling the shared `check_expiry()` function with `current_phase=4`
+directly and confirming all three recorded exceptions are reported expired,
+then confirming zero are reported at the real `CURRENT_PHASE` of `1`.
+
+## What phase 4 inherits, corrected
+
+The three recorded exceptions (`quantization-contract-in-model-hpp`,
+`placement-model-inventory-registry`, `tokenizer-pretokenizer-split`) are
+unchanged in their expiry (phase 4) and their underlying reasoning. What
+changed is that `placement-model-inventory-registry` now states plainly, in
+its own `reason` text, that it forgives a real link-level cycle and not just
+a set of declared-but-unused includes — a materially bigger claim than the
+original text made, now made honestly rather than implicitly.

@@ -1,8 +1,17 @@
 # 0120 — Phase 0: building and gating the refactor's equivalence oracle
 
-Status: **closed, gate PASS.** Every claimed win in this record is measured on
-Gemma 4, the model that started this unit with zero runtime-level test
-coverage and zero introspection of any kind.
+Status: **closed, gate PASS, with corrections from an independent cold review
+(brief 05) applied in place below rather than as a separate erratum.** Every
+claimed win in this record is measured on Gemma 4, the model that started
+this unit with zero runtime-level test coverage and zero introspection of
+any kind. Read the "Correction" callouts throughout before trusting the
+sections around them: the causal story for the 34-skipped-tests trap was
+wrong and is corrected in place; "localized exactly" is a narrower claim than
+it originally read; the three perturbation arms should not be cited as
+validating the code that actually shipped, only the fixture re-capture's
+identity should be; and the oracle now runs automatically (`make
+check-equivalence`, brief 05 F2) rather than existing only as a fixture
+nothing referenced.
 
 ## Hypothesis
 
@@ -65,6 +74,26 @@ reconstructing the layer/operation divergence maps from the three committed
 perturbation JSONs and diffing them against the fixture — every number
 matched, including P3's.
 
+**Correction (brief 05, cold review): "localized exactly" is a weaker claim
+for P1 and P2 than the summary above lets it sound, and only P3 tests what
+localization actually means.** P1 and P2 inject their fault directly into an
+operation that already has its own checkpoint (`attention_local`/`_global`
+for P1, `attention_residual` for P2) — a hash recorded at the exact point the
+fault happens will, near-definitionally, name that exact point. That is not
+nothing (it rules out the hash simply being wrong or not firing at all), but
+it does not exercise whether the oracle can find a fault that lands *between*
+checkpoints. P3 is the only one of the three that does: it was injected into
+what was, at the time, an uninstrumented gap, which is exactly why it missed
+by one layer instead of matching exactly. P3 is therefore the one arm that
+actually tested localization as a general property, and it is also the one
+arm that failed that test. **The gap P3 found is now closed structurally**
+(`mlp_residual`, see below) **and that fix has never been tested** — no
+fourth perturbation arm was run against it. The claim that stands is narrower
+than "the gate proved localization": it is "the gate proved detection on
+three arms, and proved exact localization only where a checkpoint already
+sat, with the one arm that tested the harder case failing at the time and
+its fix unverified since."
+
 **None of the three faults changed the generated token.** All three still
 produced "Paris." This is the whole argument for a tiered oracle rather than
 diffing final output: a single corrupted value, a dropped residual, or a
@@ -100,13 +129,30 @@ added beyond the minimum ask, not in the thing the gate was gating on.
 
 **Fixed in this unit** (see Task 0 below): a fourth operation-hash checkpoint,
 `mlp_residual`, added at the same point `record_layer_hash` already fires.
-The fixture was re-captured and the gap is now closed — a fault in that
-position would now localize to operation-hash layer 55 as well. This was not
-re-verified with a fourth perturbation arm; the fix is structural (the new
-checkpoint fires at the exact point the old one was missing) and re-running
-the full three-arm gate was judged not worth another three model loads for a
-fix whose correctness follows from where the code changed, not from a new
-measurement. Flagging this as a judgment call, not a hidden assumption.
+The fixture was re-captured and the gap is now closed in the sense that a
+fault in that position would land on an instrumented checkpoint at layer 55
+going forward. This was not re-verified with a fourth perturbation arm; the
+fix is structural (the new checkpoint fires at the exact point the old one
+was missing) and re-running the full three-arm gate was judged not worth
+another three model loads for a fix whose correctness follows from where the
+code changed, not from a new measurement. Flagging this as a judgment call,
+not a hidden assumption.
+
+**Correction (brief 05, F5 and F6): stop citing the three perturbation arms
+as validating the code actually shipped.** `7385e89` changed the
+instrumentation twice after the arms were run — the `mlp_residual` checkpoint
+just described, *and*, separately, rerouting `analyze_logits`/
+`stable_bf16_hash` through the FNV helpers promoted in the same commit. This
+record disclosed the first change and not the second, and either way: **the
+three arms were never re-run against the code that actually shipped.** The
+real evidence that the shipped hash function still computes what it always
+did is the fixture re-capture itself, not the arms: the re-captured
+`layer_hidden_hashes` has all 1080 entries equal to the pre-`7385e89`
+capture, and the aggregate `trace_hash` is bit-for-bit identical
+(`9fdbee6c3f216c01`) before and after every instrumentation change since. That
+identity is the claim this record can actually stand behind. The P3 gap fix
+is untested (previous paragraph); the hash function's continued correctness
+after promotion is tested, by the fixture match, not by the arms.
 
 ## The 34-silently-skipped-tests trap
 
@@ -114,19 +160,38 @@ Before any of the above, `strata-tests` run fresh in this worktree reported
 `277/311 passed, 34 skipped, 0 failed` — a green-looking result. The 34 skips
 were every test gated on a real checkpoint being present
 (`<model>_checkpoint_present()`), silently no-opping because this worktree had
-no `models/` directory: `models/` is gitignored (correctly, checkpoints are
-per-checkout data, not repo content), but the `.gitignore` pattern was
-`/models/` — a trailing-slash, directory-only pattern that does not match a
-*symlink* to a directory. A `models -> /home/rodrigo/Developer/strata/models`
-symlink, the obvious fix for reusing checkpoints across worktrees, stayed
-untracked-but-not-ignored and `git status` kept flagging it, while the tests
-behind it just never ran.
+no `models/` directory at all.
 
-**This is not a hypothetical risk.** It is the exact failure mode the charter
-warns about: a measurement that looks like a pass but tested nothing. Had this
-gone unnoticed, every later phase's "gate: same test count, 0 new failures"
-check would have been comparing two silently-degraded runs against each
-other and never caught a real regression in checkpoint-dependent code.
+**Correction (brief 05, cold review): the causal story originally recorded
+here was wrong, and it was repeated forward into later briefs, so the
+correction matters beyond this file.** The original account said a
+`.gitignore` pattern mismatch (`/models/`, trailing-slash, directory-only)
+caused the skips by leaving an existing symlink untracked. **A `.gitignore`
+pattern cannot cause a test to skip by itself** — `std::filesystem::exists`
+resolves a path at runtime regardless of what git thinks is tracked; git
+never touches whether a symlink target exists on disk. **What is actually
+known:** this worktree had no `models/` entry of any kind — no directory, no
+symlink — when `strata-tests` was first run in it, which is sufficient on its
+own to explain all 34 skips. A `models -> /home/rodrigo/Developer/strata/models`
+symlink was then created as the fix, and creating it is what surfaced the
+separate, real `.gitignore` bug: the `/models/` pattern does not match a
+symlink, so the new symlink stayed untracked-but-not-ignored, flagged by
+every `git status`. **What is not known:** whether a symlink existed at some
+earlier point and was removed by something (a plausible mechanism is a
+destructive git operation such as `clean -fd`, which would sweep up an
+untracked, unignored symlink exactly because the same pattern bug left it
+unprotected) — no evidence in this session shows that happened, and none of
+the work in this worktree ran such a command. The pattern bug is real,
+independently verified, and worth having fixed regardless of which of these
+is the true history; the causal claim that it *produced* the 34 skips does
+not hold, and is retracted.
+
+**This is not a hypothetical risk, independent of the corrected mechanism.**
+A green-looking result that measured 34 tests' worth of nothing is the exact
+failure mode the charter warns about. Had it gone unnoticed, every later
+phase's "gate: same test count, 0 new failures" check would have been
+comparing two silently-degraded runs against each other and never caught a
+real regression in checkpoint-dependent code.
 
 **Fixed:** `.gitignore`'s `/models/` → `/models` (drop the trailing slash),
 which matches files, directories, and symlinks alike. Verified with
@@ -172,6 +237,121 @@ using a fused decode path, and any phase that needs decode-step coverage
 (phase 5, phase 6) will need to either instrument the fused kernel directly or
 accept a prefill-equivalent proxy — a design question for whoever picks that
 up, not resolved here.
+
+## Scoping facts (brief 05, F7)
+
+Stated plainly rather than left implicit: **five of the six models have no
+equivalence fixture at all** — only Gemma 4 does. **Decode has no coverage on
+any model**, Gemma 4 included — the fused-decode-path blind spot above means
+every fixture and every perturbation arm in this record exercises prefill
+only. Both are scoping facts of Phase 0, not gaps introduced by this
+remediation unit, and both were already implied by earlier sections of this
+record; this section exists so a reader does not have to reconstruct them
+from context.
+
+## Open question, not decided here (brief 05, F8)
+
+`stable_bf16_hash` rounds f32 to bf16 before hashing. That means **any
+difference that never moves a value across a bf16 rounding boundary is
+invisible to this oracle by construction.** That is precisely the class of
+difference ordinary code motion produces — inlining, vectorization, FMA
+contraction crossing a translation-unit boundary differently than before. The
+A2 unit did exactly this kind of motion once already, moving
+`flash_attention_reference_f32` into its own translation unit; phase 3 does it
+wholesale, to every file in the codebase. So "the trace is byte-identical" and
+"the computation is bit-identical" are not the same claim, and the gap between
+them is exactly where phase 3 will spend most of its risk. It cuts in both
+directions: the same insensitivity means the oracle will not false-alarm on
+code motion that is genuinely behavior-preserving at full precision but
+happens to round differently at bf16 — which is arguably correct, since bf16
+rounding is the declared contract for inference in this codebase, not F32.
+
+Whether to do anything about this is the orchestrator's decision, not
+recorded as resolved here. One option raised: an opt-in F32-level hash
+alongside the existing bf16 one, so a phase that is supposed to change
+*nothing at all* (as opposed to a phase operating inside the declared bf16
+contract) can assert the stronger property on demand, while every phase where
+bf16 rounding is the actual contract keeps using the weaker, correct-for-that-
+contract hash. Whether that is the right shape, or whether there is a cheaper
+way to get the same guarantee, is open.
+
+## Cold review remediation (brief 05)
+
+**F2 (blocking) — nothing ran the oracle.** `tests/fixtures/gemma4/
+layer-hash-trace.json` was referenced by zero files outside its own README:
+no test, no script, no CMake target, no make target. This record's own
+"Phase 0's job was to build that oracle" claim was true of building the
+*hashing*, not of building anything that *re-runs the comparison*.
+Re-verification meant a human typing a `diff` against a 33 GB checkpoint by
+hand, and nothing failed if that never happened — the exact thing this
+record's own hypothesis names Phase 0 as existing to prevent, unmet by Phase
+0 itself.
+
+Fixed: `scripts/check_equivalence.py` runs `strata-gemma4-run
+--layer-hash-trace --json` fresh and diffs the result against the committed
+fixture (`layer_hidden_hashes` entries, the aggregate `trace_hash`,
+`generated_token_ids`, and `answer`), registered as a ctest entry
+(`strata-equivalence-gemma4`) with `SKIP_RETURN_CODE` set so an absent
+checkpoint reports as skipped, not passed or silently absent — the same
+distinction every other checkpoint-gated test in this suite already makes,
+extended to the oracle itself. Also runnable standalone as
+`make check-equivalence`. Verified by actually running it against the real
+checkpoint present on this machine: `PASS gemma4 equivalence oracle: 1080
+layer hashes, generated_token_ids and answer all match
+tests/fixtures/gemma4/layer-hash-trace.json`.
+
+**F9 (cheap, makes phase 4 easier) — the diagnostic JSON serializer was
+hand-copied per binary, and had already diverged.** `strata_gemma4_run.cpp`
+and `strata_deepseek_run.cpp` each had their own `hex_u64` and their own copy
+of the `layer_hidden_hashes`/`operation_hashes` JSON-printing logic.
+Diverged at birth: DeepSeek guards `operation_hashes` emission on
+`layer_hash_trace_enabled && !operation_hashes.empty()`; Gemma 4 only checked
+the first half, emitting `"operation_hashes":[]` where DeepSeek would omit
+the key entirely. Phase 0 promoted the diagnostic *types*
+(`include/strata/diagnostics.hpp`) and left the code that renders them
+duplicated per binary — phase 4's fan-out would have made that six copies.
+
+Fixed: `hex_u64` and the `layer_hidden_hashes` object-printing logic (which
+*was* byte-identical between the two binaries already) moved into
+`strata_platform` as `include/strata/diagnostics_json.hpp` +
+`src/diagnostics_json.cpp`. The divergent guard condition was deliberately
+**not** reconciled — each binary still decides for itself whether to call
+the shared `print_operation_hashes_fields`, preserving each one's existing
+output exactly. Unifying that guard would be a real behaviour change to at
+least one binary's JSON shape, and this unit does not make behaviour
+changes.
+
+**F10 (cheap, makes phase 4 easier) — `operation_hashes` had no aggregate
+hash.** `layer_hidden_hashes` has had one since promotion
+(`layer_hash_trace_hash`); `operation_hashes` did not, so any routine
+comparison had to serialize the entire list — 4320 records / 525 KB for an
+18-token prompt, and, at the charter's stated 3,565-token operating point,
+roughly 100 MB per captured arm if committed to git the way this unit's
+fixtures are. Fixed: `operation_hash_trace_hash` added to `DiagnosticTrace`,
+folded by `record_operation_hash` in both `gemma4_runtime.cpp` and
+`deepseek_runtime.cpp` using the identical fold-position-token-layer-then-hash
+pattern `record_layer_hash` already uses, plus the operation name's own bytes
+(a distinguishing input the layer-hash aggregate does not need, since it has
+no comparable per-record string field). This is a genuine JSON-shape
+*addition*, not present for either binary before, so there is no prior
+per-caller behaviour to preserve — unlike F9's guard condition.
+
+**Minor, taken:** `Gemma4Runtime::Impl::forward_layers`'s `tokens` parameter
+had a `= {}` default with exactly one call site, which already passes real
+tokens; a future second call site could have silently recorded `input_token:
+0` instead of failing to compile. Default removed — zero behaviour change
+today, closes a future footgun for free. `reset_diagnostics()` now also
+reserves `operation_hashes` (4x `layer_hashes`' reservation, matching Gemma
+4's current four-checkpoints-per-layer wiring, with a comment explaining the
+multiplier rather than a bare magic number).
+
+**Minor, not taken, with the one-line reason asked for:** the same reserve
+fix was not applied to `DeepSeekV4Runtime`'s `operation_hashes`, because
+DeepSeek's operation-hash count is not a fixed multiple of its layer-hash
+count the way Gemma 4's is — it varies by prefill/decode path and tiling —
+so a safe reserve would need a conservative overestimate rather than an exact
+multiplier, which is a bigger judgment call than the one-line fix Gemma 4
+got.
 
 ## Recommendations carried forward (not actioned in this unit)
 

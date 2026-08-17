@@ -55,7 +55,6 @@ endif()
 
 add_library(strata_platform STATIC
     src/attention.cpp
-    src/checkpoint.cpp
     src/checkpoint_io.cpp
     src/compressed_tensors.cpp
     src/diagnostics.cpp
@@ -145,6 +144,7 @@ add_library(strata_models STATIC
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp
     src/model.cpp
+    src/checkpoint.cpp
     kernels/cpu/dsv4_fp4_expert.cpp
 )
 target_include_directories(strata_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -14,6 +14,12 @@ struct Dsv4AdmissionConfig {
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     std::uint32_t maximum_context_tokens{2048U};
+    // A batched prefill page pins its own sliding history: the page's
+    // retention floor holds every row from position_base + 1 - kWindow until
+    // the page's attend loop completes, so the sliding table carries
+    // page_tokens + kWindow rows, not kWindow. Budgeting for the window alone
+    // exhausts the host KV cache on the first page wider than a block.
+    std::uint32_t prefill_page_tokens{1U};
     bool enable_dspark{};
     bool enable_mhc_prepack{};
     bool host_routed_experts{};

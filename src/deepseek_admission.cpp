@@ -202,9 +202,14 @@ Dsv4AdmissionResult plan_dsv4_resident_topology(
         const auto sliding_capacity = config.physical_kv_cache
             ? dsv4_kv_block_rows(Dsv4KvBlockKind::Sliding, 1U, true)
             : kDsv4KvBlockRows;
+        // A page of N rows retains [base + 1 - window, base + N - 1] for the
+        // whole page, so the live span is N + window - 1 rows before block
+        // rounding -- not window alone.
+        const auto page_rows = std::max<std::uint64_t>(
+            1U, config.prefill_page_tokens);
         const auto maximum_sliding_rows = std::min<std::uint64_t>(
             config.maximum_context_tokens,
-            window + sliding_capacity - 1U);
+            window + page_rows + sliding_capacity - 2U);
         const auto sliding_blocks =
             (maximum_sliding_rows + sliding_capacity - 1U) /
             sliding_capacity;

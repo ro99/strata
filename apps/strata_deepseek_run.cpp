@@ -1174,6 +1174,7 @@ int main(int argc, char** argv) {
         config.device_kv_cache_bytes = options.device_kv_cache_bytes;
         config.vram_weight_budgets = budgets;
         config.maximum_context_tokens = options.maximum_context_tokens;
+        config.prefill_page_tokens = options.prefill_page_tokens;
         config.enable_mhc_prepack =
             options.prepack_mhc && !options.device_resident_runtime;
         config.compact_kv_cache = options.block_kv_cache;

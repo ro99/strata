@@ -9141,6 +9141,7 @@ ValidationResult DeepSeekV4Runtime::initialize(
     admission_config.host_kv_cache_bytes = config.host_kv_cache_bytes;
     admission_config.device_kv_cache_bytes = kv_device_capacities;
     admission_config.maximum_context_tokens = config.maximum_context_tokens;
+    admission_config.prefill_page_tokens = config.prefill_page_tokens;
     admission_config.enable_dspark = config.enable_dspark;
     admission_config.enable_mhc_prepack =
         config.prepack_mhc_projection &&

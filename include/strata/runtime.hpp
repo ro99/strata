@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,11 +67,16 @@ struct RuntimeConfig {
 struct GenerationMetrics {
     std::uint64_t prompt_tokens{};
     std::uint64_t prefill_tokens{};
-    std::uint64_t reused_prompt_tokens{};
+    // Unset, not zero, when the loaded runtime does not implement incremental
+    // prefix reuse at all (Inkling, Kimi-K3 today). GenerationMetrics has no
+    // other way to say "not applicable" versus "measured, and the answer is
+    // none reused" (Phase 2, B6) -- a defaulted 0/false was indistinguishable
+    // from a genuine zero.
+    std::optional<std::uint64_t> reused_prompt_tokens;
     std::uint64_t decode_tokens{};
     double prefill_seconds{};
     double decode_seconds{};
-    bool incremental_kv_continuation{};
+    std::optional<bool> incremental_kv_continuation;
 };
 
 struct GenerationResult {

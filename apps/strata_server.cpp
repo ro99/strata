@@ -624,7 +624,9 @@ private:
             aggregated.prefill_seconds += result.metrics.prefill_seconds;
             aggregated.decode_tokens += result.metrics.decode_tokens;
             aggregated.decode_seconds += result.metrics.decode_seconds;
-            aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
+            aggregated.reused_prompt_tokens =
+                aggregated.reused_prompt_tokens.value_or(0U) +
+                result.metrics.reused_prompt_tokens.value_or(0U);
             returned_tokens += result.generated_token_ids.size();
             if (!connected) {
                 std::cerr << "[request] id=" << id
@@ -673,7 +675,7 @@ private:
                 final << ",\"usage\":"
                       << strata::render_openai_usage(
                           aggregated.prompt_tokens, aggregated.decode_tokens,
-                          aggregated.reused_prompt_tokens)
+                          aggregated.reused_prompt_tokens.value_or(0U))
                       << ",\"timings\":" << strata::render_openai_timings(aggregated);
             }
             final << "}\n\n";
@@ -743,7 +745,9 @@ private:
             aggregated.prefill_seconds += result.metrics.prefill_seconds;
             aggregated.decode_tokens += result.metrics.decode_tokens;
             aggregated.decode_seconds += result.metrics.decode_seconds;
-            aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
+            aggregated.reused_prompt_tokens =
+                aggregated.reused_prompt_tokens.value_or(0U) +
+                result.metrics.reused_prompt_tokens.value_or(0U);
             response << "{\"index\":" << index << ',';
             if (chat) {
                 response << "\"message\":{\"role\":\"assistant\",\"content\":\""
@@ -761,7 +765,7 @@ private:
         const auto prompt_tokens = aggregated.prompt_tokens;
         response << "],\"usage\":"
                  << strata::render_openai_usage(prompt_tokens, completion_tokens,
-                                                aggregated.reused_prompt_tokens)
+                                                aggregated.reused_prompt_tokens.value_or(0U))
                  << ",\"timings\":" << strata::render_openai_timings(aggregated)
                  << "}";
         double model_seconds = 0.0;

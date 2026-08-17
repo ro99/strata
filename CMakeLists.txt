@@ -157,6 +157,12 @@ add_library(strata_app STATIC
 )
 target_include_directories(strata_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_app PUBLIC strata_models)
+# Scoped to this one file, not a warnings-as-errors push: runtime.cpp's model
+# dispatch relies on -Wswitch (part of -Wall) actually failing the build when
+# a RuntimeModel enumerator is added without a matching case (Phase 2, B7). A
+# blanket -Werror would also turn deepseek_runtime.cpp:4185's pre-existing
+# -Wconversion warning into a build break as an unrelated side effect.
+set_source_files_properties(src/runtime.cpp PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
 add_library(strata_core INTERFACE)
 target_link_libraries(strata_core INTERFACE strata_app)

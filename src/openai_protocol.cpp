@@ -621,7 +621,7 @@ std::string render_openai_timings(const GenerationMetrics& metrics) {
            << ",\"predicted_ms\":" << metrics.decode_seconds * 1000.0
            << ",\"predicted_per_token_ms\":" << predicted_per_token_ms
            << ",\"predicted_per_second\":" << predicted_per_second
-           << ",\"cache_n\":" << metrics.reused_prompt_tokens << '}';
+           << ",\"cache_n\":" << metrics.reused_prompt_tokens.value_or(0U) << '}';
     return output.str();
 }
 

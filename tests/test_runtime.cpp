@@ -125,3 +125,72 @@ TEST_CASE("runtime session cannot generate before initialization") {
     strata::RuntimeSession runtime;
     REQUIRE(!runtime.generate_stream("hello", 1U).ok());
 }
+
+// Free test 1 (Phase 2 survey, brief 04 task 2): the only two conformance
+// properties assertable across all six RuntimeModel values without a real
+// checkpoint. A failed initialize() must never leave impl_ holding a runtime
+// -- the facade falls through to std::monostate, so generation afterward
+// must report the same "not initialized" error every model gets from a
+// session that was never touched, not silently produce output or crash.
+TEST_CASE("initialization failure leaves generation disabled, all six models") {
+    constexpr std::array<strata::RuntimeModel, 6> models{
+        strata::RuntimeModel::Glm52,     strata::RuntimeModel::DeepSeekV4,
+        strata::RuntimeModel::Gemma4,    strata::RuntimeModel::Laguna,
+        strata::RuntimeModel::Inkling,   strata::RuntimeModel::KimiK3,
+    };
+    for (const auto model : models) {
+        strata::RuntimeSession runtime;
+        strata::RuntimeConfig config;
+        config.model = model;
+        const auto initialized = runtime.initialize("not-present", config);
+        REQUIRE(!initialized.ok());
+        const auto generated = runtime.generate_stream("hello", 1U);
+        REQUIRE(!generated.ok());
+        REQUIRE(std::any_of(generated.errors.begin(), generated.errors.end(),
+                            [](const std::string& error) {
+                                return error.find("not initialized") !=
+                                       std::string::npos;
+                            }));
+    }
+}
+
+// Free test 2 / Phase 2, B7: a RuntimeModel value outside the declared six
+// (only reachable via an explicit cast -- every real caller derives the enum
+// from a closed switch or ternary chain) must be rejected by name, not
+// quietly executed as DeepSeek against whatever directory was supplied.
+// Red for the right reason: before the fix, none of the if-conditions in
+// RuntimeSession::initialize matched RuntimeModel(99), so it fell through to
+// the unconditional trailing block and attempted to open "definitely-not-a-
+// real-checkpoint-directory" as a DeepSeek checkpoint -- producing a real
+// error, but one about a missing/invalid checkpoint, never one naming the
+// model as unhandled. A test that only checked `!result.ok()` would have
+// passed for the wrong reason on the old code; checking the error text is
+// what makes this catch the actual defect.
+TEST_CASE("an unhandled runtime model is rejected, not silently run as DeepSeek") {
+    strata::RuntimeSession runtime;
+    strata::RuntimeConfig config;
+    config.model = static_cast<strata::RuntimeModel>(99);
+    const auto initialized =
+        runtime.initialize("definitely-not-a-real-checkpoint-directory", config);
+    REQUIRE(!initialized.ok());
+    REQUIRE(std::any_of(initialized.errors.begin(), initialized.errors.end(),
+                        [](const std::string& error) {
+                            return error.find("unhandled") != std::string::npos;
+                        }));
+}
+
+// Phase 2, B6: GenerationMetrics must be able to say "not applicable" for a
+// runtime that does not implement incremental prefix reuse at all (Inkling,
+// Kimi-K3), distinct from "measured, and the answer is none reused". A
+// hardcoded 0/false default cannot express that distinction; std::optional
+// can. Pure struct-shape check: no runtime, no checkpoint, exactly the
+// "cheap because honest" property the schema fix was chosen for.
+TEST_CASE("generation metrics can express reuse fields as not applicable") {
+    strata::GenerationMetrics metrics;
+    REQUIRE(!metrics.reused_prompt_tokens.has_value());
+    REQUIRE(!metrics.incremental_kv_continuation.has_value());
+    metrics.reused_prompt_tokens = 4U;
+    metrics.incremental_kv_continuation = true;
+    REQUIRE(metrics.reused_prompt_tokens.value() == 4U);
+    REQUIRE(metrics.incremental_kv_continuation.value());
+}

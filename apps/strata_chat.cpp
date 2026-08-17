@@ -639,9 +639,10 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
                << "\"prompt_tokens\":" << result.metrics.prompt_tokens
                << ",\"prefill_tokens\":" << result.metrics.prefill_tokens
                << ",\"reused_prompt_tokens\":"
-               << result.metrics.reused_prompt_tokens
+               << result.metrics.reused_prompt_tokens.value_or(0U)
                << ",\"incremental_kv_continuation\":"
-               << (result.metrics.incremental_kv_continuation ? "true" : "false")
+               << (result.metrics.incremental_kv_continuation.value_or(false)
+                       ? "true" : "false")
                << ",\"decode_tokens\":" << result.metrics.decode_tokens
                << ",\"prefill_seconds\":" << result.metrics.prefill_seconds
                << ",\"prefill_tok_s\":" << prefill_tok_s

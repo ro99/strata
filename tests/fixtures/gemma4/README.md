@@ -1,8 +1,18 @@
 # Gemma 4 layer-hash-trace fixture
 
 `layer-hash-trace.json` is the tier-1 (per-layer, per-operation BF16 hash) and
-tier-2 (generated token IDs) equivalence-oracle fixture for Gemma 4, captured
-at commit `5783d39` (branch `infra/00-equivalence-oracle`).
+tier-2 (generated token IDs) equivalence-oracle fixture for Gemma 4.
+
+**Re-captured** after closing the P3 blind spot (brief 00c task 3 / brief 01
+task 0): a fourth operation-hash checkpoint, `mlp_residual`, was added right
+after the final scaled residual add, at the same point `record_layer_hash`
+already fires. Before this, a fault landing between the `mlp` checkpoint and
+the next layer's first checkpoint was invisible to `operation_hashes`
+specifically (though still caught by `layer_hidden_hashes`, which is why the
+gate passed anyway) -- see perturbation 3's commit (`84e41ee`) for the
+mechanism. `layer_hidden_hashes`' `trace_hash` is unchanged by this fix
+(`9fdbee6c3f216c01`, same as the original capture at `d3852a0`), because it
+was never blind to begin with; only `operation_hashes` gained a checkpoint.
 
 ## How it was captured
 
@@ -19,10 +29,9 @@ is fully VRAM-resident so device topology does not change the result.
 
 ## Determinism
 
-Run twice, back to back, same command, same machine: **byte-identical**
-(`diff` empty). This is the binding claim task 2 asked to verify before
-anything downstream trusts this fixture — see the report for the second run's
-artifact if it's still around, or just re-run the command above twice and diff.
+Run twice, back to back, same command, same machine, after the `mlp_residual`
+change: **byte-identical** (`diff` empty). Re-checked, not assumed carried
+over from the pre-fix capture.
 
 ## What's in it
 
@@ -32,11 +41,11 @@ artifact if it's still around, or just re-run the command above twice and diff.
 - `diagnostics.layer_hidden_hashes`: tier 1. 1080 entries = 18 prompt tokens x
   60 layers, one BF16 hash of the residual stream per (position, layer) pair,
   plus one rolling `trace_hash` aggregate over all of them.
-- `diagnostics.operation_hashes`: 3240 entries = 18 x 60 x 3, one hash each
-  for `attention_local`/`attention_global`, `attention_residual`, and `mlp`
-  per layer. Finer-grained than task 2 strictly asked for, but it's what
-  localizes a detected break to *which part* of a layer, not just which
-  layer -- kept because task 3 needs it.
+- `diagnostics.operation_hashes`: **4320** entries = 18 x 60 x 4, one hash each
+  for `attention_local`/`attention_global`, `attention_residual`, `mlp`, and
+  now `mlp_residual` per layer. Finer-grained than task 2 of brief 00c
+  strictly asked for, but it's what localizes a detected break to *which
+  part* of a layer, not just which layer.
 
 Only the prefill pass is covered: this prompt is short enough that every
 generated token comes from the fused CUDA decode path, which has no

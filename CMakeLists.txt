@@ -138,6 +138,9 @@ target_link_libraries(strata-run PRIVATE strata_core)
 add_executable(strata-deepseek-run apps/strata_deepseek_run.cpp)
 target_link_libraries(strata-deepseek-run PRIVATE strata_core)
 
+add_executable(strata-gemma4-run apps/strata_gemma4_run.cpp)
+target_link_libraries(strata-gemma4-run PRIVATE strata_core)
+
 add_executable(strata-chat apps/strata_chat.cpp)
 target_link_libraries(strata-chat PRIVATE strata_core)
 
@@ -406,7 +409,7 @@ if(BUILD_TESTING)
     )
 endif()
 
-install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat strata-server
+install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-gemma4-run strata-chat strata-server
         strata-host-expert-probe strata-kimi-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)

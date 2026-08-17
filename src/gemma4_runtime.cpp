@@ -43,6 +43,36 @@ float decode_bf16(std::uint16_t value) noexcept {
     return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
 }
 
+// Rolling aggregate for the layer hash trace. Mirrors DeepSeek's private
+// diagnostic_hash_* helpers (src/deepseek_runtime.cpp) so a trace_hash from
+// either model is computed the same way; the per-value BF16 hashing itself
+// is the shared strata::stable_bf16_hash from diagnostics.hpp.
+constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
+constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
+
+[[nodiscard]] std::uint64_t diagnostic_hash_byte(
+    std::uint64_t hash, std::uint8_t value) noexcept {
+    return (hash ^ value) * kDiagnosticFnvPrime;
+}
+
+[[nodiscard]] std::uint64_t diagnostic_hash_u32(
+    std::uint64_t hash, std::uint32_t value) noexcept {
+    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
+        hash = diagnostic_hash_byte(
+            hash, static_cast<std::uint8_t>(value >> shift));
+    }
+    return hash;
+}
+
+[[nodiscard]] std::uint64_t diagnostic_hash_u64(
+    std::uint64_t hash, std::uint64_t value) noexcept {
+    for (std::uint32_t shift = 0U; shift < 64U; shift += 8U) {
+        hash = diagnostic_hash_byte(
+            hash, static_cast<std::uint8_t>(value >> shift));
+    }
+    return hash;
+}
+
 std::uint64_t linear_bytes(const Gemma4CheckpointReader& checkpoint,
                            std::string_view base) {
     if (const auto* plain = checkpoint.find(std::string(base) + ".weight");
@@ -153,9 +183,42 @@ struct Gemma4Runtime::Impl {
     bool initialized{};
     bool reusable_sequence{};
     bool device_kv_ready{};
+    DiagnosticTrace diagnostics;
 
     std::size_t layer_device(std::uint32_t layer) const {
         return schedule[layer % schedule.size()];
+    }
+
+    void reset_diagnostics() {
+        diagnostics = {};
+        diagnostics.layer_hash_trace_enabled = config.enable_layer_hash_trace;
+        if (config.enable_layer_hash_trace) {
+            diagnostics.layer_hash_trace_hash = diagnostic_hash_u32(
+                kDiagnosticFnvOffset, c.layer_count);
+            diagnostics.layer_hashes.reserve(
+                static_cast<std::size_t>(config.maximum_context_tokens) *
+                c.layer_count);
+        }
+    }
+
+    void record_layer_hash(std::uint32_t position, std::uint32_t token,
+                           std::uint32_t layer, std::span<const float> hidden) {
+        const auto hash = stable_bf16_hash(hidden);
+        diagnostics.layer_hashes.push_back({position, token, layer, hash});
+        auto aggregate = diagnostics.layer_hash_trace_hash;
+        aggregate = diagnostic_hash_u32(aggregate, position);
+        aggregate = diagnostic_hash_u32(aggregate, token);
+        aggregate = diagnostic_hash_u32(aggregate, layer);
+        diagnostics.layer_hash_trace_hash =
+            diagnostic_hash_u64(aggregate, hash);
+    }
+
+    void record_operation_hash(std::uint32_t position, std::uint32_t token,
+                               std::uint32_t layer, std::string_view operation,
+                               std::span<const float> values) {
+        const auto hash = stable_bf16_hash(values);
+        diagnostics.operation_hashes.push_back(
+            {position, token, layer, std::string(operation), hash});
     }
 
     ValidationResult linear(const Linear& weight, std::span<const float> input,
@@ -881,7 +944,8 @@ struct Gemma4Runtime::Impl {
     ValidationResult forward_layers(std::span<float> hidden,
                                     std::uint32_t rows,
                                     std::uint32_t position_base,
-                                    std::span<const std::int32_t> multimodal_groups) {
+                                    std::span<const std::int32_t> multimodal_groups,
+                                    std::span<const std::uint32_t> tokens = {}) {
         if (rows == 1U && device_kv_ready && multimodal_groups.empty()) {
             return forward_decode_layers(hidden, position_base);
         }
@@ -891,23 +955,56 @@ struct Gemma4Runtime::Impl {
         for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
             const auto started = std::chrono::steady_clock::now();
             auto& weights = layers[layer];
+            const bool global = gemma4_global_attention_layer(layer);
             result = norm_rows(normalized, hidden, weights.input_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
             result = attention(layer, normalized, rows, position_base,
                                multimodal_groups, branch);
             if (!result.ok()) return result;
+            if (config.enable_layer_hash_trace) {
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    const auto position = position_base + row;
+                    const auto token = row < tokens.size() ? tokens[row] : 0U;
+                    const auto output_row = std::span<const float>(branch)
+                        .subspan(row * c.hidden_size, c.hidden_size);
+                    record_operation_hash(
+                        position, token, layer,
+                        global ? "attention_global" : "attention_local",
+                        output_row);
+                }
+            }
             result = norm_rows(normalized, branch, weights.post_attention_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
             for (std::size_t index = 0U; index < hidden.size(); ++index) {
                 hidden[index] = bf16_round_f32(hidden[index] + normalized[index]);
             }
+            if (config.enable_layer_hash_trace) {
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    const auto position = position_base + row;
+                    const auto token = row < tokens.size() ? tokens[row] : 0U;
+                    const auto hidden_row = std::span<const float>(hidden)
+                        .subspan(row * c.hidden_size, c.hidden_size);
+                    record_operation_hash(position, token, layer,
+                                         "attention_residual", hidden_row);
+                }
+            }
             result = norm_rows(normalized, hidden, weights.pre_feedforward_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
             result = mlp(weights, normalized, rows, branch);
             if (!result.ok()) return result;
+            if (config.enable_layer_hash_trace) {
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    const auto position = position_base + row;
+                    const auto token = row < tokens.size() ? tokens[row] : 0U;
+                    const auto output_row = std::span<const float>(branch)
+                        .subspan(row * c.hidden_size, c.hidden_size);
+                    record_operation_hash(position, token, layer, "mlp",
+                                         output_row);
+                }
+            }
             result = norm_rows(normalized, branch, weights.post_feedforward_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
@@ -915,6 +1012,15 @@ struct Gemma4Runtime::Impl {
                 hidden[index] = bf16_round_f32(
                     bf16_round_f32(hidden[index] + normalized[index]) *
                     weights.scalar);
+            }
+            if (config.enable_layer_hash_trace) {
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    const auto position = position_base + row;
+                    const auto token = row < tokens.size() ? tokens[row] : 0U;
+                    const auto hidden_row = std::span<const float>(hidden)
+                        .subspan(row * c.hidden_size, c.hidden_size);
+                    record_layer_hash(position, token, layer, hidden_row);
+                }
             }
             if (config.verbose) {
                 const auto seconds = std::chrono::duration<double>(
@@ -945,7 +1051,7 @@ struct Gemma4Runtime::Impl {
         result = embed(token_ids, replacements, replacement_mask, hidden);
         if (!result.ok()) return result;
         result = forward_layers(hidden, static_cast<std::uint32_t>(token_ids.size()),
-                                position_base, multimodal_groups);
+                                position_base, multimodal_groups, token_ids);
         if (!result.ok()) return result;
         std::vector<float> normalized(c.hidden_size);
         result = gemma4_rms_norm_bf16(
@@ -1370,6 +1476,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
         }
     }
     result.prompt_token_ids = std::move(encoded.value);
+    impl_->reset_diagnostics();
     std::vector<float> replacements;
     std::vector<std::uint8_t> replacement_mask;
     std::vector<std::int32_t> multimodal_groups;
@@ -1492,6 +1599,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
         std::chrono::steady_clock::now() - decode_started).count();
     result.metrics.rss_bytes = process_resident_set_bytes();
     result.metrics.device_vram_used_bytes = device_vram_used_bytes(impl_->devices);
+    result.diagnostics = std::move(impl_->diagnostics);
     impl_->reusable_sequence =
         impl_->config.enable_incremental_kv_continuation && result.ok();
     return result;

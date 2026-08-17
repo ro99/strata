@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/chat_protocol.hpp"
+#include "strata/diagnostics.hpp"
 #include "strata/placement.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
@@ -24,6 +25,14 @@ struct Gemma4RuntimeConfig {
     bool load_progress{};
     bool enable_flash_attention{true};
     bool enable_incremental_kv_continuation{true};
+    // Default off, no cost on the hot path either way. Records a per-layer
+    // BF16 hash of the residual stream and a per-operation hash of each
+    // layer's attention and MLP outputs, during the host-side forward_layers
+    // path (prefill, and any decode step that has not yet uploaded its KV
+    // cache to the fused device path). The fused device decode path has no
+    // host-visible layer boundary, so it is not covered -- the same
+    // limitation DeepSeek's own device-resident decode path has.
+    bool enable_layer_hash_trace{};
     // Optional pre-solved placement. When present and prescriptive it supplies
     // the layer-to-device assignment and the admitted per-device budgets, so
     // the load performs exactly the placement a dry run printed. Borrowed for
@@ -49,6 +58,7 @@ struct Gemma4GenerationResult {
     std::vector<std::uint32_t> generated_token_ids;
     std::vector<TokenLogprob> logprobs;
     Gemma4RunMetrics metrics;
+    DiagnosticTrace diagnostics;
     std::vector<std::string> errors;
     bool stopped{};
 

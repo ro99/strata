@@ -39,13 +39,79 @@ else()
     set(STRATA_HAS_CUDA OFF)
 endif()
 
-add_library(strata_core STATIC
-    src/attention.cpp
-    src/chat_protocol.cpp
+# Phase 1 (docs/experiments/0121): strata_core split into six layered
+# targets, dependencies pointing strictly downward:
+#   platform -> device -> kernels -> engine -> models -> app
+# Files are not moved -- every path below is exactly where it was in the
+# single strata_core list. This is a link-graph and enforcement change only;
+# scripts/check_layers.py is the boundary enforcement (there is no physical
+# per-target include directory yet, so the compiler alone cannot catch a
+# violation -- that is phase 3's job once files actually move).
+#
+# strata_core is kept as a thin alias so every existing
+# `target_link_libraries(<binary> PRIVATE strata_core)` line below keeps
+# working unchanged; it forwards to strata_app, which pulls in the other
+# five PUBLICly through the chain.
+
+add_library(strata_platform STATIC
     src/checkpoint.cpp
     src/checkpoint_io.cpp
     src/compressed_tensors.cpp
+    src/diagnostics.cpp
+    src/json_cursor.cpp
+    src/numa_topology.cpp
+    src/numerics.cpp
+    src/safetensors.cpp
+    src/trace.cpp
+    src/worker_pool.cpp
+)
+target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(strata_platform PUBLIC STRATA_VERSION="${PROJECT_VERSION}")
+
+add_library(strata_device STATIC
     ${STRATA_CUDA_SOURCE}
+)
+target_include_directories(strata_device PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_device PUBLIC strata_platform)
+
+if(STRATA_HAS_CUDA)
+    set_property(TARGET strata_device PROPERTY CUDA_ARCHITECTURES 86 120)
+    set_property(TARGET strata_device PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata_device PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(strata_device PUBLIC STRATA_HAS_CUDA=1)
+    target_compile_options(strata_device PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-Wall,-Wextra>
+    )
+else()
+    target_compile_definitions(strata_device PUBLIC STRATA_HAS_CUDA=0)
+endif()
+
+add_library(strata_kernels STATIC
+    kernels/cpu/q4_reference.cpp
+    kernels/cpu/glm_int4.cpp
+    kernels/cpu/dsv4_fp4_expert.cpp
+)
+target_include_directories(strata_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_kernels PUBLIC strata_device)
+
+add_library(strata_engine STATIC
+    src/attention.cpp
+    src/chat_protocol.cpp
+    src/openai_protocol.cpp
+    src/placement.cpp
+    src/placement_cache.cpp
+    src/placement_model.cpp
+    src/residency.cpp
+    src/route_predictor.cpp
+    src/runtime_support.cpp
+    src/sampling.cpp
+    src/simulator.cpp
+    src/tokenizer.cpp
+)
+target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_engine PUBLIC strata_kernels)
+
+add_library(strata_models STATIC
     src/glm_ops.cpp
     src/gemma4_ops.cpp
     src/gemma4_checkpoint.cpp
@@ -71,7 +137,6 @@ add_library(strata_core STATIC
     src/deepseek_kv_cache.cpp
     src/dsv4_attention_kv.cpp
     src/deepseek_ops.cpp
-    src/diagnostics.cpp
     src/deepseek_checkpoint.cpp
     src/deepseek_rank_shard.cpp
     src/dsv4_host_moe_executor.cpp
@@ -80,47 +145,26 @@ add_library(strata_core STATIC
     src/dsv4_rank_local_weights.cpp
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp
-    src/json_cursor.cpp
     src/model.cpp
-    src/numerics.cpp
-    src/numa_topology.cpp
-    src/openai_protocol.cpp
-    src/placement.cpp
-    src/placement_cache.cpp
-    src/placement_model.cpp
-    src/safetensors.cpp
-    src/tokenizer.cpp
-    src/worker_pool.cpp
-    src/trace.cpp
-    src/route_predictor.cpp
-    src/runtime.cpp
-    src/runtime_support.cpp
-    src/residency.cpp
-    src/sampling.cpp
-    src/simulator.cpp
-    kernels/cpu/q4_reference.cpp
-    kernels/cpu/glm_int4.cpp
-    kernels/cpu/dsv4_fp4_expert.cpp
 )
+target_include_directories(strata_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_models PUBLIC strata_engine)
 
-target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(strata_core PUBLIC STRATA_VERSION="${PROJECT_VERSION}")
+add_library(strata_app STATIC
+    src/runtime.cpp
+)
+target_include_directories(strata_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_app PUBLIC strata_models)
 
-if(STRATA_HAS_CUDA)
-    set_property(TARGET strata_core PROPERTY CUDA_ARCHITECTURES 86 120)
-    set_property(TARGET strata_core PROPERTY CUDA_STANDARD 20)
-    set_property(TARGET strata_core PROPERTY CUDA_STANDARD_REQUIRED ON)
-    target_compile_definitions(strata_core PUBLIC STRATA_HAS_CUDA=1)
-    target_compile_options(strata_core PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-Wall,-Wextra>
-    )
-else()
-    target_compile_definitions(strata_core PUBLIC STRATA_HAS_CUDA=0)
-endif()
+add_library(strata_core INTERFACE)
+target_link_libraries(strata_core INTERFACE strata_app)
 
 if(STRATA_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(strata_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(strata_core PUBLIC -fsanitize=address,undefined)
+    foreach(strata_layer IN ITEMS strata_platform strata_device strata_kernels
+                                  strata_engine strata_models strata_app)
+        target_compile_options(${strata_layer} PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${strata_layer} PUBLIC -fsanitize=address,undefined)
+    endforeach()
 endif()
 
 add_executable(strata-sim apps/strata_sim.cpp)
@@ -199,7 +243,7 @@ if(STRATA_HAS_CUDA)
     )
 
     find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(strata_core PUBLIC CUDA::cublas)
+    target_link_libraries(strata_device PUBLIC CUDA::cublas)
 
     add_executable(strata-dsv4-bf16-gemm-probe
         apps/strata_dsv4_bf16_gemm_probe.cu)
@@ -325,20 +369,24 @@ if(STRATA_HAS_CUDA)
         message(STATUS "NCCL header: ${STRATA_NCCL_INCLUDE_DIR}")
         message(STATUS "NCCL library: ${STRATA_NCCL_LIBRARY}")
         get_filename_component(STRATA_NCCL_LIBRARY_DIR "${STRATA_NCCL_LIBRARY}" DIRECTORY)
-        # Compiled into strata_core rather than a separate archive: the executor
-        # needs CudaBackend and the runtime needs the executor, so a distinct
-        # library would be a cycle.
-        target_sources(strata_core PRIVATE
+        # Compiled into strata_models rather than a separate archive: the
+        # executor needs CudaBackend (strata_device) and deepseek_runtime.cpp
+        # (strata_models) needs the executor, so a distinct library between
+        # them would be a cycle. Phase 1 note: this is itself a case worth
+        # watching once headers move in phase 3 -- a device-tier kernel that
+        # only a models-tier consumer uses is exactly the shape that makes a
+        # clean device/models split hard, and it's already here today.
+        target_sources(strata_models PRIVATE
             kernels/cuda/dsv4_rank_local_layer_executor.cu)
-        target_include_directories(strata_core PRIVATE "${STRATA_NCCL_INCLUDE_DIR}")
-        target_link_libraries(strata_core PUBLIC "${STRATA_NCCL_LIBRARY}" ${CMAKE_DL_LIBS} ${NUMA_LIBRARY})
-        set_target_properties(strata_core PROPERTIES BUILD_RPATH "${STRATA_NCCL_LIBRARY_DIR}")
+        target_include_directories(strata_models PRIVATE "${STRATA_NCCL_INCLUDE_DIR}")
+        target_link_libraries(strata_models PUBLIC "${STRATA_NCCL_LIBRARY}" ${CMAKE_DL_LIBS} ${NUMA_LIBRARY})
+        set_target_properties(strata_models PROPERTIES BUILD_RPATH "${STRATA_NCCL_LIBRARY_DIR}")
         # PUBLIC so the runtime, CLI, chat and server all agree on whether the
         # rank-local topology exists at all.
-        target_compile_definitions(strata_core PUBLIC STRATA_HAS_NCCL=1)
-        set_property(TARGET strata_core PROPERTY CUDA_ARCHITECTURES 86 120)
-        set_property(TARGET strata_core PROPERTY CUDA_STANDARD 20)
-        set_property(TARGET strata_core PROPERTY CUDA_STANDARD_REQUIRED ON)
+        target_compile_definitions(strata_models PUBLIC STRATA_HAS_NCCL=1)
+        set_property(TARGET strata_models PROPERTY CUDA_ARCHITECTURES 86 120)
+        set_property(TARGET strata_models PROPERTY CUDA_STANDARD 20)
+        set_property(TARGET strata_models PROPERTY CUDA_STANDARD_REQUIRED ON)
     endif()
 endif()
 

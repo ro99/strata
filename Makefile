@@ -1,6 +1,7 @@
-.PHONY: all configure build check test tui tui-check tui-clean check-all clean
+.PHONY: all configure build check check-layers test tui tui-check tui-clean check-all clean
 
 CARGO ?= cargo
+PYTHON ?= python3
 
 all: build
 
@@ -13,6 +14,13 @@ build: configure
 check: configure
 	cmake --build build --parallel
 	ctest --test-dir build --output-on-failure
+
+# Phase 1 layering enforcement (docs/experiments/0121). Static: reads the
+# strata_* add_library source lists straight out of CMakeLists.txt, needs no
+# build. Exits non-zero on any violation -- see the script's own docstring
+# for exactly what the two checks are.
+check-layers:
+	$(PYTHON) scripts/check_layers.py
 
 test: check
 

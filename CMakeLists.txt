@@ -100,6 +100,7 @@ add_library(strata_engine STATIC
     src/engine/placement.cpp
     src/engine/placement_cache.cpp
     src/engine/placement_model.cpp
+    src/engine/model_registry.cpp
     src/engine/residency.cpp
     src/engine/route_predictor.cpp
     src/engine/runtime_support.cpp
@@ -111,6 +112,12 @@ target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(strata_engine PUBLIC strata_kernels)
 
 add_library(strata_models STATIC
+    src/models/dsv4/dsv4_executor.cpp
+    src/models/glm52/glm52_executor.cpp
+    src/models/gemma4/gemma4_executor.cpp
+    src/models/kimi_k3/kimi_k3_executor.cpp
+    src/models/laguna/laguna_executor.cpp
+    src/models/inkling/inkling_executor.cpp
     src/models/glm52/glm_ops.cpp
     src/models/gemma4/gemma4_ops.cpp
     src/models/gemma4/gemma4_checkpoint.cpp
@@ -165,7 +172,20 @@ target_link_libraries(strata_app PUBLIC strata_models)
 set_source_files_properties(src/app/runtime.cpp PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
 add_library(strata_core INTERFACE)
-target_link_libraries(strata_core INTERFACE strata_app)
+# --whole-archive around strata_models is what makes self-registration work.
+# Each model's *_executor.cpp declares a file-scope ModelRegistrar whose
+# constructor runs before main; nothing references those objects by name, so a
+# static library drops every one of them and find_model returns null for every
+# model. This flag is the price of "adding a model touches zero shared files";
+# the alternative is a central list of register_<model>() calls, which is the
+# thing Phase 4 exists to remove.
+# strata_app first: GNU ld resolves in a single pass, so an archive only
+# satisfies undefined symbols from objects that came before it. strata_engine
+# (pulled in transitively by strata_app) still references strata_models -- the
+# link cycle check-symbols reports under the placement-model-inventory-registry
+# exception -- so strata_models has to follow it on the line.
+target_link_libraries(strata_core INTERFACE
+    strata_app -Wl,--whole-archive strata_models -Wl,--no-whole-archive)
 
 if(STRATA_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     foreach(strata_layer IN ITEMS strata_platform strata_device strata_kernels

@@ -315,10 +315,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         std::cerr << "invalid sampler option: " << sampling_error << '\n';
         return false;
     }
+    // Resolved through the model registry rather than a hardcoded list, so a
+    // new model needs no edit here.
     return !options.model.empty() &&
-           (options.model_type == "glm" || options.model_type == "deepseek" ||
-            options.model_type == "gemma4" || options.model_type == "laguna" ||
-            options.model_type == "inkling" || options.model_type == "kimi-k3");
+           strata::find_model_by_cli_name(options.model_type) != nullptr;
 }
 
 // A run is reproducible when nothing stochastic is enabled. Temperature alone
@@ -702,26 +702,19 @@ int main(int argc, char** argv) {
         protocol_message("status", "Loading model");
     }
 
+    // parse_options already rejected an unregistered --model-type.
+    const auto* registration =
+        strata::find_model_by_cli_name(options.model_type);
     strata::RuntimeConfig config;
-    config.model = options.model_type == "glm"
-                       ? strata::RuntimeModel::Glm52
-                   : options.model_type == "gemma4"
-                       ? strata::RuntimeModel::Gemma4
-                   : options.model_type == "kimi-k3"
-                       ? strata::RuntimeModel::KimiK3
-                   : options.model_type == "laguna"
-                       ? strata::RuntimeModel::Laguna
-                   : options.model_type == "inkling"
-                       ? strata::RuntimeModel::Inkling
-                       : strata::RuntimeModel::DeepSeekV4;
+    config.model = registration->model;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;
     config.vram_cache_fraction = options.vram_fraction;
-    config.verbose = options.model_type == "deepseek";
-    config.load_progress = options.model_type != "deepseek";
+    config.verbose = registration->verbose_by_default;
+    config.load_progress = registration->progress_by_default;
     config.sampling = options.sampling;
-    config.enable_flash_attention = options.flash_attention ||
-        options.model_type == "gemma4" || options.model_type == "laguna";
+    config.enable_flash_attention =
+        options.flash_attention || registration->flash_attention_by_default;
     config.enable_incremental_kv_continuation =
         options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;

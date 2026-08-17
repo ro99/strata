@@ -1,26 +1,15 @@
 #include "strata/runtime.hpp"
 
-#include "strata/deepseek_runtime.hpp"
-#include "strata/dsv4_attention_kv.hpp"
-#include "strata/gemma4_runtime.hpp"
-#include "strata/glm_runtime.hpp"
-#include "strata/inkling_runtime.hpp"
-#include "strata/kimi_k3_runtime.hpp"
-#include "strata/laguna_runtime.hpp"
-
-#include <array>
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <string>
 #include <utility>
-#include <variant>
 
 namespace strata {
 
 struct RuntimeSession::Impl {
-    std::variant<std::monostate, Glm52Runtime, DeepSeekV4Runtime,
-                 Gemma4Runtime, LagunaRuntime, InklingRuntime,
-                 KimiK3Runtime> runtime;
+    std::unique_ptr<ModelExecutor> executor;
     SamplingOptions sampling;
     PlacementPlan placement;
     bool placement_ready{};
@@ -28,45 +17,11 @@ struct RuntimeSession::Impl {
 
 namespace {
 
-// Names a declared model, or nullptr for a value that is not an enumerator.
-//
-// This is the single admission point for RuntimeModel and it carries two
-// separate guarantees. At compile time there is no default label, so
-// -Werror=switch (scoped to this file in CMakeLists.txt) turns a seventh
-// enumerator into a build failure right here. At run time a value outside the
-// enum -- legal for a scoped enum with an explicit underlying type -- returns
-// nullptr, so initialize can reject it instead of falling through to whichever
-// runtime happens to be written last.
-[[nodiscard]] const char* runtime_model_name(RuntimeModel model) noexcept {
-    switch (model) {
-        case RuntimeModel::Glm52: return "GLM-5.2";
-        case RuntimeModel::DeepSeekV4: return "DeepSeek-V4";
-        case RuntimeModel::Gemma4: return "Gemma 4";
-        case RuntimeModel::KimiK3: return "Kimi-K3";
-        case RuntimeModel::Laguna: return "Laguna";
-        case RuntimeModel::Inkling: return "Inkling";
-    }
-    return nullptr;
-}
-
-[[nodiscard]] PlacementModel placement_model(RuntimeModel model) noexcept {
-    switch (model) {
-        case RuntimeModel::Glm52: return PlacementModel::Glm52;
-        case RuntimeModel::DeepSeekV4: return PlacementModel::DeepSeekV4;
-        case RuntimeModel::Gemma4: return PlacementModel::Gemma4;
-        case RuntimeModel::Laguna: return PlacementModel::Laguna;
-        case RuntimeModel::Inkling: return PlacementModel::Inkling;
-        case RuntimeModel::KimiK3: return PlacementModel::KimiK3;
-    }
-    // Unreachable: initialize rejects an undeclared model before anything
-    // reaches this, and -Werror=switch covers the missing-enumerator case.
-    return PlacementModel::Gemma4;
-}
-
 // Names the DeepSeek-only switch a request carries, or nullptr if it carries
-// none. Every other runtime rejects on it rather than ignoring it: a request
-// for rank-local decode that quietly runs a centralized GLM would report the
-// accepted path while executing a different one.
+// none. Rejected rather than ignored by every model whose registration does
+// not claim them: a request for rank-local decode that quietly ran a
+// centralized GLM would report the accepted path while executing a different
+// one.
 [[nodiscard]] const char* deepseek_only_control(
     const RuntimeConfig& config) noexcept {
     if (config.deepseek_rank_local_decode) return "rank-local decode";
@@ -82,7 +37,9 @@ namespace {
 PlacementRequest placement_request_for(const std::string& model_directory,
                                        const RuntimeConfig& config) {
     PlacementRequest request;
-    request.model = placement_model(config.model);
+    const auto* registration = find_model(config.model);
+    request.model = registration != nullptr ? registration->placement
+                                            : PlacementModel::Gemma4;
     request.model_directory = model_directory;
     request.devices = config.devices;
     request.vram_cache_fraction = config.vram_cache_fraction;
@@ -107,19 +64,29 @@ RuntimeSession& RuntimeSession::operator=(RuntimeSession&&) noexcept = default;
 ValidationResult RuntimeSession::initialize(
     const std::string& model_directory, const RuntimeConfig& config) {
     ValidationResult result;
-    if (!std::holds_alternative<std::monostate>(impl_->runtime)) {
+    if (impl_->executor != nullptr) {
         result.errors.emplace_back("runtime session is already initialized");
         return result;
     }
-    // Reject before any placement work or checkpoint access. The dispatch
-    // below is an if-chain whose last arm is unconditional, so without this an
-    // undeclared model would be constructed as DeepSeek against whatever
-    // directory was supplied and report initialization success.
-    if (runtime_model_name(config.model) == nullptr) {
+
+    // Single admission point. A value outside the enum is legal for a scoped
+    // enum with an explicit underlying type, so this is a real check and not a
+    // formality; before Phase 4 an unregistered model fell through an if-chain
+    // and was constructed as DeepSeek against whatever directory was supplied.
+    const auto* registration = find_model(config.model);
+    if (registration == nullptr) {
         result.errors.emplace_back(
             "unhandled runtime model: " +
             std::to_string(static_cast<unsigned>(config.model)));
         return result;
+    }
+    if (!registration->accepts_deepseek_controls) {
+        if (const auto* control = deepseek_only_control(config)) {
+            result.errors.emplace_back(
+                std::string("DeepSeek ") + control + " cannot be used by the " +
+                registration->name + " runtime");
+            return result;
+        }
     }
     impl_->sampling = config.sampling;
 
@@ -167,151 +134,11 @@ ValidationResult RuntimeSession::initialize(
     const auto* placement =
         impl_->placement_ready ? &impl_->placement : nullptr;
 
-    if (config.model == RuntimeModel::Glm52) {
-        if (const auto* control = deepseek_only_control(config)) {
-            result.errors.emplace_back(
-                std::string("DeepSeek ") + control +
-                " cannot be used by the GLM runtime");
-            return result;
-        }
-        Glm52Runtime runtime;
-        Glm52RuntimeConfig concrete;
-        concrete.devices = config.devices;
-        concrete.vram_cache_fraction = config.vram_cache_fraction;
-        concrete.maximum_context_tokens = config.maximum_context_tokens;
-        concrete.sampling_temperature = config.sampling.temperature;
-        concrete.sampling_seed = config.sampling.seed;
-        concrete.verbose = config.verbose;
-        concrete.load_progress = config.load_progress;
-        concrete.enable_flash_attention = config.enable_flash_attention;
-        concrete.enable_incremental_kv_continuation =
-            config.enable_incremental_kv_continuation;
-        result = runtime.initialize(model_directory, concrete);
-        if (result.ok()) impl_->runtime.emplace<Glm52Runtime>(std::move(runtime));
-        return result;
-    }
-    if (config.model == RuntimeModel::KimiK3) {
-        if (const auto* control = deepseek_only_control(config)) {
-            result.errors.emplace_back(
-                std::string("DeepSeek ") + control +
-                " cannot be used by the Kimi-K3 runtime");
-            return result;
-        }
-        KimiK3Runtime runtime;
-        KimiK3RuntimeConfig concrete;
-        concrete.maximum_context_tokens = config.maximum_context_tokens;
-        concrete.sampling_temperature = config.sampling.temperature;
-        concrete.sampling_seed = config.sampling.seed;
-        concrete.verbose = config.verbose;
-        concrete.load_progress = config.load_progress;
-        concrete.placement = placement;
-        result = runtime.initialize(model_directory, concrete);
-        if (result.ok()) impl_->runtime.emplace<KimiK3Runtime>(std::move(runtime));
-        return result;
-    }
-    if (config.model == RuntimeModel::Gemma4) {
-        if (const auto* control = deepseek_only_control(config)) {
-            result.errors.emplace_back(
-                std::string("DeepSeek ") + control +
-                " cannot be used by the Gemma 4 runtime");
-            return result;
-        }
-        Gemma4Runtime runtime;
-        Gemma4RuntimeConfig concrete;
-        concrete.devices = config.devices;
-        concrete.vram_cache_fraction = config.vram_cache_fraction;
-        concrete.maximum_context_tokens = config.maximum_context_tokens;
-        concrete.sampling_temperature = config.sampling.temperature;
-        concrete.sampling_seed = config.sampling.seed;
-        concrete.verbose = config.verbose;
-        concrete.load_progress = config.load_progress;
-        concrete.enable_flash_attention = config.enable_flash_attention;
-        concrete.enable_incremental_kv_continuation =
-            config.enable_incremental_kv_continuation;
-        concrete.placement = placement;
-        result = runtime.initialize(model_directory, concrete);
-        if (result.ok()) impl_->runtime.emplace<Gemma4Runtime>(std::move(runtime));
-        return result;
-    }
-    if (config.model == RuntimeModel::Inkling) {
-        if (const auto* control = deepseek_only_control(config)) {
-            result.errors.emplace_back(
-                std::string("DeepSeek ") + control +
-                " cannot be used by the Inkling runtime");
-            return result;
-        }
-        InklingRuntime runtime;
-        InklingRuntimeConfig concrete;
-        concrete.maximum_context_tokens = config.maximum_context_tokens;
-        concrete.sampling_temperature = config.sampling.temperature;
-        concrete.sampling_seed = config.sampling.seed;
-        concrete.verbose = config.verbose;
-        concrete.load_progress = config.load_progress;
-        result = runtime.initialize(model_directory, concrete);
-        if (result.ok()) impl_->runtime.emplace<InklingRuntime>(std::move(runtime));
-        return result;
-    }
-    if (config.model == RuntimeModel::Laguna) {
-        if (const auto* control = deepseek_only_control(config)) {
-            result.errors.emplace_back(
-                std::string("DeepSeek ") + control +
-                " cannot be used by the Laguna runtime");
-            return result;
-        }
-        LagunaRuntime runtime;
-        LagunaRuntimeConfig concrete;
-        concrete.devices = config.devices;
-        concrete.vram_cache_fraction = config.vram_cache_fraction;
-        concrete.maximum_context_tokens = config.maximum_context_tokens;
-        concrete.sampling_temperature = config.sampling.temperature;
-        concrete.sampling_seed = config.sampling.seed;
-        concrete.verbose = config.verbose;
-        concrete.load_progress = config.load_progress;
-        concrete.enable_flash_attention = config.enable_flash_attention;
-        concrete.enable_incremental_kv_continuation =
-            config.enable_incremental_kv_continuation;
-        result = runtime.initialize(model_directory, concrete);
-        if (result.ok()) impl_->runtime.emplace<LagunaRuntime>(std::move(runtime));
-        return result;
-    }
-    DeepSeekV4Runtime runtime;
-    Dsv4RuntimeConfig concrete;
-    concrete.devices = config.devices;
-    concrete.vram_cache_fraction = config.vram_cache_fraction;
-    concrete.maximum_context_tokens = config.maximum_context_tokens;
-    concrete.sampling_temperature = config.sampling.temperature;
-    concrete.sampling_seed = config.sampling.seed;
-    concrete.verbose = config.verbose;
-    concrete.enable_flash_attention = config.enable_flash_attention;
-    concrete.enable_incremental_kv_continuation =
-        config.enable_incremental_kv_continuation;
-    concrete.pin_resident_arena = config.pin_resident_arena;
-    concrete.prepack_mhc_projection = config.prepack_mhc_projection;
-    concrete.kv_cache_mode = config.deepseek_device_resident_runtime
-        ? Dsv4KvCacheMode::PhysicalDevice
-        : config.deepseek_block_kv_cache ? Dsv4KvCacheMode::Block
-                                         : Dsv4KvCacheMode::ScalarOracle;
-    concrete.kv_block_rows = config.deepseek_device_resident_runtime
-        ? kDsv4PhysicalKvBlockRows : kDsv4KvBlockRows;
-    if (config.deepseek_prefill_page_tokens != 0U) {
-        concrete.prefill_page_tokens = config.deepseek_prefill_page_tokens;
-    }
-    if (config.deepseek_device_resident_runtime) {
-        // The device-resident decode contract is a bundle, not a knob. Leaving
-        // any member of it to the caller lets a run report the accepted
-        // attention/mHC path while executing routed experts somewhere else,
-        // which is what made this opt-in rather than a default. These are the
-        // same implications strata-deepseek-run applies to the flag.
-        concrete.enable_flash_attention = true;
-        concrete.enable_gpu_lightning_indexer = false;
-        concrete.enable_host_routed_moe = true;
-        concrete.prepack_mhc_projection = false;
-    }
-    concrete.decode_topology = config.deepseek_rank_local_decode
-        ? Dsv4DecodeTopology::RankLocalTp2
-        : Dsv4DecodeTopology::Centralized;
-    result = runtime.initialize(model_directory, concrete);
-    if (result.ok()) impl_->runtime.emplace<DeepSeekV4Runtime>(std::move(runtime));
+    auto executor = registration->make();
+    result = executor->initialize(model_directory, config, placement);
+    // Commit only on success: a failed attempt leaves generation disabled and
+    // a retry starts from a fresh implementation object.
+    if (result.ok()) impl_->executor = std::move(executor);
     return result;
 }
 
@@ -338,6 +165,10 @@ GenerationResult RuntimeSession::generate_chat_stream(
     const GenerationOptions& options,
     const TokenStreamCallback& on_token) {
     GenerationResult result;
+    if (impl_->executor == nullptr) {
+        result.errors.emplace_back("runtime session is not initialized");
+        return result;
+    }
     const bool has_images = std::any_of(
         messages.begin(), messages.end(), [](const ChatMessage& message) {
             return std::any_of(message.parts.begin(), message.parts.end(),
@@ -345,131 +176,12 @@ GenerationResult RuntimeSession::generate_chat_stream(
                     return part.kind == ChatContentKind::Image;
                 });
         });
-    if (has_images && !std::holds_alternative<Gemma4Runtime>(impl_->runtime)) {
+    if (has_images && !impl_->executor->accepts_images()) {
         result.errors.emplace_back(
             "this loaded model does not support image content");
         return result;
     }
-    if (auto* runtime = std::get_if<Glm52Runtime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_chat_stream(
-            messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
-        result.text = std::move(concrete.text);
-        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
-        result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.logprobs = std::move(concrete.logprobs);
-        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
-        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
-        result.metrics.reused_prompt_tokens =
-            concrete.metrics.reused_prompt_tokens;
-        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
-        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
-        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
-        result.metrics.incremental_kv_continuation =
-            concrete.metrics.incremental_kv_continuation;
-        result.errors = std::move(concrete.errors);
-        result.stopped = concrete.stopped;
-        return result;
-    }
-    if (auto* runtime = std::get_if<DeepSeekV4Runtime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_chat_stream(
-            messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
-        result.text = std::move(concrete.text);
-        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
-        result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.logprobs = std::move(concrete.logprobs);
-        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
-        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
-        result.metrics.reused_prompt_tokens =
-            concrete.metrics.reused_prompt_tokens;
-        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
-        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
-        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
-        result.metrics.incremental_kv_continuation =
-            concrete.metrics.incremental_kv_continuation;
-        result.errors = std::move(concrete.errors);
-        result.stopped = concrete.stopped;
-        return result;
-    }
-    if (auto* runtime = std::get_if<InklingRuntime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_chat_stream(
-            messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
-        result.text = std::move(concrete.text);
-        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
-        result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.logprobs = std::move(concrete.logprobs);
-        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
-        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
-        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
-        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
-        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
-        result.errors = std::move(concrete.errors);
-        result.stopped = concrete.stopped;
-        return result;
-    }
-    if (auto* runtime = std::get_if<KimiK3Runtime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_chat_stream(
-            messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
-        result.text = std::move(concrete.text);
-        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
-        result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.logprobs = std::move(concrete.logprobs);
-        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
-        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
-        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
-        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
-        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
-        result.errors = std::move(concrete.errors);
-        result.stopped = concrete.stopped;
-        return result;
-    }
-    if (auto* runtime = std::get_if<LagunaRuntime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_chat_stream(
-            messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
-        result.text = std::move(concrete.text);
-        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
-        result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.logprobs = std::move(concrete.logprobs);
-        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
-        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
-        result.metrics.reused_prompt_tokens =
-            concrete.metrics.reused_prompt_tokens;
-        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
-        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
-        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
-        result.metrics.incremental_kv_continuation =
-            concrete.metrics.incremental_kv_continuation;
-        result.errors = std::move(concrete.errors);
-        result.stopped = concrete.stopped;
-        return result;
-    }
-    if (auto* runtime = std::get_if<Gemma4Runtime>(&impl_->runtime)) {
-        auto concrete = runtime->generate_chat_stream(
-            messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
-        result.text = std::move(concrete.text);
-        result.prompt_token_ids = std::move(concrete.prompt_token_ids);
-        result.generated_token_ids = std::move(concrete.generated_token_ids);
-        result.logprobs = std::move(concrete.logprobs);
-        result.metrics.prompt_tokens = concrete.metrics.prompt_tokens;
-        result.metrics.prefill_tokens = concrete.metrics.prefill_tokens;
-        result.metrics.reused_prompt_tokens =
-            concrete.metrics.reused_prompt_tokens;
-        result.metrics.decode_tokens = concrete.metrics.decode_tokens;
-        result.metrics.prefill_seconds = concrete.metrics.prefill_seconds;
-        result.metrics.decode_seconds = concrete.metrics.decode_seconds;
-        result.metrics.incremental_kv_continuation =
-            concrete.metrics.incremental_kv_continuation;
-        result.errors = std::move(concrete.errors);
-        result.stopped = concrete.stopped;
-        return result;
-    }
-    result.errors.emplace_back("runtime session is not initialized");
-    return result;
+    return impl_->executor->generate_chat_stream(messages, options, on_token);
 }
 
 }  // namespace strata

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "strata/attention.hpp"
-#include "strata/model.hpp"
+#include "strata/result.hpp"
 #include "strata/safetensors.hpp"
 
 #include <cstddef>

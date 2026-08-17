@@ -54,6 +54,7 @@ endif()
 # five PUBLICly through the chain.
 
 add_library(strata_platform STATIC
+    src/attention.cpp
     src/checkpoint.cpp
     src/checkpoint_io.cpp
     src/compressed_tensors.cpp
@@ -89,15 +90,13 @@ endif()
 add_library(strata_kernels STATIC
     kernels/cpu/q4_reference.cpp
     kernels/cpu/glm_int4.cpp
-    kernels/cpu/dsv4_fp4_expert.cpp
+    kernels/cpu/attention_reference.cpp
 )
 target_include_directories(strata_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_kernels PUBLIC strata_device)
 
 add_library(strata_engine STATIC
-    src/attention.cpp
     src/chat_protocol.cpp
-    src/openai_protocol.cpp
     src/placement.cpp
     src/placement_cache.cpp
     src/placement_model.cpp
@@ -146,12 +145,14 @@ add_library(strata_models STATIC
     src/deepseek_admission.cpp
     src/deepseek_runtime.cpp
     src/model.cpp
+    kernels/cpu/dsv4_fp4_expert.cpp
 )
 target_include_directories(strata_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_models PUBLIC strata_engine)
 
 add_library(strata_app STATIC
     src/runtime.cpp
+    src/openai_protocol.cpp
 )
 target_include_directories(strata_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_app PUBLIC strata_models)

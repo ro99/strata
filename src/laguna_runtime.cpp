@@ -2,6 +2,7 @@
 
 #include "cuda_stats_delta.hpp"
 
+#include "strata/attention_reference.hpp"
 #include "strata/laguna_checkpoint.hpp"
 #include "strata/laguna_ops.hpp"
 #include "strata/model.hpp"

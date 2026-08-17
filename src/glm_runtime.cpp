@@ -2,6 +2,7 @@
 
 #include "cuda_stats_delta.hpp"
 
+#include "strata/attention_reference.hpp"
 #include "strata/glm_ops.hpp"
 #include "strata/glm_int4.hpp"
 #include "strata/model_adapter.hpp"

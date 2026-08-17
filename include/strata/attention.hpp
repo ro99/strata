@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strata/model.hpp"
+#include "strata/result.hpp"
 
 #include <cstdint>
 #include <span>
@@ -69,9 +69,18 @@ struct FlashAttentionShape {
 [[nodiscard]] ParseResult<FlashAttentionShape> validate_flash_attention_request(
     const FlashAttentionRequest& request, std::span<float> output);
 
-// Scalar oracle for the request's declared numerical contract. Architecture
-// adapters own any BF16 rounding boundaries before and after this operation.
-[[nodiscard]] ValidationResult flash_attention_reference_f32(
-    const FlashAttentionRequest& request, std::span<float> output);
+// One segment's shape, resolved and bounds-checked against the request. Not
+// part of the public contract's vocabulary -- exposed (rather than kept
+// anonymous-namespace-private, as it was before the CPU reference moved to
+// its own translation unit in strata_kernels) purely so
+// flash_attention_reference_f32 can reuse the same validated shape instead of
+// re-deriving it.
+struct SegmentShape {
+    std::uint64_t source_rows{};
+    std::uint64_t logical_rows{};
+};
+
+[[nodiscard]] ParseResult<SegmentShape> segment_shape(
+    const FlashAttentionRequest& request, const FlashAttentionSegment& segment);
 
 }  // namespace strata

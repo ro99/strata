@@ -1,6 +1,7 @@
 #include "strata/gemma4_runtime.hpp"
 
 #include "strata/attention.hpp"
+#include "strata/attention_reference.hpp"
 #include "strata/cuda_backend.hpp"
 #include "strata/gemma4_checkpoint.hpp"
 #include "strata/gemma4_image.hpp"

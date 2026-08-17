@@ -169,6 +169,15 @@ struct Gemma4Runtime::Impl {
             diagnostics.layer_hashes.reserve(
                 static_cast<std::size_t>(config.maximum_context_tokens) *
                 c.layer_count);
+            diagnostics.operation_hash_trace_hash = diagnostic_hash_u32(
+                kDiagnosticFnvOffset, c.layer_count);
+            // Four operation-hash records per layer-hash record with today's
+            // wiring (attention_local/global, attention_residual, mlp,
+            // mlp_residual) -- see the comment on DiagnosticTrace's
+            // operation_hashes field.
+            diagnostics.operation_hashes.reserve(
+                4U * static_cast<std::size_t>(config.maximum_context_tokens) *
+                c.layer_count);
         }
     }
 
@@ -190,6 +199,16 @@ struct Gemma4Runtime::Impl {
         const auto hash = stable_bf16_hash(values);
         diagnostics.operation_hashes.push_back(
             {position, token, layer, std::string(operation), hash});
+        auto aggregate = diagnostics.operation_hash_trace_hash;
+        aggregate = diagnostic_hash_u32(aggregate, position);
+        aggregate = diagnostic_hash_u32(aggregate, token);
+        aggregate = diagnostic_hash_u32(aggregate, layer);
+        for (const char ch : operation) {
+            aggregate = diagnostic_hash_byte(
+                aggregate, static_cast<std::uint8_t>(ch));
+        }
+        diagnostics.operation_hash_trace_hash =
+            diagnostic_hash_u64(aggregate, hash);
     }
 
     ValidationResult linear(const Linear& weight, std::span<const float> input,
@@ -916,7 +935,7 @@ struct Gemma4Runtime::Impl {
                                     std::uint32_t rows,
                                     std::uint32_t position_base,
                                     std::span<const std::int32_t> multimodal_groups,
-                                    std::span<const std::uint32_t> tokens = {}) {
+                                    std::span<const std::uint32_t> tokens) {
         if (rows == 1U && device_kv_ready && multimodal_groups.empty()) {
             return forward_decode_layers(hidden, position_base);
         }

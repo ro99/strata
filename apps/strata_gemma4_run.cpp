@@ -4,6 +4,7 @@
 // not expose architecture-specific diagnostics (see runtime.hpp). This binary
 // talks to Gemma4Runtime directly so --layer-hash-trace has somewhere to go.
 
+#include "strata/diagnostics_json.hpp"
 #include "strata/gemma4_runtime.hpp"
 
 #include "cli_common.hpp"
@@ -12,7 +13,6 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -107,49 +107,13 @@ bool parse_options(int argc, char** argv, Options& options) {
     return !options.model.empty();
 }
 
-std::string hex_u64(std::uint64_t value) {
-    std::ostringstream output;
-    output << std::hex << std::setfill('0') << std::setw(16) << value;
-    return output.str();
-}
-
 void print_diagnostics(std::ostream& output,
                        const strata::DiagnosticTrace& diagnostics) {
     output << "{\"hash_algorithm\":\"fnv1a64-little-endian\""
-           << ",\"layer_hidden_hashes\":{\"enabled\":"
-           << (diagnostics.layer_hash_trace_enabled ? "true" : "false");
+           << ",\"layer_hidden_hashes\":";
+    strata::print_layer_hidden_hashes_object(output, diagnostics);
     if (diagnostics.layer_hash_trace_enabled) {
-        output << ",\"aggregate\":{\"entry_count\":"
-               << diagnostics.layer_hashes.size()
-               << ",\"trace_hash\":\""
-               << hex_u64(diagnostics.layer_hash_trace_hash)
-               << "\"},\"entries\":[";
-        for (std::size_t index = 0U; index < diagnostics.layer_hashes.size(); ++index) {
-            const auto& record = diagnostics.layer_hashes[index];
-            if (index != 0U) output << ',';
-            output << "{\"position\":" << record.position
-                   << ",\"input_token\":" << record.input_token
-                   << ",\"layer\":" << record.layer
-                   << ",\"bf16_hash\":\"" << hex_u64(record.bf16_hash)
-                   << "\"}";
-        }
-        output << ']';
-    }
-    output << '}';
-    if (diagnostics.layer_hash_trace_enabled) {
-        output << ",\"operation_hashes\":[";
-        for (std::size_t index = 0U; index < diagnostics.operation_hashes.size();
-             ++index) {
-            const auto& record = diagnostics.operation_hashes[index];
-            if (index != 0U) output << ',';
-            output << "{\"position\":" << record.position
-                   << ",\"input_token\":" << record.input_token
-                   << ",\"layer\":" << record.layer
-                   << ",\"operation\":\"" << record.operation << '"'
-                   << ",\"bf16_hash\":\"" << hex_u64(record.bf16_hash)
-                   << "\"}";
-        }
-        output << ']';
+        strata::print_operation_hashes_fields(output, diagnostics);
     }
     output << '}';
 }
@@ -206,7 +170,7 @@ int main(int argc, char** argv) {
                   << (generated.diagnostics.layer_hash_trace_enabled
                           ? std::to_string(generated.diagnostics.layer_hashes.size()) +
                                 " entries, trace_hash=" +
-                                hex_u64(generated.diagnostics.layer_hash_trace_hash)
+                                strata::hex_u64(generated.diagnostics.layer_hash_trace_hash)
                           : "disabled")
                   << '\n';
     }

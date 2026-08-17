@@ -58,6 +58,7 @@ add_library(strata_platform STATIC
     src/checkpoint_io.cpp
     src/compressed_tensors.cpp
     src/diagnostics.cpp
+    src/diagnostics_json.cpp
     src/json_cursor.cpp
     src/numa_topology.cpp
     src/numerics.cpp
@@ -456,6 +457,21 @@ if(BUILD_TESTING)
             --lease 8
             --json
     )
+    # Phase 0's equivalence oracle (brief 05, F2): re-runs the committed
+    # Gemma 4 layer-hash fixture and diffs it against a fresh
+    # strata-gemma4-run --layer-hash-trace capture. Before this test existed,
+    # tests/fixtures/gemma4/layer-hash-trace.json was referenced by nothing
+    # outside its own README -- re-verification was a human typing a diff by
+    # hand, and nothing failed if it never happened. Guarded on the pinned
+    # checkpoint's presence, same as every other real-checkpoint test in this
+    # suite; SKIP_RETURN_CODE makes ctest report an absent checkpoint as
+    # skipped, not passed.
+    add_test(
+        NAME strata-equivalence-gemma4
+        COMMAND ${CMAKE_COMMAND} -E env python3
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_equivalence.py
+    )
+    set_tests_properties(strata-equivalence-gemma4 PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-gemma4-run strata-chat strata-server

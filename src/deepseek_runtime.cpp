@@ -2309,6 +2309,8 @@ void DeepSeekV4Runtime::Impl::reset_diagnostics() {
             kDiagnosticFnvOffset, kLayers);
         diagnostics.layer_hashes.reserve(
             static_cast<std::size_t>(config.maximum_context_tokens) * kLayers);
+        diagnostics.operation_hash_trace_hash = diagnostic_hash_u32(
+            kDiagnosticFnvOffset, kLayers);
     }
 }
 
@@ -2331,6 +2333,14 @@ void DeepSeekV4Runtime::Impl::record_operation_hash(
     const auto hash = stable_bf16_hash(values);
     diagnostics.operation_hashes.push_back(
         {position, token, layer, std::string(operation), hash});
+    auto aggregate = diagnostics.operation_hash_trace_hash;
+    aggregate = diagnostic_hash_u32(aggregate, position);
+    aggregate = diagnostic_hash_u32(aggregate, token);
+    aggregate = diagnostic_hash_u32(aggregate, layer);
+    for (const char ch : operation) {
+        aggregate = diagnostic_hash_byte(aggregate, static_cast<std::uint8_t>(ch));
+    }
+    diagnostics.operation_hash_trace_hash = diagnostic_hash_u64(aggregate, hash);
 }
 
 void DeepSeekV4Runtime::Impl::record_logits(

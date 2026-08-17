@@ -102,6 +102,14 @@ struct DiagnosticTrace {
     std::vector<LogitTraceRecord> logits;
     std::uint64_t layer_hash_trace_hash{};
     std::vector<LayerHashTraceRecord> layer_hashes;
+    // Mirrors layer_hash_trace_hash: a rolling aggregate over every recorded
+    // operation, so a caller can compare one hash instead of serializing the
+    // whole list. operation_hashes has no per-model bound on entry count the
+    // way layer_hashes does (layers x positions) -- it can be several times
+    // larger (four per layer for Gemma 4's current wiring) -- which is
+    // exactly why an aggregate matters here: the full list is still recorded
+    // for localisation, but routine comparison need not serialize it.
+    std::uint64_t operation_hash_trace_hash{};
     std::vector<OperationHashTraceRecord> operation_hashes;
     std::uint64_t index_selection_count{};
     std::uint64_t index_selection_trace_hash{};

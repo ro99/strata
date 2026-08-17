@@ -313,3 +313,57 @@ authorization to run remediation → Phase 2 → Phase 3 continuously.
    `runtime.cpp`'s two switches); worth the same treatment when a seventh
    model is actually added.
 2. F8 (bf16-vs-f32 hash sensitivity) — deferred to Phase 5, see Phase 0.
+
+---
+
+## Phase 2 — facade defects (B5/B6/B7)
+
+Fixed. `RuntimeConfig` → concrete-config copying was hand-written per model and
+dropped fields silently.
+
+- **B5** Inkling's arm never assigned `devices` or `vram_cache_fraction`, so
+  `--devices 0` was accepted and discarded against a `{0,1,2}` default. Kimi is
+  *not* the same defect: its config has no such fields at all and takes device
+  information from the shared placement plan. Whether it honours that restriction
+  is open, and is not a missing-assignment bug.
+- **B6** was a schema defect, not an omission: neither Inkling nor Kimi *has*
+  `reused_prompt_tokens` / `incremental_kv_continuation`, because neither
+  implements incremental prefix reuse. `0`/`false` was indistinguishable from a
+  measured zero. Now `std::optional` on both, so "not applicable" is representable.
+- **B7** `initialize` was an if-chain with an unconditional trailing DeepSeek arm.
+  `runtime_model_name()` is now the single admission point: no default label, so
+  `-Werror=switch` (scoped to `src/app/runtime.cpp` alone) makes a seventh
+  enumerator a build failure; an out-of-enum value returns nullptr and is rejected
+  before any placement or checkpoint access.
+
+`-Werror` is **not** set globally in this build, so `-Wswitch` alone would have
+been a warning — and a warning is not a gate here: `deepseek_runtime.cpp:4185`
+carried one across every build of this session. The scoped `-Werror=switch` is what
+delivers the guarantee. Note also that a compile check catches a *missing* case,
+never a *wrong* one; the runtime test covers that half.
+
+## Phase 3 — file moves
+
+`src/` was 63 files in one flat directory. Now `src/platform` (11), `src/engine`
+(10), `src/app` (2), `src/models/{dsv4,glm52,gemma4,kimi_k3,laguna,inkling,common}`.
+
+Pure `git mv`. **A file move cannot alter numerics if its bytes are unchanged, so
+this phase needs no numerical oracle** — the gate is `git diff -M` showing renames
+rather than rewrites, plus a green build. That is cheaper and stricter than the
+equivalence run originally planned for it.
+
+Public headers stay flat under `include/strata/`. Moving them would rewrite the
+include line of nearly every file for no enforcement gain: the tier is expressed by
+the build target and checked by `check-layers` / `check-symbols`, not by header path.
+
+Every `layer_exceptions.py` entry went stale on the moves and the stale check caught
+all of them — the mechanism working as designed, on its first real test.
+
+## Process note
+
+Phases 0–1 cost 1,241 lines of code against 810 lines of experiment record, across
+six brief/report round trips, two of which produced no code. The
+performance-research protocol was imported wholesale onto a refactor, where a wrong
+step costs `git revert` rather than four hours of GPU. Phases 2–3 were executed
+directly, with one build and one test run at the end, and are recorded in this
+section rather than in a document of their own.

@@ -99,7 +99,6 @@ add_library(strata_engine STATIC
     src/engine/chat_protocol.cpp
     src/engine/placement.cpp
     src/engine/placement_cache.cpp
-    src/engine/placement_model.cpp
     src/engine/model_registry.cpp
     src/engine/residency.cpp
     src/engine/route_predictor.cpp
@@ -152,6 +151,7 @@ add_library(strata_models STATIC
     src/models/dsv4/deepseek_admission.cpp
     src/models/dsv4/deepseek_runtime.cpp
     src/models/common/model.cpp
+    src/models/common/placement_model.cpp
     src/models/glm52/checkpoint.cpp
     kernels/cpu/dsv4_fp4_expert.cpp
 )

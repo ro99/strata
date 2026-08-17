@@ -998,57 +998,11 @@ struct OpenCheckpoints {
 
 }  // namespace
 
-ParseResult<std::string> probe_model_identity(const std::string& model_directory) {
-    ParseResult<std::string> result;
-    std::error_code code;
-    std::vector<std::string> entries;
-    for (const auto& entry :
-         std::filesystem::directory_iterator(model_directory, code)) {
-        if (code) break;
-        if (!entry.is_regular_file(code) || code) continue;
-        const auto name = entry.path().filename().string();
-        if (name.size() < 12U ||
-            name.compare(name.size() - 12U, 12U, ".safetensors") != 0) {
-            continue;
-        }
-        const auto size = entry.file_size(code);
-        if (code) break;
-        const auto written = std::filesystem::last_write_time(entry, code);
-        if (code) break;
-        entries.push_back(
-            name + ':' + std::to_string(size) + ':' +
-            std::to_string(written.time_since_epoch().count()));
-    }
-    if (code) {
-        result.errors.push_back("cannot inspect checkpoint directory " +
-                                model_directory + ": " + code.message());
-        return result;
-    }
-    if (entries.empty()) {
-        result.errors.push_back("no safetensors shards found in " + model_directory);
-        return result;
-    }
-    std::sort(entries.begin(), entries.end());
-    constexpr std::uint64_t offset = 1469598103934665603ULL;
-    constexpr std::uint64_t prime = 1099511628211ULL;
-    std::uint64_t hash = offset;
-    for (const auto& entry : entries) {
-        for (const unsigned char byte : entry) {
-            hash ^= byte;
-            hash *= prime;
-        }
-        hash ^= '\n';
-        hash *= prime;
-    }
-    std::array<char, 24> text{};
-    std::snprintf(text.data(), text.size(), "%016llx",
-                  static_cast<unsigned long long>(hash));
-    result.value = text.data();
-    return result;
-}
 
-PlacementPlanResult plan_model_placement(const PlacementRequest& request,
-                                         const PlacementHardware& hardware) {
+namespace {
+
+PlacementPlanResult plan_model_placement_impl(const PlacementRequest& request,
+                                              const PlacementHardware& hardware) {
     PlacementPlanResult result;
     const auto ceiling = model_context_ceiling(request.model);
     if (request.maximum_context_tokens == 0U ||
@@ -1170,5 +1124,10 @@ PlacementPlanResult plan_model_placement(const PlacementRequest& request,
     }
     return result;
 }
+
+
+const PlacementPlannerRegistrar planner_registrar{&plan_model_placement_impl};
+
+}  // namespace
 
 }  // namespace strata

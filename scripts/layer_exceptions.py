@@ -59,49 +59,6 @@ EXCEPTIONS = [
         ],
     },
     {
-        "name": "placement-model-inventory-registry",
-        "reason": (
-            "placement_model.cpp's six build_<model>_inventory functions "
-            "(~72% of the file) belong with each model, not inlined in an "
-            "engine-tier dispatcher. The solver itself (plan_model_placement) "
-            "is already close to a pure function of inventory plus hardware "
-            "-- PlacementInventory is the right shape -- but extracting the "
-            "builders cleanly needs build_inventory's dispatch to become a "
-            "registry each model populates, which is a design decision, not "
-            "a mechanical split. Phase 4 is when each model's own code is "
-            "already open for the oracle fan-out; the registry gets designed "
-            "once, with all six builders in view, instead of once now for "
-            "two models and stretched to fit four more later.\n\n"
-            "This is materially bigger than an include-lint entry (brief 05, "
-            "F1): placement_model.cpp.o carries 24 undefined symbols "
-            "(GlmCheckpointReader::open, Dsv4CheckpointReader::open, "
-            "Gemma4CheckpointReader::find, InklingCheckpointReader::*, "
-            "KimiCheckpointReader::open, the six *_spec() functions) that "
-            "only strata_models defines -- a real link-graph cycle, not "
-            "just a declared-but-unused include. It builds today only "
-            "because every executable links through the strata_core "
-            "INTERFACE alias, which puts every archive on one link line "
-            "regardless of declared per-target order and lets GNU ld's "
-            "single-pass resolution absorb the upward reference silently -- "
-            "the identical mechanism docs/experiments/0121 names for Cause "
-            "B and calls luck, not correctness, still present one tier up. "
-            "This exception forgives that link cycle explicitly, not just "
-            "the includes that announce it."
-        ),
-        "expiry_phase": 4,
-        "matches": [
-            ("src/engine/placement_model.cpp", "checkpoint.hpp"),
-            ("src/engine/placement_model.cpp", "deepseek_admission.hpp"),
-            ("src/engine/placement_model.cpp", "deepseek_checkpoint.hpp"),
-            ("src/engine/placement_model.cpp", "gemma4_checkpoint.hpp"),
-            ("src/engine/placement_model.cpp", "kimi_k3_checkpoint.hpp"),
-            ("src/engine/placement_model.cpp", "inkling_checkpoint.hpp"),
-            ("src/engine/placement_model.cpp", "laguna_checkpoint.hpp"),
-            ("src/engine/placement_model.cpp", "model_adapter.hpp"),
-        ],
-        "symbol_objects": ["placement_model.cpp.o"],
-    },
-    {
         "name": "tokenizer-pretokenizer-split",
         "reason": (
             "tokenizer.cpp inlines two models' generated Unicode category "

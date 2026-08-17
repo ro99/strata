@@ -1,6 +1,6 @@
 #include "strata/openai_protocol.hpp"
 
-#include "json_cursor.hpp"
+#include "../platform/json_cursor.hpp"
 
 #include <algorithm>
 #include <array>

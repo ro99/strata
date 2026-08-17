@@ -1,6 +1,6 @@
 #include "strata/kimi_k3_manifest.hpp"
 
-#include "json_cursor.hpp"
+#include "../../platform/json_cursor.hpp"
 
 #include "strata/model_adapter.hpp"
 

@@ -11,7 +11,7 @@
 // letters satisfies either alternative, which is what keeps CJK and Devanagari
 // from being split character by character.
 
-#include "laguna_unicode.hpp"
+#include "../laguna/laguna_unicode.hpp"
 
 #include <array>
 #include <cstdint>

@@ -1,6 +1,6 @@
 #include "strata/gemma4_checkpoint.hpp"
 
-#include "checkpoint_common.hpp"
+#include "../common/checkpoint_common.hpp"
 
 #include "strata/compressed_tensors.hpp"
 #include "strata/model.hpp"

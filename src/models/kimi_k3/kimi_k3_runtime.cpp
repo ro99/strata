@@ -1,6 +1,6 @@
 #include "strata/kimi_k3_runtime.hpp"
 
-#include "json_cursor.hpp"
+#include "../../platform/json_cursor.hpp"
 
 #include "strata/kimi_k3_checkpoint.hpp"
 #include "strata/kimi_k3_kv_cache.hpp"

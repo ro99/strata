@@ -1,6 +1,6 @@
 #include "strata/placement.hpp"
 
-#include "json_cursor.hpp"
+#include "../platform/json_cursor.hpp"
 
 #include <array>
 #include <cstdio>

@@ -1,6 +1,6 @@
 #include "strata/chat_protocol.hpp"
 
-#include "json_cursor.hpp"
+#include "../platform/json_cursor.hpp"
 
 #include <exception>
 #include <string>

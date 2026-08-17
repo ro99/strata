@@ -1,6 +1,6 @@
 #include "strata/glm_runtime.hpp"
 
-#include "cuda_stats_delta.hpp"
+#include "../common/cuda_stats_delta.hpp"
 
 #include "strata/attention_reference.hpp"
 #include "strata/glm_ops.hpp"

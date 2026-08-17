@@ -1,6 +1,6 @@
 #include "strata/deepseek_checkpoint.hpp"
 
-#include "checkpoint_common.hpp"
+#include "../common/checkpoint_common.hpp"
 
 #include "strata/deepseek_host_expert.hpp"
 #include "strata/deepseek_ops.hpp"

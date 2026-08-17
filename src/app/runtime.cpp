@@ -28,6 +28,27 @@ struct RuntimeSession::Impl {
 
 namespace {
 
+// Names a declared model, or nullptr for a value that is not an enumerator.
+//
+// This is the single admission point for RuntimeModel and it carries two
+// separate guarantees. At compile time there is no default label, so
+// -Werror=switch (scoped to this file in CMakeLists.txt) turns a seventh
+// enumerator into a build failure right here. At run time a value outside the
+// enum -- legal for a scoped enum with an explicit underlying type -- returns
+// nullptr, so initialize can reject it instead of falling through to whichever
+// runtime happens to be written last.
+[[nodiscard]] const char* runtime_model_name(RuntimeModel model) noexcept {
+    switch (model) {
+        case RuntimeModel::Glm52: return "GLM-5.2";
+        case RuntimeModel::DeepSeekV4: return "DeepSeek-V4";
+        case RuntimeModel::Gemma4: return "Gemma 4";
+        case RuntimeModel::KimiK3: return "Kimi-K3";
+        case RuntimeModel::Laguna: return "Laguna";
+        case RuntimeModel::Inkling: return "Inkling";
+    }
+    return nullptr;
+}
+
 [[nodiscard]] PlacementModel placement_model(RuntimeModel model) noexcept {
     switch (model) {
         case RuntimeModel::Glm52: return PlacementModel::Glm52;
@@ -37,6 +58,8 @@ namespace {
         case RuntimeModel::Inkling: return PlacementModel::Inkling;
         case RuntimeModel::KimiK3: return PlacementModel::KimiK3;
     }
+    // Unreachable: initialize rejects an undeclared model before anything
+    // reaches this, and -Werror=switch covers the missing-enumerator case.
     return PlacementModel::Gemma4;
 }
 
@@ -86,6 +109,16 @@ ValidationResult RuntimeSession::initialize(
     ValidationResult result;
     if (!std::holds_alternative<std::monostate>(impl_->runtime)) {
         result.errors.emplace_back("runtime session is already initialized");
+        return result;
+    }
+    // Reject before any placement work or checkpoint access. The dispatch
+    // below is an if-chain whose last arm is unconditional, so without this an
+    // undeclared model would be constructed as DeepSeek against whatever
+    // directory was supplied and report initialization success.
+    if (runtime_model_name(config.model) == nullptr) {
+        result.errors.emplace_back(
+            "unhandled runtime model: " +
+            std::to_string(static_cast<unsigned>(config.model)));
         return result;
     }
     impl_->sampling = config.sampling;

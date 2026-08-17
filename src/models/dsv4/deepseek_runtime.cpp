@@ -1,6 +1,6 @@
 #include "strata/deepseek_runtime.hpp"
 
-#include "cuda_stats_delta.hpp"
+#include "../common/cuda_stats_delta.hpp"
 
 #include "strata/deepseek_ops.hpp"
 #include "strata/deepseek_host_expert.hpp"

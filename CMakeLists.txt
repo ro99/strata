@@ -35,7 +35,7 @@ if(STRATA_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     set(STRATA_CUDA_SOURCE kernels/cuda/backend.cu)
     set(STRATA_HAS_CUDA ON)
 else()
-    set(STRATA_CUDA_SOURCE src/cuda_backend_stub.cpp)
+    set(STRATA_CUDA_SOURCE src/platform/cuda_backend_stub.cpp)
     set(STRATA_HAS_CUDA OFF)
 endif()
 
@@ -54,17 +54,17 @@ endif()
 # five PUBLICly through the chain.
 
 add_library(strata_platform STATIC
-    src/attention.cpp
-    src/checkpoint_io.cpp
-    src/compressed_tensors.cpp
-    src/diagnostics.cpp
-    src/diagnostics_json.cpp
-    src/json_cursor.cpp
-    src/numa_topology.cpp
-    src/numerics.cpp
-    src/safetensors.cpp
-    src/trace.cpp
-    src/worker_pool.cpp
+    src/platform/attention.cpp
+    src/platform/checkpoint_io.cpp
+    src/platform/compressed_tensors.cpp
+    src/platform/diagnostics.cpp
+    src/platform/diagnostics_json.cpp
+    src/platform/json_cursor.cpp
+    src/platform/numa_topology.cpp
+    src/platform/numerics.cpp
+    src/platform/safetensors.cpp
+    src/platform/trace.cpp
+    src/platform/worker_pool.cpp
 )
 target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(strata_platform PUBLIC STRATA_VERSION="${PROJECT_VERSION}")
@@ -96,64 +96,64 @@ target_include_directories(strata_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inc
 target_link_libraries(strata_kernels PUBLIC strata_device)
 
 add_library(strata_engine STATIC
-    src/chat_protocol.cpp
-    src/placement.cpp
-    src/placement_cache.cpp
-    src/placement_model.cpp
-    src/residency.cpp
-    src/route_predictor.cpp
-    src/runtime_support.cpp
-    src/sampling.cpp
-    src/simulator.cpp
-    src/tokenizer.cpp
+    src/engine/chat_protocol.cpp
+    src/engine/placement.cpp
+    src/engine/placement_cache.cpp
+    src/engine/placement_model.cpp
+    src/engine/residency.cpp
+    src/engine/route_predictor.cpp
+    src/engine/runtime_support.cpp
+    src/engine/sampling.cpp
+    src/engine/simulator.cpp
+    src/engine/tokenizer.cpp
 )
 target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_engine PUBLIC strata_kernels)
 
 add_library(strata_models STATIC
-    src/glm_ops.cpp
-    src/gemma4_ops.cpp
-    src/gemma4_checkpoint.cpp
-    src/gemma4_image.cpp
-    src/gemma4_runtime.cpp
-    src/glm_runtime.cpp
-    src/glm_manifest.cpp
-    src/kimi_k3_ops.cpp
-    src/kimi_k3_manifest.cpp
-    src/kimi_k3_checkpoint.cpp
-    src/kimi_k3_kv_cache.cpp
-    src/kimi_k3_expert_arena.cpp
-    src/kimi_k3_layer.cpp
-    src/kimi_k3_runtime.cpp
-    src/laguna_ops.cpp
-    src/laguna_checkpoint.cpp
-    src/laguna_runtime.cpp
-    src/inkling_ops.cpp
-    src/inkling_checkpoint.cpp
-    src/inkling_device.cpp
-    src/inkling_runtime.cpp
-    src/deepseek_manifest.cpp
-    src/deepseek_kv_cache.cpp
-    src/dsv4_attention_kv.cpp
-    src/deepseek_ops.cpp
-    src/deepseek_checkpoint.cpp
-    src/deepseek_rank_shard.cpp
-    src/dsv4_host_moe_executor.cpp
-    src/dsv4_rank_local_topology.cpp
-    src/dsv4_rank_local_kv.cpp
-    src/dsv4_rank_local_weights.cpp
-    src/deepseek_admission.cpp
-    src/deepseek_runtime.cpp
-    src/model.cpp
-    src/checkpoint.cpp
+    src/models/glm52/glm_ops.cpp
+    src/models/gemma4/gemma4_ops.cpp
+    src/models/gemma4/gemma4_checkpoint.cpp
+    src/models/gemma4/gemma4_image.cpp
+    src/models/gemma4/gemma4_runtime.cpp
+    src/models/glm52/glm_runtime.cpp
+    src/models/glm52/glm_manifest.cpp
+    src/models/kimi_k3/kimi_k3_ops.cpp
+    src/models/kimi_k3/kimi_k3_manifest.cpp
+    src/models/kimi_k3/kimi_k3_checkpoint.cpp
+    src/models/kimi_k3/kimi_k3_kv_cache.cpp
+    src/models/kimi_k3/kimi_k3_expert_arena.cpp
+    src/models/kimi_k3/kimi_k3_layer.cpp
+    src/models/kimi_k3/kimi_k3_runtime.cpp
+    src/models/laguna/laguna_ops.cpp
+    src/models/laguna/laguna_checkpoint.cpp
+    src/models/laguna/laguna_runtime.cpp
+    src/models/inkling/inkling_ops.cpp
+    src/models/inkling/inkling_checkpoint.cpp
+    src/models/inkling/inkling_device.cpp
+    src/models/inkling/inkling_runtime.cpp
+    src/models/dsv4/deepseek_manifest.cpp
+    src/models/dsv4/deepseek_kv_cache.cpp
+    src/models/dsv4/dsv4_attention_kv.cpp
+    src/models/dsv4/deepseek_ops.cpp
+    src/models/dsv4/deepseek_checkpoint.cpp
+    src/models/dsv4/deepseek_rank_shard.cpp
+    src/models/dsv4/dsv4_host_moe_executor.cpp
+    src/models/dsv4/dsv4_rank_local_topology.cpp
+    src/models/dsv4/dsv4_rank_local_kv.cpp
+    src/models/dsv4/dsv4_rank_local_weights.cpp
+    src/models/dsv4/deepseek_admission.cpp
+    src/models/dsv4/deepseek_runtime.cpp
+    src/models/common/model.cpp
+    src/models/glm52/checkpoint.cpp
     kernels/cpu/dsv4_fp4_expert.cpp
 )
 target_include_directories(strata_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_models PUBLIC strata_engine)
 
 add_library(strata_app STATIC
-    src/runtime.cpp
-    src/openai_protocol.cpp
+    src/app/runtime.cpp
+    src/app/openai_protocol.cpp
 )
 target_include_directories(strata_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_app PUBLIC strata_models)
@@ -162,7 +162,7 @@ target_link_libraries(strata_app PUBLIC strata_models)
 # a RuntimeModel enumerator is added without a matching case (Phase 2, B7). A
 # blanket -Werror would also turn deepseek_runtime.cpp:4185's pre-existing
 # -Wconversion warning into a build break as an unrelated side effect.
-set_source_files_properties(src/runtime.cpp PROPERTIES COMPILE_OPTIONS "-Werror=switch")
+set_source_files_properties(src/app/runtime.cpp PROPERTIES COMPILE_OPTIONS "-Werror=switch")
 
 add_library(strata_core INTERFACE)
 target_link_libraries(strata_core INTERFACE strata_app)

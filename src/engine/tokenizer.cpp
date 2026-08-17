@@ -1,8 +1,8 @@
 #include "strata/tokenizer.hpp"
 
-#include "json_cursor.hpp"
-#include "inkling_unicode.hpp"
-#include "laguna_unicode.hpp"
+#include "../platform/json_cursor.hpp"
+#include "../models/inkling/inkling_unicode.hpp"
+#include "../models/laguna/laguna_unicode.hpp"
 
 #include <algorithm>
 #include <cctype>

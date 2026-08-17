@@ -1,6 +1,6 @@
 #include "strata/checkpoint.hpp"
 
-#include "checkpoint_common.hpp"
+#include "../common/checkpoint_common.hpp"
 
 #include <bit>
 #include <cerrno>

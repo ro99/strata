@@ -1,6 +1,6 @@
 #include "strata/inkling_checkpoint.hpp"
 
-#include "checkpoint_common.hpp"
+#include "../common/checkpoint_common.hpp"
 
 #include "strata/model.hpp"
 #include "strata/model_adapter.hpp"

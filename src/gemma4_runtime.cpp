@@ -43,36 +43,6 @@ float decode_bf16(std::uint16_t value) noexcept {
     return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
 }
 
-// Rolling aggregate for the layer hash trace. Mirrors DeepSeek's private
-// diagnostic_hash_* helpers (src/deepseek_runtime.cpp) so a trace_hash from
-// either model is computed the same way; the per-value BF16 hashing itself
-// is the shared strata::stable_bf16_hash from diagnostics.hpp.
-constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
-constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
-
-[[nodiscard]] std::uint64_t diagnostic_hash_byte(
-    std::uint64_t hash, std::uint8_t value) noexcept {
-    return (hash ^ value) * kDiagnosticFnvPrime;
-}
-
-[[nodiscard]] std::uint64_t diagnostic_hash_u32(
-    std::uint64_t hash, std::uint32_t value) noexcept {
-    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
-        hash = diagnostic_hash_byte(
-            hash, static_cast<std::uint8_t>(value >> shift));
-    }
-    return hash;
-}
-
-[[nodiscard]] std::uint64_t diagnostic_hash_u64(
-    std::uint64_t hash, std::uint64_t value) noexcept {
-    for (std::uint32_t shift = 0U; shift < 64U; shift += 8U) {
-        hash = diagnostic_hash_byte(
-            hash, static_cast<std::uint8_t>(value >> shift));
-    }
-    return hash;
-}
-
 std::uint64_t linear_bytes(const Gemma4CheckpointReader& checkpoint,
                            std::string_view base) {
     if (const auto* plain = checkpoint.find(std::string(base) + ".weight");
@@ -1019,6 +989,8 @@ struct Gemma4Runtime::Impl {
                     const auto token = row < tokens.size() ? tokens[row] : 0U;
                     const auto hidden_row = std::span<const float>(hidden)
                         .subspan(row * c.hidden_size, c.hidden_size);
+                    record_operation_hash(position, token, layer,
+                                         "mlp_residual", hidden_row);
                     record_layer_hash(position, token, layer, hidden_row);
                 }
             }

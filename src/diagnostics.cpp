@@ -11,26 +11,10 @@ namespace strata {
 
 namespace {
 
-constexpr std::uint64_t kFnvOffset = 14'695'981'039'346'656'037ULL;
-constexpr std::uint64_t kFnvPrime = 1'099'511'628'211ULL;
-
-[[nodiscard]] std::uint64_t hash_byte(std::uint64_t hash,
-                                      std::uint8_t value) noexcept {
-    return (hash ^ value) * kFnvPrime;
-}
-
 [[nodiscard]] std::uint64_t hash_u16(std::uint64_t hash,
                                      std::uint16_t value) noexcept {
-    hash = hash_byte(hash, static_cast<std::uint8_t>(value & 0xFFU));
-    return hash_byte(hash, static_cast<std::uint8_t>(value >> 8U));
-}
-
-[[nodiscard]] std::uint64_t hash_u32(std::uint64_t hash,
-                                     std::uint32_t value) noexcept {
-    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
-        hash = hash_byte(hash, static_cast<std::uint8_t>(value >> shift));
-    }
-    return hash;
+    hash = diagnostic_hash_byte(hash, static_cast<std::uint8_t>(value & 0xFFU));
+    return diagnostic_hash_byte(hash, static_cast<std::uint8_t>(value >> 8U));
 }
 
 [[nodiscard]] std::uint16_t encode_bf16(float value) noexcept {
@@ -59,13 +43,13 @@ LogitAnalysis analyze_logits(std::span<const float> logits,
     LogitAnalysis result;
     auto& summary = result.summary;
     summary.value_count = logits.size();
-    summary.raw_f32_hash = kFnvOffset;
+    summary.raw_f32_hash = kDiagnosticFnvOffset;
 
     std::vector<TopLogit> candidates;
     candidates.reserve(logits.size());
     for (std::size_t index = 0U; index < logits.size(); ++index) {
         const float value = logits[index];
-        summary.raw_f32_hash = hash_u32(
+        summary.raw_f32_hash = diagnostic_hash_u32(
             summary.raw_f32_hash, std::bit_cast<std::uint32_t>(value));
         candidates.push_back(
             {static_cast<std::uint32_t>(index), value});
@@ -98,8 +82,29 @@ LogitAnalysis analyze_logits(std::span<const float> logits,
 }
 
 std::uint64_t stable_bf16_hash(std::span<const float> values) noexcept {
-    std::uint64_t hash = kFnvOffset;
+    std::uint64_t hash = kDiagnosticFnvOffset;
     for (const float value : values) hash = hash_u16(hash, encode_bf16(value));
+    return hash;
+}
+
+std::uint64_t diagnostic_hash_byte(std::uint64_t hash,
+                                   std::uint8_t value) noexcept {
+    return (hash ^ value) * kDiagnosticFnvPrime;
+}
+
+std::uint64_t diagnostic_hash_u32(std::uint64_t hash,
+                                  std::uint32_t value) noexcept {
+    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
+        hash = diagnostic_hash_byte(hash, static_cast<std::uint8_t>(value >> shift));
+    }
+    return hash;
+}
+
+std::uint64_t diagnostic_hash_u64(std::uint64_t hash,
+                                  std::uint64_t value) noexcept {
+    for (std::uint32_t shift = 0U; shift < 64U; shift += 8U) {
+        hash = diagnostic_hash_byte(hash, static_cast<std::uint8_t>(value >> shift));
+    }
     return hash;
 }
 

@@ -94,8 +94,6 @@ constexpr std::uint32_t kMaximumPrefillPageTokens = 8192U;
 constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 static_assert(kHeads == 2U * kPhysicalPagedHeads);
-constexpr std::uint64_t kDiagnosticFnvOffset = 14'695'981'039'346'656'037ULL;
-constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
 
 [[nodiscard]] std::string layer_prefix(std::uint32_t layer) {
     return "layers." + std::to_string(layer) + ".";
@@ -107,29 +105,6 @@ void append_errors(ValidationResult& result, std::vector<std::string> errors,
         if (!context.empty()) error = std::string(context) + ": " + error;
         result.errors.push_back(std::move(error));
     }
-}
-
-[[nodiscard]] std::uint64_t diagnostic_hash_byte(
-    std::uint64_t hash, std::uint8_t value) noexcept {
-    return (hash ^ value) * kDiagnosticFnvPrime;
-}
-
-[[nodiscard]] std::uint64_t diagnostic_hash_u32(
-    std::uint64_t hash, std::uint32_t value) noexcept {
-    for (std::uint32_t shift = 0U; shift < 32U; shift += 8U) {
-        hash = diagnostic_hash_byte(
-            hash, static_cast<std::uint8_t>(value >> shift));
-    }
-    return hash;
-}
-
-[[nodiscard]] std::uint64_t diagnostic_hash_u64(
-    std::uint64_t hash, std::uint64_t value) noexcept {
-    for (std::uint32_t shift = 0U; shift < 64U; shift += 8U) {
-        hash = diagnostic_hash_byte(
-            hash, static_cast<std::uint8_t>(value >> shift));
-    }
-    return hash;
 }
 
 [[nodiscard]] float round_bf16(float value) noexcept {

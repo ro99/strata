@@ -40,6 +40,23 @@ struct LogitAnalysis {
 [[nodiscard]] std::uint64_t stable_bf16_hash(
     std::span<const float> values) noexcept;
 
+// FNV-1a basis and combinators for folding discrete diagnostic fields
+// (position, token, layer, a record's own bf16_hash, ...) into a single
+// rolling trace_hash aggregate. stable_bf16_hash uses the same algorithm
+// internally for tensor values; these are the byte-at-a-time primitives a
+// model's own diagnostic wiring combines scalar metadata with, the same way
+// for every model rather than each reimplementing FNV-1a privately.
+inline constexpr std::uint64_t kDiagnosticFnvOffset =
+    14'695'981'039'346'656'037ULL;
+inline constexpr std::uint64_t kDiagnosticFnvPrime = 1'099'511'628'211ULL;
+
+[[nodiscard]] std::uint64_t diagnostic_hash_byte(
+    std::uint64_t hash, std::uint8_t value) noexcept;
+[[nodiscard]] std::uint64_t diagnostic_hash_u32(
+    std::uint64_t hash, std::uint32_t value) noexcept;
+[[nodiscard]] std::uint64_t diagnostic_hash_u64(
+    std::uint64_t hash, std::uint64_t value) noexcept;
+
 struct LogitTraceRecord {
     std::uint32_t position{};
     std::uint32_t input_token{};

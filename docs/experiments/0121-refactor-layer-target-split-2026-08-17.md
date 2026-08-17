@@ -1,6 +1,8 @@
 # 0121 — Phase 1: splitting `strata_core`, and what a 4 → 30 prediction miss means
 
-Status: **A1-A5 applied and gated green. B1-B3 proposed, not applied — awaiting decision.**
+Status: **CLOSED. Phase 1 gate green: every binary links, `make check-layers` exits clean, `make check`
+(build included) passes for the first time this phase. B1 applied. B2 and B3 deferred to phase 4 with
+recorded, self-checking lint exceptions.**
 
 ## Hypothesis
 
@@ -132,12 +134,19 @@ Three model runtimes (`gemma4_runtime.cpp`, `glm_runtime.cpp`,
 `laguna_runtime.cpp`) and two tests (`test_attention.cpp`,
 `test_cuda_backend.cpp`) called `flash_attention_reference_f32` through a
 transitive include `attention.hpp` no longer carries once the CPU reference
-moved out. Two of the three runtimes (`laguna_runtime.cpp`, `glm_runtime.cpp`)
-never included `attention.hpp` directly at all — they got the declaration only
-by accident, through `checkpoint.hpp` → `cuda_backend.hpp` → `attention.hpp`
-(the exact B1 chain). All five files now include
-`strata/attention_reference.hpp` directly instead of depending on that
-accident.
+moved out. All five files now include `strata/attention_reference.hpp`
+directly instead of depending on the accident described next.
+
+**The finding worth naming plainly:** `laguna_runtime.cpp` and
+`glm_runtime.cpp` **never included `attention.hpp` at all.** They picked up
+`flash_attention_reference_f32`'s declaration purely by accident, through
+`checkpoint.hpp` → `cuda_backend.hpp` → `attention.hpp` — the exact chain B1
+is about. Two files that use a function got away with never declaring that
+they need it, because one shared archive quietly manufactured the dependency
+for them. That is not a hypothetical risk this phase is guarding against; it
+is a dependency that already existed, undeclared, in the codebase this record
+started from. It is the entire thesis of phase 1, demonstrated by accident
+rather than argued for.
 
 ## The lint's own two defects
 
@@ -164,140 +173,155 @@ accident.
    direction check's own ownership resolution rather than re-deriving it, so
    the two checks cannot disagree about who owns what.
 
-## Gate for A1-A5
+## Intermediate gate (A1-A5, brief 02)
 
 `strata-tests`: **310/311 passed, 1 skipped, 0 failed** — line-for-line
 identical `PASS`/`SKIP` set to the pre-Phase-1 baseline (`diff` empty).
 
-`make check-layers`: reports exactly three violation groups and nothing else —
-B1 (`checkpoint.hpp`, 2 upward includes + 1 identifier hit), B2
+`make check-layers`: reported exactly three violation groups and nothing
+else — B1 (`checkpoint.hpp`, 2 upward includes + 1 identifier hit), B2
 (`placement_model.cpp`, 7 upward includes + 6 identifier hits), B3
 (`tokenizer.cpp`, 2 upward includes + 2 identifier hits) — **plus one item not
-originally on this list**: `compressed_tensors.hpp` (1 upward include + 1
-identifier hit), the corrected-classification finding above. 21 total lines
-across these four files, all expected, none silently absorbed.
+originally on the review's list**: `compressed_tensors.hpp` (1 upward include
++ 1 identifier hit), the corrected-classification finding above. 21 total
+lines across these four files, all expected, none silently absorbed.
 
-**Binaries:** links clean for `strata-tests`, `strata-gemma4-run`,
-`strata-deepseek-run`, `strata-topology-probe`, and every CPU-only probe. Does
+**Binaries:** linked clean for `strata-tests`, `strata-gemma4-run`,
+`strata-deepseek-run`, `strata-topology-probe`, and every CPU-only probe. Did
 **not** link for `strata-chat`, `strata-run`, `strata-server`, and
-`strata-host-expert-probe` — all four fail solely on B1
+`strata-host-expert-probe` — all four failed solely on B1
 (`checkpoint.cpp`'s undefined references to
-`build_glm52_w4a16_index_manifest`/`validate_glm52_w4a16_checkpoint`), which is
-explicitly not approved for this unit. The brief's stated gate text ("all
-binaries build") and its explicit instruction that "the B1-B3 files stay
-untouched" cannot both be literally satisfied simultaneously; this record
-resolves that in favor of the untouched-files instruction, since it was the
-more specific and more recent one, and reports the resulting four broken
-binaries plainly rather than silently declaring the gate met.
+`build_glm52_w4a16_index_manifest`/`validate_glm52_w4a16_checkpoint`), not
+approved for that unit. The brief's stated gate text ("all binaries build")
+and its explicit instruction that "the B1-B3 files stay untouched" could not
+both be literally satisfied simultaneously; that record resolved the conflict
+in favor of the untouched-files instruction and reported the four broken
+binaries plainly. The orchestrator confirmed this was the correct resolution
+and that the self-contradiction was theirs, not an error to charge against
+the executor.
 
-## B1-B3: proposed, not applied
+## B1 — decided and applied: `checkpoint.{hpp,cpp}` → `strata_models`
 
-### B1 — `include/strata/checkpoint.hpp`
+Independently verified consumers, twice, by both sides: `glm_runtime.hpp`,
+`laguna_checkpoint.hpp`, `inkling_checkpoint.hpp`, `laguna_runtime.hpp`,
+`inkling_runtime.hpp`, `placement_model.cpp`, `checkpoint.cpp`, and one probe.
+**Three models share `GlmCheckpointReader`** — shared infrastructure with a
+GLM-shaped name, not a GLM-only file; renaming it would have been wrong.
 
-Independently verified consumers: `glm_runtime.hpp`, `laguna_checkpoint.hpp`,
-`inkling_checkpoint.hpp`, `laguna_runtime.hpp`, `inkling_runtime.hpp`,
-`placement_model.cpp`, `checkpoint.cpp`, and one probe. **Three models share
-`GlmCheckpointReader`** — it is shared infrastructure with a GLM-shaped name,
-not a GLM-only file, and renaming it would be wrong.
-
-Reading the file: `GlmCheckpointReader` is a generic mmap/read-slicing engine
-(`open`, `read`, `read_slice`, `view`, `read_f32`, ...) whose public surface is
-typed against `GlmIndexManifest`/`GlmManifestTensor`
-(`include/strata/glm_manifest.hpp`) — and those two types are not a generic
-tensor-index shape; `GlmManifestTensor` carries `GlmTensorRole` and
+`GlmCheckpointReader`'s public surface is typed against
+`GlmIndexManifest`/`GlmManifestTensor`, and those are not a generic
+tensor-index shape: `GlmManifestTensor` carries `GlmTensorRole` and
 `GlmTensorComponent`, GLM's own tensor-classification taxonomy, baked into the
-type the reader is templated against by construction, not by parameter. The
-one function needing `cuda_backend.hpp`, `load_glm_cuda_linear`, is a thin
-wrapper that reads through the same reader and uploads to a `CudaBackend` —
-inseparable from the reader's own coupling, not an independent problem.
+type the reader is built against by construction. Calling the reader a
+platform primitive was a claim the code did not support.
 
-**Cheapest correct option:** reassign the whole file — `checkpoint.hpp` +
-`checkpoint.cpp`, unchanged — from `strata_platform` to `strata_models` in
-`CMakeLists.txt`. Zero code changes. Every current consumer already lives in
-`strata_models` except `placement_model.cpp` (B2, already broken, not made
-worse) and the probe (not part of the layered targets). Cost: it accepts, for
-now, that `GlmCheckpointReader` is models-tier infrastructure rather than a
-core platform primitive — architecturally honest given what it actually
-returns, but it means nothing in `strata_platform`/`device`/`kernels`/`engine`
-can use it without becoming a models-tier consumer. It does not foreclose a
-later generalization; it just stops pretending one already happened.
+**Applied: reassigned `checkpoint.hpp` + `checkpoint.cpp`, unchanged, from
+`strata_platform` to `strata_models`.** Zero code changes. Every current
+consumer was already `strata_models` except `placement_model.cpp` (already
+covered by B2's own violations, not made worse) and the probe (outside the
+layered targets). This accepts, for now, that `GlmCheckpointReader` is
+models-tier infrastructure rather than a core platform primitive — honest
+given what it actually returns.
 
-**Alternative (larger, not proposed for this unit):** extract a genuinely
-model-neutral `ManifestTensor`/`IndexManifest` contract (name, shard, dtype,
-shape, offset, bytes — the fields that are not GLM-specific) into
-`strata_platform`, and have `GlmManifestTensor` extend or wrap it, with
-`GlmCheckpointReader` parameterized over the generic base for its storage/read
-logic while keeping GLM's role/component classification as a thin layer above.
-This is the change that would make three models sharing one manifest type
-stop being an accident of convenience — but it changes the reader's public API
-and needs at least a look at every one of its three current model call sites,
-which is exactly the design commitment flagged as "not today."
+A third option considered and rejected in the prior unit — split
+`load_glm_cuda_linear` out, leave the reader behind — stays rejected:
+`glm_manifest.hpp` alone still forces `strata_models` regardless of what
+happens to the CUDA-upload half.
 
-A third option — split `load_glm_cuda_linear` out into its own file, leaving
-`GlmCheckpointReader` behind — was considered and rejected: it removes only
-the `cuda_backend.hpp` half of the coupling. `glm_manifest.hpp` remains
-regardless, so the reader still cannot stay below `strata_models`, and the
-split adds a file and a decision for no lower final tier. Not listed as the
-alternative above because it is strictly dominated by it.
+**The generalization alternative is the right end state, and is not this
+unit.** Extracting a genuinely model-neutral `ManifestTensor`/`IndexManifest`
+contract (name, shard, dtype, shape, offset, bytes) into `strata_platform`,
+with `GlmManifestTensor` extending or wrapping it and `GlmCheckpointReader`
+parameterized over the generic base, is what would make three models sharing
+one manifest type stop being an accident of convenience. It changes the
+reader's public API and needs a look at all three current model call sites —
+recorded as a lint exception with **expiry: phase 4**, the same shape and the
+same reason as B2 and B3: it wants to happen once, with all six models'
+actual manifest shapes in view, not designed against three today and
+stretched to fit three more later.
 
-### B2 — `src/placement_model.cpp`
+## B2 and B3 — deferred to phase 4, with recorded lint exceptions
 
-1,174 lines. Six `build_<model>_inventory` functions (lines 100-949, about 72%
-of the file) each convert one model's checkpoint reader into the already
-model-neutral `PlacementInventory` type; `build_inventory` (line 949)
-dispatches on architecture kind to the right one; `plan_model_placement`
-(line 1050) is the actual solver entry point. The review's finding matches
-what's on the page: the solver is already close to "a pure function of
-inventory plus hardware" — `PlacementInventory` is the right shape — but the
-six builders are inlined in an engine-tier file instead of living with each
-model.
+The deferral decision was made by the orchestrator, not the executor — the
+prior unit's report was explicit that choosing to defer was not its call, only
+that deferring was the recommendation if someone else made the call. It was
+made: **both defer to phase 4.** Extracting `placement_model.cpp`'s six
+inventory builders needs `build_inventory`'s dispatch to become a registry
+each model populates; `tokenizer.cpp`'s two model-specific pretokenizers need
+the same shape of decision one level down. Designing that registry once,
+against all six models' actual needs at phase 4's fan-out, beats designing it
+now against two and stretching it to fit four more later.
 
-**Recommendation: defer to phase 4, not a phase-1 move.** Moving the six
-builders out cleanly needs more than relocation — `build_inventory`'s
-dispatch would need to become a registry (each model registers its own
-builder callback) so `placement_model.cpp` never names a model directly, and
-that registry's shape is a design decision, not a mechanical split. Phase 4 is
-explicitly when "each adopter is already inside its own model's code" for the
-oracle fan-out; relocating that model's own inventory builder in the same pass
-is one visit to the file instead of two, and the registry shape only needs to
-be decided once, with all six models' actual needs in view, rather than
-designed now for one and stretched to fit five more later. **Expiry: phase 4.**
-If the answer is "defer," the lint should carry `placement_model.cpp`'s seven
-includes as a recorded exception with that expiry — not implemented in this
-unit, since deciding to defer is not this unit's call to make.
+**`scripts/layer_exceptions.py`** records three entries, each naming what it
+defers, why, and its expiry phase in the file itself:
 
-### B3 — `src/tokenizer.cpp`
+- `quantization-contract-in-model-hpp` — `compressed_tensors.hpp`'s need for
+  `QuantizedWeightSpec`/`QuantizationGranularity`, folded in as the same
+  question as B1's generalization alternative rather than left as an
+  unexplained fourth item, since both stem from `model.hpp` bundling generic
+  quantization vocabulary alongside genuinely model-specific specs.
+- `placement-model-inventory-registry` — B2, 8 matched `(file, header)` pairs
+  (7 named in the original review plus `checkpoint.hpp`, newly upward once B1
+  moved it — the same file, the same deferred fix, one more line covered by
+  the same exception, not a new item).
+- `tokenizer-pretokenizer-split` — B3, 2 matched pairs.
 
-1,960 lines. `inkling_unicode.hpp` and `laguna_unicode.hpp` are Unicode-15.0
-category tables generated specifically for each model's own pretokenizer
-regex classes, with the model-specific pretokenize functions
-(`pretokenize_laguna_chunk`, `laguna_letter`, etc.) inlined directly into the
-shared `ModelTokenizer` dispatch. Structurally the same shape as B2: a
-generic-purpose engine-tier class with two models' specific logic branched
-inside it instead of living with those models.
+All three: **expiry phase 4.**
 
-**Recommendation: defer to phase 4, same reasoning as B2, same expiry.**
-Pretokenization is exactly "inside the model's own code" territory once each
-model's fan-out pass happens; deciding it now would mean designing the
-per-model-pretokenizer dispatch mechanism twice (once ad hoc for two models,
-again properly for six) rather than once, with all six in view.
+**The exception mechanism has the two required properties, both verified by
+actually breaking one and watching it fail:**
+
+1. A listed `(file, header)` pair that no longer corresponds to a real
+   violation fails the run. Verified: appended a fourth exception entry
+   naming a header nothing includes, ran `check_layers.py`, got exit 1 and
+   `== STALE EXCEPTIONS (1) == [fake-stale-test] no longer matches a real
+   violation: src/tokenizer.cpp includes nonexistent_header.hpp`, then
+   reverted the test entry. A stale exception cannot silently keep a
+   boundary open past whatever fixed it.
+2. `check_layers.py` prints every exception it applied, by name, with the
+   exact violations each one covered, on every run — not just on request, not
+   summarized away. See the "exceptions applied" section of any
+   `make check-layers` run.
+
+## Final gate for Phase 1
+
+- **Every binary links.** `strata-chat`, `strata-run`, `strata-server`, and
+  `strata-host-expert-probe` — the four that failed solely on B1 — now build
+  and link, confirmed by a from-scratch rebuild.
+- **`make check-layers` exits 0**, printing all three exceptions with 11/11
+  matches consumed and 0 stale.
+- **`strata-tests`: 310/311 passed, 1 skipped** — line-for-line identical
+  `PASS`/`SKIP` set to the brief-00b baseline, re-verified on this unit's
+  final state.
+- **`make check` — the whole thing, build included — passes.** First time in
+  this phase that command has exited 0.
 
 ## What's committed
 
-`c1a1d73` (Phase 1 split, non-linking, superseded by the next commit's fixes),
-`3805dc8` (A1-A4 applied, six-target split links clean except for B1's four
-binaries, gate green), plus this record. `scripts/check_layers.py`'s A5 fix
-was committed separately. None of `checkpoint.hpp`, `placement_model.cpp`,
-`tokenizer.cpp`, `model.hpp`, or `model_adapter.hpp` have been edited.
+`c1a1d73` (initial split, non-linking), `3805dc8` (A1-A4, six-target split
+links except for B1's four binaries), `46d14b8` (A5, identifier check
+target-aware), `9349366` (this record, first draft), `f2c0f8b` (B1
+reassignment + the three recorded exceptions + `check_layers.py`'s exception
+consumer), plus this record's final update. `placement_model.cpp` and
+`tokenizer.cpp` were never edited, per every unit's scope fence in this
+phase — both are deferred, not fixed, and the record says so in the code
+itself via the exceptions file, not just here.
 
-## Recommendation for the next unit
+## Phase 1 is closed. What phase 4 inherits.
 
-1. Decide B1: reassign `checkpoint.hpp`/`checkpoint.cpp` to `strata_models`
-   (cheapest), or commit to generalizing the manifest contract now.
-2. Decide B2/B3: apply the phase-4-deferred recorded exception, or pull them
-   forward.
-3. `compressed_tensors.hpp`'s reintroduced violation is a new, small
-   corollary of B1's own question (contract vocabulary bundled inside
-   `model.hpp` alongside genuinely model-specific specs) — worth folding into
-   whichever `model.hpp`-splitting decision B1's alternative eventually
-   triggers, not a separate unit on its own.
+Three recorded exceptions, each with expiry phase 4, each naming a registry
+or contract that needs designing once against all six models rather than
+piecemeal: `placement_model.cpp`'s inventory-builder registry,
+`tokenizer.cpp`'s per-model pretokenizer split, and the model-neutral
+manifest contract that would let `GlmCheckpointReader` (and
+`compressed_tensors.hpp`'s quantization vocabulary) stop depending on GLM's
+own types for infrastructure three-to-six models actually share. All three
+are the same underlying pattern — generic-purpose code that took on one
+model's shape because it was built for that model first — and all three want
+the same fix: design the shared shape once, when every model's actual need is
+in view, not incrementally against whichever model happened to need it first.
+
+Per this unit's own instruction: **phase 2 does not start here.** A
+cold-context review sits between this green phase and any landing to `main`;
+that review, and any landing that follows it, is out of scope for the agent
+that did the work.

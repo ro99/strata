@@ -1805,7 +1805,7 @@ struct DeepSeekV4Runtime::Impl {
     std::vector<float> tiled_routed;
     std::array<std::atomic<std::uint64_t>, 48U> tiled_lane_next{};
     std::array<std::uint64_t, 48U> tiled_lane_end{};
-    Dsv4DiagnosticTrace diagnostics;
+    DiagnosticTrace diagnostics;
     Dsv4DeviceMoeStats device_moe_stats;
     Dsv4GraphStats graph_stats;
     std::vector<int> devices;
@@ -2340,7 +2340,7 @@ void DeepSeekV4Runtime::Impl::reset_diagnostics() {
 void DeepSeekV4Runtime::Impl::record_layer_hash(
     std::uint32_t position, std::uint32_t token, std::uint32_t layer,
     std::span<const float> hidden) {
-    const auto hash = dsv4_stable_bf16_hash(hidden);
+    const auto hash = stable_bf16_hash(hidden);
     diagnostics.layer_hashes.push_back({position, token, layer, hash});
     auto aggregate = diagnostics.layer_hash_trace_hash;
     aggregate = diagnostic_hash_u32(aggregate, position);
@@ -2353,7 +2353,7 @@ void DeepSeekV4Runtime::Impl::record_operation_hash(
     std::uint32_t position, std::uint32_t token,
     std::uint32_t layer, std::string_view operation,
     std::span<const float> values) {
-    const auto hash = dsv4_stable_bf16_hash(values);
+    const auto hash = stable_bf16_hash(values);
     diagnostics.operation_hashes.push_back(
         {position, token, layer, std::string(operation), hash});
 }
@@ -2361,7 +2361,7 @@ void DeepSeekV4Runtime::Impl::record_operation_hash(
 void DeepSeekV4Runtime::Impl::record_logits(
     std::uint32_t position, std::uint32_t token, std::uint32_t selected,
     std::span<const float> logits) {
-    auto analysis = analyze_dsv4_logits(logits, config.logit_trace_top_k);
+    auto analysis = analyze_logits(logits, config.logit_trace_top_k);
     const auto& summary = analysis.summary;
     auto& aggregate = diagnostics.logit_aggregate;
     ++aggregate.forward_count;

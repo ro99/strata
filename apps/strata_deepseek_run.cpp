@@ -982,7 +982,7 @@ void print_json_number(std::ostream& output, T value) {
 }
 
 void print_logit_summary(std::ostream& output,
-                         const strata::Dsv4LogitSummary& summary) {
+                         const strata::LogitSummary& summary) {
     output << "{\"value_count\":" << summary.value_count
            << ",\"finite_count\":" << summary.finite_count
            << ",\"non_finite_count\":" << summary.non_finite_count
@@ -1003,7 +1003,7 @@ void print_logit_summary(std::ostream& output,
 }
 
 void print_diagnostics(std::ostream& output,
-                       const strata::Dsv4DiagnosticTrace& diagnostics) {
+                       const strata::DiagnosticTrace& diagnostics) {
     const auto previous_precision = output.precision();
     output << std::setprecision(std::numeric_limits<double>::max_digits10)
            << "{\"hash_algorithm\":\"fnv1a64-little-endian\""

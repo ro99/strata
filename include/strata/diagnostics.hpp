@@ -7,12 +7,12 @@
 
 namespace strata {
 
-struct Dsv4TopLogit {
+struct TopLogit {
     std::uint32_t token_id{};
     float raw_logit{};
 };
 
-struct Dsv4LogitSummary {
+struct LogitSummary {
     std::uint64_t value_count{};
     std::uint64_t finite_count{};
     std::uint64_t non_finite_count{};
@@ -25,30 +25,30 @@ struct Dsv4LogitSummary {
     bool has_finite{};
 };
 
-struct Dsv4LogitAnalysis {
-    Dsv4LogitSummary summary;
-    std::vector<Dsv4TopLogit> top;
+struct LogitAnalysis {
+    LogitSummary summary;
+    std::vector<TopLogit> top;
 };
 
 // Produces a deterministic diagnostic ordering without participating in token
 // selection. Equal logits are ordered by ascending token id; NaNs sort last.
-[[nodiscard]] Dsv4LogitAnalysis analyze_dsv4_logits(
+[[nodiscard]] LogitAnalysis analyze_logits(
     std::span<const float> logits, std::uint32_t top_k);
 
 // FNV-1a over the little-endian bytes of each value after the runtime's
 // round-to-nearest-even BF16 boundary. This is stable across host endianness.
-[[nodiscard]] std::uint64_t dsv4_stable_bf16_hash(
+[[nodiscard]] std::uint64_t stable_bf16_hash(
     std::span<const float> values) noexcept;
 
-struct Dsv4LogitTraceRecord {
+struct LogitTraceRecord {
     std::uint32_t position{};
     std::uint32_t input_token{};
     std::uint32_t selected_token{};
-    Dsv4LogitSummary summary;
-    std::vector<Dsv4TopLogit> top;
+    LogitSummary summary;
+    std::vector<TopLogit> top;
 };
 
-struct Dsv4LogitTraceAggregate {
+struct LogitTraceAggregate {
     std::uint64_t forward_count{};
     std::uint64_t value_count{};
     std::uint64_t finite_count{};
@@ -62,14 +62,14 @@ struct Dsv4LogitTraceAggregate {
     bool has_finite{};
 };
 
-struct Dsv4LayerHashTraceRecord {
+struct LayerHashTraceRecord {
     std::uint32_t position{};
     std::uint32_t input_token{};
     std::uint32_t layer{};
     std::uint64_t bf16_hash{};
 };
 
-struct Dsv4OperationHashTraceRecord {
+struct OperationHashTraceRecord {
     std::uint32_t position{};
     std::uint32_t input_token{};
     std::uint32_t layer{};
@@ -77,15 +77,15 @@ struct Dsv4OperationHashTraceRecord {
     std::uint64_t bf16_hash{};
 };
 
-struct Dsv4DiagnosticTrace {
+struct DiagnosticTrace {
     bool logit_trace_enabled{};
     bool layer_hash_trace_enabled{};
     std::uint32_t logit_top_k{20U};
-    Dsv4LogitTraceAggregate logit_aggregate;
-    std::vector<Dsv4LogitTraceRecord> logits;
+    LogitTraceAggregate logit_aggregate;
+    std::vector<LogitTraceRecord> logits;
     std::uint64_t layer_hash_trace_hash{};
-    std::vector<Dsv4LayerHashTraceRecord> layer_hashes;
-    std::vector<Dsv4OperationHashTraceRecord> operation_hashes;
+    std::vector<LayerHashTraceRecord> layer_hashes;
+    std::vector<OperationHashTraceRecord> operation_hashes;
     std::uint64_t index_selection_count{};
     std::uint64_t index_selection_trace_hash{};
 };

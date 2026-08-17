@@ -1,4 +1,4 @@
-#include "strata/deepseek_diagnostics.hpp"
+#include "strata/diagnostics.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -41,8 +41,8 @@ constexpr std::uint64_t kFnvPrime = 1'099'511'628'211ULL;
     return static_cast<std::uint16_t>(bits >> 16U);
 }
 
-[[nodiscard]] bool better_logit(const Dsv4TopLogit& left,
-                                const Dsv4TopLogit& right) noexcept {
+[[nodiscard]] bool better_logit(const TopLogit& left,
+                                const TopLogit& right) noexcept {
     const bool left_nan = std::isnan(left.raw_logit);
     const bool right_nan = std::isnan(right.raw_logit);
     if (left_nan != right_nan) return !left_nan;
@@ -54,14 +54,14 @@ constexpr std::uint64_t kFnvPrime = 1'099'511'628'211ULL;
 
 }  // namespace
 
-Dsv4LogitAnalysis analyze_dsv4_logits(std::span<const float> logits,
-                                      std::uint32_t top_k) {
-    Dsv4LogitAnalysis result;
+LogitAnalysis analyze_logits(std::span<const float> logits,
+                             std::uint32_t top_k) {
+    LogitAnalysis result;
     auto& summary = result.summary;
     summary.value_count = logits.size();
     summary.raw_f32_hash = kFnvOffset;
 
-    std::vector<Dsv4TopLogit> candidates;
+    std::vector<TopLogit> candidates;
     candidates.reserve(logits.size());
     for (std::size_t index = 0U; index < logits.size(); ++index) {
         const float value = logits[index];
@@ -97,7 +97,7 @@ Dsv4LogitAnalysis analyze_dsv4_logits(std::span<const float> logits,
     return result;
 }
 
-std::uint64_t dsv4_stable_bf16_hash(std::span<const float> values) noexcept {
+std::uint64_t stable_bf16_hash(std::span<const float> values) noexcept {
     std::uint64_t hash = kFnvOffset;
     for (const float value : values) hash = hash_u16(hash, encode_bf16(value));
     return hash;

@@ -4,8 +4,8 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
-#include "strata/deepseek_diagnostics.hpp"
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/diagnostics.hpp"
 #include "strata/dsv4_rank_local_topology.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
@@ -326,7 +326,7 @@ struct Dsv4GenerationResult {
     std::vector<std::uint32_t> generated_token_ids;
     std::vector<TokenLogprob> logprobs;
     Dsv4GenerationMetrics metrics;
-    Dsv4DiagnosticTrace diagnostics;
+    DiagnosticTrace diagnostics;
     std::vector<std::string> errors;
     bool stopped{};
 

@@ -1864,11 +1864,32 @@ InklingGenerationResult InklingRuntime::Impl::generate(
     std::vector<float> hidden;
     std::vector<float> logits;
     auto started = std::chrono::steady_clock::now();
-    for (std::size_t index = 0U; index < prompt.size(); ++index) {
-        auto status = impl.forward(prompt[index], index, hidden);
-        if (!status.ok()) {
-            result.errors = std::move(status.errors);
-            return result;
+    // Only the final row's hidden state feeds the first sampled token, but
+    // every row still has to run: each one's K/V is what the rows after it
+    // attend to.
+    const auto page = impl.config.prefill_page_tokens;
+    if (page > 1U) {
+        std::vector<float> rows_hidden;
+        for (std::size_t begin = 0U; begin < prompt.size(); begin += page) {
+            const auto count =
+                std::min<std::size_t>(page, prompt.size() - begin);
+            auto status = impl.forward_page(
+                std::span<const std::uint32_t>(prompt).subspan(begin, count),
+                begin, rows_hidden);
+            if (!status.ok()) {
+                result.errors = std::move(status.errors);
+                return result;
+            }
+        }
+        hidden.assign(rows_hidden.end() - static_cast<std::ptrdiff_t>(kHidden),
+                      rows_hidden.end());
+    } else {
+        for (std::size_t index = 0U; index < prompt.size(); ++index) {
+            auto status = impl.forward(prompt[index], index, hidden);
+            if (!status.ok()) {
+                result.errors = std::move(status.errors);
+                return result;
+            }
         }
     }
     auto status = impl.logits_from_hidden(hidden, logits);

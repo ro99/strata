@@ -35,7 +35,7 @@ struct InklingRuntimeConfig {
     // between them expert-major, so each distinct expert of the page is
     // fetched once instead of once per row that selected it. Arithmetic is
     // identical either way; this is a scheduling change.
-    std::uint32_t prefill_page_tokens{};
+    std::uint32_t prefill_page_tokens{64U};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     bool verbose{};

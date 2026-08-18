@@ -7,6 +7,7 @@
 #include "strata/deepseek_kv_cache.hpp"
 #include "strata/diagnostics.hpp"
 #include "strata/dsv4_rank_local_topology.hpp"
+#include "strata/dsv4_static_expert_tier.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
@@ -122,6 +123,13 @@ struct Dsv4RuntimeConfig {
     // translation-bound. The selector is retained so the rejection stays
     // reproducible from one binary.
     bool hugepage_expert_arena{false};
+    // Static routed-expert tier: a plan from strata-dsv4-expert-residency, the
+    // device to hold it (outside the rank pair), and the VRAM to spend there.
+    // An empty path or a negative device disables it, which is the default and
+    // is exactly today's decode.
+    std::string static_expert_plan_path;
+    int static_expert_tier_device{-1};
+    std::uint64_t static_expert_tier_bytes{};
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};
@@ -263,6 +271,13 @@ struct Dsv4GraphStats {
     // splits every expert across a node's threads and pays three dispatches
     // per layer, where 0051's standalone kernel gave each thread a whole
     // expert and paid one.
+    // Static expert tier: submissions, experts served, device wall time on the
+    // tier device, and how long the routing callback blocked waiting for it.
+    // The gap between the last two is what the handoff costs beyond the work.
+    std::uint64_t static_tier_submissions{};
+    std::uint64_t static_tier_experts{};
+    std::uint64_t static_tier_device_nanoseconds{};
+    std::uint64_t static_tier_wait_nanoseconds{};
     std::uint64_t rank_local_moe_gate_up_nanoseconds{};
     std::uint64_t rank_local_moe_down_nanoseconds{};
     std::uint64_t rank_local_moe_reduce_nanoseconds{};

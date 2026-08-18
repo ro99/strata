@@ -54,6 +54,9 @@ struct Options {
     bool device_moe{true};
     bool host_routed_moe{};
     bool hugepage_expert_arena{false};
+    std::string static_expert_plan;
+    int static_expert_device{-1};
+    std::uint64_t static_expert_bytes{};
     bool flash_attention{};
     bool gpu_lightning_indexer{};
     bool block_kv_cache{};
@@ -85,6 +88,8 @@ void usage() {
         << "       [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe|--host-routed-moe]\n"
         << "       [--arena-hugepages|--no-arena-hugepages]\n"
+        << "       [--static-expert-plan PATH --static-expert-device N\n"
+        << "        --static-expert-bytes BYTES]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
         << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
@@ -258,6 +263,18 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.device_moe = true;
         } else if (argument == "--serial-device-moe") {
             options.device_moe = false;
+        } else if (argument == "--static-expert-plan") {
+            const auto* value = index + 1 < argc ? argv[++index] : nullptr;
+            if (value == nullptr) return false;
+            options.static_expert_plan = value;
+        } else if (argument == "--static-expert-device") {
+            const auto* value = index + 1 < argc ? argv[++index] : nullptr;
+            std::uint32_t parsed = 0U;
+            if (value == nullptr || !strata::cli::parse_u32(value, parsed)) return false;
+            options.static_expert_device = static_cast<int>(parsed);
+        } else if (argument == "--static-expert-bytes") {
+            const auto* value = index + 1 < argc ? argv[++index] : nullptr;
+            if (value == nullptr || !parse_bytes(value, options.static_expert_bytes)) return false;
         } else if (argument == "--arena-hugepages") {
             options.hugepage_expert_arena = true;
         } else if (argument == "--no-arena-hugepages") {
@@ -862,6 +879,12 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.rank_local_candidate_nanoseconds)
            << ",\"rank_local_boundary_seconds\":"
            << seconds(stats.rank_local_boundary_nanoseconds)
+           << ",\"static_tier_submissions\":" << stats.static_tier_submissions
+           << ",\"static_tier_experts\":" << stats.static_tier_experts
+           << ",\"static_tier_device_seconds\":"
+           << seconds(stats.static_tier_device_nanoseconds)
+           << ",\"static_tier_wait_seconds\":"
+           << seconds(stats.static_tier_wait_nanoseconds)
            << ",\"rank_local_moe_gate_up_seconds\":"
            << seconds(stats.rank_local_moe_gate_up_nanoseconds)
            << ",\"rank_local_moe_down_seconds\":"
@@ -1218,6 +1241,9 @@ int main(int argc, char** argv) {
     config.enable_device_moe = options.device_moe;
     config.enable_host_routed_moe = options.host_routed_moe;
     config.hugepage_expert_arena = options.hugepage_expert_arena;
+    config.static_expert_plan_path = options.static_expert_plan;
+    config.static_expert_tier_device = options.static_expert_device;
+    config.static_expert_tier_bytes = options.static_expert_bytes;
     config.enable_flash_attention = options.flash_attention;
     config.enable_gpu_lightning_indexer = options.gpu_lightning_indexer;
     config.kv_cache_mode = options.device_resident_runtime

@@ -542,11 +542,57 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
                   slot.result->routed_coefficients[rank].begin());
     }
     auto destination = rank_partials.subspan(rank * kHidden, kHidden);
+
+    // Split the route between the static tier and this rank's host pool. The
+    // tier computes whole experts on a device outside this pair, so both ranks
+    // skip the same slots and only rank 0 adds the tier's result in. Deriving
+    // `serve` from this rank's own route keeps each rank self-consistent; the
+    // executor already treats a cross-rank route divergence as a failure.
+    auto* tier = owner.options.static_expert_tier;
+    std::array<bool, kTopK> serve{};
+    std::size_t served = 0U;
+    bool submitted = false;
+    if (tier != nullptr && tier->active()) {
+        served = tier->select(slot.layer, state.route.experts, serve);
+        if (served != 0U && rank == 0U) {
+            auto sent = tier->submit(slot.layer, state.route.experts,
+                                     state.route.weights, serve, input);
+            if (!sent.ok()) {
+                for (auto& error : sent.errors) {
+                    std::fprintf(stderr, "static expert tier submit: %s\n",
+                                 error.c_str());
+                }
+                // Fail closed: the tier disables itself, and this layer still
+                // has to be exact, so fall back to serving every slot here.
+                serve = {};
+                served = 0U;
+            } else {
+                submitted = true;
+            }
+        }
+    }
+
     Dsv4HostMoePhaseTimings callback_phases{};
     const auto status = state.cpu->run(
         slot.layer, state.route, input,
         *owner.options.resident,
-        destination, &callback_phases);
+        destination, &callback_phases,
+        served != 0U ? std::span<const bool>(serve) : std::span<const bool>{});
+    if (submitted) {
+        auto joined = tier->collect(destination);
+        if (!joined.ok()) {
+            for (auto& error : joined.errors) {
+                std::fprintf(stderr, "static expert tier collect: %s\n",
+                             error.c_str());
+            }
+            // The host share is already in `destination` but the tier's is
+            // missing, so this layer is incomplete. Report rather than publish
+            // a partial sum.
+            std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
+            observation_failure();
+            return false;
+        }
+    }
     state.chain_cpu_moe_phases.gate_up_nanoseconds +=
         callback_phases.gate_up_nanoseconds;
     state.chain_cpu_moe_phases.down_nanoseconds +=

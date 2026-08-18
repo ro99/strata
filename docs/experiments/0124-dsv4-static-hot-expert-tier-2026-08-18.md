@@ -1,8 +1,10 @@
 # Experiment 0124 — a static hot-expert tier on the idle GPU
 
-Status: **simulation gate passed on held-out data; planner landed, runtime not
-yet built.** Projected decode 8.63 -> 10.79 tok/s from the tier alone, and
-15.89 tok/s combined with the LRU tier the two 3090s already admit.
+Status: **placement validated on held-out data; first implementation is
+defective and under repair.** The projection was 8.63 -> 10.79 tok/s. The first
+implementation measures worse than a 30x regression, which is far outside what
+its own added latency can explain, so it is being treated as a defect in the
+code rather than as evidence against the design.
 
 ## The question this answers
 
@@ -171,3 +173,142 @@ first increment and stands alone at 1.30x.
 - Coverage is measured in activations, not in bytes moved. They coincide here
   only because every triplet is the same size, which is true for this model and
   should be asserted rather than assumed for another.
+
+
+## Runtime result: first implementation defective
+
+The tier was built and run end to end. It loads correctly -- device weight
+uploads rise from 25.2 GB to 40.2 GB, the extra 15 GB being the 1,124 triplets
+on device 0 -- and after fixing the collect contract (the command returns one
+unsummed row per routed expert, not their weighted sum) it executes without
+error and produces output.
+
+It is drastically slower. Against a baseline arm of about 32 seconds of prefill
+plus decode, the tier arm was still running after **15 minutes** past model
+load and was killed.
+
+That magnitude is itself the diagnosis. The design's own worst case -- 43
+synchronous device round trips per token at a few milliseconds each -- is on the
+order of 130 ms/token added, which would be a 2-3x regression. A 30x regression
+is not that; it is a defect. Reporting a number one cannot explain is not
+neutral, so this is recorded as an open defect with the mechanism still
+unproven either way, not as a result about the design.
+
+### Why, and what the simulation missed
+
+The simulation costed **bytes**: it moved 38.5% of the routed-expert reads off
+DRAM and divided by the measured 47.4 GB/s. It never costed the
+**synchronizations** the design adds.
+
+Routing is decided inside a `cudaLaunchHostFunc` callback, where CUDA calls are
+forbidden, so the tier hands its work to a worker thread and the callback waits
+for it. That wait happens **once per layer, per token** -- 43 times a token --
+and each one is a full device round trip on device 0: input upload, kernel,
+output download, event synchronize. Worse, the thread being blocked is a CUDA
+driver callback thread, so blocking it stalls the rank's own stream for the
+duration.
+
+The design tried to hide this by submitting before the host share and
+collecting after, so the device work would overlap the CPU work. That window is
+exactly what the tier shrinks: serving 38.5% of the experts on the device
+leaves only 61.5% of the host work to overlap against, so the more the tier
+succeeds at removing DRAM bytes, the less time it has to hide its own latency
+behind.
+
+This is the charter's "separate volume from overlap", and the failure is the
+same shape as experiment 0025: a mechanism that reduces the volume of a term
+while adding to a serial one, justified by an arithmetic that only modelled the
+volume. The rule existed; the simulation still did not apply it. **A residency
+simulation must cost the synchronizations its dispatch implies, not only the
+bytes it relocates.**
+
+### The defect, measured
+
+`strata-dsv4-static-tier-probe` prices one tier call in isolation -- upload one
+hidden row, run N resident FP4 experts, download the routed rows, synchronize --
+without the 120-second model stage.
+
+| routed experts per call | ms | per expert |
+| ---: | ---: | ---: |
+| 1 | 0.3343 | 0.334 |
+| 2 | 0.6423 | 0.321 |
+| 6 | 2.1045 | 0.351 |
+
+It is **linear in the expert count with no measurable fixed cost**, so this is
+not handoff latency, which was the obvious suspect and is wrong. It is the
+kernel.
+
+One expert triplet is 13.37 MB. At 0.34 ms that is **39 GB/s on a card with
+448 GB/s of VRAM bandwidth -- 8.7% of it.** The batch-1 FP4 expert GEMV is the
+defect, and it is not specific to this card: 0058 records the same kernel at
+44.6 GB/s of a 3090's 936 GB/s.
+
+The consequence is decisive and explains the direction of the result. The CPU
+path moves 3.449 GB/token at 47.4 GB/s aggregate; the device path moves the
+same experts at 39 GB/s. **The CPU is currently faster per expert than the GPU
+is**, so relocating experts onto the device makes decode slower no matter how
+good the placement is. At 6 experts a layer the tier costs 2.10 ms where the
+host share it replaces costs about 1.65 ms, and 43 layers turn that into 90
+ms/token of tier calls against roughly 27 ms of DRAM reads removed.
+
+This is a property of the kernel, not of the placement. The placement decides
+*which* bytes move off DRAM; it cannot help if the engine reading them is
+slower than the one it replaced. At even 200 GB/s -- still under half the
+card's bandwidth -- six experts would cost 0.4 ms, the tier calls would be 17
+ms/token, and the projection would hold.
+
+Worth noting where that fix likely lives: the tier device is the RTX 5060 Ti,
+which is SM120 and the only device on this machine with **native FP4 tensor
+cores**. The kernel it is running was written for SM86, which has none, so it
+decodes FP4 in-register and feeds CUDA cores. That is the same gap experiments
+0103-0105 closed for FP8 projections on SM86, and it is the obvious first place
+to look for the missing 5x.
+
+### Other defects in this implementation
+
+Four, all in the code rather than the idea:
+
+1. **The callback is blocked.** `collect` waits on a `cudaLaunchHostFunc`
+   callback thread, which stalls the rank's own stream for the duration. The
+   submit-early/collect-late structure was meant to overlap the device work
+   with the host share; blocking that thread means it does not overlap at all.
+2. **A full device round trip per layer.** `enqueue_deepseek_moe` plus
+   `collect_deepseek_moe` uploads the input, launches, downloads every routed
+   row and event-synchronizes -- 43 times a token, when the layer's own command
+   stream is already going to the device anyway.
+3. **The tier's own counters were never surfaced.** `device_nanoseconds` and
+   `wait_nanoseconds` exist on the class and reach no JSON, so the 30x has no
+   attribution. That is the same dead-instrumentation mistake 0123 found twice
+   elsewhere, repeated here.
+4. **Nothing was measured at small scale first.** The mechanism went straight
+   into a 120-second model load. A standalone probe of one layer's tier call
+   would have priced the round trip in minutes.
+
+The correct next step is (3) then (4): instrument, then price the round trip in
+isolation, and only then judge the design.
+
+### What survives regardless
+
+The *placement* finding stands and is independent of this mechanism:
+concentration is 2.03x, it is the model's rather than the conversation's, and a
+14.4 GB set chosen from one prompt covers 38.6% of another's decode activations
+against a 10.4% null. The planner and the plan format are landed and tested.
+
+What is in doubt is only this dispatch: serving that set **from a device outside
+the rank pair via a blocking per-layer handoff**. Two directions for the repair:
+
+1. The simulation's own table already prefers the other tier. The 3090s' LRU
+   alone projects 13.26 tok/s against this tier's 10.79, and those experts live
+   on the devices that are already executing the layer -- no cross-device
+   handoff, no callback blocking, no extra synchronization per layer. That is
+   the mechanism to build next, and this experiment is the argument for
+   building it first.
+2. Any device-served expert tier must be reachable **without blocking the
+   routing callback**. That means the selection has to happen on the device --
+   a top-k over router logits it already holds, tested against a residency
+   bitmap in constant memory -- so the expert executes inside the layer's
+   existing command stream rather than behind a host round trip. The static
+   map is still what makes that possible; the blocking handoff was the error.
+
+The tier remains in the tree behind `--static-expert-plan`, defaulted off, so
+the defect is reproducible from one binary.

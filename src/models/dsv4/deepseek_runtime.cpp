@@ -1696,6 +1696,9 @@ struct DeepSeekV4Runtime::Impl {
     std::unique_ptr<Dsv4RankLocalWeightStore> rank_local_weights;
 #if defined(STRATA_HAS_NCCL)
     std::unique_ptr<Dsv4RankLocalLayerExecutor> rank_local_executor;
+    // Outlives the executor that points at it, so it is declared before the
+    // executor is torn down and destroyed after.
+    std::unique_ptr<Dsv4StaticExpertTier> static_expert_tier;
 #endif
     Dsv4RankLocalAdmission rank_local_admission;
     std::vector<std::uint64_t> rank_local_initial_device_vram_bytes;
@@ -6823,6 +6826,34 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
         options.rank_cpus[rank] = admitted.rank_cpus[rank];
     }
     options.resident = &resident;
+
+    // Static routed-expert tier on a device outside the rank pair. Optional by
+    // construction: an unset path, an absent device, or a plan that admits
+    // nothing all leave decode exactly as it was.
+    if (!config.static_expert_plan_path.empty() &&
+        config.static_expert_tier_device >= 0) {
+        auto plan = Dsv4ExpertResidencyPlan::load(
+            config.static_expert_plan_path, kLayers, kExperts);
+        if (!plan.ok()) {
+            store->clear();
+            append_errors(result, std::move(plan.errors),
+                          "static expert residency plan");
+            return result;
+        }
+        static_expert_tier = std::make_unique<Dsv4StaticExpertTier>();
+        auto prepared = static_expert_tier->initialize(
+            config.static_expert_tier_device, cuda, *checkpoint,
+            std::move(plan.value), config.static_expert_tier_bytes,
+            kDeepSeekV4ExecutionContract.swiglu_limit);
+        if (!prepared.ok()) {
+            store->clear();
+            static_expert_tier.reset();
+            append_errors(result, std::move(prepared.errors),
+                          "static expert tier");
+            return result;
+        }
+        options.static_expert_tier = static_expert_tier.get();
+    }
     result = executor->initialize(options);
     if (!result.ok()) {
         store->clear();
@@ -8973,8 +9004,35 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result.errors = std::move(tokenizer.errors);
         return result;
     }
-    result = impl_->cuda.initialize(config.devices, config.detailed_timing);
+    // The static expert tier lives on a device outside the execution set, so
+    // it needs its own context and weight arena. It is included here rather
+    // than in config.devices because it must not join the layer schedule, the
+    // KV placement or the rank pair -- it only holds weights and computes the
+    // experts it holds.
+    std::vector<int> context_devices(config.devices.begin(), config.devices.end());
+    const bool tier_requested = !config.static_expert_plan_path.empty() &&
+                                config.static_expert_tier_device >= 0;
+    if (tier_requested) {
+        const auto tier_device = config.static_expert_tier_device;
+        if (std::find(context_devices.begin(), context_devices.end(),
+                      tier_device) != context_devices.end()) {
+            result.errors.emplace_back(
+                "static expert tier device " + std::to_string(tier_device) +
+                " is already an execution device; the tier must be separate");
+            return result;
+        }
+        context_devices.push_back(tier_device);
+    }
+    result = impl_->cuda.initialize(context_devices, config.detailed_timing);
     if (!result.ok()) return result;
+    if (tier_requested && config.static_expert_tier_bytes != 0U) {
+        // Reserve up front: the tier allocates thousands of small weights and
+        // the arena refuses a per-weight fallback once enabled.
+        result = impl_->cuda.reserve_weight_arena(
+            config.static_expert_tier_device,
+            config.static_expert_tier_bytes);
+        if (!result.ok()) return result;
+    }
     if (config.enable_flash_attention) {
         for (const int device : config.devices) {
             result = impl_->cuda.validate_flash_attention_device(device);

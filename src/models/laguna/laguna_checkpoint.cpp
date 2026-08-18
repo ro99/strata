@@ -497,8 +497,14 @@ ValidationResult load_laguna_cuda_linear(
     // The upload source is the shard mapping itself. `read` would copy every
     // byte into a fresh heap vector first, which measured 0.30 ms per routed
     // expert projection of pure duplication -- 1.9x on the whole staging path
-    // once the per-weight cudaMalloc goes too. `upload` synchronizes its stream
-    // before returning, so the mapping outlives the transfer.
+    // once the per-weight cudaMalloc goes too.
+    //
+    // Deferred, not synchronous: the copy lands on the upload stream and the
+    // consumer orders itself behind it with an event, so staging an expert no
+    // longer blocks the host. The source is the reader's own mapping, which
+    // outlives every batch, so the transfer cannot outlive its bytes -- that
+    // precondition is what makes deferring legal here and not in a runtime
+    // that stages through a temporary.
     if (module.encoding == LagunaTensorEncoding::Plain) {
         if (module.weight == nullptr) {
             result.errors.emplace_back("Laguna plain linear has no weight tensor");
@@ -520,7 +526,8 @@ ValidationResult load_laguna_cuda_linear(
         descriptor.dtype = module.weight->dtype;
         descriptor.rows = module.rows;
         descriptor.columns = module.columns;
-        return backend.upload(device, descriptor, data.value, {}, output);
+        return backend.upload(device, descriptor, data.value, {}, output,
+                              CudaBackend::UploadCompletion::Deferred);
     }
     if (module.packed == nullptr || module.scale == nullptr ||
         module.global_scale == nullptr) {
@@ -556,7 +563,8 @@ ValidationResult load_laguna_cuda_linear(
         kContract.nvfp4_group_size;
     descriptor.group_size = kContract.nvfp4_group_size;
     descriptor.global_scale = global.value[0];
-    return backend.upload(device, descriptor, packed.value, scale.value, output);
+    return backend.upload(device, descriptor, packed.value, scale.value, output,
+                          CudaBackend::UploadCompletion::Deferred);
 }
 
 }  // namespace strata

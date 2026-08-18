@@ -271,6 +271,11 @@ public:
         state.stage_nanoseconds += elapsed_nanoseconds(stage_started);
         if (!result.ok()) return result;
         const auto matmul_started = std::chrono::steady_clock::now();
+        // Orders this device's execution stream behind any deferred weight
+        // copies. Cheap and idempotent -- it returns immediately when nothing
+        // is pending -- and it is a device-side event wait, not a host block.
+        result = backend_.synchronize_uploads(devices_[device_slot]);
+        if (!result.ok()) return result;
         result = backend_.matmul(entry->weight, input, rows, output);
         state.matmul_nanoseconds += elapsed_nanoseconds(matmul_started);
         return result;
@@ -543,6 +548,12 @@ struct LagunaRuntime::Impl {
             result.errors.emplace_back("resident Laguna projection is not loaded");
             return result;
         }
+        // The resident spine loads through the same deferred path, so its
+        // first use has to order behind the copies too. After that this is a
+        // no-op: synchronize_uploads returns immediately once nothing is
+        // pending on the device.
+        result = cuda.synchronize_uploads(spine.weight.device());
+        if (!result.ok()) return result;
         return cuda.matmul(spine.weight, input, rows, output);
     }
 
@@ -972,6 +983,11 @@ struct LagunaRuntime::Impl {
         }
 
         const auto command_started = std::chrono::steady_clock::now();
+        result = cuda.synchronize_uploads(devices[slot]);
+        if (!result.ok()) {
+            release_all();
+            return result;
+        }
         result = cuda.enqueue_moe(devices[slot], input.first(kHidden), 1U, batch,
                                   nullptr);
         if (!result.ok()) {

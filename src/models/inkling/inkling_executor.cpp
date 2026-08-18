@@ -1,4 +1,5 @@
 #include "../common/executor_support.hpp"
+#include "strata/runtime_support.hpp"
 #include "strata/inkling_runtime.hpp"
 
 namespace strata {
@@ -12,7 +13,7 @@ public:
         InklingRuntimeConfig concrete;
         // Phase 2, B5: these two were dropped by the old hand-written arm, so
         // --devices was accepted and discarded against a {0,1,2} default.
-        concrete.devices = config.devices;
+        concrete.devices = resolve_runtime_devices(config.devices);
         concrete.vram_cache_fraction = config.vram_cache_fraction;
         concrete.maximum_context_tokens = config.maximum_context_tokens;
         concrete.sampling_temperature = config.sampling.temperature;

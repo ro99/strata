@@ -47,7 +47,10 @@ enum class RuntimeModel : std::uint8_t {
 
 struct RuntimeConfig {
     RuntimeModel model{RuntimeModel::Glm52};
-    std::vector<int> devices{0, 1, 2};
+    // Empty means every visible device. The old default named three GPUs
+    // because the development box had three; on a one- or two-GPU machine it
+    // silently claimed devices that were not there.
+    std::vector<int> devices;
     double vram_cache_fraction{0.85};
     std::uint32_t maximum_context_tokens{2048U};
     // Session default sampler. Greedy unless the caller asks otherwise, so a

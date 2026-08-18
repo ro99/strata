@@ -54,6 +54,10 @@ struct RuntimeDevicePlan {
 
 using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
 
+// An empty device list means "every visible device". Call this before
+// validation so a config default does not have to name a GPU count.
+[[nodiscard]] std::vector<int> resolve_runtime_devices(std::vector<int> requested);
+
 [[nodiscard]] ValidationResult validate_common_runtime_config(
     std::span<const int> devices, double vram_fraction,
     double sampling_temperature, std::string_view model_label);

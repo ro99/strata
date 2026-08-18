@@ -23,6 +23,18 @@ constexpr std::uint32_t kWarmups = 5U;
 constexpr std::uint32_t kSamples = 21U;
 constexpr double kRtx3090DenseBf16TensorGflops = 142'000.0;
 
+// Rated dense BF16 tensor peaks, keyed by the substring cudaGetDeviceProperties
+// reports. Add a card here to get a fraction for it; absence costs the
+// fraction, never the run.
+[[nodiscard]] double rated_dense_bf16_peak(std::string_view name) {
+    if (name.find("RTX 3090") != std::string_view::npos) {
+        return kRtx3090DenseBf16TensorGflops;
+    }
+    return 0.0;
+}
+
+double rated_dense_bf16_tensor_gflops = 0.0;
+
 struct Shape {
     const char* name;
     std::uint32_t n;
@@ -444,9 +456,13 @@ void print_measurement(const Measurement& measurement, bool final) {
                      measurement.cublas_milliseconds
               << ",\n"
               << "      \"current_fraction_of_rated_dense_bf16_tensor_peak\": "
-              << current_gflops / kRtx3090DenseBf16TensorGflops << ",\n"
+              << (rated_dense_bf16_tensor_gflops > 0.0
+                      ? current_gflops / rated_dense_bf16_tensor_gflops : 0.0)
+              << ",\n"
               << "      \"cublas_fraction_of_rated_dense_bf16_tensor_peak\": "
-              << cublas_gflops / kRtx3090DenseBf16TensorGflops << ",\n"
+              << (rated_dense_bf16_tensor_gflops > 0.0
+                      ? cublas_gflops / rated_dense_bf16_tensor_gflops : 0.0)
+              << ",\n"
               << "      \"maximum_absolute_difference_fp32\": "
               << measurement.difference.maximum_absolute << ",\n"
               << "      \"maximum_relative_difference_fp32_floor_1e_7\": "
@@ -500,10 +516,18 @@ int main(int argc, char** argv) {
         cudaDeviceProp properties{};
         check(cudaGetDeviceProperties(&properties, device),
               "query reference device");
-        if (std::string_view(properties.name).find("RTX 3090") ==
-            std::string_view::npos) {
-            throw std::runtime_error(
-                "rated-peak denominator is declared only for RTX 3090");
+        // A rated peak is a per-card datum, not a precondition. Refusing to
+        // run on anything but an RTX 3090 made a generic BF16 GEMM probe
+        // unusable on every other GPU, for a denominator that only scales the
+        // reported fraction. An unknown card now reports raw GFLOPS and omits
+        // the fraction, which is the honest output rather than no output.
+        rated_dense_bf16_tensor_gflops =
+            rated_dense_bf16_peak(properties.name);
+        if (rated_dense_bf16_tensor_gflops == 0.0) {
+            std::cerr << "note: no rated dense BF16 tensor peak is declared for \""
+                      << properties.name
+                      << "\"; reporting absolute GFLOPS without a fraction. Add "
+                         "it to rated_dense_bf16_peak to get one.\n";
         }
         cudaStream_t stream = nullptr;
         cublasHandle_t handle = nullptr;
@@ -525,7 +549,7 @@ int main(int argc, char** argv) {
                   << "  \"device_index\": " << device << ",\n"
                   << "  \"device_name\": \"" << properties.name << "\",\n"
                   << "  \"rated_dense_bf16_tensor_gflops\": "
-                  << kRtx3090DenseBf16TensorGflops << ",\n"
+                  << rated_dense_bf16_tensor_gflops << ",\n"
                   << "  \"warmups\": " << kWarmups << ",\n"
                   << "  \"samples\": " << kSamples << ",\n"
                   << "  \"relative_error_denominator_floor\": 0.000000100,\n"

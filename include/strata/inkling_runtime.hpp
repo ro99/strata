@@ -16,7 +16,10 @@
 namespace strata {
 
 struct InklingRuntimeConfig {
-    std::vector<int> devices{0, 1, 2};
+    // Empty means every visible device. The old default named three GPUs
+    // because the development box had three; on a one- or two-GPU machine it
+    // silently claimed devices that were not there.
+    std::vector<int> devices;
     // Fraction of each device's free VRAM the runtime may claim. What the
     // resident spine does not use becomes routed-expert cache.
     double vram_cache_fraction{0.85};

@@ -89,7 +89,9 @@ ValidationResult Dsv4HostMoeExecutor::initialize() {
         (node_lanes_[0].size() != workers_->size() / kShards ||
          node_lanes_[1].size() != workers_->size() / kShards)) {
         result.errors.emplace_back(
-            "DeepSeek host-MoE production executor requires 24 workers per NUMA node");
+            "DeepSeek host-routed MoE needs its workers split evenly across "
+                "the NUMA nodes; got " + std::to_string(workers_->size()) +
+                " across " + std::to_string(node_lanes_.size()) + " nodes");
         return result;
     }
     if (!both_shards_ && node_lanes_[shard_index_].size() != workers_->size()) {

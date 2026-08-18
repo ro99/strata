@@ -1,6 +1,9 @@
 #include "strata/runtime_support.hpp"
 
 #include "strata/cuda_backend.hpp"
+#include "strata/hardware_profile.hpp"
+
+#include "strata/cuda_backend.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -63,6 +66,9 @@ ValidationResult validate_common_runtime_config(
     double sampling_temperature, std::string_view model_label) {
     ValidationResult result;
     if (devices.empty()) {
+        // Reached only when the caller passed an explicitly empty list AND the
+        // machine reports no CUDA device; resolve_runtime_devices below turns
+        // "unset" into the visible set before this runs.
         result.errors.emplace_back(std::string(model_label) +
                                    " runtime requires at least one CUDA device");
     }
@@ -291,6 +297,16 @@ ChatPrompt prepare_chat_prompt(const ChatPromptRequest& request) {
             return prompt;
         }
     }
+}
+
+
+std::vector<int> resolve_runtime_devices(std::vector<int> requested) {
+    if (!requested.empty()) return requested;
+    // Every device the process can see. Asking the backend is why this lives
+    // in strata_engine rather than beside the rest of the hardware profile in
+    // strata_platform, which must not depend on strata_device -- both lints
+    // caught that inversion when it was tried the other way.
+    return CudaBackend::available_devices();
 }
 
 }  // namespace strata

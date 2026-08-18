@@ -9303,7 +9303,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
         if (impl_->expert_node_lanes[0].size() != workers / 2U ||
             impl_->expert_node_lanes[1].size() != workers / 2U) {
             result.errors.emplace_back(
-                "DeepSeek host-routed MoE requires 24 workers per NUMA node");
+                "DeepSeek host-routed MoE needs its workers split evenly across "
+                "the NUMA nodes");
             return result;
         }
         constexpr std::size_t shards = 2U;

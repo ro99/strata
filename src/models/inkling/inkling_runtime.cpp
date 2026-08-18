@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
+#include <utility>
 #include <random>
 #include <thread>
 
@@ -755,6 +757,283 @@ struct InklingRuntime::Impl {
         return result;
     }
 
+    // Routed experts of one prefill page, grouped expert-major.
+    //
+    // The per-token path acquires a routed expert, uploads it, applies it to
+    // one row and releases it -- so a page of R rows pays for the same expert
+    // once per row that selected it. Inkling routes top-6 of 256 per row, so
+    // at R = 64 an expert chosen by 20 rows is fetched 20 times.
+    //
+    // Grouping inverts that: every distinct expert of the page is acquired
+    // once and applied to every row that chose it, in one batched command.
+    // enqueue_moe's batching is dense over expert x row, so the rows handed to
+    // it must be exactly that expert's rows -- passing the page's whole row
+    // set against the union of its experts would compute |union| * R products
+    // instead of R * 6, which is worse than not batching at all.
+    //
+    // Arithmetic is unchanged per row. Router weights are still applied on
+    // collection, after the down projection, because scaling before it is not
+    // float-equal to scaling after and the reference scales after.
+    ValidationResult moe_page(const LayerWeights& layer,
+                              const DeviceLayer& device, std::uint32_t index,
+                              std::span<const InklingRoute> routes,
+                              std::span<const float> inputs,
+                              std::span<float> outputs) {
+        ValidationResult result;
+        const auto rows = static_cast<std::uint32_t>(routes.size());
+        std::fill(outputs.begin(), outputs.end(), 0.0F);
+
+        // expert -> the (row, choice) slots that selected it. The choice index
+        // is carried because the reference sums a row's experts in choice
+        // order, and float addition is not associative: summing them in expert
+        // id order instead diverges from the token-at-a-time path in the last
+        // bits, which compounds over 42 layers. Contributions are therefore
+        // parked per slot and summed in choice order below.
+        std::map<std::uint32_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>>
+            selections;
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            for (std::uint32_t choice = 0U; choice < kTopK; ++choice) {
+                selections[routes[row].experts[choice]].emplace_back(row, choice);
+            }
+        }
+        std::vector<float> contributions(
+            static_cast<std::size_t>(rows) * kTopK * kHidden, 0.0F);
+
+        std::vector<float> gathered;
+        std::vector<float> collected;
+        for (const auto& [expert, members] : selections) {
+            CudaMoeExpert descriptor;
+            auto staged = expert_cache->acquire(device.slot, index, expert,
+                                                layer.expert_gate_up,
+                                                layer.expert_down);
+            if (!staged.ok()) {
+                result.errors = std::move(staged.errors);
+                return result;
+            }
+            descriptor = CudaMoeExpert{&staged.value->gate, &staged.value->up,
+                                       &staged.value->down, 1.0F};
+            graph.routed_expert_bytes += staged.value->device_bytes();
+
+            const auto member_rows = static_cast<std::uint32_t>(members.size());
+            gathered.resize(static_cast<std::size_t>(member_rows) * kHidden);
+            for (std::uint32_t position = 0U; position < member_rows;
+                 ++position) {
+                const auto source =
+                    static_cast<std::size_t>(members[position].first) * kHidden;
+                std::copy_n(inputs.begin() +
+                                static_cast<std::ptrdiff_t>(source),
+                            kHidden,
+                            gathered.begin() +
+                                static_cast<std::ptrdiff_t>(position) * kHidden);
+            }
+
+            const std::array<CudaMoeExpert, 1U> one{descriptor};
+            result = cuda.enqueue_moe(devices[device.slot], gathered,
+                                      member_rows, one, nullptr);
+            if (!result.ok()) {
+                expert_cache->release(device.slot, index, expert);
+                return result;
+            }
+            collected.assign(static_cast<std::size_t>(member_rows) * kHidden,
+                             0.0F);
+            result = cuda.collect_moe(devices[device.slot], collected, {});
+            expert_cache->release(device.slot, index, expert);
+            if (!result.ok()) return result;
+
+            for (std::uint32_t position = 0U; position < member_rows;
+                 ++position) {
+                const auto [row, choice] = members[position];
+                const auto* block =
+                    collected.data() +
+                    static_cast<std::size_t>(position) * kHidden;
+                auto* slot = contributions.data() +
+                             ((static_cast<std::size_t>(row) * kTopK) + choice) *
+                                 kHidden;
+                std::copy_n(block, kHidden, slot);
+            }
+        }
+
+        // Sum each row in choice order, exactly as the per-row path does.
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            auto* target = outputs.data() + static_cast<std::size_t>(row) * kHidden;
+            for (std::uint32_t choice = 0U; choice < kTopK; ++choice) {
+                const float weight = routes[row].weights[choice];
+                const auto* slot =
+                    contributions.data() +
+                    ((static_cast<std::size_t>(row) * kTopK) + choice) * kHidden;
+                for (std::uint32_t element = 0U; element < kHidden; ++element) {
+                    target[element] += weight * slot[element];
+                }
+            }
+        }
+
+        // Both sink experts run on every row, so this one is a genuine dense
+        // batch: the whole page against both, in a single command.
+        std::vector<CudaMoeExpert> sinks;
+        sinks.reserve(kShared);
+        for (std::uint32_t shared = 0U; shared < kShared; ++shared) {
+            sinks.push_back(CudaMoeExpert{&device.shared_gate[shared],
+                                          &device.shared_up[shared],
+                                          &device.shared_down[shared], 1.0F});
+        }
+        result = cuda.enqueue_moe(devices[device.slot], inputs, rows, sinks,
+                                  nullptr);
+        if (!result.ok()) return result;
+        std::vector<float> shared_collected(
+            static_cast<std::size_t>(sinks.size()) * rows * kHidden);
+        result = cuda.collect_moe(devices[device.slot], shared_collected, {});
+        if (!result.ok()) return result;
+        for (std::size_t sink = 0U; sink < sinks.size(); ++sink) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const float weight = routes[row].weights[kTopK + sink];
+                const auto* block =
+                    shared_collected.data() +
+                    ((sink * rows) + row) * kHidden;
+                auto* target =
+                    outputs.data() + static_cast<std::size_t>(row) * kHidden;
+                for (std::uint32_t element = 0U; element < kHidden; ++element) {
+                    target[element] += weight * block[element];
+                }
+            }
+        }
+        return result;
+    }
+
+    // Prefill a page of rows. Identical arithmetic to calling forward() once
+    // per token -- this is a scheduling change, not a numerical one.
+    //
+    // Two of the three stages in a block carry row-ordered state and stay
+    // serial: attention appends this row's K/V before attending, and the four
+    // short convolutions roll over the previous kConvTaps rows. The feed
+    // forward between them has no cross-row state at all, which is the whole
+    // reason a page can be batched here and nowhere else in this graph.
+    //
+    // So a page runs each layer in three passes: attention row by row in
+    // order, then one batched MoE over the whole page, then the MLP
+    // convolution and residual row by row in order.
+    ValidationResult forward_page(std::span<const std::uint32_t> tokens,
+                                  std::uint64_t base_position,
+                                  std::vector<float>& hidden_rows) {
+        ValidationResult result;
+        const auto rows = static_cast<std::uint32_t>(tokens.size());
+        if (rows == 0U) return result;
+        hidden_rows.assign(static_cast<std::size_t>(rows) * kHidden, 0.0F);
+
+        auto started = std::chrono::steady_clock::now();
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            auto slice = std::span<float>(hidden_rows)
+                             .subspan(static_cast<std::size_t>(row) * kHidden,
+                                      kHidden);
+            std::vector<float> one(kHidden, 0.0F);
+            result = embed(tokens[row], one);
+            if (!result.ok()) return result;
+            std::copy(one.begin(), one.end(), slice.begin());
+        }
+        graph.embedding_nanoseconds += elapsed_since(started);
+
+        std::vector<float> normalized(static_cast<std::size_t>(rows) * kHidden);
+        std::vector<float> deltas(static_cast<std::size_t>(rows) * kHidden);
+        std::vector<InklingRoute> routes(rows);
+        std::vector<float> row_delta(kHidden);
+
+        for (std::uint32_t index = 0U; index < kLayers; ++index) {
+            const auto& layer = layers[index];
+            const auto& device = device_layers[index];
+            auto& layer_state = state[index];
+
+            // Attention: strictly in row order, so each row sees exactly the
+            // keys and values of the rows before it.
+            started = std::chrono::steady_clock::now();
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                auto hidden = std::span<float>(hidden_rows)
+                                  .subspan(static_cast<std::size_t>(row) * kHidden,
+                                           kHidden);
+                auto norm = std::span<float>(normalized)
+                                .subspan(static_cast<std::size_t>(row) * kHidden,
+                                         kHidden);
+                rms_norm(norm, hidden, layer.attention.attention_norm);
+                result = attention(layer.attention, device, layer_state, norm,
+                                   base_position + row, row_delta);
+                if (!result.ok()) return result;
+                for (std::uint32_t element = 0U; element < kHidden; ++element) {
+                    hidden[element] += row_delta[element];
+                }
+            }
+            graph.attention_nanoseconds += elapsed_since(started);
+
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                auto hidden = std::span<const float>(hidden_rows)
+                                  .subspan(static_cast<std::size_t>(row) * kHidden,
+                                           kHidden);
+                auto norm = std::span<float>(normalized)
+                                .subspan(static_cast<std::size_t>(row) * kHidden,
+                                         kHidden);
+                rms_norm(norm, hidden, layer.attention.mlp_norm);
+            }
+
+            // The one batched stage.
+            const bool batchable =
+                layer.sparse && cuda_enabled && device.resident;
+            if (batchable) {
+                started = std::chrono::steady_clock::now();
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    auto norm = std::span<const float>(normalized)
+                                    .subspan(static_cast<std::size_t>(row) * kHidden,
+                                             kHidden);
+                    std::vector<float> logits(layer.gate.rows);
+                    result = spine_matvec(device.gate, layer.gate, norm, logits);
+                    if (!result.ok()) return result;
+                    auto route = inkling_route_sigmoid_sink(
+                        logits, layer.gate_bias, router, kShared,
+                        layer.gate_global_scale);
+                    if (!route.ok()) {
+                        result.errors = std::move(route.errors);
+                        return result;
+                    }
+                    routes[row] = std::move(route.value);
+                }
+                graph.moe_router_nanoseconds += elapsed_since(started);
+                started = std::chrono::steady_clock::now();
+                result = moe_page(layer, device, index, routes, normalized,
+                                  deltas);
+                if (!result.ok()) return result;
+                graph.moe_routed_nanoseconds += elapsed_since(started);
+            } else {
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    auto norm = std::span<const float>(normalized)
+                                    .subspan(static_cast<std::size_t>(row) * kHidden,
+                                             kHidden);
+                    auto out = std::span<float>(deltas)
+                                   .subspan(static_cast<std::size_t>(row) * kHidden,
+                                            kHidden);
+                    result = layer.sparse
+                        ? moe(layer, device, index, norm, out)
+                        : dense_mlp(layer.dense_gate_up, layer.dense_down,
+                                    layer.dense_global_scale, &device, norm, out);
+                    if (!result.ok()) return result;
+                }
+            }
+
+            // MLP convolution and residual: row order again, for conv history.
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                auto out = std::span<float>(deltas)
+                               .subspan(static_cast<std::size_t>(row) * kHidden,
+                                        kHidden);
+                result = short_conv(layer_state, layer.attention, kConvMlp, out);
+                if (!result.ok()) return result;
+                auto hidden = std::span<float>(hidden_rows)
+                                  .subspan(static_cast<std::size_t>(row) * kHidden,
+                                           kHidden);
+                for (std::uint32_t element = 0U; element < kHidden; ++element) {
+                    hidden[element] += out[element];
+                }
+            }
+        }
+        graph.forward_tokens += rows;
+        trim_sliding_caches();
+        return result;
+    }
+
     ValidationResult forward(std::uint32_t token, std::uint64_t token_position,
                              std::vector<float>& hidden) {
         hidden.assign(kHidden, 0.0F);
@@ -1444,7 +1723,31 @@ ValidationResult InklingRuntime::forward_logits(
     impl_->reset_sequence();
     logits.clear();
     logits.reserve(tokens.size());
+    const auto page = impl_->config.prefill_page_tokens;
     std::vector<float> hidden;
+    if (page > 1U) {
+        std::vector<float> rows_hidden;
+        for (std::size_t begin = 0U; begin < tokens.size(); begin += page) {
+            const auto count =
+                std::min<std::size_t>(page, tokens.size() - begin);
+            result = impl_->forward_page(tokens.subspan(begin, count), begin,
+                                         rows_hidden);
+            if (!result.ok()) return result;
+            for (std::size_t row = 0U; row < count; ++row) {
+                std::vector<float> single(
+                    rows_hidden.begin() +
+                        static_cast<std::ptrdiff_t>(row * kHidden),
+                    rows_hidden.begin() +
+                        static_cast<std::ptrdiff_t>((row + 1U) * kHidden));
+                std::vector<float> out;
+                result = impl_->logits_from_hidden(single, out);
+                if (!result.ok()) return result;
+                logits.push_back(std::move(out));
+            }
+        }
+        impl_->position = tokens.size();
+        return result;
+    }
     for (std::size_t index = 0U; index < tokens.size(); ++index) {
         result = impl_->forward(tokens[index], index, hidden);
         if (!result.ok()) return result;

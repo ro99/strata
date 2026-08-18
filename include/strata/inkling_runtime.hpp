@@ -29,6 +29,13 @@ struct InklingRuntimeConfig {
     // waits on storage instead of on PCIe.
     bool warm_expert_pages{true};
     std::uint32_t maximum_context_tokens{2048U};
+    // Rows per prefill page. Zero or one keeps the token-at-a-time path.
+    // Above one, a page runs attention and the short convolutions row by row
+    // in order -- both carry row-ordered state -- and batches the routed MoE
+    // between them expert-major, so each distinct expert of the page is
+    // fetched once instead of once per row that selected it. Arithmetic is
+    // identical either way; this is a scheduling change.
+    std::uint32_t prefill_page_tokens{};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     bool verbose{};

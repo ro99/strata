@@ -1,5 +1,7 @@
 #include "strata/dsv4_rank_local_topology.hpp"
 
+#include "strata/hardware_profile.hpp"
+
 #include <algorithm>
 #include <iterator>
 #include <limits>
@@ -168,8 +170,20 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
             "declares " + std::to_string(request.layer_count));
     }
 
-    auto cpu_plan = plan_dsv4_rank_local_cpus(
-        topology, kDsv4RankLocalMinimumCpusPerRank, result.rank_cpus);
+    // Width comes from the machine, not from a constant. The old
+    // kDsv4RankLocalMinimumCpusPerRank was doing two jobs at once -- the floor
+    // below which a rank cannot work, and the pool width to actually assign --
+    // and 24 was only ever correct for both on the box it was measured on.
+    // The width is now the smallest node's CPU count (24 there, unchanged),
+    // and the constant is only the floor.
+    std::size_t width = 0U;
+    for (const auto& cpus : topology.node_cpus) {
+        if (cpus.empty()) continue;
+        if (width == 0U || cpus.size() < width) width = cpus.size();
+    }
+    width = std::max(width, kDsv4RankLocalMinimumCpusPerRank);
+    auto cpu_plan =
+        plan_dsv4_rank_local_cpus(topology, width, result.rank_cpus);
     if (!cpu_plan.ok()) {
         result.errors.insert(result.errors.end(), cpu_plan.errors.begin(),
                              cpu_plan.errors.end());
@@ -183,7 +197,12 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
     for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
         const auto& account = request.device[rank];
         const auto fixed = account.fixed_total();
-        const auto ceiling = request.per_device_vram_ceiling_bytes;
+        // Zero means "derive from this device". A caller that supplies a
+        // figure is stating an explicit operator ceiling and gets it verbatim.
+        const auto ceiling =
+            request.per_device_vram_ceiling_bytes != 0U
+                ? request.per_device_vram_ceiling_bytes
+                : dsv4_rank_local_vram_ceiling(account.device_total_bytes);
         if (fixed > ceiling) {
             result.errors.emplace_back(
                 "rank " + std::to_string(rank) + " fixed residency " +
@@ -209,13 +228,16 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
     }
 
     result.host_total_bytes = request.host.total();
-    if (result.host_total_bytes > request.host_rss_ceiling_bytes) {
+    const auto host_ceiling = request.host_rss_ceiling_bytes != 0U
+        ? request.host_rss_ceiling_bytes
+        : dsv4_rank_local_host_rss_ceiling();
+    if (result.host_total_bytes > host_ceiling) {
         result.errors.emplace_back(
             "host residency " + std::to_string(result.host_total_bytes) +
             " B exceeds the host ceiling " +
-            std::to_string(request.host_rss_ceiling_bytes) + " B by " +
+            std::to_string(host_ceiling) + " B by " +
             std::to_string(result.host_total_bytes -
-                           request.host_rss_ceiling_bytes) + " B");
+                           host_ceiling) + " B");
     }
 
     if (!result.ok()) {
@@ -225,6 +247,11 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
         for (auto& cpus : result.rank_cpus) cpus.clear();
     }
     return result;
+}
+
+
+std::uint64_t dsv4_rank_local_host_rss_ceiling() noexcept {
+    return host_hardware_profile().host_usable_bytes();
 }
 
 }  // namespace strata

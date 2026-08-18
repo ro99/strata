@@ -27,7 +27,7 @@ struct Options {
     bool detailed_timing{};
     bool flash_attention{};
     bool host_cold_experts{};
-    std::uint32_t host_worker_threads{36U};
+    std::uint32_t host_worker_threads{};  // zero: derived from the hardware profile
     std::string route_trace;
 };
 

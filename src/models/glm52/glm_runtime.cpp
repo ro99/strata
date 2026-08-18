@@ -1,5 +1,7 @@
 #include "strata/glm_runtime.hpp"
 
+#include "strata/hardware_profile.hpp"
+
 #include "../common/cuda_stats_delta.hpp"
 
 #include "strata/attention_reference.hpp"
@@ -1803,7 +1805,8 @@ Glm52Runtime::Glm52Runtime(Glm52Runtime&&) noexcept = default;
 Glm52Runtime& Glm52Runtime::operator=(Glm52Runtime&&) noexcept = default;
 
 ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
-                                          const Glm52RuntimeConfig& config) {
+                                          const Glm52RuntimeConfig& caller_config) {
+    Glm52RuntimeConfig config(caller_config);
     ValidationResult result;
     if (impl_->initialized) {
         result.errors.emplace_back("GLM runtime is already initialized");
@@ -1820,8 +1823,13 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
             "GLM runtime context exceeds the declared model ceiling");
         return result;
     }
-    if (config.host_cold_experts &&
-        (config.host_worker_threads == 0U || config.host_worker_threads > 256U)) {
+    // Zero means "ask the hardware" rather than "invalid": the default is now
+    // derived from this process's CPU affinity mask instead of the 36 that was
+    // measured on one machine. An explicit out-of-range value is still an error.
+    if (config.host_worker_threads == 0U) {
+        config.host_worker_threads = host_hardware_profile().worker_threads();
+    }
+    if (config.host_cold_experts && config.host_worker_threads > 256U) {
         result.errors.emplace_back("host expert worker count must be in [1, 256]");
         return result;
     }

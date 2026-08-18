@@ -27,14 +27,14 @@ struct Options {
     std::uint32_t prefill_page_tokens{64U};
     std::uint32_t prefill_layer_tile_tokens{};
     std::uint32_t logit_trace_top_k{20U};
-    std::uint32_t host_attention_threads{28U};
+    std::uint32_t host_attention_threads{};  // zero: derived from the hardware profile
     std::uint32_t flash_attention_minimum_rows{};
-    std::uint32_t resident_read_workers{8U};
-    std::uint32_t spine_warmup_workers{3U};
+    std::uint32_t resident_read_workers{};  // zero: derived from the hardware profile
+    std::uint32_t spine_warmup_workers{};  // zero: derived from the hardware profile
     std::uint32_t expert_prefetch_predictions{};
     std::uint32_t expert_prefetch_queue_depth{8U};
     std::uint32_t expert_prefetch_lease_ticks{16U};
-    std::uint64_t host_memory_bytes{216ULL << 30U};
+    std::uint64_t host_memory_bytes{};  // zero: derived from the hardware profile
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     bool pin_resident_arena{};
     bool serial_expert_upload{};

@@ -1,5 +1,7 @@
 #include "strata/placement.hpp"
 
+#include "strata/hardware_profile.hpp"
+
 #include "strata/checkpoint.hpp"
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_admission.hpp"
@@ -27,10 +29,9 @@ constexpr std::uint64_t kDeepSeekDeviceWorkspaceReserve = 256ULL << 20U;
 // alongside 7168- and 3584-wide activations and the 96-head KDA state.
 constexpr std::uint64_t kKimiDeviceWorkspaceReserve = 1536ULL << 20U;
 constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
-// Mirrors Dsv4RuntimeConfig::host_memory_limit_bytes, the ceiling strata-chat
-// and strata-server run DeepSeek under. Planning against all free host memory
-// would report a fit its own admission then refuses.
-constexpr std::uint64_t kDeepSeekHostMemoryLimit = 216ULL << 30U;
+// The same ceiling Dsv4RuntimeConfig applies, taken from the same place, so
+// the two cannot drift. Planning against all free host memory would report a
+// fit that DeepSeek's own admission then refuses.
 
 [[nodiscard]] std::string module_base(std::string_view name) {
     const auto dot = name.rfind('.');
@@ -967,7 +968,7 @@ struct OpenCheckpoints {
                 checkpoints.deepseek->manifest(), scoped,
                 admitted_budgets(hardware, request.vram_cache_fraction),
                 std::min(hardware.host_available_bytes,
-                         kDeepSeekHostMemoryLimit),
+                         host_hardware_profile().host_usable_bytes()),
                 admission_notes);
         case PlacementModel::KimiK3:
             return build_kimi_k3_inventory(checkpoints.kimi->manifest(),

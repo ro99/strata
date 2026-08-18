@@ -25,7 +25,8 @@ struct Glm52RuntimeConfig {
     bool enable_flash_attention{};
     bool enable_incremental_kv_continuation{true};
     bool host_cold_experts{};
-    std::uint32_t host_worker_threads{36};
+    // Zero derives from the process's CPU affinity mask.
+    std::uint32_t host_worker_threads{};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     std::string route_trace_path;

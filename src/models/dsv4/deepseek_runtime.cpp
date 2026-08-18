@@ -15,6 +15,7 @@
 #include "strata/dsv4_rank_local_layer_executor.hpp"
 #endif
 #include "strata/model_adapter.hpp"
+#include "strata/hardware_profile.hpp"
 #include "strata/numa_topology.hpp"
 #include "strata/numerics.hpp"
 #include "strata/route_predictor.hpp"
@@ -94,6 +95,39 @@ constexpr std::uint32_t kMaximumPrefillPageTokens = 8192U;
 constexpr float kRmsEpsilon = kDeepSeekV4ExecutionContract.rms_epsilon;
 constexpr float kAttentionScale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
 static_assert(kHeads == 2U * kPhysicalPagedHeads);
+
+// The rank-local per-device VRAM ceiling, as a fraction of what the card
+// actually reports rather than the byte count measured on one 24 GiB card.
+// Zero when the device cannot be queried, which admission treats as "no
+// headroom" and rejects, never as "unlimited".
+// Fills in every config field whose zero means "ask the hardware". Applied
+// once at initialize so the rest of the runtime sees concrete numbers and no
+// later code has to know which defaults were probed.
+void resolve_hardware_defaults(Dsv4RuntimeConfig& config) noexcept {
+    const auto& profile = host_hardware_profile();
+    if (config.host_memory_limit_bytes == 0U) {
+        config.host_memory_limit_bytes = profile.host_usable_bytes();
+    }
+    if (config.host_attention_threads == 0U) {
+        config.host_attention_threads = profile.worker_threads(0.5);
+    }
+    if (config.resident_read_workers == 0U) {
+        // Storage staging saturates well below core count; more readers past
+        // this contend on the same queue rather than adding bandwidth.
+        config.resident_read_workers =
+            std::min<std::uint32_t>(profile.worker_threads(0.15), 8U);
+    }
+    if (config.spine_warmup_workers == 0U) {
+        config.spine_warmup_workers =
+            std::min<std::uint32_t>(profile.worker_threads(0.05), 3U);
+    }
+}
+
+[[nodiscard]] std::uint64_t rank_local_vram_ceiling(int device) noexcept {
+    const auto memory = CudaBackend::device_memory(device);
+    if (!memory.ok()) return 0U;
+    return dsv4_rank_local_vram_ceiling(memory.value.total_bytes);
+}
 
 [[nodiscard]] std::string layer_prefix(std::uint32_t layer) {
     return "layers." + std::to_string(layer) + ".";
@@ -6760,6 +6794,14 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
     request.host.kv_state_bytes = memory.kv_state_bytes;
     request.host.host_workspace_bytes = memory.host_workspace_bytes;
 
+    // The cards' real capacities, so the ceiling is a fraction of this
+    // machine rather than of the one the constant was measured on.
+    for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+        const auto memory = CudaBackend::device_memory(devices[rank]);
+        if (memory.ok()) {
+            request.device[rank].device_total_bytes = memory.value.total_bytes;
+        }
+    }
     auto admitted = admit_dsv4_rank_local(request, NumaTopology::detect());
     if (!admitted.ok()) {
         store->clear();
@@ -6796,16 +6838,15 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
         return result;
     }
     for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-        if (rank_local_actual_device_vram_bytes[rank] >
-            kDsv4RankLocalPerDeviceVramCeiling) {
+        const auto ceiling = rank_local_vram_ceiling(devices[rank]);
+        if (rank_local_actual_device_vram_bytes[rank] > ceiling) {
             store->clear();
             result.errors.emplace_back(
                 "rank-local CUDA device " +
                 std::to_string(devices[rank]) + " uses " +
                 std::to_string(rank_local_actual_device_vram_bytes[rank]) +
                 " B after setup, above the " +
-                std::to_string(kDsv4RankLocalPerDeviceVramCeiling) +
-                " B program ceiling");
+                std::to_string(ceiling) + " B program ceiling");
         }
     }
     if (!result.ok()) return result;
@@ -8757,7 +8798,12 @@ DeepSeekV4Runtime::DeepSeekV4Runtime(DeepSeekV4Runtime&&) noexcept = default;
 DeepSeekV4Runtime& DeepSeekV4Runtime::operator=(DeepSeekV4Runtime&&) noexcept = default;
 
 ValidationResult DeepSeekV4Runtime::initialize(
-    const std::string& model_directory, const Dsv4RuntimeConfig& config) {
+    const std::string& model_directory, const Dsv4RuntimeConfig& caller_config) {
+    // Every zero-means-probe field is filled in here, once, so nothing below
+    // this line has to know which numbers came from the caller and which from
+    // the machine.
+    Dsv4RuntimeConfig config(caller_config);
+    resolve_hardware_defaults(config);
     ValidationResult result;
     const auto initialization_started = std::chrono::steady_clock::now();
     if (impl_->initialized) {
@@ -8944,18 +8990,17 @@ ValidationResult DeepSeekV4Runtime::initialize(
              ++slot) {
             const auto initial =
                 impl_->rank_local_initial_device_vram_bytes[slot];
-            if (initial >= kDsv4RankLocalPerDeviceVramCeiling) {
+            const auto ceiling = rank_local_vram_ceiling(config.devices[slot]);
+            if (initial >= ceiling) {
                 result.errors.emplace_back(
                     "rank-local CUDA device " +
                     std::to_string(config.devices[slot]) +
                     " already uses " + std::to_string(initial) +
                     " B, which leaves no room below the " +
-                    std::to_string(kDsv4RankLocalPerDeviceVramCeiling) +
-                    " B program ceiling");
+                    std::to_string(ceiling) + " B program ceiling");
                 return result;
             }
-            const auto available =
-                kDsv4RankLocalPerDeviceVramCeiling - initial;
+            const auto available = ceiling - initial;
             effective_explicit_vram_budget =
                 effective_explicit_vram_budget == 0U
                     ? available

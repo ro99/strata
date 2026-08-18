@@ -1,0 +1,91 @@
+#include "strata/hardware_profile.hpp"
+
+#include <algorithm>
+#include <charconv>
+#include <fstream>
+#include <string>
+#include <string_view>
+#include <thread>
+
+#include <sched.h>
+
+namespace strata {
+
+namespace {
+
+// MemTotal from /proc/meminfo, in bytes. Zero when unreadable -- the caller
+// distinguishes that from a real answer, so an unreadable file must not fall
+// back to a plausible-looking guess.
+[[nodiscard]] std::uint64_t read_host_memory_bytes() noexcept {
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo) return 0U;
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        constexpr std::string_view key = "MemTotal:";
+        if (line.compare(0U, key.size(), key) != 0) continue;
+        std::string_view rest(line);
+        rest.remove_prefix(key.size());
+        while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1U);
+        std::uint64_t kibibytes = 0U;
+        const auto* begin = rest.data();
+        const auto parsed =
+            std::from_chars(begin, begin + rest.size(), kibibytes);
+        if (parsed.ec != std::errc{}) return 0U;
+        return kibibytes * 1024U;
+    }
+    return 0U;
+}
+
+// The process's CPU affinity mask, not the machine's CPU count: a cgroup or a
+// taskset makes those differ, and threads beyond the mask only contend.
+[[nodiscard]] std::size_t read_usable_cpus() noexcept {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        const int count = CPU_COUNT(&set);
+        if (count > 0) return static_cast<std::size_t>(count);
+    }
+    const auto concurrency = std::thread::hardware_concurrency();
+    return concurrency == 0U ? 1U : static_cast<std::size_t>(concurrency);
+}
+
+[[nodiscard]] HardwareProfile probe() {
+    HardwareProfile profile;
+    profile.host_memory_bytes = read_host_memory_bytes();
+    profile.usable_cpus = read_usable_cpus();
+    profile.numa = NumaTopology::detect();
+    std::size_t smallest = 0U;
+    for (const auto& cpus : profile.numa.node_cpus) {
+        if (cpus.empty()) continue;
+        if (smallest == 0U || cpus.size() < smallest) smallest = cpus.size();
+    }
+    // A machine sysfs reports as single-node still has all its CPUs on that
+    // one node, so the minimum is the whole mask rather than zero.
+    profile.minimum_cpus_per_node =
+        smallest != 0U ? smallest : profile.usable_cpus;
+    return profile;
+}
+
+}  // namespace
+
+std::uint64_t HardwareProfile::host_usable_bytes(
+    double fraction) const noexcept {
+    if (host_memory_bytes == 0U) return 0U;
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    return static_cast<std::uint64_t>(
+        static_cast<double>(host_memory_bytes) * clamped);
+}
+
+std::uint32_t HardwareProfile::worker_threads(double fraction) const noexcept {
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    const auto scaled = static_cast<std::size_t>(
+        static_cast<double>(usable_cpus) * clamped);
+    return static_cast<std::uint32_t>(std::max<std::size_t>(scaled, 1U));
+}
+
+const HardwareProfile& host_hardware_profile() {
+    static const HardwareProfile profile = probe();
+    return profile;
+}
+
+}  // namespace strata

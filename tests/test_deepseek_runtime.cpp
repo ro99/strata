@@ -17,9 +17,13 @@ TEST_CASE("DeepSeek fast exact execution defaults are enabled") {
     REQUIRE(!config.enable_logit_trace);
     REQUIRE(!config.enable_layer_hash_trace);
     REQUIRE(config.logit_trace_top_k == 20U);
-    REQUIRE(config.host_attention_threads == 28U);
-    REQUIRE(config.resident_read_workers == 8U);
-    REQUIRE(config.spine_warmup_workers == 3U);
+    // Zero is the new default and means "ask the hardware profile"; the
+    // concrete widths (28 / 8 / 3 on the box these were measured on) are
+    // resolved in DeepSeekV4Runtime::initialize, not baked into the struct.
+    REQUIRE(config.host_attention_threads == 0U);
+    REQUIRE(config.resident_read_workers == 0U);
+    REQUIRE(config.spine_warmup_workers == 0U);
+    REQUIRE(config.host_memory_limit_bytes == 0U);
     REQUIRE(config.prepack_mhc_projection);
     REQUIRE(config.expert_prefetch_predictions == 0U);
     REQUIRE(config.expert_prefetch_queue_depth == 8U);

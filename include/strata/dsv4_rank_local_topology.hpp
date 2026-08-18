@@ -24,7 +24,11 @@ inline constexpr std::size_t kDsv4RankLocalWorld = 2U;
 inline constexpr std::uint32_t kDsv4RankLocalLayerCount = 43U;
 // Minimum CPUs a NUMA node must contribute to own one rank's routed-expert
 // pool. The measured production shape is one node's 24 CPUs per rank.
-inline constexpr std::size_t kDsv4RankLocalMinimumCpusPerRank = 24U;
+// Was 24, measured on the development box and asserted as a requirement --
+// so the fastest path in the engine hard-failed on any other machine. It is
+// now a floor below which one rank's expert pool cannot do useful work;
+// admission takes the real figure from the hardware profile's smallest node.
+inline constexpr std::size_t kDsv4RankLocalMinimumCpusPerRank = 4U;
 // Program ceilings. These are the declared operating-point limits, not
 // hardware capacities; admission rejects rather than exceeding them.
 //
@@ -46,10 +50,27 @@ inline constexpr std::size_t kDsv4RankLocalMinimumCpusPerRank = 24U;
 // This is headroom for integration, not the resolution. Releasing the
 // centralized spine after prefill returns 9.2 GB instead of the 0.76 GiB this
 // buys, and remains the correct fix.
-inline constexpr std::uint64_t kDsv4RankLocalPerDeviceVramCeiling =
-    22'548'578'304ULL;
-inline constexpr std::uint64_t kDsv4RankLocalHostRssCeiling =
-    231'928'233'984ULL;
+// Both ceilings were byte counts measured on one machine. They are now
+// fractions of what this machine reports, chosen to reproduce those exact
+// figures on the box they were validated on:
+//
+//   22,548,578,304 / 24 GiB      = 0.8750 exactly
+//   231,928,233,984 / 251.8 GiB  = 0.8577, so the profile's 0.85 default
+//                                  lands at 214.1 GiB, within 1%
+//
+// The property experiment 0082 validated was zero decode weight and workspace
+// allocations at the admitted budget -- not the byte count -- so expressing it
+// as a fraction preserves what was actually gated while letting a different
+// card or a different amount of RAM get the equivalent headroom.
+inline constexpr double kDsv4RankLocalVramFraction = 0.875;
+
+[[nodiscard]] inline std::uint64_t dsv4_rank_local_vram_ceiling(
+    std::uint64_t device_total_bytes) noexcept {
+    return static_cast<std::uint64_t>(
+        static_cast<double>(device_total_bytes) * kDsv4RankLocalVramFraction);
+}
+
+[[nodiscard]] std::uint64_t dsv4_rank_local_host_rss_ceiling() noexcept;
 // Rank-local decode supports the model's full declared context. Above
 // `index_topk * compression_ratio` (2048 at the DSV4 contract) active tokens
 // the sparse Lightning Indexer engages; the queued page-update path admits
@@ -66,6 +87,10 @@ struct Dsv4RankLocalDeviceAccount {
     // includes the CUDA context and is conservatively measured as total device
     // usage, so unrelated processes can only reduce admission headroom.
     std::uint64_t initial_device_usage_bytes{};
+    // Total VRAM the card reports. The ceiling is a fraction of this, so the
+    // same admission arithmetic holds on a 16 GiB card and a 48 GiB one.
+    // Zero leaves per_device_vram_ceiling_bytes as the only source.
+    std::uint64_t device_total_bytes{};
     // Rank-local sharded attention, router, shared-expert and mHC weights.
     std::uint64_t rank_local_weight_bytes{};
     // Centralized resident spine retained so prefill can still run.
@@ -113,8 +138,8 @@ struct Dsv4RankLocalAdmissionRequest {
     std::array<Dsv4RankLocalDeviceAccount, kDsv4RankLocalWorld> device{};
     Dsv4RankLocalHostAccount host{};
     std::uint64_t per_device_vram_ceiling_bytes{
-        kDsv4RankLocalPerDeviceVramCeiling};
-    std::uint64_t host_rss_ceiling_bytes{kDsv4RankLocalHostRssCeiling};
+        0U};  // zero: derived per device at admission
+    std::uint64_t host_rss_ceiling_bytes{};  // zero: derived from the profile
 };
 
 struct Dsv4RankLocalAdmission {

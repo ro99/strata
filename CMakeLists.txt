@@ -59,6 +59,7 @@ add_library(strata_platform STATIC
     src/platform/compressed_tensors.cpp
     src/platform/diagnostics.cpp
     src/platform/diagnostics_json.cpp
+    src/platform/hardware_profile.cpp
     src/platform/json_cursor.cpp
     src/platform/numa_topology.cpp
     src/platform/numerics.cpp

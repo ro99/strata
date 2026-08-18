@@ -15,7 +15,10 @@
 namespace strata {
 
 struct Glm52RuntimeConfig {
-    std::vector<int> devices{0, 1, 2};
+    // Empty means every visible device. The old default named three GPUs
+    // because the development box had three; on a one- or two-GPU machine it
+    // silently claimed devices that were not there.
+    std::vector<int> devices;
     double vram_cache_fraction{0.85};
     std::uint32_t maximum_context_tokens{256};
     bool verbose{true};
@@ -25,7 +28,8 @@ struct Glm52RuntimeConfig {
     bool enable_flash_attention{};
     bool enable_incremental_kv_continuation{true};
     bool host_cold_experts{};
-    std::uint32_t host_worker_threads{36};
+    // Zero derives from the process's CPU affinity mask.
+    std::uint32_t host_worker_threads{};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     std::string route_trace_path;

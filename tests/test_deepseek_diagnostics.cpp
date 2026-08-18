@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/deepseek_diagnostics.hpp"
+#include "strata/diagnostics.hpp"
 
 #include <array>
 #include <limits>
@@ -9,8 +9,8 @@ TEST_CASE("DeepSeek diagnostic top-K ordering and summaries are deterministic") 
     constexpr std::array<float, 7> logits{
         1.0F, 3.0F, 3.0F, -2.0F, 2.0F,
         std::numeric_limits<float>::quiet_NaN(), 0.5F};
-    const auto first = strata::analyze_dsv4_logits(logits, 4U);
-    const auto second = strata::analyze_dsv4_logits(logits, 4U);
+    const auto first = strata::analyze_logits(logits, 4U);
+    const auto second = strata::analyze_logits(logits, 4U);
 
     REQUIRE(first.top.size() == 4U);
     REQUIRE(first.top[0].token_id == 1U);
@@ -34,9 +34,9 @@ TEST_CASE("DeepSeek BF16 hidden-state hash observes the declared rounding bounda
     constexpr std::array<float, 3> same_bf16{1.0001F, -2.0001F, 0.5001F};
     constexpr std::array<float, 3> different_bf16{1.01F, -2.0F, 0.5F};
 
-    const auto reference_hash = strata::dsv4_stable_bf16_hash(reference);
+    const auto reference_hash = strata::stable_bf16_hash(reference);
     REQUIRE(reference_hash == 0x5A24'B89C'D9CF'A12DULL);
-    REQUIRE(reference_hash == strata::dsv4_stable_bf16_hash(reference));
-    REQUIRE(reference_hash == strata::dsv4_stable_bf16_hash(same_bf16));
-    REQUIRE(reference_hash != strata::dsv4_stable_bf16_hash(different_bf16));
+    REQUIRE(reference_hash == strata::stable_bf16_hash(reference));
+    REQUIRE(reference_hash == strata::stable_bf16_hash(same_bf16));
+    REQUIRE(reference_hash != strata::stable_bf16_hash(different_bf16));
 }

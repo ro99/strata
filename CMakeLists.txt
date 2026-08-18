@@ -35,92 +35,166 @@ if(STRATA_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     set(STRATA_CUDA_SOURCE kernels/cuda/backend.cu)
     set(STRATA_HAS_CUDA ON)
 else()
-    set(STRATA_CUDA_SOURCE src/cuda_backend_stub.cpp)
+    set(STRATA_CUDA_SOURCE src/platform/cuda_backend_stub.cpp)
     set(STRATA_HAS_CUDA OFF)
 endif()
 
-add_library(strata_core STATIC
-    src/attention.cpp
-    src/chat_protocol.cpp
-    src/checkpoint.cpp
-    src/checkpoint_io.cpp
-    src/compressed_tensors.cpp
-    ${STRATA_CUDA_SOURCE}
-    src/glm_ops.cpp
-    src/gemma4_ops.cpp
-    src/gemma4_checkpoint.cpp
-    src/gemma4_image.cpp
-    src/gemma4_runtime.cpp
-    src/glm_runtime.cpp
-    src/glm_manifest.cpp
-    src/kimi_k3_ops.cpp
-    src/kimi_k3_manifest.cpp
-    src/kimi_k3_checkpoint.cpp
-    src/kimi_k3_kv_cache.cpp
-    src/kimi_k3_expert_arena.cpp
-    src/kimi_k3_layer.cpp
-    src/kimi_k3_runtime.cpp
-    src/laguna_ops.cpp
-    src/laguna_checkpoint.cpp
-    src/laguna_runtime.cpp
-    src/inkling_ops.cpp
-    src/inkling_checkpoint.cpp
-    src/inkling_device.cpp
-    src/inkling_runtime.cpp
-    src/deepseek_manifest.cpp
-    src/deepseek_kv_cache.cpp
-    src/dsv4_attention_kv.cpp
-    src/deepseek_ops.cpp
-    src/deepseek_diagnostics.cpp
-    src/deepseek_checkpoint.cpp
-    src/deepseek_rank_shard.cpp
-    src/dsv4_host_moe_executor.cpp
-    src/dsv4_rank_local_topology.cpp
-    src/dsv4_rank_local_kv.cpp
-    src/dsv4_rank_local_weights.cpp
-    src/deepseek_admission.cpp
-    src/deepseek_runtime.cpp
-    src/json_cursor.cpp
-    src/model.cpp
-    src/numerics.cpp
-    src/numa_topology.cpp
-    src/openai_protocol.cpp
-    src/placement.cpp
-    src/placement_cache.cpp
-    src/placement_model.cpp
-    src/safetensors.cpp
-    src/tokenizer.cpp
-    src/worker_pool.cpp
-    src/trace.cpp
-    src/route_predictor.cpp
-    src/runtime.cpp
-    src/runtime_support.cpp
-    src/residency.cpp
-    src/sampling.cpp
-    src/simulator.cpp
-    kernels/cpu/q4_reference.cpp
-    kernels/cpu/glm_int4.cpp
-    kernels/cpu/dsv4_fp4_expert.cpp
-)
+# Phase 1 (docs/experiments/0121): strata_core split into six layered
+# targets, dependencies pointing strictly downward:
+#   platform -> device -> kernels -> engine -> models -> app
+# Phase 3 subsequently moved the sources into per-tier directories, which is
+# why the paths below read src/platform/..., src/models/dsv4/... and so on.
+# There is still no per-target include directory, so the compiler alone cannot
+# catch a boundary violation: scripts/check_layers.py enforces the include
+# graph and scripts/check_symbols.py the link graph, and both run in
+# `make check`.
+#
+# strata_core is kept as a thin alias so every existing
+# `target_link_libraries(<binary> PRIVATE strata_core)` line below keeps
+# working unchanged; it forwards to strata_app, which pulls in the other
+# five PUBLICly through the chain.
 
-target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(strata_core PUBLIC STRATA_VERSION="${PROJECT_VERSION}")
+add_library(strata_platform STATIC
+    src/platform/attention.cpp
+    src/platform/checkpoint_io.cpp
+    src/platform/compressed_tensors.cpp
+    src/platform/diagnostics.cpp
+    src/platform/diagnostics_json.cpp
+    src/platform/hardware_profile.cpp
+    src/platform/json_cursor.cpp
+    src/platform/numa_topology.cpp
+    src/platform/numerics.cpp
+    src/platform/safetensors.cpp
+    src/platform/trace.cpp
+    src/platform/worker_pool.cpp
+)
+target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(strata_platform PUBLIC STRATA_VERSION="${PROJECT_VERSION}")
+
+add_library(strata_device STATIC
+    ${STRATA_CUDA_SOURCE}
+)
+target_include_directories(strata_device PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_device PUBLIC strata_platform)
 
 if(STRATA_HAS_CUDA)
-    set_property(TARGET strata_core PROPERTY CUDA_ARCHITECTURES 86 120)
-    set_property(TARGET strata_core PROPERTY CUDA_STANDARD 20)
-    set_property(TARGET strata_core PROPERTY CUDA_STANDARD_REQUIRED ON)
-    target_compile_definitions(strata_core PUBLIC STRATA_HAS_CUDA=1)
-    target_compile_options(strata_core PRIVATE
+    set_property(TARGET strata_device PROPERTY CUDA_ARCHITECTURES 86 120)
+    set_property(TARGET strata_device PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata_device PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(strata_device PUBLIC STRATA_HAS_CUDA=1)
+    target_compile_options(strata_device PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-Wall,-Wextra>
     )
 else()
-    target_compile_definitions(strata_core PUBLIC STRATA_HAS_CUDA=0)
+    target_compile_definitions(strata_device PUBLIC STRATA_HAS_CUDA=0)
 endif()
 
+add_library(strata_kernels STATIC
+    kernels/cpu/q4_reference.cpp
+    kernels/cpu/glm_int4.cpp
+    kernels/cpu/attention_reference.cpp
+)
+target_include_directories(strata_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_kernels PUBLIC strata_device)
+
+add_library(strata_engine STATIC
+    src/engine/chat_protocol.cpp
+    src/engine/placement.cpp
+    src/engine/placement_cache.cpp
+    src/engine/model_registry.cpp
+    src/engine/residency.cpp
+    src/engine/route_predictor.cpp
+    src/engine/runtime_support.cpp
+    src/engine/sampling.cpp
+    src/engine/simulator.cpp
+)
+target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_engine PUBLIC strata_kernels)
+
+add_library(strata_models STATIC
+    src/models/dsv4/dsv4_executor.cpp
+    src/models/glm52/glm52_executor.cpp
+    src/models/gemma4/gemma4_executor.cpp
+    src/models/kimi_k3/kimi_k3_executor.cpp
+    src/models/laguna/laguna_executor.cpp
+    src/models/inkling/inkling_executor.cpp
+    src/models/glm52/glm_ops.cpp
+    src/models/gemma4/gemma4_ops.cpp
+    src/models/gemma4/gemma4_checkpoint.cpp
+    src/models/gemma4/gemma4_image.cpp
+    src/models/gemma4/gemma4_runtime.cpp
+    src/models/glm52/glm_runtime.cpp
+    src/models/glm52/glm_manifest.cpp
+    src/models/kimi_k3/kimi_k3_ops.cpp
+    src/models/kimi_k3/kimi_k3_manifest.cpp
+    src/models/kimi_k3/kimi_k3_checkpoint.cpp
+    src/models/kimi_k3/kimi_k3_kv_cache.cpp
+    src/models/kimi_k3/kimi_k3_expert_arena.cpp
+    src/models/kimi_k3/kimi_k3_layer.cpp
+    src/models/kimi_k3/kimi_k3_runtime.cpp
+    src/models/laguna/laguna_ops.cpp
+    src/models/laguna/laguna_checkpoint.cpp
+    src/models/laguna/laguna_runtime.cpp
+    src/models/inkling/inkling_ops.cpp
+    src/models/inkling/inkling_checkpoint.cpp
+    src/models/inkling/inkling_device.cpp
+    src/models/inkling/inkling_runtime.cpp
+    src/models/dsv4/deepseek_manifest.cpp
+    src/models/dsv4/deepseek_kv_cache.cpp
+    src/models/dsv4/dsv4_attention_kv.cpp
+    src/models/dsv4/deepseek_ops.cpp
+    src/models/dsv4/deepseek_checkpoint.cpp
+    src/models/dsv4/deepseek_rank_shard.cpp
+    src/models/dsv4/dsv4_host_moe_executor.cpp
+    src/models/dsv4/dsv4_rank_local_topology.cpp
+    src/models/dsv4/dsv4_rank_local_kv.cpp
+    src/models/dsv4/dsv4_rank_local_weights.cpp
+    src/models/dsv4/deepseek_admission.cpp
+    src/models/dsv4/deepseek_runtime.cpp
+    src/models/common/model.cpp
+    src/models/common/placement_model.cpp
+    src/models/common/tokenizer.cpp
+    src/models/glm52/checkpoint.cpp
+    kernels/cpu/dsv4_fp4_expert.cpp
+)
+target_include_directories(strata_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_models PUBLIC strata_engine)
+
+add_library(strata_app STATIC
+    src/app/runtime.cpp
+    src/app/openai_protocol.cpp
+)
+target_include_directories(strata_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_app PUBLIC strata_models)
+# Scoped to this one file, not a warnings-as-errors push: runtime.cpp's model
+# dispatch relies on -Wswitch (part of -Wall) actually failing the build when
+# a RuntimeModel enumerator is added without a matching case (Phase 2, B7). A
+# blanket -Werror would also turn deepseek_runtime.cpp:4185's pre-existing
+# -Wconversion warning into a build break as an unrelated side effect.
+set_source_files_properties(src/app/runtime.cpp PROPERTIES COMPILE_OPTIONS "-Werror=switch")
+
+add_library(strata_core INTERFACE)
+# --whole-archive around strata_models is what makes self-registration work.
+# Each model's *_executor.cpp declares a file-scope ModelRegistrar whose
+# constructor runs before main; nothing references those objects by name, so a
+# static library drops every one of them and find_model returns null for every
+# model. This flag is the price of "adding a model touches zero shared files";
+# the alternative is a central list of register_<model>() calls, which is the
+# thing Phase 4 exists to remove.
+# strata_app first: GNU ld resolves in a single pass, so an archive only
+# satisfies undefined symbols from objects that came before it. strata_engine
+# (pulled in transitively by strata_app) still references strata_models -- the
+# link cycle check-symbols reports under the placement-model-inventory-registry
+# exception -- so strata_models has to follow it on the line.
+target_link_libraries(strata_core INTERFACE
+    strata_app -Wl,--whole-archive strata_models -Wl,--no-whole-archive)
+
 if(STRATA_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(strata_core PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(strata_core PUBLIC -fsanitize=address,undefined)
+    foreach(strata_layer IN ITEMS strata_platform strata_device strata_kernels
+                                  strata_engine strata_models strata_app)
+        target_compile_options(${strata_layer} PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(${strata_layer} PUBLIC -fsanitize=address,undefined)
+    endforeach()
 endif()
 
 add_executable(strata-sim apps/strata_sim.cpp)
@@ -137,6 +211,9 @@ target_link_libraries(strata-run PRIVATE strata_core)
 
 add_executable(strata-deepseek-run apps/strata_deepseek_run.cpp)
 target_link_libraries(strata-deepseek-run PRIVATE strata_core)
+
+add_executable(strata-gemma4-run apps/strata_gemma4_run.cpp)
+target_link_libraries(strata-gemma4-run PRIVATE strata_core)
 
 add_executable(strata-chat apps/strata_chat.cpp)
 target_link_libraries(strata-chat PRIVATE strata_core)
@@ -196,7 +273,7 @@ if(STRATA_HAS_CUDA)
     )
 
     find_package(CUDAToolkit REQUIRED)
-    target_link_libraries(strata_core PUBLIC CUDA::cublas)
+    target_link_libraries(strata_device PUBLIC CUDA::cublas)
 
     add_executable(strata-dsv4-bf16-gemm-probe
         apps/strata_dsv4_bf16_gemm_probe.cu)
@@ -322,20 +399,24 @@ if(STRATA_HAS_CUDA)
         message(STATUS "NCCL header: ${STRATA_NCCL_INCLUDE_DIR}")
         message(STATUS "NCCL library: ${STRATA_NCCL_LIBRARY}")
         get_filename_component(STRATA_NCCL_LIBRARY_DIR "${STRATA_NCCL_LIBRARY}" DIRECTORY)
-        # Compiled into strata_core rather than a separate archive: the executor
-        # needs CudaBackend and the runtime needs the executor, so a distinct
-        # library would be a cycle.
-        target_sources(strata_core PRIVATE
+        # Compiled into strata_models rather than a separate archive: the
+        # executor needs CudaBackend (strata_device) and deepseek_runtime.cpp
+        # (strata_models) needs the executor, so a distinct library between
+        # them would be a cycle. Phase 1 note: this is itself a case worth
+        # watching once headers move in phase 3 -- a device-tier kernel that
+        # only a models-tier consumer uses is exactly the shape that makes a
+        # clean device/models split hard, and it's already here today.
+        target_sources(strata_models PRIVATE
             kernels/cuda/dsv4_rank_local_layer_executor.cu)
-        target_include_directories(strata_core PRIVATE "${STRATA_NCCL_INCLUDE_DIR}")
-        target_link_libraries(strata_core PUBLIC "${STRATA_NCCL_LIBRARY}" ${CMAKE_DL_LIBS} ${NUMA_LIBRARY})
-        set_target_properties(strata_core PROPERTIES BUILD_RPATH "${STRATA_NCCL_LIBRARY_DIR}")
+        target_include_directories(strata_models PRIVATE "${STRATA_NCCL_INCLUDE_DIR}")
+        target_link_libraries(strata_models PUBLIC "${STRATA_NCCL_LIBRARY}" ${CMAKE_DL_LIBS} ${NUMA_LIBRARY})
+        set_target_properties(strata_models PROPERTIES BUILD_RPATH "${STRATA_NCCL_LIBRARY_DIR}")
         # PUBLIC so the runtime, CLI, chat and server all agree on whether the
         # rank-local topology exists at all.
-        target_compile_definitions(strata_core PUBLIC STRATA_HAS_NCCL=1)
-        set_property(TARGET strata_core PROPERTY CUDA_ARCHITECTURES 86 120)
-        set_property(TARGET strata_core PROPERTY CUDA_STANDARD 20)
-        set_property(TARGET strata_core PROPERTY CUDA_STANDARD_REQUIRED ON)
+        target_compile_definitions(strata_models PUBLIC STRATA_HAS_NCCL=1)
+        set_property(TARGET strata_models PROPERTY CUDA_ARCHITECTURES 86 120)
+        set_property(TARGET strata_models PROPERTY CUDA_STANDARD 20)
+        set_property(TARGET strata_models PROPERTY CUDA_STANDARD_REQUIRED ON)
     endif()
 endif()
 
@@ -404,9 +485,24 @@ if(BUILD_TESTING)
             --lease 8
             --json
     )
+    # Phase 0's equivalence oracle (brief 05, F2): re-runs the committed
+    # Gemma 4 layer-hash fixture and diffs it against a fresh
+    # strata-gemma4-run --layer-hash-trace capture. Before this test existed,
+    # tests/fixtures/gemma4/layer-hash-trace.json was referenced by nothing
+    # outside its own README -- re-verification was a human typing a diff by
+    # hand, and nothing failed if it never happened. Guarded on the pinned
+    # checkpoint's presence, same as every other real-checkpoint test in this
+    # suite; SKIP_RETURN_CODE makes ctest report an absent checkpoint as
+    # skipped, not passed.
+    add_test(
+        NAME strata-equivalence-gemma4
+        COMMAND ${CMAKE_COMMAND} -E env python3
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_equivalence.py
+    )
+    set_tests_properties(strata-equivalence-gemma4 PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
-install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-chat strata-server
+install(TARGETS strata-sim strata-inspect strata-tokenize strata-run strata-deepseek-run strata-gemma4-run strata-chat strata-server
         strata-host-expert-probe strata-kimi-expert-probe RUNTIME DESTINATION bin)
 if(STRATA_HAS_CUDA)
     install(TARGETS strata-topology-probe RUNTIME DESTINATION bin)

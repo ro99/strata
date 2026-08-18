@@ -4,8 +4,8 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
-#include "strata/deepseek_diagnostics.hpp"
 #include "strata/deepseek_kv_cache.hpp"
+#include "strata/diagnostics.hpp"
 #include "strata/dsv4_rank_local_topology.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
@@ -29,7 +29,9 @@ struct Dsv4RuntimeConfig {
     // Optional hard per-device admission ceiling. Zero preserves the
     // fractional-only contract; non-zero is combined with it as min().
     std::uint64_t explicit_vram_budget_bytes{};
-    std::uint64_t host_memory_limit_bytes{216ULL << 30U};
+    // Zero asks the hardware profile (85% of MemTotal). A non-zero value is
+    // an explicit operator ceiling and is used as given.
+    std::uint64_t host_memory_limit_bytes{};
     std::uint64_t host_kv_cache_bytes{};
     std::vector<std::uint64_t> device_kv_cache_bytes;
     std::uint32_t maximum_context_tokens{2048U};
@@ -61,7 +63,8 @@ struct Dsv4RuntimeConfig {
     // Zero keeps prefill on the CPU as well.
     std::uint32_t prefill_device_moe_minimum_rows{2U};
     std::uint32_t logit_trace_top_k{20U};
-    std::uint32_t host_attention_threads{28U};
+    // Zero derives from the process's CPU affinity mask.
+    std::uint32_t host_attention_threads{};
     bool enable_flash_attention{};
     bool enable_gpu_lightning_indexer{};
     bool enable_incremental_kv_continuation{true};
@@ -90,8 +93,9 @@ struct Dsv4RuntimeConfig {
     // build. Per-row arithmetic is identical either way.
     bool row_major_moe_page{};
     bool prepack_mhc_projection{true};
-    std::uint32_t resident_read_workers{8U};
-    std::uint32_t spine_warmup_workers{3U};
+    // Zero derives from the hardware profile; see resolve_dsv4_hardware_defaults.
+    std::uint32_t resident_read_workers{};
+    std::uint32_t spine_warmup_workers{};
     // Zero predictions disables advisory expert prefetch. The remaining
     // defaults are bounded so one CLI switch is sufficient to enable it.
     std::uint32_t expert_prefetch_predictions{};
@@ -326,7 +330,7 @@ struct Dsv4GenerationResult {
     std::vector<std::uint32_t> generated_token_ids;
     std::vector<TokenLogprob> logprobs;
     Dsv4GenerationMetrics metrics;
-    Dsv4DiagnosticTrace diagnostics;
+    DiagnosticTrace diagnostics;
     std::vector<std::string> errors;
     bool stopped{};
 

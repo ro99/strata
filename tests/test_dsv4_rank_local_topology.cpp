@@ -1,5 +1,13 @@
 #include "test.hpp"
 
+// The production ceiling is now a fraction of the card this process actually
+// sees (dsv4_rank_local_vram_ceiling), so these tests pin the byte count they
+// were written against. They exercise admission arithmetic, not the hardware
+// probe; keeping them hermetic is the point.
+namespace {
+constexpr std::uint64_t kTestVramCeiling = 22'548'578'304ULL;
+}  // namespace
+
 #include "strata/dsv4_attention_kv.hpp"
 #include "strata/deepseek_runtime.hpp"
 #include "strata/dsv4_rank_local_topology.hpp"
@@ -11,9 +19,13 @@
 
 namespace {
 
-// Two nodes, 24 CPUs each: the measured production shape.
+// Two nodes, 24 CPUs each: the measured production shape. Pinned rather than
+// taken from kDsv4RankLocalMinimumCpusPerRank, which is now a portable floor
+// (4) instead of a restatement of this box's width.
+constexpr std::size_t kProductionCpusPerNode = 24U;
+
 [[nodiscard]] strata::NumaTopology two_node_topology(
-    std::size_t cpus_per_node = strata::kDsv4RankLocalMinimumCpusPerRank) {
+    std::size_t cpus_per_node = kProductionCpusPerNode) {
     strata::NumaTopology topology;
     topology.nodes = 2;
     topology.node_cpus.resize(2U);
@@ -53,6 +65,12 @@ namespace {
     request.host.host_parameter_bytes = 4ULL << 30U;
     request.host.kv_state_bytes = 4'078'601'600ULL;
     request.host.host_workspace_bytes = 1ULL << 30U;
+    // Pinned rather than probed: these tests describe the production operating
+    // point's arithmetic, so they must give the same answer on any machine
+    // that runs them. Production leaves both zero and derives them from the
+    // cards and MemTotal it actually sees.
+    request.per_device_vram_ceiling_bytes = kTestVramCeiling;
+    request.host_rss_ceiling_bytes = 231'928'233'984ULL;
     return request;
 }
 
@@ -69,10 +87,10 @@ namespace {
 TEST_CASE("rank-local CPU planning assigns one disjoint NUMA node per rank") {
     std::array<std::vector<int>, strata::kDsv4RankLocalWorld> cpus;
     const auto planned = strata::plan_dsv4_rank_local_cpus(
-        two_node_topology(), strata::kDsv4RankLocalMinimumCpusPerRank, cpus);
+        two_node_topology(), kProductionCpusPerNode, cpus);
     REQUIRE(planned.ok());
-    REQUIRE(cpus[0].size() == strata::kDsv4RankLocalMinimumCpusPerRank);
-    REQUIRE(cpus[1].size() == strata::kDsv4RankLocalMinimumCpusPerRank);
+    REQUIRE(cpus[0].size() == kProductionCpusPerNode);
+    REQUIRE(cpus[1].size() == kProductionCpusPerNode);
     // Disjoint: two pools must never contend for the same cores.
     for (const auto cpu : cpus[0]) {
         REQUIRE(std::find(cpus[1].begin(), cpus[1].end(), cpu) ==
@@ -83,10 +101,10 @@ TEST_CASE("rank-local CPU planning assigns one disjoint NUMA node per rank") {
 TEST_CASE("rank-local CPU planning preserves the calibrated pool width") {
     std::array<std::vector<int>, strata::kDsv4RankLocalWorld> cpus;
     const auto planned = strata::plan_dsv4_rank_local_cpus(
-        two_node_topology(28U), strata::kDsv4RankLocalMinimumCpusPerRank, cpus);
+        two_node_topology(28U), kProductionCpusPerNode, cpus);
     REQUIRE(planned.ok());
-    REQUIRE(cpus[0].size() == strata::kDsv4RankLocalMinimumCpusPerRank);
-    REQUIRE(cpus[1].size() == strata::kDsv4RankLocalMinimumCpusPerRank);
+    REQUIRE(cpus[0].size() == kProductionCpusPerNode);
+    REQUIRE(cpus[1].size() == kProductionCpusPerNode);
     REQUIRE(cpus[0].back() == 23);
     REQUIRE(cpus[1].front() == 28);
     REQUIRE(cpus[1].back() == 51);
@@ -99,7 +117,7 @@ TEST_CASE("rank-local CPU planning rejects a single-node host") {
     for (int cpu = 0; cpu < 48; ++cpu) topology.node_cpus[0].push_back(cpu);
     std::array<std::vector<int>, strata::kDsv4RankLocalWorld> cpus;
     const auto planned = strata::plan_dsv4_rank_local_cpus(
-        topology, strata::kDsv4RankLocalMinimumCpusPerRank, cpus);
+        topology, kProductionCpusPerNode, cpus);
     REQUIRE(!planned.ok());
     REQUIRE(mentions(planned.errors, "at least 2 NUMA nodes"));
     REQUIRE(cpus[0].empty());
@@ -109,7 +127,7 @@ TEST_CASE("rank-local CPU planning rejects a single-node host") {
 TEST_CASE("rank-local CPU planning rejects an underprovisioned node") {
     std::array<std::vector<int>, strata::kDsv4RankLocalWorld> cpus;
     const auto planned = strata::plan_dsv4_rank_local_cpus(
-        two_node_topology(23U), strata::kDsv4RankLocalMinimumCpusPerRank, cpus);
+        two_node_topology(23U), kProductionCpusPerNode, cpus);
     REQUIRE(!planned.ok());
     REQUIRE(mentions(planned.errors, "below the required"));
     // Fail closed: no rank keeps a partial CPU set.
@@ -122,10 +140,10 @@ TEST_CASE("rank-local admission accepts the production operating point") {
         admissible_request(), two_node_topology());
     REQUIRE(admitted.ok());
     REQUIRE(admitted.rank_cpus[0].size() ==
-            strata::kDsv4RankLocalMinimumCpusPerRank);
+            kProductionCpusPerNode);
     for (std::size_t rank = 0U; rank < strata::kDsv4RankLocalWorld; ++rank) {
         REQUIRE(admitted.device_total_bytes[rank] <=
-                strata::kDsv4RankLocalPerDeviceVramCeiling);
+                kTestVramCeiling);
     }
 }
 
@@ -141,9 +159,9 @@ TEST_CASE("rank-local admission caps the centralized prefill expert cache") {
     REQUIRE(admitted.expert_cache_capacity_bytes[0] <
             request.device[0].expert_cache_bytes);
     REQUIRE(admitted.expert_cache_capacity_bytes[0] ==
-            strata::kDsv4RankLocalPerDeviceVramCeiling - fixed);
+            kTestVramCeiling - fixed);
     REQUIRE(admitted.device_total_bytes[0] ==
-            strata::kDsv4RankLocalPerDeviceVramCeiling);
+            kTestVramCeiling);
 }
 
 TEST_CASE("rank-local admission fits the 1M decode set beside the prefill spine") {
@@ -180,7 +198,7 @@ TEST_CASE("rank-local admission fits the 1M decode set beside the prefill spine"
         REQUIRE(admitted.device_total_bytes[rank] >
                 21'287'272'448ULL);
         REQUIRE(admitted.device_total_bytes[rank] <=
-                strata::kDsv4RankLocalPerDeviceVramCeiling);
+                kTestVramCeiling);
     }
 
     // The headroom is finite: the ceiling still has to reject something, or it
@@ -299,7 +317,7 @@ TEST_CASE("rank-local admission reports every unmet requirement at once") {
     request.fp4_routed_experts = false;
     request.kv_cache_mode = strata::Dsv4KvCacheMode::ScalarOracle;
     const auto admitted =
-        strata::admit_dsv4_rank_local(request, two_node_topology(4U));
+        strata::admit_dsv4_rank_local(request, two_node_topology(3U));
     REQUIRE(!admitted.ok());
     // One rejection should name all of them, so an operator fixes the
     // configuration in one pass rather than one condition per run.

@@ -1,95 +1,21 @@
 #pragma once
 
-#include "strata/chat_protocol.hpp"
-#include "strata/placement.hpp"
-#include "strata/result.hpp"
-#include "strata/sampling.hpp"
-#include "strata/types.hpp"
+// The application-facing facade.
+//
+// RuntimeModel, RuntimeConfig, GenerationResult and friends moved to
+// model_executor.hpp in Phase 4 and are re-exported here, so every existing
+// `#include "strata/runtime.hpp"` keeps working unchanged. They live a tier
+// lower because the six models implement ModelExecutor against them: had they
+// stayed here, every model would depend upward on the application tier, which
+// is exactly the inversion check-symbols exists to catch.
 
-#include <cstdint>
+#include "strata/model_executor.hpp"
+
 #include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace strata {
-
-enum class RuntimeModel : std::uint8_t {
-    Glm52,
-    DeepSeekV4,
-    Gemma4,
-    KimiK3,
-    Laguna,
-    Inkling,
-};
-
-struct RuntimeConfig {
-    RuntimeModel model{RuntimeModel::Glm52};
-    std::vector<int> devices{0, 1, 2};
-    double vram_cache_fraction{0.85};
-    std::uint32_t maximum_context_tokens{2048U};
-    // Session default sampler. Greedy unless the caller asks otherwise, so a
-    // run stays reproducible until someone opts into a stochastic stage.
-    SamplingOptions sampling{greedy_sampling()};
-    bool verbose{};
-    bool load_progress{};
-    bool enable_flash_attention{};
-    bool enable_incremental_kv_continuation{true};
-    bool deepseek_block_kv_cache{};
-    // The DeepSeek device-resident decode contract: physical KV pages,
-    // device-resident mHC, CUDA attention, the scalar lightning indexer, and
-    // routed experts in the two NUMA-local CPU shards. It is a bundle rather
-    // than a knob, so setting it overrides the individual switches above
-    // exactly as strata-deepseek-run's --device-resident-runtime does.
-    bool deepseek_device_resident_runtime{};
-    // Rank-local TP2 decode. Opt-in, admitted fail-closed before the
-    // checkpoint is opened, and never falling back once admitted. Requires an
-    // NCCL build and exactly two devices, and implies the device-resident
-    // contract above.
-    bool deepseek_rank_local_decode{};
-    // Prompt rows per prefill page. Zero keeps the runtime default. The
-    // device-resident path executes a page layer-major over one mHC slot per
-    // row and groups the page's rows by expert; 1 restores row-at-a-time
-    // prompt processing.
-    std::uint32_t deepseek_prefill_page_tokens{};
-    bool pin_resident_arena{};
-    bool prepack_mhc_projection{true};
-    // Placement plan cache. An empty directory selects the default location;
-    // see placement_cache_directory. A cached plan that matches this
-    // checkpoint, hardware, and request is reused instead of recomputed.
-    std::string placement_cache_directory;
-    bool use_placement_cache{true};
-    bool refresh_placement_plan{};
-    bool report_placement_plan{};
-};
-
-struct GenerationMetrics {
-    std::uint64_t prompt_tokens{};
-    std::uint64_t prefill_tokens{};
-    std::uint64_t reused_prompt_tokens{};
-    std::uint64_t decode_tokens{};
-    double prefill_seconds{};
-    double decode_seconds{};
-    bool incremental_kv_continuation{};
-};
-
-struct GenerationResult {
-    std::string text;
-    std::vector<std::uint32_t> prompt_token_ids;
-    std::vector<std::uint32_t> generated_token_ids;
-    std::vector<TokenLogprob> logprobs;
-    GenerationMetrics metrics;
-    std::vector<std::string> errors;
-    bool stopped{};
-
-    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
-};
-
-struct GenerationOptions {
-    std::uint32_t maximum_new_tokens{256U};
-    SamplingOptions sampling;
-    std::vector<std::string> stop;
-};
 
 // Placement inputs implied by a runtime configuration. Applications use this to
 // dry-run a load without constructing a session.

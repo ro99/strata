@@ -237,6 +237,26 @@ using PlacementPlanResult = ParseResult<PlacementPlan>;
 
 // Opens the checkpoint index and shard headers, sizes every component, and
 // solves. Reads no tensor payload and uploads nothing.
+// The planner seam. plan_model_placement below is a thin dispatcher in
+// strata_engine; the implementation that knows how to open six different
+// checkpoints and size six different inventories lives in strata_models and
+// installs itself here at static-init time.
+//
+// This exists to invert one specific dependency. Before it, placement_cache.cpp
+// (engine) called a symbol defined in placement_model.cpp, which references
+// every model's checkpoint reader -- an engine->models link edge that
+// check-symbols reported as a cycle and that only linked because ld happened
+// to see the archives in a forgiving order. Engine now names no model symbol.
+using PlacementPlanner = PlacementPlanResult (*)(const PlacementRequest&,
+                                                 const PlacementHardware&);
+void register_placement_planner(PlacementPlanner planner) noexcept;
+
+struct PlacementPlannerRegistrar {
+    explicit PlacementPlannerRegistrar(PlacementPlanner planner) noexcept {
+        register_placement_planner(planner);
+    }
+};
+
 [[nodiscard]] PlacementPlanResult plan_model_placement(
     const PlacementRequest& request, const PlacementHardware& hardware);
 

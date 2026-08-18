@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -232,5 +233,72 @@ TEST_CASE("Inkling device logits match the host oracle") {
                       << '\n';
         }
         REQUIRE(relative <= 2.0e-2);
+    }
+}
+
+// Page prefill is a scheduling change, not a numerical one: attention and the
+// four short convolutions still run row by row in order, and only the routed
+// MoE between them is batched expert-major. So every logit must be bit
+// identical to the token-at-a-time path -- not close, identical. Anything else
+// means a row saw the wrong KV, the wrong convolution history, or the wrong
+// router coefficient, and none of those would be visible in generated text.
+TEST_CASE("Inkling page prefill is bit-identical to token-at-a-time") {
+    if (!inkling_checkpoint_present()) {
+        SKIP("pinned Inkling-Small-NVFP4 checkpoint is absent (missing-checkpoint)");
+    }
+    // Without a device, moe_page -- the entire subject of this test -- never
+    // runs, and the comparison would pass while exercising nothing.
+    if (strata::CudaBackend::available_devices().empty()) {
+        SKIP("no CUDA device is available, so the batched MoE path is unreachable");
+    }
+    auto tokenizer = strata::ModelTokenizer::load(
+        (inkling_model_path() / "tokenizer.json").string());
+    REQUIRE(tokenizer.ok());
+    const auto prompt =
+        tokenizer.value.encode("The capital of France is Paris, and the "
+                               "capital of Japan is Tokyo, and the capital");
+    REQUIRE(prompt.ok());
+    REQUIRE(prompt.value.size() > 8U);
+
+    const auto run = [&](std::uint32_t page,
+                         std::vector<std::vector<float>>& out) {
+        strata::InklingRuntimeConfig config;
+        config.maximum_context_tokens = 128U;
+        config.warm_expert_pages = false;
+        config.prefill_page_tokens = page;
+        strata::InklingRuntime runtime;
+        REQUIRE(runtime.initialize(inkling_model_path().string(), config).ok());
+        REQUIRE(runtime.forward_logits(prompt.value, out).ok());
+    };
+
+    std::vector<std::vector<float>> serial;
+    run(0U, serial);
+    std::vector<std::vector<float>> paged;
+    // A page smaller than the prompt, so the multi-page path is exercised and
+    // the second page starts from state the first one left behind.
+    run(8U, paged);
+    // And again at a page wider than the prompt, the single-page case, so the
+    // test is not pinned to one page size while callers choose another.
+    std::vector<std::vector<float>> single_page;
+    run(64U, single_page);
+
+    REQUIRE(paged.size() == serial.size());
+    REQUIRE(single_page.size() == serial.size());
+    for (std::size_t position = 0U; position < serial.size(); ++position) {
+        for (std::size_t index = 0U; index < serial[position].size(); ++index) {
+            REQUIRE(single_page[position][index] == serial[position][index]);
+        }
+    }
+    for (std::size_t position = 0U; position < serial.size(); ++position) {
+        REQUIRE(paged[position].size() == serial[position].size());
+        for (std::size_t index = 0U; index < serial[position].size(); ++index) {
+            // Equality, not a tolerance. This caught a real defect the first
+            // time it ran: the page summed a row's experts in expert-id order
+            // where the reference sums them in router-choice order, and float
+            // addition is not associative. It showed as 0.0163 on the logits
+            // at position 0 -- small enough that generated text still looked
+            // right, which is exactly why the assertion is exact.
+            REQUIRE(paged[position][index] == serial[position][index]);
+        }
     }
 }

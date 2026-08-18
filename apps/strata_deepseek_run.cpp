@@ -1,4 +1,5 @@
 #include "strata/deepseek_runtime.hpp"
+#include "strata/diagnostics_json.hpp"
 #include "strata/dsv4_attention_kv.hpp"
 #include "strata/runtime_support.hpp"
 
@@ -11,7 +12,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,14 +27,14 @@ struct Options {
     std::uint32_t prefill_page_tokens{64U};
     std::uint32_t prefill_layer_tile_tokens{};
     std::uint32_t logit_trace_top_k{20U};
-    std::uint32_t host_attention_threads{28U};
+    std::uint32_t host_attention_threads{};  // zero: derived from the hardware profile
     std::uint32_t flash_attention_minimum_rows{};
-    std::uint32_t resident_read_workers{8U};
-    std::uint32_t spine_warmup_workers{3U};
+    std::uint32_t resident_read_workers{};  // zero: derived from the hardware profile
+    std::uint32_t spine_warmup_workers{};  // zero: derived from the hardware profile
     std::uint32_t expert_prefetch_predictions{};
     std::uint32_t expert_prefetch_queue_depth{8U};
     std::uint32_t expert_prefetch_lease_ticks{16U};
-    std::uint64_t host_memory_bytes{216ULL << 30U};
+    std::uint64_t host_memory_bytes{};  // zero: derived from the hardware profile
     std::uint64_t expert_prefetch_byte_budget{1ULL << 30U};
     bool pin_resident_arena{};
     bool serial_expert_upload{};
@@ -969,11 +969,7 @@ void print_plan(std::ostream& output, const strata::Dsv4MemoryPlan& plan) {
            << '}';
 }
 
-std::string hex_u64(std::uint64_t value) {
-    std::ostringstream output;
-    output << std::hex << std::setfill('0') << std::setw(16) << value;
-    return output.str();
-}
+using strata::hex_u64;
 
 template <typename T>
 void print_json_number(std::ostream& output, T value) {
@@ -982,7 +978,7 @@ void print_json_number(std::ostream& output, T value) {
 }
 
 void print_logit_summary(std::ostream& output,
-                         const strata::Dsv4LogitSummary& summary) {
+                         const strata::LogitSummary& summary) {
     output << "{\"value_count\":" << summary.value_count
            << ",\"finite_count\":" << summary.finite_count
            << ",\"non_finite_count\":" << summary.non_finite_count
@@ -1003,7 +999,7 @@ void print_logit_summary(std::ostream& output,
 }
 
 void print_diagnostics(std::ostream& output,
-                       const strata::Dsv4DiagnosticTrace& diagnostics) {
+                       const strata::DiagnosticTrace& diagnostics) {
     const auto previous_precision = output.precision();
     output << std::setprecision(std::numeric_limits<double>::max_digits10)
            << "{\"hash_algorithm\":\"fnv1a64-little-endian\""
@@ -1051,43 +1047,14 @@ void print_diagnostics(std::ostream& output,
         }
         output << ']';
     }
-    output << "},\"layer_hidden_hashes\":{\"enabled\":"
-           << (diagnostics.layer_hash_trace_enabled ? "true" : "false");
-    if (diagnostics.layer_hash_trace_enabled) {
-        output << ",\"aggregate\":{\"entry_count\":"
-               << diagnostics.layer_hashes.size()
-               << ",\"trace_hash\":\""
-               << hex_u64(diagnostics.layer_hash_trace_hash)
-               << "\"},\"entries\":[";
-        for (std::size_t index = 0U; index < diagnostics.layer_hashes.size(); ++index) {
-            const auto& record = diagnostics.layer_hashes[index];
-            if (index != 0U) output << ',';
-            output << "{\"position\":" << record.position
-                   << ",\"input_token\":" << record.input_token
-                   << ",\"layer\":" << record.layer
-                   << ",\"bf16_hash\":\"" << hex_u64(record.bf16_hash)
-                   << "\"}";
-        }
-        output << ']';
-    }
-    output << '}';
+    output << "},\"layer_hidden_hashes\":";
+    strata::print_layer_hidden_hashes_object(output, diagnostics);
     output << ",\"index_selections\":{\"entry_count\":"
            << diagnostics.index_selection_count
            << ",\"trace_hash\":\""
            << hex_u64(diagnostics.index_selection_trace_hash) << "\"}";
     if (diagnostics.layer_hash_trace_enabled && !diagnostics.operation_hashes.empty()) {
-        output << ",\"operation_hashes\":[";
-        for (std::size_t index = 0U; index < diagnostics.operation_hashes.size(); ++index) {
-            const auto& record = diagnostics.operation_hashes[index];
-            if (index != 0U) output << ',';
-            output << "{\"position\":" << record.position
-                   << ",\"input_token\":" << record.input_token
-                   << ",\"layer\":" << record.layer
-                   << ",\"operation\":\"" << record.operation << '"'
-                   << ",\"bf16_hash\":\"" << hex_u64(record.bf16_hash)
-                   << "\"}";
-        }
-        output << ']';
+        strata::print_operation_hashes_fields(output, diagnostics);
     }
     output << '}';
     output.precision(previous_precision);

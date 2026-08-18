@@ -193,10 +193,10 @@ bool parse_options(int argc, char** argv, Options& options) {
     if (options.model_id.empty() && !options.model.empty()) {
         options.model_id = std::filesystem::path(options.model).filename().string();
     }
+    // Resolved through the model registry rather than a hardcoded list, so a
+    // new model needs no edit here.
     return !options.model.empty() && !options.model_id.empty() &&
-        (options.model_type == "glm" || options.model_type == "deepseek" ||
-         options.model_type == "gemma4" || options.model_type == "laguna" ||
-         options.model_type == "inkling" || options.model_type == "kimi-k3");
+        strata::find_model_by_cli_name(options.model_type) != nullptr;
 }
 
 std::string lower(std::string_view text) {
@@ -624,7 +624,9 @@ private:
             aggregated.prefill_seconds += result.metrics.prefill_seconds;
             aggregated.decode_tokens += result.metrics.decode_tokens;
             aggregated.decode_seconds += result.metrics.decode_seconds;
-            aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
+            aggregated.reused_prompt_tokens =
+                aggregated.reused_prompt_tokens.value_or(0U) +
+                result.metrics.reused_prompt_tokens.value_or(0U);
             returned_tokens += result.generated_token_ids.size();
             if (!connected) {
                 std::cerr << "[request] id=" << id
@@ -673,7 +675,7 @@ private:
                 final << ",\"usage\":"
                       << strata::render_openai_usage(
                           aggregated.prompt_tokens, aggregated.decode_tokens,
-                          aggregated.reused_prompt_tokens)
+                          aggregated.reused_prompt_tokens.value_or(0U))
                       << ",\"timings\":" << strata::render_openai_timings(aggregated);
             }
             final << "}\n\n";
@@ -743,7 +745,9 @@ private:
             aggregated.prefill_seconds += result.metrics.prefill_seconds;
             aggregated.decode_tokens += result.metrics.decode_tokens;
             aggregated.decode_seconds += result.metrics.decode_seconds;
-            aggregated.reused_prompt_tokens += result.metrics.reused_prompt_tokens;
+            aggregated.reused_prompt_tokens =
+                aggregated.reused_prompt_tokens.value_or(0U) +
+                result.metrics.reused_prompt_tokens.value_or(0U);
             response << "{\"index\":" << index << ',';
             if (chat) {
                 response << "\"message\":{\"role\":\"assistant\",\"content\":\""
@@ -761,7 +765,7 @@ private:
         const auto prompt_tokens = aggregated.prompt_tokens;
         response << "],\"usage\":"
                  << strata::render_openai_usage(prompt_tokens, completion_tokens,
-                                                aggregated.reused_prompt_tokens)
+                                                aggregated.reused_prompt_tokens.value_or(0U))
                  << ",\"timings\":" << strata::render_openai_timings(aggregated)
                  << "}";
         double model_seconds = 0.0;
@@ -828,31 +832,23 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
+    // parse_options already rejected an unregistered --model-type.
+    const auto* registration =
+        strata::find_model_by_cli_name(options.model_type);
     strata::RuntimeConfig config;
-    config.model = options.model_type == "glm"
-        ? strata::RuntimeModel::Glm52
-        : options.model_type == "gemma4"
-            ? strata::RuntimeModel::Gemma4
-        : options.model_type == "kimi-k3"
-            ? strata::RuntimeModel::KimiK3
-        : options.model_type == "laguna"
-            ? strata::RuntimeModel::Laguna
-        : options.model_type == "inkling"
-            ? strata::RuntimeModel::Inkling
-            : strata::RuntimeModel::DeepSeekV4;
+    config.model = registration->model;
     config.devices = options.devices;
     config.maximum_context_tokens = options.context_size;
     config.vram_cache_fraction = options.vram_fraction;
     config.enable_flash_attention =
-        options.flash_attention || options.model_type == "gemma4" ||
-        options.model_type == "laguna";
+        options.flash_attention || registration->flash_attention_by_default;
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
     config.deepseek_prefill_page_tokens = options.prefill_page_tokens;
     config.deepseek_rank_local_decode = options.rank_local_decode;
     config.pin_resident_arena = options.pin_resident_arena;
-    config.verbose = options.model_type == "deepseek";
-    config.load_progress = options.model_type != "deepseek";
+    config.verbose = registration->verbose_by_default;
+    config.load_progress = registration->progress_by_default;
     config.placement_cache_directory = options.plan_cache;
     config.use_placement_cache = options.use_plan_cache;
     config.refresh_placement_plan = options.replan;

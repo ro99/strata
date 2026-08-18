@@ -1,5 +1,6 @@
 #include "test.hpp"
 
+#include "strata/attention_reference.hpp"
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_kv_cache.hpp"
 #include "strata/deepseek_host_expert.hpp"

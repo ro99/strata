@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/quantization.hpp"
 #include "strata/result.hpp"
 #include "strata/types.hpp"
 
@@ -64,18 +65,6 @@ enum class QuantizationKind : std::uint8_t {
     CompressedTensorsW8A16,
     CompressedTensorsNvfp4W4A16,
     NativeFp4Fp8,
-};
-
-enum class QuantizationGranularity : std::uint8_t {
-    Group,
-    Channel,
-};
-
-struct QuantizedWeightSpec {
-    std::uint32_t bits{kMinimumQuantBits};
-    QuantizationGranularity granularity{QuantizationGranularity::Group};
-    std::uint32_t group_size{};
-    bool symmetric{true};
 };
 
 struct MixedQuantizationSpec {

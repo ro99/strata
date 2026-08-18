@@ -16,7 +16,10 @@
 namespace strata {
 
 struct InklingRuntimeConfig {
-    std::vector<int> devices{0, 1, 2};
+    // Empty means every visible device. The old default named three GPUs
+    // because the development box had three; on a one- or two-GPU machine it
+    // silently claimed devices that were not there.
+    std::vector<int> devices;
     // Fraction of each device's free VRAM the runtime may claim. What the
     // resident spine does not use becomes routed-expert cache.
     double vram_cache_fraction{0.85};
@@ -29,6 +32,20 @@ struct InklingRuntimeConfig {
     // waits on storage instead of on PCIe.
     bool warm_expert_pages{true};
     std::uint32_t maximum_context_tokens{2048U};
+    // Rows per prefill page. Zero or one keeps the token-at-a-time path.
+    // Above one, a page runs attention and the short convolutions row by row
+    // in order -- both carry row-ordered state -- and batches the routed MoE
+    // between them expert-major, so each distinct expert of the page is
+    // fetched once instead of once per row that selected it. Arithmetic is
+    // identical either way; this is a scheduling change.
+    // Opt-in until measured. Expert-major batching cuts expert stagings by
+    // about 1.93x at page 64 (384 selections -> ~199 distinct experts under
+    // uniform routing) but raises enqueue/collect round trips per layer from
+    // 64 to ~199, and collect_moe ends in cudaStreamSynchronize -- so it
+    // trades expert-fetch bytes for host stream drains, and Sigma_serial is
+    // the term that usually dominates. The direction of that trade has not
+    // been measured, so it does not default on.
+    std::uint32_t prefill_page_tokens{};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     bool verbose{};

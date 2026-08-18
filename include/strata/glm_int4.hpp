@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strata/model.hpp"
+#include "strata/result.hpp"
 
 #include <cstddef>
 #include <cstdint>

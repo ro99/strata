@@ -827,6 +827,24 @@ int bind_server(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Pin CUDA enumeration to PCI bus order, exactly as strata-deepseek-run
+    // does, so `--devices 1,2` names the same two physical cards from either
+    // binary. Without this the runtime takes CUDA's default "fastest first"
+    // ordering, which on a mixed box does not match `nvidia-smi` and silently
+    // selects different hardware than the operator asked for.
+    //
+    // On the development box the two orderings are:
+    //   default:     0,1 = RTX 3090 (sm_86), 2 = RTX 5060 Ti (sm_120)
+    //   PCI_BUS_ID:  0 = RTX 5060 Ti (sm_120), 1,2 = RTX 3090 (sm_86)
+    // so `--devices 1,2` meant one 3090 paired with the 5060 Ti under the
+    // server and the two 3090s under the runner. That put an sm_120 card into
+    // a rank-local pair whose mHC contract requires sm_86, capped both ranks'
+    // symmetric VRAM admission at the 16 GiB card, and left one 3090 idle.
+    //
+    // Set only when the operator has not chosen an order themselves.
+    if (std::getenv("CUDA_DEVICE_ORDER") == nullptr) {
+        static_cast<void>(setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0));
+    }
     Options options;
     if (!parse_options(argc, argv, options)) {
         usage();

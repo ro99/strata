@@ -53,6 +53,7 @@ struct Options {
     bool detailed_timing{};
     bool device_moe{true};
     bool host_routed_moe{};
+    bool hugepage_expert_arena{false};
     bool flash_attention{};
     bool gpu_lightning_indexer{};
     bool block_kv_cache{};
@@ -83,6 +84,7 @@ void usage() {
         << "       [--vram-fraction F] [--vram-budget-bytes BYTES]\n"
         << "       [--admission-only] [--route-trace PATH]\n"
         << "       [--device-moe|--serial-device-moe|--host-routed-moe]\n"
+        << "       [--arena-hugepages|--no-arena-hugepages]\n"
         << "       [--flash-attention|--scalar-attention]\n"
         << "       [--gpu-lightning-indexer|--scalar-lightning-indexer]\n"
         << "       [--block-kv-cache|--scalar-kv-cache|--device-resident-runtime]\n"
@@ -256,6 +258,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.device_moe = true;
         } else if (argument == "--serial-device-moe") {
             options.device_moe = false;
+        } else if (argument == "--arena-hugepages") {
+            options.hugepage_expert_arena = true;
+        } else if (argument == "--no-arena-hugepages") {
+            options.hugepage_expert_arena = false;
         } else if (argument == "--host-routed-moe") {
             options.host_routed_moe = true;
         } else if (argument == "--flash-attention") {
@@ -856,6 +862,12 @@ void print_graph_stats(std::ostream& output, const strata::Dsv4GraphStats& stats
            << seconds(stats.rank_local_candidate_nanoseconds)
            << ",\"rank_local_boundary_seconds\":"
            << seconds(stats.rank_local_boundary_nanoseconds)
+           << ",\"rank_local_moe_gate_up_seconds\":"
+           << seconds(stats.rank_local_moe_gate_up_nanoseconds)
+           << ",\"rank_local_moe_down_seconds\":"
+           << seconds(stats.rank_local_moe_down_nanoseconds)
+           << ",\"rank_local_moe_reduce_seconds\":"
+           << seconds(stats.rank_local_moe_reduce_nanoseconds)
            << ",\"rank_local_collective_seconds\":"
            << seconds(stats.rank_local_collective_nanoseconds)
            << ",\"rank_local_transition_seconds\":"
@@ -1205,6 +1217,7 @@ int main(int argc, char** argv) {
     config.enable_dspark = false;
     config.enable_device_moe = options.device_moe;
     config.enable_host_routed_moe = options.host_routed_moe;
+    config.hugepage_expert_arena = options.hugepage_expert_arena;
     config.enable_flash_attention = options.flash_attention;
     config.enable_gpu_lightning_indexer = options.gpu_lightning_indexer;
     config.kv_cache_mode = options.device_resident_runtime
@@ -1247,6 +1260,8 @@ int main(int argc, char** argv) {
                   << ",\"dspark\":\"disabled\""
                   << ",\"device_moe\":"
                   << (metrics.device_moe_enabled ? "true" : "false")
+                  << ",\"arena_hugepages\":"
+                  << (options.hugepage_expert_arena ? "true" : "false")
                   << ",\"host_routed_moe\":"
                   << (metrics.host_routed_moe_enabled ? "true" : "false")
                   << ",\"host_attention_threads\":"

@@ -293,7 +293,7 @@ Dsv4ResidentWeightStore::~Dsv4ResidentWeightStore() {
 ValidationResult Dsv4ResidentWeightStore::stage(
     const Dsv4CheckpointReader& checkpoint,
     std::uint64_t host_memory_ceiling_bytes, std::uint32_t read_workers,
-    bool include_dspark, bool tiled_experts) {
+    bool include_dspark, bool tiled_experts, bool hugepage_arena) {
     ValidationResult result;
     if (complete_ || arena_ != nullptr) {
         result.errors.emplace_back("DeepSeek resident expert store is already staged");
@@ -360,6 +360,26 @@ ValidationResult Dsv4ResidentWeightStore::stage(
             return result;
         }
         arena_ = static_cast<std::byte*>(allocation);
+        // Ask for hugepages before the first touch, so the faulting path can
+        // hand back 2 MiB pages instead of promoting 4 KiB ones afterwards.
+        //
+        // This arena is ~148 GB and decode reads six randomly-selected experts
+        // per layer out of it. On 4 KiB pages that is 36.2M pages, and one
+        // 13.37 MB expert triplet alone spans 3,264 of them against a 1,536
+        // entry L2 STLB on this Broadwell part -- so essentially every expert
+        // read is a page walk. At 2 MiB the same arena is ~74K pages and one
+        // expert is 7. Nothing about the bytes, the layout, the NUMA binding
+        // or the arithmetic changes; only the translation cost does.
+        //
+        // Advisory by contract: MADV_HUGEPAGE is a hint, the kernel may refuse
+        // it, and the run is correct either way. A refusal is recorded for the
+        // measurement and never fails the load.
+        hugepage_requested_ = hugepage_arena;
+        if (hugepage_arena) {
+            hugepage_accepted_ =
+                madvise(allocation, static_cast<std::size_t>(arena_bytes_),
+                        MADV_HUGEPAGE) == 0;
+        }
         const auto topology = NumaTopology::detect();
         if (topology.nodes < static_cast<int>(shards)) {
             result.errors.emplace_back(

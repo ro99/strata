@@ -7156,9 +7156,22 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         }
         graph_stats.rank_local_kv_nanoseconds += page_callback_nanoseconds;
     }
-    graph_stats.moe_nanoseconds += std::max(
-        chain.cpu_moe_phases[0].total_nanoseconds,
-        chain.cpu_moe_phases[1].total_nanoseconds);
+    {
+        // Attribute the phases on the same rank the MoE term is taken from,
+        // so the phase sum and the total describe one rank's critical path
+        // rather than a mixture of both.
+        const auto slower =
+            chain.cpu_moe_phases[0].total_nanoseconds >=
+                    chain.cpu_moe_phases[1].total_nanoseconds
+                ? 0U : 1U;
+        const auto& phases = chain.cpu_moe_phases[slower];
+        graph_stats.moe_nanoseconds += phases.total_nanoseconds;
+        graph_stats.rank_local_moe_gate_up_nanoseconds +=
+            phases.gate_up_nanoseconds;
+        graph_stats.rank_local_moe_down_nanoseconds += phases.down_nanoseconds;
+        graph_stats.rank_local_moe_reduce_nanoseconds +=
+            phases.reduce_nanoseconds;
+    }
     if (fuse_head && (!rank_local_head[0].invoked ||
                       !rank_local_head[1].invoked)) {
         result.errors.emplace_back(
@@ -9326,7 +9339,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
                                                config.host_memory_limit_bytes,
                                                config.resident_read_workers,
                                                config.enable_dspark,
-                                               config.enable_host_routed_moe);
+                                               config.enable_host_routed_moe,
+                                               config.hugepage_expert_arena);
         staging_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         staging_finished.store(true, std::memory_order_release);

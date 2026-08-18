@@ -361,6 +361,14 @@ public:
         result = ensure_locked(state, device_slot, base, output_columns,
                                input_columns, false, entry);
         if (!result.ok()) return result;
+        // Orders this device's execution stream behind any deferred weight
+        // copies. Idempotent and cheap: it returns immediately when nothing is
+        // pending, and otherwise records an event the execution stream waits
+        // on rather than blocking the host.
+        if (auto ordered = backend_.synchronize_uploads(entry->weight.device());
+            !ordered.ok()) {
+            return ordered;
+        }
         return backend_.matmul(entry->weight, input, rows, output);
     }
 
@@ -1434,6 +1442,8 @@ struct Glm52Runtime::Impl {
             if (!result.ok()) return result;
             shared_output->resize(static_cast<std::size_t>(rows) * kHidden);
         }
+        result = cuda.synchronize_uploads(devices[device]);
+        if (!result.ok()) return result;
         result = cuda.enqueue_moe(
             devices[device], input, rows, experts,
             shared_output == nullptr ? nullptr : &shared);

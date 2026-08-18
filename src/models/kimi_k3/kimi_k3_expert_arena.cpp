@@ -1,5 +1,7 @@
 #include "strata/kimi_k3_expert_arena.hpp"
 
+#include "strata/numa_topology.hpp"
+
 #include "strata/placement.hpp"
 
 #include <algorithm>
@@ -336,6 +338,25 @@ ValidationResult KimiExpertArena::reset(const KimiArenaConfig& config) {
     }
     base_ = static_cast<std::byte*>(memory);
     capacity_bytes_ = bytes;
+
+    // Spread the arena across every NUMA node before anything touches it.
+    //
+    // This matters more here than anywhere else in the engine: Kimi runs no
+    // CUDA at all, so host DRAM bandwidth is its bottleneck by construction.
+    // The pages are anonymous and faulted on first touch, and mlock() below
+    // runs on one thread -- which under the default first-touch policy would
+    // land the entire arena on that thread's node and put every routed-expert
+    // read on one memory controller, remote for every core on the other node.
+    // Interleaving is the right default for an arena with no single owner:
+    // each expert lands wherever its pages fall, and all of the machine's
+    // controllers work at once.
+    //
+    // Advisory. It must precede first touch (no MPOL_MF_MOVE), and a failure
+    // leaves the default policy, because placement changes no bytes.
+    const auto topology = NumaTopology::detect();
+    if (topology.multi_node()) {
+        numa_interleave_range(base_, capacity_bytes_, topology);
+    }
     slot_bytes_ = slot;
     slots_.assign(static_cast<std::size_t>(count), Entry{});
     for (std::size_t index = 0U; index < slots_.size(); ++index) {

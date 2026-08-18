@@ -325,9 +325,19 @@ ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,
             result.errors.emplace_back("plain linear shape mismatch for " + plain_name);
             return result;
         }
-        auto data = checkpoint.read(plain_name, plain->source_bytes);
+        // view(), not read(): read copies every byte into a fresh heap
+        // vector purely to hand it to the driver, which then copies it again.
+        // The reader owns the mapping and outlives the transfer, so the copy
+        // buys nothing. Laguna measured the same substitution at 0.30 ms per
+        // routed expert projection.
+        auto data = checkpoint.view(plain_name);
         if (!data.ok()) {
             append_errors(result, std::move(data.errors));
+            return result;
+        }
+        if (data.value.size() != plain->source_bytes) {
+            result.errors.emplace_back("plain linear mapping size mismatch for " +
+                                       plain_name);
             return result;
         }
         CudaWeightDescriptor descriptor;
@@ -335,7 +345,11 @@ ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,
         descriptor.dtype = plain->source_dtype;
         descriptor.rows = expected_rows;
         descriptor.columns = expected_columns;
-        return backend.upload(device, descriptor, data.value, {}, output);
+        // Deferred: the copy lands on the upload stream and consumers order
+        // themselves behind it with an event. Legal because the source is the
+        // reader's mapping, which outlives any batch.
+        return backend.upload(device, descriptor, data.value, {}, output,
+                              CudaBackend::UploadCompletion::Deferred);
     }
 
     const std::string packed_name = std::string(base_name) + ".weight_packed";
@@ -363,11 +377,17 @@ ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,
                                    std::string(base_name));
         return result;
     }
-    auto packed_data = checkpoint.read(packed_name, packed->source_bytes);
-    auto scale_data = checkpoint.read(scale_name, scales->source_bytes);
+    auto packed_data = checkpoint.view(packed_name);
+    auto scale_data = checkpoint.view(scale_name);
     if (!packed_data.ok()) append_errors(result, std::move(packed_data.errors));
     if (!scale_data.ok()) append_errors(result, std::move(scale_data.errors));
     if (!result.ok()) return result;
+    if (packed_data.value.size() != packed->source_bytes ||
+        scale_data.value.size() != scales->source_bytes) {
+        result.errors.emplace_back("compressed linear mapping size mismatch for " +
+                                   std::string(base_name));
+        return result;
+    }
 
     CudaWeightDescriptor descriptor;
     descriptor.encoding = CudaWeightEncoding::OffsetPackedInt4;
@@ -377,7 +397,8 @@ ValidationResult load_glm_cuda_linear(const GlmCheckpointReader& checkpoint,
     descriptor.packed_columns = expected_packed_columns;
     descriptor.scale_columns = expected_scale_columns;
     descriptor.group_size = group_size;
-    return backend.upload(device, descriptor, packed_data.value, scale_data.value, output);
+    return backend.upload(device, descriptor, packed_data.value, scale_data.value,
+                          output, CudaBackend::UploadCompletion::Deferred);
 }
 
 }  // namespace strata

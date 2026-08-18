@@ -40,6 +40,9 @@ previous “not implemented” statement false.
   implementation claim.
 - `model-format.md` — native format contract and the implemented foreign-extent
   path; standalone pack tooling is still planned.
+- `cli.md` — every command-line flag and the dry-run placement planner.
+- `sampling.md` — sampler options, their exact semantics, reproducibility.
+- `server.md` — `strata-server` and the OpenAI-compatible API.
 - `model-bringup-guide.md` — **how to add a seventh model.** The procedure, the
   five shared files, and the rules that are not obvious. Start here for a new
   architecture.

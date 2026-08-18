@@ -66,7 +66,10 @@ not transfer to another, and none is quoted here without its record.
 
 | | |
 |---|---|
-| [`docs/cli.md`](docs/cli.md) | every flag, the dry-run planner, samplers, TUI, server |
+| [`docs/cli.md`](docs/cli.md) | every flag and the dry-run planner |
+| [`docs/sampling.md`](docs/sampling.md) | sampler semantics and reproducibility |
+| [`docs/server.md`](docs/server.md) | the OpenAI-compatible HTTP API |
+| [`docs/tui.md`](docs/tui.md) | the terminal UI |
 | [`docs/current-architecture.md`](docs/current-architecture.md) | how the code is organised and what is enforced |
 | [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding a seventh model |
 | [`docs/architecture.md`](docs/architecture.md) | the target scheduler design, not yet built |

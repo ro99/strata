@@ -35,7 +35,14 @@ struct InklingRuntimeConfig {
     // between them expert-major, so each distinct expert of the page is
     // fetched once instead of once per row that selected it. Arithmetic is
     // identical either way; this is a scheduling change.
-    std::uint32_t prefill_page_tokens{64U};
+    // Opt-in until measured. Expert-major batching cuts expert stagings by
+    // about 1.93x at page 64 (384 selections -> ~199 distinct experts under
+    // uniform routing) but raises enqueue/collect round trips per layer from
+    // 64 to ~199, and collect_moe ends in cudaStreamSynchronize -- so it
+    // trades expert-fetch bytes for host stream drains, and Sigma_serial is
+    // the term that usually dominates. The direction of that trade has not
+    // been measured, so it does not default on.
+    std::uint32_t prefill_page_tokens{};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
     bool verbose{};

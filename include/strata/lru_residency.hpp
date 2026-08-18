@@ -57,7 +57,13 @@ public:
     [[nodiscard]] auto begin() const noexcept { return order_.begin(); }
     [[nodiscard]] auto end() const noexcept { return order_.end(); }
     [[nodiscard]] bool empty() const noexcept { return order_.empty(); }
-    void clear() noexcept { order_.clear(); }
+
+    // Deliberately no clear(): emptying the list would leave every live
+    // LruPosition marked linked and holding a dangling iterator, so the next
+    // touch() or unlink() on any of them would erase from a container that no
+    // longer holds it. This type owns no back-pointers to its positions, so it
+    // cannot mark them unlinked -- which is the argument for not offering the
+    // operation rather than for adding the back-pointers.
 
 private:
     std::list<Key> order_;

@@ -108,6 +108,13 @@ HEADER_OVERRIDES = {
     "model_adapter.hpp": "strata_models",
     "deepseek_host_expert.hpp": "strata_models",
     "dsv4_rank_local_layer_executor.hpp": "strata_models",
+    # The Phase 4 seam and its two companions. Without these three the
+    # ownership map cannot classify them, and an unowned header is not
+    # scanned at all -- see the unowned-header check below, which now makes
+    # that a hard failure rather than a silent hole.
+    "model_executor.hpp": "strata_engine",
+    "lru_residency.hpp": "strata_engine",
+    "quantization.hpp": "strata_platform",
     # model.hpp and checkpoint.hpp each have a same-basename .cpp assigned to
     # strata_models below, so neither needs an override; listed here only as
     # a note that both were checked, not assumed, given the misleading names.
@@ -120,6 +127,7 @@ LOCAL_HEADER_OVERRIDES = {
     "cuda_stats_delta.hpp": "strata_device",
     "inkling_unicode.hpp": "strata_models",
     "laguna_unicode.hpp": "strata_models",
+    "executor_support.hpp": "strata_models",
 }
 
 INCLUDE_RE = re.compile(
@@ -229,6 +237,34 @@ def build_exception_index() -> dict[tuple[str, str], list[dict]]:
     return index
 
 
+def unowned_headers(cpp_to_target: dict[str, str]) -> list[str]:
+    """Every header the ownership map cannot classify.
+
+    An unowned header is worse than a violation: `owning_target` returns None,
+    so no include of it can be a direction hit, AND the header itself is never
+    added to any target's scan set, so its own includes are never read. A cold
+    review demonstrated the hole by adding a DeepSeek include to
+    model_executor.hpp and an include of that from strata_engine -- the run
+    reported a clean tree.
+
+    This is the same failure the docstring above records for `strata_device`
+    contributing 0 files to an earlier version of this script. Treat it the
+    same way: fail loudly, never scan nothing.
+    """
+    problems: list[str] = []
+    for header in sorted(ROOT.glob("include/strata/**/*.hpp")):
+        if owning_target(header.name, cpp_to_target) is None:
+            problems.append(
+                f"include/strata/{header.name} is owned by no target -- add it "
+                f"to HEADER_OVERRIDES; until then its includes are unscanned")
+    for header in sorted(ROOT.glob("src/**/*.hpp")):
+        if owning_target(header.name, cpp_to_target) is None:
+            problems.append(
+                f"{header.relative_to(ROOT)} is owned by no target -- add it to "
+                f"LOCAL_HEADER_OVERRIDES; until then its includes are unscanned")
+    return problems
+
+
 def check_expiry(current_phase: int = CURRENT_PHASE) -> list[str]:
     """Exceptions whose expiry_phase has arrived or passed. Shared with
     check_symbols.py so both checks fail identically on an expired entry
@@ -335,6 +371,7 @@ def main() -> int:
                     f"violation: {file_rel} includes {included}")
 
     expired = check_expiry()
+    unowned = unowned_headers(cpp_to_target)
 
     print(f"check-layers: {sum(len(v) for v in targets.values())} files "
           f"across {len(targets)} targets "
@@ -375,9 +412,15 @@ def main() -> int:
         print(f"== EXPIRED EXCEPTIONS ({len(expired)}) ==")
         for line in expired:
             print(f"  {line}")
+    if unowned:
+        print()
+        print(f"== UNOWNED HEADERS ({len(unowned)}) -- these are not scanned "
+              f"at all, which is worse than a violation ==")
+        for line in unowned:
+            print(f"  {line}")
 
     total = (len(violations) + len(identifier_hits) + len(self_named_hits) +
-             len(stale) + len(expired))
+             len(stale) + len(expired) + len(unowned))
     print()
     print(f"check-layers: {total} total violation(s) "
           f"({len(excepted)} excepted, {len(stale)} stale, "

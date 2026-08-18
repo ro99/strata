@@ -194,3 +194,24 @@ TEST_CASE("generation metrics can express reuse fields as not applicable") {
     REQUIRE(metrics.reused_prompt_tokens.value() == 4U);
     REQUIRE(metrics.incremental_kv_continuation.value());
 }
+
+// Without -Wl,--whole-archive on strata_models, every ModelRegistrar is
+// dropped by the linker -- nothing references those objects by name -- and
+// find_model returns null for all six models. Every binary then rejects every
+// --model-type. Nothing else in the suite catches that: the initialization
+// and rejection tests below pass just as happily against an empty registry,
+// because "unhandled runtime model: 0" is still a failure and an
+// uninitialized session still says "not initialized".
+TEST_CASE("every model is registered, which is what --whole-archive buys") {
+    REQUIRE(strata::registered_models().size() == 6U);
+    for (const auto* cli_name : {"glm", "deepseek", "gemma4", "kimi-k3",
+                                 "laguna", "inkling"}) {
+        const auto* found = strata::find_model_by_cli_name(cli_name);
+        REQUIRE(found != nullptr);
+        REQUIRE(found->make != nullptr);
+        REQUIRE(strata::find_model(found->model) == found);
+    }
+    // The generated help text cannot drift from the registry.
+    REQUIRE(strata::registered_model_names().find("inkling") !=
+            std::string::npos);
+}

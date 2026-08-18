@@ -36,7 +36,7 @@ from __future__ import annotations
 # Phase 1 remediation (brief 05) does not advance this: brief 05 is still
 # phase 1, phase 2's start is the orchestrator's decision, not a side effect
 # of a lint fix landing.
-CURRENT_PHASE = 1
+CURRENT_PHASE = 7
 
 EXCEPTIONS = [
 ]

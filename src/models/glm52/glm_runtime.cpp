@@ -1854,7 +1854,12 @@ ValidationResult Glm52Runtime::initialize(const std::string& model_directory,
     // derived from this process's CPU affinity mask instead of the 36 that was
     // measured on one machine. An explicit out-of-range value is still an error.
     if (config.host_worker_threads == 0U) {
-        config.host_worker_threads = host_hardware_profile().worker_threads();
+        // 0.75, not 1.0: the constant this replaces was 36, measured on a
+        // 48-CPU box, so the fraction that states the same measurement
+        // portably is three quarters. Taking every CPU would be a silent 33%
+        // widening of a pool somebody sized deliberately.
+        config.host_worker_threads =
+            host_hardware_profile().worker_threads(0.75);
     }
     if (config.host_cold_experts && config.host_worker_threads > 256U) {
         result.errors.emplace_back("host expert worker count must be in [1, 256]");

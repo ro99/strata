@@ -38,6 +38,26 @@ applied exception is printed with exactly what it covered.
 
 Both checks (`check_layers.py`, this one) plus the expiry check use the same
 `CURRENT_PHASE`/`expiry_phase` mechanism from `layer_exceptions.py`.
+
+LIMITS -- read the score as "0 upward references expressible as undefined
+symbols", which is weaker than "0 upward dependencies". Two shapes are
+invisible here by construction:
+
+  1. A function-pointer registry. strata_engine holds a null pointer that
+     strata_models fills at static-init time (register_model / find_model, and
+     register_placement_planner / plan_model_placement). The runtime
+     dependency is unchanged -- link strata_engine without strata_models and
+     every plan fails with "no placement planner is registered" -- but there
+     is no undefined symbol for nm to report. This is deliberate dependency
+     inversion and it is how the last recorded symbol exception was retired;
+     it is recorded here so nobody reads the zero as stronger than it is.
+     It also converts a link failure into a runtime one.
+
+  2. Inline and template code in headers. An upward dependency consumed
+     entirely through inline members leaves no undefined symbol in the lower
+     archive. Combined with an unowned header, which check_layers.py does not
+     scan, such a dependency is invisible to both checks at once -- which is
+     why check_layers.py now fails on any header it cannot classify.
 """
 
 from __future__ import annotations

@@ -246,6 +246,11 @@ TEST_CASE("Inkling page prefill is bit-identical to token-at-a-time") {
     if (!inkling_checkpoint_present()) {
         SKIP("pinned Inkling-Small-NVFP4 checkpoint is absent (missing-checkpoint)");
     }
+    // Without a device, moe_page -- the entire subject of this test -- never
+    // runs, and the comparison would pass while exercising nothing.
+    if (strata::CudaBackend::available_devices().empty()) {
+        SKIP("no CUDA device is available, so the batched MoE path is unreachable");
+    }
     auto tokenizer = strata::ModelTokenizer::load(
         (inkling_model_path() / "tokenizer.json").string());
     REQUIRE(tokenizer.ok());
@@ -272,8 +277,18 @@ TEST_CASE("Inkling page prefill is bit-identical to token-at-a-time") {
     // A page smaller than the prompt, so the multi-page path is exercised and
     // the second page starts from state the first one left behind.
     run(8U, paged);
+    // And again at a page wider than the prompt, the single-page case, so the
+    // test is not pinned to one page size while callers choose another.
+    std::vector<std::vector<float>> single_page;
+    run(64U, single_page);
 
     REQUIRE(paged.size() == serial.size());
+    REQUIRE(single_page.size() == serial.size());
+    for (std::size_t position = 0U; position < serial.size(); ++position) {
+        for (std::size_t index = 0U; index < serial[position].size(); ++index) {
+            REQUIRE(single_page[position][index] == serial[position][index]);
+        }
+    }
     for (std::size_t position = 0U; position < serial.size(); ++position) {
         REQUIRE(paged[position].size() == serial[position].size());
         for (std::size_t index = 0U; index < serial[position].size(); ++index) {

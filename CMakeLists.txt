@@ -42,11 +42,12 @@ endif()
 # Phase 1 (docs/experiments/0121): strata_core split into six layered
 # targets, dependencies pointing strictly downward:
 #   platform -> device -> kernels -> engine -> models -> app
-# Files are not moved -- every path below is exactly where it was in the
-# single strata_core list. This is a link-graph and enforcement change only;
-# scripts/check_layers.py is the boundary enforcement (there is no physical
-# per-target include directory yet, so the compiler alone cannot catch a
-# violation -- that is phase 3's job once files actually move).
+# Phase 3 subsequently moved the sources into per-tier directories, which is
+# why the paths below read src/platform/..., src/models/dsv4/... and so on.
+# There is still no per-target include directory, so the compiler alone cannot
+# catch a boundary violation: scripts/check_layers.py enforces the include
+# graph and scripts/check_symbols.py the link graph, and both run in
+# `make check`.
 #
 # strata_core is kept as a thin alias so every existing
 # `target_link_libraries(<binary> PRIVATE strata_core)` line below keeps

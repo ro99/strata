@@ -869,6 +869,12 @@ struct InklingRuntime::Impl {
 
         // Both sink experts run on every row, so this one is a genuine dense
         // batch: the whole page against both, in a single command.
+        //
+        // Charged to moe_shared_nanoseconds, not to the routed total. A phase
+        // counter that reads zero because its stage moved under a neighbouring
+        // counter is the exact trap this project has hit before, and it is
+        // invisible to any logits comparison.
+        const auto shared_started = std::chrono::steady_clock::now();
         std::vector<CudaMoeExpert> sinks;
         sinks.reserve(kShared);
         for (std::uint32_t shared = 0U; shared < kShared; ++shared) {
@@ -883,6 +889,7 @@ struct InklingRuntime::Impl {
             static_cast<std::size_t>(sinks.size()) * rows * kHidden);
         result = cuda.collect_moe(devices[device.slot], shared_collected, {});
         if (!result.ok()) return result;
+        graph.moe_shared_nanoseconds += elapsed_since(shared_started);
         for (std::size_t sink = 0U; sink < sinks.size(); ++sink) {
             for (std::uint32_t row = 0U; row < rows; ++row) {
                 const float weight = routes[row].weights[kTopK + sink];
@@ -1006,10 +1013,18 @@ struct InklingRuntime::Impl {
                     auto out = std::span<float>(deltas)
                                    .subspan(static_cast<std::size_t>(row) * kHidden,
                                             kHidden);
-                    result = layer.sparse
-                        ? moe(layer, device, index, norm, out)
-                        : dense_mlp(layer.dense_gate_up, layer.dense_down,
-                                    layer.dense_global_scale, &device, norm, out);
+                    if (layer.sparse) {
+                        result = moe(layer, device, index, norm, out);
+                    } else {
+                        const auto dense_started =
+                            std::chrono::steady_clock::now();
+                        result = dense_mlp(layer.dense_gate_up,
+                                           layer.dense_down,
+                                           layer.dense_global_scale, &device,
+                                           norm, out);
+                        graph.dense_mlp_nanoseconds +=
+                            elapsed_since(dense_started);
+                    }
                     if (!result.ok()) return result;
                 }
             }

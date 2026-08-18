@@ -230,6 +230,9 @@ target_link_libraries(strata-numa-probe PRIVATE strata_core)
 add_executable(strata-dsv4-host-expert-probe apps/strata_dsv4_host_expert_probe.cpp)
 target_link_libraries(strata-dsv4-host-expert-probe PRIVATE strata_core)
 
+add_executable(strata-dsv4-expert-residency apps/strata_dsv4_expert_residency.cpp)
+target_link_libraries(strata-dsv4-expert-residency PRIVATE strata_core)
+
 add_executable(strata-dsv4-expert-row-batch-probe
     apps/strata_dsv4_expert_row_batch_probe.cpp)
 target_link_libraries(strata-dsv4-expert-row-batch-probe PRIVATE strata_core)

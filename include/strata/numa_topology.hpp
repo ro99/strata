@@ -29,7 +29,17 @@ struct NumaTopology {
     // cpu_node[c] is the node of logical CPU c, or -1 when unknown.
     std::vector<int> cpu_node;
 
+    // node_primary_cpus[n] lists only the first logical CPU of each physical
+    // core on node n -- one entry per core, SMT siblings excluded. Empty when
+    // sysfs does not expose thread siblings, in which case callers fall back
+    // to node_cpus.
+    std::vector<std::vector<int>> node_primary_cpus;
+
     [[nodiscard]] static NumaTopology detect();
+    // One worker per physical core on the smallest node. A compute-bound pool
+    // gains nothing from SMT siblings on this workload and loses the runnable
+    // headroom the rest of the process needs; see experiment 0123.
+    [[nodiscard]] std::size_t smallest_node_cores() const noexcept;
     [[nodiscard]] bool multi_node() const noexcept { return nodes > 1; }
     // The node a logical CPU belongs to, or 0 when the topology is unknown.
     [[nodiscard]] int node_of_cpu(int cpu) const noexcept;

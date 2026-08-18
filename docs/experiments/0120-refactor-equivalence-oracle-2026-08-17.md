@@ -421,3 +421,130 @@ than Phase 1 made and could not verify.
 Shared files a seventh model must edit: **12 -> 3** — the `RuntimeModel` enum,
 the `PlacementModel` enum, and the CMake source list. Everything else is one new
 directory under `src/models/`.
+
+## Phase 4 — the model seam
+
+`include/strata/model_executor.hpp` is the second polymorphic interface in the
+codebase and the first that is not model-specific. Models register themselves
+from their own translation unit; `RuntimeSession` is a registry lookup and two
+virtual calls. `src/app/runtime.cpp`: **475 → 187 lines** — the `std::variant`
+over six runtimes, the six-arm `if`-chain, and the six-arm `std::get_if` chain
+that hand-copied 10–13 result fields are all gone.
+
+Self-registration needs `-Wl,--whole-archive` on `strata_models`: a static
+library drops any member nothing references, and nothing references a
+self-registering TU by definition. `strata_app` links *ahead* of it, because ld
+resolves in one pass. Getting that backwards produced 24 undefined references
+from `placement_model.cpp` — F1 from the cold review arriving as a build
+failure rather than a silent inversion, which is what the enforcement is for.
+
+All three Phase-1 lint exceptions were **deleted, not repointed**: the
+placement dependency was inverted through a registered `PlacementPlanner`, the
+tokenizer moved to `strata_models` (six pretokenizers and twelve chat templates
+— it is model code), and the quantization vocabulary split into
+`include/strata/quantization.hpp`. Both lints now report 0 violations with 0
+exceptions.
+
+Shared files a seventh model must edit: **12 → 3** (`RuntimeModel`,
+`PlacementModel`, the CMake source list).
+
+## Phase 7 — the hardware profile
+
+Nine constants described the development machine and were asserted as program
+facts; 216 GiB appeared three times independently. `hardware_profile.hpp` probes
+MemTotal, the process's **affinity mask** (not the machine's core count — a
+cgroup or taskset makes those differ), and NUMA. Zero in a config field means
+"ask the hardware"; non-zero is an explicit operator ceiling.
+
+Rank-local ceilings became fractions reproducing the validated figures exactly
+on the box they were measured on: 22,548,578,304 / 24 GiB = 0.8750; the host
+ceiling at 0.85 of MemTotal lands within 1% of 216 GiB. Experiment 0082 gated
+*zero decode weight and workspace allocations*, not the byte count, so the
+property survives on other hardware.
+
+Two defects the constants had been hiding:
+
+- `kDsv4RankLocalMinimumCpusPerRank` was doing **two jobs** — the floor below
+  which a rank cannot work, and the pool width to assign. Lowering it to a
+  portable floor silently narrowed the production pool from 24 CPUs to 4. An
+  existing test caught it. Width now comes from the smallest online node.
+- Deriving a device's VRAM ceiling from its own *usage* is circular.
+  `Dsv4RankLocalDeviceAccount` carries `device_total_bytes` instead.
+
+## Post-phase: the "exists but unused" audit
+
+An independent audit classified the seven mechanisms the review called
+DeepSeek-private into: **A** doesn't exist, **B** exists and is generic but
+callers pass a degenerate argument, **C** genuinely DeepSeek-shaped.
+
+The review was **wrong on three of seven**. Mechanisms 3 (expert-major MoE), 4
+(NUMA placement) and 5 (deferred upload, pinned host memory) all have
+model-neutral counterparts in `cuda_backend.hpp`, `worker_pool.hpp` and
+`numa_topology.hpp` that nothing outside `src/models/dsv4/` called. The error
+was reading model-named **files** as model-private **capability**.
+
+It was right on 6 (TP2: world=2, 43 layers, MLA absorption, mHC), 7 (FP8 tensor
+page — passing `true` elsewhere would be *inert*, no other model has FP8
+weights), and the kernels of 2 and 4.
+
+Acted on, in the audit's ranked order:
+
+- **Laguna deferred upload.** `UploadCompletion` has existed since the DeepSeek
+  concurrency work, defaulting to `Synchronous`, with one caller ever passing
+  `Deferred`. Laguna's precondition was already met — it uploads from the
+  reader's mmap. `ExpertCache::acquire` was doing three serial host syncs per
+  expert under a held mutex. Ordering points added at all three kernel sites,
+  including the resident spine, which loads through the same path.
+- **Kimi's arena NUMA-interleaved.** Anonymous mmap, faulted on first touch,
+  `mlock`ed on one thread — which under the default policy lands the whole arena
+  on one node. Kimi runs no CUDA, so host DRAM bandwidth is its bottleneck by
+  construction.
+- **Eviction scans, GLM and Laguna.** Both ranked every entry to find one victim
+  under the device mutex. DeepSeek measured the identical pattern at 14.3 ms/step
+  and the fix was already written there. Ineligible entries are *skipped, not
+  unlinked*, so releasing a lease does not make an entry newer than entries used
+  since. Writing that list twice is what produced `lru_residency.hpp`.
+- **GLM `read()` → `view()`, then deferred.** Removes a full heap copy per weight
+  and supplies the precondition for deferring.
+
+**Not done, deliberately.** The audit's item 5 — row-group MoE in the generic
+kernels — would collapse up to ~256 host-blocking round trips per prefill layer
+into one, for three models. It needs six new kernels *and* `kMaxRoutedMoeExperts`
+raised from 10 to a page's whole expert union. Building that without a phase
+profile at a non-DeepSeek operating point is experiment 0025's failure mode
+exactly: ~2,900 lines written before the cost model was instantiated. It stays
+open, with the gate named.
+
+## Inkling batched prefill
+
+Inkling was the only model of six with no batched path anywhere: `forward()`
+took one token and ran the whole graph. `forward_page` runs each layer in three
+passes — attention row-serial (each row appends its K/V before attending), one
+batched MoE, then convolution and residual row-serial (rolling history). The
+feed-forward is the only stage with no cross-row state, which is why the page
+batches there and nowhere else.
+
+`moe_page` groups expert-major: each distinct expert is fetched once per page
+rather than once per selecting row. `enqueue_moe`'s batching is dense over
+expert × row, so the rows handed to it are exactly that expert's rows — passing
+the page's whole row set against the union would compute |union| × R products
+instead of R × 6.
+
+**The A/B test failed on its first run, which is why it asserts equality rather
+than a tolerance.** The page summed a row's experts in expert-id order where the
+reference sums them in router-choice order; float addition is not associative.
+It showed as 0.0163 absolute on the logits at position 0 — small enough that
+generated text would still have looked correct. Contributions are now parked per
+(row, choice) slot and summed in choice order. Page and serial are now
+bit-identical across 18 positions and the full 200,058-entry vocabulary.
+
+## What is not measured
+
+Nothing in this record claims a throughput number. The Inkling batching, the
+deferred uploads, the eviction lists and the NUMA interleave are verified
+**correct** and their preconditions verified **from source**; none has a measured
+effect at its own model's operating point. The 14.3 ms, 64.5 ms and 0.30 ms
+figures quoted throughout belong to DeepSeek and Laguna at *their* operating
+points and must not be inherited. There is no phase breakdown in-repo for GLM,
+Laguna, Inkling, Gemma 4 or Kimi-K3; before any of this is claimed as a win, the
+charter's step 1 applies.

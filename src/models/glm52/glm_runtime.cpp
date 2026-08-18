@@ -26,7 +26,7 @@
 #include <iterator>
 #include <limits>
 #include <iostream>
-#include <list>
+#include "strata/lru_residency.hpp"
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -248,24 +248,6 @@ ValidationResult validate_runtime_graph_contract(const GlmCheckpointReader& chec
 }
 
 class WeightCache {
-    // Unlinks an entry from the recency list without touching the map.
-    template <typename StateT, typename EntryT>
-    static void unlink_locked(StateT& state, EntryT& entry) {
-        if (!entry.linked) return;
-        state.recency.erase(entry.recency);
-        entry.linked = false;
-    }
-
-    // Moves an entry to the most-recently-used end.
-    template <typename StateT, typename EntryT>
-    static void touch_locked(StateT& state, const std::string& key,
-                             EntryT& entry) {
-        unlink_locked(state, entry);
-        state.recency.push_back(key);
-        entry.recency = std::prev(state.recency.end());
-        entry.linked = true;
-    }
-
     struct Entry {
         CudaWeight weight;
         std::uint64_t last_use{};
@@ -276,15 +258,14 @@ class WeightCache {
         // The scan this replaces walked the whole map per eviction while
         // holding the device mutex; DeepSeek measured the identical pattern at
         // 14.3 ms/step (deepseek_runtime.cpp, Dsv4WeightCache).
-        std::list<std::string>::iterator recency{};
-        bool linked{};
+        LruPosition<std::string> recency;
     };
     struct State {
         mutable std::mutex mutex;
         std::unordered_map<std::string, Entry> entries;
         // Ordered by last_use ascending -- exactly the key the ranking scan
         // used, so eviction order is unchanged.
-        std::list<std::string> recency;
+        LruOrder<std::string> recency;
         std::uint64_t capacity{};
         std::uint64_t used{};
         std::uint64_t peak{};
@@ -452,7 +433,7 @@ private:
         auto found = state.entries.find(key);
         if (found != state.entries.end()) {
             found->second.last_use = state.clock;
-            touch_locked(state, key, found->second);
+            state.recency.touch(key, found->second.recency);
             if (pin && !found->second.pinned) {
                 found->second.pinned = true;
                 state.pinned_used += found->second.weight.device_bytes();
@@ -492,7 +473,7 @@ private:
                 return result;
             }
             state.used -= victim->second.weight.device_bytes();
-            unlink_locked(state, victim->second);
+            state.recency.unlink(victim->second.recency);
             state.entries.erase(victim);
             ++state.evictions;
             evictions_.fetch_add(1U, std::memory_order_relaxed);
@@ -508,7 +489,7 @@ private:
         if (pin) state.pinned_used += entry.weight.device_bytes();
         state.peak = std::max(state.peak, state.used);
         found = state.entries.emplace(key, std::move(entry)).first;
-        touch_locked(state, key, found->second);
+        state.recency.touch(key, found->second.recency);
         misses_.fetch_add(1U, std::memory_order_relaxed);
         ++state.misses;
         output = &found->second;

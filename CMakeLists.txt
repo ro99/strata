@@ -142,6 +142,7 @@ add_library(strata_models STATIC
     src/models/dsv4/deepseek_manifest.cpp
     src/models/dsv4/deepseek_kv_cache.cpp
     src/models/dsv4/dsv4_attention_kv.cpp
+    src/models/dsv4/dsv4_expert_residency.cpp
     src/models/dsv4/deepseek_ops.cpp
     src/models/dsv4/deepseek_checkpoint.cpp
     src/models/dsv4/deepseek_rank_shard.cpp
@@ -431,6 +432,7 @@ if(BUILD_TESTING)
         tests/test_chat_protocol.cpp
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
+        tests/test_dsv4_expert_residency.cpp
         tests/test_glm_ops.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp

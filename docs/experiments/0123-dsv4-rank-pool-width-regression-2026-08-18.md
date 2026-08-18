@@ -139,3 +139,66 @@ cmake --build build-release --target strata-server -j
   --prefill-page-tokens 8192 --host 127.0.0.1 --port 8033 &
 bash scripts/dsv4_server_decode_bench.sh 8033 label 3
 ```
+
+## Addendum — the corrected decode budget, and what 20 tok/s needs
+
+With the fix in place the step is **115.9 ms/token (8.625 tok/s)**:
+
+| term | ms/token | share |
+| --- | ---: | ---: |
+| `moe_seconds` (host routed experts) | 72.81 | 62.8% |
+| non-MoE inside the layer loop | 41.54 | 35.8% |
+| KV / output head / candidate / outside | 7.42 | 6.4% |
+
+Every other decode counter reads exactly zero, and the cause is
+`kernels/cuda/dsv4_rank_local_layer_executor.cu:1436`:
+
+```cpp
+if (output.success && !impl_->chain_mode) {   // event timing, sequential only
+```
+
+Production decode runs chain mode, so the CUDA event breakdown -- attention,
+attention collective, publication, router, shared, MoE collective, final
+transition -- is never computed. The 41.54 ms is therefore unattributed by
+construction, not by omission. `cpu_moe_phases` *is* populated (line 550), in
+`kernels/`, which an earlier grep over `src/ apps/ include/` missed.
+
+One suspect priced without instrumenting anything. Rank-local decode issues 86
+NCCL all-reduces per token (43 attention, 43 MoE) between two 3090s with no
+working P2P, each 4,096 floats. Measured standalone on this box, devices 1 and
+2, 500 iterations x 3:
+
+```
+all-reduce 4096 floats (16 KB): 0.0158 ms each  ->  86/token = 1.36 ms/token
+```
+
+**Collectives are 1.36 ms of the 41.54, or 3.3%.** They are not the term. What
+remains is ~40 ms of per-layer host submission and device work, 0.97 ms per
+layer across 43 layers.
+
+### The arithmetic to 50 ms/token
+
+- The host MoE kernel now runs at 3.449 GB / 72.81 ms = **47.4 GB/s aggregate**
+  against 0058's 56.7-60.9 GB/s bound, so kernel tuning alone is worth at most
+  1.28x: 72.81 -> ~57 ms. Not sufficient.
+- Removing bytes from the CPU is the lever. Serving the VRAM-resident fraction
+  of each layer's six experts on the GPU and leaving the CPU only the misses,
+  at hit rates from the LRU replay in [[dsv4-expert-cache-lever]]:
+
+| expert cache | decode hit rate | CPU bytes/token | MoE ms | step ms | tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none (today) | 0% | 3.449 GB | 72.8 | 115.9 | 8.6 |
+| 17.7 GB (already admitted) | ~65% | 1.21 GB | 25.5 | 68.6 | 14.6 |
+| ~47 GB (reclaimed + 5060 Ti) | ~85% | 0.52 GB | 10.9 | 54.0 | 18.5 |
+
+- Even a **free** MoE leaves 41.54 + 7.42 = 48.96 ms, which is 20.4 tok/s. So
+  the MoE term alone cannot reach the target with margin; the 41.54 ms must
+  come down too.
+
+**20 tok/s = MoE to ~11 ms and the non-MoE layer term to ~31 ms.** That is 6.6x
+on the first and 1.34x on the second. Both are required; neither suffices alone.
+
+The next measurement is therefore the 41.54 ms, and the cheapest way in is to
+compute the existing event timings in chain mode rather than only in sequential
+mode -- the events are already recorded, and the guard above is the only thing
+between them and an attribution.

@@ -4,111 +4,178 @@ This document describes the code that exists today. The intended expert-ticket
 wavefront is documented separately in [`architecture.md`](architecture.md) and
 must not be treated as implemented behavior.
 
-## Dependency layers
+## Layers
 
-Strata has four dependency layers:
+Six static libraries, dependencies pointing strictly downward:
 
-1. **Core infrastructure** owns result types, Safetensors/shard I/O, numerical
-   primitives, CUDA boundaries, worker pools, sampling, and the versioned route
-   trace contract.
-2. **Model adapters** own immutable pinned execution contracts, tokenizer and
-   chat-template behavior, tensor classification, router semantics, and exact
-   GLM-5.2, DeepSeek-V4, Gemma 4, or Kimi-K3 operations.
-3. **Execution** owns device admission and placement, runtime initialization,
-   request/session state, generation, cache policy, and metrics. Applications
-   use `RuntimeSession`; research tools may use the concrete model runtimes for
-   model-specific diagnostics.
-4. **Applications** parse CLI options and render output. They do not select
-   tensor names, model operations, or cache placement.
+```text
+strata_platform   result/types, safetensors and shard I/O, json, numerics,
+                  worker pool, NUMA topology, hardware profile, trace,
+                  diagnostics, the FlashAttention request contract
+strata_device     the CUDA backend, or its error-returning stub
+strata_kernels    CPU reference kernels (Q4, INT4 group-128, attention)
+strata_engine     placement solver and cache, residency, sampling, chat and
+                  session support, the model registry
+strata_models     six models, one directory each, plus the shared checkpoint
+                  reader, tokenizer and placement inventories
+strata_app        RuntimeSession and the OpenAI protocol
+```
 
-Dependencies point downward. DeepSeek code does not depend on GLM code for
-generic numerical operations, and applications do not branch over concrete
-runtime result types for ordinary generation.
+`strata_core` is an interface alias forwarding to `strata_app`, so every
+`target_link_libraries(<binary> PRIVATE strata_core)` keeps working. It links
+`strata_models` under `--whole-archive`; see "Model registration" below.
 
-## Current execution model
+`src/` mirrors this: `src/platform/`, `src/engine/`, `src/app/`, and
+`src/models/{dsv4,glm52,gemma4,kimi_k3,laguna,inkling,common}/`. Public headers
+stay flat under `include/strata/` — the tier is expressed by the build target
+and checked by the two lints, not by header path.
 
-The current executors are architecture-specific and exact. GLM performs a
-batched prefill followed by token-at-a-time decode. Gemma 4 performs bounded
-prefill with whole vision blocks, hybrid local/global attention, and a BF16
-local-ring/global-full KV cache. DeepSeek performs bounded
-layer-major prefill pages with a multi-row router projection, exact row-ordered
-causal/cache transitions, and token-at-a-time decode. Each executor performs its
-own exact attention, router, shared-expert, routed-expert, residual, and
-cache-state transitions.
+### The layering is enforced, not asserted
 
-The concrete runtime translation units are model executors, not the future
-cross-request scheduler. They share lifecycle, device planning, storage I/O,
-route tracing, numerical primitives, and the application facade, while model
-mathematics stays isolated behind pinned adapter contracts.
+Two checks, both run by `make check`:
 
-## Current residency and scheduling
+- `scripts/check_layers.py` reads the `add_library` source lists out of
+  `CMakeLists.txt` and fails on an include pointing upward, on a model
+  identifier appearing in a no-model target, and on any header it cannot
+  assign to a target. That last case matters: an unowned header is not scanned
+  at all, which is worse than a violation, and a cold review demonstrated the
+  hole by hiding a DeepSeek include inside `model_executor.hpp`.
+- `scripts/check_symbols.py` reads real `nm` output from the built archives.
+  It exists because the include check cannot see a link edge with no
+  corresponding `#include`, and there was one: `strata_engine` referenced
+  `strata_models` through `placement_model.cpp`, and it linked only because
+  every binary goes through one archive list that let `ld`'s single-pass
+  resolution absorb it.
 
-Gemma 4 places its dense text graph and vision tower resident across the
-capacity-weighted GPU schedule. GLM uses a per-device LRU weight cache with a pinned dense spine and optional
-host execution for cold routed experts. DeepSeek stages canonical routed expert
-weights in host RAM, pins its dense/shared spine in VRAM, and leases exact
-top-k expert triplets during device execution. Kimi-K3 holds its 106.55 GiB BF16
-dense spine resident in host RAM and streams MXFP4 routed experts from SATA
-through a locked, coalescing O_DIRECT arena; its placement inventory is
-descriptive, not yet prescriptive, and no byte derived from its weights may
-reach the NVMe. See `docs/kimi-k3-runtime.md`. Device assignment is a shared,
-capacity-weighted schedule; see "Placement planning" for how it is sized,
-reported, and cached. Its opt-in past-only predictor can queue bounded
-host-to-VRAM expert prefetch without changing exact routes or coefficients;
-demand cancels queued duplicates and may evict prefetched entries first.
+Both report zero violations with **zero exceptions**. Read the symbol score as
+"zero upward references expressible as undefined symbols" — a function-pointer
+registry and inline code in headers are both invisible to `nm`, and the script
+says so at the point it prints the number.
 
-There is no cross-request ticket ring, peer expert RPC, route-affinity cohort
-scheduler yet. Those are target architecture items and cannot be claimed by
+## Model registration
+
+`include/strata/model_executor.hpp` is the seam. `ModelExecutor` has three
+virtual members — `initialize`, `generate_chat_stream`, `accepts_images` — and
+each model registers itself with a file-scope `ModelRegistrar` in its own
+translation unit. `RuntimeSession` is a registry lookup and two virtual calls;
+it contains no model names.
+
+The registration carries what applications used to hardcode: the
+`--model-type` token, the placement model, whether the model accepts the
+DeepSeek-only controls, and the per-model presentation defaults. `strata-chat`
+and `strata-server` resolve through `find_model_by_cli_name` and have no
+string-to-enum chain.
+
+`--whole-archive` on `strata_models` is load-bearing: a static library drops
+any member nothing references, and nothing references a self-registering
+translation unit by definition. `strata_app` links ahead of it because `ld`
+resolves in one pass. A test asserts all six models are registered, because
+without the flag `find_model` returns null for every model and the rest of the
+suite still passes.
+
+## What a new model costs
+
+Its own directory under `src/models/`, and **five shared files**:
+
+1. `include/strata/model_executor.hpp` — the `RuntimeModel` enumerator.
+2. `include/strata/placement.hpp` — the `PlacementModel` enumerator.
+3. `CMakeLists.txt` — the `strata_models` source list.
+4. `src/models/common/placement_model.cpp` — three `switch (PlacementModel)`.
+5. `src/models/common/tokenizer.cpp` — the pretokenizer dispatch.
+
+Items 4 and 5 are the remaining per-model switches; both are inside
+`strata_models`, so they are a code-organisation cost rather than a layering
+defect. See [`model-bringup-guide.md`](model-bringup-guide.md) for the
+procedure.
+
+## Execution model
+
+The executors are architecture-specific and exact. GLM performs a batched
+prefill then token-at-a-time decode. Gemma 4 performs bounded prefill with
+whole vision blocks, hybrid local/global attention, and a BF16
+local-ring/global-full KV cache. DeepSeek performs bounded layer-major prefill
+pages with a multi-row router projection and exact row-ordered causal
+transitions. Kimi-K3 batches over a token span throughout. Inkling has an
+opt-in paged prefill (`prefill_page_tokens`) that runs attention and its four
+short convolutions row-serial — both carry row-ordered state — and batches the
+routed MoE expert-major between them; it is bit-identical to its
+token-at-a-time path and defaults off pending measurement.
+
+Each executor performs its own exact attention, router, shared-expert,
+routed-expert, residual and cache-state transitions. They share lifecycle,
+device planning, storage I/O, route tracing, numerical primitives, chat-prompt
+preparation and the application facade.
+
+There is no cross-request ticket ring, peer expert RPC, or route-affinity
+cohort scheduler. Those are target architecture items and cannot be claimed by
 current benchmarks.
+
+## Hardware
+
+`include/strata/hardware_profile.hpp` probes the machine once and caches it:
+`MemTotal`, the process's CPU affinity mask (not the machine's core count — a
+cgroup or taskset makes those differ), NUMA topology, and the smallest node's
+CPU count. `resolve_runtime_devices` turns an empty device list into every
+visible device.
+
+The convention: **zero in a config field means "ask the hardware"; a non-zero
+value is an explicit operator ceiling and is used verbatim.** A measurement
+belongs in the profile; a policy — a fraction, a reserve, a floor — belongs in
+the code that applies it. The rank-local ceilings are fractions chosen to
+reproduce the figures experiment 0082 validated on the machine it validated
+them on.
+
+Not yet portable: `CudaBackend` is concrete with no virtual members, the CPU
+fallback is a hand-mirrored stub that every new method must be added to twice,
+`CUDA_ARCHITECTURES` is `86 120`, and eleven SM86 gates sit on DeepSeek's
+device paths. A different NVIDIA architecture is an edit; a different vendor is
+not.
+
+## Equivalence oracle
+
+`make check-equivalence` (also a ctest entry, guarded on the checkpoint being
+present) runs Gemma 4 against `tests/fixtures/gemma4/layer-hash-trace.json` —
+a per-layer hidden-state hash plus per-operation hashes over a fixed prompt.
+The types are model-neutral (`include/strata/diagnostics.hpp`); DeepSeek emits
+the same records, and the remaining four models do not yet.
+
+Its limits, stated because a gate nobody understands is worse than none: it
+covers **prefill only** — once the device KV path engages, a whole device's
+worth of layers returns from one CUDA call with no host-visible boundary, and
+DeepSeek shares that blind spot — and `stable_bf16_hash` rounds to BF16 before
+hashing, so a difference that moves no value across a rounding boundary is
+invisible by construction. That is the class of difference code motion
+produces, which is exactly why the file-move phase gated on
+renames-not-rewrites rather than on this.
 
 ## Placement planning
 
 `strata/placement.hpp` sizes a checkpoint against measured hardware before any
-weight is read. It has three pieces:
+weight is read: an **inventory** (model-specific, from checkpoint headers only,
+hardware-independent), a **solver** (a pure function of inventory plus a
+hardware probe), and a **plan cache** keyed by checkpoint identity, GPU
+identity, context size, device list, VRAM fraction and flags.
 
-- An **inventory** — every placeable module with its device bytes, host bytes,
-  and the bytes it contributes to one batch-1 decode step. Model-specific, built
-  from checkpoint headers only, hardware-independent, and therefore reproducible
-  and testable without a GPU.
-- A **solver** — a pure function from inventory plus a hardware probe to a plan.
-  It assigns layer blocks, applies the tier order device → host → NVMe to
-  spillable classes only, and reports the per-resource `W_r` volume of a decode
-  step. It measures no bandwidth and produces no duration.
-- A **plan cache** — the solved plan as JSON under `~/.cache/strata/plans`,
-  keyed by checkpoint identity (shard names, sizes, mtimes), GPU identity,
-  context size, device list, VRAM fraction, and flags. Any mismatch is a miss
-  and the plan is recomputed; a plan is never reinterpreted across a schema
-  version.
+`plan_model_placement` in `strata_engine` is a thin dispatcher through a
+registered `PlacementPlanner`; the implementation that opens six different
+checkpoints lives in `strata_models` and installs itself at static-init. That
+inversion is why `strata_engine` names no model symbol.
 
-Only sparse classes are marked spillable. A densely read class is read on every
-step, so moving it out of VRAM to make room for a sparsely read one is negative
-under a `max` over resources, and for a dense model larger than aggregate
-resident memory the plan reports I/O dependence rather than manufacturing
-sparsity.
-
-Placement is **prescriptive for Gemma 4**: the plan chooses contiguous,
-byte-balanced layer blocks sized to each device's admitted budget, and
-`Gemma4Runtime::initialize` consumes that assignment and those budgets. It is
-**descriptive for GLM and DeepSeek**: the solver reproduces the VRAM-weighted
-round-robin those runtimes already use and reports the resulting placement
-without changing it, so a planning defect cannot regress a validated runtime.
-DeepSeek's KV and compressor-state sizing is delegated to
-`plan_dsv4_resident_topology` rather than restated.
-
-`RuntimeSession::initialize` resolves and verifies a plan before constructing a
-runtime. Verification re-probes free VRAM, because the cached budget was taken
-at plan time and another process may have claimed memory since; a prescriptive
-plan that no longer fits is an error, and a descriptive one warns.
+Placement is **prescriptive for Gemma 4** and **descriptive for GLM and
+DeepSeek** — the solver reproduces the round-robin those runtimes already
+perform and reports it without changing it, so a planning defect cannot
+regress a validated runtime.
 
 ## Route traces
 
-Both runtimes emit `strata.route_trace` JSONL version 2. The simulator parser
-consumes that same schema and retains backward compatibility with the original
-numeric text fixture format. Every event carries request, phase, token position,
-layer, ordered experts, and exact coefficients.
+Both runtimes emit `strata.route_trace` JSONL version 2, and the simulator
+parser consumes the same schema. Every event carries request, phase, token
+position, layer, ordered experts and exact coefficients.
 
 ## Initialization contract
 
-A concrete runtime may be initialized once successfully. A failed attempt leaves
-generation disabled, and a retry starts from a fresh implementation object.
-`RuntimeSession` commits a concrete runtime only after initialization succeeds.
+A concrete runtime may be initialized once successfully. A failed attempt
+leaves generation disabled, and a retry starts from a fresh implementation
+object. `RuntimeSession` commits an executor only after initialization
+succeeds, and rejects an unregistered `RuntimeModel` before any placement work
+or checkpoint access.

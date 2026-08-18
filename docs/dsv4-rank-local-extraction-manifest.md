@@ -1,5 +1,13 @@
 # DSV4 rank-local extraction manifest
 
+> **Path note (2026-08-18).** This is a historical record and its file paths
+> predate the layering refactor. `src/<name>.cpp` moved to `src/platform/`,
+> `src/engine/`, `src/app/` or `src/models/<model>/`; see
+> [`current-architecture.md`](current-architecture.md). Some paths here never
+> existed on `main` at all — they are from experiment branches that were never
+> merged. The record is left as written; only this note is added.
+
+
 This manifest is the traceability record for the production landing of the
 rank-local TP2 decode topology. It classifies **every file** in
 `main...a31ac58` — the complete 42-commit experiment delta — into exactly one

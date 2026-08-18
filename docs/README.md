@@ -40,7 +40,12 @@ previous “not implemented” statement false.
   implementation claim.
 - `model-format.md` — native format contract and the implemented foreign-extent
   path; standalone pack tooling is still planned.
-- `model-bringup.md` — staged correctness contract with per-stage status notes.
+- `model-bringup-guide.md` — **how to add a seventh model.** The procedure, the
+  five shared files, and the rules that are not obvious. Start here for a new
+  architecture.
+- `model-bringup.md` — the historical GLM-5.2 / DeepSeek-V4 bring-up contract:
+  pinned revisions and staged correctness gates. Not a procedure for a new
+  model; see the guide above.
 - `research-roadmap.md` — phase scope and current high-level status.
 - `glm52-throughput-handoffs.md` — historical T0/T1 handoff plan, superseded as a
   live status page by experiment records and the root README.

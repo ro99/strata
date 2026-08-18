@@ -1,5 +1,13 @@
 # DSV4 Rank-Local TP2 Main-Landing Tracker
 
+> **Path note (2026-08-18).** This is a historical record and its file paths
+> predate the layering refactor. `src/<name>.cpp` moved to `src/platform/`,
+> `src/engine/`, `src/app/` or `src/models/<model>/`; see
+> [`current-architecture.md`](current-architecture.md). Some paths here never
+> existed on `main` at all — they are from experiment branches that were never
+> merged. The record is left as written; only this note is added.
+
+
 Last updated: 2026-08-13
 
 Branch: `feat/dsv4-rank-local-decode`

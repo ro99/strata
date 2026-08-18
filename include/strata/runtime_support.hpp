@@ -5,6 +5,7 @@
 #include "strata/types.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -82,6 +83,38 @@ using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
 
 [[nodiscard]] bool trim_oldest_chat_turn(
     std::vector<ChatMessage>& messages);
+
+// Render a chat template, encode it, and make it fit the context.
+//
+// Five of the six runtimes wrote this loop themselves, identically apart from
+// which template function they called and whether an over-long prompt trims or
+// reports. The shape is: render, encode, check that the prompt plus the
+// requested generation fits, and if it does not, drop the oldest turn and
+// render again -- because trimming changes the rendered text, so the encode
+// has to be redone rather than the token vector truncated.
+struct ChatPromptRequest {
+    std::span<const ChatMessage> messages;
+    std::uint32_t maximum_new_tokens{};
+    std::uint32_t maximum_context_tokens{};
+    // This model's chat template.
+    std::function<std::string(std::span<const ChatMessage>)> render;
+    // This model's tokenizer.
+    std::function<ParseResult<std::vector<std::uint32_t>>(const std::string&)>
+        encode;
+    // Drop the oldest turn and retry when the prompt does not fit. False
+    // reports the overflow instead, which is what a runtime with no sliding
+    // cache has to do rather than silently answer a different conversation.
+    bool trim_oldest_turn_to_fit{true};
+};
+
+struct ChatPrompt {
+    std::vector<std::uint32_t> token_ids;
+    std::vector<std::string> errors;
+
+    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
+};
+
+[[nodiscard]] ChatPrompt prepare_chat_prompt(const ChatPromptRequest& request);
 
 // Returns the complete valid UTF-8 prefix, or string_view::npos for invalid input.
 [[nodiscard]] std::size_t complete_utf8_prefix(std::string_view text) noexcept;

@@ -1966,23 +1966,22 @@ Glm52GenerationResult Glm52Runtime::generate_chat_stream(
         result.errors.push_back(std::move(validation_error));
         return result;
     }
-    std::vector<ChatMessage> active_messages(messages.begin(), messages.end());
-    ParseResult<std::vector<std::uint32_t>> encoded;
-    for (;;) {
-        encoded = impl_->tokenizer.encode(render_glm52_chat_prompt(active_messages));
-        if (!encoded.ok()) {
-            result.errors = std::move(encoded.errors);
-            return result;
-        }
-        if (encoded.value.size() + maximum_new_tokens <=
-            impl_->config.maximum_context_tokens) break;
-        if (!trim_oldest_chat_turn(active_messages)) {
-            result.errors.emplace_back(
-                "prompt and requested generation exceed the context ceiling");
-            return result;
-        }
+    ChatPromptRequest prompt_request;
+    prompt_request.messages = messages;
+    prompt_request.maximum_new_tokens = maximum_new_tokens;
+    prompt_request.maximum_context_tokens = impl_->config.maximum_context_tokens;
+    prompt_request.render = [](std::span<const ChatMessage> active) {
+        return render_glm52_chat_prompt(active);
+    };
+    prompt_request.encode = [&](const std::string& text) {
+        return impl_->tokenizer.encode(text);
+    };
+    auto prompt = prepare_chat_prompt(prompt_request);
+    if (!prompt.ok()) {
+        result.errors = std::move(prompt.errors);
+        return result;
     }
-    result.prompt_token_ids = encoded.value;
+    result.prompt_token_ids = prompt.token_ids;
     impl_->active_request_id = impl_->config.request_id + impl_->generated_requests++;
     std::size_t prefill_offset = impl_->config.enable_incremental_kv_continuation &&
         impl_->reusable_sequence

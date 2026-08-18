@@ -9585,29 +9585,28 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
         return result;
     }
     impl_->weights->finish_prefetch();
-    std::vector<ChatMessage> active_messages(messages.begin(), messages.end());
-    ParseResult<std::vector<std::uint32_t>> encoded;
-    for (;;) {
-        encoded = impl_->tokenizer.encode(
-            render_deepseek_v4_chat_prompt(active_messages));
-        if (!encoded.ok()) {
-            result.errors = std::move(encoded.errors);
-            return result;
-        }
-        if (encoded.value.size() + maximum_new_tokens <=
-            impl_->config.maximum_context_tokens) break;
-        if (!trim_oldest_chat_turn(active_messages)) {
-            result.errors.emplace_back(
-                "prompt and requested DeepSeek generation exceed the context ceiling");
-            return result;
-        }
+    ChatPromptRequest prompt_request;
+    prompt_request.messages = messages;
+    prompt_request.maximum_new_tokens = maximum_new_tokens;
+    prompt_request.maximum_context_tokens = impl_->config.maximum_context_tokens;
+    prompt_request.render = [](std::span<const ChatMessage> active) {
+        return render_deepseek_v4_chat_prompt(active);
+    };
+    prompt_request.encode = [&](const std::string& text) {
+        return impl_->tokenizer.encode(text);
+    };
+    auto prompt = prepare_chat_prompt(prompt_request);
+    if (!prompt.ok()) {
+        result.errors = std::move(prompt.errors);
+        return result;
     }
-    result.prompt_token_ids = encoded.value;
+    result.prompt_token_ids = std::move(prompt.token_ids);
     impl_->active_request_id = impl_->generated_requests++;
-    impl_->active_prompt_tokens = static_cast<std::uint32_t>(encoded.value.size());
+    impl_->active_prompt_tokens =
+        static_cast<std::uint32_t>(result.prompt_token_ids.size());
     impl_->reset_diagnostics();
     const auto active_context_tokens = static_cast<std::uint32_t>(
-        encoded.value.size() + maximum_new_tokens);
+        result.prompt_token_ids.size() + maximum_new_tokens);
     std::size_t prefill_offset = impl_->config.enable_incremental_kv_continuation &&
         impl_->reusable_sequence
         ? incremental_kv_prefix_tokens(impl_->cached_token_ids,

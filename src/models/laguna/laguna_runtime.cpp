@@ -1409,24 +1409,22 @@ LagunaGenerationResult LagunaRuntime::generate_chat_stream(
     impl_->sampled_token_ids.clear();
     impl_->sampler.seed(sampling.seed);
 
-    std::vector<ChatMessage> active_messages(messages.begin(), messages.end());
-    ParseResult<std::vector<std::uint32_t>> encoded;
-    for (;;) {
-        encoded = impl_->tokenizer.encode(render_laguna_chat_prompt(
-            active_messages, impl_->config.enable_thinking));
-        if (!encoded.ok()) {
-            result.errors = std::move(encoded.errors);
-            return result;
-        }
-        if (encoded.value.size() + maximum_new_tokens <=
-            impl_->config.maximum_context_tokens) break;
-        if (!trim_oldest_chat_turn(active_messages)) {
-            result.errors.emplace_back(
-                "prompt and requested generation exceed the context ceiling");
-            return result;
-        }
+    ChatPromptRequest prompt_request;
+    prompt_request.messages = messages;
+    prompt_request.maximum_new_tokens = maximum_new_tokens;
+    prompt_request.maximum_context_tokens = impl_->config.maximum_context_tokens;
+    prompt_request.render = [&](std::span<const ChatMessage> active) {
+        return render_laguna_chat_prompt(active, impl_->config.enable_thinking);
+    };
+    prompt_request.encode = [&](const std::string& text) {
+        return impl_->tokenizer.encode(text);
+    };
+    auto prompt = prepare_chat_prompt(prompt_request);
+    if (!prompt.ok()) {
+        result.errors = std::move(prompt.errors);
+        return result;
     }
-    result.prompt_token_ids = std::move(encoded.value);
+    result.prompt_token_ids = std::move(prompt.token_ids);
     impl_->active_request_id =
         impl_->config.request_id + impl_->generated_requests++;
 

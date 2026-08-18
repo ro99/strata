@@ -264,4 +264,33 @@ std::size_t complete_utf8_prefix(std::string_view text) noexcept {
     return offset;
 }
 
+
+ChatPrompt prepare_chat_prompt(const ChatPromptRequest& request) {
+    ChatPrompt prompt;
+    if (request.render == nullptr || request.encode == nullptr) {
+        prompt.errors.emplace_back(
+            "chat prompt preparation needs a template and a tokenizer");
+        return prompt;
+    }
+    std::vector<ChatMessage> active(request.messages.begin(),
+                                   request.messages.end());
+    for (;;) {
+        auto encoded = request.encode(request.render(active));
+        if (!encoded.ok()) {
+            prompt.errors = std::move(encoded.errors);
+            return prompt;
+        }
+        if (encoded.value.size() + request.maximum_new_tokens <=
+            request.maximum_context_tokens) {
+            prompt.token_ids = std::move(encoded.value);
+            return prompt;
+        }
+        if (!request.trim_oldest_turn_to_fit || !trim_oldest_chat_turn(active)) {
+            prompt.errors.emplace_back(
+                "prompt and requested generation exceed the context ceiling");
+            return prompt;
+        }
+    }
+}
+
 }  // namespace strata

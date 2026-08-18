@@ -367,3 +367,57 @@ performance-research protocol was imported wholesale onto a refactor, where a wr
 step costs `git revert` rather than four hours of GPU. Phases 2–3 were executed
 directly, with one build and one test run at the end, and are recorded in this
 section rather than in a document of their own.
+
+## Phase 4 — the model seam, and clearing every deferral
+
+`ModelExecutor` (`include/strata/model_executor.hpp`) is the second polymorphic
+interface in the codebase and the first that is not model-specific. Each model
+registers itself from its own translation unit via a file-scope `ModelRegistrar`;
+`RuntimeSession` is a registry lookup and two virtual calls.
+
+`src/app/runtime.cpp`: **475 -> 187 lines.** Gone: the `std::variant` over six
+concrete runtimes, the six-arm `if`-chain in `initialize`, and the six-arm
+`std::get_if` chain that hand-copied 10-13 result fields (two arms of which had
+silently lost fields — B5, B6). The per-model config translation was **moved**,
+not rewritten, into each model's own directory.
+
+Self-registration needs `-Wl,--whole-archive` on `strata_models`: a static
+library drops any member nothing references, and nothing references a
+self-registering TU by definition. `strata_app` is linked *ahead* of it because
+GNU ld resolves in one pass — the first attempt got that backwards and produced
+24 undefined references from `placement_model.cpp`, which is F1 from the cold
+review arriving as a build failure instead of a silent inversion.
+
+The registry also carries the `--model-type` token and the per-model
+presentation defaults, so `strata-chat` and `strata-server` lost their
+string-to-enum ternaries and hardcoded model lists entirely.
+
+### The three recorded exceptions are deleted, not repointed
+
+All expired at Phase 4 and all are now genuinely fixed:
+
+- **placement** — `placement_cache.cpp` (engine) called `plan_model_placement`,
+  defined beside six checkpoint readers. Inverted: `placement.cpp` holds a thin
+  dispatcher through a registered `PlacementPlanner`, and `placement_model.cpp`
+  installs itself and moves to `strata_models`. `probe_model_identity` moved the
+  other way — it hashes sorted shard names and is model-neutral, it was just
+  written next to code that is not.
+- **tokenizer** — six pretokenizers and twelve chat templates. Every consumer is
+  models or above, so the file moved to `strata_models`. It is model code.
+- **quantization** — `QuantizedWeightSpec` and `QuantizationGranularity` are
+  storage-format vocabulary with no architecture in them; they forced a platform
+  header to include all six models' Spec types. Split into
+  `include/strata/quantization.hpp`.
+
+```
+check-layers:  0 violations, 0 exceptions, 0 stale
+check-symbols: 0 violations, 0 exceptions, 0 stale
+strata-tests:  313/314 passed, 1 skipped, 0 failed
+```
+
+**The link graph is acyclic with nothing forgiven.** That is a stronger claim
+than Phase 1 made and could not verify.
+
+Shared files a seventh model must edit: **12 -> 3** — the `RuntimeModel` enum,
+the `PlacementModel` enum, and the CMake source list. Everything else is one new
+directory under `src/models/`.

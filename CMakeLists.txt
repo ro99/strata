@@ -105,7 +105,6 @@ add_library(strata_engine STATIC
     src/engine/runtime_support.cpp
     src/engine/sampling.cpp
     src/engine/simulator.cpp
-    src/engine/tokenizer.cpp
 )
 target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_engine PUBLIC strata_kernels)
@@ -152,6 +151,7 @@ add_library(strata_models STATIC
     src/models/dsv4/deepseek_runtime.cpp
     src/models/common/model.cpp
     src/models/common/placement_model.cpp
+    src/models/common/tokenizer.cpp
     src/models/glm52/checkpoint.cpp
     kernels/cpu/dsv4_fp4_expert.cpp
 )

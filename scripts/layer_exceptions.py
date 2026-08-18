@@ -39,41 +39,4 @@ from __future__ import annotations
 CURRENT_PHASE = 1
 
 EXCEPTIONS = [
-    {
-        "name": "quantization-contract-in-model-hpp",
-        "reason": (
-            "compressed_tensors.hpp needs QuantizedWeightSpec and "
-            "QuantizationGranularity, which are model-neutral quantization "
-            "vocabulary bundled inside model.hpp alongside the genuinely "
-            "model-specific Spec structs. The intended fix is the same "
-            "model-neutral contract extraction that would let "
-            "GlmManifestTensor (checkpoint.hpp's former coupling, resolved "
-            "in this unit by reassigning checkpoint.* to strata_models "
-            "outright) extend a generic ManifestTensor/IndexManifest base "
-            "instead of being the base. Not designed against one caller "
-            "today; wants all six models' actual shapes in view."
-        ),
-        "expiry_phase": 4,
-        "matches": [
-            ("include/strata/compressed_tensors.hpp", "model.hpp"),
-        ],
-    },
-    {
-        "name": "tokenizer-pretokenizer-split",
-        "reason": (
-            "tokenizer.cpp inlines two models' generated Unicode category "
-            "tables (inkling_unicode.hpp, laguna_unicode.hpp) and their "
-            "specific pretokenize functions directly into the shared "
-            "ModelTokenizer dispatch -- the same shape as "
-            "placement-model-inventory-registry, one level down. "
-            "Pretokenization is exactly the kind of per-model logic that "
-            "belongs with each model's own fan-out work at phase 4, not "
-            "split out ad hoc for two of six models now."
-        ),
-        "expiry_phase": 4,
-        "matches": [
-            ("src/engine/tokenizer.cpp", "../models/inkling/inkling_unicode.hpp"),
-            ("src/engine/tokenizer.cpp", "../models/laguna/laguna_unicode.hpp"),
-        ],
-    },
 ]

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strata/model.hpp"
+#include "strata/quantization.hpp"
 #include "strata/safetensors.hpp"
 
 #include <array>

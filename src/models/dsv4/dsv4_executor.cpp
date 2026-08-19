@@ -34,6 +34,8 @@ public:
         if (config.deepseek_prefill_page_tokens != 0U) {
             concrete.prefill_page_tokens = config.deepseek_prefill_page_tokens;
         }
+        concrete.static_expert_plan_path = config.deepseek_static_expert_plan;
+        concrete.static_expert_tier_bytes = config.deepseek_static_expert_bytes;
         if (config.deepseek_device_resident_runtime) {
             // The device-resident decode contract is a bundle, not a knob.
             // Leaving any member of it to the caller lets a run report the

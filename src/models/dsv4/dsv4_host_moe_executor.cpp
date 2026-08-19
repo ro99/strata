@@ -190,8 +190,17 @@ ValidationResult Dsv4HostMoeExecutor::dispatch_ranges(
 ValidationResult Dsv4HostMoeExecutor::run(
     std::uint32_t layer, const Dsv4Route& route,
     std::span<const float> input, const Dsv4ResidentWeightStore& resident,
-    std::span<float> rank_partials, Dsv4HostMoePhaseTimings* timings) {
+    std::span<float> rank_partials, Dsv4HostMoePhaseTimings* timings,
+    std::span<const bool> skip) {
     ValidationResult result;
+    if (!skip.empty() && skip.size() != kTopK) {
+        result.errors.emplace_back(
+            "DeepSeek host-MoE skip mask must name every top-k slot");
+        return result;
+    }
+    const auto skipped = [skip](std::size_t rank) {
+        return !skip.empty() && skip[rank];
+    };
     if (!initialized_ || layer >= kDeepSeekV4ExecutionContract.layer_count ||
         input.size() != kHidden || route.experts.size() != kTopK ||
         route.weights.size() != kTopK ||
@@ -215,6 +224,7 @@ ValidationResult Dsv4HostMoeExecutor::run(
             return result;
         }
         for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+            if (skipped(rank)) continue;
             auto viewed = dsv4_tiled_expert_weights(
                 resident.find_tiled_expert(layer, route.experts[rank],
                                             static_cast<std::uint32_t>(source_shard)),
@@ -234,6 +244,7 @@ ValidationResult Dsv4HostMoeExecutor::run(
         kTopK * intermediate_blocks, true,
         [&](std::size_t shard, std::uint64_t task) {
             const auto rank = static_cast<std::size_t>(task / intermediate_blocks);
+            if (skipped(rank)) return;
             const auto offset = (task % intermediate_blocks) * kBlock;
             std::array<float, kBlock> gate{};
             std::array<float, kBlock> up{};
@@ -266,6 +277,7 @@ ValidationResult Dsv4HostMoeExecutor::run(
             kTopK * hidden_blocks, true,
             [&](std::size_t shard, std::uint64_t task) {
                 const auto rank = static_cast<std::size_t>(task / hidden_blocks);
+                if (skipped(rank)) return;
                 const auto offset = (task % hidden_blocks) * kBlock;
                 const auto source = std::span<const float>(tiled_activation_)
                     .subspan((shard * kTopK + rank) * kLocalIntermediate,
@@ -290,12 +302,28 @@ ValidationResult Dsv4HostMoeExecutor::run(
             [&](std::size_t shard, std::uint64_t task) {
                 const auto offset = task * kBlock;
                 auto* destination = rank_partials.data() + shard * kHidden + offset;
+                // Seed from the lowest surviving slot so the accumulation
+                // order over the slots that remain is exactly what it was
+                // when none were skipped.
+                std::size_t first = kTopK;
+                for (std::size_t rank = 0U; rank < kTopK; ++rank) {
+                    if (!skipped(rank)) { first = rank; break; }
+                }
+                if (first == kTopK) {
+                    // Every expert is served by another tier: this executor
+                    // owes exactly zero, not a stale buffer.
+                    for (std::size_t index = 0U; index < kBlock; ++index) {
+                        destination[index] = 0.0F;
+                    }
+                    return;
+                }
                 for (std::size_t index = 0U; index < kBlock; ++index) {
                     destination[index] = tiled_routed_[
-                        (shard * kTopK) * kHidden + offset + index] *
-                        route.weights[0];
+                        (shard * kTopK + first) * kHidden + offset + index] *
+                        route.weights[first];
                 }
-                for (std::size_t rank = 1U; rank < kTopK; ++rank) {
+                for (std::size_t rank = first + 1U; rank < kTopK; ++rank) {
+                    if (skipped(rank)) continue;
                     const auto* source = tiled_routed_.data() +
                         (shard * kTopK + rank) * kHidden + offset;
                     for (std::size_t index = 0U; index < kBlock; ++index) {

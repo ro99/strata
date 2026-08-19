@@ -50,6 +50,8 @@ struct Options {
     // layer-major and groups its rows by expert, which is exact and faster;
     // 1 restores row-at-a-time prompt processing.
     std::uint32_t prefill_page_tokens{};
+    std::string static_expert_plan;
+    std::uint64_t static_expert_bytes{};
     std::string plan_cache;
     bool dry_run{};
     bool use_plan_cache{true};
@@ -82,6 +84,8 @@ void usage() {
         << "                     [--device-resident-runtime]\n"
         << "                     [--decode-topology centralized|rank-local-tp2]\n"
         << "                     [--prefill-page-tokens N]\n"
+        << "                     [--static-expert-plan PATH]\n"
+        << "                     [--static-expert-bytes BYTES]\n"
         << "                     [--dry-run] [--replan]\n"
         << "                     [--plan-cache DIR] [--no-plan-cache]\n\n"
         << "--device-resident-runtime is the DeepSeek device-resident decode\n"
@@ -163,6 +167,20 @@ bool parse_options(int argc, char** argv, Options& options) {
             } else {
                 return false;
             }
+        }
+        else if (argument == "--static-expert-plan") {
+            options.static_expert_plan = next();
+        }
+        else if (argument == "--static-expert-bytes") {
+            const auto text = next();
+            std::uint64_t multiplier = 1U;
+            auto value = text;
+            const char suffix = value.empty() ? '\0' : value.back();
+            if (suffix == 'G' || suffix == 'g') { multiplier = 1ULL << 30U; value.remove_suffix(1U); }
+            else if (suffix == 'M' || suffix == 'm') { multiplier = 1ULL << 20U; value.remove_suffix(1U); }
+            std::uint64_t base = 0U;
+            if (!strata::cli::parse_u64(value, base)) return false;
+            options.static_expert_bytes = base * multiplier;
         }
         else if (argument == "--prefill-page-tokens") {
             if (!strata::cli::parse_positive_u32(
@@ -827,6 +845,24 @@ int bind_server(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Pin CUDA enumeration to PCI bus order, exactly as strata-deepseek-run
+    // does, so `--devices 1,2` names the same two physical cards from either
+    // binary. Without this the runtime takes CUDA's default "fastest first"
+    // ordering, which on a mixed box does not match `nvidia-smi` and silently
+    // selects different hardware than the operator asked for.
+    //
+    // On the development box the two orderings are:
+    //   default:     0,1 = RTX 3090 (sm_86), 2 = RTX 5060 Ti (sm_120)
+    //   PCI_BUS_ID:  0 = RTX 5060 Ti (sm_120), 1,2 = RTX 3090 (sm_86)
+    // so `--devices 1,2` meant one 3090 paired with the 5060 Ti under the
+    // server and the two 3090s under the runner. That put an sm_120 card into
+    // a rank-local pair whose mHC contract requires sm_86, capped both ranks'
+    // symmetric VRAM admission at the 16 GiB card, and left one 3090 idle.
+    //
+    // Set only when the operator has not chosen an order themselves.
+    if (std::getenv("CUDA_DEVICE_ORDER") == nullptr) {
+        static_cast<void>(setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0));
+    }
     Options options;
     if (!parse_options(argc, argv, options)) {
         usage();
@@ -846,6 +882,8 @@ int main(int argc, char** argv) {
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
     config.deepseek_prefill_page_tokens = options.prefill_page_tokens;
     config.deepseek_rank_local_decode = options.rank_local_decode;
+    config.deepseek_static_expert_plan = options.static_expert_plan;
+    config.deepseek_static_expert_bytes = options.static_expert_bytes;
     config.pin_resident_arena = options.pin_resident_arena;
     config.verbose = registration->verbose_by_default;
     config.load_progress = registration->progress_by_default;

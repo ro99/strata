@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 #include "strata/dsv4_host_moe_executor.hpp"
+#include "strata/dsv4_static_expert_tier.hpp"
 
 #include <array>
 #include <cstddef>
@@ -215,6 +216,11 @@ struct Dsv4RankLocalLayerOptions {
     std::array<int, 2U> devices{};
     std::array<std::vector<int>, 2U> rank_cpus;
     const Dsv4ResidentWeightStore* resident{};
+    // Optional static routed-expert tier on a device outside this pair. When
+    // present, both ranks skip the triplets it holds -- it computes the whole
+    // expert, not a shard -- and rank 0 alone adds its contribution in, so the
+    // sum over the six slots is unchanged and nothing is counted twice.
+    std::array<Dsv4StaticExpertTier*, 2U> static_expert_tiers{};
     std::uint32_t warmup_count{1U};
 };
 

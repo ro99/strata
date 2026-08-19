@@ -142,6 +142,8 @@ add_library(strata_models STATIC
     src/models/dsv4/deepseek_manifest.cpp
     src/models/dsv4/deepseek_kv_cache.cpp
     src/models/dsv4/dsv4_attention_kv.cpp
+    src/models/dsv4/dsv4_expert_residency.cpp
+    src/models/dsv4/dsv4_static_expert_tier.cpp
     src/models/dsv4/deepseek_ops.cpp
     src/models/dsv4/deepseek_checkpoint.cpp
     src/models/dsv4/deepseek_rank_shard.cpp
@@ -229,6 +231,12 @@ target_link_libraries(strata-numa-probe PRIVATE strata_core)
 
 add_executable(strata-dsv4-host-expert-probe apps/strata_dsv4_host_expert_probe.cpp)
 target_link_libraries(strata-dsv4-host-expert-probe PRIVATE strata_core)
+
+add_executable(strata-dsv4-expert-residency apps/strata_dsv4_expert_residency.cpp)
+target_link_libraries(strata-dsv4-expert-residency PRIVATE strata_core)
+
+add_executable(strata-dsv4-static-tier-probe apps/strata_dsv4_static_tier_probe.cpp)
+target_link_libraries(strata-dsv4-static-tier-probe PRIVATE strata_core strata_models)
 
 add_executable(strata-dsv4-expert-row-batch-probe
     apps/strata_dsv4_expert_row_batch_probe.cpp)
@@ -428,6 +436,8 @@ if(BUILD_TESTING)
         tests/test_chat_protocol.cpp
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
+        tests/test_dsv4_expert_residency.cpp
+        tests/test_fp4_decode.cpp
         tests/test_glm_ops.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp

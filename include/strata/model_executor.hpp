@@ -77,6 +77,12 @@ struct RuntimeConfig {
     // row and groups the page's rows by expert; 1 restores row-at-a-time
     // prompt processing.
     std::uint32_t deepseek_prefill_page_tokens{};
+    // Routed-expert tier: a plan from strata-dsv4-expert-residency, and the
+    // VRAM each rank device spends holding its slice of it. The bytes come out
+    // of the centralized prefill expert cache, which decode never reads.
+    // An empty path disables the tier, which is the default.
+    std::string deepseek_static_expert_plan;
+    std::uint64_t deepseek_static_expert_bytes{};
     bool pin_resident_arena{};
     bool prepack_mhc_projection{true};
     // Placement plan cache. An empty directory selects the default location;

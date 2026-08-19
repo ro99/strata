@@ -54,12 +54,20 @@ public:
     // `route` is already selected using the target router contract. The
     // executor changes no route, coefficient, precision, or arithmetic order.
     // `rank_partials` is H or 2*H floats according to output_shards().
+    //
+    // `skip`, when non-empty, is one flag per top-k slot: a set flag means
+    // that expert is served by another tier and this executor must contribute
+    // nothing for it -- not read its weights, not accumulate its term. The
+    // caller owes the skipped terms; the sum over all six is unchanged, only
+    // its grouping. Skipping is the whole point of a residency tier, because
+    // the cost this executor pays is the DRAM read, not the arithmetic.
     [[nodiscard]] ValidationResult run(
         std::uint32_t layer, const Dsv4Route& route,
         std::span<const float> input,
         const Dsv4ResidentWeightStore& resident,
         std::span<float> rank_partials,
-        Dsv4HostMoePhaseTimings* timings = nullptr);
+        Dsv4HostMoePhaseTimings* timings = nullptr,
+        std::span<const bool> skip = {});
 
 private:
     [[nodiscard]] ValidationResult dispatch_ranges(

@@ -633,6 +633,18 @@ private:
 // One exact DeepSeek expert projection triplet. The weight objects must remain
 // alive until the matching collect call completes. Each routed coefficient is
 // applied once before w2; the optional shared expert must use coefficient 1.0.
+// One layer's tier selection, written by the CPU-MoE callback into pinned
+// memory and read by the tier kernels enqueued behind it. `experts[i]` is
+// kDsv4TierAbsent for a slot the host computes instead.
+inline constexpr std::uint32_t kDsv4TierAbsent = 0xFFFF'FFFFU;
+inline constexpr std::size_t kDsv4TierSlots = 6U;
+struct CudaDsv4TierSelection {
+    std::uint32_t experts[kDsv4TierSlots]{};
+    float coefficients[kDsv4TierSlots]{};
+    std::uint32_t layer{};
+    std::uint32_t count{};
+};
+
 struct CudaDeepSeekMoeExpert {
     const CudaWeight* w1{};
     const CudaWeight* w3{};
@@ -1081,6 +1093,33 @@ public:
         int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4DeviceInputHostMoeCallback callback,
         void* callback_context, CudaDsv4HostMoeDeviceView& view);
+    // Device-resident routed-expert tier.
+    //
+    // reserve allocates the per-(layer, expert) pointer table on `device`;
+    // add installs one triplet whose CudaWeights must already live there. The
+    // table is built once at load and never mutated afterwards, so the decode
+    // path only reads it.
+    //
+    // When a tier is present, enqueue_dsv4_host_moe* exposes a pinned
+    // selection slot through dsv4_tier_selection(): the CPU-MoE callback writes
+    // the experts it is NOT computing into it, and the kernels enqueued behind
+    // the callback -- which are stream-ordered after it, so its writes are
+    // visible -- compute those and accumulate into the same rank partial the
+    // join already consumes. Writing the slot is a plain store, which is what
+    // makes this legal from inside a cudaLaunchHostFunc callback.
+    [[nodiscard]] ValidationResult dsv4_tier_reserve(
+        int device, std::uint32_t layers, std::uint32_t experts);
+    [[nodiscard]] ValidationResult dsv4_tier_add(
+        int device, std::uint32_t layer, std::uint32_t expert,
+        const CudaWeight& w1, const CudaWeight& w3, const CudaWeight& w2);
+    // Uploads the pointer table. Call once after the last add; the decode
+    // path never mutates it afterwards.
+    [[nodiscard]] ValidationResult dsv4_tier_commit(int device);
+    [[nodiscard]] bool dsv4_tier_active(int device) const noexcept;
+    // Pinned slot for the next enqueued layer. Null when no tier is reserved.
+    // kDsv4TierAbsent marks a slot this tier does not serve.
+    [[nodiscard]] CudaDsv4TierSelection* dsv4_tier_selection(int device) noexcept;
+
     [[nodiscard]] ValidationResult collect_deepseek_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output);

@@ -6,6 +6,7 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace strata {
 namespace {
@@ -77,7 +78,15 @@ ValidationResult plan_dsv4_rank_local_cpus(
 
     // Node order, so the rank-to-node mapping is stable across runs.
     for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
-        const auto& cpus = topology.node_cpus[rank];
+        // Prefer this node's physical-core primaries over its full logical
+        // list, so a pool of N never lands two workers on one core's SMT
+        // siblings while another core sits idle. Falls back to the logical
+        // list when sysfs does not expose siblings.
+        const auto& primary = rank < topology.node_primary_cpus.size()
+            ? topology.node_primary_cpus[rank]
+            : std::vector<int>{};
+        const auto& cpus = primary.empty()
+            ? topology.node_cpus[rank] : primary;
         if (cpus.size() < minimum_cpus_per_rank) {
             result.errors.emplace_back(
                 "NUMA node " + std::to_string(rank) + " assigns " +
@@ -86,11 +95,9 @@ ValidationResult plan_dsv4_rank_local_cpus(
                 std::to_string(minimum_cpus_per_rank));
             continue;
         }
-        // The accepted M3 operating point uses exactly 24 workers per rank.
-        // Passing every logical CPU from a larger NUMA node changes that
-        // measured resource shape (and can add SMT contention) while still
-        // appearing to satisfy the minimum. Keep admission tied to the
-        // calibrated pool width.
+        // Assign exactly the calibrated width. Passing every CPU a node has
+        // changes the measured resource shape while still appearing to satisfy
+        // the minimum, which is precisely how Phase 7 regressed decode 2.6x.
         rank_cpus[rank].assign(
             cpus.begin(),
             cpus.begin() + static_cast<std::ptrdiff_t>(minimum_cpus_per_rank));
@@ -174,13 +181,31 @@ Dsv4RankLocalAdmission admit_dsv4_rank_local(
     // kDsv4RankLocalMinimumCpusPerRank was doing two jobs at once -- the floor
     // below which a rank cannot work, and the pool width to actually assign --
     // and 24 was only ever correct for both on the box it was measured on.
-    // The width is now the smallest node's CPU count (24 there, unchanged),
-    // and the constant is only the floor.
-    std::size_t width = 0U;
-    for (const auto& cpus : topology.node_cpus) {
-        if (cpus.empty()) continue;
-        if (width == 0U || cpus.size() < width) width = cpus.size();
-    }
+    // The constant is now only the floor.
+    //
+    // The width is one worker per *physical core* on the smallest node, not
+    // per logical CPU. Phase 7 replaced the constant with the node's full CPU
+    // count on the belief that it was "24 there, unchanged"; this box's nodes
+    // hold 28 logical CPUs over 14 cores, so both pools silently widened to 28
+    // and the machine was left with no runnable headroom -- 2 x 28 workers on
+    // 56 logical CPUs, competing with the main thread, the CUDA driver, NCCL
+    // and the server.
+    //
+    // That is a cliff rather than a slope, because these pools are barrier
+    // synchronized: one preempted worker stalls its whole cohort at every fork
+    // and join, and the routed MoE forks three times per layer, 43 layers per
+    // token, per rank. Measured on this box (experiment 0123, bisected to
+    // Phase 7 6fd2637), decode against pool width:
+    //
+    //   28 logical (Phase 7)  3.19 tok/s   MoE 222.3 ms/token
+    //   26                    7.66 tok/s   MoE  78.3 ms/token
+    //   24 (pre-Phase 7)      8.43 tok/s   MoE  73.1 ms/token
+    //   14 (one per core)     8.49 tok/s   MoE  72.7 ms/token
+    //
+    // The kernel saturates at one worker per core: 14 matches 24 within noise
+    // and beats it slightly, while leaving half the machine's logical CPUs for
+    // everything else. SMT siblings buy nothing here and cost the cliff.
+    std::size_t width = topology.smallest_node_cores();
     width = std::max(width, kDsv4RankLocalMinimumCpusPerRank);
     auto cpu_plan =
         plan_dsv4_rank_local_cpus(topology, width, result.rank_cpus);

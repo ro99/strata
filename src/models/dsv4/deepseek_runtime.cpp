@@ -1696,6 +1696,9 @@ struct DeepSeekV4Runtime::Impl {
     std::unique_ptr<Dsv4RankLocalWeightStore> rank_local_weights;
 #if defined(STRATA_HAS_NCCL)
     std::unique_ptr<Dsv4RankLocalLayerExecutor> rank_local_executor;
+    // Outlives the executor that points at it, so it is declared before the
+    // executor is torn down and destroyed after.
+    std::vector<std::unique_ptr<Dsv4StaticExpertTier>> static_expert_tiers;
 #endif
     Dsv4RankLocalAdmission rank_local_admission;
     std::vector<std::uint64_t> rank_local_initial_device_vram_bytes;
@@ -6775,8 +6778,18 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
                 "the centralized prefill spine");
             continue;
         }
-        const auto arena_expert_bytes =
-            capacities[rank] - sharded[rank] - cache_pinned;
+        // The routed-expert tier is permanent and suballocates from this same
+        // arena, so its bytes are reserved before the prefill cache is sized.
+        // Without this the cache is promised space the tier already holds and
+        // fails an acquire mid-prefill rather than simply being smaller.
+        const auto tier_reserved =
+            config.static_expert_plan_path.empty()
+                ? 0U : config.static_expert_tier_bytes;
+        const auto arena_after_tier =
+            capacities[rank] > sharded[rank] + cache_pinned + tier_reserved
+                ? capacities[rank] - sharded[rank] - cache_pinned - tier_reserved
+                : 0U;
+        const auto arena_expert_bytes = arena_after_tier;
         const auto cache_expert_bytes =
             rank < cache.capacity_bytes.size() &&
                     cache.capacity_bytes[rank] > cache_pinned
@@ -6823,6 +6836,39 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
         options.rank_cpus[rank] = admitted.rank_cpus[rank];
     }
     options.resident = &resident;
+
+    // Routed-expert tiers on the rank devices themselves. The layer is already
+    // executing there, so the experts cost 0.128 ms each against the host
+    // path's 0.282, and nothing crosses a device boundary. Each rank's tier
+    // takes a disjoint slice of one ranking, so the two cards split the hottest
+    // experts rather than both holding the same ones.
+    if (!config.static_expert_plan_path.empty()) {
+        auto plan = Dsv4ExpertResidencyPlan::load(
+            config.static_expert_plan_path, kLayers, kExperts);
+        if (!plan.ok()) {
+            store->clear();
+            append_errors(result, std::move(plan.errors),
+                          "expert residency plan");
+            return result;
+        }
+        static_expert_tiers.clear();
+        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+            auto tier = std::make_unique<Dsv4StaticExpertTier>();
+            auto copy = plan.value;
+            auto prepared = tier->initialize(
+                rank_devices[rank], cuda, *checkpoint, std::move(copy),
+                config.static_expert_tier_bytes, rank, kDsv4RankLocalWorld);
+            if (!prepared.ok()) {
+                store->clear();
+                static_expert_tiers.clear();
+                append_errors(result, std::move(prepared.errors),
+                              "expert tier rank " + std::to_string(rank));
+                return result;
+            }
+            options.static_expert_tiers[rank] = tier.get();
+            static_expert_tiers.push_back(std::move(tier));
+        }
+    }
     result = executor->initialize(options);
     if (!result.ok()) {
         store->clear();
@@ -7156,9 +7202,22 @@ ValidationResult DeepSeekV4Runtime::Impl::rank_local_forward_hidden(
         }
         graph_stats.rank_local_kv_nanoseconds += page_callback_nanoseconds;
     }
-    graph_stats.moe_nanoseconds += std::max(
-        chain.cpu_moe_phases[0].total_nanoseconds,
-        chain.cpu_moe_phases[1].total_nanoseconds);
+    {
+        // Attribute the phases on the same rank the MoE term is taken from,
+        // so the phase sum and the total describe one rank's critical path
+        // rather than a mixture of both.
+        const auto slower =
+            chain.cpu_moe_phases[0].total_nanoseconds >=
+                    chain.cpu_moe_phases[1].total_nanoseconds
+                ? 0U : 1U;
+        const auto& phases = chain.cpu_moe_phases[slower];
+        graph_stats.moe_nanoseconds += phases.total_nanoseconds;
+        graph_stats.rank_local_moe_gate_up_nanoseconds +=
+            phases.gate_up_nanoseconds;
+        graph_stats.rank_local_moe_down_nanoseconds += phases.down_nanoseconds;
+        graph_stats.rank_local_moe_reduce_nanoseconds +=
+            phases.reduce_nanoseconds;
+    }
     if (fuse_head && (!rank_local_head[0].invoked ||
                       !rank_local_head[1].invoked)) {
         result.errors.emplace_back(
@@ -8960,8 +9019,35 @@ ValidationResult DeepSeekV4Runtime::initialize(
         result.errors = std::move(tokenizer.errors);
         return result;
     }
-    result = impl_->cuda.initialize(config.devices, config.detailed_timing);
+    // The static expert tier lives on a device outside the execution set, so
+    // it needs its own context and weight arena. It is included here rather
+    // than in config.devices because it must not join the layer schedule, the
+    // KV placement or the rank pair -- it only holds weights and computes the
+    // experts it holds.
+    std::vector<int> context_devices(config.devices.begin(), config.devices.end());
+    const bool tier_requested = !config.static_expert_plan_path.empty() &&
+                                config.static_expert_tier_device >= 0;
+    if (tier_requested) {
+        const auto tier_device = config.static_expert_tier_device;
+        if (std::find(context_devices.begin(), context_devices.end(),
+                      tier_device) != context_devices.end()) {
+            result.errors.emplace_back(
+                "static expert tier device " + std::to_string(tier_device) +
+                " is already an execution device; the tier must be separate");
+            return result;
+        }
+        context_devices.push_back(tier_device);
+    }
+    result = impl_->cuda.initialize(context_devices, config.detailed_timing);
     if (!result.ok()) return result;
+    if (tier_requested && config.static_expert_tier_bytes != 0U) {
+        // Reserve up front: the tier allocates thousands of small weights and
+        // the arena refuses a per-weight fallback once enabled.
+        result = impl_->cuda.reserve_weight_arena(
+            config.static_expert_tier_device,
+            config.static_expert_tier_bytes);
+        if (!result.ok()) return result;
+    }
     if (config.enable_flash_attention) {
         for (const int device : config.devices) {
             result = impl_->cuda.validate_flash_attention_device(device);
@@ -9122,6 +9208,18 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     auto arena_capacities = weight_capacities;
     auto cache_weight_capacities = arena_capacities;
+    // The routed-expert tier suballocates from the same weight arena as the
+    // centralized prefill cache, and the tier is permanent while the cache is
+    // a prefill performance term. Reserve the tier's bytes out of the cache's
+    // logical capacity so the cache stops short of the arena instead of
+    // failing an acquire mid-prefill, which is what an unreserved tier caused.
+    if (!config.static_expert_plan_path.empty() &&
+        config.static_expert_tier_bytes != 0U) {
+        for (auto& capacity : cache_weight_capacities) {
+            capacity = capacity > config.static_expert_tier_bytes
+                ? capacity - config.static_expert_tier_bytes : 0U;
+        }
+    }
     const auto mhc_slot = static_cast<std::size_t>(std::distance(
         arena_capacities.begin(),
         std::max_element(arena_capacities.begin(), arena_capacities.end())));
@@ -9326,7 +9424,8 @@ ValidationResult DeepSeekV4Runtime::initialize(
                                                config.host_memory_limit_bytes,
                                                config.resident_read_workers,
                                                config.enable_dspark,
-                                               config.enable_host_routed_moe);
+                                               config.enable_host_routed_moe,
+                                               config.hugepage_expert_arena);
         staging_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
         staging_finished.store(true, std::memory_order_release);

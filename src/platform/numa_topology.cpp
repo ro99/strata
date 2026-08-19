@@ -108,7 +108,52 @@ NumaTopology NumaTopology::detect() {
             result.cpu_node[static_cast<std::size_t>(cpu)] = node;
         }
     }
+
+    // One entry per physical core: a logical CPU is the primary of its core
+    // when it is the lowest-numbered of its own thread siblings. Left empty if
+    // sysfs does not expose siblings, so callers fall back to node_cpus rather
+    // than to a silently narrower pool.
+    result.node_primary_cpus.assign(result.node_cpus.size(), {});
+    bool siblings_readable = true;
+    for (std::size_t node = 0U; node < result.node_cpus.size(); ++node) {
+        for (const auto cpu : result.node_cpus[node]) {
+            std::ifstream file("/sys/devices/system/cpu/cpu" +
+                               std::to_string(cpu) +
+                               "/topology/thread_siblings_list");
+            std::string list;
+            if (!file || !std::getline(file, list) || list.empty()) {
+                siblings_readable = false;
+                break;
+            }
+            const auto separator = list.find_first_of(",-");
+            const auto first = separator == std::string::npos
+                ? list : list.substr(0U, separator);
+            int lowest = 0;
+            const auto parsed = std::from_chars(
+                first.data(), first.data() + first.size(), lowest);
+            if (parsed.ec != std::errc{}) {
+                siblings_readable = false;
+                break;
+            }
+            if (lowest == cpu) result.node_primary_cpus[node].push_back(cpu);
+        }
+        if (!siblings_readable) break;
+    }
+    if (!siblings_readable) result.node_primary_cpus.assign(
+        result.node_cpus.size(), {});
     return result;
+}
+
+std::size_t NumaTopology::smallest_node_cores() const noexcept {
+    std::size_t smallest = 0U;
+    for (std::size_t node = 0U; node < node_cpus.size(); ++node) {
+        const auto& primary = node < node_primary_cpus.size()
+            ? node_primary_cpus[node] : node_cpus[node];
+        const auto& cpus = primary.empty() ? node_cpus[node] : primary;
+        if (cpus.empty()) continue;
+        if (smallest == 0U || cpus.size() < smallest) smallest = cpus.size();
+    }
+    return smallest;
 }
 
 int NumaTopology::node_of_cpu(int cpu) const noexcept {

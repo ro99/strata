@@ -100,12 +100,26 @@ public:
     Dsv4ResidentWeightStore(const Dsv4ResidentWeightStore&) = delete;
     Dsv4ResidentWeightStore& operator=(const Dsv4ResidentWeightStore&) = delete;
 
+    // `hugepage_arena` asks the kernel to back the tiled expert arena with
+    // transparent hugepages. It is advisory in the strict sense -- the kernel
+    // may decline, and the bytes, layout and arithmetic are identical either
+    // way -- so a refusal is recorded, not an error. It exists as a parameter
+    // rather than an unconditional call so one binary can measure both arms.
     [[nodiscard]] ValidationResult stage(
         const Dsv4CheckpointReader& checkpoint,
         std::uint64_t host_memory_ceiling_bytes,
         std::uint32_t read_workers = 1U,
         bool include_dspark = false,
-        bool tiled_experts = false);
+        bool tiled_experts = false,
+        bool hugepage_arena = true);
+    // Whether the tiled arena was advised for hugepages and the kernel
+    // accepted the advice. Diagnostic only.
+    [[nodiscard]] bool arena_hugepages_requested() const noexcept {
+        return hugepage_requested_;
+    }
+    [[nodiscard]] bool arena_hugepages_accepted() const noexcept {
+        return hugepage_accepted_;
+    }
     [[nodiscard]] std::span<const std::byte> find(std::string_view name) const noexcept;
     [[nodiscard]] std::span<const std::byte> find_tiled_expert(
         std::uint32_t layer, std::uint32_t expert,
@@ -132,6 +146,8 @@ private:
     CudaBackend* pinned_backend_{};
     bool pinned_{};
     bool tiled_experts_{};
+    bool hugepage_requested_{};
+    bool hugepage_accepted_{};
     bool complete_{};
 };
 

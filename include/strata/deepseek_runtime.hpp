@@ -7,6 +7,7 @@
 #include "strata/deepseek_kv_cache.hpp"
 #include "strata/diagnostics.hpp"
 #include "strata/dsv4_rank_local_topology.hpp"
+#include "strata/dsv4_static_expert_tier.hpp"
 #include "strata/sampling.hpp"
 #include "strata/types.hpp"
 
@@ -112,6 +113,23 @@ struct Dsv4RuntimeConfig {
     // output-tiled NUMA-local CPU shards while the shared expert stays on GPU.
     // Prefill remains on the existing grouped device path.
     bool enable_host_routed_moe{};
+    // Back the ~148 GB tiled routed-expert arena with transparent hugepages.
+    // Advisory: identical bytes and arithmetic either way.
+    //
+    // Default OFF. Experiment 0122 measured this at 0.956x on decode over two
+    // interleaved repetitions with the mechanism verified as landed (106.8 GB
+    // of AnonHugePages against 0 in the baseline), and it costs 12-20 s of
+    // extra staging to compaction. The host routed-expert MoE is not
+    // translation-bound. The selector is retained so the rejection stays
+    // reproducible from one binary.
+    bool hugepage_expert_arena{false};
+    // Static routed-expert tier: a plan from strata-dsv4-expert-residency, the
+    // device to hold it (outside the rank pair), and the VRAM to spend there.
+    // An empty path or a negative device disables it, which is the default and
+    // is exactly today's decode.
+    std::string static_expert_plan_path;
+    int static_expert_tier_device{-1};
+    std::uint64_t static_expert_tier_bytes{};
     bool enable_logit_trace{};
     bool enable_layer_hash_trace{};
     bool detailed_timing{};
@@ -246,6 +264,23 @@ struct Dsv4GraphStats {
     std::uint64_t rank_local_candidate_nanoseconds{};
     std::uint64_t rank_local_boundary_nanoseconds{};
     std::uint64_t rank_local_collective_nanoseconds{};
+    // The routed CPU-MoE body split by phase, summed over the chain's layers
+    // and taken on the slower rank -- the same rank `moe_nanoseconds` takes.
+    // `moe_nanoseconds` minus the sum of these three is the executor's own
+    // fork/join and barrier cost, which is otherwise invisible: production
+    // splits every expert across a node's threads and pays three dispatches
+    // per layer, where 0051's standalone kernel gave each thread a whole
+    // expert and paid one.
+    // Static expert tier: submissions, experts served, device wall time on the
+    // tier device, and how long the routing callback blocked waiting for it.
+    // The gap between the last two is what the handoff costs beyond the work.
+    std::uint64_t static_tier_submissions{};
+    std::uint64_t static_tier_experts{};
+    std::uint64_t static_tier_device_nanoseconds{};
+    std::uint64_t static_tier_wait_nanoseconds{};
+    std::uint64_t rank_local_moe_gate_up_nanoseconds{};
+    std::uint64_t rank_local_moe_down_nanoseconds{};
+    std::uint64_t rank_local_moe_reduce_nanoseconds{};
     std::uint64_t rank_local_transition_nanoseconds{};
     std::uint64_t rank_local_shared_nanoseconds{};
     // Future-entropy lookahead, kept separate because it is whole speculative

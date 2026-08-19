@@ -542,11 +542,57 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
                   slot.result->routed_coefficients[rank].begin());
     }
     auto destination = rank_partials.subspan(rank * kHidden, kHidden);
+
+    // Split the route between the device tiers and this rank's host pool.
+    //
+    // Writing the selection is a plain store into pinned memory, which is legal
+    // from a host function where a CUDA call is not. The tier kernels are
+    // enqueued behind this callback on the same stream, so they are ordered
+    // after it and observe what is written here; they accumulate into the rank
+    // partial the join already reads. Nothing waits.
+    //
+    // A tier computes the *whole* expert, not this rank's shard of it, so the
+    // skip mask is the union over every tier while the selection this rank
+    // writes names only what its own device holds. Skipping only the local
+    // tier would leave the other rank's shard of a remotely-held expert
+    // computed twice.
+    std::array<bool, kTopK> skip{};
+    std::size_t served = 0U;
+    for (std::size_t index = 0U; index < kTopK; ++index) {
+        const auto expert = state.route.experts[index];
+        for (const auto* candidate : owner.options.static_expert_tiers) {
+            if (candidate != nullptr && candidate->active() &&
+                candidate->resident(slot.layer, expert)) {
+                skip[index] = true;
+                break;
+            }
+        }
+    }
+    auto* tier = owner.options.static_expert_tiers[rank];
+    if (tier != nullptr && tier->active()) {
+        auto* selection = owner.backend->dsv4_tier_selection(tier->device());
+        if (selection != nullptr) {
+            selection->layer = slot.layer;
+            for (std::size_t index = 0U; index < kTopK; ++index) {
+                const auto expert = state.route.experts[index];
+                const bool mine = tier->resident(slot.layer, expert);
+                selection->experts[index] = mine ? expert : kDsv4TierAbsent;
+                selection->coefficients[index] =
+                    mine ? state.route.weights[index] : 0.0F;
+                if (mine) ++served;
+            }
+            selection->count = static_cast<std::uint32_t>(served);
+        }
+    }
+    const bool any_skipped =
+        std::any_of(skip.begin(), skip.end(), [](bool value) { return value; });
+
     Dsv4HostMoePhaseTimings callback_phases{};
     const auto status = state.cpu->run(
         slot.layer, state.route, input,
         *owner.options.resident,
-        destination, &callback_phases);
+        destination, &callback_phases,
+        any_skipped ? std::span<const bool>(skip) : std::span<const bool>{});
     state.chain_cpu_moe_phases.gate_up_nanoseconds +=
         callback_phases.gate_up_nanoseconds;
     state.chain_cpu_moe_phases.down_nanoseconds +=

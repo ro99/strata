@@ -1990,6 +1990,12 @@ struct DeepSeekV4Runtime::Impl {
                              std::span<const float> base,
                              bool parallel_projection = false);
     ValidationResult reset_sequence(std::uint32_t active_context_tokens);
+    // Drops every KV device lease this runtime still holds from a finished
+    // generation. Page leases are deliberately kept until the next token's
+    // same-layer prepare, so when generation ends they are still open on the
+    // last blocks. An append cannot mutate a leased block, so a continuation
+    // that skips reset_sequence must drop them before it prefills.
+    void release_retained_kv_leases() noexcept;
     // Admits rank-local decode against measured byte accounts, then loads the
     // rank-sharded weights and initializes the two-rank executor. Fail-closed:
     // any rejection leaves rank_local_active false and the centralized path
@@ -2663,6 +2669,19 @@ ValidationResult DeepSeekV4Runtime::Impl::mhc_pre(
         lanes);
 }
 
+void DeepSeekV4Runtime::Impl::release_retained_kv_leases() noexcept {
+    for (auto& scratch : rank_local_scratch) {
+        scratch.compressed_block_leased.clear();
+        scratch.leases.clear();
+        scratch.index_leases.clear();
+        for (auto& pages : scratch.pages) pages.clear();
+        for (auto& pages : scratch.index_pages) pages.clear();
+    }
+    // The centralized path parks its leases here until the matching MoE
+    // collect, which an ended generation never reaches.
+    pending_attention_leases.clear();
+}
+
 ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     std::uint32_t active_context_tokens) {
     ValidationResult result;
@@ -2670,11 +2689,7 @@ ValidationResult DeepSeekV4Runtime::Impl::reset_sequence(
     cached_token_ids.clear();
     // Page slots and leases describe blocks of the sequence being discarded,
     // where the same indices will refer to different pages in the next one.
-    for (auto& scratch : rank_local_scratch) {
-        scratch.compressed_block_leased.clear();
-        scratch.leases.clear();
-        for (auto& pages : scratch.pages) pages.clear();
-    }
+    release_retained_kv_leases();
     if (kv_cache != nullptr) {
         result = kv_cache->reset_sequence(active_sequence);
         if (!result.ok()) return result;
@@ -9731,6 +9746,12 @@ Dsv4GenerationResult DeepSeekV4Runtime::generate_chat_stream(
             result.errors = std::move(reset.errors);
             return result;
         }
+    } else {
+        // A continuation keeps the sequence, so reset_sequence does not run and
+        // the leases the previous generation left open are still held. The
+        // prefill below appends the new turn into the last block of that same
+        // sequence, and an append refuses to mutate a leased block.
+        impl_->release_retained_kv_leases();
     }
     const auto reads_before = impl_->checkpoint->stats();
     const auto cuda_before = impl_->cuda.stats();

@@ -239,12 +239,23 @@ struct Dsv4RankLocalLayerExecutor::Impl {
         std::uint16_t* head_full{};
         std::vector<float> route_scratch;
         Dsv4Route route;
+        // Left by the route half for the host share that follows it. Per rank
+        // rather than per slot: both halves of a slot are host nodes on the one
+        // stream, so they run back to back and the next slot cannot overtake.
+        std::array<float, kHidden> route_input{};
+        std::array<bool, kTopK> route_skip{};
+        bool route_valid{};
+        bool route_any_skipped{};
         std::array<CallbackSlot, kChainSlots> callback_slots{};
         std::array<CallbackContext, kChainSlots> callback_contexts{};
     };
 
     CudaBackend* backend{};
     Dsv4RankLocalLayerOptions options;
+    // Set once at initialize from whether any tier is active. Splitting the
+    // boundary costs one extra host node per layer, which is only worth paying
+    // when there is a tier to release early.
+    bool split_route_callback{};
     std::array<RankState, kWorld> ranks;
     bool execution_active{};
     bool chain_active{};
@@ -442,25 +453,39 @@ struct ActiveCallGuard {
     return true;
 }
 
-bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
-                       std::span<const float> router_logits,
-                       std::span<float> rank_partials) {
-    auto& context = *static_cast<Dsv4RankLocalLayerExecutor::Impl::CallbackContext*>(
-        opaque);
+// True when this executor has any routed-expert tier to serve. It decides
+// whether the CPU-MoE boundary is split into a route half and a host-share
+// half: with no tier there is nothing to overlap, so the original single
+// callback is kept and the no-tier decode path stays byte for byte what it was.
+[[nodiscard]] bool any_tier_active(
+    const Dsv4RankLocalLayerExecutor::Impl& owner) noexcept {
+    for (const auto* candidate : owner.options.static_expert_tiers) {
+        if (candidate != nullptr && candidate->active()) return true;
+    }
+    return false;
+}
+
+// Decides the route and publishes the tier selection, leaving both in the
+// rank's scratch for the host share to consume. Shared by the split and
+// unsplit entry points so that there is exactly one router: two would be two
+// things to keep bit-identical, and the charter does not allow router
+// semantics to drift silently.
+[[nodiscard]] bool prepare_route(
+    Dsv4RankLocalLayerExecutor::Impl::CallbackContext& context,
+    std::span<const std::uint16_t> encoded,
+    std::span<const float> router_logits) {
     auto& owner = *context.owner;
     const auto rank = context.rank;
     if (rank >= kWorld || context.slot >= kChainSlots ||
         owner.options.resident == nullptr ||
-        encoded.size() != kHidden || router_logits.size() != kRouter ||
-        rank_partials.size() != 2U * kHidden) {
-        std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
+        encoded.size() != kHidden || router_logits.size() != kRouter) {
         return false;
     }
-    auto& slot = owner.ranks[rank].callback_slots[context.slot];
-    if (!slot.active) {
-        std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
-        return false;
-    }
+    auto& state = owner.ranks[rank];
+    state.route_valid = false;
+    state.route_any_skipped = false;
+    auto& slot = state.callback_slots[context.slot];
+    if (!slot.active) return false;
     auto* observation = slot.observation;
     Dsv4RankLocalLayerRankObservation* rank_observation = nullptr;
     if (observation != nullptr) {
@@ -482,7 +507,6 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
             rank_observation->completed = true;
         }
     };
-    std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
     const auto pre_failure = is_pre_failure(slot.failure) &&
         failure_rank(slot.failure) == static_cast<int>(rank) &&
         is_moe_failure(slot.failure);
@@ -494,7 +518,7 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
     // This callback is intentionally allocation-free. The fixed stack decode
     // is the production BF16 callback boundary, and all executor scratch was
     // reserved by initialize().
-    std::array<float, kHidden> input{};
+    auto& input = state.route_input;
     for (std::size_t index = 0U; index < kHidden; ++index) {
         const auto bits = static_cast<std::uint32_t>(encoded[index]) << 16U;
         input[index] = std::bit_cast<float>(bits);
@@ -513,10 +537,11 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
             return false;
         }
     }
-    auto& state = owner.ranks[rank];
     // Same-rank callbacks are enqueued on one CUDA stream. Host nodes execute
     // in stream order, so this fixed route scratch may be reused by the next
-    // slot only after the preceding node has completed.
+    // slot only after the preceding node has completed. The split keeps that
+    // property: both halves of a slot are host nodes on the same stream, so
+    // they run back to back before the next slot's route half.
     const auto routed = slot.router_token_experts.empty()
         ? dsv4_route_sqrtsoftplus_f32_into(
               router_logits, slot.router_bias, owner.router_spec,
@@ -525,7 +550,6 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
               router_logits, slot.router_token_experts, owner.router_spec,
               state.route.experts, state.route.weights);
     if (!routed.ok()) {
-        std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
         observation_failure();
         return false;
     }
@@ -541,22 +565,23 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
         std::copy(state.route.weights.begin(), state.route.weights.end(),
                   slot.result->routed_coefficients[rank].begin());
     }
-    auto destination = rank_partials.subspan(rank * kHidden, kHidden);
 
     // Split the route between the device tiers and this rank's host pool.
     //
     // Writing the selection is a plain store into pinned memory, which is legal
-    // from a host function where a CUDA call is not. The tier kernels are
-    // enqueued behind this callback on the same stream, so they are ordered
-    // after it and observe what is written here; they accumulate into the rank
-    // partial the join already reads. Nothing waits.
+    // from a host function where a CUDA call is not. The tier kernels observe
+    // it either behind this node on the same stream, or -- when the boundary is
+    // split -- on their own stream released by an event recorded immediately
+    // after this node returns, so they run while the host share below is still
+    // computing rather than after it.
     //
     // A tier computes the *whole* expert, not this rank's shard of it, so the
     // skip mask is the union over every tier while the selection this rank
     // writes names only what its own device holds. Skipping only the local
     // tier would leave the other rank's shard of a remotely-held expert
     // computed twice.
-    std::array<bool, kTopK> skip{};
+    auto& skip = state.route_skip;
+    skip.fill(false);
     std::size_t served = 0U;
     for (std::size_t index = 0U; index < kTopK; ++index) {
         const auto expert = state.route.experts[index];
@@ -584,15 +609,71 @@ bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
             selection->count = static_cast<std::uint32_t>(served);
         }
     }
-    const bool any_skipped =
+    state.route_any_skipped =
         std::any_of(skip.begin(), skip.end(), [](bool value) { return value; });
+    state.route_valid = true;
+    return true;
+}
 
+// First host node of the split boundary. Nothing but the route belongs here.
+bool route_callback(void* opaque, std::span<const std::uint16_t> encoded,
+                    std::span<const float> router_logits) {
+    auto& context = *static_cast<Dsv4RankLocalLayerExecutor::Impl::CallbackContext*>(
+        opaque);
+    return prepare_route(context, encoded, router_logits);
+}
+
+bool host_moe_callback(void* opaque, std::span<const std::uint16_t> encoded,
+                       std::span<const float> router_logits,
+                       std::span<float> rank_partials) {
+    auto& context = *static_cast<Dsv4RankLocalLayerExecutor::Impl::CallbackContext*>(
+        opaque);
+    auto& owner = *context.owner;
+    const auto rank = context.rank;
+    if (rank >= kWorld || context.slot >= kChainSlots ||
+        owner.options.resident == nullptr ||
+        encoded.size() != kHidden || router_logits.size() != kRouter ||
+        rank_partials.size() != 2U * kHidden) {
+        std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
+        return false;
+    }
+    auto& state = owner.ranks[rank];
+    auto& slot = state.callback_slots[context.slot];
+    if (!slot.active) {
+        std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
+        return false;
+    }
+    auto* observation = slot.observation;
+    Dsv4RankLocalLayerRankObservation* rank_observation =
+        observation == nullptr ? nullptr : &observation->rank[rank];
+    const auto observation_failure = [&]() noexcept {
+        if (rank_observation != nullptr) {
+            rank_observation->failure = true;
+            rank_observation->completed = true;
+        }
+    };
+    std::fill(rank_partials.begin(), rank_partials.end(), 0.0F);
+
+    // With a tier the route was decided by the node before this one, so that
+    // the tier could start against it. Without one there is no such node and
+    // the route is decided here, exactly as it always was.
+    if (owner.split_route_callback) {
+        if (!state.route_valid) {
+            observation_failure();
+            return false;
+        }
+    } else if (!prepare_route(context, encoded, router_logits)) {
+        return false;
+    }
+
+    auto destination = rank_partials.subspan(rank * kHidden, kHidden);
     Dsv4HostMoePhaseTimings callback_phases{};
     const auto status = state.cpu->run(
-        slot.layer, state.route, input,
+        slot.layer, state.route, state.route_input,
         *owner.options.resident,
         destination, &callback_phases,
-        any_skipped ? std::span<const bool>(skip) : std::span<const bool>{});
+        state.route_any_skipped ? std::span<const bool>(state.route_skip)
+                                : std::span<const bool>{});
     state.chain_cpu_moe_phases.gate_up_nanoseconds +=
         callback_phases.gate_up_nanoseconds;
     state.chain_cpu_moe_phases.down_nanoseconds +=
@@ -764,6 +845,7 @@ ValidationResult Dsv4RankLocalLayerExecutor::initialize(
         return result;
     }
     impl_->options = options;
+    impl_->split_route_callback = any_tier_active(*impl_);
     impl_->router_spec = deepseek_v4_flash_0731_spec().router;
     devices_ = options.devices;
     for (std::size_t rank = 0U; rank < kWorld; ++rank) {
@@ -1257,7 +1339,8 @@ ValidationResult Dsv4RankLocalLayerExecutor::run(
             auto enqueued = backend_.enqueue_dsv4_host_moe_from_device_input_device_view(
                 devices_[rank], *weights.shared, kSwiGluLimit,
                 host_moe_callback,
-                &impl_->ranks[rank].callback_contexts[slot_index], moe_views[rank]);
+                &impl_->ranks[rank].callback_contexts[slot_index], moe_views[rank],
+                impl_->split_route_callback ? route_callback : nullptr);
             if (!enqueued.ok()) {
                 output.errors.insert(output.errors.end(), enqueued.errors.begin(),
                                      enqueued.errors.end());

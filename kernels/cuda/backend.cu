@@ -172,26 +172,41 @@ __device__ float fp8_e4m3_value(unsigned char encoded) {
     return negative ? -value : value;
 }
 
+// E2M1 decode, branch-free.
+//
+// This ran as a sixteen-way switch, which nvcc lowers to a jump table or a
+// branch tree and which executes once per weight element. Measured with ncu on
+// the DeepSeek batch-1 expert kernels, that left them at 77% SM throughput
+// against 6% DRAM throughput -- issue-bound, with the memory system idle
+// (experiment 0124). The bytes were never the constraint; the decode was.
+//
+// E2M1 is a sign bit, a two-bit exponent with bias 1, and a one-bit mantissa,
+// so the value is exactly a float built from bits. For exponent e >= 1 the
+// magnitude is 2^(e-1) * (1 + m/2), which is the float whose exponent field is
+// 126 + e and whose top mantissa bit is m. For e == 0 it is subnormal, m/2,
+// giving 0 or 0.5. That case is the only one the bit construction cannot
+// express, and it collapses to a single select.
+//
+// Exhaustively bit-identical to the switch over all sixteen encodings;
+// tests/test_fp4_decode.cpp mirrors this construction and pins it against the
+// declared table. Measured effect on the batch-1 expert path: 2.09 -> 1.06 ms
+// per six-expert call on the 5060 Ti and 1.47 -> 0.77 ms on a 3090.
 __device__ float fp4_e2m1_value(unsigned int encoded) {
-    switch (encoded & 0x0FU) {
-        case 0x0U: return 0.0F;
-        case 0x1U: return 0.5F;
-        case 0x2U: return 1.0F;
-        case 0x3U: return 1.5F;
-        case 0x4U: return 2.0F;
-        case 0x5U: return 3.0F;
-        case 0x6U: return 4.0F;
-        case 0x7U: return 6.0F;
-        case 0x8U: return 0.0F;
-        case 0x9U: return -0.5F;
-        case 0xAU: return -1.0F;
-        case 0xBU: return -1.5F;
-        case 0xCU: return -2.0F;
-        case 0xDU: return -3.0F;
-        case 0xEU: return -4.0F;
-        case 0xFU: return -6.0F;
-        default: return 0.0F;
-    }
+    const unsigned int magnitude = encoded & 0x07U;
+    const unsigned int exponent = magnitude >> 1U;
+    const unsigned int mantissa = magnitude & 0x01U;
+    const unsigned int normal =
+        ((126U + exponent) << 23U) | (mantissa << 22U);
+    // exponent 0 is subnormal: 0.0 for mantissa 0, 0.5 for mantissa 1.
+    const unsigned int subnormal = mantissa == 0U ? 0U : 0x3F00'0000U;
+    const unsigned int bits = exponent == 0U ? subnormal : normal;
+    // Encoding 0x8 is negative zero in the bit construction but the declared
+    // table gives +0.0, and the two differ in their bits even though they
+    // compare equal. Suppress the sign when the magnitude is zero so the
+    // decode is bit-identical, not merely numerically equal.
+    const unsigned int sign =
+        magnitude == 0U ? 0U : ((encoded & 0x08U) << 28U);
+    return __uint_as_float(bits | sign);
 }
 
 __device__ float quantize_e4m3_value(float value) {

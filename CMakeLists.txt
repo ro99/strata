@@ -437,6 +437,7 @@ if(BUILD_TESTING)
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
         tests/test_dsv4_expert_residency.cpp
+        tests/test_fp4_decode.cpp
         tests/test_glm_ops.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp

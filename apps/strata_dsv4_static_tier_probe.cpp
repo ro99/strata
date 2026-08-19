@@ -127,14 +127,22 @@ int main(int argc, char** argv) {
     std::vector<float> output(static_cast<std::size_t>(options.experts) * kHidden, 0.0F);
     const auto limit = strata::kDeepSeekV4ExecutionContract.swiglu_limit;
 
+    double enqueue_ms = 0.0;
+    double collect_ms = 0.0;
     const auto one_call = [&]() -> bool {
+        const auto enqueue_started = std::chrono::steady_clock::now();
         auto enqueued = backend.enqueue_deepseek_moe(
             options.device, input, routed, nullptr, limit);
+        enqueue_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - enqueue_started).count();
         if (!enqueued.ok()) {
             for (const auto& error : enqueued.errors) std::cerr << "error: " << error << "\n";
             return false;
         }
+        const auto collect_started = std::chrono::steady_clock::now();
         auto collected = backend.collect_deepseek_moe(options.device, output, {});
+        collect_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - collect_started).count();
         if (!collected.ok()) {
             for (const auto& error : collected.errors) std::cerr << "error: " << error << "\n";
             return false;
@@ -145,6 +153,8 @@ int main(int argc, char** argv) {
     for (std::uint32_t warm = 0U; warm < 20U; ++warm) {
         if (!one_call()) return 1;
     }
+    enqueue_ms = 0.0;
+    collect_ms = 0.0;
     std::vector<double> samples;
     samples.reserve(options.iterations);
     for (std::uint32_t iteration = 0U; iteration < options.iterations; ++iteration) {
@@ -162,6 +172,9 @@ int main(int argc, char** argv) {
     std::printf(
         "  per call: median %.4f ms   min %.4f   max %.4f\n",
         median, samples.front(), samples.back());
+    std::printf(
+        "  split: enqueue %.4f ms   collect %.4f ms  (mean per call)\n",
+        enqueue_ms / options.iterations, collect_ms / options.iterations);
     std::printf(
         "  43 layers/token -> %.2f ms/token of tier calls\n", median * 43.0);
     return 0;

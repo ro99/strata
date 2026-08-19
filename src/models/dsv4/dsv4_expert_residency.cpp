@@ -144,6 +144,25 @@ ParseResult<Dsv4ExpertResidencyPlan> Dsv4ExpertResidencyPlan::load(
     return parse(buffer.str(), layers, experts);
 }
 
+std::size_t Dsv4ExpertResidencyPlan::slice(std::size_t offset,
+                                           std::size_t stride) {
+    if (stride <= 1U) return pairs_.size();
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> kept;
+    kept.reserve(pairs_.size() / stride + 1U);
+    for (std::size_t index = 0U; index < pairs_.size(); ++index) {
+        const auto [layer, expert] = pairs_[index];
+        if (index % stride == offset % stride) {
+            kept.emplace_back(layer, expert);
+            continue;
+        }
+        // Not ours: clear the bit so this tier never claims an expert another
+        // tier owns. Exactly one engine must owe each triplet.
+        bitmap_[static_cast<std::size_t>(layer) * experts_ + expert] = 0U;
+    }
+    pairs_ = std::move(kept);
+    return pairs_.size();
+}
+
 std::size_t Dsv4ExpertResidencyPlan::truncate(std::size_t limit) {
     if (limit >= pairs_.size()) return pairs_.size();
     for (std::size_t index = limit; index < pairs_.size(); ++index) {

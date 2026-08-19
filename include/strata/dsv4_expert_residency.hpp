@@ -63,6 +63,11 @@ public:
     // Drops everything past `limit`, keeping the hottest. Returns what remains.
     std::size_t truncate(std::size_t limit);
 
+    // Keeps every `stride`-th entry starting at `offset`, so N devices each
+    // take a disjoint slice of one ranking and the hottest triplets spread
+    // evenly rather than piling onto one card. Returns what remains.
+    std::size_t slice(std::size_t offset, std::size_t stride);
+
 private:
     std::uint32_t layers_{};
     std::uint32_t experts_{};

@@ -1698,7 +1698,7 @@ struct DeepSeekV4Runtime::Impl {
     std::unique_ptr<Dsv4RankLocalLayerExecutor> rank_local_executor;
     // Outlives the executor that points at it, so it is declared before the
     // executor is torn down and destroyed after.
-    std::unique_ptr<Dsv4StaticExpertTier> static_expert_tier;
+    std::vector<std::unique_ptr<Dsv4StaticExpertTier>> static_expert_tiers;
 #endif
     Dsv4RankLocalAdmission rank_local_admission;
     std::vector<std::uint64_t> rank_local_initial_device_vram_bytes;
@@ -6778,8 +6778,18 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
                 "the centralized prefill spine");
             continue;
         }
-        const auto arena_expert_bytes =
-            capacities[rank] - sharded[rank] - cache_pinned;
+        // The routed-expert tier is permanent and suballocates from this same
+        // arena, so its bytes are reserved before the prefill cache is sized.
+        // Without this the cache is promised space the tier already holds and
+        // fails an acquire mid-prefill rather than simply being smaller.
+        const auto tier_reserved =
+            config.static_expert_plan_path.empty()
+                ? 0U : config.static_expert_tier_bytes;
+        const auto arena_after_tier =
+            capacities[rank] > sharded[rank] + cache_pinned + tier_reserved
+                ? capacities[rank] - sharded[rank] - cache_pinned - tier_reserved
+                : 0U;
+        const auto arena_expert_bytes = arena_after_tier;
         const auto cache_expert_bytes =
             rank < cache.capacity_bytes.size() &&
                     cache.capacity_bytes[rank] > cache_pinned
@@ -6827,32 +6837,37 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
     }
     options.resident = &resident;
 
-    // Static routed-expert tier on a device outside the rank pair. Optional by
-    // construction: an unset path, an absent device, or a plan that admits
-    // nothing all leave decode exactly as it was.
-    if (!config.static_expert_plan_path.empty() &&
-        config.static_expert_tier_device >= 0) {
+    // Routed-expert tiers on the rank devices themselves. The layer is already
+    // executing there, so the experts cost 0.128 ms each against the host
+    // path's 0.282, and nothing crosses a device boundary. Each rank's tier
+    // takes a disjoint slice of one ranking, so the two cards split the hottest
+    // experts rather than both holding the same ones.
+    if (!config.static_expert_plan_path.empty()) {
         auto plan = Dsv4ExpertResidencyPlan::load(
             config.static_expert_plan_path, kLayers, kExperts);
         if (!plan.ok()) {
             store->clear();
             append_errors(result, std::move(plan.errors),
-                          "static expert residency plan");
+                          "expert residency plan");
             return result;
         }
-        static_expert_tier = std::make_unique<Dsv4StaticExpertTier>();
-        auto prepared = static_expert_tier->initialize(
-            config.static_expert_tier_device, cuda, *checkpoint,
-            std::move(plan.value), config.static_expert_tier_bytes,
-            kDeepSeekV4ExecutionContract.swiglu_limit);
-        if (!prepared.ok()) {
-            store->clear();
-            static_expert_tier.reset();
-            append_errors(result, std::move(prepared.errors),
-                          "static expert tier");
-            return result;
+        static_expert_tiers.clear();
+        for (std::size_t rank = 0U; rank < kDsv4RankLocalWorld; ++rank) {
+            auto tier = std::make_unique<Dsv4StaticExpertTier>();
+            auto copy = plan.value;
+            auto prepared = tier->initialize(
+                rank_devices[rank], cuda, *checkpoint, std::move(copy),
+                config.static_expert_tier_bytes, rank, kDsv4RankLocalWorld);
+            if (!prepared.ok()) {
+                store->clear();
+                static_expert_tiers.clear();
+                append_errors(result, std::move(prepared.errors),
+                              "expert tier rank " + std::to_string(rank));
+                return result;
+            }
+            options.static_expert_tiers[rank] = tier.get();
+            static_expert_tiers.push_back(std::move(tier));
         }
-        options.static_expert_tier = static_expert_tier.get();
     }
     result = executor->initialize(options);
     if (!result.ok()) {
@@ -9193,6 +9208,18 @@ ValidationResult DeepSeekV4Runtime::initialize(
     }
     auto arena_capacities = weight_capacities;
     auto cache_weight_capacities = arena_capacities;
+    // The routed-expert tier suballocates from the same weight arena as the
+    // centralized prefill cache, and the tier is permanent while the cache is
+    // a prefill performance term. Reserve the tier's bytes out of the cache's
+    // logical capacity so the cache stops short of the arena instead of
+    // failing an acquire mid-prefill, which is what an unreserved tier caused.
+    if (!config.static_expert_plan_path.empty() &&
+        config.static_expert_tier_bytes != 0U) {
+        for (auto& capacity : cache_weight_capacities) {
+            capacity = capacity > config.static_expert_tier_bytes
+                ? capacity - config.static_expert_tier_bytes : 0U;
+        }
+    }
     const auto mhc_slot = static_cast<std::size_t>(std::distance(
         arena_capacities.begin(),
         std::max_element(arena_capacities.begin(), arena_capacities.end())));

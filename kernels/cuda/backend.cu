@@ -2151,6 +2151,160 @@ __global__ void plain_bf16_moe_down_kernel(
     }
 }
 
+// Device-resident routed-expert tier.
+//
+// The routed set is 143.7 GB against 64 GB of VRAM, so most experts must stay
+// in host DRAM where the CPU reads them at 0.282 ms each. A 3090 computes the
+// same expert from VRAM in 0.128 ms, so every expert that fits is worth moving.
+//
+// The obstacle was never the arithmetic, it was the ordering: routing is
+// decided inside a cudaLaunchHostFunc callback, where CUDA calls are illegal,
+// and a previous attempt that blocked that callback waiting on a worker thread
+// stalled the whole context (experiment 0124).
+//
+// This avoids the callback entirely. Host functions are stream-ordered, so a
+// kernel enqueued behind the callback is guaranteed to observe its writes. The
+// callback therefore writes the experts it is NOT going to compute into pinned
+// memory -- a plain store, no CUDA API -- and the kernel behind it reads that
+// selection, looks the weights up in a table built once at load, and
+// accumulates into the same rank-partial buffer the existing join already
+// consumes. No worker thread, no events, no host wait, no change to the join.
+struct DeepSeekTierTable {
+    // Indexed by layer * experts + expert. Null weight means not resident, in
+    // which case the host owes that expert and this kernel must skip it.
+    const unsigned char* const* w1_weights{};
+    const unsigned char* const* w1_scales{};
+    const unsigned char* const* w3_weights{};
+    const unsigned char* const* w3_scales{};
+    const unsigned char* const* w2_weights{};
+    const unsigned char* const* w2_scales{};
+    std::uint32_t experts{};
+};
+
+// One selection per layer, written by the callback into pinned memory and
+// uploaded on the same stream. `expert` is kDeepSeekTierAbsent for a slot this
+// tier does not serve.
+constexpr std::uint32_t kDeepSeekTierAbsent = 0xFFFF'FFFFU;
+struct DeepSeekTierSelection {
+    std::uint32_t experts[kMaxDeepSeekRoutedExperts]{};
+    float coefficients[kMaxDeepSeekRoutedExperts]{};
+    std::uint32_t layer{};
+    std::uint32_t count{};
+};
+
+// Gate/up for the tier's slots. Grid is (intermediate, kMaxDeepSeekRoutedExperts);
+// a block whose slot is absent exits immediately, which costs a launch but keeps
+// the grid shape independent of a route only the host knows.
+__global__ void deepseek_fp4_tier_gate_up_kernel(
+    float* activations, const float* hidden, DeepSeekTierTable table,
+    const DeepSeekTierSelection* selection, std::uint64_t columns,
+    std::uint64_t intermediate, std::uint64_t packed_columns,
+    std::uint64_t scale_columns) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t slot = blockIdx.y;
+    if (output_row >= intermediate || slot >= kMaxDeepSeekRoutedExperts) return;
+    const std::uint32_t expert = selection->experts[slot];
+    if (expert == kDeepSeekTierAbsent) return;
+    const std::uint64_t entry =
+        static_cast<std::uint64_t>(selection->layer) * table.experts + expert;
+    const auto* w1 = table.w1_weights[entry];
+    const auto* w3 = table.w3_weights[entry];
+    if (w1 == nullptr || w3 == nullptr) return;
+    const auto* w1_scales = table.w1_scales[entry];
+    const auto* w3_scales = table.w3_scales[entry];
+
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t group = warp; group < scale_columns; group += 8U) {
+        float gate_scale = lane == 0U
+                               ? fp8_e8m0_scale_bits(w1_scales[scale_base + group])
+                               : 0.0F;
+        float up_scale = lane == 0U
+                             ? fp8_e8m0_scale_bits(w3_scales[scale_base + group])
+                             : 0.0F;
+        gate_scale = __shfl_sync(0xFFFF'FFFFU, gate_scale, 0);
+        up_scale = __shfl_sync(0xFFFF'FFFFU, up_scale, 0);
+        const std::uint64_t column = group * 32U + lane;
+        if (column < columns) {
+            const float input = hidden[column];
+            const unsigned char gate_packed = w1[packed_base + column / 2U];
+            const unsigned char up_packed = w3[packed_base + column / 2U];
+            const unsigned int gate_encoded = column % 2U == 0U
+                                                  ? gate_packed & 0x0FU
+                                                  : gate_packed >> 4U;
+            const unsigned int up_encoded = column % 2U == 0U
+                                                ? up_packed & 0x0FU
+                                                : up_packed >> 4U;
+            gate += input * fp4_e2m1_value(gate_encoded) * gate_scale;
+            up += input * fp4_e2m1_value(up_encoded) * up_scale;
+        }
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F
+                                  ? 1.0F / (1.0F + exponential)
+                                  : exponential / (1.0F + exponential);
+        activations[static_cast<std::uint64_t>(slot) * intermediate + output_row] =
+            gate * sigmoid * up;
+    }
+}
+
+// Down projection, accumulating each served expert's contribution into the
+// rank partial the join already reads. Accumulation is by atomicAdd across
+// slots because the slots are independent blocks; within a row the order is
+// therefore not fixed, which is the same reassociation the CPU path's own
+// cross-slot sum performs.
+__global__ void deepseek_fp4_tier_down_kernel(
+    float* rank_partials, const float* activations, DeepSeekTierTable table,
+    const DeepSeekTierSelection* selection, std::uint64_t columns,
+    std::uint64_t rows, std::uint64_t packed_columns,
+    std::uint64_t scale_columns) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t slot = blockIdx.y;
+    if (output_row >= rows || slot >= kMaxDeepSeekRoutedExperts) return;
+    const std::uint32_t expert = selection->experts[slot];
+    if (expert == kDeepSeekTierAbsent) return;
+    const std::uint64_t entry =
+        static_cast<std::uint64_t>(selection->layer) * table.experts + expert;
+    const auto* weights = table.w2_weights[entry];
+    if (weights == nullptr) return;
+    const auto* scales = table.w2_scales[entry];
+    const float coefficient = selection->coefficients[slot];
+
+    const std::uint64_t packed_base = output_row * packed_columns;
+    const std::uint64_t scale_base = output_row * scale_columns;
+    const std::uint64_t input_base = static_cast<std::uint64_t>(slot) * columns;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    float sum = 0.0F;
+    for (std::uint64_t group = warp; group < scale_columns; group += 8U) {
+        float scale = lane == 0U
+                          ? fp8_e8m0_scale_bits(scales[scale_base + group])
+                          : 0.0F;
+        scale = __shfl_sync(0xFFFF'FFFFU, scale, 0);
+        const std::uint64_t column = group * 32U + lane;
+        if (column < columns) {
+            const unsigned char packed = weights[packed_base + column / 2U];
+            const unsigned int encoded = column % 2U == 0U
+                                             ? packed & 0x0FU
+                                             : packed >> 4U;
+            sum += activations[input_base + column] *
+                   fp4_e2m1_value(encoded) * scale;
+        }
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        atomicAdd(&rank_partials[output_row], sum * coefficient);
+    }
+}
+
 __global__ void deepseek_fp4_gate_up_kernel(
     float* activations, const float* hidden, DeepSeekFp4Batch batch,
     std::uint64_t columns, std::uint64_t intermediate,
@@ -5323,6 +5477,25 @@ struct CudaBackend::Impl {
         float* moe_bf16_silu{};
         unsigned int* moe_error{};
         void* moe_host_staging{};
+        // Routed-expert tier: host-side pointer arrays mirrored to device, the
+        // pinned selection the callback writes, and its device copy.
+        std::vector<const unsigned char*> tier_host_pointers[6];
+        const unsigned char** tier_device_pointers[6]{};
+        CudaDsv4TierSelection* tier_selection_host{};
+        CudaDsv4TierSelection* tier_selection_device{};
+        std::uint32_t tier_layers{};
+        std::uint32_t tier_experts{};
+        std::uint64_t tier_installed{};
+        bool tier_committed{};
+        // Taken from the first installed triplet rather than assumed, and
+        // every later triplet must match: a tier holding two shapes would
+        // index one of them wrongly.
+        std::uint64_t tier_gate_packed_columns{};
+        std::uint64_t tier_gate_scale_columns{};
+        std::uint64_t tier_down_packed_columns{};
+        std::uint64_t tier_down_scale_columns{};
+        float* tier_activations{};
+        std::uint64_t tier_activation_bytes{};
         std::uint64_t moe_hidden_bytes{};
         std::uint64_t moe_activation_bytes{};
         std::uint64_t moe_output_bytes{};
@@ -15023,6 +15196,75 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         abort_enqueue(status, "upload DeepSeek CPU-MoE rank partials");
         return result;
     }
+    // Routed-expert tier. Enqueued after the callback, so it is stream-ordered
+    // behind it and observes the selection the callback wrote into pinned
+    // memory, and after the rank-partial upload, so it accumulates into the
+    // same buffer the join below already consumes. No host wait, no worker
+    // thread, no change to the join itself.
+    if (state.tier_committed && state.tier_installed != 0U) {
+        const std::uint64_t tier_activation_bytes =
+            kMaxDeepSeekRoutedExperts * intermediate_columns * sizeof(float);
+        if (tier_activation_bytes > state.tier_activation_bytes) {
+            if (state.tier_activations != nullptr) {
+                static_cast<void>(cudaFree(state.tier_activations));
+                state.tier_activations = nullptr;
+                state.tier_activation_bytes = 0U;
+            }
+            void* scratch = nullptr;
+            if (const auto status = cudaMalloc(
+                    &scratch, static_cast<std::size_t>(tier_activation_bytes));
+                status != cudaSuccess) {
+                abort_enqueue(status, "allocate DeepSeek tier activations");
+                return result;
+            }
+            state.tier_activations = static_cast<float*>(scratch);
+            state.tier_activation_bytes = tier_activation_bytes;
+        }
+        if (auto status = cudaMemcpyAsync(
+                state.tier_selection_device, state.tier_selection_host,
+                sizeof(CudaDsv4TierSelection), cudaMemcpyHostToDevice,
+                state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "upload DeepSeek tier selection");
+            return result;
+        }
+        DeepSeekTierTable table;
+        table.w1_weights = state.tier_device_pointers[0];
+        table.w1_scales = state.tier_device_pointers[1];
+        table.w3_weights = state.tier_device_pointers[2];
+        table.w3_scales = state.tier_device_pointers[3];
+        table.w2_weights = state.tier_device_pointers[4];
+        table.w2_scales = state.tier_device_pointers[5];
+        table.experts = state.tier_experts;
+        const auto* tier_selection =
+            reinterpret_cast<const DeepSeekTierSelection*>(
+                state.tier_selection_device);
+        const dim3 tier_gate_grid(
+            static_cast<unsigned int>(intermediate_columns),
+            kMaxDeepSeekRoutedExperts, 1U);
+        deepseek_fp4_tier_gate_up_kernel<<<
+            tier_gate_grid, threads, 0U, state.stream>>>(
+            state.tier_activations, state.moe_hidden, table, tier_selection,
+            hidden_columns, intermediate_columns,
+            state.tier_gate_packed_columns, state.tier_gate_scale_columns);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek tier W1/W3");
+            return result;
+        }
+        const dim3 tier_down_grid(static_cast<unsigned int>(hidden_columns),
+                                  kMaxDeepSeekRoutedExperts, 1U);
+        deepseek_fp4_tier_down_kernel<<<
+            tier_down_grid, threads, 0U, state.stream>>>(
+            rank_partials, state.tier_activations, table, tier_selection,
+            intermediate_columns, hidden_columns,
+            state.tier_down_packed_columns, state.tier_down_scale_columns);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch DeepSeek tier W2");
+            return result;
+        }
+    }
     if (auto status = cudaStreamWaitEvent(
             state.stream, state.moe_shared_finished);
         status != cudaSuccess) {
@@ -16151,6 +16393,170 @@ ValidationResult CudaBackend::enqueue_moe(
         device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
     }
     return result;
+}
+
+ValidationResult CudaBackend::dsv4_tier_reserve(
+    int device, std::uint32_t layers, std::uint32_t experts) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek tier reserve targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.tier_layers != 0U) {
+        result.errors.emplace_back("DeepSeek tier is already reserved");
+        return result;
+    }
+    if (layers == 0U || experts == 0U) {
+        result.errors.emplace_back("DeepSeek tier needs a positive geometry");
+        return result;
+    }
+    if (const auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for DeepSeek tier");
+    }
+    const auto entries = static_cast<std::size_t>(layers) * experts;
+    for (std::size_t array = 0U; array < 6U; ++array) {
+        state.tier_host_pointers[array].assign(entries, nullptr);
+        void* device_array = nullptr;
+        if (const auto status = cudaMalloc(
+                &device_array, entries * sizeof(const unsigned char*));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate DeepSeek tier pointer table");
+        }
+        state.tier_device_pointers[array] =
+            static_cast<const unsigned char**>(device_array);
+    }
+    void* selection_host = nullptr;
+    if (const auto status = cudaMallocHost(
+            &selection_host, sizeof(CudaDsv4TierSelection));
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate DeepSeek tier selection staging");
+    }
+    state.tier_selection_host =
+        static_cast<CudaDsv4TierSelection*>(selection_host);
+    *state.tier_selection_host = CudaDsv4TierSelection{};
+    void* selection_device = nullptr;
+    if (const auto status =
+            cudaMalloc(&selection_device, sizeof(CudaDsv4TierSelection));
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate DeepSeek tier selection");
+    }
+    state.tier_selection_device =
+        static_cast<CudaDsv4TierSelection*>(selection_device);
+    state.tier_layers = layers;
+    state.tier_experts = experts;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_tier_add(
+    int device, std::uint32_t layer, std::uint32_t expert,
+    const CudaWeight& w1, const CudaWeight& w3, const CudaWeight& w2) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek tier add targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.tier_layers == 0U) {
+        result.errors.emplace_back("DeepSeek tier is not reserved");
+        return result;
+    }
+    if (layer >= state.tier_layers || expert >= state.tier_experts) {
+        result.errors.emplace_back("DeepSeek tier entry is out of range");
+        return result;
+    }
+    const std::array<const CudaWeight*, 3U> weights{&w1, &w3, &w2};
+    for (const auto* weight : weights) {
+        if (weight == nullptr || !weight->valid() ||
+            weight->impl_->device != device) {
+            result.errors.emplace_back(
+                "DeepSeek tier entry weight is invalid or on another device");
+            return result;
+        }
+        if (weight->impl_->descriptor.encoding !=
+            CudaWeightEncoding::Fp4E2m1Group32) {
+            result.errors.emplace_back(
+                "DeepSeek tier entry weight is not FP4 E2M1 group 32");
+            return result;
+        }
+    }
+    const auto entry =
+        static_cast<std::size_t>(layer) * state.tier_experts + expert;
+    if (state.tier_host_pointers[0][entry] != nullptr) {
+        result.errors.emplace_back(
+            "DeepSeek tier already holds this layer and expert");
+        return result;
+    }
+    const auto& gate_descriptor = w1.impl_->descriptor;
+    const auto& down_descriptor = w2.impl_->descriptor;
+    if (state.tier_gate_packed_columns == 0U) {
+        state.tier_gate_packed_columns = gate_descriptor.packed_columns;
+        state.tier_gate_scale_columns = gate_descriptor.scale_columns;
+        state.tier_down_packed_columns = down_descriptor.packed_columns;
+        state.tier_down_scale_columns = down_descriptor.scale_columns;
+    } else if (gate_descriptor.packed_columns != state.tier_gate_packed_columns ||
+               gate_descriptor.scale_columns != state.tier_gate_scale_columns ||
+               down_descriptor.packed_columns != state.tier_down_packed_columns ||
+               down_descriptor.scale_columns != state.tier_down_scale_columns) {
+        result.errors.emplace_back(
+            "DeepSeek tier entry shape differs from the tier's first entry");
+        return result;
+    }
+    const std::array<const CudaWeight*, 6U> ordered{&w1, &w1, &w3, &w3, &w2, &w2};
+    for (std::size_t array = 0U; array < 6U; ++array) {
+        state.tier_host_pointers[array][entry] = static_cast<const unsigned char*>(
+            array % 2U == 0U ? ordered[array]->impl_->weights
+                             : ordered[array]->impl_->scales);
+    }
+    ++state.tier_installed;
+    return result;
+}
+
+ValidationResult CudaBackend::dsv4_tier_commit(int device) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "DeepSeek tier commit targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    if (state.tier_layers == 0U) {
+        result.errors.emplace_back("DeepSeek tier is not reserved");
+        return result;
+    }
+    if (const auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for DeepSeek tier commit");
+    }
+    const auto entries =
+        static_cast<std::size_t>(state.tier_layers) * state.tier_experts;
+    for (std::size_t array = 0U; array < 6U; ++array) {
+        if (const auto status = cudaMemcpy(
+                state.tier_device_pointers[array],
+                state.tier_host_pointers[array].data(),
+                entries * sizeof(const unsigned char*), cudaMemcpyHostToDevice);
+            status != cudaSuccess) {
+            return cuda_error(status, "upload DeepSeek tier pointer table");
+        }
+    }
+    state.tier_committed = true;
+    return result;
+}
+
+bool CudaBackend::dsv4_tier_active(int device) const noexcept {
+    const auto found = impl_->devices.find(device);
+    return found != impl_->devices.end() && found->second.tier_installed != 0U &&
+           found->second.tier_committed;
+}
+
+CudaDsv4TierSelection* CudaBackend::dsv4_tier_selection(int device) noexcept {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) return nullptr;
+    return found->second.tier_selection_host;
 }
 
 ValidationResult CudaBackend::collect_deepseek_moe(

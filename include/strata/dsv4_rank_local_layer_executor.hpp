@@ -220,7 +220,7 @@ struct Dsv4RankLocalLayerOptions {
     // present, both ranks skip the triplets it holds -- it computes the whole
     // expert, not a shard -- and rank 0 alone adds its contribution in, so the
     // sum over the six slots is unchanged and nothing is counted twice.
-    Dsv4StaticExpertTier* static_expert_tier{};
+    std::array<Dsv4StaticExpertTier*, 2U> static_expert_tiers{};
     std::uint32_t warmup_count{1U};
 };
 

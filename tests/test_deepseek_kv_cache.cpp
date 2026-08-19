@@ -646,6 +646,52 @@ TEST_CASE("DeepSeek KV device eviction protects in-flight blocks") {
     REQUIRE(backend.stats().synchronization_calls == 3U);
 }
 
+TEST_CASE("DeepSeek KV append refuses a block a retained lease still holds") {
+    // A finished generation leaves its attention page leases open: they are
+    // dropped at the next token's same-layer prepare, which an ended generation
+    // never runs. A multi-turn continuation keeps the sequence, so it skips
+    // reset_sequence and appends the new turn into that same partially filled
+    // block. The runtime must drop the retained lease first; this pins the
+    // guard that makes skipping it a hard failure rather than a silent
+    // mutation of a block a device is still reading.
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{devices.front()};
+    REQUIRE(backend.initialize(selected, false).ok());
+
+    const auto block_bytes = strata::dsv4_kv_block_bytes(
+        strata::Dsv4KvBlockKind::Sliding,
+        strata::dsv4_kv_format(strata::Dsv4KvBlockKind::Sliding), 4U);
+    strata::Dsv4KvCacheConfig config;
+    config.block_rows = 4U;
+    config.sliding_window_rows = 8U;
+    config.host_capacity_bytes = block_bytes * 2U;
+    config.devices = {devices.front()};
+    config.device_capacity_bytes = {block_bytes * 2U};
+    strata::Dsv4KvCache cache(config, &backend);
+    const auto created = cache.create_sequence();
+    REQUIRE(created.ok());
+    const auto values = row(
+        strata::kDeepSeekV4ExecutionContract.head_dim, 1.0F);
+
+    // The turn that just finished, and the lease it left behind.
+    REQUIRE(cache.append(created.value, strata::Dsv4KvBlockKind::Sliding,
+                         0U, 1U, 0U, values).ok());
+    auto retained = cache.acquire_device(
+        created.value, strata::Dsv4KvBlockKind::Sliding, 0U, 0U, 0U);
+    REQUIRE(retained.ok() && retained.value.valid());
+
+    // The next turn appends into the same block and must be refused.
+    REQUIRE(!cache.append(created.value, strata::Dsv4KvBlockKind::Sliding,
+                          0U, 1U, 1U, values).ok());
+
+    // Dropping the retained lease is exactly what unblocks the continuation.
+    retained.value = {};
+    REQUIRE(cache.append(created.value, strata::Dsv4KvBlockKind::Sliding,
+                         0U, 1U, 1U, values).ok());
+}
+
 TEST_CASE("DeepSeek KV truncation restores the state a lookahead started from") {
     // The future-entropy lookahead decodes one speculative token per candidate
     // and then rolls the sequence back. What it rolls back to has to be

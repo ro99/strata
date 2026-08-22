@@ -384,6 +384,65 @@ Matrix load_matrix(const std::string& path,
     return matrix;
 }
 
+std::vector<std::uint16_t> load_bf16_vector(
+    const std::string& path, const strata::SafetensorsShard& shard,
+    std::string_view name, std::size_t elements) {
+    const auto& tensor = find_tensor(shard, name);
+    if (tensor.dtype != strata::SafetensorsDtype::Bf16 ||
+        tensor.shape.size() != 1U || tensor.shape[0] != elements) {
+        throw std::runtime_error("incompatible BF16 vector: " +
+                                 std::string(name));
+    }
+    const auto bytes = read_tensor(path, tensor);
+    std::vector<std::uint16_t> result(elements);
+    std::memcpy(result.data(), bytes.data(), bytes.size());
+    return result;
+}
+
+std::vector<std::uint16_t> normalize_query_rank(
+    std::span<const std::uint16_t> input,
+    std::span<const std::uint16_t> weight, bool exact) {
+    double squared_sum = 0.0;
+    if (exact) {
+        for (const auto bits : input) {
+            const double value = bf16_value(bits);
+            squared_sum += value * value;
+        }
+    } else {
+        std::array<float, kWarp> partial{};
+        for (std::uint32_t lane = 0U; lane < kWarp; ++lane) {
+            for (std::uint32_t index = lane; index < input.size();
+                 index += kWarp) {
+                const float value = bf16_value(input[index]);
+                partial[lane] += value * value;
+            }
+        }
+        for (std::uint32_t offset = kWarp / 2U; offset != 0U; offset >>= 1U) {
+            for (std::uint32_t lane = 0U; lane < offset; ++lane) {
+                partial[lane] += partial[lane + offset];
+            }
+        }
+        squared_sum = partial[0];
+    }
+    const float inverse = 1.0F / std::sqrt(
+        static_cast<float>(squared_sum / input.size()) + 1.0e-6F);
+    std::vector<std::uint16_t> output(input.size());
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        output[index] = bf16_bits(
+            bf16_value(input[index]) * inverse * bf16_value(weight[index]));
+    }
+    return output;
+}
+
+std::uint64_t mismatch_count(std::span<const std::uint16_t> left,
+                             std::span<const std::uint16_t> right) {
+    std::uint64_t result = 0U;
+    for (std::size_t index = 0U; index < left.size(); ++index) {
+        if (left[index] != right[index]) ++result;
+    }
+    return result;
+}
+
 Matrix concatenate(Matrix main, const Matrix& suffix) {
     if (main.k != suffix.k) throw std::runtime_error("fusion K mismatch");
     main.name += "+" + suffix.name;
@@ -720,6 +779,8 @@ int main(int argc, char** argv) {
         const std::string prefix =
             "layers." + std::to_string(options.layer) + ".attn.";
         auto qa = load_matrix(options.shard, shard_result.value, prefix + "wq_a");
+        const auto query_norm = load_bf16_vector(
+            options.shard, shard_result.value, prefix + "q_norm.weight", 1024U);
         auto qb = load_matrix(options.shard, shard_result.value, prefix + "wq_b");
         const bool has_indexer = std::any_of(
             shard_result.value.tensors.begin(), shard_result.value.tensors.end(),
@@ -734,6 +795,16 @@ int main(int argc, char** argv) {
         auto oa = load_matrix(options.shard, shard_result.value, prefix + "wo_a");
         auto ob = load_matrix(options.shard, shard_result.value, prefix + "wo_b");
         const auto qa_result = run_matrix<16, false>(qa, activations.hidden);
+        const auto exact_query_rank = normalize_query_rank(
+            qa_result.candidate_output, query_norm, true);
+        const auto warp_query_rank = normalize_query_rank(
+            qa_result.candidate_output, query_norm, false);
+        const auto exact_fixture_mismatches = mismatch_count(
+            exact_query_rank, activations.query_rank);
+        const auto warp_fixture_mismatches = mismatch_count(
+            warp_query_rank, activations.query_rank);
+        const auto warp_exact_mismatches = mismatch_count(
+            warp_query_rank, exact_query_rank);
         const auto qb_result = run_ungrouped(
             qb, activations.query_rank, options.qb_split);
         const auto kv_result = run_matrix<16, false>(kv, activations.hidden);
@@ -741,7 +812,10 @@ int main(int argc, char** argv) {
             oa, activations.attention, options.oa_split);
         const auto ob_result = run_matrix<8, false>(ob,
             std::span<const std::uint16_t>(oa_result.incumbent_output));
-        const bool accepted = qa_result.no_worse && qb_result.no_worse &&
+        const bool query_norm_accepted = exact_fixture_mismatches == 0U &&
+            warp_fixture_mismatches == 0U && warp_exact_mismatches == 0U;
+        const bool accepted = qa_result.no_worse && query_norm_accepted &&
+            qb_result.no_worse &&
             kv_result.no_worse && oa_result.no_worse && ob_result.no_worse;
         std::ofstream file;
         std::ostream* output = &std::cout;
@@ -759,6 +833,14 @@ int main(int argc, char** argv) {
                 << ",\n  \"q_b_split\":" << options.qb_split
                 << ",\n  \"wo_a_split\":" << options.oa_split
                 << ",\n  \"accepted\":" << (accepted ? "true" : "false")
+                << ",\n  \"query_norm\":{\"accepted\":"
+                << (query_norm_accepted ? "true" : "false")
+                << ",\"exact_fixture_mismatches\":"
+                << exact_fixture_mismatches
+                << ",\"warp_fixture_mismatches\":"
+                << warp_fixture_mismatches
+                << ",\"warp_exact_mismatches\":"
+                << warp_exact_mismatches << "}"
                 << ",\n  \"operations\":{\n";
         print_metrics(*output, "wq_a", qa_result, true);
         print_metrics(*output, has_indexer ? "wq_b+indexer.wq_b" : "wq_b",

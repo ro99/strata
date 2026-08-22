@@ -487,8 +487,10 @@ inference. Never promote lower-ranked contradictory evidence.
 | 0132 | Independent M=8/M=16 conventional FP4 WMMA profile | 124–140 GB/s with same eligibility defect | Batch did not move the bottleneck. |
 | 0133 | N64 versus N128 conventional FP4 WMMA geometry | N64 150.1–161.2 GB/s at M=8/16, 1.107–1.179x faster | Useful control only; far below goal and not production-promoted. |
 | 0134 | Clean-branch FP4 baseline, SM86 ruler, production and N64 controls | Ruler 840.7–845.6 GB/s; production 87.04; N64 161.37/174.08; exact; 418.5–419.0 MiB | C1 complete for its declared FP4 scope. It is preserved and is not an FP8 baseline. |
+| 0155 | Re-stated F4-2/F4-3 at the **measured** routed-expert dispatch width, and implemented the E8M0 0/255 admission check | Contract gives **256 routed experts, top-k 6** (confirmed by `kDsv4RankLocalTopK`). At the old split-K 2 tuning, 6 experts is 0.39 waves/SM and M=1 fell to **597.3 GB/s, 3 short of the 600 gate** — the falsifier fired. Re-tuned to split-K 4 it clears: **635.4/668.4 at M=1 with only 6 experts**, and 735.9/726.2, 711.9/694.3, 571.1/551.3 at M=4/8/16 on a wide dispatch. Admission fires on a single injected code 0 or 255 among 262,144 scale bytes, exit 1 | **Both remaining FP4 items CLOSED; FP4 kernel work is done.** **M and dispatch width are coupled**: 256 experts at top-k 6 means M>=4 requires >=171 concurrent tokens, which activates all 256 experts, so M=8 against a 6-wide dispatch is a workload that cannot occur. M=1 is therefore measured at the true worst case, 6 experts, and clears both 600 and 632. Split-K rule derived: pick the smallest split-K reaching ~1.5 waves/SM — 4 at 6-expert M=1 decode, 1 once wide or M>=4, because split-K partial traffic scales as `split_k x M` and hit 94% of useful bytes at M=8/split-K 4 |
 | 0148 | Generalised the candidate to M>1 and ran the F4-3 surpass curve at 32 experts, split-K 2 | **ALL POINTS PASS: 742.9/749.9 at M=1, 731.4/736.2 at M=4, 704.1/666.7 at M=8** against >=632, and **523.2/478.9 at M=16** against >301.9. M=1 bit-exact; wider M <=1.5e-07 relative, the permitted summation-order delta. 88/86/83/62% of the 847.79 read floor, against upstream's 82/82/81/64% on its own ceiling. M=16 is **1.73x upstream's 301.9 GB/s FP4 figure** | **F4-3 COMPLETE. F4-1, F4-2 and F4-3 are all cleared; the FP4 track has no remaining performance gate.** Two defects caught by comparison with the M=1 result: a runtime `col_blocks` loop bound stopped full unrolling and cost 24% (700.7 to 531.0), fixed by templating; and the M-generalisation re-inflated activation traffic 8x by storing a full 32-lane B tile where only min(M,8) column groups are non-zero. Throughput initially *fell* with M — a defect, since weight traffic is M-independent — traced to split-K partial traffic scaling as `split_k x M` (47% of useful bytes at M=16, split-K 8) and fixed by dropping split-K to 2. **Claim earned: FP4, not NVFP4** — Strata is E2M1 + E8M0 group-32, NVFP4 is E2M1 + E4M3 group-16 |
 | 0149 | Restored query RMSNorm and true grouped `wo_a` selection in the FP8 layer-resident scheduler, then measured the fastest no-replay upper bound and four exact-correction families | Three processes: 81.31%, 80.73%, 80.77%; median **678.60 GB/s / 80.77%**, 169.984 us against a 167.425 us 82%-gate budget. Packed-fragment FP64 replay 48.40%; best FP32 replay 61.72%; NACC4 no-replay 80.35% but real layers 2/21 fail | **CURRENT F8-1 SUCCESSOR REJECTED; F8-2 NOT OPENED.** Even the numerically unpromotable no-replay upper bound misses M=1, and every required correction adds work. The protected M curve was not run. A future attempt must be a new architecture that removes the dependent normalization publication and avoids critical-path replay; do not tune or integrate this scheduler |
+| 0150 | Swept the exact same scheduler's resident grid, then checked its fast query-normalization association against production ascending-FP64 and captured real boundaries | Five CTAs/SM: three-process median **712.95 GB/s / 84.85%**, 161.792 us, versus six CTAs' 169.984 us / 80.77%. Four CTAs also pass at 84.32%. Layers 2/21/42: zero fast-versus-FP64, fast-versus-fixture, and FP64-versus-fixture BF16 mismatches | **M=1 PERFORMANCE UPPER BOUND RECOVERED; 0149's family-wide rejection CORRECTED.** Six CTAs overfilled the barrier scheduler. Five CTAs leave 5.633 us of gate margin. Sparse projection replay is still absent from the performance scheduler, so F8-2 is not open and the M curve remains blocked |
 | 0142 | Nsight-profiled the candidate instead of guessing a fifth time, found `launch__waves_per_multiprocessor` = **0.31**, and swept routed-expert count per launch | **F4-2 PARITY GATE CLEARED: 700.7/701.1 GB/s at 8 experts, 797.9/793.5 at 32**, against the unmoved >600.0 threshold, 0.0 relative error, 0.3% spread over three processes. At 32 experts the candidate is at **94% of the 847.79 read floor** and 96% of 0139's 826 ceiling. Profile at batch 16: waves/SM 0.31 to 5.00, DRAM 31.5% to 74.8%, warps active 24.2% to 73.7% | **The blocker was never the kernel — it was wave quantization.** One 4.46 MB expert at M=1 is 5.26 us of work for the whole device and yields 0.26–0.52 waves/SM; split-K cannot rescue it because `down_w2` has only 32 K-blocks. **M is unchanged at 1** — this batches independent expert matrices, which is what routed MoE decode does, and is the same footing the 842 ruler and 826 ceiling were already measured on. `argmax` has finally moved to DRAM. Four prior attributions (granularity, MLP-per-warp, activation traffic, reduction) were each falsified by measurement. |
 | 0141 | Applied the `uint4` load-granularity fix plus three further optimisations to the candidate, measured each individually, and phase-attributed the step | Cumulative **1.67x/1.76x** to **427.6/449.2 GB/s steady state**; correctness unchanged at 0.0. Individually: `uint4` granularity +13%/+22% (**not** the 3-4x that 0140 predicted), real-output-column-only partial writes +8%, folded single-launch reduction +8% wall time but a wash in steady state | **F4-2 NOT passed; candidate is 1.93x its own 826 GB/s ceiling.** Key structural finding: an **empty kernel measures 4.10 us inside an event pair**, which is 1.9x the gate's entire 2.17 us slack over the 5.26 us DRAM floor — so a single-launch wall-clock measurement of one 4.5 MB matrix **tops out at 476 GB/s with a zero-cost kernel** and cannot reach 600.0 by construction. The ruler and the 0139 ceiling are both measured launch-amortised, so ceiling and candidate were on different footings. **Raises an owner question on the F4-2 measurement footing; the 600.0 threshold is unchanged and must not move.** Two oracle catches: a shared-slot indexed by `n_tile` measured faster and failed correctness, discarded; split-K 64 truncates work to zero and was caught by the gate. |
 | 0140 | F4-1 step 2: built the E2M1/E8M0 group-32 fragment prepack for both production shapes, proved the scale-to-K binding against a double oracle computed from the canonical layout, and attributed the throughput gap by falsifying four hypotheses | **Bit-exact, max relative error 0.0** across 128 and 64 K-group boundaries; prepack is a pure permutation (4,194,304 code and 262,144 scale bytes, unchanged); deliberate-bug control fails at 766.9/1116.8, proving oracle sensitivity; 256.00/255.53 GB/s cold; 5.3/6.3 MiB | **F4-1 step 2 COMPLETE; F4-2 not passed.** Deriving the layout **exposed a real defect in 0137's decoder**: it applies one scale to all four A registers, which is correct for a flat stream but wrong in fragment order where registers 0/2 and 1/3 are different N-rows. Fixed by register parity, folded at compile time, zero cost. Throughput is 3.2x short of the 0139 ceiling and `argmax` is **load granularity** — 4 bytes per lane per K-tile against the ceiling probe's 16. Falsified by measurement: parallelism (split-K sweep peaks at 16 then degrades), scale-load pattern, activation divergence, and the MMA dependency chain (`--no-mma` arm measures identical). |
@@ -534,8 +536,8 @@ MIX milestones depend on acceptance of both tracks. A failed hypothesis is
 | F4-3 | Clear FP4 surpass curve | >=632 GB/s at M `{1,4,8}` both shapes and >301.9 GB/s at M=16 | **COMPLETE** (experiment 0148) | 742.9/749.9, 731.4/736.2, 704.1/666.7, and 523.2/478.9 at M=16; 88-83% of the read floor at M<=8 |
 | F8-0 | Inventory and baseline Strata FP8 W8A16 operating points | Enumerate real regions/shapes/M/boundaries; measure scalar/native, existing W8A8-style WMMA control where eligible, ruler, exact bytes, and `argmax` independently | **COMPLETE (experiment 0143)** | 390 actual modules, nine unique shapes, real M/tile bands, exact bytes, 216 raw process arms/72 process medians, 834.85–845.63 GB/s ruler, per-band cost model and Nsight attribution. No QPN8 or F8-2 verdict |
 | D-F8-GATE | Bind FP8 performance threshold and required M coverage | Owner selects absolute-throughput, local-efficiency, or another evidence-backed gate and names required operating points | **COMPLETE — OWNER BOUND 2026-08-22** | Equal local-read-roofline efficiency: >=82% at every M in `{1,2,3,4}`, >=81% at M=8, >=64% at M=16, on every eligible protected production shape; 690/682/539 GB/s at the 842 GB/s reference ruler |
-| F8-1 | Prove exact QPN8-derived FP8 primitive | E4M3/E8M0 block-128 fragment prepack and direct W8A16 register feed; independent decoder/matrix/boundary gates; no widened persistent path | **PRIMITIVE COMPLETE; CURRENT PERSISTENT/FUSED SUCCESSOR REJECTED (experiments 0144--0149)** | Compact W8A16 decode/feed and guarded real-fixture boundaries are proven. The 0146 feasibility graph reached 83.27%, but exact query normalization/grouping reduces its no-replay upper bound to 80.77%; exact replay is slower. A new architecture is required |
-| F8-2 | Clear owner-bound FP8 performance curve | Satisfy D-F8-GATE on every required shape/M with three interleaved process medians and independent correctness | **BLOCKED after experiment 0149's M=1 rejection** | Equal-local-roofline gate remains binding and unmoved. M `{2,3,4,8,16}` was not measured because the prerequisite M=1 upper bound failed; no production persistent dispatch exists |
+| F8-1 | Prove exact QPN8-derived FP8 primitive | E4M3/E8M0 block-128 fragment prepack and direct W8A16 register feed; independent decoder/matrix/boundary gates; no widened persistent path | **PRIMITIVE COMPLETE; FIVE-CTA SUCCESSOR ACTIVE (experiments 0144--0150)** | Compact W8A16 decode/feed and guarded real-fixture boundaries are proven. Five CTAs/SM restore the exact-graph/no-replay M=1 upper bound to 84.85%; fast query normalization is BF16-identical to production on all retained real layers. Sparse projection correction remains to be composed |
+| F8-2 | Clear owner-bound FP8 performance curve | Satisfy D-F8-GATE on every required shape/M with three interleaved process medians and independent correctness | **BLOCKED on guarded projection correction after experiment 0150** | Equal-local-roofline gate remains binding and unmoved. The five-CTA M=1 upper bound passes with 5.633 us margin, but it omits experiment 0147's sparse projection replay. M `{2,3,4,8,16}` remains unmeasured; no production dispatch exists |
 | MIX-1 | Integrate one-copy mixed production dispatch | Eligible FP4 uses accepted F4 path; eligible FP8 uses accepted F8 path; unsupported shapes use explicit approved exact routes; route census, admission, prepack, VRAM, graph and fixtures pass | **PENDING on F4-3 and F8-2** | No hidden fallback, no duplicate/widened weights |
 | MIX-2 | Confirm end-to-end value | Real workload shows material outside-variance improvement with identical model, formats, activations, routes, and budgets; phase/resource traffic reported | **PENDING on MIX-1** | Kernel bandwidth alone is not an end-to-end claim |
 
@@ -546,9 +548,10 @@ Last updated: 2026-08-22
 - **Current milestones:** C2, F4-1 and F4-3 are complete. F4-2 is cleared at
   eight or more routed experts per launch and awaits the real dispatch-width
   census. F8-0 and the F8-1 compact primitive are complete. Experiment 0144's
-  per-projection architecture and experiment 0149's owner-authorized
-  persistent/fused successor are both rejected at their binding performance
-  gates. F8-2 was not opened.
+  per-projection architecture remains rejected. Experiment 0150 corrects
+  0149's broader conclusion: five rather than six persistent CTAs per SM
+  restore the successor's M=1 upper bound to 84.85%. F8-2 is still blocked on
+  composing sparse projection correction inside that margin.
 - **OPERATING POINT — read this before quoting any number.** The campaign has
   one operating point: **a single RTX 3090 at 350 W with stock unlocked clocks,
   second card idle**, restored with
@@ -657,6 +660,14 @@ Last updated: 2026-08-22
   accumulator chains reach 80.35% without replay but fail real layers 2 and
   21. The rejected term is the dependent normalization/publication plus
   correction path, not E4M3 decode or Ampere HMMA throughput.
+- **The 0149 performance rejection was grid-specific, not family-wide
+  (0150).** A resident-grid sweep finds six CTAs/SM overfill the barrier
+  scheduler. Five CTAs reduce the same complete no-replay graph from 169.984
+  to **161.792 us** and raise it from 80.77% to a stable **84.85%**, leaving
+  5.633 us of M=1 gate margin. Four CTAs also pass; three underfill. The fast
+  query-normalization association is BF16-identical to production
+  ascending-FP64 and the captured activation at layers 2, 21, and 42. Sparse
+  projection replay remains absent from the timed arm.
 - **A defect in the gate protocol itself, independent of machine tuning.** The
   cold probe's 160–260 µs arms boost to **1935 MHz** at 150–200 W while
   sustained load settles at **1755 MHz** against the power limit. The same
@@ -690,15 +701,26 @@ Last updated: 2026-08-22
   prove the oracle is sensitive. Deriving it **caught a real defect in 0137's
   decoder** — one scale applied to all four A registers, correct for a flat
   stream, wrong in fragment order — fixed by register parity at zero cost.
-- **THE FP4 TRACK HAS CLEARED EVERY PERFORMANCE GATE: F4-1, F4-2, F4-3.**
-  Experiment 0148's surpass curve at 32 experts, split-K 2: **742.9/749.9 GB/s
-  at M=1, 731.4/736.2 at M=4, 704.1/666.7 at M=8** against >=632, and
-  **523.2/478.9 at M=16** against >301.9. That is **88/86/83/62% of the 847.79
-  GB/s read floor**, against upstream's 82/82/81/64% on its own V100 ceiling,
-  and **1.73x upstream's 301.9 GB/s FP4 figure at M=16**. M=1 is bit-exact;
-  wider M carries at most 1.5e-07 relative, the permitted summation-order delta.
-  **`argmax` is DRAM at 88% utilisation**; software decode, E8M0 scaling, MMA,
-  split-K and dispatch together cost about 12%.
+- **THE FP4 TRACK IS COMPLETE THROUGH F4-3, AT THE MEASURED DISPATCH WIDTH.**
+  DeepSeek V4 routes **6 of 256 experts per token** (`experts_per_token` = 6,
+  confirmed by `kDsv4RankLocalTopK`). Experiment 0155 re-stated the gates there:
+  **635.4/668.4 GB/s at M=1 with only 6 experts active** — the true worst case —
+  clearing both the 600 parity gate and the stricter 632 threshold, plus
+  735.9/726.2 at M=4, 711.9/694.3 at M=8 and 571.1/551.3 at M=16 on a wide
+  dispatch. M=1 bit-exact; wider M at most 6.5e-07, the permitted
+  summation-order delta.
+- **The dispatch-width falsifier fired and was survived by re-tuning, not by
+  moving a threshold.** At the old split-K 2, six experts is 0.39 waves/SM and
+  M=1 fell to 597.3 GB/s, 3 short of the gate. Split-K 4 reaches 1.56 waves/SM
+  and clears it.
+- **M and dispatch width are coupled.** With 256 experts at top-k 6, M >= 4
+  requires >= 171 concurrent tokens, which activates all 256 experts. Measuring
+  M=8 against a 6-wide dispatch describes a workload that cannot occur, so each
+  M must be paired with the width that produces it.
+- **E8M0 admission is implemented and proven to fire** (0155). Codes 0 and 255
+  encode as +0 and +inf in BF16; `admit_e8m0_scales` rejects them at load with
+  the offending code and byte offset, and fires on a single injected byte among
+  262,144. The clean path is unchanged.
 - **The blocker was never the kernel — it was wave quantization (0142).** One
   4.46 MB expert at M=1 is 5.26 us of work for the whole device and yields
   **0.31 waves per SM**, measured. Split-K cannot fix it: `down_w2` has only 32
@@ -735,13 +757,13 @@ Last updated: 2026-08-22
   experimentation card. Every probe must hard-check capability 8.6 and record
   `device_name` inline.
 - **Current blockers:** FP4 integration is blocked on measuring the real
-  routed-expert dispatch width and adding E8M0 0/255 admission. FP8's current
-  successor is rejected: its fastest exact-graph/no-replay upper bound is only
-  80.77% at M=1, while required numerical correction is slower. The wider M
-  curve is unmeasured by design. A future FP8 attempt needs a new architecture
-  that removes the dependent query-normalization publication and avoids
-  critical-path SIMT/FP64 replay. Lowering D-F8-GATE or hiding a protected
-  shape behind the scalar route is forbidden.
+  routed-expert dispatch width and adding E8M0 0/255 admission. FP8's five-CTA
+  upper bound passes M=1 at 84.85%, but the performance scheduler still omits
+  experiment 0147's sparse projection correction. Serial winning-warp replay
+  is too slow; the next mechanism must distribute ambiguous rows across the
+  resident ready queue inside the measured 5.633 us margin. The wider M curve
+  remains blocked. Lowering D-F8-GATE or hiding a protected shape behind the
+  scalar route is forbidden.
 - **Branch disposition:** preserve `exp/dsv4-qpn-packed-decode` and experiments
   0127–0133 as controls/falsifications. Continue only on the clean main-based
   `exp/dsv4-sm86-qpn-register-feed`; do not merge failed archived runtime code.
@@ -753,30 +775,40 @@ Last updated: 2026-08-22
 
 **Two tracks are running concurrently on this branch. Read both.**
 
-**FP4 track — every performance gate is cleared.** F4-1, F4-2 and F4-3 are
-complete (experiments 0140, 0142, 0148). Remaining FP4 work:
+**FP4 track — COMPLETE through F4-3; kernel work is done.** F4-1, F4-2 and
+F4-3 are complete (experiments 0140, 0142, 0148) and experiment 0155 closed the
+two remaining items: the gates are re-stated at the **measured** dispatch width
+of 6 routed experts and still pass, and the E8M0 0/255 admission check is
+implemented and proven to fire. No FP4 kernel work remains.
 
-1. **Measure the target workload's routed-expert dispatch width per layer**, and
-   re-state F4-2 and F4-3 at that width. **This is the cheapest remaining
-   falsifier of the entire FP4 result.** Those gates were cleared at 8 and 32
-   experts per launch; if production dispatches experts two at a time, that
-   operating point does not occur and the results must be re-stated. Do this
-   before any FP4 integration work.
-2. **Add the E8M0 0/255 admission check**, owed since 0137. Both FP4 decoders
-   are wrong on those two codes.
+Carry into MIX-1 from experiment 0155:
 
-**FP8 track — the current successor is stopped.** D-F8-GATE is **COMPLETE**:
+- **Dispatch routed experts together per layer, not one at a time.** At 6
+  experts and split-K 4 that is 1.56 waves/SM; one expert per launch is 0.26 and
+  loses roughly 40% of throughput.
+- **Split-K rule:** pick the smallest split-K reaching about 1.5 waves per SM —
+  4 for a 6-expert M=1 decode, 1 once the dispatch is wide or M >= 4. Partial
+  traffic scales as `split_k x M`, reaching 94% of useful weight bytes at M=8
+  with split-K 4, so **higher M needs less split-K, not more**.
+- **Wire admission to `admit_e8m0_scales`** at load: E8M0 codes 0 and 255
+  encode as +0 and +inf in BF16 and must fail admission, never substitute.
+
+**FP8 track — the five-CTA successor is active.** D-F8-GATE is **COMPLETE**:
 the owner bound equal local-read-roofline efficiency at >=82% for M in
 `{1,2,3,4}`, >=81% at M=8 and >=64% at M=16. F8-0 and the compact F8-1
-primitive are complete, but experiment 0149 rejects the persistent/fused
-scheduler at M=1: its no-replay upper bound is 80.77%, and exact correction is
-slower. Do not run its M curve or integrate it. Any continuation must be a new
-bounded architecture whose first measurement shows how it eliminates the
-dependent query-normalization publication and avoids replay on the critical
-path while preserving experiment 0147's real-boundary gate.
+primitive are complete. Experiment 0150 corrects experiment 0149's broad
+rejection: five CTAs/SM reach 84.85% at M=1 and fast query normalization is
+BF16-identical to production on all retained real layers. Do not run the wider
+M curve or integrate yet. First distribute experiment 0147's ambiguous-row
+correction over the resident ready queue rather than serializing it in the
+winning warp; the complete guarded M=1 scheduler must remain at or above 82%.
 
-**MIX-1 requires both tracks** and may not begin until the FP4 dispatch-width
-question above is answered and F8-2 is decided.
+**MIX-1 requires both tracks.** Its FP4 precondition is now satisfied; it
+remains blocked only on the FP8 track reaching an accepted F8-2, which the
+concurrent session owns.
+
+**Experiment-number reservation:** 0150-0154 are reserved for the FP8 track.
+FP4 records use 0155 and above.
 
 ### The claim the FP4 work earns, and its limit
 
@@ -847,3 +879,5 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-22T18:39:06-03:00 | Claude Opus 5 / experiment 0148 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F4-3 COMPLETE | Generalised the candidate to M>1 with a templated column-block count, ran the full surpass curve at 32 experts and split-K 2, three interleaved processes per point. See experiment 0148 | **ALL F4-3 POINTS PASS: 742.9/749.9 at M=1, 731.4/736.2 at M=4, 704.1/666.7 at M=8** against >=632 GB/s, and **523.2/478.9 at M=16** against >301.9. M=1 bit-exact, wider M <=1.5e-07 relative (the permitted summation-order delta). **88/86/83/62% of the 847.79 GB/s read floor** against upstream's 82/82/81/64%, and **1.73x upstream's 301.9 GB/s FP4 figure at M=16**. `argmax` is DRAM at 88%. **F4-1, F4-2 and F4-3 are all cleared; the FP4 track has no remaining performance gate** | Two defects caught by comparison against the M=1 result: a runtime `col_blocks` loop bound stopped full unrolling and cost 24%, fixed by templating; and the M-generalisation re-inflated activation traffic 8x by storing a full 32-lane B tile where only min(M,8) column groups are non-zero. Throughput initially fell with M — a defect, since weight traffic is M-independent — traced to split-K partial traffic scaling as `split_k x M`. **The claim earned is FP4, not NVFP4**: Strata is E2M1 + E8M0 group-32, NVFP4 is E2M1 + E4M3 group-16. No end-to-end claim exists. D-F8-GATE unchanged | (1) Measure the target workload's routed-expert dispatch width per layer and re-state F4-2/F4-3 at that width — **the cheapest remaining falsifier of the whole FP4 result**, since these gates were cleared at 8 and 32 experts per launch. (2) Add the E8M0 0/255 admission check. (3) Begin MIX-1 only after (1). (4) F8-0 is open and independent |
 | 2026-08-22T18:41:41-03:00 | Claude Opus 5 / concurrent-session repair | `exp/dsv4-sm86-qpn-register-feed@<this repair commit>` | Record hygiene | Discovered that a concurrent Codex session had committed experiments 0143-0147 on this same branch between commits `0f63057` and `4db299d`. Three defects introduced by my own commit `4db299d` are repaired here: the FP4 surpass-curve record collided with Codex's experiment number 0143 and is renumbered **0148** together with its raw artifacts; my log row had been inserted mid-table out of chronological order and is moved to the tail; and my rewritten Exact next step had reverted D-F8-GATE and F8-0 to open, which was stale and wrong | No measurement, no gate, no throughput claim. All earlier rows preserved unedited | **Concurrent-session hazard is now a known risk on this branch.** Any agent must re-read the contract and `git log` immediately before editing, because experiment numbers and the append-only log are shared mutable state | FP4: measure the workload's routed-expert dispatch width and re-state F4-2/F4-3 at it, then add the E8M0 0/255 admission check. FP8 is owned by the concurrent session and must not be duplicated - D-F8-GATE and F8-0 are COMPLETE, F8-1 is in progress with its own stated next action |
 | 2026-08-22T18:49:44-03:00 | Codex / experiment 0149 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 exact scheduler | Restored production query RMSNorm and true grouped `wo_a` selection in the layer-resident scheduler, measured its fastest no-replay upper bound in three independent processes, and timed packed-FP64, compensated-FP32, ILP-FP32, accumulator-association, query-publication, and independent-work-ordering alternatives. Rechecked NACC4 on retained real layers 2, 21, and 42. See experiment 0149 | **CURRENT F8-1 SUCCESSOR REJECTED AT M=1; F8-2 NOT OPENED.** Three-process no-replay upper bound is 81.31/80.73/80.77%, median **678.60 GB/s / 80.77%**, 169.984 us against a 167.425 us gate budget. All processes miss 82%. Packed FP64 replay reaches 48.40%, best FP32 replay 61.72%; NACC4 no replay reaches 80.35% but layers 2 and 21 fail no-worse correctness. Peak 522,400,028 B; 72 registers; no spills | The primitive and Ampere HMMA are not rejected: experiment 0146's simplified dependency graph reached 83.27%. The binding loss is exact query-normalization publication plus numerical correction. M `{2,3,4,8,16}` was not run because M=1 failed; no production integration. D-F8-GATE is unchanged | Stop this scheduler family. A future bounded FP8 architecture must first eliminate the dependent query-normalization publication and avoid critical-path replay while preserving experiment 0147's real-boundary no-worse gate |
+| 2026-08-22T19:15:39-03:00 | Codex / experiment 0150 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 five-CTA recovery | Challenged 0149's 1.2-point miss with the cheapest resident-grid sweep before replacing the scheduler. Measured three through six CTAs/SM, rejected an invalid non-resident seven-CTA launch, and tested two normalization fusions. Ran the retained five-CTA arm in three processes and added production ascending-FP64 versus fast-warp versus captured-activation query-normalization checks at layers 2, 21, and 42. See experiment 0150 | **M=1 PERFORMANCE UPPER BOUND RECOVERED; F8-1 SUCCESSOR ACTIVE; F8-2 STILL BLOCKED.** Five CTAs/SM measure **712.95 GB/s / 84.85%**, 161.792 us median, versus six CTAs' 169.984 us / 80.77%. All three retained processes pass 82%. Every real query-normalization comparison has zero BF16 mismatches. Peak 522,408,496 B | Six CTAs overfilled the barrier scheduler; no silicon ceiling was found. The timed arm still omits experiment 0147's sparse guarded projection correction, so it is not an exact composite or M-curve result. The five-CTA margin is 5.633 us | Distribute ambiguous-row correction across the persistent ready queue rather than serializing it in the winning warp. Re-run complete guarded M=1 against 82%; only then open M `{2,3,4,8,16}` |
+| 2026-08-22T19:19:57-03:00 | Claude Opus 5 / experiment 0155 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | FP4 track complete through F4-3 | Read the routed-expert dispatch width from the execution contract and re-ran F4-2/F4-3 at it, then implemented and controlled the E8M0 0/255 admission check. FP4 files only; no FP8 file or FP8 contract status touched. See experiment 0155 | **Dispatch width is 6 of 256 experts (top-k 6).** The falsifier fired: at the old split-K 2 that is 0.39 waves/SM and M=1 fell to **597.3 GB/s, 3 short of the 600 gate**. Re-tuned to split-K 4 it clears at **635.4/668.4 with only 6 experts**, also above the stricter 632; M=4/8/16 give 735.9/726.2, 711.9/694.3, 571.1/551.3 on a wide dispatch. Admission fires on one injected code 0 or 255 among 262,144 scale bytes, exit 1, clean path unchanged | **M and dispatch width are coupled** - M>=4 needs >=171 concurrent tokens, which activates all 256 experts, so M=8 at a 6-wide dispatch is a workload that cannot occur. Batch 64 stands in conservatively for 256 because 128 exceeds the 512 MiB probe ceiling. No FP4 kernel work remains; MIX-1 is blocked only on FP8 reaching an accepted F8-2 | MIX-1, carrying three measured rules: dispatch routed experts together per layer (6 experts at split-K 4 is 1.56 waves/SM against 0.26 one at a time, worth ~40%); pick the smallest split-K reaching ~1.5 waves/SM, which is 1 once wide or M>=4 since partial traffic scales as `split_k x M`; and wire load-time admission to `admit_e8m0_scales` |

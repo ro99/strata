@@ -13,6 +13,8 @@
 //
 // Milestone F4-1, FP4 track only. Experimentation operating point.
 
+#include <strata/safetensors.hpp>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -72,6 +74,78 @@ struct Shape {
 bool g_break_scale_binding = false;
 bool g_no_mma = false;
 int g_inject_bad_scale = 0;
+std::string g_checkpoint_shard;   // real DeepSeek V4 shard, closes the real-weights gate
+std::string g_tensor_prefix;      // e.g. layers.0.ffn.experts.0.w1
+
+// Load a real expert's packed E2M1 codes and E8M0 scales straight from the
+// checkpoint, so the measured path is exercised on production bytes rather than
+// synthetic ones. Returns false when no checkpoint was requested.
+bool load_real_expert(const Shape& shape, std::vector<std::uint8_t>& codes,
+                      std::vector<std::uint8_t>& scales) {
+    if (g_checkpoint_shard.empty()) return false;
+    const auto shard = strata::load_safetensors_shard(g_checkpoint_shard);
+    if (!shard.ok())
+        throw std::runtime_error("cannot read checkpoint shard: " +
+                                 g_checkpoint_shard + ": " +
+                                 (shard.errors.empty() ? "" : shard.errors[0]));
+    const auto find = [&](const std::string& name) {
+        for (const auto& t : shard.value.tensors) {
+            if (t.name == name) return &t;
+        }
+        throw std::runtime_error("tensor not in shard: " + name);
+    };
+    // gate_up_w1 is the checkpoint's w1, down_w2 is w2. Both are exactly
+    // 4,194,304 packed bytes, so a byte-count check alone cannot tell them
+    // apart - the declared shape must be checked too.
+    const std::string suffix =
+        (std::string_view(shape.name) == "down_w2") ? ".w2" : ".w1";
+    const std::string weight_name = g_tensor_prefix + suffix + ".weight";
+    const std::string scale_name = g_tensor_prefix + suffix + ".scale";
+    const auto* weight = find(weight_name);
+    const auto* scale = find(scale_name);
+
+    // The checkpoint must actually carry the declared FP4 contract: packed
+    // E2M1 at two codes per byte, and one E8M0 byte per group of 32 along K.
+    if (weight->dtype != strata::SafetensorsDtype::I8)
+        throw std::runtime_error(weight_name + " is not I8-packed E2M1");
+    if (scale->dtype != strata::SafetensorsDtype::F8E8M0)
+        throw std::runtime_error(scale_name + " is not E8M0");
+    const std::uint64_t want_codes =
+        static_cast<std::uint64_t>(shape.n) * (shape.k / 2U);
+    const std::uint64_t want_scales =
+        static_cast<std::uint64_t>(shape.n) * (shape.k / kGroup);
+    if (weight->bytes() != want_codes || scale->bytes() != want_scales)
+        throw std::runtime_error(weight_name + " byte count does not match " +
+                                 std::string(shape.name));
+    // Shape, not just size: [N, K/2] codes and [N, K/32] scales.
+    if (weight->shape.size() != 2U || weight->shape[0] != shape.n ||
+        weight->shape[1] != shape.k / 2U)
+        throw std::runtime_error(weight_name + " shape is not [" +
+                                 std::to_string(shape.n) + "," +
+                                 std::to_string(shape.k / 2U) + "]");
+    if (scale->shape.size() != 2U || scale->shape[0] != shape.n ||
+        scale->shape[1] != shape.k / kGroup)
+        throw std::runtime_error(scale_name + " shape is not [" +
+                                 std::to_string(shape.n) + "," +
+                                 std::to_string(shape.k / kGroup) + "]");
+
+    const auto wbytes = strata::read_safetensors_tensor(
+        g_checkpoint_shard, *weight, want_codes);
+    const auto sbytes = strata::read_safetensors_tensor(
+        g_checkpoint_shard, *scale, want_scales);
+    if (!wbytes.ok() || !sbytes.ok())
+        throw std::runtime_error("failed reading real expert tensors");
+    codes.resize(static_cast<std::size_t>(shape.n) * shape.k);
+    for (std::size_t byte = 0U; byte < want_codes; ++byte) {
+        const auto packed = static_cast<std::uint8_t>(wbytes.value[byte]);
+        codes[byte * 2U] = static_cast<std::uint8_t>(packed & 0x0FU);
+        codes[byte * 2U + 1U] = static_cast<std::uint8_t>(packed >> 4U);
+    }
+    scales.assign(reinterpret_cast<const std::uint8_t*>(sbytes.value.data()),
+                  reinterpret_cast<const std::uint8_t*>(sbytes.value.data()) +
+                      want_scales);
+    return true;
+}
 bool g_split_reduce = false;
 // A single 4.46 MB matrix at M=1 cannot fill an RTX 3090: it yields 0.31 waves
 // per SM, measured. Production MoE decode dispatches many routed experts per
@@ -437,6 +511,7 @@ struct Result {
     std::uint64_t device_bytes{0U};
     double max_absolute{0.0}, max_relative{0.0};
     ScaleAdmission admission{};
+    bool real_weights{false};
     double output_max_abs{0.0}, oracle_max_abs{0.0};
     std::uint32_t nonzero_outputs{0U};
     std::uint32_t k_groups_crossed{0U};
@@ -461,9 +536,13 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     std::vector<std::uint8_t> canon_scales(r.scale_bytes);
     std::vector<float> activation(static_cast<std::size_t>(k) * g_m);
     std::uint32_t state = 0x5EED'1234U ^ n ^ (k << 7U);
-    for (auto& c : canon_codes) c = static_cast<std::uint8_t>(xorshift(state) & 0x0FU);
-    for (auto& s : canon_scales)
-        s = static_cast<std::uint8_t>(120U + xorshift(state) % 15U);
+    r.real_weights = load_real_expert(shape, canon_codes, canon_scales);
+    if (!r.real_weights) {
+        for (auto& c : canon_codes)
+            c = static_cast<std::uint8_t>(xorshift(state) & 0x0FU);
+        for (auto& s : canon_scales)
+            s = static_cast<std::uint8_t>(120U + xorshift(state) % 15U);
+    }
     if (g_inject_bad_scale != 0) {
         // Proves the admission check can fail. A check that never fires its
         // own control is not a check.
@@ -803,6 +882,10 @@ int main(int argc, char** argv) {
             else if (f == "--output" && i + 1 < argc) output_path = argv[++i];
             else if (f == "--break-scale-binding") g_break_scale_binding = true;
             else if (f == "--no-mma") g_no_mma = true;
+            else if (f == "--checkpoint" && i + 1 < argc)
+                g_checkpoint_shard = argv[++i];
+            else if (f == "--tensor" && i + 1 < argc)
+                g_tensor_prefix = argv[++i];
             else if (f == "--inject-scale-nan") g_inject_bad_scale = 1;
             else if (f == "--inject-scale-zero") g_inject_bad_scale = -1;
             else if (f == "--split-reduce") g_split_reduce = true;
@@ -854,6 +937,8 @@ int main(int argc, char** argv) {
                  << ", \"device_bytes\": " << r.device_bytes
                  << ", \"prepack_seconds\": " << std::setprecision(3)
                  << r.prepack_seconds
+                 << ", \"real_weights\": "
+                 << (r.real_weights ? "true" : "false")
                  << ", \"e8m0_admitted\": "
                  << (r.admission.admitted() ? "true" : "false")
                  << ", \"e8m0_inadmissible\": " << r.admission.inadmissible

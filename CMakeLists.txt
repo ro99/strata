@@ -428,7 +428,7 @@ if(STRATA_HAS_CUDA)
     add_executable(strata-dsv4-sm86-fp4-prepack-probe
         apps/strata_dsv4_sm86_fp4_prepack_probe.cu)
     target_link_libraries(strata-dsv4-sm86-fp4-prepack-probe PRIVATE
-        CUDA::cudart)
+        strata_platform CUDA::cudart)
     set_property(TARGET strata-dsv4-sm86-fp4-prepack-probe PROPERTY
         CUDA_ARCHITECTURES 86)
     set_property(TARGET strata-dsv4-sm86-fp4-prepack-probe PROPERTY

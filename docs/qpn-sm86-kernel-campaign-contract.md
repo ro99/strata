@@ -271,8 +271,8 @@ is `REJECTED`, recorded, and replaced only by a newly justified hypothesis.
 | ID | Milestone | Gate | Status | Evidence / note |
 |---|---|---|---|---|
 | C0 | Freeze correct campaign understanding | Contract records Ampere target, exact goal, sources, corrections, tried work, and update protocol | **COMPLETE** | This document, 2026-08-22 |
-| C1 | Establish clean SM86 baseline | Fresh branch from `main`; contract commit present; device identity, 842-class ruler, production controls, byte formula, and correctness reproduced in three interleaved repetitions | **NEXT** | Do not inherit experimental runtime code from `exp/dsv4-qpn-packed-decode` |
-| C2 | Prove an exact register-fed SM86 primitive | Exact E2M1 + E8M0/group-32 decode feeds a chosen native SM86 MMA operand mapping without persistent widening; intended instructions confirmed in SASS; no inner-loop spill or unintended widened-memory path; cost model shows the design can still exceed 600 after unavoidable terms | **PENDING** | Compare against conventional WMMA and, if useful, legacy `m8n8k4` only as controls |
+| C1 | Establish clean SM86 baseline | Fresh branch from `main`; contract commit present; device identity, 842-class ruler, production controls, byte formula, and correctness reproduced in three interleaved repetitions | **COMPLETE** | Experiment 0134: 840.7–845.6 GB/s ruler; exact controls; 418.5–419.0 MiB |
+| C2 | Prove an exact register-fed SM86 primitive | Exact E2M1 + E8M0/group-32 decode feeds a chosen native SM86 MMA operand mapping without persistent widening; intended instructions confirmed in SASS; no inner-loop spill or unintended widened-memory path; cost model shows the design can still exceed 600 after unavoidable terms | **NEXT** | Start with isolated native BF16 MMA lane/register map and SASS falsifier |
 | C3 | Clear M=1 parity on production shapes | Greater than 600.0 GB/s cold at both `[2048,4096]` and `[4096,2048]`, full candidate step including its reduction, three interleaved process medians, oracle clean | **PENDING** | No threshold shopping or favorable-shape-only pass |
 | C4 | Clear the surpass curve | At least 632 GB/s cold at M `{1,4,8}` on both shapes and greater than 301.9 GB/s at M=16, with per-operating-point cost model and correctness | **PENDING** | Re-measure every M; do not reuse M=1 constants |
 | C5 | Integrate one-copy production dispatch | Runtime uses the accepted path with one persistent packed representation; prepack/admission/VRAM/graphs/fallback accounting and operation/layer fixtures pass; `make check` green | **PENDING** | Probe success alone cannot advance this milestone |
@@ -282,45 +282,47 @@ is `REJECTED`, recorded, and replaced only by a newly justified hypothesis.
 
 Last updated: 2026-08-22
 
-- **Current milestone:** C1 — establish a clean SM86 baseline.
-- **What exists:** a measurement/probe branch containing experiments 0127–0133
-  and useful controls, ending at `ecfb50d`. Its best conventional WMMA/SIMT
-  arms remain roughly one quarter of the greater-than-600 target or less.
+- **Current milestone:** C2 — prove an exact register-fed SM86 primitive.
+- **What exists:** clean branch `exp/dsv4-sm86-qpn-register-feed` from
+  `main@b895f82`, containing only the contract plus experiment 0134's minimal
+  baseline probe. Three processes reproduce an RTX 3090 SM86 ruler of
+  840.7–845.6 GB/s, production at 87.04 GB/s, and the exact conventional N64
+  WMMA control at 161.37/174.08 GB/s cold.
 - **What does not exist:** an exact Ampere-native, fragment-prepacked,
   register-fed QPN-style kernel for Strata's E2M1 + E8M0/group-32 contract.
 - **Current measured bottlenecks:** legacy SIMT is ALU/instruction-bound;
   conventional packed WMMA has an ALU resource maximum plus a still larger
   no-eligible/barrier scheduling residual. Neither is DRAM-bound.
-- **Current blockers:** no external blocker. The technical unknowns are the
-  correct native SM86 MMA shape/lane mapping, exact register-side scale/decode
-  sequence, and geometry that retains enough eligibility without spills.
+- **Current blockers:** no external blocker. C2's first unresolved dependency
+  is the native SM86 BF16 MMA lane/register fragment mapping and emitted SASS;
+  the exact register-side scale/decode sequence and spill-free geometry follow
+  only after that mapping is measured.
 - **Branch disposition:** preserve `exp/dsv4-qpn-packed-decode` and experiments
   0127–0133 as an archive of controls and falsifications. Do not delete or merge
-  its failed runtime code. Begin implementation from `main`; transfer this
-  contract and its AGENTS/CLAUDE pointers as a documentation-only commit.
+  its failed runtime code. Active implementation now proceeds only on the clean
+  `exp/dsv4-sm86-qpn-register-feed` branch created from `main`; do not merge the
+  archived probe branch into it.
 - **Unrelated worktree state:** preserve the three untracked scripts
   `scripts/dsv4_decode15_bench.sh`, `scripts/dsv4_decode15_server.sh`, and
   `scripts/dsv4_server_prefill_bench.sh`.
 
 ## Exact next step
 
-Complete C1 and nothing beyond it in the same experiment:
+Execute the first bounded C2 falsifier, not a production kernel:
 
-1. Create a new `exp/dsv4-sm86-qpn-register-feed` branch from `main` and bring
-   in only the documentation-only commit containing this contract and its
-   AGENTS/CLAUDE pointers—none of the probe/runtime changes from
-   `exp/dsv4-qpn-packed-decode`.
-2. Reconstruct the smallest production-shape probe needed to reproduce device
-   identity, the 842-class cold ruler, the production reference, and the old
-   conventional WMMA control. Record exact byte accounting and three
-   interleaved process medians.
-3. Record experiment 0134 as the clean-baseline gate. Only after C1 passes may
-   an agent design C2's SM86 register-fragment mapping.
+1. Add an isolated inline-PTX probe for
+   `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` on SM86.
+2. With known BF16 operands, map every participating lane/register to matrix
+   coordinates, compare every accumulator output against a host oracle, and
+   inspect SASS to confirm the intended native tensor instruction with no
+   spills or unintended memory operands.
+3. Record the lane map and feasibility verdict as experiment 0135. If exact,
+   extend that same bounded experiment with fragment-order E2M1/E8M0 group-32
+   prepacking and direct register decode. If the instruction or map gate fails,
+   stop and choose a different native SM86 MMA shape from evidence.
 
-The first C2 hypothesis must be stated narrowly: a fragment-order prepack and
-register-side E2M1/E8M0 decoder can feed one selected **native SM86** MMA
-instruction without inner-loop shared-memory materialization while preserving
-the oracle. Measure this mechanism before building runtime dispatch.
+Do not build runtime dispatch, tune conventional WMMA, or copy Volta's
+`m8n8k4` lane map during this step.
 
 ## Update and handoff protocol
 
@@ -358,3 +360,4 @@ experiment document. Timestamps use America/Sao_Paulo (`-03:00`).
 | Timestamp | Agent/session | Branch@commit | Milestone | Action and evidence | Gate/result | Current blockers | Exact next action |
 |---|---|---|---|---|---|---|---|
 | 2026-08-22T12:53:41-03:00 | Codex / contract reset | `exp/dsv4-qpn-packed-decode@ecfb50d` before contract commit | C0 | Re-read upstream `skinny_kernels.cu`, upstream README, Reddit thread/comments, and experiments 0127–0133; established the Ampere-specific contract and corrected the QPN2 interpretation | C0 complete; no performance claim | No external blocker; SM86 register-fed mechanism unmeasured | Create `exp/dsv4-sm86-qpn-register-feed` from `main`, bring in only this documentation commit, and execute C1 only |
+| 2026-08-22T13:04:11-03:00 | Codex / experiment 0134 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | C1 | Built a clean SM86-only baseline probe; three raw runs reproduce device, ruler, production and N64 WMMA controls; see experiment 0134 | C1 complete: 840.7–845.6 GB/s ruler, exact controls, under 512 MiB; no speedup claim | No external blocker; native BF16 MMA lane/register map unmeasured | Execute experiment 0135's isolated inline-PTX `m16n8k16` lane-map, oracle and SASS gate |

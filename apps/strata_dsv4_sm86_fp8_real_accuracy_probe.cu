@@ -135,7 +135,7 @@ __device__ __forceinline__ std::uint8_t packed_code_at(
     return static_cast<std::uint8_t>(words[word] >> ((index & 3U) * 8U));
 }
 
-template<int Split, bool Grouped>
+template<int Split, bool Grouped, int Accs = 2, bool Replay = true>
 __global__ __launch_bounds__(kThreads) void qpn8_accuracy_kernel(
     const uint4* codes, const std::uint8_t* scales,
     const std::uint16_t* input, float* partials, std::uint32_t* counters,
@@ -156,7 +156,7 @@ __global__ __launch_bounds__(kThreads) void qpn8_accuracy_kernel(
     const std::uint32_t thread = lane & 3U;
     const std::uint32_t input_group = Grouped ? nt / 64U : 0U;
     input += static_cast<std::size_t>(input_group) * k;
-    float even[4]{}, odd[4]{};
+    float accum[Accs][4]{};
     for (std::uint32_t pb = pbegin; pb < pend; pb += 4U) {
         const std::uint32_t kt_begin = pb * 2U;
         std::uint32_t scale = lane == 0U
@@ -196,18 +196,28 @@ __global__ __launch_bounds__(kThreads) void qpn8_accuracy_kernel(
                     b0 = *reinterpret_cast<const std::uint32_t*>(base);
                     b1 = *reinterpret_cast<const std::uint32_t*>(base + 8U);
                 }
-                auto& accumulator = half == 0 ? even : odd;
+                auto& accumulator = accum[(pb * 2U +
+                    static_cast<std::uint32_t>(unroll) * 2U +
+                    static_cast<std::uint32_t>(half)) % Accs];
                 mma(accumulator[0], accumulator[1], accumulator[2],
                     accumulator[3], a0, a1, a2, a3, b0, b1);
             }
         }
     }
 #pragma unroll
-    for (int index = 0; index < 4; ++index) even[index] += odd[index];
+    for (int step = 1; step < Accs; step *= 2) {
+#pragma unroll
+        for (int base = 0; base < Accs; base += step * 2) {
+#pragma unroll
+            for (int reg = 0; reg < 4; ++reg) {
+                accum[base][reg] += accum[base + step][reg];
+            }
+        }
+    }
     auto* destination = partials +
         (static_cast<std::size_t>(nt) * Split + slice) * 128U + lane * 4U;
 #pragma unroll
-    for (int index = 0; index < 4; ++index) destination[index] = even[index];
+    for (int index = 0; index < 4; ++index) destination[index] = accum[0][index];
     __threadfence();
     __shared__ std::uint32_t arrived[kWarps];
     if (lane == 0U) arrived[warp] = atomicAdd(counters + nt, 1U);
@@ -236,10 +246,10 @@ __global__ __launch_bounds__(kThreads) void qpn8_accuracy_kernel(
     // midpoint to make reassociation observable are replayed. The replay uses
     // the same invertibly prepacked bytes and a warp-voted FP64 dot; it is not
     // a widened weight copy or a precision fallback.
-    std::uint32_t ambiguous = __ballot_sync(
+    std::uint32_t ambiguous = Replay ? __ballot_sync(
         0xffffffffU, lane < 16U &&
         (midpoint_distance <= (Grouped ? 1024U : 512U) ||
-         (fast_value != 0.0F && fabsf(fast_value) <= 1.0e-6F)));
+         (fast_value != 0.0F && fabsf(fast_value) <= 1.0e-6F))) : 0U;
     while (ambiguous != 0U) {
         const std::uint32_t owner = __ffs(ambiguous) - 1U;
         const std::uint32_t logical_row = nt * 16U + owner;
@@ -566,7 +576,7 @@ struct Comparison {
     std::uint32_t near_zero_fast_rows{};
 };
 
-template<int Split, bool Grouped>
+template<int Split, bool Grouped, int Accs = 2, bool Replay = true>
 Comparison run_matrix(const Matrix& matrix,
                       std::span<const std::uint16_t> input);
 
@@ -598,7 +608,35 @@ Comparison run_grouped(const Matrix& matrix,
     }
 }
 
-template<int Split, bool Grouped>
+Comparison run_nacc8_ungrouped(const Matrix& matrix,
+                               std::span<const std::uint16_t> input,
+                               std::uint32_t split) {
+    if (split != 1U) throw std::runtime_error("NACC8 query requires split 1");
+    return run_matrix<1, false, 8, false>(matrix, input);
+}
+
+Comparison run_nacc8_grouped(const Matrix& matrix,
+                             std::span<const std::uint16_t> input,
+                             std::uint32_t split) {
+    if (split != 4U) throw std::runtime_error("NACC8 grouped output requires split 4");
+    return run_matrix<4, true, 8, false>(matrix, input);
+}
+
+Comparison run_nacc16_ungrouped(const Matrix& matrix,
+                                std::span<const std::uint16_t> input,
+                                std::uint32_t split) {
+    if (split != 1U) throw std::runtime_error("NACC16 query requires split 1");
+    return run_matrix<1, false, 16, false>(matrix, input);
+}
+
+Comparison run_nacc16_grouped(const Matrix& matrix,
+                              std::span<const std::uint16_t> input,
+                              std::uint32_t split) {
+    if (split != 4U) throw std::runtime_error("NACC16 grouped output requires split 4");
+    return run_matrix<4, true, 16, false>(matrix, input);
+}
+
+template<int Split, bool Grouped, int Accs, bool Replay>
 Comparison run_matrix(const Matrix& matrix,
                       std::span<const std::uint16_t> input) {
     const std::size_t partial_bytes =
@@ -629,7 +667,7 @@ Comparison run_matrix(const Matrix& matrix,
     check(cudaMemset(fallback_count.get(), 0, fallback_count.bytes()),
           "clear ambiguity count");
     const std::uint32_t works = (matrix.n / 16U) * Split;
-    qpn8_accuracy_kernel<Split, Grouped>
+    qpn8_accuracy_kernel<Split, Grouped, Accs, Replay>
         <<<(works + kWarps - 1U) / kWarps, kThreads>>>(
             static_cast<const uint4*>(codes.get()),
             static_cast<const std::uint8_t*>(scales.get()),
@@ -729,6 +767,8 @@ struct Options {
     std::string output;
     std::uint32_t qb_split{1U};
     std::uint32_t oa_split{4U};
+    bool nacc8_no_replay{};
+    bool nacc16_no_replay{};
 };
 
 Options parse(int argc, char** argv) {
@@ -746,6 +786,8 @@ Options parse(int argc, char** argv) {
         else if (argument == "--output") options.output = value();
         else if (argument == "--qb-split") options.qb_split = std::stoul(value());
         else if (argument == "--oa-split") options.oa_split = std::stoul(value());
+        else if (argument == "--nacc8-no-replay") options.nacc8_no_replay = true;
+        else if (argument == "--nacc16-no-replay") options.nacc16_no_replay = true;
         else throw std::runtime_error("unknown option: " + std::string(argument));
     }
     if (options.shard.empty() || options.activations.empty()) {
@@ -805,11 +847,17 @@ int main(int argc, char** argv) {
             warp_query_rank, activations.query_rank);
         const auto warp_exact_mismatches = mismatch_count(
             warp_query_rank, exact_query_rank);
-        const auto qb_result = run_ungrouped(
-            qb, activations.query_rank, options.qb_split);
+        const auto qb_result = options.nacc16_no_replay
+            ? run_nacc16_ungrouped(qb, activations.query_rank, options.qb_split)
+            : options.nacc8_no_replay
+                ? run_nacc8_ungrouped(qb, activations.query_rank, options.qb_split)
+                : run_ungrouped(qb, activations.query_rank, options.qb_split);
         const auto kv_result = run_matrix<16, false>(kv, activations.hidden);
-        const auto oa_result = run_grouped(
-            oa, activations.attention, options.oa_split);
+        const auto oa_result = options.nacc16_no_replay
+            ? run_nacc16_grouped(oa, activations.attention, options.oa_split)
+            : options.nacc8_no_replay
+                ? run_nacc8_grouped(oa, activations.attention, options.oa_split)
+                : run_grouped(oa, activations.attention, options.oa_split);
         const auto ob_result = run_matrix<8, false>(ob,
             std::span<const std::uint16_t>(oa_result.incumbent_output));
         const bool query_norm_accepted = exact_fixture_mismatches == 0U &&
@@ -832,6 +880,10 @@ int main(int argc, char** argv) {
                 << (has_indexer ? "true" : "false")
                 << ",\n  \"q_b_split\":" << options.qb_split
                 << ",\n  \"wo_a_split\":" << options.oa_split
+                << ",\n  \"nacc8_no_replay\":"
+                << (options.nacc8_no_replay ? "true" : "false")
+                << ",\n  \"nacc16_no_replay\":"
+                << (options.nacc16_no_replay ? "true" : "false")
                 << ",\n  \"accepted\":" << (accepted ? "true" : "false")
                 << ",\n  \"query_norm\":{\"accepted\":"
                 << (query_norm_accepted ? "true" : "false")

@@ -635,6 +635,18 @@ Last updated: 2026-08-22
   actual checkpoint fixtures must show no-worse maximum/RMS error because the
   random chain has 1--21 BF16 boundary differences, and the protected M curve
   remains unmeasured.
+- **The guarded real-boundary numerical gate passes (0147), after the
+  unguarded reduction was correctly rejected.** Actual layer 2, 21, and 42
+  checkpoint tensors consume real hidden, post-query-RMSNorm, and
+  inverse-RoPE attention fixtures. The original performance splits failed at
+  layer 2 (`wq_b+indexer` 9 oracle mismatches versus incumbent 4; grouped
+  `wo_a` 1 versus 0). A warp-voted same-prepack FP64 replay for sparse BF16
+  midpoint/near-zero rows makes every maximum-absolute, maximum-relative, RMS,
+  and mismatch metric no worse without a duplicate or widened weight copy.
+  Replay incidence is 1.63--1.68% for query rows and 1.46--1.90% for grouped
+  output rows. The audit also corrected 0146's semantics claim: its carriers
+  omitted query RMSNorm and reused one input across `wo_a` groups. Those exact
+  operations plus the replay must enter the scheduler before its M curve.
 - **A defect in the gate protocol itself, independent of machine tuning.** The
   cold probe's 160–260 µs arms boost to **1935 MHz** at 150–200 W while
   sustained load settles at **1755 MHz** against the power limit. The same
@@ -704,11 +716,13 @@ Last updated: 2026-08-22
   `nvidia-smi` index 1, `GPU-3032cfa3`, pci 82:00.0, and is the unlocked
   experimentation card. Every probe must hard-check capability 8.6 and record
   `device_name` inline.
-- **Current blockers:** F4-3 depends on its own M-curve measurement. F8-2 is
-  blocked by F8-1's rejected per-projection launch architecture. Resuming FP8
-  requires owner authorization for a materially broader launch-free executor
-  or operation fusion and a new cost model; lowering D-F8-GATE or hiding either
-  protected shape behind the scalar route is forbidden.
+- **Current blockers:** F4-3 depends on its own M-curve measurement. F8-1's
+  layer-resident architecture and guarded real-fixture numerical gate are both
+  positive, but F8-2 remains blocked on an exact guarded scheduler: query
+  RMSNorm, grouped `wo_a` input selection, and the measured sparse replay cost
+  are not yet present in experiment 0146's performance probe. M
+  `{1,2,3,4,8,16}` remains unmeasured. Lowering D-F8-GATE or hiding a protected
+  shape behind the scalar route is forbidden.
 - **Branch disposition:** preserve `exp/dsv4-qpn-packed-decode` and experiments
   0127–0133 as controls/falsifications. Continue only on the clean main-based
   `exp/dsv4-sm86-qpn-register-feed`; do not merge failed archived runtime code.
@@ -721,11 +735,12 @@ Last updated: 2026-08-22
 **F4-1 is COMPLETE and F4-2 is CLEARED at >= 8 routed experts per launch**
 (experiment 0142: 700.7/701.1 GB/s, 0.0 error).
 
-**Exact next action on the FP8 track:** stop. Experiment 0144 passed the exact
-register-feed primitive but falsified the ordered launch/wave gate even for a
-read-only same-input-fused upper bound. Do not build the full QPN8 kernel.
-Resumption requires an owner-authorized launch-free architecture hypothesis;
-the 82%/81%/64% D-F8-GATE remains binding.
+**Exact next action on the FP8 track:** install experiment 0147's warp-voted
+same-prepack replay in the layer-resident scheduler, add the real query RMSNorm
+between `wq_a` and `wq_b`, and make grouped `wo_a` select its own 4,096-value
+activation slice. Measure M=1 first with replay counters and the same-session
+ruler; only if it remains at least 82% may the same exact scheduler run the
+protected M `{2,3,4,8,16}` curve. The 82%/81%/64% D-F8-GATE remains binding.
 
 Independently, F4-3 remains open: run the interleaved M `{1,4,8,16}` curve on
 both FP4 production shapes against its unchanged gates.
@@ -789,3 +804,4 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-22T17:01:44-03:00 | Codex / experiment 0144 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 | Executed both ordered cheap falsifiers. First re-derived a BF16 word-parallel E4M3 decoder and the SM86 fragment prepack, crossed both N=128 and K=128 scale axes, and tested broad finite BF16 activations plus three deliberate defects. Only after it passed, swept read-only launch geometries for `wkv`, `wq_a`, and their contiguous same-input fusion against a fresh ruler. See experiment 0144 | **Primitive phase PASS; F8-1 architecture REJECTED at the binding launch/wave gate; F8-2 not attempted.** 64,770 finite decode cases, zero mismatches; invertible byte-preserving prepack; zero register-feed bit mismatches and zero canonical-oracle violations; 25 registers, zero spills/shared/barriers. But the 845.626 GB/s ruler gives 3.025/6.049/9.074 us budgets while favorable read-only arms need 6.144/9.216/12.288 us: only **40.37%/53.82%/60.55%**, with empty launch already 3.072 us. Three warmed process medians agree | D-F8-GATE is unmoved. The per-projection register-fed kernel cannot reduce the binding launch/underfilled-wave serial term, and adding decode/MMA/output cannot rescue a failed read-only upper bound. Full QPN8 kernel deliberately not built; no production dispatch or persistent path changed | Stop the FP8 track. Continue independent F4-3. FP8 resumption requires owner authorization for a materially broader launch-free/persistent or surrounding-operation-fused architecture with a new semantics proof and cost model; do not lower the gate or hide protected shapes behind scalar fallback |
 | 2026-08-22T17:40:19-03:00 | Codex / owner-authorized successor + experiment 0145 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 | Owner explicitly authorized bold continuation through a materially broader architecture and redirected the design lens from Volta imitation to Ampere advantages. Built the full compact E4M3/E8M0 W8A16 kernel, measured actual production shapes, falsified hierarchical reduction, two-N ownership, scale-on-B and `cp.async` staging, swept shape-specific split-K and independent execution width, then profiled the valid main-plus-indexer `wq_b` fusion. See experiment 0145 | **F8-1 successor ACTIVE; no F8-2 verdict.** Three-process valid `(40960,1024)` fusion median **718.64 GB/s / 84.98%**, above the unchanged 82% gate; Nsight 85.01% DRAM, 63.59% active warps, 40 registers, no spill/widened shared tile. Isolated `wq_b`/`wo_a`/`wo_b` are 80.73--81.11% including launch; small `wq_a+wkv` remains 48.44%. Synthetic width proves 36--40 MiB crosses 82% but is mechanism evidence only | Layer-resident dependency-aware scheduler not built; M `{2,3,4,8,16}` unmeasured; large random matrices have 1--5 BF16 publication differences and require real-fixture/no-worse incumbent closure. Experiment 0144's isolated architecture remains rejected | Build one bounded layer-resident scheduler probe: `wq_a` first, then a heterogeneous ready queue that runs `wq_b` concurrently with independent `wkv` and folds indexer `wq_b` into the K=1024 grid when active; retain split `{1,4,8}`, prove every BF16 boundary, and measure aggregate useful bytes against the same ruler before any production dispatch |
 | 2026-08-22T17:52:00-03:00 | Codex / experiment 0146 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 successor | Built the bounded layer-resident scheduler required by 0145: six resident CTAs/SM, real `q_a -> q_b` and `wo_a -> wo_b` BF16 carriers, concurrent ready `wkv`, fused main-plus-indexer K=1024 grid, three explicit dependency barriers, and shape-specific split-K. Ran three independent processes and profiled the persistent kernel. See experiment 0146 | **PERFORMANCE FEASIBILITY PASS; F8-1 NUMERICAL GATE OPEN; no F8-2 verdict.** Stable median **699.67 GB/s / 83.27%** for 115,350,400 useful bytes against an 840.21 GB/s ruler; 164.864 us; 522,338,568 B; 72 registers, 20 B shared, zero spill/widened tile. Nsight: 78.55% DRAM, 49.41% active warps, 68.21% long scoreboard | Random full-output chain has deterministic BF16 differences: `2/1024`, `21/40960`, `1/512`, `1/8192`, `4/4096`. Real checkpoint/activation fixtures and no-worse incumbent maximum/RMS comparison are binding. M `{2,3,4,8,16}` remains unmeasured | Run the real-fixture numerical A/B at every immediate BF16 boundary against the exact incumbent. Stop if candidate maximum or RMS error is worse; only a clean verdict opens the protected scheduler M curve |
+| 2026-08-22T18:17:57-03:00 | Codex / experiment 0147 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 numerical closure | Loaded untouched E4M3/E8M0 tensors from layers 2, 21, and 42 and real BF16 hidden/post-query-RMSNorm/inverse-RoPE attention activations. The unguarded layer-2 arm failed and was preserved. Swept reduction association, then added a warp-voted FP64 replay of only ambiguous rows directly from the sole fragment prepack. See experiment 0147 | **REAL-FIXTURE NO-WORSE PASS; F8-1 successor ACTIVE; no F8-2 verdict.** Every operation/layer passes incumbent maximum-absolute, maximum-relative, RMS, and mismatch gates. Layer 2/21 query candidates are oracle-exact versus incumbent 4/3 mismatches; layer 42 query has 1 versus 5 and is lower on every error metric. Query replay incidence 1.63--1.68%, grouped output 1.46--1.90%; 41.66 MiB maximum operation allocation; `make check` passes | The replay, query RMSNorm, and true grouped `wo_a` selection are not yet in the performance scheduler. Therefore guarded M=1 cost and M `{2,3,4,8,16}` are unmeasured. Full teacher-forcing/generation and production dispatch remain later gates | Install those three exact mechanisms in the layer-resident probe and re-run guarded M=1 against 82% with replay counters; only a pass opens the unchanged protected M curve |

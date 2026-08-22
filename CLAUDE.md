@@ -11,14 +11,15 @@ admission contract says it should be.
 
 ## Active campaign contracts
 
-- Before any work on the RTX 3090 FP4 expert-kernel/QPN campaign, read
+- Before any work on the RTX 3090 mixed FP4/FP8 skinny-kernel/QPN campaign, read
   `docs/qpn-sm86-kernel-campaign-contract.md` in full, then read its last log
   line. That contract is authoritative for the campaign goal, target hardware,
   evidence interpretation, milestone order, current position, and next step.
   Update its mutable status and append-only log as required by the contract
   before handing the campaign to another agent. Older QPN handovers and
   experiments remain evidence, but do not override the contract's corrected
-  Ampere-specific interpretation.
+  Ampere-specific mixed-format interpretation or its separate W4A16/W8A16
+  gates.
 
 ## Hard invariants
 

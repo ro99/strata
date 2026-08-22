@@ -1,226 +1,379 @@
-# RTX 3090 FP4 QPN kernel campaign contract
+# RTX 3090 mixed FP4/FP8 skinny-kernel campaign contract
 
 Status: **ACTIVE — authoritative campaign contract**
 
 Established: 2026-08-22
 
+Owner amendment: 2026-08-22 — expanded from an FP4-only campaign to the
+checkpoint's mixed FP4/FP8 execution stack
+
 Target: NVIDIA RTX 3090, Ampere GA102, SM86
 
-Headline goal: **greater than 600 GB/s cold effective packed-weight bandwidth**
+Umbrella objective:
+
+> Build Ampere-native, register-fed skinny kernels for Strata's mixed low-bit
+> regions: a QPN2-derived W4A16 path for FP4 regions and a QPN8-derived W8A16
+> path for FP8 regions, preserving each region's exact checkpoint format,
+> numerical semantics, one-copy residency, and measured dispatch contract.
+
+Binding FP4 headline goal: **greater than 600 GB/s cold effective
+packed-weight bandwidth**
+
+Binding FP8 headline goal: **BLOCKED on owner decision D-F8-GATE; do not copy
+the FP4 threshold**
 
 Archived implementation evidence head: `exp/dsv4-qpn-packed-decode@ecfb50d`
 
-Required next implementation base: a fresh `exp/` branch from `main`
+Active implementation branch: `exp/dsv4-sm86-qpn-register-feed`, created from
+`main@b895f82`
 
-This document is the single source of truth for the RTX 3090 FP4 expert-kernel
-campaign. Every agent must read it in full, including the last row of the log,
-before planning, coding, profiling, interpreting a result, or handing off work.
+This document is the single source of truth for the RTX 3090 mixed FP4/FP8
+skinny-kernel campaign. Every agent must read it in full, including the final
+row of the append-only log, before planning, coding, profiling, interpreting a
+result, or handing off work.
 
-The **Contract** section is immutable unless the owner explicitly changes it.
-Agents may update the milestone status, Current position, blockers, next step,
-and append-only log. Older entries must never be edited or deleted; correct an
-error with a new log row and, when necessary, an explicitly dated amendment.
+The **Contract** section changes only when the owner explicitly changes it.
+The 2026-08-22 mixed-format amendment is such a change and supersedes the
+FP4-only scope without erasing it from history. Agents may update milestone
+status, Current position, blockers, Exact next step, and the append-only log.
+Older log rows must never be edited or deleted; correct an error with a new
+row and, when necessary, a dated amendment.
 
 ## Contract
 
 ### 1. What is expected
 
-Build an exact, dependency-light C/C++/CUDA kernel for Strata's production FP4
-expert projections that uses the RTX 3090 well enough to exceed 600 GB/s cold
-effective packed-weight bandwidth. The campaign is inspired by the execution
-architecture in `dnv2003/v100-skinny`, but it is an **Ampere/SM86 campaign**.
-It is not a Volta porting exercise and success on V100 is not evidence of
-success on RTX 3090.
+Strata must execute the checkpoint's two low-bit region types without
+requantizing one into the other:
 
-The binding performance ladder is:
+- **FP4 regions:** E2M1 codes with E8M0 group-32 scales through an
+  Ampere-adapted, QPN2-derived, register-fed **W4A16** architecture.
+- **FP8 regions:** E4M3 weight codes with E8M0 block-128 scales through an
+  Ampere-adapted, QPN8-derived, register-fed **W8A16** architecture.
 
-1. **Parity:** exceed 600.0 GB/s cold at M=1 on both production per-rank expert
-   shapes, `gate_up_w1 [N=2048,K=4096]` and
-   `down_w2 [N=4096,K=2048]`.
-2. **Surpass:** reach at least 75% of the measured 842 GB/s cold RTX 3090 read
-   ceiling, currently 632 GB/s after rounding, at the real M=1–8 operating
-   points. At minimum, report M in `{1,4,8}` on both shapes. Also beat the
-   published v100-skinny NVFP4 M=16 result of 301.9 GB/s on both shapes.
-3. **Production:** preserve the win after dispatch, prepack, reduction, memory,
-   graph, and end-to-end routed-decode costs are included. An isolated probe win
-   is necessary but is not a production win.
+This is an RTX 3090/SM86 campaign analogous to the mixed-format execution
+stack in `dnv2003/v100-skinny`. It is not a literal Volta source, format, lane
+map, or opcode port. “QPN2-derived” and “QPN8-derived” name the register-fed,
+fragment-prepacked dataflow. They do not claim that Strata's formats or
+numerical boundaries are identical to upstream.
 
-The absolute numbers are the target. Hardware labels, theoretical bandwidth,
-and relative speedups cannot substitute for them. A result within observed
-variance is not a pass.
+The final production result is mixed dispatch:
 
-### 2. Exact workload and correctness contract
+1. eligible FP4 regions use the accepted QPN2-derived W4A16 path;
+2. eligible FP8 regions use the accepted QPN8-derived W8A16 path; and
+3. unsupported shapes use an explicit, named, contract-approved exact route.
 
-The target is Strata's actual DeepSeek V4 per-rank expert projection contract:
+An unsupported case may fail admission when no approved exact route exists.
+It may never disappear into a hidden fallback. Dispatch counters and a route
+census must make every production choice observable.
 
-- packed E2M1 FP4 weight codes, two codes per byte;
-- E8M0 group scales, one scale per 32 weights;
-- fp32 activation storage whose values are BF16-representable at this boundary;
-- fp32 accumulation/reduction behavior under the existing declared numerical
-  contract;
-- production shapes and real skinny decode/verification M values;
-- unchanged precision, scale semantics, routing, expert count, top-k, and model
-  behavior.
+### 2. Shared invariants
+
+- Target hardware is exactly RTX 3090, GA102, SM86. Successful compilation or
+  performance on Volta is not target evidence.
+- Weights stay in their checkpoint precision and scale semantics. No FP8-to-FP4
+  conversion, FP4-to-FP8 conversion, or persistent FP16/BF16 expansion is
+  permitted.
+- W4A16 and W8A16 both retain 16-bit activation operands at the MMA boundary.
+  An existing FP32 carrier may be converted according to the operation's
+  declared BF16/FP16 boundary. The campaign does not silently introduce
+  activation E4M3 or otherwise turn W8A16 into W8A8.
+- Accumulation, publication, routing, expert count, top-k, and model semantics
+  remain those declared by each production operation. A performance result
+  does not authorize a numerical-contract change.
+- Only one persistent packed representation per weight region is allowed in
+  the promoted design. A verified invertible fragment-order prepack may
+  replace the canonical device layout after all consumers are accounted for;
+  it may not become a second unnoticed full copy.
+- Exact mode either executes an approved exact route or reports failure. It
+  never silently substitutes a different precision, format, or activation
+  contract.
+
+### 3. FP4/W4A16 track
+
+#### Format and numerical contract
+
+- Weight codes: packed E2M1, two codes per byte.
+- Weight scales: one E8M0 byte per group of 32 weights.
+- Activation boundary: FP32 carrier values known to be BF16-representable at
+  the current expert-projection boundary; the candidate is W4A16.
+- Accumulation/publication: existing FP32 behavior under Strata's declared
+  int4 numerical contract.
+- Current production per-rank expert shapes:
+  `gate_up_w1 [N=2048,K=4096]` and
+  `down_w2 [N=4096,K=2048]`.
 
 Every candidate must pass the existing int4 reference oracle. M=1 has so far
-been bit-identical to production for accepted probe arms. Wider M may retain
-only already-declared summation-order differences; a new delta requires an
-explicit numerical-contract review and may not be normalized as harmless.
-Exhaustive decoder tests are necessary but insufficient: random matrix tests,
-both production shapes, real-weight/real-activation tests, and eventually the
-full runtime oracle are mandatory. The V100 project itself found an FP16
-overflow only with real activations; synthetic-only correctness is not enough.
+been bit-identical for accepted controls. Wider M may retain only an already
+declared summation-order delta. Exhaustive code/scale decode, random matrices,
+both production shapes, real weights/activations, operation/layer fixtures,
+and the full runtime oracle remain independent gates.
 
-### 3. Measurement contract
+#### Byte accounting and resource model
+
+For divisible production shapes, useful packed weight bytes per matrix pass
+are:
+
+`W_FP4 = N*K/2 + N*K/32` bytes.
+
+Both current expert shapes therefore contain 4,456,448 useful packed bytes.
+Headline bandwidth is `W_FP4 / full_candidate_step_time`, including required
+split-K reduction. Activation, output, partial-reduction, scrub, and duplicate
+probe traffic must be reported separately and never folded into useful weight
+bytes to inflate the result.
+
+The baseline resource model is instruction/ALU plus serial eligibility loss,
+not DRAM: the legacy SIMT arm is instruction-bound, while conventional packed
+WMMA exposes 62–65% no-eligible cycles and only about 20% DRAM utilization.
+The candidate targets decoder/instruction work and shared-memory/barrier serial
+terms. It adds fragment prepack, register pressure, activation conversion,
+scale work, and possibly partial reduction; every sign must be measured.
+
+#### Performance and coverage gates
+
+1. **Parity:** greater than 600.0 GB/s cold at M=1 on both production shapes.
+2. **Surpass:** at least 75% of the measured 842 GB/s cold SM86 ruler,
+   currently 632 GB/s after rounding, at M in `{1,4,8}` on both shapes; also
+   greater than upstream's 301.9 GB/s FP4 result at M=16.
+3. **Production:** preserve a material outside-variance win after prepack,
+   reduction, dispatch, memory, graph, and routed-decode costs.
+
+The FP4 microbenchmark must use cold arena rotation/L2 scrub, the actual
+shapes, full candidate timing, three warmups, eleven samples, and at least
+three independent interleaved process repetitions. Any failure of correctness,
+one-copy residency, either M=1 shape, the required M curve, or the measured
+cost-model feasibility gate rejects that candidate architecture. The threshold
+may not be moved to a favorable shape or M.
+
+### 4. FP8/W8A16 track
+
+#### Format and numerical contract
+
+- Weight codes: one E4M3 byte per weight.
+- Weight scales: one E8M0 byte per checkpoint `[128,128]` weight block.
+- Activation boundary: a separately declared 16-bit BF16 or FP16 MMA operand
+  derived from the operation's existing carrier; the intended candidate is
+  W8A16, not W8A8.
+- Accumulation and publication are defined per production operation. Existing
+  attention-page projections publish through BF16; that does not authorize an
+  agent to assume all FP8 consumers have the same boundary.
+- Before setting dispatch coverage, inventory every real FP8 region, operation,
+  `(M,N,K)`, activation carrier, publication boundary, and frequency in the
+  target workload. Upstream's Qwen region census and M ranges are not Strata's
+  dispatch contract.
+
+FP8 correctness is independent of FP4 correctness. Required gates are an
+exhaustive E4M3/E8M0 decoder test, random matrix tests, every protected
+production shape, real-weight/real-activation fixtures, comparison to an FP64
+decoded oracle at the operation's immediate production boundary, and full
+teacher-forcing/generation oracles. Experiment 0104's no-worse-after-BF16
+result applies only to the tested existing path and shapes; it is evidence,
+not a blanket waiver for a new W8A16 reduction order.
+
+#### Byte accounting and resource model
+
+For N and K divisible by 128, useful packed weight bytes per matrix pass are:
+
+`W_FP8 = N*K + (N/128)*(K/128)` bytes.
+
+For padded or non-divisible tensors, use the manifest's actual encoded storage
+layout and report padding explicitly; do not replace block-128 scaling with a
+per-row or group-32 formula. Headline bandwidth is
+`W_FP8 / full_candidate_step_time`, including required reduction. Report
+activation, output, scale, partial, scrub, prepack, and any duplicate probe
+traffic independently.
+
+Experiments 0103–0105 measured a large production weight-reread defect for
+multi-row attention pages and removed it by tiling. That operating point and
+its current incumbent must be re-measured separately from skinny decode. The
+new QPN8-derived path must instantiate `tau = max_r(W_r/B_r)+Sigma_serial` at
+each real M band before implementation. It is expected to reduce expanded
+tile/shared-memory traffic, barriers, and decode/feed instructions, while
+increasing fragment-prepack work and possibly registers, activation-conversion
+work, and split-K/NACC costs. A QPN8 mechanism that does not reduce the current
+`argmax` at its intended operating point is rejected before production work.
+
+#### Microbenchmark, coverage, and rejection gates
+
+The FP8 track requires its own clean SM86 control, measured read ceiling,
+correct byte formula, resource profile, and independent interleaved matrix.
+Report every real dispatch M band; at minimum preserve distinct results for
+single-row decode, verification batches, and multi-row attention-page shapes
+that are actually eligible. Do not copy upstream's M≤8, MT=2 M≤16, or chunked
+M≤96 boundaries. Re-derive fragment layout, instruction shape, split-K, NACC,
+and dispatch boundaries for SM86 and Strata.
+
+The exact FP8 throughput threshold is not yet owner-bound. Upstream QPN8 on a
+V100 read ceiling of 879 GB/s reports:
+
+| M | Upstream QPN8 | V100 roofline efficiency | Same efficiency against the measured 842 GB/s SM86 ruler |
+|---:|---:|---:|---:|
+| 1–4 | 718.6–720.5 GB/s | 82% | approximately 690 GB/s |
+| 8 | 712.4 GB/s | 81% | approximately 682 GB/s |
+| 16 | 558.5 GB/s | 64% | approximately 539 GB/s |
+
+Matching absolute upstream throughput and matching its fraction of the local
+read ceiling are different gates. The owner has not selected between them or
+defined required Strata M coverage. Therefore **D-F8-GATE is a blocking owner
+decision for FP8 performance acceptance**. No agent may invent a number, apply
+the FP4 >600/632 thresholds, or call an FP8 performance win before that row is
+resolved. Measurement, correctness, and resource-model work may proceed, but
+performance promotion may not.
+
+Independently of the unresolved numeric threshold, reject any FP8 candidate
+that changes W8A16 to W8A8, changes E4M3/E8M0 block-128 semantics, creates a
+persistent widened/duplicate weight copy, fails an operation boundary oracle,
+hides an unsupported shape, or cannot plausibly reduce the measured bottleneck.
+
+### 5. Existing FP8 paths are distinct
+
+The following paths must never be conflated in plans, results, or dispatch:
+
+1. **Existing scalar/native production path:** `native_fp8_matmul_kernel` and
+   its current exact dispatch. It is an incumbent/control, not QPN8.
+2. **Existing SM86 tensor-page path from experiments 0103–0105:** E4M3 weights
+   are decoded to BF16 through a conventional WMMA tile with 48 KiB shared
+   memory per CTA. Production quantizes each activation row/K128 block to E4M3
+   with an E8M0 activation scale. This is an activation-quantized W8A8-style
+   behavior and a valuable production/control path; it is not the intended
+   register-fed W8A16 QPN8 architecture.
+3. **Intended QPN8-derived path:** checkpoint E4M3/E8M0 block-128 weights feed
+   an SM86-native register-fragment architecture while activations retain their
+   declared 16-bit boundary. It requires a new correctness and performance
+   verdict and cannot inherit 0103–0105's gate automatically.
+
+An explicit future owner amendment could approve activation-quantized W8A8 as
+a separate optimization, but it would remain a separate named dispatch and
+could not be reported as completion of this W8A16 track.
+
+### 6. Shared Ampere-native prerequisite and transferable thesis
+
+The native SM86 MMA lane/register-map work is a shared prerequisite only where
+the operand type and instruction are truly shared. It must establish:
+
+- exact lane/register-to-matrix coordinates for the selected native SM86 MMA;
+- intended tensor instructions in SASS;
+- no spills, unintended local/shared widened path, or hidden memory operands;
+- the activation fragment contract used by both W4A16 and W8A16 candidates;
+- measured register/occupancy feasibility before format-specific kernels.
+
+After that shared fact is established, FP4 and FP8 split into independent
+tracks. Code decoders, scale semantics, fragment prepack, byte accounting,
+split-K, NACC, correctness, benchmarks, M coverage, dispatch, and rejection
+criteria remain format-specific.
+
+The transferable QPN thesis is dataflow:
+
+1. keep codes compressed through HBM;
+2. pre-permute codes at load time into the SM86 fragment order;
+3. arrange decoder output to occupy operand registers without inner-loop
+   shuffles or a materialized widened tile;
+4. decode and apply each format's exact scales at point of consumption;
+5. share activation fragments across as much N work as the measured SM86 lane
+   map permits;
+6. avoid shared-memory staging and block-wide barriers in the main weight loop
+   when the native fragment path permits; and
+7. select split-K, NACC, multi-tile geometry, and dispatch boundaries from SM86
+   evidence rather than copying constants.
+
+Tensor cores remain plausible. The rejected default is the high-level,
+shared-memory-heavy WMMA architecture as the target dataflow, not tensor cores
+as a class.
+
+### 7. What does not transfer automatically from upstream
+
+- Volta's `mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32`, its quadpair/lane
+  map, all-four-quadpairs-on-N geometry, FP16 operand details, and dispatcher.
+- Upstream QPN2's NVFP4 scale semantics. The upstream source describes E2M1
+  with FP8 group-16 scaling; Strata requires E2M1 with E8M0 group-32 scaling.
+- Upstream QPN8's Volta-specific E4M3 decoder, FP16 scale folding, fragment
+  permutation, MT=2, split-K values `{4,8,16,32}`, NACC values `{1,2}`, shared
+  reduction, register count, occupancy, or M≤96 dispatch.
+- V100 throughput values as proof that an SM86 mechanism works, and successful
+  SM86 compilation of a legacy opcode as evidence that it is efficient.
+
+For both tracks, fragment layouts, native MMA instructions, scale handling,
+split-K, NACC, reduction, and dispatch ranges must be re-derived on SM86.
+Neither high-level WMMA nor a literal Volta source port is presumed correct.
+
+### 8. Measurement and memory protocol
 
 All headline kernel numbers are cold measurements on an identified RTX 3090.
 Use the established L2 scrub and arena rotation, three warmups, eleven
-interleaved samples, and report the median of at least three independent,
-interleaved process repetitions. State the byte formula used for effective
-bandwidth; packed codes and scale traffic must not be silently omitted or
-double-counted when comparing arms.
-
-The current achievable ruler is **842 GB/s cold** and approximately 857 GB/s
-hot, measured by experiment 0129 with a 128 MiB ILP-4 stream. Re-measure it on
-the new branch and whenever clocks, power, driver, CUDA, or device change.
-Never use the older 435–484 GB/s launch-deflated ruler.
+interleaved samples, and the median of at least three independent interleaved
+process repetitions. The current ruler is 842 GB/s cold and approximately
+857 GB/s hot, measured in experiment 0129 and reproduced in 0134. Re-measure
+when clocks, power, driver, CUDA, device, or benchmark traffic changes. Never
+use the older 435–484 GB/s launch-deflated ruler.
 
 For every optimization, instantiate
-`tau = max_r(W_r / B_r) + Sigma_serial` at the actual operating point. Report
-main and reduction phase time, DRAM bytes and bandwidth, executed instructions,
-relevant ALU/tensor utilization, registers, shared memory, spills, grid/waves,
-occupancy, eligible/no-eligible cycles, and barrier/scoreboard stalls. Name the
-resource `argmax` and the serial term before selecting a mechanism. Profiled
-replay timings are attribution evidence, not substitutes for clean native event
-timings.
+`tau = max_r(W_r/B_r) + Sigma_serial` at its actual operating point. Report
+phase time, traffic and bandwidth, instruction/tensor utilization, registers,
+shared memory, spills, grid/waves, occupancy, eligible/no-eligible cycles, and
+barrier/scoreboard stalls. Name `argmax` and the serial term before selecting a
+mechanism. Profile replay time is attribution evidence, not a headline time.
 
-CUDA enumeration is not stable across tools on this machine. Standalone CUDA
-probe ordinals 0 and 1 were RTX 3090s and ordinal 2 was the RTX 5060 Ti in the
-recorded session; `nvidia-smi`/PCI order differed. Verify and record
-`device_name` every session. The target result is invalid if collected on the
-5060 Ti by mistake.
+Prepack time, temporary workspace, scale storage, partial reductions, output
+buffers, device allocation, RSS, and persistent-copy count must be measured.
+Probe-only duplicate buffers must be declared. Promotion requires one
+persistent packed representation for each region and no persistent widened
+weights.
 
-### 4. Memory and integration contract
+CUDA device enumeration differs between tools on this machine. Verify and
+record `device_name` each session; a result accidentally collected on the RTX
+5060 Ti is invalid.
 
-- There must be only one persistent packed representation of the weights in
-  the production design. A fragment-order prepack may replace the canonical
-  device layout after all consumers and fallbacks are accounted for; it may not
-  become an unnoticed second full weight copy.
-- No persistent FP16/BF16-expanded weights may exist in HBM. Weights must stay
-  packed across HBM and widen only at point of consumption, preferably directly
-  into registers.
-- Prepack time, temporary workspace, scale storage, partial reductions, and
-  output buffers must be measured and reported. Probe-only duplicate buffers
-  must be declared and removed or admitted before production promotion.
-- Exact mode must either execute the exact path or report failure. No silent
-  fallback may make a benchmark appear correct or fast.
+### 9. Source-of-truth evidence
 
-### 5. The transferable QPN thesis
-
-The promising part of v100-skinny is its **dataflow**, not its GPU-generation
-specific instruction:
-
-1. Keep low-bit codes compressed through HBM.
-2. Pre-permute codes at weight-load time into the fragment order consumed by
-   the tensor-core instruction.
-3. Arrange nibble pairs so decoder output already occupies the required
-   operand registers; avoid inner-loop shuffles and materialized widened tiles.
-4. Decode codes and apply scales at the point of consumption in registers.
-5. Share activation operands across as much N work as the SM86 instruction and
-   lane map permit.
-6. Avoid shared-memory staging and block-wide barriers in the main weight loop
-   when the native SM86 fragment path permits it; retain only reductions that
-   measured geometry requires.
-7. Use split-K and independent accumulator sets as measured latency/eligibility
-   controls, not copied constants.
-
-This thesis targets the two measured defects in our recent arms: excessive
-ALU/instruction work and the large no-eligible `Sigma_serial` exposed by
-shared-memory/barrier-heavy geometry. Expected costs must also be charged:
-fragment prepacking, more registers, possible occupancy loss, activation
-conversion/load work, scale handling, split-K partial storage, and reduction.
-
-Using tensor cores remains plausible. The rejected object is the current
-high-level, shared-memory-heavy WMMA architecture as the primary path—not tensor
-cores as a class.
-
-### 6. What does not transfer automatically from Volta
-
-The following are reference evidence, not Ampere design decisions:
-
-- Volta's inline PTX
-  `mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32`;
-- its quadpair/lane/fragment mapping and all-four-quadpairs-on-N geometry;
-- FP16 activation operands;
-- FP8 E4M3 group-16 scales and the reference's scale-folding sequence;
-- V100-specific split-K values `{8,16,32}`, NACC values `{1,2}`, register
-  count, occupancy, launch geometry, and dispatcher boundaries;
-- V100 throughput numbers and the assumption that a legacy instruction which
-  compiles on SM86 is efficient there.
-
-Our likely primary candidate is an inline, Ampere-native register-fed MMA path,
-with native BF16 MMA a strong candidate because of Strata's activation
-contract. The exact SM86 instruction shape, operand types, lane mapping,
-fragment prepack, scale application, split-K, and accumulator count are
-**unresolved experimental questions**. They must be selected by an exact SM86
-mechanism probe and SASS/counter evidence. Neither high-level WMMA nor a literal
-Volta `m8n8k4` port is the presumed answer.
-
-### 7. Source-of-truth evidence
-
-Read these sources before changing the interpretation:
+Read these sources before changing interpretation:
 
 1. Upstream implementation:
    <https://raw.githubusercontent.com/dnv2003/v100-skinny/refs/heads/main/kernels/skinny_kernels.cu>
-   The audited 2026-08-22 copy is byte-identical to
+   The audited local copy is
    `results/qpn-surpass/reference/skinny_kernels.cu`, SHA-256
    `112ae57bdae0a0763d9898ad7b49eaf927be411cda0bde5344a76821d166533e`.
-   Relevant code is `skinny_nvfp4_qpn2`, its fragment-order prepack contract,
-   `MMA_8N8K4`, split-K, and NACC—not merely the older SIMT/WMMA kernels near
-   the start of the file.
+   Read both `skinny_nvfp4_qpn2` and `skinny_fp8_qpn8`/`qpn8_mt2`, their
+   prepack, decode, split-K, NACC, and dispatcher—not only early SIMT/WMMA code.
 2. Upstream README snapshot:
    `results/qpn-surpass/reference/v100-skinny-README.md`, SHA-256
    `433e66b4b538297893223431fe6da56a4df3d2ec33d175809b12e73331a0162b`.
-   It reports QPN2 at 679.5/676.6/619.8 GB/s for M=1/4/8 and first-generation
-   QPN at 301.9 GB/s for M=16, against an 879 GB/s V100 read ceiling.
+   It defines the mixed QPN2 W4A16/QPN8 W8A16 execution architecture and the
+   V100 performance evidence used above.
 3. Reddit discussion:
    <https://www.reddit.com/r/LocalLLaMA/comments/1vsq3zg/nvfp4_on_volta_despite_being_built_for_blackwell/>
-   The author's RTX 3090 statement is: “3090 support is next on the list, it
-   should work; the question really is if it is better than the int4 path.”
-   Therefore the thread contains no measured Ampere validation. The disputed
-   comment claiming stock vLLM already widens NVFP4 after HBM supplies no
-   benchmark or kernel evidence and is not a campaign result.
-4. Local experiment records 0127–0133 under `docs/experiments/`. They are the
-   authority for what Strata actually measured, but their old interpretation
-   of which upstream mechanism produced the V100 headline is superseded below.
+   The author's RTX 3090 statement is only that it “should work” and must be
+   measured; the thread contains no Ampere result.
+4. Experiments 0103–0105 under `docs/experiments/`: authoritative for Strata's
+   E4M3/E8M0 block-128 behavior, production boundary, existing activation-
+   quantized tensor-page path, and measured multi-row resource defect.
+5. Experiments 0127–0134 under `docs/experiments/`: authoritative for Strata's
+   FP4 controls, corrected SM86 ruler, bottleneck profiles, clean baseline, and
+   rejected conventional architectures.
 
-Evidence ranks as: target-hardware measurement with raw artifacts and oracle
-gate; inspected source/SASS; upstream measurement on other hardware; author or
-commenter claim; inference. Never promote a lower-ranked claim over a higher-
-ranked contradictory result.
+Evidence ranks as: target-hardware measurement with raw artifacts and oracle;
+inspected source/SASS; upstream measurement on other hardware; author claim;
+inference. Never promote lower-ranked contradictory evidence.
 
-### 8. Explicit corrections to prior campaign drift
+### 10. Explicit corrections and caveats
 
-These corrections are binding:
-
-- The published v100-skinny M=1–8 NVFP4 results are the shipping **QPN2** path,
-  not the legacy `skinny_nvfp4_simt` path. Experiment 0128 and both 2026-08-21
-  handovers state or imply otherwise because they did not inspect the complete
-  current upstream source. That interpretation is wrong.
-- Experiment 0130's “faithful-port line” was a faithful attempt at selected
-  legacy SIMT mechanisms under Strata's format. It was not a faithful port of
-  current QPN2. Its rejection remains valid for that SIMT architecture only.
-- Experiments 0127, 0128, and 0132–0133 optimize a conventional WMMA pipeline
-  with decoded operands staged through shared memory. QPN2's central feature is
-  register-fed fragment-order MMA with no shared memory in the main loop. Those
-  experiments measure useful controls, not the target architecture.
-- Experiment 0133's 10.7–17.9% N64 improvement is real and correctly
-  attributed, but approximately 150–161 GB/s at the binding wide-M points is
-  nowhere near the greater-than-600 goal. It must not redirect the campaign
-  into endless WMMA geometry tuning.
+- This is a mixed FP4/FP8 campaign. The original contract and first two log
+  rows described an FP4-only campaign; their work and chronology remain valid
+  within that narrower scope, but their umbrella scope is superseded by this
+  owner amendment.
+- Upstream's M=1–8 FP4 headline is QPN2, not legacy SIMT. Experiment 0130
+  rejects only the selected SIMT architecture.
+- Experiments 0127, 0128, and 0132–0133 are conventional shared-memory WMMA
+  controls, not QPN2's register-fed target architecture.
+- Experiments 0103–0105 establish useful SM86 FP8 behavior and an accepted
+  production control, but their 48 KiB shared-memory WMMA and E4M3-quantized
+  activations are not the intended register-fed W8A16 QPN8 path.
+- The FP4 >600/632 thresholds do not apply to FP8. D-F8-GATE must be resolved
+  explicitly before an FP8 performance pass can be declared.
+- A native BF16 MMA lane map can be shared evidence; an FP4 decoder or group-32
+  scale proof cannot be silently treated as an FP8/block-128 proof.
 - “Volta versus Ampere” is neither an excuse nor permission for a literal port.
-  Ampere is the target; every mechanism must be re-derived and measured for
-  SM86 while preserving the transferable QPN dataflow.
+  Every mechanism must preserve the transferable dataflow while being
+  re-derived and measured for SM86.
 
 ## Recorded work and lessons
 
@@ -228,136 +381,154 @@ These corrections are binding:
 
 | Experiment | What was actually tested | RTX 3090 result | Binding verdict and lesson |
 |---|---|---|---|
-| 0127 | Conventional BF16 WMMA with scalar FP4 decode and shared-memory operands | 114.5/124.3 GB/s at M=1; 111.6/124.3 at M=8 | M=1 gate failed. Flat ceiling was not DRAM. Activation fp32 must be explicitly converted to BF16. |
-| 0128 | Packed shift/rebias decode in the same WMMA pipeline; then a legacy-style SIMT arm | WMMA 128.0/140.4 at M=1 and 135.7/145.5 at M=8; SIMT 88.8/87.0 at M=1 | 200 GB/s gate failed. Exact scale application consumed the apparent decode headroom. The record's claim that SIMT produced upstream's headline is superseded. |
-| 0129 | Corrected 128 MiB ILP-4 cold-read ruler | 840–846 GB/s cold, campaign denominator 842 | Kept. The old 435–484 ruler was launch-deflated and is forbidden. |
-| 0130 | Legacy SIMT staging, R=2/R=4, prefetch, and lane-private multi-code decode | Best 151.0/120.9 GB/s at M=1 | Pre-stated 300 GB/s kill fired. Staging and R=2 helped; R=4 and deep prefetch failed. Reject this SIMT line, not QPN2 dataflow. |
-| 0131 | M=1 Nsight attribution of SIMT and packed WMMA | SIMT ALU/issue-bound. WMMA had 62–65% no-eligible cycles, 16–24% occupancy, ~7 us DRAM term, and 19–22 us serial residual | Main kernels were not DRAM-bound. Stop inventing latency stories; reduce instruction work and serial/barrier exposure. |
-| 0132 | Independent M=8/M=16 WMMA profile | 124–140 GB/s; same eligibility defect and only 20–22% DRAM use | Batch did not move the bottleneck. A bounded N64 control was justified. |
-| 0133 | N64 versus N128 conventional WMMA geometry | N64 150.1–161.2 GB/s at M=8/16, 1.107–1.179x faster | Kept as a probe control only. It reduced serial residual but remains far below the campaign goal and is not production-promoted. |
+| 0103 | FP8 E4M3/E8M0 block-128 screen: scalar incumbent versus decoded-BF16, 48 KiB shared-memory WMMA; standalone E4M3 activation scale was implicit one | Tensor screen 6.50–23.62x faster on M=677 shapes; stronger pre-publication FP32 no-worse gate failed | Preserved control. It exposed reread cost and exact format behavior, not a QPN8 W8A16 result. |
+| 0104 | Existing FP8 tensor path at the real immediate BF16 publication boundary | No worse than incumbent on all metrics/shapes; no compensation stage needed | Correctness gate applies to that path and tested boundary only. New W8A16 reduction orders require their own oracle. |
+| 0105 | Integrated multi-row SM86 FP8 tensor-page projections with production E4M3+E8M0 activation quantization and shared-memory WMMA | Query device 7.158365 s to 0.338589 s, 21.14x; KV 6.25x; decode unregressed | Accepted production/control path. It is activation-quantized W8A8-style, not the desired register-fed W8A16 architecture. |
+| 0127 | Conventional BF16 WMMA with scalar FP4 decode and shared-memory operands | 114.5/124.3 GB/s at M=1; 111.6/124.3 at M=8 | FP4 M=1 failed. Flat ceiling was not DRAM. |
+| 0128 | Packed FP4 shift/rebias decode in the same WMMA pipeline; legacy-style SIMT arm | WMMA 128.0/140.4 at M=1; SIMT 88.8/87.0 | 200 GB/s gate failed. The old claim that SIMT produced upstream's headline is superseded. |
+| 0129 | Corrected 128 MiB ILP-4 cold-read ruler | 840–846 GB/s cold; campaign denominator 842 | Kept. Older 435–484 ruler is forbidden. |
+| 0130 | Legacy FP4 SIMT staging, R variants, prefetch, lane-private decode | Best 151.0/120.9 GB/s at M=1 | Pre-stated 300 GB/s kill fired. Reject this SIMT line, not QPN dataflow. |
+| 0131 | M=1 Nsight attribution of FP4 SIMT and packed WMMA | SIMT ALU/issue-bound; WMMA 62–65% no-eligible, 16–24% occupancy, 19–22 us serial residual | Not DRAM-bound. Reduce instruction work and serial/barrier exposure. |
+| 0132 | Independent M=8/M=16 conventional FP4 WMMA profile | 124–140 GB/s with same eligibility defect | Batch did not move the bottleneck. |
+| 0133 | N64 versus N128 conventional FP4 WMMA geometry | N64 150.1–161.2 GB/s at M=8/16, 1.107–1.179x faster | Useful control only; far below goal and not production-promoted. |
+| 0134 | Clean-branch FP4 baseline, SM86 ruler, production and N64 controls | Ruler 840.7–845.6 GB/s; production 87.04; N64 161.37/174.08; exact; 418.5–419.0 MiB | C1 complete for its declared FP4 scope. It is preserved and is not an FP8 baseline. |
 
 ### Do not repeat without new evidence
 
-- Do not continue conventional WMMA tile tuning merely because N64 passed its
-  local relative gate. A new arm must test the register-fed SM86 thesis or be
-  justified by a newly measured larger term.
-- Do not reopen the rejected legacy SIMT line, R=4 geometry, or D=4/D=8 deep
-  prefetch without a new profile showing that its rejected premise changed.
-- Do not use the PRMT-LUT `dequant_pair` variant; it was about 28% slower than
-  shift/rebias in the recorded comparison.
-- Do not infer latency-boundedness from hot approximately equaling cold. A
-  streamed no-reuse weight path makes that equality structural.
-- Do not cite a fast number from a kernel that failed the oracle. A prior
-  incorrect prefetch build reached an apparent 167 GB/s by loading only half
-  the code stream.
-- Do not trust algorithm-only decoder models to catch CUDA indexing, lane-map,
-  inactive-lane, alignment, or shared-memory bugs. Use exhaustive bit tests and
-  device-side matrix/oracle probes.
-- Do not use word-level XOR swizzles with `float4`; they can break 16-byte
-  alignment. Do not allow idle lanes to read unstaged shared memory; NaN times
-  zero remains NaN.
-- Do not compare different formats, scale group sizes, activation types,
-  shapes, batches, or byte-accounting formulas as though they were equal.
-- Do not treat the Reddit thread, a V100 result, or successful SM86 compilation
-  as an RTX 3090 performance measurement.
+- Do not continue conventional WMMA tile tuning merely because N64 passed a
+  local relative gate. A new target arm must test register-fed SM86 dataflow or
+  be justified by a newly measured larger term.
+- Do not reopen rejected legacy SIMT, R=4, deep-prefetch, or PRMT-LUT variants
+  without a profile showing that the rejected premise changed.
+- Do not cite a fast kernel that failed its oracle. One incorrect prefetch arm
+  appeared to reach 167 GB/s by loading only half the FP4 code stream.
+- Do not use algorithm-only decoder models to certify CUDA indexing, lane-map,
+  inactive-lane, alignment, or memory-path correctness.
+- Do not compare FP4 and FP8 bandwidth without their separate useful-byte
+  formulas, shapes, activation types, and operating points.
+- Do not treat the existing FP8 W8A8-style tensor-page result as a W8A16 result
+  or silently change activation precision to inherit it.
+- Do not infer Ampere performance from the Reddit thread, a V100 number, or a
+  legacy instruction that happens to compile for SM86.
 
 ## Milestones
 
-Milestone order is binding. A milestone advances only when its gate is recorded
-in a committed experiment document and linked from a new log row. `BLOCKED`
-means an external dependency prevents the next falsifier; a failed hypothesis
-is `REJECTED`, recorded, and replaced only by a newly justified hypothesis.
+Dependencies are binding. C2 is shared where valid; after C2, the FP4 and FP8
+tracks have independent gates and may advance only through their own evidence.
+MIX milestones depend on acceptance of both tracks. A failed hypothesis is
+`REJECTED`; an external owner/dependency decision is `BLOCKED`.
 
 | ID | Milestone | Gate | Status | Evidence / note |
 |---|---|---|---|---|
-| C0 | Freeze correct campaign understanding | Contract records Ampere target, exact goal, sources, corrections, tried work, and update protocol | **COMPLETE** | This document, 2026-08-22 |
-| C1 | Establish clean SM86 baseline | Fresh branch from `main`; contract commit present; device identity, 842-class ruler, production controls, byte formula, and correctness reproduced in three interleaved repetitions | **COMPLETE** | Experiment 0134: 840.7–845.6 GB/s ruler; exact controls; 418.5–419.0 MiB |
-| C2 | Prove an exact register-fed SM86 primitive | Exact E2M1 + E8M0/group-32 decode feeds a chosen native SM86 MMA operand mapping without persistent widening; intended instructions confirmed in SASS; no inner-loop spill or unintended widened-memory path; cost model shows the design can still exceed 600 after unavoidable terms | **NEXT** | Start with isolated native BF16 MMA lane/register map and SASS falsifier |
-| C3 | Clear M=1 parity on production shapes | Greater than 600.0 GB/s cold at both `[2048,4096]` and `[4096,2048]`, full candidate step including its reduction, three interleaved process medians, oracle clean | **PENDING** | No threshold shopping or favorable-shape-only pass |
-| C4 | Clear the surpass curve | At least 632 GB/s cold at M `{1,4,8}` on both shapes and greater than 301.9 GB/s at M=16, with per-operating-point cost model and correctness | **PENDING** | Re-measure every M; do not reuse M=1 constants |
-| C5 | Integrate one-copy production dispatch | Runtime uses the accepted path with one persistent packed representation; prepack/admission/VRAM/graphs/fallback accounting and operation/layer fixtures pass; `make check` green | **PENDING** | Probe success alone cannot advance this milestone |
-| C6 | Confirm end-to-end value | Real routed decode shows a material, outside-variance improvement with identical model/precision/routes/budgets; phase times and all resource traffic reported | **PENDING** | Kernel bandwidth is not itself an end-to-end claim |
+| C0 | Freeze original Ampere QPN understanding | FP4 contract recorded target, sources, corrections, tried work, and protocol | **COMPLETE, SCOPE SUPERSEDED** | Original 2026-08-22 contract; history preserved |
+| C0A | Correct umbrella scope to mixed FP4/FP8 | Contract records both exact formats, independent gates, path distinctions, mixed dispatch, sources, blockers, and protocol | **COMPLETE WITH THIS COMMIT** | Owner amendment, 2026-08-22 |
+| C1 | Establish clean SM86 FP4 baseline | Fresh main-based branch; device, ruler, FP4 controls/formula/correctness reproduced three times | **COMPLETE** | Experiment 0134; valid work preserved |
+| C2 | Prove the shared native SM86 register-fragment prerequisite | Exact BF16 MMA lane/register map, oracle, SASS, spill/memory-path audit, and feasibility; format-specific decoder evidence labeled separately | **NEXT** | Preserved uncommitted 0135 phase A/B evidence must be audited and recorded; it is not yet a milestone commit |
+| F4-1 | Prove exact QPN2-derived FP4 primitive | E2M1/E8M0 group-32 fragment prepack and direct W4A16 register feed; exact decoder/matrix gates; no widened persistent path; feasible cost model | **PENDING on C2** | Independent FP4 microbenchmark/resource model |
+| F4-2 | Clear FP4 M=1 parity | >600.0 GB/s cold on both production shapes, full candidate step, three interleaved process medians, oracle clean | **PENDING on F4-1** | No favorable-shape pass |
+| F4-3 | Clear FP4 surpass curve | >=632 GB/s at M `{1,4,8}` both shapes and >301.9 GB/s at M=16 | **PENDING on F4-2** | Per-M cost models required |
+| F8-0 | Inventory and baseline Strata FP8 W8A16 operating points | Enumerate real regions/shapes/M/boundaries; measure scalar/native, existing W8A8-style WMMA control where eligible, ruler, exact bytes, and `argmax` independently | **PENDING on C2** | Experiments 0103–0105 are prior evidence, not the new W8A16 baseline |
+| D-F8-GATE | Bind FP8 performance threshold and required M coverage | Owner selects absolute-throughput, local-efficiency, or another evidence-backed gate and names required operating points | **BLOCKED — OWNER DECISION** | Derived candidates: about 690/682/539 GB/s for equal V100 efficiency; not binding |
+| F8-1 | Prove exact QPN8-derived FP8 primitive | E4M3/E8M0 block-128 fragment prepack and direct W8A16 register feed; independent decoder/matrix/boundary gates; no widened persistent path | **PENDING on C2 and F8-0** | Independent FP8 microbenchmark/resource model |
+| F8-2 | Clear owner-bound FP8 performance curve | Satisfy D-F8-GATE on every required shape/M with three interleaved process medians and independent correctness | **BLOCKED on D-F8-GATE and F8-1** | FP4 thresholds forbidden here |
+| MIX-1 | Integrate one-copy mixed production dispatch | Eligible FP4 uses accepted F4 path; eligible FP8 uses accepted F8 path; unsupported shapes use explicit approved exact routes; route census, admission, prepack, VRAM, graph and fixtures pass | **PENDING on F4-3 and F8-2** | No hidden fallback, no duplicate/widened weights |
+| MIX-2 | Confirm end-to-end value | Real workload shows material outside-variance improvement with identical model, formats, activations, routes, and budgets; phase/resource traffic reported | **PENDING on MIX-1** | Kernel bandwidth alone is not an end-to-end claim |
 
 ## Current position
 
 Last updated: 2026-08-22
 
-- **Current milestone:** C2 — prove an exact register-fed SM86 primitive.
-- **What exists:** clean branch `exp/dsv4-sm86-qpn-register-feed` from
-  `main@b895f82`, containing only the contract plus experiment 0134's minimal
-  baseline probe. Three processes reproduce an RTX 3090 SM86 ruler of
-  840.7–845.6 GB/s, production at 87.04 GB/s, and the exact conventional N64
-  WMMA control at 161.37/174.08 GB/s cold.
-- **What does not exist:** an exact Ampere-native, fragment-prepacked,
-  register-fed QPN-style kernel for Strata's E2M1 + E8M0/group-32 contract.
-- **Current measured bottlenecks:** legacy SIMT is ALU/instruction-bound;
-  conventional packed WMMA has an ALU resource maximum plus a still larger
-  no-eligible/barrier scheduling residual. Neither is DRAM-bound.
-- **Current blockers:** no external blocker. C2's first unresolved dependency
-  is the native SM86 BF16 MMA lane/register fragment mapping and emitted SASS;
-  the exact register-side scale/decode sequence and spill-free geometry follow
-  only after that mapping is measured.
+- **Current milestone:** C0A completes with the focused contract-correction
+  commit. The exact next gated experiment is C2; no runtime implementation may
+  advance until this correction is committed.
+- **Preserved validated work:** C1/experiment 0134 remains complete for FP4:
+  RTX 3090 ruler 840.7–845.6 GB/s, production control 87.04 GB/s, exact N64
+  conventional WMMA 161.37/174.08 GB/s, and 418.5–419.0 MiB allocation.
+- **Preserved pending work:** the uncommitted CMake entry and
+  `apps/strata_dsv4_sm86_bf16_mma_probe.cu`, with ignored
+  `results/qpn-sm86/0135-phase-a.json` and `0135-phase-b.json`, contain pending
+  C2 evidence. They are deliberately not part of this documentation commit and
+  must not be discarded or silently promoted.
+- **What does not exist:** an accepted Ampere-native register-fed production
+  kernel for either Strata FP4 W4A16 or Strata FP8 W8A16, an independent new
+  FP8 W8A16 operating-point baseline, or accepted mixed production dispatch.
+- **Measured bottlenecks:** FP4 legacy SIMT is instruction/ALU-bound and FP4
+  conventional WMMA has an ALU plus no-eligible/barrier serial defect. Existing
+  FP8 multi-row scalar production exhibited 677x logical weight rereads; the
+  accepted WMMA control removes that volume defect but has 48 KiB shared-memory
+  staging. The intended W8A16 operating points still require a fresh `argmax`
+  profile before mechanism work.
+- **Current blockers:** D-F8-GATE is an explicit owner blocker for FP8
+  performance acceptance. It does not block C2 shared measurement, F8 format/
+  correctness inventory, or an FP8 baseline; it blocks declaring F8-2 passed.
 - **Branch disposition:** preserve `exp/dsv4-qpn-packed-decode` and experiments
-  0127–0133 as an archive of controls and falsifications. Do not delete or merge
-  its failed runtime code. Active implementation now proceeds only on the clean
-  `exp/dsv4-sm86-qpn-register-feed` branch created from `main`; do not merge the
-  archived probe branch into it.
-- **Unrelated worktree state:** preserve the three untracked scripts
+  0127–0133 as controls/falsifications. Continue only on the clean main-based
+  `exp/dsv4-sm86-qpn-register-feed`; do not merge failed archived runtime code.
+- **Unrelated worktree state:** preserve untracked
   `scripts/dsv4_decode15_bench.sh`, `scripts/dsv4_decode15_server.sh`, and
   `scripts/dsv4_server_prefill_bench.sh`.
 
 ## Exact next step
 
-Execute the first bounded C2 falsifier, not a production kernel:
+After this contract correction is committed, execute only the bounded C2
+experiment 0135 evidence audit:
 
-1. Add an isolated inline-PTX probe for
-   `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` on SM86.
-2. With known BF16 operands, map every participating lane/register to matrix
-   coordinates, compare every accumulator output against a host oracle, and
-   inspect SASS to confirm the intended native tensor instruction with no
-   spills or unintended memory operands.
-3. Record the lane map and feasibility verdict as experiment 0135. If exact,
-   extend that same bounded experiment with fragment-order E2M1/E8M0 group-32
-   prepacking and direct register decode. If the instruction or map gate fails,
-   stop and choose a different native SM86 MMA shape from evidence.
+1. Preserve and inspect the existing uncommitted BF16 MMA probe, its CMake
+   change, and raw `0135-phase-a.json`/`0135-phase-b.json` artifacts.
+2. Re-run as needed to verify the exact lane/register map for
+   `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, every accumulator
+   against the host oracle, intended `HMMA.16816.F32.BF16` SASS, register
+   count, and zero spills/unintended shared/local widened operands.
+3. Record the native BF16 lane/register result as the **shared** C2 fact.
+   Record the existing E2M1/E8M0 group-32 direct-decode portion only as
+   preliminary **FP4-specific** evidence; do not claim it proves E4M3/E8M0
+   block-128 FP8 behavior.
+4. Write experiment 0135, run `make check`, update this document, and commit
+   only that bounded result. If the shared instruction/map gate fails, stop and
+   select another SM86-native MMA shape from measured evidence.
 
-Do not build runtime dispatch, tune conventional WMMA, or copy Volta's
-`m8n8k4` lane map during this step.
+Do not begin QPN8 format implementation, runtime dispatch, conventional WMMA
+tuning, or a literal Volta port during C2. After C2, F8-0 is the required FP8
+baseline/census before F8-1, while F4-1 follows its own gate.
 
 ## Update and handoff protocol
 
 At the start of every campaign interaction:
 
-1. Read this whole document and the final log row.
+1. Read this entire document and the final log row.
 2. Run the repository preflight required by `AGENTS.md`.
-3. Verify that Current position matches Git and artifacts. If stale, correct it
-   and append a log row before new work.
+3. Verify Current position against Git, processes, and artifacts; append a
+   correction row before new work if stale.
 4. State hypothesis, primary metric, correctness gate, memory ceiling,
-   rollback, measured bottleneck, targeted term, and effects on other resources.
-5. Work on only the current milestone's cheapest falsifier.
+   rollback, measured bottleneck, targeted term, and signs on other resources.
+5. Name the track and milestone. Never use evidence or gates from the other
+   format without an explicit shared-prerequisite justification.
+6. Run only the current milestone's cheapest falsifier.
 
 Before every result commit or handoff:
 
 1. Run `make check`.
-2. Write a numbered experiment record containing raw-artifact paths, complete
-   runs, median, cost model, correctness, gate verdict, and failures.
-3. Update only the mutable milestone status and Current position sections.
+2. Write a numbered experiment record with raw paths, all runs, median, exact
+   byte formula, cost model, correctness, gate verdict, and failures.
+3. Update mutable milestone status, Current position, blockers, and Exact next
+   step.
 4. Append exactly one log row. Never edit an earlier row.
-5. State one exact next action and all real blockers. “Continue optimizing” is
-   not an acceptable next action.
+5. State one exact next action and every real blocker. “Continue optimizing” is
+   not an acceptable action.
 
 If evidence falsifies a gate, record `REJECTED` and stop that line. Do not lower
-the gate, change the batch/shape, or proceed to a dependent milestone. If an
-old statement is wrong, preserve it and add a correction row pointing to the
-new evidence.
+the threshold, change the shape/M, swap activation precision, or proceed to a
+dependent milestone. If an old statement is wrong, preserve it and append a
+correction row pointing to new evidence.
 
 ## Append-only campaign log
 
 One row represents one state-changing interaction, experiment verdict, owner
-amendment, or handoff. Keep the row concise; put detailed evidence in a tracked
-experiment document. Timestamps use America/Sao_Paulo (`-03:00`).
+amendment, or handoff. Detailed evidence belongs in tracked experiment records.
+Timestamps use America/Sao_Paulo (`-03:00`).
 
 | Timestamp | Agent/session | Branch@commit | Milestone | Action and evidence | Gate/result | Current blockers | Exact next action |
 |---|---|---|---|---|---|---|---|
 | 2026-08-22T12:53:41-03:00 | Codex / contract reset | `exp/dsv4-qpn-packed-decode@ecfb50d` before contract commit | C0 | Re-read upstream `skinny_kernels.cu`, upstream README, Reddit thread/comments, and experiments 0127–0133; established the Ampere-specific contract and corrected the QPN2 interpretation | C0 complete; no performance claim | No external blocker; SM86 register-fed mechanism unmeasured | Create `exp/dsv4-sm86-qpn-register-feed` from `main`, bring in only this documentation commit, and execute C1 only |
 | 2026-08-22T13:04:11-03:00 | Codex / experiment 0134 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | C1 | Built a clean SM86-only baseline probe; three raw runs reproduce device, ruler, production and N64 WMMA controls; see experiment 0134 | C1 complete: 840.7–845.6 GB/s ruler, exact controls, under 512 MiB; no speedup claim | No external blocker; native BF16 MMA lane/register map unmeasured | Execute experiment 0135's isolated inline-PTX `m16n8k16` lane-map, oracle and SASS gate |
+| 2026-08-22T13:19:33-03:00 | Codex / mixed-format owner correction | `exp/dsv4-sm86-qpn-register-feed@<this correction commit>` | C0A | Paused implementation; re-read experiments 0103–0105 and upstream QPN2/QPN8 source/results; expanded the authoritative contract to separate Strata FP4 W4A16 and FP8 W8A16 tracks while preserving C1, pending C2 evidence, and earlier rows | C0A complete after focused docs commit; no throughput claim; FP4 gate unchanged; no invented FP8 gate | D-F8-GATE owner decision blocks FP8 performance acceptance; C2 shared evidence remains uncommitted | Audit and record experiment 0135 only: establish the shared SM86 BF16 lane/register/SASS fact, label its FP4 decoder evidence separately, run `make check`, and stop on its gate |

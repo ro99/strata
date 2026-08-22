@@ -71,6 +71,7 @@ struct Shape {
 
 bool g_break_scale_binding = false;
 bool g_no_mma = false;
+int g_inject_bad_scale = 0;
 bool g_split_reduce = false;
 // A single 4.46 MB matrix at M=1 cannot fill an RTX 3090: it yields 0.31 waves
 // per SM, measured. Production MoE decode dispatches many routed experts per
@@ -132,6 +133,42 @@ double fp4_value(std::uint8_t code) {
 }
 
 double e8m0(std::uint8_t s) { return std::ldexp(1.0, static_cast<int>(s) - 127); }
+
+// E8M0 admission. Both FP4 decoders map the scale code straight into a BF16
+// exponent field, which is exact for codes 1-254 and silently wrong outside it:
+// code 0 means 2^-127, subnormal in BF16 whose smallest normal is 2^-126, and
+// encodes as +0; code 255 is the E8M0 NaN encoding and encodes as +inf. The
+// contract requires exact mode to execute an approved route or report failure,
+// never to substitute silently, so a region carrying either code must fail
+// admission at load rather than produce a wrong value at decode.
+constexpr std::uint8_t kE8m0AdmissibleMinimum = 1U;
+constexpr std::uint8_t kE8m0AdmissibleMaximum = 254U;
+
+struct ScaleAdmission {
+    std::uint64_t inadmissible{0U};
+    std::uint64_t subnormal_code_zero{0U};
+    std::uint64_t nan_code_255{0U};
+    std::size_t first_offset{0U};
+    std::uint8_t first_code{0U};
+    [[nodiscard]] bool admitted() const noexcept { return inadmissible == 0U; }
+};
+
+ScaleAdmission admit_e8m0_scales(const std::vector<std::uint8_t>& scales) {
+    ScaleAdmission a{};
+    for (std::size_t i = 0U; i < scales.size(); ++i) {
+        const std::uint8_t code = scales[i];
+        if (code >= kE8m0AdmissibleMinimum && code <= kE8m0AdmissibleMaximum) {
+            continue;
+        }
+        if (a.inadmissible == 0U) {
+            a.first_offset = i;
+            a.first_code = code;
+        }
+        ++a.inadmissible;
+        if (code == 0U) ++a.subnormal_code_zero; else ++a.nan_code_255;
+    }
+    return a;
+}
 
 __constant__ std::uint32_t kMagHigh[2] = {0x3F3F'3F00U, 0x4040'4040U};
 __constant__ std::uint32_t kMagLow[2] = {0xC080'0000U, 0xC080'4000U};
@@ -399,6 +436,7 @@ struct Result {
     std::uint64_t prepacked_code_bytes{0U}, prepacked_scale_bytes{0U};
     std::uint64_t device_bytes{0U};
     double max_absolute{0.0}, max_relative{0.0};
+    ScaleAdmission admission{};
     double output_max_abs{0.0}, oracle_max_abs{0.0};
     std::uint32_t nonzero_outputs{0U};
     std::uint32_t k_groups_crossed{0U};
@@ -426,6 +464,17 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     for (auto& c : canon_codes) c = static_cast<std::uint8_t>(xorshift(state) & 0x0FU);
     for (auto& s : canon_scales)
         s = static_cast<std::uint8_t>(120U + xorshift(state) % 15U);
+    if (g_inject_bad_scale != 0) {
+        // Proves the admission check can fail. A check that never fires its
+        // own control is not a check.
+        canon_scales[canon_scales.size() / 3U] =
+            static_cast<std::uint8_t>(g_inject_bad_scale > 0 ? 255U : 0U);
+    }
+    r.admission = admit_e8m0_scales(canon_scales);
+    if (!r.admission.admitted()) {
+        // Report and stop for this shape rather than decoding a wrong value.
+        return r;
+    }
     for (auto& a : activation)
         a = bf16_value(
             static_cast<float>(static_cast<int>(xorshift(state) % 9U) - 4));
@@ -754,6 +803,8 @@ int main(int argc, char** argv) {
             else if (f == "--output" && i + 1 < argc) output_path = argv[++i];
             else if (f == "--break-scale-binding") g_break_scale_binding = true;
             else if (f == "--no-mma") g_no_mma = true;
+            else if (f == "--inject-scale-nan") g_inject_bad_scale = 1;
+            else if (f == "--inject-scale-zero") g_inject_bad_scale = -1;
             else if (f == "--split-reduce") g_split_reduce = true;
             else if (f == "--m" && i + 1 < argc) {
                 g_m = static_cast<std::uint32_t>(std::stoul(argv[++i]));
@@ -803,6 +854,11 @@ int main(int argc, char** argv) {
                  << ", \"device_bytes\": " << r.device_bytes
                  << ", \"prepack_seconds\": " << std::setprecision(3)
                  << r.prepack_seconds
+                 << ", \"e8m0_admitted\": "
+                 << (r.admission.admitted() ? "true" : "false")
+                 << ", \"e8m0_inadmissible\": " << r.admission.inadmissible
+                 << ", \"e8m0_code_zero\": " << r.admission.subnormal_code_zero
+                 << ", \"e8m0_code_255\": " << r.admission.nan_code_255
                  << ", \"output_max_abs\": " << std::setprecision(3)
                  << r.output_max_abs
                  << ", \"oracle_max_abs\": " << r.oracle_max_abs
@@ -827,6 +883,18 @@ int main(int argc, char** argv) {
             std::ofstream o(output_path);
             if (!o) throw std::runtime_error("cannot open " + output_path);
             o << json.str();
+        }
+        for (const Result& r : results) {
+            if (!r.admission.admitted()) {
+                std::cerr << "admission failure: " << r.name << " carries "
+                          << r.admission.inadmissible
+                          << " inadmissible E8M0 scale codes (first: code "
+                          << static_cast<unsigned>(r.admission.first_code)
+                          << " at byte offset " << r.admission.first_offset
+                          << "); exact mode reports failure rather than "
+                             "substituting\n";
+                return EXIT_FAILURE;
+            }
         }
         if (g_no_mma) return EXIT_SUCCESS;  // attribution arm: output is meaningless
         for (const Result& r : results)

@@ -45,6 +45,13 @@ constexpr std::uint32_t kWarp = 32U;
 // read consecutive 16-byte chunks and a warp issues one fully coalesced
 // 512-byte transaction that feeds kKPerLoad MMAs.
 constexpr std::uint32_t kKPerLoad = 4U;
+// Memory-level parallelism. At M=1 this kernel is latency-bound, not
+// bandwidth- or compute-bound: decode is free (0139) and DRAM can serve
+// 847 GB/s, but a warp that loads, waits, decodes and issues has only one
+// request in flight. Hoisting kUnroll independent uint4 loads to the top of
+// the iteration multiplies requests-in-flight per warp by kUnroll, which is
+// the Ampere lever -- 4 loads cost 16 registers out of 255.
+constexpr std::uint32_t kUnroll = 1U;
 constexpr std::uint32_t kWarpsPerBlock = 4U;
 std::uint32_t g_split_k = 8U;
 constexpr std::uint32_t kWarmups = 3U;
@@ -60,6 +67,11 @@ struct Shape {
 bool g_break_scale_binding = false;
 bool g_no_mma = false;
 bool g_split_reduce = false;
+// A single 4.46 MB matrix at M=1 cannot fill an RTX 3090: it yields 0.31 waves
+// per SM, measured. Production MoE decode dispatches many routed experts per
+// layer, so this batches independent expert matrices into one launch, which is
+// the operating point the kernel will actually run at.
+std::uint32_t g_batch = 1U;
 
 constexpr Shape kShapes[] = {
     {"gate_up_w1", 2048U, 4096U},
@@ -173,13 +185,21 @@ __global__ void prepacked_matmul_kernel(
     const uint2* __restrict__ activations, std::uint32_t k_extent,
     std::uint32_t k_tiles_per_slice, std::uint32_t split_k,
     float* __restrict__ partials, std::uint32_t* __restrict__ counters,
-    float* __restrict__ output, bool fold_reduction) {
+    float* __restrict__ output, bool fold_reduction,
+    std::uint32_t n_tiles_per_matrix) {
     const std::uint32_t lane = threadIdx.x & 31U;
     const std::uint32_t warp = threadIdx.x >> 5U;
     const std::uint32_t global_warp = blockIdx.x * kWarpsPerBlock + warp;
-    const std::uint32_t n_tile = global_warp / split_k;
+    const std::uint32_t flat_tile = global_warp / split_k;
+    const std::uint32_t n_tile = flat_tile % n_tiles_per_matrix;
+    const std::uint32_t batch = flat_tile / n_tiles_per_matrix;
     const std::uint32_t slice = global_warp % split_k;
     const std::uint32_t k_tiles = k_extent / kTileK;
+    // Each batch element is an independent expert matrix laid out end to end.
+    codes += static_cast<std::size_t>(batch) * n_tiles_per_matrix * k_tiles *
+             kWarp;
+    scales += static_cast<std::size_t>(batch) * n_tiles_per_matrix *
+              (k_extent / kGroup) * kTileN;
     const std::uint32_t group = lane >> 2U;
     const std::uint32_t thread = lane & 3U;
     __shared__ std::uint32_t arrived[kWarpsPerBlock];
@@ -190,22 +210,44 @@ __global__ void prepacked_matmul_kernel(
     const std::uint32_t shift = (group & 3U) * 8U;
     const std::uint32_t begin = slice * (k_tiles_per_slice / kKPerLoad);
     const std::uint32_t end = begin + k_tiles_per_slice / kKPerLoad;
-    for (std::uint32_t kb = begin; kb < end && kb < k_blocks; ++kb) {
-        // One coalesced 16-byte load per lane covers kKPerLoad K-tiles.
-        const uint4 packed_words =
-            reinterpret_cast<const uint4*>(codes)[(n_tile * k_blocks + kb) *
-                                                      kWarp + lane];
-        const std::uint32_t word[kKPerLoad] = {packed_words.x, packed_words.y,
-                                               packed_words.z, packed_words.w};
+    const uint4* code4 = reinterpret_cast<const uint4*>(codes);
+    for (std::uint32_t kb = begin; kb < end && kb < k_blocks; kb += kUnroll) {
+        // Every load for this iteration is issued before any of them is
+        // consumed, so kUnroll DRAM requests per lane are in flight at once.
+        uint4 packed[kUnroll];
+        uint4 even[kUnroll];
+        uint4 odd[kUnroll];
+        uint2 bfrag[kUnroll][kKPerLoad];
+#pragma unroll
+        for (std::uint32_t u = 0U; u < kUnroll; ++u) {
+            const std::uint32_t block = kb + u;
+            packed[u] = code4[(n_tile * k_blocks + block) * kWarp + lane];
+            const unsigned char* base =
+                scales + static_cast<std::size_t>(
+                             n_tile * (k_extent / kGroup) + block * 2U) *
+                             kTileN;
+            even[u] = *reinterpret_cast<const uint4*>(base);
+            odd[u] = *reinterpret_cast<const uint4*>(base + kTileN);
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kKPerLoad; ++j) {
+                // At M=1 only B column 0 is non-zero, so the store holds just
+                // the four distinct fragments per K-tile instead of a full
+                // 32-lane tile that is 7/8 zeros. All eight lanes of a column
+                // group read the same address, which is a broadcast, and the
+                // zero for groups 1-7 is a predicated select rather than a
+                // load. This removes 8.39 MB of activation traffic per matrix
+                // pass, which was 2x the code traffic.
+                bfrag[u][j] =
+                    activations[(block * kKPerLoad + j) * 4U + thread];
+            }
+        }
 
-        // kKPerLoad K-tiles span exactly two E8M0 groups, both read as
-        // 16-byte broadcast loads rather than per-lane byte loads.
-        const unsigned char* group_base =
-            scales + static_cast<std::size_t>(n_tile * (k_extent / kGroup) +
-                                              kb * 2U) * kTileN;
-        const uint4 scales_even = *reinterpret_cast<const uint4*>(group_base);
-        const uint4 scales_odd =
-            *reinterpret_cast<const uint4*>(group_base + kTileN);
+#pragma unroll
+        for (std::uint32_t u = 0U; u < kUnroll; ++u) {
+        const std::uint32_t word[kKPerLoad] = {packed[u].x, packed[u].y,
+                                               packed[u].z, packed[u].w};
+        const uint4 scales_even = even[u];
+        const uint4 scales_odd = odd[u];
 
 #pragma unroll
         for (std::uint32_t j = 0U; j < kKPerLoad; ++j) {
@@ -223,8 +265,8 @@ __global__ void prepacked_matmul_kernel(
             decode_fragment<kBreakScaleBinding>(word[j], scale_low, scale_high,
                                                 a);
 
-            const uint2 b =
-                activations[(kb * kKPerLoad + j) * kWarp + lane];
+            const uint2 raw = bfrag[u][j];
+            const uint2 b = (group == 0U) ? raw : make_uint2(0U, 0U);
             if constexpr (kUseMma) {
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -239,6 +281,7 @@ __global__ void prepacked_matmul_kernel(
                 d3 += __int_as_float(a[3]);
             }
         }
+        }
     }
 
     // D fragment: row = group + (i>=2 ? 8 : 0), column = thread*2 + (i&1).
@@ -248,7 +291,7 @@ __global__ void prepacked_matmul_kernel(
     // the real column is stored.
     if (thread == 0U) {
         float* slot = partials + static_cast<std::size_t>(
-                                     n_tile * split_k + slice) * kTileN;
+                                     flat_tile * split_k + slice) * kTileN;
         slot[group] = d0;
         slot[group + 8U] = d2;
     }
@@ -265,19 +308,19 @@ __global__ void prepacked_matmul_kernel(
     if (lane == 0U) {
         // One slot per warp in the block, not per N-tile: warps in a block
         // carry different N-tiles.
-        arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        arrived[warp] = atomicAdd(&counters[flat_tile], 1U);
     }
     __syncwarp();
     if (fold_reduction && arrived[warp] == split_k - 1U) {
         if (lane < kTileN) {
             float sum = 0.0F;
             for (std::uint32_t sl = 0U; sl < split_k; ++sl) {
-                sum += partials[(static_cast<std::size_t>(n_tile) * split_k +
+                sum += partials[(static_cast<std::size_t>(flat_tile) * split_k +
                                  sl) * kTileN + lane];
             }
-            output[n_tile * kTileN + lane] = sum;
+            output[flat_tile * kTileN + lane] = sum;
         }
-        if (lane == 0U) counters[n_tile] = 0U;
+        if (lane == 0U) counters[flat_tile] = 0U;
     }
 }
 
@@ -285,7 +328,7 @@ __global__ void reduce_kernel(const float* __restrict__ partials,
                               std::uint32_t n_tiles, std::uint32_t split_k,
                               float* __restrict__ out) {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    const std::uint32_t total = n_tiles * kTileN;
+    const std::uint32_t total = n_tiles * kTileN;  // n_tiles is batch-global
     if (index >= total) return;
     const std::uint32_t n_tile = index / kTileN;
     const std::uint32_t row = index % kTileN;
@@ -406,36 +449,34 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     // b0 = rows {2t, 2t+1} and b1 = rows {2t+8, 2t+9} of column `group`. Only
     // column 0 is real at M=1, so lanes with group != 0 carry zeros.
     std::vector<std::uint32_t> activation_frag(
-        static_cast<std::size_t>(k_tiles) * kWarp * 2U);
+        static_cast<std::size_t>(k_tiles) * 4U * 2U);
     for (std::uint32_t kt = 0U; kt < k_tiles; ++kt) {
-        for (std::uint32_t lane = 0U; lane < kWarp; ++lane) {
-            const std::uint32_t g = lane >> 2U, t = lane & 3U;
-            std::uint32_t b0 = 0U, b1 = 0U;
-            if (g == 0U) {
-                const std::uint32_t base = kt * kTileK;
-                b0 = static_cast<std::uint32_t>(
-                         bf16_bits(activation[base + t * 2U])) |
-                     (static_cast<std::uint32_t>(
-                          bf16_bits(activation[base + t * 2U + 1U]))
-                      << 16U);
-                b1 = static_cast<std::uint32_t>(
-                         bf16_bits(activation[base + t * 2U + 8U])) |
-                     (static_cast<std::uint32_t>(
-                          bf16_bits(activation[base + t * 2U + 9U]))
-                      << 16U);
-            }
-            activation_frag[(static_cast<std::size_t>(kt) * kWarp + lane) * 2U] = b0;
-            activation_frag[(static_cast<std::size_t>(kt) * kWarp + lane) * 2U + 1U] = b1;
+        for (std::uint32_t t = 0U; t < 4U; ++t) {
+            const std::uint32_t base = kt * kTileK;
+            const std::uint32_t b0 =
+                static_cast<std::uint32_t>(
+                    bf16_bits(activation[base + t * 2U])) |
+                (static_cast<std::uint32_t>(
+                     bf16_bits(activation[base + t * 2U + 1U]))
+                 << 16U);
+            const std::uint32_t b1 =
+                static_cast<std::uint32_t>(
+                    bf16_bits(activation[base + t * 2U + 8U])) |
+                (static_cast<std::uint32_t>(
+                     bf16_bits(activation[base + t * 2U + 9U]))
+                 << 16U);
+            activation_frag[(static_cast<std::size_t>(kt) * 4U + t) * 2U] = b0;
+            activation_frag[(static_cast<std::size_t>(kt) * 4U + t) * 2U + 1U] = b1;
         }
     }
 
-    DeviceBuffer d_codes(r.prepacked_code_bytes);
-    DeviceBuffer d_scales(r.prepacked_scale_bytes);
+    DeviceBuffer d_codes(r.prepacked_code_bytes * g_batch);
+    DeviceBuffer d_scales(r.prepacked_scale_bytes * g_batch);
     DeviceBuffer d_act(activation_frag.size() * sizeof(std::uint32_t));
-    DeviceBuffer d_partials(static_cast<std::size_t>(n_tiles) * g_split_k *
-                            kTileN * sizeof(float));
-    DeviceBuffer d_out(static_cast<std::size_t>(n) * sizeof(float));
-    DeviceBuffer d_counters(static_cast<std::size_t>(n_tiles) *
+    DeviceBuffer d_partials(static_cast<std::size_t>(n_tiles) * g_batch *
+                            g_split_k * kTileN * sizeof(float));
+    DeviceBuffer d_out(static_cast<std::size_t>(n) * g_batch * sizeof(float));
+    DeviceBuffer d_counters(static_cast<std::size_t>(n_tiles) * g_batch *
                             sizeof(std::uint32_t));
     check(cudaMemsetAsync(d_counters.get(), 0, d_counters.bytes(), stream),
           "zero split-K counters");
@@ -443,25 +484,39 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     r.device_bytes = d_codes.bytes() + d_scales.bytes() + d_act.bytes() +
                      d_partials.bytes() + d_out.bytes();
 
-    check(cudaMemcpyAsync(d_codes.get(), frag_codes.data(),
-                          r.prepacked_code_bytes, cudaMemcpyHostToDevice,
-                          stream), "upload fragment codes");
-    check(cudaMemcpyAsync(d_scales.get(), frag_scales.data(),
-                          r.prepacked_scale_bytes, cudaMemcpyHostToDevice,
-                          stream), "upload fragment scales");
+    for (std::uint32_t b = 0U; b < g_batch; ++b) {
+        check(cudaMemcpyAsync(
+                  static_cast<unsigned char*>(d_codes.get()) +
+                      static_cast<std::size_t>(b) * r.prepacked_code_bytes,
+                  frag_codes.data(), r.prepacked_code_bytes,
+                  cudaMemcpyHostToDevice, stream), "upload fragment codes");
+        check(cudaMemcpyAsync(
+                  static_cast<unsigned char*>(d_scales.get()) +
+                      static_cast<std::size_t>(b) * r.prepacked_scale_bytes,
+                  frag_scales.data(), r.prepacked_scale_bytes,
+                  cudaMemcpyHostToDevice, stream), "upload fragment scales");
+    }
     check(cudaMemcpyAsync(d_act.get(), activation_frag.data(),
                           d_act.bytes(), cudaMemcpyHostToDevice, stream),
           "upload B-fragment activations");
     check(cudaStreamSynchronize(stream), "finish uploads");
 
-    const std::uint32_t warps = n_tiles * g_split_k;
+    const std::uint32_t k_blocks_total = k_tiles / kKPerLoad;
+    if (k_blocks_total % (g_split_k * kUnroll) != 0U) {
+        throw std::runtime_error(
+            "split-K " + std::to_string(g_split_k) +
+            " leaves " + std::to_string(k_blocks_total / g_split_k) +
+            " blocks per slice, which is not a multiple of the unroll " +
+            std::to_string(kUnroll) + "; this would silently skip work");
+    }
+    const std::uint32_t warps = n_tiles * g_batch * g_split_k;
     const std::uint32_t blocks = warps / kWarpsPerBlock;
     const std::uint32_t k_tiles_per_slice = k_tiles / g_split_k;
 
     const auto launch_reduce = [&] {
-        reduce_kernel<<<(n + 255U) / 256U, 256U, 0U, stream>>>(
-            static_cast<const float*>(d_partials.get()), n_tiles, g_split_k,
-            static_cast<float*>(d_out.get()));
+        reduce_kernel<<<(n * g_batch + 255U) / 256U, 256U, 0U, stream>>>(
+            static_cast<const float*>(d_partials.get()), n_tiles * g_batch,
+            g_split_k, static_cast<float*>(d_out.get()));
     };
     const auto launch_matmul = [&] {
         if (g_no_mma)
@@ -473,7 +528,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                     k_tiles_per_slice, g_split_k,
                     static_cast<float*>(d_partials.get()),
                     static_cast<std::uint32_t*>(d_counters.get()),
-                    static_cast<float*>(d_out.get()), !g_split_reduce);
+                    static_cast<float*>(d_out.get()), !g_split_reduce, n_tiles);
         else if (g_break_scale_binding)
             prepacked_matmul_kernel<true>
                 <<<blocks, kWarpsPerBlock * kWarp, 0U, stream>>>(
@@ -483,7 +538,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                     k_tiles_per_slice, g_split_k,
                     static_cast<float*>(d_partials.get()),
                     static_cast<std::uint32_t*>(d_counters.get()),
-                    static_cast<float*>(d_out.get()), !g_split_reduce);
+                    static_cast<float*>(d_out.get()), !g_split_reduce, n_tiles);
         else
         prepacked_matmul_kernel<false>
             <<<blocks, kWarpsPerBlock * kWarp, 0U, stream>>>(
@@ -493,7 +548,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
             k_tiles_per_slice, g_split_k,
             static_cast<float*>(d_partials.get()),
             static_cast<std::uint32_t*>(d_counters.get()),
-            static_cast<float*>(d_out.get()), !g_split_reduce);
+            static_cast<float*>(d_out.get()), !g_split_reduce, n_tiles);
     };
     const auto launch = [&] {
         launch_matmul();
@@ -592,7 +647,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
             chain.push_back(ms / static_cast<float>(kChain));
         }
         r.pipelined_us = median(std::move(chain)) * 1.0e3F;
-        r.pipelined_gbps = static_cast<double>(r.useful_bytes) /
+        r.pipelined_gbps = static_cast<double>(r.useful_bytes * g_batch) /
                            (static_cast<double>(r.pipelined_us) * 1.0e-6) / 1.0e9;
     }
 
@@ -634,6 +689,8 @@ int main(int argc, char** argv) {
             else if (f == "--break-scale-binding") g_break_scale_binding = true;
             else if (f == "--no-mma") g_no_mma = true;
             else if (f == "--split-reduce") g_split_reduce = true;
+            else if (f == "--batch" && i + 1 < argc)
+                g_batch = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (f == "--split-k" && i + 1 < argc)
                 g_split_k = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else { std::cerr << "usage: " << argv[0]

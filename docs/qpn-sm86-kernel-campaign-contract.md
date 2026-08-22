@@ -392,6 +392,7 @@ inference. Never promote lower-ranked contradictory evidence.
 | 0132 | Independent M=8/M=16 conventional FP4 WMMA profile | 124–140 GB/s with same eligibility defect | Batch did not move the bottleneck. |
 | 0133 | N64 versus N128 conventional FP4 WMMA geometry | N64 150.1–161.2 GB/s at M=8/16, 1.107–1.179x faster | Useful control only; far below goal and not production-promoted. |
 | 0134 | Clean-branch FP4 baseline, SM86 ruler, production and N64 controls | Ruler 840.7–845.6 GB/s; production 87.04; N64 161.37/174.08; exact; 418.5–419.0 MiB | C1 complete for its declared FP4 scope. It is preserved and is not an FP8 baseline. |
+| 0135 | Shared native SM86 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` lane/register map, oracle, SASS, spill/memory-path and register/occupancy audit; plus separately labeled preliminary FP4 decoder evidence | Bit-exact on both BF16 fixtures over all 128 D elements, three identical processes; one `HMMA.16816.F32.BF16` per MMA kernel and no other `HMMA` form; 16 and 28 registers/thread agreed by ptxas and the runtime; 0 spill/stack bytes; 0 `LDL`/`STL`/`LDS`/`STS`/`LDSM`/`LDGSTS`/`BAR`; 1,280 B per fixture. FP4-specific: 63,744 exhaustive decode cases, 0 mismatches; register-fed FP4 fixture bit-exact | C2 complete for the shared native-MMA fact. No throughput measured or claimed. FP4 evidence is preliminary and is explicitly not an E4M3/E8M0 block-128 proof. Four recorded FP4 limitations — E8M0 window 2–250 only, scale bound per M row rather than per group of 32 along K, single MMA rather than a kernel, and a measured decoder ALU instruction mix — are carried into F4-1. |
 
 ### Do not repeat without new evidence
 
@@ -421,13 +422,13 @@ MIX milestones depend on acceptance of both tracks. A failed hypothesis is
 | ID | Milestone | Gate | Status | Evidence / note |
 |---|---|---|---|---|
 | C0 | Freeze original Ampere QPN understanding | FP4 contract recorded target, sources, corrections, tried work, and protocol | **COMPLETE, SCOPE SUPERSEDED** | Original 2026-08-22 contract; history preserved |
-| C0A | Correct umbrella scope to mixed FP4/FP8 | Contract records both exact formats, independent gates, path distinctions, mixed dispatch, sources, blockers, and protocol | **COMPLETE WITH THIS COMMIT** | Owner amendment, 2026-08-22 |
+| C0A | Correct umbrella scope to mixed FP4/FP8 | Contract records both exact formats, independent gates, path distinctions, mixed dispatch, sources, blockers, and protocol | **COMPLETE** | Owner amendment, 2026-08-22, committed as `8cbd030` |
 | C1 | Establish clean SM86 FP4 baseline | Fresh main-based branch; device, ruler, FP4 controls/formula/correctness reproduced three times | **COMPLETE** | Experiment 0134; valid work preserved |
-| C2 | Prove the shared native SM86 register-fragment prerequisite | Exact BF16 MMA lane/register map, oracle, SASS, spill/memory-path audit, and feasibility; format-specific decoder evidence labeled separately | **NEXT** | Preserved uncommitted 0135 phase A/B evidence must be audited and recorded; it is not yet a milestone commit |
-| F4-1 | Prove exact QPN2-derived FP4 primitive | E2M1/E8M0 group-32 fragment prepack and direct W4A16 register feed; exact decoder/matrix gates; no widened persistent path; feasible cost model | **PENDING on C2** | Independent FP4 microbenchmark/resource model |
+| C2 | Prove the shared native SM86 register-fragment prerequisite | Exact BF16 MMA lane/register map, oracle, SASS, spill/memory-path audit, and feasibility; format-specific decoder evidence labeled separately | **COMPLETE** | Experiment 0135. Preserved phase A/B artifacts audited and reproduced byte-for-byte by three new processes. Shared fact is the BF16 map, instruction, register-fed operand contract, and measured register budget only |
+| F4-1 | Prove exact QPN2-derived FP4 primitive | E2M1/E8M0 group-32 fragment prepack and direct W4A16 register feed; exact decoder/matrix gates; no widened persistent path; feasible cost model | **NEXT (FP4 track)** | Independent FP4 microbenchmark/resource model. Must close 0135's four FP4 limitations, especially the group-32 scale-to-K binding, and must pin K to the PTX coordinate rather than to 0135's self-consistent gauge |
 | F4-2 | Clear FP4 M=1 parity | >600.0 GB/s cold on both production shapes, full candidate step, three interleaved process medians, oracle clean | **PENDING on F4-1** | No favorable-shape pass |
 | F4-3 | Clear FP4 surpass curve | >=632 GB/s at M `{1,4,8}` both shapes and >301.9 GB/s at M=16 | **PENDING on F4-2** | Per-M cost models required |
-| F8-0 | Inventory and baseline Strata FP8 W8A16 operating points | Enumerate real regions/shapes/M/boundaries; measure scalar/native, existing W8A8-style WMMA control where eligible, ruler, exact bytes, and `argmax` independently | **PENDING on C2** | Experiments 0103–0105 are prior evidence, not the new W8A16 baseline |
+| F8-0 | Inventory and baseline Strata FP8 W8A16 operating points | Enumerate real regions/shapes/M/boundaries; measure scalar/native, existing W8A8-style WMMA control where eligible, ruler, exact bytes, and `argmax` independently | **NEXT (FP8 track)** | Experiments 0103–0105 are prior evidence, not the new W8A16 baseline. Not blocked by D-F8-GATE and not dependent on F4-1. 0135's FP4 decoder evidence carries nothing here |
 | D-F8-GATE | Bind FP8 performance threshold and required M coverage | Owner selects absolute-throughput, local-efficiency, or another evidence-backed gate and names required operating points | **BLOCKED — OWNER DECISION** | Derived candidates: about 690/682/539 GB/s for equal V100 efficiency; not binding |
 | F8-1 | Prove exact QPN8-derived FP8 primitive | E4M3/E8M0 block-128 fragment prepack and direct W8A16 register feed; independent decoder/matrix/boundary gates; no widened persistent path | **PENDING on C2 and F8-0** | Independent FP8 microbenchmark/resource model |
 | F8-2 | Clear owner-bound FP8 performance curve | Satisfy D-F8-GATE on every required shape/M with three interleaved process medians and independent correctness | **BLOCKED on D-F8-GATE and F8-1** | FP4 thresholds forbidden here |
@@ -438,29 +439,63 @@ MIX milestones depend on acceptance of both tracks. A failed hypothesis is
 
 Last updated: 2026-08-22
 
-- **Current milestone:** C0A completes with the focused contract-correction
-  commit. The exact next gated experiment is C2; no runtime implementation may
-  advance until this correction is committed.
+- **Current milestone:** C2 is **COMPLETE** with experiment 0135. The FP4 and
+  FP8 tracks are now independent and both are open: F4-1 is the next FP4 gate
+  and F8-0 is the next FP8 gate. Neither may borrow the other's evidence.
+- **The shared C2 fact, and only this:** on the identified RTX 3090,
+  `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` has a verified
+  lane/register map for A (4 x b32), B (2 x b32) and C/D (4 x f32), is
+  bit-exact against a host oracle over all 128 accumulator elements in three
+  identical processes, lowers to `HMMA.16816.F32.BF16` and no other `HMMA`
+  form, and takes every operand from registers with 0 spill bytes, 0 shared
+  memory and 0 barriers at 16 registers per thread, 28 with an FP4 decoder
+  in front of it.
+- **The measured register budget for both tracks:** 65,536 registers and 48
+  warps per SM on this device, so 100% occupancy needs <= 32 registers per
+  thread, 67% needs <= 64, 44% needs <= 96, 33% needs <= 128. 0135's reported
+  33.3% occupancy is the 16-blocks-per-SM cap meeting a one-warp-per-block
+  probe and must never be quoted as a kernel occupancy result.
+- **Known gauge, and where it stops being free:** a functional MMA test cannot
+  distinguish a shared M relabeling between A and D, a shared N relabeling
+  between B and D, or a shared K relabeling between A and B. These are
+  invariants of the instruction, pinned by the PTX specification rather than by
+  measurement. The K relabeling becomes observable wherever an external index
+  is bound to the true K coordinate, which is exactly what an FP4 group-32
+  scale and an FP8 block-128 scale both do. F4-1 and F8-1 each owe an
+  independent scale-to-K binding proof.
 - **Preserved validated work:** C1/experiment 0134 remains complete for FP4:
   RTX 3090 ruler 840.7–845.6 GB/s, production control 87.04 GB/s, exact N64
-  conventional WMMA 161.37/174.08 GB/s, and 418.5–419.0 MiB allocation.
-- **Preserved pending work:** the uncommitted CMake entry and
-  `apps/strata_dsv4_sm86_bf16_mma_probe.cu`, with ignored
-  `results/qpn-sm86/0135-phase-a.json` and `0135-phase-b.json`, contain pending
-  C2 evidence. They are deliberately not part of this documentation commit and
-  must not be discarded or silently promoted.
+  conventional WMMA 161.37/174.08 GB/s, and 418.5–419.0 MiB allocation. The
+  previously uncommitted `0135-phase-a.json` and `0135-phase-b.json` were
+  audited, reproduced byte-for-byte by three new processes, and are now
+  recorded rather than pending.
+- **Preliminary FP4-only evidence, not a milestone:** an exhaustive
+  E2M1/E8M0 decode of 63,744 cases with 0 mismatches, and a register-fed FP4
+  fixture that is bit-exact and places its four decoder `LOP3` results directly
+  in the MMA operand registers. It carries four recorded limitations into F4-1:
+  the tested E8M0 window is codes 2–250 rather than 0–255, the fixture binds
+  one scale per A row rather than per group of 32 along K, one MMA is not a
+  kernel, and the decoder's measured ALU instruction mix could reintroduce the
+  0130/0131 issue-bound term. None of it is FP8 evidence.
 - **What does not exist:** an accepted Ampere-native register-fed production
-  kernel for either Strata FP4 W4A16 or Strata FP8 W8A16, an independent new
-  FP8 W8A16 operating-point baseline, or accepted mixed production dispatch.
-- **Measured bottlenecks:** FP4 legacy SIMT is instruction/ALU-bound and FP4
-  conventional WMMA has an ALU plus no-eligible/barrier serial defect. Existing
-  FP8 multi-row scalar production exhibited 677x logical weight rereads; the
-  accepted WMMA control removes that volume defect but has 48 KiB shared-memory
-  staging. The intended W8A16 operating points still require a fresh `argmax`
-  profile before mechanism work.
+  kernel for either Strata FP4 W4A16 or Strata FP8 W8A16, any throughput number
+  for a register-fed candidate, an independent new FP8 W8A16 operating-point
+  baseline, or accepted mixed production dispatch.
+- **Measured bottlenecks:** unchanged, and no C2 evidence displaces them. FP4
+  legacy SIMT is instruction/ALU-bound and FP4 conventional WMMA has an ALU
+  plus no-eligible/barrier serial defect. Existing FP8 multi-row scalar
+  production exhibited 677x logical weight rereads; the accepted WMMA control
+  removes that volume defect but has 48 KiB shared-memory staging. Both F4-1
+  and F8-1 must instantiate `tau` at their own operating points and may inherit
+  no constant from 0130, 0131, or 0135.
+- **Device enumeration, confirmed not assumed:** `nvidia-smi` reports the RTX
+  5060 Ti at index 0 and the RTX 3090s at 1 and 2; the CUDA runtime reports the
+  RTX 3090s at 0 and 1 and the 5060 Ti at 2. The orders are nearly reversed.
+  Every probe must hard-check compute capability 8.6 and record `device_name`
+  inline, as 0135's probe does and exercises.
 - **Current blockers:** D-F8-GATE is an explicit owner blocker for FP8
-  performance acceptance. It does not block C2 shared measurement, F8 format/
-  correctness inventory, or an FP8 baseline; it blocks declaring F8-2 passed.
+  performance acceptance. It does not block F8-0, C2 shared measurement, or FP8
+  format/correctness inventory; it blocks declaring F8-2 passed.
 - **Branch disposition:** preserve `exp/dsv4-qpn-packed-decode` and experiments
   0127–0133 as controls/falsifications. Continue only on the clean main-based
   `exp/dsv4-sm86-qpn-register-feed`; do not merge failed archived runtime code.
@@ -470,26 +505,42 @@ Last updated: 2026-08-22
 
 ## Exact next step
 
-After this contract correction is committed, execute only the bounded C2
-experiment 0135 evidence audit:
+C2 is closed. Two independent successors are unblocked; run one, and do not
+let either borrow the other's evidence.
 
-1. Preserve and inspect the existing uncommitted BF16 MMA probe, its CMake
-   change, and raw `0135-phase-a.json`/`0135-phase-b.json` artifacts.
-2. Re-run as needed to verify the exact lane/register map for
-   `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, every accumulator
-   against the host oracle, intended `HMMA.16816.F32.BF16` SASS, register
-   count, and zero spills/unintended shared/local widened operands.
-3. Record the native BF16 lane/register result as the **shared** C2 fact.
-   Record the existing E2M1/E8M0 group-32 direct-decode portion only as
-   preliminary **FP4-specific** evidence; do not claim it proves E4M3/E8M0
-   block-128 FP8 behavior.
-4. Write experiment 0135, run `make check`, update this document, and commit
-   only that bounded result. If the shared instruction/map gate fails, stop and
-   select another SM86-native MMA shape from measured evidence.
+**FP4 track — F4-1.** Build the E2M1/E8M0 group-32 fragment prepack and the
+direct W4A16 register feed for the real production shapes
+`gate_up_w1 [N=2048,K=4096]` and `down_w2 [N=4096,K=2048]`. Before any
+throughput arm, close 0135's limitations in this order, because each gates the
+next:
 
-Do not begin QPN8 format implementation, runtime dispatch, conventional WMMA
-tuning, or a literal Volta port during C2. After C2, F8-0 is the required FP8
-baseline/census before F8-1, while F4-1 follows its own gate.
+1. Pin K to the PTX coordinate and prove the group-32 scale-to-K binding
+   across a group boundary. 0135 never crossed one.
+2. Either extend the E2M1/E8M0 decode proof across the full 0–255 E8M0 range
+   or carry an explicit admission check that rejects out-of-window scale codes.
+   A silently wrong value for a real checkpoint scale byte is a correctness
+   defect, not a performance question.
+3. Instantiate `tau = max_r(W_r/B_r) + Sigma_serial` at the FP4 operating point
+   with the decoder's ALU term included, and name `argmax`. If the decoder
+   becomes the new `argmax`, stop and report rather than proceeding to a
+   bandwidth arm.
+
+Only then run the FP4 microbenchmark under the section 3 protocol — cold arena
+rotation, L2 scrub, actual shapes, full candidate timing, three warmups, eleven
+samples, three independent interleaved process medians — against the
+unmoved >600.0 GB/s M=1 parity gate on both shapes.
+
+**FP8 track — F8-0.** Inventory every real FP8 region, operation, `(M,N,K)`,
+activation carrier, publication boundary, and frequency in the target workload,
+then measure the scalar/native incumbent, the existing W8A8-style WMMA control
+where eligible, the read ceiling, the exact `W_FP8 = N*K + (N/128)*(K/128)`
+bytes, and `argmax` independently per M band. Do not copy upstream's region
+census or M boundaries, do not reuse 0135's FP4 decoder evidence, and do not
+declare any FP8 performance verdict — **D-F8-GATE remains open and unresolved,
+and only the owner can close it.**
+
+Do not begin runtime dispatch, conventional WMMA tuning, or a literal Volta
+port on either track.
 
 ## Update and handoff protocol
 
@@ -532,3 +583,4 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-22T12:53:41-03:00 | Codex / contract reset | `exp/dsv4-qpn-packed-decode@ecfb50d` before contract commit | C0 | Re-read upstream `skinny_kernels.cu`, upstream README, Reddit thread/comments, and experiments 0127–0133; established the Ampere-specific contract and corrected the QPN2 interpretation | C0 complete; no performance claim | No external blocker; SM86 register-fed mechanism unmeasured | Create `exp/dsv4-sm86-qpn-register-feed` from `main`, bring in only this documentation commit, and execute C1 only |
 | 2026-08-22T13:04:11-03:00 | Codex / experiment 0134 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | C1 | Built a clean SM86-only baseline probe; three raw runs reproduce device, ruler, production and N64 WMMA controls; see experiment 0134 | C1 complete: 840.7–845.6 GB/s ruler, exact controls, under 512 MiB; no speedup claim | No external blocker; native BF16 MMA lane/register map unmeasured | Execute experiment 0135's isolated inline-PTX `m16n8k16` lane-map, oracle and SASS gate |
 | 2026-08-22T13:19:33-03:00 | Codex / mixed-format owner correction | `exp/dsv4-sm86-qpn-register-feed@<this correction commit>` | C0A | Paused implementation; re-read experiments 0103–0105 and upstream QPN2/QPN8 source/results; expanded the authoritative contract to separate Strata FP4 W4A16 and FP8 W8A16 tracks while preserving C1, pending C2 evidence, and earlier rows | C0A complete after focused docs commit; no throughput claim; FP4 gate unchanged; no invented FP8 gate | D-F8-GATE owner decision blocks FP8 performance acceptance; C2 shared evidence remains uncommitted | Audit and record experiment 0135 only: establish the shared SM86 BF16 lane/register/SASS fact, label its FP4 decoder evidence separately, run `make check`, and stop on its gate |
+| 2026-08-22T13:42:10-03:00 | Claude Opus 5 / experiment 0135 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | C2 | Audited the preserved `0135-phase-a/b.json` and the uncommitted probe, reproduced them byte-for-byte in three independent processes, then added the missing C2 evidence the preserved artifacts did not carry: `HMMA.16816.F32.BF16` SASS confirmation, ptxas and runtime register counts, a spill/shared/barrier memory-path census, and a measured on-device register/occupancy budget. Confirmed the enumeration hazard is nearly a reversal — `nvidia-smi` 0 is the 5060 Ti, CUDA 0 is a 3090 — and exercised the probe's SM86 hard check. See experiment 0135 | C2 complete for the shared native-MMA fact: bit-exact on all 128 D elements, one `HMMA.16816.F32.BF16` per MMA kernel and no other form, 16/28 registers per thread agreed by ptxas and the runtime, 0 spill bytes, 0 `LDL`/`STL`/`LDS`/`STS`/`LDSM`/`LDGSTS`/`BAR`, 1,280 B per fixture, `make check` exit 0. **No throughput measured or claimed.** FP4 decoder evidence recorded as preliminary and FP4-only, with four limitations carried to F4-1; explicitly not an E4M3/E8M0 block-128 proof | D-F8-GATE owner decision still blocks FP8 performance acceptance and only the owner can close it; it does not block F8-0. The MMA's M/N/K relabeling gauge is pinned by the PTX specification rather than by measurement, so F4-1 and F8-1 each owe an independent scale-to-K binding proof | Run one of two now-independent successors. F4-1: prove the group-32 scale-to-K binding across a group boundary, close or admission-guard the E8M0 0–255 range, instantiate `tau` including the decoder ALU term and name `argmax`, and only then run the section 3 FP4 microbenchmark against the unmoved >600.0 GB/s M=1 gate on both production shapes. F8-0: inventory every real FP8 region/shape/M/boundary and measure the incumbent, control, ceiling, exact bytes and `argmax` per M band, declaring no FP8 performance verdict |

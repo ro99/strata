@@ -324,6 +324,20 @@ if(STRATA_HAS_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
     )
 
+    add_executable(strata-dsv4-sm86-bf16-mma-probe
+        apps/strata_dsv4_sm86_bf16_mma_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-bf16-mma-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-bf16-mma-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-bf16-mma-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-bf16-mma-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-bf16-mma-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
     if(STRATA_ENABLE_NCCL)
         # NCCL is rarely installed system-wide. In practice it arrives with the
         # CUDA toolkit or as the nvidia-nccl-cu12 wheel inside a Python

@@ -532,8 +532,8 @@ MIX milestones depend on acceptance of both tracks. A failed hypothesis is
 | F4-3 | Clear FP4 surpass curve | >=632 GB/s at M `{1,4,8}` both shapes and >301.9 GB/s at M=16 | **PENDING on F4-2** | Per-M cost models required |
 | F8-0 | Inventory and baseline Strata FP8 W8A16 operating points | Enumerate real regions/shapes/M/boundaries; measure scalar/native, existing W8A8-style WMMA control where eligible, ruler, exact bytes, and `argmax` independently | **COMPLETE (experiment 0143)** | 390 actual modules, nine unique shapes, real M/tile bands, exact bytes, 216 raw process arms/72 process medians, 834.85–845.63 GB/s ruler, per-band cost model and Nsight attribution. No QPN8 or F8-2 verdict |
 | D-F8-GATE | Bind FP8 performance threshold and required M coverage | Owner selects absolute-throughput, local-efficiency, or another evidence-backed gate and names required operating points | **COMPLETE — OWNER BOUND 2026-08-22** | Equal local-read-roofline efficiency: >=82% at every M in `{1,2,3,4}`, >=81% at M=8, >=64% at M=16, on every eligible protected production shape; 690/682/539 GB/s at the 842 GB/s reference ruler |
-| F8-1 | Prove exact QPN8-derived FP8 primitive | E4M3/E8M0 block-128 fragment prepack and direct W8A16 register feed; independent decoder/matrix/boundary gates; no widened persistent path | **NEXT — dependencies C2 and F8-0 complete** | Begin with the E4M3/E8M0 scale-to-K/register-feed proof and the 2.10/4.19 MiB launch-wave upper bound from experiment 0143; no performance verdict yet |
-| F8-2 | Clear owner-bound FP8 performance curve | Satisfy D-F8-GATE on every required shape/M with three interleaved process medians and independent correctness | **PENDING on F8-1** | Equal-local-roofline gate is binding; FP4 thresholds forbidden here |
+| F8-1 | Prove exact QPN8-derived FP8 primitive | E4M3/E8M0 block-128 fragment prepack and direct W8A16 register feed; independent decoder/matrix/boundary gates; no widened persistent path | **REJECTED at binding launch/wave gate (experiment 0144); primitive correctness phase PASSED** | 64,770 finite decoder cases, invertible byte-preserving prepack, exact register feed and boundary controls pass. The favorable read-only ceiling is only 40.37% `wkv`, 53.82% `wq_a`, and 60.55% fused versus the required 82%; stop before the full kernel |
+| F8-2 | Clear owner-bound FP8 performance curve | Satisfy D-F8-GATE on every required shape/M with three interleaved process medians and independent correctness | **BLOCKED by rejected F8-1 architecture** | Equal-local-roofline gate remains binding and unmoved. Resumption requires a newly authorized launch-free architecture hypothesis, not a lower gate or scalar fallback |
 | MIX-1 | Integrate one-copy mixed production dispatch | Eligible FP4 uses accepted F4 path; eligible FP8 uses accepted F8 path; unsupported shapes use explicit approved exact routes; route census, admission, prepack, VRAM, graph and fixtures pass | **PENDING on F4-3 and F8-2** | No hidden fallback, no duplicate/widened weights |
 | MIX-2 | Confirm end-to-end value | Real workload shows material outside-variance improvement with identical model, formats, activations, routes, and budgets; phase/resource traffic reported | **PENDING on MIX-1** | Kernel bandwidth alone is not an end-to-end claim |
 
@@ -543,8 +543,9 @@ Last updated: 2026-08-22
 
 - **Current milestones:** C2 and F4-1 are complete. F4-2 is cleared at eight or
   more routed experts per launch; F4-3 is next on the FP4 track. F8-0 is
-  complete from experiment 0143. D-F8-GATE is complete and owner-bound; F8-1
-  is next on the independent FP8 track.
+  complete. F8-1's exact primitive phase passes, but its binding read-only
+  launch/wave ceiling is negative in experiment 0144, so the per-projection
+  QPN8-derived architecture is rejected and F8-2 is blocked.
 - **OPERATING POINT — read this before quoting any number.** The campaign has
   one operating point: **a single RTX 3090 at 350 W with stock unlocked clocks,
   second card idle**, restored with
@@ -600,6 +601,15 @@ Last updated: 2026-08-22
   bound first and may test fused `wq_a+wkv`, which share the same layer input.
   If no exact geometry fits, stop rather than hiding either shape behind the
   scalar fallback.
+- **F8-1 stopped on that binding test (0144).** The E4M3/E8M0 block-128
+  primitive itself is exact: 64,770 finite decoder cases, zero prepack inverse
+  mismatches, zero bit mismatches against a BF16-fragment control, an
+  independent canonical oracle, and all three deliberate bugs firing. But the
+  845.626 GB/s same-session ruler gives 3.025/6.049/9.074 us budgets for
+  `wkv`/`wq_a`/fused, while a read-only kernel that omits decode, MMA,
+  activation and output needs 6.144/9.216/12.288 us: 40.37%, 53.82%, and
+  60.55% of the ruler. Empty launch alone is 3.072 us. **The rejected term is
+  launch/underfilled-wave serial cost, not FP8 decode correctness.**
 - **A defect in the gate protocol itself, independent of machine tuning.** The
   cold probe's 160–260 µs arms boost to **1935 MHz** at 150–200 W while
   sustained load settles at **1755 MHz** against the power limit. The same
@@ -669,10 +679,11 @@ Last updated: 2026-08-22
   `nvidia-smi` index 1, `GPU-3032cfa3`, pci 82:00.0, and is the unlocked
   experimentation card. Every probe must hard-check capability 8.6 and record
   `device_name` inline.
-- **Current blockers:** no external owner decision blocks either format track.
-  F4-3 depends on its own M-curve measurement. F8-1 has no dependency blocker,
-  but its first measured feasibility test must resolve the 2.10/4.19 MiB
-  launch-wave budgets before a full primitive is built.
+- **Current blockers:** F4-3 depends on its own M-curve measurement. F8-2 is
+  blocked by F8-1's rejected per-projection launch architecture. Resuming FP8
+  requires owner authorization for a materially broader launch-free executor
+  or operation fusion and a new cost model; lowering D-F8-GATE or hiding either
+  protected shape behind the scalar route is forbidden.
 - **Branch disposition:** preserve `exp/dsv4-qpn-packed-decode` and experiments
   0127–0133 as controls/falsifications. Continue only on the clean main-based
   `exp/dsv4-sm86-qpn-register-feed`; do not merge failed archived runtime code.
@@ -685,14 +696,11 @@ Last updated: 2026-08-22
 **F4-1 is COMPLETE and F4-2 is CLEARED at >= 8 routed experts per launch**
 (experiment 0142: 700.7/701.1 GB/s, 0.0 error).
 
-**Exact next action on the FP8 track:** begin F8-1 with two ordered cheap
-falsifiers from experiment 0143: (1) prove E4M3/E8M0 block-128 decode and
-scale-to-K binding directly into the C2 BF16 fragment registers using broad
-finite BF16 activations and deliberate permutation/scale bugs; then (2)
-measure a launch/wave upper bound for `wkv` and `wq_a`, including their valid
-same-input fused geometry, against the same-session approximately 3.02/6.05 us
-budgets. Do not build the full QPN8 kernel if either exact upper bound is
-negative.
+**Exact next action on the FP8 track:** stop. Experiment 0144 passed the exact
+register-feed primitive but falsified the ordered launch/wave gate even for a
+read-only same-input-fused upper bound. Do not build the full QPN8 kernel.
+Resumption requires an owner-authorized launch-free architecture hypothesis;
+the 82%/81%/64% D-F8-GATE remains binding.
 
 Independently, F4-3 remains open: run the interleaved M `{1,4,8,16}` curve on
 both FP4 production shapes against its unchanged gates.
@@ -753,3 +761,4 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-22T15:41:33-03:00 | Claude Opus 5 / experiment 0142 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F4-1 COMPLETE, F4-2 CLEARED | Stopped guessing after four falsified attributions and ran Nsight Compute, which reported `launch__waves_per_multiprocessor` = **0.31** — the kernel never filled the GPU once. Swept routed-expert count per launch. See experiment 0142 | **F4-2 PARITY GATE CLEARED: 700.7 / 701.1 GB/s at 8 experts and 797.9 / 793.5 at 32**, against the unmoved >600.0 threshold, **0.0 relative error**, 0.3% spread across three processes, `--break-scale-binding` control still failing. At 32 experts the candidate is at **94% of the 847.79 GB/s read floor** and 96% of 0139's ceiling. Profile at 16 experts: waves/SM 0.31 to 5.00, DRAM 31.5% to 74.8%, warps active 24.2% to 73.7%, issue 24.0% to 61.8%. **`argmax` is finally DRAM** | **The blocker was wave quantization, not the kernel.** One expert at M=1 is 5.26 us of work for the whole device; split-K cannot rescue it since `down_w2` has only 32 K-blocks. **M is unchanged at 1** — independent expert matrices are batched, not tokens, which is what routed MoE decode does and is the footing the ruler and ceiling were already measured on. Still owed: production-operating-point re-measurement, E8M0 0/255 admission, F4-3's M curve, and the workload's real dispatch width. D-F8-GATE unchanged | (1) Re-measure batch-8 at the production point — both cards, 250 W, 1605 MHz locked — since no production claim may rest on an experimentation number. (2) Add the E8M0 0/255 admission check. (3) Attempt F4-3: >=632 GB/s at M in {1,4,8} and >301.9 at M=16. (4) Record the routed-expert dispatch width the target workload actually produces; if it is narrower than 8, F4-2's pass is narrower than it looks and must be re-stated |
 | 2026-08-22T16:08:57-03:00 | Codex / software-native and FP8 gate owner amendment | `exp/dsv4-sm86-qpn-register-feed@0f63057` plus owner documentation amendment | C0A + D-F8-GATE | Owner explicitly bound the umbrella to software-native execution of DeepSeek V4's unchanged mixed MXFP4/FP8 representation, analogous to `v100-skinny` on Volta, and selected equal local-read-roofline efficiency for FP8. Reconciled mutable status with experiment 0142 and the already-declared single unlocked operating point; no kernel or performance experiment was run | **D-F8-GATE COMPLETE:** >=82% at every M in `{1,2,3,4}`, >=81% at M=8, >=64% at M=16 on every eligible protected production shape; 690/682/539 GB/s at the 842 GB/s reference ruler. No new throughput claim | No external owner blocker. F4-3 remains unmeasured; F8-0 inventory and per-band cost models remain unmeasured | Execute F4-3's interleaved M `{1,4,8,16}` curve on both FP4 production shapes at the single unlocked operating point |
 | 2026-08-22T16:37:26-03:00 | Codex / experiment 0143 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-0 | Scanned all 48 checkpoint shards, inventoried 390 actual FP8 modules/nine unique shapes and their runtime publication/M boundaries, then built an SM86-only standalone W8A16 scalar/W8A8 full-step control with a same-session cold ruler. Ran 216 raw process arms at M `{1,2,3,4,8,16,32,64}`, formed 72 three-process medians, instantiated exact traffic and `tau`, and profiled every protected scalar band plus the tensor/quantizer/ruler controls. See experiment 0143 | **F8-0 COMPLETE; no F8-2 verdict.** Ruler 834.85–845.63 GB/s, 95.26% DRAM; maximum allocation 512,040,448 B below 512 MiB. Scalar W8A16 is decoder/load issue and dependency bound (`wq_b` about 13.5% DRAM/68% issue across M); W8A8 is wave/shared-pipeline bound (`wkv` M64 0.02 waves/SM, 0.17% DRAM, 96 registers, 48 KiB shared). All 28 actually eligible tensor-page shape/M records were no worse at the sampled BF16 oracle with zero sampled mismatches. No production dispatch or persistent widened weight added | No external dependency blocker. Small-shape feasibility is now explicit: same-session full-step budgets are about 3.02 us `wkv`, 6.05 us `wq_a`, 12.10 us per 8.39 MB shape, and 48.4 us per 33.56 MB shape at M=1–4. Current generic and tensor incumbents are W8A8; rank-local attention persistently widens five projections and is incompatible with the promoted one-copy objective | Begin F8-1 in binding order: prove E4M3/E8M0 block-128 scale-to-K/register-feed exactness with broad BF16 activations and deliberate-bug controls, then measure a launch/wave upper bound for `wkv`/`wq_a`, including valid same-input fusion. Stop before a full kernel if either exact budget is negative |
+| 2026-08-22T17:01:44-03:00 | Codex / experiment 0144 | `exp/dsv4-sm86-qpn-register-feed@<this result commit>` | F8-1 | Executed both ordered cheap falsifiers. First re-derived a BF16 word-parallel E4M3 decoder and the SM86 fragment prepack, crossed both N=128 and K=128 scale axes, and tested broad finite BF16 activations plus three deliberate defects. Only after it passed, swept read-only launch geometries for `wkv`, `wq_a`, and their contiguous same-input fusion against a fresh ruler. See experiment 0144 | **Primitive phase PASS; F8-1 architecture REJECTED at the binding launch/wave gate; F8-2 not attempted.** 64,770 finite decode cases, zero mismatches; invertible byte-preserving prepack; zero register-feed bit mismatches and zero canonical-oracle violations; 25 registers, zero spills/shared/barriers. But the 845.626 GB/s ruler gives 3.025/6.049/9.074 us budgets while favorable read-only arms need 6.144/9.216/12.288 us: only **40.37%/53.82%/60.55%**, with empty launch already 3.072 us. Three warmed process medians agree | D-F8-GATE is unmoved. The per-projection register-fed kernel cannot reduce the binding launch/underfilled-wave serial term, and adding decode/MMA/output cannot rescue a failed read-only upper bound. Full QPN8 kernel deliberately not built; no production dispatch or persistent path changed | Stop the FP8 track. Continue independent F4-3. FP8 resumption requires owner authorization for a materially broader launch-free/persistent or surrounding-operation-fused architecture with a new semantics proof and cost model; do not lower the gate or hide protected shapes behind scalar fallback |

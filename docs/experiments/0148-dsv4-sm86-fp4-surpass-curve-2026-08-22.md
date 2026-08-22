@@ -1,4 +1,4 @@
-# Experiment 0143 — F4-3 surpass curve cleared; Ampere gets FP4 from software
+# Experiment 0148 — F4-3 surpass curve cleared; Ampere gets FP4 from software
 
 Status: **F4-3 COMPLETE. Every point of the surpass curve passes.** At 32 routed
 experts per launch and split-K 2: **742.9 / 749.9 GB/s at M=1**, **731.4 /

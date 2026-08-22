@@ -13,7 +13,10 @@
 //
 // Milestone F4-1, FP4 track only. Experimentation operating point.
 
+#include <strata/result.hpp>
 #include <strata/safetensors.hpp>
+
+#include <map>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -74,26 +77,132 @@ struct Shape {
 bool g_break_scale_binding = false;
 bool g_no_mma = false;
 int g_inject_bad_scale = 0;
-std::string g_checkpoint_shard;   // real DeepSeek V4 shard, closes the real-weights gate
-std::string g_tensor_prefix;      // e.g. layers.0.ffn.experts.0.w1
+std::uint32_t g_sweep_layer = 0U;
+bool g_correctness_only = false;
+std::string g_checkpoint_shard;   // single shard, or empty when using --index
+std::string g_tensor_prefix;      // e.g. layers.0.ffn.experts.0
+std::string g_checkpoint_index;   // model.safetensors.index.json
+std::string g_sweep;              // "L:E,L:E,..." multi-layer/expert fixture
+int g_activation_token = -1;      // >=0 selects a real checkpoint-derived vector
+
+// Resolves a tensor name to the shard holding it, so a fixture can span layers
+// that live in different shards.
+class Checkpoint {
+  public:
+    void open(const std::string& index_path, const std::string& root) {
+        root_ = root;
+        const auto text = strata::load_bounded_text_file(index_path, 64ULL << 20U);
+        if (!text.ok()) throw std::runtime_error("cannot read index: " + index_path);
+        const auto index = strata::parse_safetensors_index(text.value);
+        if (!index.ok()) throw std::runtime_error("cannot parse index: " + index_path);
+        for (const auto& e : index.value.entries) shard_of_[e.name] = e.shard;
+    }
+
+    [[nodiscard]] bool opened() const noexcept { return !shard_of_.empty(); }
+
+    // Returns the shard path and tensor descriptor for `name`.
+    std::pair<std::string, strata::SafetensorsTensor> find(
+        const std::string& name) {
+        std::string path = g_checkpoint_shard;
+        if (opened()) {
+            const auto it = shard_of_.find(name);
+            if (it == shard_of_.end())
+                throw std::runtime_error("tensor not in index: " + name);
+            path = root_ + "/" + it->second;
+        }
+        auto& shard = shard_cache_[path];
+        if (shard.tensors.empty()) {
+            const auto loaded = strata::load_safetensors_shard(path);
+            if (!loaded.ok())
+                throw std::runtime_error("cannot read shard: " + path);
+            shard = loaded.value;
+        }
+        for (const auto& t : shard.tensors) {
+            if (t.name == name) return {path, t};
+        }
+        throw std::runtime_error("tensor not in shard: " + name);
+    }
+
+  private:
+    std::string root_;
+    std::map<std::string, std::string> shard_of_;
+    std::map<std::string, strata::SafetensorsShard> shard_cache_;
+};
+
+Checkpoint g_checkpoint;
+
+// Reads a single row of a 2-D tensor without materialising the whole thing.
+// embed.weight alone is 1.06 GB; the fixture needs 8 KiB of it.
+std::vector<std::byte> read_tensor_row(const std::string& path,
+                                       const strata::SafetensorsTensor& t,
+                                       std::uint64_t row) {
+    if (t.shape.size() != 2U || row >= t.shape[0])
+        throw std::runtime_error("bad row request for " + t.name);
+    const std::uint64_t row_bytes = t.bytes() / t.shape[0];
+    strata::SafetensorsTensor slice = t;
+    slice.relative_begin = t.relative_begin + row * row_bytes;
+    slice.relative_end = slice.relative_begin + row_bytes;
+    slice.absolute_begin = t.absolute_begin + row * row_bytes;
+    const auto bytes = strata::read_safetensors_tensor(path, slice, row_bytes);
+    if (!bytes.ok()) throw std::runtime_error("cannot read row of " + t.name);
+    return bytes.value;
+}
+
+float bf16_value(float value);  // defined below
+
+float bf16_to_float(std::uint16_t bits) {
+    const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16U;
+    float out = 0.0F;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
+// A checkpoint-derived activation: a real token embedding row put through the
+// production RMSNorm with the layer's real ffn_norm weight. This is NOT a
+// captured forward-pass activation -- it skips attention -- but every value and
+// the per-channel scale structure come from the checkpoint, and the result is
+// BF16-representable at the expert boundary as the contract requires.
+bool load_real_activation(std::uint32_t layer, std::uint32_t k,
+                          std::vector<float>& activation, std::uint32_t m) {
+    if (g_activation_token < 0) return false;
+    const auto [embed_path, embed] = g_checkpoint.find("embed.weight");
+    const auto [norm_path, norm] = g_checkpoint.find(
+        "layers." + std::to_string(layer) + ".ffn_norm.weight");
+    const auto norm_bytes =
+        strata::read_safetensors_tensor(norm_path, norm, norm.bytes());
+    if (!norm_bytes.ok()) throw std::runtime_error("cannot read ffn_norm");
+
+    for (std::uint32_t col = 0U; col < m; ++col) {
+        const auto row_bytes = read_tensor_row(
+            embed_path, embed,
+            (static_cast<std::uint64_t>(g_activation_token) + col) %
+                embed.shape[0]);
+        const auto* hidden =
+            reinterpret_cast<const std::uint16_t*>(row_bytes.data());
+        const auto* gain =
+            reinterpret_cast<const std::uint16_t*>(norm_bytes.value.data());
+        double sum = 0.0;
+        for (std::uint32_t i = 0U; i < k; ++i) {
+            const double v = bf16_to_float(hidden[i]);
+            sum += v * v;
+        }
+        const float scale =
+            static_cast<float>(1.0 / std::sqrt(sum / static_cast<double>(k) +
+                                               1.0e-6));
+        for (std::uint32_t i = 0U; i < k; ++i) {
+            activation[static_cast<std::size_t>(i) * m + col] = bf16_value(
+                bf16_to_float(hidden[i]) * scale * bf16_to_float(gain[i]));
+        }
+    }
+    return true;
+}
 
 // Load a real expert's packed E2M1 codes and E8M0 scales straight from the
 // checkpoint, so the measured path is exercised on production bytes rather than
 // synthetic ones. Returns false when no checkpoint was requested.
 bool load_real_expert(const Shape& shape, std::vector<std::uint8_t>& codes,
                       std::vector<std::uint8_t>& scales) {
-    if (g_checkpoint_shard.empty()) return false;
-    const auto shard = strata::load_safetensors_shard(g_checkpoint_shard);
-    if (!shard.ok())
-        throw std::runtime_error("cannot read checkpoint shard: " +
-                                 g_checkpoint_shard + ": " +
-                                 (shard.errors.empty() ? "" : shard.errors[0]));
-    const auto find = [&](const std::string& name) {
-        for (const auto& t : shard.value.tensors) {
-            if (t.name == name) return &t;
-        }
-        throw std::runtime_error("tensor not in shard: " + name);
-    };
+    if (g_checkpoint_shard.empty() && !g_checkpoint.opened()) return false;
     // gate_up_w1 is the checkpoint's w1, down_w2 is w2. Both are exactly
     // 4,194,304 packed bytes, so a byte-count check alone cannot tell them
     // apart - the declared shape must be checked too.
@@ -101,8 +210,10 @@ bool load_real_expert(const Shape& shape, std::vector<std::uint8_t>& codes,
         (std::string_view(shape.name) == "down_w2") ? ".w2" : ".w1";
     const std::string weight_name = g_tensor_prefix + suffix + ".weight";
     const std::string scale_name = g_tensor_prefix + suffix + ".scale";
-    const auto* weight = find(weight_name);
-    const auto* scale = find(scale_name);
+    const auto [weight_path, weight_t] = g_checkpoint.find(weight_name);
+    const auto [scale_path, scale_t] = g_checkpoint.find(scale_name);
+    const auto* weight = &weight_t;
+    const auto* scale = &scale_t;
 
     // The checkpoint must actually carry the declared FP4 contract: packed
     // E2M1 at two codes per byte, and one E8M0 byte per group of 32 along K.
@@ -129,10 +240,10 @@ bool load_real_expert(const Shape& shape, std::vector<std::uint8_t>& codes,
                                  std::to_string(shape.n) + "," +
                                  std::to_string(shape.k / kGroup) + "]");
 
-    const auto wbytes = strata::read_safetensors_tensor(
-        g_checkpoint_shard, *weight, want_codes);
-    const auto sbytes = strata::read_safetensors_tensor(
-        g_checkpoint_shard, *scale, want_scales);
+    const auto wbytes =
+        strata::read_safetensors_tensor(weight_path, *weight, want_codes);
+    const auto sbytes =
+        strata::read_safetensors_tensor(scale_path, *scale, want_scales);
     if (!wbytes.ok() || !sbytes.ok())
         throw std::runtime_error("failed reading real expert tensors");
     codes.resize(static_cast<std::size_t>(shape.n) * shape.k);
@@ -512,6 +623,7 @@ struct Result {
     double max_absolute{0.0}, max_relative{0.0};
     ScaleAdmission admission{};
     bool real_weights{false};
+    bool real_activations{false};
     double output_max_abs{0.0}, oracle_max_abs{0.0};
     std::uint32_t nonzero_outputs{0U};
     std::uint32_t k_groups_crossed{0U};
@@ -554,9 +666,13 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
         // Report and stop for this shape rather than decoding a wrong value.
         return r;
     }
-    for (auto& a : activation)
-        a = bf16_value(
-            static_cast<float>(static_cast<int>(xorshift(state) % 9U) - 4));
+    r.real_activations =
+        load_real_activation(g_sweep_layer, k, activation, g_m);
+    if (!r.real_activations) {
+        for (auto& a : activation)
+            a = bf16_value(
+                static_cast<float>(static_cast<int>(xorshift(state) % 9U) - 4));
+    }
 
     // ---- prepack: pure permutation into fragment order ----
     const std::uint32_t n_tiles = n / kTileN;
@@ -779,6 +895,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     }
 
     // ---- timing ----
+    if (g_correctness_only) return r;
     cudaEvent_t start = nullptr, stop = nullptr;
     check(cudaEventCreate(&start), "create start");
     check(cudaEventCreate(&stop), "create stop");
@@ -884,8 +1001,27 @@ int main(int argc, char** argv) {
             else if (f == "--no-mma") g_no_mma = true;
             else if (f == "--checkpoint" && i + 1 < argc)
                 g_checkpoint_shard = argv[++i];
-            else if (f == "--tensor" && i + 1 < argc)
+            else if (f == "--index" && i + 1 < argc) {
+                const std::string idx = argv[++i];
+                const auto slash = idx.find_last_of('/');
+                g_checkpoint.open(idx, slash == std::string::npos
+                                           ? std::string(".")
+                                           : idx.substr(0U, slash));
+            }
+            else if (f == "--sweep" && i + 1 < argc) g_sweep = argv[++i];
+            else if (f == "--correctness-only") g_correctness_only = true;
+            else if (f == "--activation-token" && i + 1 < argc)
+                g_activation_token = std::stoi(argv[++i]);
+            else if (f == "--tensor" && i + 1 < argc) {
                 g_tensor_prefix = argv[++i];
+                // The activation's RMSNorm gain must come from the same layer
+                // as the expert, so derive it rather than defaulting to 0.
+                const auto begin = g_tensor_prefix.find("layers.");
+                if (begin != std::string::npos) {
+                    g_sweep_layer = static_cast<std::uint32_t>(
+                        std::stoul(g_tensor_prefix.substr(begin + 7U)));
+                }
+            }
             else if (f == "--inject-scale-nan") g_inject_bad_scale = 1;
             else if (f == "--inject-scale-zero") g_inject_bad_scale = -1;
             else if (f == "--split-reduce") g_split_reduce = true;
@@ -937,6 +1073,8 @@ int main(int argc, char** argv) {
                  << ", \"device_bytes\": " << r.device_bytes
                  << ", \"prepack_seconds\": " << std::setprecision(3)
                  << r.prepack_seconds
+                 << ", \"real_activations\": "
+                 << (r.real_activations ? "true" : "false")
                  << ", \"real_weights\": "
                  << (r.real_weights ? "true" : "false")
                  << ", \"e8m0_admitted\": "

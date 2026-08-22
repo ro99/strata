@@ -309,6 +309,45 @@ __global__ void decode_prmt_kernel(const uint4* __restrict__ codes,
     if (accumulator == 0xFFFF'FFFFU) sink[0] = accumulator;
 }
 
+// Arm 6: the successor decoder feeding the native SM86 MMA it exists to serve.
+// Experiment 0136 measured the MMA free, but that was with the 0135 decoder,
+// which had 1.6x of ALU slack for the tensor op to hide inside. The successor
+// sits within 1.9% of the read floor, so that result may not be inherited and
+// is re-measured here. Each 32-bit code word decodes to exactly four BF16
+// pairs, which is exactly one m16n8k16 A fragment, so the feed is one MMA per
+// word with no repacking. Timing ceiling only: the arena is not in fragment
+// order, so no correctness claim attaches to this arm.
+__global__ void decode_prmt_mma_kernel(const uint4* __restrict__ codes,
+                                       const unsigned char* __restrict__ scales,
+                                       std::uint32_t groups, float* sink) {
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    float d0 = 0.0F;
+    float d1 = 0.0F;
+    float d2 = 0.0F;
+    float d3 = 0.0F;
+    const std::uint32_t b0 = 0x3F80'3F80U;
+    const std::uint32_t b1 = 0x3F80'3F80U;
+    for (std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+         group < groups; group += stride) {
+        const uint4 packed = codes[group];
+        const std::uint32_t scale = scale_pair_bf16(scales[group]);
+        const std::uint32_t words[4] = {packed.x, packed.y, packed.z,
+                                        packed.w};
+#pragma unroll
+        for (std::uint32_t word = 0U; word < 4U; ++word) {
+            std::uint32_t out[4];
+            decode_prmt_word(words[word], scale, out);
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(out[0]), "r"(out[1]), "r"(out[2]), "r"(out[3]),
+                  "r"(b0), "r"(b1));
+        }
+    }
+    if (d0 + d1 + d2 + d3 == 12345.678F) sink[0] = d0;
+}
+
 __global__ void oracle_prmt_kernel(const uint4* __restrict__ codes,
                                    const unsigned char* __restrict__ scales,
                                    std::uint32_t groups,
@@ -418,7 +457,7 @@ struct ShapeResult {
     std::uint32_t oracle_pairs{0U};
     std::uint32_t oracle_mismatches{0U};
     std::uint32_t successor_mismatches{0U};
-    std::array<ArmResult, 5U> arms{};
+    std::array<ArmResult, 6U> arms{};
 };
 
 ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
@@ -504,10 +543,14 @@ ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
             decode_x2_kernel<<<blocks, kThreads, 0U, stream>>>(
                 arena_codes(), arena_scales(), swept_groups,
                 static_cast<std::uint32_t*>(device_sink.get()));
-        } else {
+        } else if (arm == 4U) {
             decode_prmt_kernel<<<blocks, kThreads, 0U, stream>>>(
                 arena_codes(), arena_scales(), swept_groups,
                 static_cast<std::uint32_t*>(device_sink.get()));
+        } else {
+            decode_prmt_mma_kernel<<<blocks, kThreads, 0U, stream>>>(
+                arena_codes(), arena_scales(), swept_groups,
+                static_cast<float*>(device_sink.get()));
         }
         check(cudaGetLastError(), "launch FP4 ceiling arm");
     };
@@ -536,27 +579,28 @@ ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
     };
 
     for (std::uint32_t warmup = 0U; warmup < kWarmups; ++warmup) {
-        for (std::uint32_t arm = 0U; arm < 5U; ++arm) {
+        for (std::uint32_t arm = 0U; arm < 6U; ++arm) {
             static_cast<void>(time_arm(arm, false));
         }
     }
 
-    std::array<std::vector<float>, 5U> cold{};
-    std::array<std::vector<float>, 5U> hot{};
+    std::array<std::vector<float>, 6U> cold{};
+    std::array<std::vector<float>, 6U> hot{};
     for (auto& samples : cold) samples.reserve(kSamples);
     for (auto& samples : hot) samples.reserve(kSamples);
 
     for (std::uint32_t sample = 0U; sample < kSamples; ++sample) {
-        for (std::uint32_t arm = 0U; arm < 5U; ++arm) {
+        for (std::uint32_t arm = 0U; arm < 6U; ++arm) {
             cold[arm].push_back(time_arm(arm, true));
             hot[arm].push_back(time_arm(arm, false));
         }
     }
 
-    static constexpr std::array<const char*, 5U> kArmNames{
+    static constexpr std::array<const char*, 6U> kArmNames{
         "read_only", "decode_0135_shift_rebias", "decode_mma",
-        "decode_x2_attribution", "decode_prmt_lut_successor"};
-    for (std::uint32_t arm = 0U; arm < 5U; ++arm) {
+        "decode_x2_attribution", "decode_prmt_lut_successor",
+        "decode_prmt_mma"};
+    for (std::uint32_t arm = 0U; arm < 6U; ++arm) {
         ArmResult entry{kArmNames[arm]};
         entry.cold_milliseconds = median(std::move(cold[arm]));
         entry.hot_milliseconds = median(std::move(hot[arm]));

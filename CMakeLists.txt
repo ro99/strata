@@ -324,6 +324,20 @@ if(STRATA_HAS_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
     )
 
+    add_executable(strata-dsv4-sm86-fp8-baseline-probe
+        apps/strata_dsv4_sm86_fp8_baseline_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-baseline-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-baseline-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-baseline-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-baseline-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-baseline-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
     add_executable(strata-dsv4-sm86-bf16-mma-probe
         apps/strata_dsv4_sm86_bf16_mma_probe.cu)
     target_link_libraries(strata-dsv4-sm86-bf16-mma-probe PRIVATE

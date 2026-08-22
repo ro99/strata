@@ -44,8 +44,8 @@ constexpr std::uint32_t kOracleGroups = 4096U;
 // E8M0 codes outside this window drive the smallest E2M1 magnitudes into the
 // BF16 subnormal range or the largest into infinity/NaN. Experiment 0135
 // limitation 1. The stimulus stays inside it and the runtime must admit on it.
-constexpr std::uint32_t kScaleCodeMinimum = 2U;
-constexpr std::uint32_t kScaleCodeMaximum = 250U;
+std::uint32_t g_scale_minimum = 2U;
+std::uint32_t g_scale_maximum = 250U;
 
 struct Shape {
     const char* name;
@@ -215,6 +215,120 @@ __global__ void decode_mma_kernel(const uint4* __restrict__ codes,
     if (d0 + d1 + d2 + d3 == 12345.678F) sink[0] = d0;
 }
 
+// A cheaper successor decoder, screened against experiment 0136's measured
+// budget. Two differences from the 0135 shift/rebias decoder:
+//
+//   1. The E2M1 magnitude is a table lookup done with PRMT rather than a
+//      bit-twiddling reconstruction. The eight E2M1 magnitudes have only three
+//      distinct BF16 high bytes and four distinct low bytes, so both halves of
+//      the table fit in the eight source bytes one PRMT can index.
+//   2. The E8M0 scale is applied as a native BF16 multiply instead of an
+//      exponent add, which removes all of the zero-detection and
+//      subnormal-masking machinery the additive trick needs, and extends the
+//      valid scale window from codes 2-250 to 1-254.
+//
+// The nibble order is a load-time prepack choice, not a format change: the two
+// codes of a BF16 pair sit 16 bits apart in the loaded word, so all four sign
+// bits move into place with a single shift each. Experiment 0135's transferable
+// thesis item 2 is exactly this permission.
+__constant__ std::uint32_t kMagnitudeHigh[2] = {0x3F3F'3F00U, 0x4040'4040U};
+__constant__ std::uint32_t kMagnitudeLow[2] = {0xC080'0000U, 0xC080'4000U};
+
+__device__ __forceinline__ void decode_prmt_word(std::uint32_t word,
+                                                 std::uint32_t scale_pair,
+                                                 std::uint32_t (&out)[4]) {
+    const std::uint32_t magnitudes = word & 0x7777'7777U;
+    const std::uint32_t high_a =
+        __byte_perm(kMagnitudeHigh[0], kMagnitudeHigh[1], magnitudes);
+    const std::uint32_t low_a =
+        __byte_perm(kMagnitudeLow[0], kMagnitudeLow[1], magnitudes);
+    const std::uint32_t high_b = __byte_perm(
+        kMagnitudeHigh[0], kMagnitudeHigh[1], magnitudes >> 16U);
+    const std::uint32_t low_b =
+        __byte_perm(kMagnitudeLow[0], kMagnitudeLow[1], magnitudes >> 16U);
+
+    const std::uint32_t pair_a = __byte_perm(low_a, high_a, 0x5140U);
+    const std::uint32_t quad_a = __byte_perm(low_a, high_a, 0x7362U);
+    const std::uint32_t pair_b = __byte_perm(low_b, high_b, 0x5140U);
+    const std::uint32_t quad_b = __byte_perm(low_b, high_b, 0x7362U);
+
+    std::uint32_t value[4];
+    value[0] = __byte_perm(pair_a, pair_b, 0x5410U);
+    value[1] = __byte_perm(pair_a, pair_b, 0x7632U);
+    value[2] = __byte_perm(quad_a, quad_b, 0x5410U);
+    value[3] = __byte_perm(quad_a, quad_b, 0x7632U);
+
+#pragma unroll
+    for (std::uint32_t index = 0U; index < 4U; ++index) {
+        // Code at nibble `index` pairs with the code at nibble `index + 4`,
+        // so both sign bits reach bits 15 and 31 with one shared shift.
+        const std::uint32_t signs =
+            (word << (12U - index * 4U)) & 0x8000'8000U;
+        // E2M1 code 0x8 is sign-set with magnitude zero. Applying its sign
+        // would publish -0.0 where the reference oracle publishes +0.0, so the
+        // sign is suppressed on zero magnitudes. Only the zero table entry has
+        // a zero exponent field, and the largest entry plus 0x7F80 stays inside
+        // its half, so one add carries into bit 15 exactly when the half is
+        // non-zero and cannot carry across the half boundary.
+        const std::uint32_t non_zero = value[index] + 0x7F80'7F80U;
+        const __nv_bfloat162 scaled = __hmul2(
+            *reinterpret_cast<const __nv_bfloat162*>(&value[index]),
+            *reinterpret_cast<const __nv_bfloat162*>(&scale_pair));
+        out[index] = *reinterpret_cast<const std::uint32_t*>(&scaled) ^
+                     (signs & non_zero & 0x8000'8000U);
+    }
+}
+
+// E8M0 code s means 2^(s-127), whose BF16 encoding is simply s in the exponent
+// field with a zero mantissa. Broadcasting it into both halves costs one IMAD.
+__device__ __forceinline__ std::uint32_t scale_pair_bf16(std::uint32_t scale) {
+    return (scale << 7U) * 0x0001'0001U;
+}
+
+__global__ void decode_prmt_kernel(const uint4* __restrict__ codes,
+                                   const unsigned char* __restrict__ scales,
+                                   std::uint32_t groups, std::uint32_t* sink) {
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    std::uint32_t accumulator = 0U;
+    for (std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+         group < groups; group += stride) {
+        const uint4 packed = codes[group];
+        const std::uint32_t scale = scale_pair_bf16(scales[group]);
+        const std::uint32_t words[4] = {packed.x, packed.y, packed.z,
+                                        packed.w};
+#pragma unroll
+        for (std::uint32_t word = 0U; word < 4U; ++word) {
+            std::uint32_t out[4];
+            decode_prmt_word(words[word], scale, out);
+#pragma unroll
+            for (std::uint32_t index = 0U; index < 4U; ++index) {
+                accumulator ^= out[index];
+            }
+        }
+    }
+    if (accumulator == 0xFFFF'FFFFU) sink[0] = accumulator;
+}
+
+__global__ void oracle_prmt_kernel(const uint4* __restrict__ codes,
+                                   const unsigned char* __restrict__ scales,
+                                   std::uint32_t groups,
+                                   std::uint32_t* decoded) {
+    const std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x;
+    if (group >= groups) return;
+    const uint4 packed = codes[group];
+    const std::uint32_t scale = scale_pair_bf16(scales[group]);
+    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+    for (std::uint32_t word = 0U; word < 4U; ++word) {
+        std::uint32_t out[4];
+        decode_prmt_word(words[word], scale, out);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < 4U; ++index) {
+            decoded[group * 16U + word * 4U + index] = out[index];
+        }
+    }
+}
+
 // Arm 4: the decode arm with every byte decoded twice under two different
 // deltas. DRAM traffic is byte-identical to arm 2; decoder ALU work is
 // doubled. If the decode arm is ALU-bound this arm costs about twice as much;
@@ -303,7 +417,8 @@ struct ShapeResult {
     std::uint64_t swept_bytes{0U};
     std::uint32_t oracle_pairs{0U};
     std::uint32_t oracle_mismatches{0U};
-    std::array<ArmResult, 4U> arms{};
+    std::uint32_t successor_mismatches{0U};
+    std::array<ArmResult, 5U> arms{};
 };
 
 ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
@@ -335,8 +450,8 @@ ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
     }
     for (auto& value : host_scales) {
         value = static_cast<unsigned char>(
-            kScaleCodeMinimum +
-            xorshift(state) % (kScaleCodeMaximum - kScaleCodeMinimum + 1U));
+            g_scale_minimum +
+            xorshift(state) % (g_scale_maximum - g_scale_minimum + 1U));
     }
 
     DeviceBuffer device_codes(replica_code_bytes * kArenaReplicas);
@@ -385,8 +500,12 @@ ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
             decode_mma_kernel<<<blocks, kThreads, 0U, stream>>>(
                 arena_codes(), arena_scales(), swept_groups,
                 static_cast<float*>(device_sink.get()));
-        } else {
+        } else if (arm == 3U) {
             decode_x2_kernel<<<blocks, kThreads, 0U, stream>>>(
+                arena_codes(), arena_scales(), swept_groups,
+                static_cast<std::uint32_t*>(device_sink.get()));
+        } else {
+            decode_prmt_kernel<<<blocks, kThreads, 0U, stream>>>(
                 arena_codes(), arena_scales(), swept_groups,
                 static_cast<std::uint32_t*>(device_sink.get()));
         }
@@ -417,26 +536,27 @@ ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
     };
 
     for (std::uint32_t warmup = 0U; warmup < kWarmups; ++warmup) {
-        for (std::uint32_t arm = 0U; arm < 4U; ++arm) {
+        for (std::uint32_t arm = 0U; arm < 5U; ++arm) {
             static_cast<void>(time_arm(arm, false));
         }
     }
 
-    std::array<std::vector<float>, 4U> cold{};
-    std::array<std::vector<float>, 4U> hot{};
+    std::array<std::vector<float>, 5U> cold{};
+    std::array<std::vector<float>, 5U> hot{};
     for (auto& samples : cold) samples.reserve(kSamples);
     for (auto& samples : hot) samples.reserve(kSamples);
 
     for (std::uint32_t sample = 0U; sample < kSamples; ++sample) {
-        for (std::uint32_t arm = 0U; arm < 4U; ++arm) {
+        for (std::uint32_t arm = 0U; arm < 5U; ++arm) {
             cold[arm].push_back(time_arm(arm, true));
             hot[arm].push_back(time_arm(arm, false));
         }
     }
 
-    static constexpr std::array<const char*, 4U> kArmNames{
-        "read_only", "decode", "decode_mma", "decode_x2_attribution"};
-    for (std::uint32_t arm = 0U; arm < 4U; ++arm) {
+    static constexpr std::array<const char*, 5U> kArmNames{
+        "read_only", "decode_0135_shift_rebias", "decode_mma",
+        "decode_x2_attribution", "decode_prmt_lut_successor"};
+    for (std::uint32_t arm = 0U; arm < 5U; ++arm) {
         ArmResult entry{kArmNames[arm]};
         entry.cold_milliseconds = median(std::move(cold[arm]));
         entry.hot_milliseconds = median(std::move(hot[arm]));
@@ -477,6 +597,51 @@ ShapeResult run_shape(const Shape& shape, cudaStream_t stream,
           "download FP4 decode oracle");
     check(cudaStreamSynchronize(stream), "finish FP4 decode oracle");
 
+    DeviceBuffer device_prmt(
+        static_cast<std::size_t>(oracle_groups) * 16U * sizeof(std::uint32_t));
+    oracle_prmt_kernel<<<(oracle_groups + kThreads - 1U) / kThreads, kThreads,
+                         0U, stream>>>(
+        arena_codes(), arena_scales(), oracle_groups,
+        static_cast<std::uint32_t*>(device_prmt.get()));
+    check(cudaGetLastError(), "launch PRMT successor oracle");
+    std::vector<std::uint32_t> prmt(
+        static_cast<std::size_t>(oracle_groups) * 16U);
+    check(cudaMemcpyAsync(prmt.data(), device_prmt.get(),
+                          prmt.size() * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "download PRMT successor oracle");
+    check(cudaStreamSynchronize(stream), "finish PRMT successor oracle");
+
+    // The successor pairs the code at nibble j with the code at nibble j+4 of
+    // the same 32-bit word. That pairing is a load-time prepack choice, so the
+    // host oracle must reproduce it exactly rather than assume byte order.
+    for (std::uint32_t group = 0U; group < oracle_groups; ++group) {
+        const float scale = e8m0_scale(host_scales[group]);
+        for (std::uint32_t word = 0U; word < 4U; ++word) {
+            std::uint32_t packed = 0U;
+            for (std::uint32_t byte = 0U; byte < 4U; ++byte) {
+                packed |= static_cast<std::uint32_t>(
+                              host_codes[group * 16U + word * 4U + byte])
+                          << (byte * 8U);
+            }
+            for (std::uint32_t index = 0U; index < 4U; ++index) {
+                const std::uint8_t low_code =
+                    static_cast<std::uint8_t>((packed >> (index * 4U)) & 0xFU);
+                const std::uint8_t high_code = static_cast<std::uint8_t>(
+                    (packed >> ((index + 4U) * 4U)) & 0xFU);
+                const std::uint32_t expected =
+                    static_cast<std::uint32_t>(
+                        bf16_bits(fp4_e2m1_value(low_code) * scale)) |
+                    (static_cast<std::uint32_t>(
+                         bf16_bits(fp4_e2m1_value(high_code) * scale))
+                     << 16U);
+                if (prmt[group * 16U + word * 4U + index] != expected) {
+                    ++result.successor_mismatches;
+                }
+            }
+        }
+    }
+
     result.oracle_pairs = oracle_groups * 16U;
     for (std::uint32_t group = 0U; group < oracle_groups; ++group) {
         const float scale = e8m0_scale(host_scales[group]);
@@ -512,8 +677,8 @@ void print_result(std::ostream& output, int device,
            << "  \"samples\": " << kSamples << ",\n"
            << "  \"arena_replicas\": " << kArenaReplicas << ",\n"
            << "  \"scrub_bytes\": " << kScrubBytes << ",\n"
-           << "  \"e8m0_code_window\": [" << kScaleCodeMinimum << ", "
-           << kScaleCodeMaximum << "],\n"
+           << "  \"e8m0_code_window\": [" << g_scale_minimum << ", "
+           << g_scale_maximum << "],\n"
            << "  \"shapes\": [\n";
     for (std::size_t index = 0U; index < shapes.size(); ++index) {
         const ShapeResult& shape = shapes[index];
@@ -529,6 +694,8 @@ void print_result(std::ostream& output, int device,
                << ", \"swept_bytes\": " << shape.swept_bytes << ",\n"
                << "      \"oracle_pairs\": " << shape.oracle_pairs
                << ", \"oracle_mismatches\": " << shape.oracle_mismatches
+               << ", \"successor_mismatches\": "
+               << shape.successor_mismatches
                << ",\n"
                << "      \"arms\": [\n";
         for (std::size_t arm = 0U; arm < shape.arms.size(); ++arm) {
@@ -561,6 +728,15 @@ int main(int argc, char** argv) {
                 device = std::stoi(argv[++index]);
             } else if (flag == "--output" && index + 1 < argc) {
                 output_path = argv[++index];
+            } else if (flag == "--scale-window" && index + 2 < argc) {
+                // Experiment 0135 limitation 1: the additive decoder is only
+                // valid for E8M0 codes 2-250. The successor applies the scale
+                // as a multiply, so its valid window is an open question that
+                // must be measured rather than asserted.
+                g_scale_minimum =
+                    static_cast<std::uint32_t>(std::stoul(argv[++index]));
+                g_scale_maximum =
+                    static_cast<std::uint32_t>(std::stoul(argv[++index]));
             } else {
                 std::cerr << "usage: " << argv[0]
                           << " [--device INDEX] [--output PATH]\n";
@@ -598,6 +774,7 @@ int main(int argc, char** argv) {
 
         for (const ShapeResult& shape : shapes) {
             if (shape.oracle_mismatches != 0U) return EXIT_FAILURE;
+            if (shape.successor_mismatches != 0U) return EXIT_FAILURE;
         }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

@@ -2,11 +2,50 @@
 
 #include "strata/deepseek_manifest.hpp"
 
+#include "strata/result.hpp"
+
+#include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string_view>
 #include <string>
 #include <vector>
 
 namespace strata {
+
+// E8M0 scale admission for FP4 regions.
+//
+// Both FP4 decoders map the E8M0 scale code straight into a BF16 exponent
+// field. That is exact for codes 1-254 and silently wrong outside it: code 0
+// means 2^-127, which is subnormal in BF16 whose smallest normal is 2^-126 and
+// encodes as +0, and code 255 is the E8M0 NaN encoding and encodes as +inf.
+// Exact mode must execute an approved route or report failure, never
+// substitute, so a region carrying either code fails admission at load rather
+// than producing a wrong value at decode.
+//
+// Measured against the real DeepSeek V4 checkpoint in experiment 0156:
+// 1,409,286,144 scale bytes span codes [119, 125], entirely inside the window,
+// so this is a guard against a malformed or differently quantized checkpoint
+// rather than a constraint on the current one.
+inline constexpr std::uint8_t kDsv4E8m0AdmissibleMinimum = 1U;
+inline constexpr std::uint8_t kDsv4E8m0AdmissibleMaximum = 254U;
+
+struct Dsv4E8m0Admission {
+    std::uint64_t inadmissible{};
+    std::uint64_t code_zero{};
+    std::uint64_t code_255{};
+    std::uint64_t first_offset{};
+    std::uint8_t first_code{};
+    [[nodiscard]] bool admitted() const noexcept { return inadmissible == 0U; }
+};
+
+[[nodiscard]] Dsv4E8m0Admission dsv4_admit_e8m0_scales(
+    std::span<const std::byte> scales) noexcept;
+
+// Convenience wrapper that turns a rejection into a ValidationResult naming the
+// tensor, the offending code and its byte offset.
+[[nodiscard]] ValidationResult dsv4_admit_e8m0_scales_for(
+    std::string_view tensor_name, std::span<const std::byte> scales);
 
 struct Dsv4AdmissionConfig {
     std::uint64_t host_memory_ceiling_bytes{};

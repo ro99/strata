@@ -314,6 +314,7 @@ TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown 
 
     strata::set_register_fed_matmul(true);
     const auto regfed_weight = upload_fp4(backend, device, rows, columns, 0x5AU);
+    REQUIRE(backend.prepack_fragment(device, regfed_weight).ok());
     REQUIRE(backend.matmul(regfed_weight, hidden, 1U, out).ok());
     after = strata::cuda_matmul_route_census();
     REQUIRE(after.counts[fp4] == 1U);
@@ -2608,6 +2609,12 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
         backend, device, shared_intermediate, hidden, 4U);
     auto shared_w2 = upload_fp8(
         backend, device, hidden, shared_intermediate, 7U);
+    // Opt the shared expert into fragment order explicitly. These same weights
+    // are read canonically by the paged MoE path, so no dispatch site may make
+    // this decision on its own.
+    REQUIRE(backend.prepack_fragment(device, shared_w1).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_w3).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_w2).ok());
     const strata::CudaDeepSeekMoeExpert shared{
         &shared_w1, &shared_w3, &shared_w2, 1.0F};
     Dsv4HostMoeCallbackFixture fixture;
@@ -2753,8 +2760,11 @@ TEST_CASE("MIX-2 register-fed matmul matches the scalar route it replaces") {
 
         std::vector<float> measured(expected.size());
         strata::set_register_fed_matmul(true);
-        REQUIRE(backend.matmul(candidate, activation, batch, measured).ok());
+        // The permutation is an explicit opt-in: matmul_impl cannot see a
+        // weight's other consumers, so it may not decide the layout itself.
+        REQUIRE(backend.prepack_fragment(device, candidate).ok());
         REQUIRE(strata::CudaBackend::fragment_prepacked(candidate));
+        REQUIRE(backend.matmul(candidate, activation, batch, measured).ok());
         REQUIRE(!strata::CudaBackend::fragment_prepacked(control));
 
         // The two paths multiply the same real numbers and differ only in FP32
@@ -2817,4 +2827,63 @@ TEST_CASE("MIX-2 register-fed dispatch leaves inadmissible shapes on the scalar 
     // the kernel cannot read.
     REQUIRE(!backend.prepack_fragment(device, fp4).ok());
     REQUIRE(!backend.prepack_fragment(device, fp8).ok());
+}
+
+TEST_CASE("a fragment-prepacked weight is refused by every canonical route") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // Fragment order REPLACES the canonical layout, so a permuted weight
+    // reaching a scalar kernel does not lose a little accuracy -- it decodes a
+    // permutation as though it were weights. That is exactly the defect that
+    // corrupted a real DeepSeek V4 run: matmul_impl permuted the attention
+    // output projection, which the attention path then read canonically, and
+    // every generated token was wrong from the first one. The contract's rule
+    // is that an unsupported case fails explicitly, so this must be an error
+    // and never a silent result.
+    const auto weight = upload_fp8(backend, device, 128U, 128U, 0x11U);
+    std::vector<float> activation(128U, 0.5F);
+    std::vector<float> output(128U);
+    REQUIRE(backend.prepack_fragment(device, weight).ok());
+
+    strata::set_register_fed_matmul(false);
+    const auto refused = backend.matmul(weight, activation, 1U, output);
+    REQUIRE(!refused.ok());
+    REQUIRE(refused.errors.front().find("fragment-prepacked") !=
+            std::string::npos);
+
+    // With the route available the same weight must succeed.
+    strata::set_register_fed_matmul(true);
+    REQUIRE(backend.matmul(weight, activation, 1U, output).ok());
+
+    // A batch wider than the skinny kernel's 16 columns is chunked through it
+    // rather than handed to a canonical kernel that would misread the layout.
+    // That is slow for a large batch, and the census counts every chunk so the
+    // cost is visible, but it must still be correct.
+    constexpr std::uint32_t wide_rows = 64U;
+    std::vector<float> wide(128U * wide_rows);
+    for (std::size_t index = 0U; index < wide.size(); ++index) {
+        wide[index] = (index % 4U == 0U) ? 0.5F : -0.25F;
+    }
+    std::vector<float> chunked(128U * wide_rows);
+    REQUIRE(backend.matmul(weight, wide, wide_rows, chunked).ok());
+
+    const auto canonical = upload_fp8(backend, device, 128U, 128U, 0x11U);
+    std::vector<float> reference(chunked.size());
+    strata::set_register_fed_matmul(false);
+    REQUIRE(backend.matmul(canonical, wide, wide_rows, reference).ok());
+    strata::set_register_fed_matmul(true);
+    double worst = 0.0;
+    for (std::size_t index = 0U; index < chunked.size(); ++index) {
+        const double scale =
+            std::max(1.0, std::abs(static_cast<double>(reference[index])));
+        worst = std::max(worst, std::abs(static_cast<double>(chunked[index]) -
+                                         static_cast<double>(reference[index])) /
+                                    scale);
+    }
+    REQUIRE(worst < 1e-4);
 }

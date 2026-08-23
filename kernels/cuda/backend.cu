@@ -14778,8 +14778,24 @@ ValidationResult CudaBackend::matmul_impl(
         (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
              ? regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)
              : regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns));
+    // The register-fed route requires a weight already permuted by an explicit
+    // prepack_fragment call. matmul_impl must NOT decide this for itself: the
+    // layout is a property of the weight, and matmul_impl cannot see the
+    // weight's other consumers. Deciding it here corrupted the DeepSeek V4
+    // attention output projection, which matmul_impl touches 129 times a run
+    // and the attention path then reads canonically.
     const bool regfed = regfed_shape && regfed_matmul_enabled() &&
-                        (rows <= kRegfedMaxM || weight.impl_->fragment_prepacked);
+                        weight.impl_->fragment_prepacked;
+    // No hidden fallback. Fragment order replaces the canonical layout, so a
+    // permuted weight reaching a canonical kernel does not degrade -- it
+    // decodes a permutation as if it were weights. Refuse instead.
+    if (weight.impl_->fragment_prepacked && !regfed) {
+        result.errors.emplace_back(
+            "CUDA matmul received a fragment-prepacked weight but has no "
+            "register-fed route for this call; refusing to read fragment order "
+            "as canonical layout");
+        return result;
+    }
     const bool tensor_page =
         dsv4_fp8_tensor_page && !regfed &&
         state.dsv4_fp8_tensor_page_supported && rows > 1U && groups == 0U &&
@@ -15047,23 +15063,6 @@ ValidationResult CudaBackend::matmul_impl(
             return cuda_error(status, "allocate register-fed counter workspace");
         }
         state.regfed_counters = static_cast<std::uint32_t*>(counters);
-        if (!weight.impl_->fragment_prepacked) {
-            const auto scratch_bytes =
-                fragment_prepack_scratch_bytes(descriptor);
-            if (auto status = grow(state.regfed_scratch,
-                                   state.regfed_scratch_bytes, scratch_bytes,
-                                   false);
-                status != cudaSuccess) {
-                return cuda_error(status, "allocate fragment prepack scratch");
-            }
-            if (auto status = launch_fragment_prepack(
-                    descriptor, weight.impl_->weights, weight.impl_->scales,
-                    state.regfed_scratch, state.stream);
-                status != cudaSuccess) {
-                return cuda_error(status, "prepack weight into fragment order");
-            }
-            weight.impl_->fragment_prepacked = true;
-        }
         const unsigned int blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
             (static_cast<std::uint64_t>(n_tiles) * split +
              kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
@@ -15690,9 +15689,27 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
         const auto& w3_descriptor = shared->w3->impl_->descriptor;
         const bool shared_regfed =
             regfed_matmul_enabled() &&
+            // All three must already be permuted. These same weights are also read
+            // canonically by enqueue_deepseek_moe_rows through the paged kernels, so
+            // this site may not decide their layout on its own. An explicit
+            // prepack_fragment call is the opt-in, and it opts every consumer in.
+            shared->w1->impl_->fragment_prepacked &&
+            shared->w3->impl_->fragment_prepacked &&
+            shared->w2->impl_->fragment_prepacked &&
             regfed_fp8_shape_admissible(w1.rows, w1.columns) &&
             regfed_fp8_shape_admissible(w3_descriptor.rows, w3_descriptor.columns) &&
             regfed_fp8_shape_admissible(w2.rows, w2.columns);
+        if (!shared_regfed &&
+            (shared->w1->impl_->fragment_prepacked ||
+             shared->w3->impl_->fragment_prepacked ||
+             shared->w2->impl_->fragment_prepacked)) {
+            // Refuse rather than let the scalar kernel read fragment order as
+            // canonical weights, which is silent corruption, not degradation.
+            abort_enqueue(cudaErrorInvalidValue,
+                          "DeepSeek shared expert weights are fragment-prepacked "
+                          "but the register-fed route is unavailable");
+            return result;
+        }
         if (shared_regfed) {
             record_cuda_matmul_route(
                 CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed);
@@ -16302,9 +16319,27 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     const auto& w3_descriptor = shared.w3->impl_->descriptor;
     const bool shared_regfed =
         regfed_matmul_enabled() &&
+        // All three must already be permuted. These same weights are also read
+        // canonically by enqueue_deepseek_moe_rows through the paged kernels, so
+        // this site may not decide their layout on its own. An explicit
+        // prepack_fragment call is the opt-in, and it opts every consumer in.
+        shared.w1->impl_->fragment_prepacked &&
+        shared.w3->impl_->fragment_prepacked &&
+        shared.w2->impl_->fragment_prepacked &&
         regfed_fp8_shape_admissible(w1.rows, w1.columns) &&
         regfed_fp8_shape_admissible(w3_descriptor.rows, w3_descriptor.columns) &&
         regfed_fp8_shape_admissible(w2.rows, w2.columns);
+    if (!shared_regfed &&
+        (shared.w1->impl_->fragment_prepacked ||
+         shared.w3->impl_->fragment_prepacked ||
+         shared.w2->impl_->fragment_prepacked)) {
+        // Refuse rather than let the scalar kernel read fragment order as
+        // canonical weights, which is silent corruption, not degradation.
+        abort_enqueue(cudaErrorInvalidValue,
+                      "DeepSeek shared expert weights are fragment-prepacked "
+                      "but the register-fed route is unavailable");
+        return result;
+    }
     if (shared_regfed) {
         record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed);
         void* gate_buffer = state.moe_regfed_gate;

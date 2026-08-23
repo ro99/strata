@@ -435,6 +435,17 @@ if(STRATA_HAS_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
     )
 
+    add_executable(strata-moe-fp4-bandwidth-probe
+        apps/strata_moe_fp4_bandwidth_probe.cu)
+    target_link_libraries(strata-moe-fp4-bandwidth-probe PRIVATE
+        strata_platform CUDA::cudart)
+    set_property(TARGET strata-moe-fp4-bandwidth-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-moe-fp4-bandwidth-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-moe-fp4-bandwidth-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+
     add_executable(strata-dsv4-sm86-fp4-prepack-probe
         apps/strata_dsv4_sm86_fp4_prepack_probe.cu)
     target_link_libraries(strata-dsv4-sm86-fp4-prepack-probe PRIVATE

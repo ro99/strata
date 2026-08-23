@@ -2598,6 +2598,9 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
     // The live device path leaves the exact shared/routed BF16 result in
     // the persistent mHC branch buffer. Its consumer must reject missing or
     // stale producers and match the retained host bridge bit for bit.
+    // Earlier cases flip the process-global register-fed switch, so this one
+    // states which route it is measuring rather than inheriting it.
+    strata::set_register_fed_matmul(true);
     constexpr std::uint64_t shared_intermediate = 128U;
     auto shared_w1 = upload_fp8(
         backend, device, shared_intermediate, hidden, 1U);
@@ -2667,8 +2670,14 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
         &fixture).ok());
     REQUIRE(backend.collect_deepseek_moe(device, {}, {}).ok());
     const auto bridge_after = backend.stats();
+    // Nine launches on the register-fed shared expert against five on the
+    // incumbent: the fused gate/up/SwiGLU kernel becomes an activation permute,
+    // two projections and a standalone SwiGLU, and the down projection becomes a
+    // permute plus a projection. The permute is written once and read by both
+    // gate and up, which is why this is nine and not ten. The count is asserted
+    // because a silent change to it is a change to the dispatch shape.
     REQUIRE(bridge_after.deepseek_moe_kernel_launches -
-                bridge_before.deepseek_moe_kernel_launches == 5U);
+                bridge_before.deepseek_moe_kernel_launches == 9U);
     REQUIRE(bridge_after.deepseek_moe_h2d_transfers -
                 bridge_before.deepseek_moe_h2d_transfers == 1U);
     REQUIRE(bridge_after.deepseek_moe_h2d_bytes -

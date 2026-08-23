@@ -806,6 +806,10 @@ enum class CudaMatmulRoute : std::uint8_t {
     // is never called by the DeepSeek V4 runtime.
     Dsv4MoeRoutedFp4,
     Dsv4MoeSharedFp8,
+    // The same shared expert on the register-fed route. Its three projections
+    // never reach matmul_impl -- their operands never leave the device -- so it
+    // is wired at its own dispatch site and counted separately.
+    Dsv4MoeSharedFp8RegisterFed,
     // Host-routed MoE still runs a device FP4 path: the resident routed-expert
     // tier, dispatched from enqueue_dsv4_host_moe_impl. Experts that miss the
     // tier are computed on the host and never reach a CUDA route at all.

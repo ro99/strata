@@ -3545,6 +3545,148 @@ cudaError_t launch_fragment_prepack(const CudaWeightDescriptor& descriptor,
     return cudaGetLastError();
 }
 
+// Standalone SwiGLU for the register-fed shared expert. The rounding, the
+// finite check, the clamp order and the BF16 SiLU table lookup are reproduced
+// from deepseek_fp8_gate_up_kernel exactly, so substituting the projections
+// underneath cannot move the activation by itself.
+__global__ void regfed_shared_swiglu_kernel(
+    float* __restrict__ activation, const float* __restrict__ gate,
+    const float* __restrict__ up, std::uint32_t intermediate,
+    float swiglu_limit, const float* __restrict__ bf16_silu,
+    unsigned int* __restrict__ error_flag) {
+    const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= intermediate) return;
+    const float rounded_gate = bf16_round(gate[row]);
+    const float rounded_up = bf16_round(up[row]);
+    if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+        atomicExch(error_flag, 1U);
+        activation[row] = __uint_as_float(0x7FC0'0000U);
+        return;
+    }
+    const float limited_gate = fminf(rounded_gate, swiglu_limit);
+    const float limited_up =
+        fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+    const auto gate_bits =
+        static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+    activation[row] = bf16_round(bf16_silu[gate_bits] * limited_up);
+}
+
+// Workspaces for a register-fed dispatch made outside matmul_impl. Every buffer
+// is grown geometrically and kept, so a decode step that repeats the same shapes
+// allocates nothing after the first token.
+struct RegfedWorkspace {
+    void* activation{};
+    void* partials{};
+    void* counters{};
+    void* scratch{};
+    std::uint64_t activation_bytes{};
+    std::uint64_t partial_bytes{};
+    std::uint64_t counter_bytes{};
+    std::uint64_t scratch_bytes{};
+};
+
+cudaError_t regfed_grow(void*& pointer, std::uint64_t& capacity,
+                        std::uint64_t required, bool zero,
+                        cudaStream_t stream) {
+    if (required <= capacity) return cudaSuccess;
+    if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+    pointer = nullptr;
+    capacity = 0U;
+    if (auto status = cudaMalloc(&pointer, static_cast<std::size_t>(required));
+        status != cudaSuccess) {
+        return status;
+    }
+    capacity = required;
+    if (!zero) return cudaSuccess;
+    // Zeroing the whole allocation, not just the range in use, is what lets a
+    // later call with more N-tiles reuse the buffer: the fold resets every
+    // counter it touches, and everything it has not touched is still zero.
+    return cudaMemsetAsync(pointer, 0, static_cast<std::size_t>(required),
+                           stream);
+}
+
+// One register-fed FP8 matvec against a device-resident activation. Used by the
+// DeepSeek shared expert, which never reaches matmul_impl because its operands
+// never leave the device.
+cudaError_t launch_regfed_fp8_matvec(RegfedWorkspace& workspace,
+                                     const CudaWeightDescriptor& descriptor,
+                                     void* weights, void* scales,
+                                     bool& prepacked, const float* input,
+                                     float* output, cudaStream_t stream,
+                                     bool reuse_activation = false) {
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t split = regfed_split_k(columns / 32U, n_tiles);
+    const std::uint64_t activation_bytes =
+        static_cast<std::uint64_t>(k_tiles) * 4U * sizeof(uint2);
+    const std::uint64_t partial_bytes = static_cast<std::uint64_t>(n_tiles) *
+                                        split * kRegfedTileN * kRegfedMaxM *
+                                        sizeof(float);
+    const std::uint64_t counter_bytes =
+        static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+    if (auto status = regfed_grow(workspace.activation,
+                                  workspace.activation_bytes, activation_bytes,
+                                  false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.partials, workspace.partial_bytes,
+                                  partial_bytes, false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.counters, workspace.counter_bytes,
+                                  counter_bytes, true, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (!prepacked) {
+        if (auto status = regfed_grow(
+                workspace.scratch, workspace.scratch_bytes,
+                fragment_prepack_scratch_bytes(descriptor), false, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+        if (auto status = launch_fragment_prepack(descriptor, weights, scales,
+                                                  workspace.scratch, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+        prepacked = true;
+    }
+    constexpr unsigned int threads = 256U;
+    // Gate and up read the same hidden vector, so the second of the pair reuses
+    // the permutation the first one wrote rather than recomputing it.
+    if (!reuse_activation) {
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(k_tiles) * 4U;
+        regfed_activation_fragment_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((fragment_total + threads - 1U) / threads,
+                                        65535U)),
+            threads, 0U, stream>>>(
+            static_cast<uint2*>(workspace.activation), input, 1U, columns, 1U,
+            1U);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    }
+    const unsigned int blocks = static_cast<unsigned int>(
+        std::min<std::uint64_t>((static_cast<std::uint64_t>(n_tiles) * split +
+                                 kRegfedWarpsPerBlock - 1U) /
+                                    kRegfedWarpsPerBlock,
+                                65535U));
+    regfed_fp8_matmul_kernel<1U><<<blocks, kRegfedWarpsPerBlock * 32U, 0U,
+                                   stream>>>(
+        output, static_cast<const uint4*>(weights),
+        static_cast<const unsigned char*>(scales),
+        static_cast<const uint2*>(workspace.activation), columns, rows,
+        static_cast<std::uint32_t>(descriptor.scale_columns), split, 1U, 1U,
+        static_cast<float*>(workspace.partials),
+        static_cast<std::uint32_t*>(workspace.counters));
+    return cudaGetLastError();
+}
+
 __global__ void deepseek_fp8_gate_up_kernel(
     float* activation, const float* hidden,
     const unsigned char* w1, const unsigned char* w1_scales,
@@ -6152,6 +6294,13 @@ struct CudaBackend::Impl {
         // split-K partials, and one arrival counter per N-tile. All three are
         // grown geometrically and kept, so a decode step that repeats the same
         // shapes allocates nothing after the first call.
+        // The shared expert dispatches on its own stream, concurrently with the
+        // routed path, so it keeps workspaces separate from the generic
+        // matmul's rather than sharing them.
+        RegfedWorkspace moe_regfed{};
+        float* moe_regfed_gate{};
+        float* moe_regfed_up{};
+        std::uint64_t moe_regfed_gate_bytes{};
         void* regfed_activation{};
         float* regfed_partials{};
         std::uint32_t* regfed_counters{};
@@ -6380,6 +6529,15 @@ struct CudaBackend::Impl {
             }
             if (state.gemma_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.gemma_host_staging));
+            }
+            // moe_regfed_up is an interior pointer into the gate allocation,
+            // not an allocation of its own: freeing it is cudaErrorInvalidValue.
+            for (void* pointer : {state.moe_regfed.activation,
+                                  state.moe_regfed.partials,
+                                  state.moe_regfed.counters,
+                                  state.moe_regfed.scratch,
+                                  static_cast<void*>(state.moe_regfed_gate)}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
             }
             if (state.regfed_activation != nullptr) {
                 static_cast<void>(cudaFree(state.regfed_activation));
@@ -14754,6 +14912,8 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
         case CudaMatmulRoute::Dsv4MoeRoutedFp4: return "dsv4_moe_routed_fp4";
         case CudaMatmulRoute::Dsv4MoeSharedFp8: return "dsv4_moe_shared_fp8";
+        case CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed:
+            return "dsv4_moe_shared_fp8_register_fed";
         case CudaMatmulRoute::Dsv4MoeTierFp4: return "dsv4_moe_tier_fp4";
         case CudaMatmulRoute::Unsupported: return "unsupported";
         default: return "invalid";
@@ -15719,24 +15879,71 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     }
 
     if (shared != nullptr) {
-        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
         const auto& w1 = shared->w1->impl_->descriptor;
         const auto& w2 = shared->w2->impl_->descriptor;
         float* shared_activation = state.moe_activations +
             static_cast<std::uint64_t>(routed_batch.count) * intermediate_columns;
         float* shared_output = state.moe_output +
             static_cast<std::uint64_t>(routed_batch.count) * hidden_columns;
-        deepseek_fp8_gate_up_kernel<<<
-            static_cast<unsigned int>(intermediate_columns), threads, 0U,
-            state.stream>>>(
-            shared_activation, state.moe_hidden,
-            static_cast<const unsigned char*>(shared->w1->impl_->weights),
-            static_cast<const unsigned char*>(shared->w1->impl_->scales),
-            static_cast<const unsigned char*>(shared->w3->impl_->weights),
-            static_cast<const unsigned char*>(shared->w3->impl_->scales),
-            hidden_columns, intermediate_columns, w1.scale_columns,
-            swiglu_limit, state.moe_bf16_silu, state.moe_error);
-        ++state.moe_kernel_launches;
+        const auto& w3_descriptor = shared->w3->impl_->descriptor;
+        const bool shared_regfed =
+            regfed_matmul_enabled() &&
+            regfed_fp8_shape_admissible(w1.rows, w1.columns) &&
+            regfed_fp8_shape_admissible(w3_descriptor.rows, w3_descriptor.columns) &&
+            regfed_fp8_shape_admissible(w2.rows, w2.columns);
+        if (shared_regfed) {
+            record_cuda_matmul_route(
+                CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed);
+            // Gate and up share one buffer so a single allocation covers both.
+            void* gate_buffer = state.moe_regfed_gate;
+            if (auto status = regfed_grow(
+                    gate_buffer, state.moe_regfed_gate_bytes,
+                    intermediate_columns * 2U * sizeof(float), false, state.stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "allocate register-fed shared expert buffers");
+                return result;
+            }
+            state.moe_regfed_gate = static_cast<float*>(gate_buffer);
+            state.moe_regfed_up = state.moe_regfed_gate + intermediate_columns;
+            if (auto status = launch_regfed_fp8_matvec(
+                    state.moe_regfed, w1, shared->w1->impl_->weights,
+                    shared->w1->impl_->scales,
+                    shared->w1->impl_->fragment_prepacked, state.moe_hidden,
+                    state.moe_regfed_gate, state.stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "launch register-fed shared expert gate");
+                return result;
+            }
+            if (auto status = launch_regfed_fp8_matvec(
+                    state.moe_regfed, w3_descriptor, shared->w3->impl_->weights,
+                    shared->w3->impl_->scales,
+                    shared->w3->impl_->fragment_prepacked, state.moe_hidden,
+                    state.moe_regfed_up, state.stream, true);
+                status != cudaSuccess) {
+                abort_enqueue(status, "launch register-fed shared expert up");
+                return result;
+            }
+            regfed_shared_swiglu_kernel<<<
+                static_cast<unsigned int>((intermediate_columns + 255U) / 256U),
+                256U, 0U, state.stream>>>(
+                shared_activation, state.moe_regfed_gate, state.moe_regfed_up,
+                static_cast<std::uint32_t>(intermediate_columns), swiglu_limit,
+                state.moe_bf16_silu, state.moe_error);
+            state.moe_kernel_launches += 4U;
+        } else {
+            record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
+            deepseek_fp8_gate_up_kernel<<<
+                static_cast<unsigned int>(intermediate_columns), threads, 0U,
+                state.stream>>>(
+                shared_activation, state.moe_hidden,
+                static_cast<const unsigned char*>(shared->w1->impl_->weights),
+                static_cast<const unsigned char*>(shared->w1->impl_->scales),
+                static_cast<const unsigned char*>(shared->w3->impl_->weights),
+                static_cast<const unsigned char*>(shared->w3->impl_->scales),
+                hidden_columns, intermediate_columns, w1.scale_columns,
+                swiglu_limit, state.moe_bf16_silu, state.moe_error);
+            ++state.moe_kernel_launches;
+        }
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared FP8 W1/W3 SwiGLU");
             return result;
@@ -15765,14 +15972,27 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
                           "record DeepSeek shared activation quantization");
             return result;
         }
-        deepseek_fp8_down_kernel<<<
-            static_cast<unsigned int>(hidden_columns), threads, 0U,
-            state.stream>>>(
-            shared_output, shared_activation,
-            static_cast<const unsigned char*>(shared->w2->impl_->weights),
-            static_cast<const unsigned char*>(shared->w2->impl_->scales),
-            intermediate_columns, hidden_columns, w2.scale_columns);
-        ++state.moe_kernel_launches;
+        if (shared_regfed) {
+            if (auto status = launch_regfed_fp8_matvec(
+                    state.moe_regfed, w2, shared->w2->impl_->weights,
+                    shared->w2->impl_->scales,
+                    shared->w2->impl_->fragment_prepacked, shared_activation,
+                    shared_output, state.stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "launch register-fed shared expert down");
+                return result;
+            }
+            state.moe_kernel_launches += 2U;
+        } else {
+            deepseek_fp8_down_kernel<<<
+                static_cast<unsigned int>(hidden_columns), threads, 0U,
+                state.stream>>>(
+                shared_output, shared_activation,
+                static_cast<const unsigned char*>(shared->w2->impl_->weights),
+                static_cast<const unsigned char*>(shared->w2->impl_->scales),
+                intermediate_columns, hidden_columns, w2.scale_columns);
+            ++state.moe_kernel_launches;
+        }
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared FP8 W2");
             return result;
@@ -16277,18 +16497,64 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     }
 
     constexpr unsigned int threads = 256U;
-    record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
-    deepseek_fp8_gate_up_kernel<<<
-        static_cast<unsigned int>(intermediate_columns), threads, 0U,
-        state.moe_shared_stream>>>(
-        state.moe_activations, state.moe_hidden,
-        static_cast<const unsigned char*>(shared.w1->impl_->weights),
-        static_cast<const unsigned char*>(shared.w1->impl_->scales),
-        static_cast<const unsigned char*>(shared.w3->impl_->weights),
-        static_cast<const unsigned char*>(shared.w3->impl_->scales),
-        hidden_columns, intermediate_columns, w1.scale_columns,
-        swiglu_limit, state.moe_bf16_silu, state.moe_error);
-    ++state.moe_kernel_launches;
+    const auto& w3_descriptor = shared.w3->impl_->descriptor;
+    const bool shared_regfed =
+        regfed_matmul_enabled() &&
+        regfed_fp8_shape_admissible(w1.rows, w1.columns) &&
+        regfed_fp8_shape_admissible(w3_descriptor.rows, w3_descriptor.columns) &&
+        regfed_fp8_shape_admissible(w2.rows, w2.columns);
+    if (shared_regfed) {
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed);
+        void* gate_buffer = state.moe_regfed_gate;
+        if (auto status = regfed_grow(
+                gate_buffer, state.moe_regfed_gate_bytes,
+                intermediate_columns * 2U * sizeof(float), false,
+                state.moe_shared_stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "allocate register-fed shared expert buffers");
+            return result;
+        }
+        state.moe_regfed_gate = static_cast<float*>(gate_buffer);
+        state.moe_regfed_up = state.moe_regfed_gate + intermediate_columns;
+        if (auto status = launch_regfed_fp8_matvec(
+                state.moe_regfed, w1, shared.w1->impl_->weights,
+                shared.w1->impl_->scales, shared.w1->impl_->fragment_prepacked,
+                state.moe_hidden, state.moe_regfed_gate,
+                state.moe_shared_stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "launch register-fed shared expert gate");
+            return result;
+        }
+        if (auto status = launch_regfed_fp8_matvec(
+                state.moe_regfed, w3_descriptor, shared.w3->impl_->weights,
+                shared.w3->impl_->scales, shared.w3->impl_->fragment_prepacked,
+                state.moe_hidden, state.moe_regfed_up,
+                state.moe_shared_stream, true);
+            status != cudaSuccess) {
+            abort_enqueue(status, "launch register-fed shared expert up");
+            return result;
+        }
+        regfed_shared_swiglu_kernel<<<
+            static_cast<unsigned int>((intermediate_columns + 255U) / 256U),
+            256U, 0U, state.moe_shared_stream>>>(
+            state.moe_activations, state.moe_regfed_gate, state.moe_regfed_up,
+            static_cast<std::uint32_t>(intermediate_columns), swiglu_limit,
+            state.moe_bf16_silu, state.moe_error);
+        state.moe_kernel_launches += 4U;
+    } else {
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
+        deepseek_fp8_gate_up_kernel<<<
+            static_cast<unsigned int>(intermediate_columns), threads, 0U,
+            state.moe_shared_stream>>>(
+            state.moe_activations, state.moe_hidden,
+            static_cast<const unsigned char*>(shared.w1->impl_->weights),
+            static_cast<const unsigned char*>(shared.w1->impl_->scales),
+            static_cast<const unsigned char*>(shared.w3->impl_->weights),
+            static_cast<const unsigned char*>(shared.w3->impl_->scales),
+            hidden_columns, intermediate_columns, w1.scale_columns,
+            swiglu_limit, state.moe_bf16_silu, state.moe_error);
+        ++state.moe_kernel_launches;
+    }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch DeepSeek host MoE shared W1/W3");
         return result;
@@ -16318,14 +16584,27 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
                       "record DeepSeek shared activation quantization");
         return result;
     }
-    deepseek_fp8_down_kernel<<<
-        static_cast<unsigned int>(hidden_columns), threads, 0U,
-        state.moe_shared_stream>>>(
-        state.moe_output, state.moe_activations,
-        static_cast<const unsigned char*>(shared.w2->impl_->weights),
-        static_cast<const unsigned char*>(shared.w2->impl_->scales),
-        intermediate_columns, hidden_columns, w2.scale_columns);
-    ++state.moe_kernel_launches;
+    if (shared_regfed) {
+        if (auto status = launch_regfed_fp8_matvec(
+                state.moe_regfed, w2, shared.w2->impl_->weights,
+                shared.w2->impl_->scales, shared.w2->impl_->fragment_prepacked,
+                state.moe_activations, state.moe_output,
+                state.moe_shared_stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "launch register-fed shared expert down");
+            return result;
+        }
+        state.moe_kernel_launches += 2U;
+    } else {
+        deepseek_fp8_down_kernel<<<
+            static_cast<unsigned int>(hidden_columns), threads, 0U,
+            state.moe_shared_stream>>>(
+            state.moe_output, state.moe_activations,
+            static_cast<const unsigned char*>(shared.w2->impl_->weights),
+            static_cast<const unsigned char*>(shared.w2->impl_->scales),
+            intermediate_columns, hidden_columns, w2.scale_columns);
+        ++state.moe_kernel_launches;
+    }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch DeepSeek host MoE shared W2");
         return result;

@@ -13812,10 +13812,25 @@ ValidationResult CudaBackend::glm_absorbed_attention(
     return result;
 }
 
-void CudaBackend::record_matmul_route(CudaMatmulRoute route) const noexcept {
-    std::atomic_ref<std::uint64_t>(
-        route_census_[static_cast<std::size_t>(route)])
-        .fetch_add(1U, std::memory_order_relaxed);
+namespace {
+std::atomic<std::uint64_t>
+    g_route_census[static_cast<std::size_t>(CudaMatmulRoute::Count)]{};
+}  // namespace
+
+void record_cuda_matmul_route(CudaMatmulRoute route) noexcept {
+    g_route_census[static_cast<std::size_t>(route)].fetch_add(
+        1U, std::memory_order_relaxed);
+}
+
+CudaMatmulRouteCensus cuda_matmul_route_census() noexcept {
+    CudaMatmulRouteCensus out;
+    for (std::size_t i = 0; i < out.counts.size(); ++i)
+        out.counts[i] = g_route_census[i].load(std::memory_order_relaxed);
+    return out;
+}
+
+void reset_cuda_matmul_route_census() noexcept {
+    for (auto& c : g_route_census) c.store(0U, std::memory_order_relaxed);
 }
 
 const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
@@ -13831,19 +13846,6 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::Unsupported: return "unsupported";
         default: return "invalid";
     }
-}
-
-CudaMatmulRouteCensus CudaBackend::matmul_route_census() const noexcept {
-    CudaMatmulRouteCensus out;
-    for (std::size_t i = 0; i < out.counts.size(); ++i)
-        out.counts[i] = std::atomic_ref<std::uint64_t>(route_census_[i])
-                            .load(std::memory_order_relaxed);
-    return out;
-}
-
-void CudaBackend::reset_matmul_route_census() noexcept {
-    for (auto& c : route_census_)
-        std::atomic_ref<std::uint64_t>(c).store(0U, std::memory_order_relaxed);
 }
 
 ValidationResult CudaBackend::matmul_impl(
@@ -14034,7 +14036,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const __nv_bfloat16*>(weight.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
-        record_matmul_route(CudaMatmulRoute::PlainGeneric);
+        record_cuda_matmul_route(CudaMatmulRoute::PlainGeneric);
         if (rows == 1U) {
             plain_matmul_kernel<1U><<<grid, threads, 0, state.stream>>>(
                 state.output, state.input, weight.impl_->weights,
@@ -14057,7 +14059,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
             descriptor.rows, groups, rows_per_group);
     } else if (w8_group32) {
-        record_matmul_route(CudaMatmulRoute::PackedInt8Group32);
+        record_cuda_matmul_route(CudaMatmulRoute::PackedInt8Group32);
         constexpr unsigned int warps_per_block = threads / 32U;
         const auto blocks = static_cast<unsigned int>(
             (descriptor.rows + warps_per_block - 1U) / warps_per_block);
@@ -14070,7 +14072,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
                descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
-        record_matmul_route(CudaMatmulRoute::PackedOffsetInt);
+        record_cuda_matmul_route(CudaMatmulRoute::PackedOffsetInt);
         const auto bits = descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ? 4U : 8U;
         packed_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input, static_cast<const std::uint32_t*>(weight.impl_->weights),
@@ -14079,7 +14081,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
-        record_matmul_route(CudaMatmulRoute::Nvfp4Group16);
+        record_cuda_matmul_route(CudaMatmulRoute::Nvfp4Group16);
         nvfp4_group16_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
@@ -14088,7 +14090,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.scale_columns, descriptor.group_size, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
     } else if (tensor_page) {
-        record_matmul_route(CudaMatmulRoute::Fp8TensorPage);
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8TensorPage);
         const dim3 tensor_grid(
             static_cast<unsigned int>(
                 descriptor.rows / kDsv4Fp8TensorBlockN),
@@ -14105,7 +14107,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<std::uint32_t>(descriptor.columns),
             static_cast<std::uint32_t>(descriptor.rows));
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
-        record_matmul_route(CudaMatmulRoute::Fp8E4m3Block128);
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8E4m3Block128);
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
@@ -14113,7 +14115,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
-        record_matmul_route(CudaMatmulRoute::Fp4E2m1Group32);
+        record_cuda_matmul_route(CudaMatmulRoute::Fp4E2m1Group32);
         native_fp4_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
@@ -14124,7 +14126,7 @@ ValidationResult CudaBackend::matmul_impl(
         // MIX-1: no hidden fallback. This branch previously routed every
         // unrecognised encoding into the FP4 kernel, which would decode the
         // wrong format silently. An unsupported case must fail explicitly.
-        record_matmul_route(CudaMatmulRoute::Unsupported);
+        record_cuda_matmul_route(CudaMatmulRoute::Unsupported);
         ValidationResult unsupported;
         unsupported.errors.emplace_back(
             "CUDA matmul has no approved exact route for weight encoding " +

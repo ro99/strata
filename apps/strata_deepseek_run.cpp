@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -48,6 +49,7 @@ struct Options {
     std::uint64_t explicit_vram_budget_bytes{};
     double expert_prefetch_minimum_confidence{0.75};
     bool admission_only{};
+    std::string route_census_path;
     bool json{};
     bool quiet{};
     bool detailed_timing{};
@@ -86,6 +88,7 @@ void usage() {
         << "       [--overlap-resident-warmup|--serial-resident-warmup]\n"
         << "       [--vram-fraction F] [--vram-budget-bytes BYTES]\n"
         << "       [--admission-only] [--route-trace PATH]\n"
+        << "       [--route-census PATH]\n"
         << "       [--device-moe|--serial-device-moe|--host-routed-moe]\n"
         << "       [--arena-hugepages|--no-arena-hugepages]\n"
         << "       [--static-expert-plan PATH --static-expert-device N\n"
@@ -345,6 +348,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.overlap_resident_warmup = true;
         } else if (argument == "--serial-resident-warmup") {
             options.overlap_resident_warmup = false;
+        } else if (argument == "--route-census") {
+            const auto* value = next(argument);
+            if (value == nullptr) return false;
+            options.route_census_path = value;
         } else if (argument == "--admission-only") {
             options.admission_only = true;
         } else if (argument == "--detailed-timing") {
@@ -1432,6 +1439,31 @@ int main(int argc, char** argv) {
                   << metrics.decode_seconds << " s\n"
                   << "decode checkpoint reads: "
                   << metrics.decode_checkpoint_reads.bytes << " bytes\n";
+    }
+    // MIX-1 route census: every production matmul dispatch choice, observable.
+    // The census is process-global, so a rank-local TP=2 run aggregates both
+    // ranks rather than reporting whichever backend happened to be asked.
+    if (!options.route_census_path.empty()) {
+        const auto census = strata::cuda_matmul_route_census();
+        std::ofstream file(options.route_census_path);
+        if (!file) {
+            std::cerr << "error: cannot open route census path: "
+                      << options.route_census_path << '\n';
+            return 1;
+        }
+        std::uint64_t total = 0U;
+        for (const auto count : census.counts) total += count;
+        file << "{\n  \"total_matmuls\": " << total << ",\n  \"routes\": {";
+        bool first = true;
+        for (std::size_t i = 0U;
+             i < static_cast<std::size_t>(strata::CudaMatmulRoute::Count); ++i) {
+            file << (first ? "\n" : ",\n") << "    \""
+                 << strata::cuda_matmul_route_name(
+                        static_cast<strata::CudaMatmulRoute>(i))
+                 << "\": " << census.counts[i];
+            first = false;
+        }
+        file << "\n  }\n}\n";
     }
     return 0;
 }

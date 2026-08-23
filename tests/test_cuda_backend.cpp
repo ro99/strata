@@ -256,8 +256,8 @@ TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown 
     const std::vector<int> selected{device};
     REQUIRE(backend.initialize(selected, true).ok());
 
-    backend.reset_matmul_route_census();
-    const auto before = backend.matmul_route_census();
+    strata::reset_cuda_matmul_route_census();
+    const auto before = strata::cuda_matmul_route_census();
     for (const auto count : before.counts) REQUIRE(count == 0U);
 
     // An FP4 matmul must be recorded on the FP4 route and nowhere else.
@@ -267,7 +267,7 @@ TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown 
     std::vector<float> out(static_cast<std::size_t>(rows));
     REQUIRE(backend.matmul(weight, hidden, 1U, out).ok());
 
-    const auto after = backend.matmul_route_census();
+    const auto after = strata::cuda_matmul_route_census();
     const auto fp4 = static_cast<std::size_t>(
         strata::CudaMatmulRoute::Fp4E2m1Group32);
     const auto unsupported = static_cast<std::size_t>(

@@ -789,21 +789,23 @@ enum class CudaMatmulRoute : std::uint8_t {
     Count,
 };
 
-[[nodiscard]] const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept;
-
 struct CudaMatmulRouteCensus {
     std::array<std::uint64_t,
                static_cast<std::size_t>(CudaMatmulRoute::Count)> counts{};
 };
 
+[[nodiscard]] const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept;
+
+// The census is process-global, not per-backend: a rank-local TP=2 run creates
+// one CudaBackend per rank, and per-instance counters would split the census
+// across them.
+[[nodiscard]] CudaMatmulRouteCensus cuda_matmul_route_census() noexcept;
+void reset_cuda_matmul_route_census() noexcept;
+void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
+
+
 class CudaBackend {
 public:
-    // MIX-1 route census. Snapshot of how many matmuls took each route since
-    // process start; Unsupported is always zero in a healthy run, because
-    // reaching it is a hard error rather than a fallback.
-    [[nodiscard]] CudaMatmulRouteCensus matmul_route_census() const noexcept;
-    void reset_matmul_route_census() noexcept;
-    void record_matmul_route(CudaMatmulRoute route) const noexcept;
 
     CudaBackend();
     ~CudaBackend();
@@ -1192,11 +1194,6 @@ public:
 private:
     // One counter per route; atomic because the backend is called from the
     // rank-local worker pool.
-    // Plain counters incremented through std::atomic_ref, so CudaBackend stays
-    // copyable while the census is still safe under the rank-local worker pool.
-    mutable std::array<std::uint64_t,
-                       static_cast<std::size_t>(CudaMatmulRoute::Count)>
-        route_census_{};
 
     [[nodiscard]] ValidationResult dsv4_mhc_begin_impl(
         int device, const CudaDsv4MhcWeights& weights,

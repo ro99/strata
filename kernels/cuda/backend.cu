@@ -13843,6 +13843,12 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
         case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
         case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
+        case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
+        case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
+        case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
+        case CudaMatmulRoute::Dsv4MoeRoutedFp4: return "dsv4_moe_routed_fp4";
+        case CudaMatmulRoute::Dsv4MoeSharedFp8: return "dsv4_moe_shared_fp8";
+        case CudaMatmulRoute::Dsv4MoeTierFp4: return "dsv4_moe_tier_fp4";
         case CudaMatmulRoute::Unsupported: return "unsupported";
         default: return "invalid";
     }
@@ -14579,6 +14585,9 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     }
 
     if (!routed.empty()) {
+        // Counted once per command on the gate/up dispatch; the down kernel
+        // mirrors the branch, so counting both would double every entry.
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeRoutedFp4);
         const auto& w1 = routed.front().w1->impl_->descriptor;
         const auto& w2 = routed.front().w2->impl_->descriptor;
         const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
@@ -14618,6 +14627,7 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     }
 
     if (shared != nullptr) {
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
         const auto& w1 = shared->w1->impl_->descriptor;
         const auto& w2 = shared->w2->impl_->descriptor;
         float* shared_activation = state.moe_activations +
@@ -15175,6 +15185,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     }
 
     constexpr unsigned int threads = 256U;
+    record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
     deepseek_fp8_gate_up_kernel<<<
         static_cast<unsigned int>(intermediate_columns), threads, 0U,
         state.moe_shared_stream>>>(
@@ -15297,6 +15308,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         const dim3 tier_gate_grid(
             static_cast<unsigned int>(intermediate_columns),
             kMaxDeepSeekRoutedExperts, 1U);
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeTierFp4);
         deepseek_fp4_tier_gate_up_kernel<<<
             tier_gate_grid, threads, 0U, state.stream>>>(
             state.tier_activations, state.moe_hidden, table, tier_selection,
@@ -16382,6 +16394,11 @@ ValidationResult CudaBackend::enqueue_moe(
         static_cast<unsigned int>((intermediate_columns + warps_per_block - 1U) /
                                   warps_per_block),
         static_cast<unsigned int>(activation_rows), 1U);
+    // Counted once per MoE command on the gate/up dispatch; the down kernel
+    // mirrors the same branch, so counting both would double every entry.
+    record_cuda_matmul_route(plain_batch    ? CudaMatmulRoute::MoePlainBf16
+                             : nvfp4_batch  ? CudaMatmulRoute::MoeNvfp4Group16
+                                            : CudaMatmulRoute::MoePackedInt4);
     if (plain_batch) {
         plain_bf16_moe_gate_up_kernel<<<plain_gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, plain_batch_data,

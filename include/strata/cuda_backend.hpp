@@ -785,6 +785,24 @@ enum class CudaMatmulRoute : std::uint8_t {
     Fp8TensorPage,
     Fp8E4m3Block128,
     Fp4E2m1Group32,
+    // MoE expert batches dispatch through CudaBackend::enqueue_moe, which
+    // experiment 0162 showed is the path production decode actually uses --
+    // matmul_impl is load-only. These are counted separately so a census can
+    // distinguish a load-time dispatch from a per-token one.
+    MoePlainBf16,
+    MoeNvfp4Group16,
+    MoePackedInt4,
+    // DeepSeek V4's own MoE path. This is the campaign's mixed dispatch: the
+    // routed experts are FP4 E2M1/E8M0 group-32 and the shared expert is FP8
+    // E4M3/E8M0 block-128, dispatched by CudaBackend::enqueue_deepseek_moe.
+    // The generic enqueue_moe above is used by GLM-5.2, Laguna and Inkling and
+    // is never called by the DeepSeek V4 runtime.
+    Dsv4MoeRoutedFp4,
+    Dsv4MoeSharedFp8,
+    // Host-routed MoE still runs a device FP4 path: the resident routed-expert
+    // tier, dispatched from enqueue_dsv4_host_moe_impl. Experts that miss the
+    // tier are computed on the host and never reach a CUDA route at all.
+    Dsv4MoeTierFp4,
     Unsupported,
     Count,
 };

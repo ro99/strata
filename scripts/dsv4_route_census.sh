@@ -23,6 +23,6 @@ exec env CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2 \
   --devices 0,1 --host-memory 216G --vram-fraction .95 \
   --max-context 256 --max-new 4 \
   --prompt "Explain tensor parallelism briefly." \
-  --device-resident-runtime --host-routed-moe \
+  --device-resident-runtime ${MOE_MODE:---host-routed-moe} \
   --host-attention-threads 28 \
   --route-census "$CENSUS" "$@" > "$LOG" 2>&1

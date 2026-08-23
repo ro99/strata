@@ -46,10 +46,10 @@ There is also an OpenAI-compatible server (`strata-server`) and a terminal UI.
 
 | Model | Layout | Native precision | On a 64 GiB-VRAM / 251 GiB-RAM workstation |
 |---|---|---|---|
-| **Gemma 4 31B-IT** | 60 dense hybrid-attention layers + 27-layer vision tower | INT8 group-32 text, BF16 vision/KV | Fully resident in VRAM; text and image input |
+| **Gemma 4 31B-IT** | 60 dense hybrid-attention layers + 27-layer vision tower | INT8 group-32 or MXFP4 text, BF16 vision/KV | Fully resident in VRAM; text and image input. **MXFP4 decode runs the register-fed kernel, 3.367x** |
 | **DeepSeek-V4-Flash-0731** | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine | Resident in RAM; zero checkpoint reads during decode |
-| **Laguna S 2.1** | 48 layers 1:3 global/sliding, 256 experts + 1 shared, top-10 | NVFP4 experts, BF16 elsewhere | Spine in VRAM; experts stream from RAM |
-| **Inkling Small** | 42 layers, 256 experts + 2 sinks, top-6, no rotary | NVFP4 experts, BF16 elsewhere | Experts stream from RAM |
+| **Laguna S 2.1** | 48 layers 1:3 global/sliding, 256 experts + 1 shared, top-10 | NVFP4 or MXFP4 experts, BF16 elsewhere | Spine in VRAM; experts stream from RAM |
+| **Inkling Small** | 42 layers, 256 experts + 2 sinks, top-6, no rotary | NVFP4 or MXFP4 experts, BF16 elsewhere | Experts stream from RAM |
 | **GLM-5.2** | 78 layers, 256 experts, top-8 | INT4 group-128, W4A16 | Exceeds combined memory; I/O-dependent |
 | **Kimi-K3** | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16 | MXFP4 experts, BF16 elsewhere | 1.45 TB; I/O-dependent, 38.6 s/step. Vision not implemented |
 
@@ -61,6 +61,70 @@ rotary for Laguna, and so on.
 Measured figures, with their operating points, live in
 [`docs/experiments/`](docs/experiments/). A number from one context length does
 not transfer to another, and none is quoted here without its record.
+
+## Precision, as declared
+
+Strata reads a quantized checkpoint in the representation it ships in. There is
+no requantization pass, and no second copy of the weights in a wider format.
+
+- **MXFP4 is read as MXFP4.** `mxfp4-pack-quantized` — two E2M1 codes per byte,
+  one E8M0 exponent per group of 32 — is decoded from the bytes on disk. No
+  FP4-to-INT4 conversion, no FP4-to-BF16 expansion held resident beside it.
+- **Mixed representations stay mixed.** DeepSeek-V4-Flash-0731 runs its FP4
+  E2M1 experts and its FP8 E4M3 spine as published, in one model, without
+  normalizing either format to the other.
+- **Four bits is the floor**, and it is enforced in code rather than promised in
+  a README — weights, caches, KV storage, drafts and predictors alike.
+- **Scales are admitted, not clamped.** E8M0 codes 0 and 255 decode to `+0` and
+  `+inf` in a BF16 exponent field, so a checkpoint carrying them fails admission
+  at load instead of producing a wrong value at decode.
+
+### FP4 on Ampere, from software
+
+Ada and Blackwell get FP4 in silicon. Ampere does not: SM86 has no FP4 tensor
+op, and its `mma.sync` takes BF16 operands.
+
+Strata has an SM86 kernel that decodes E2M1 codes and E8M0 group-32 scales
+directly into MMA operand registers with `PRMT` and a lookup table. The codes
+stay four bits in HBM; the prepack into `m16n8k16` fragment order is a pure
+permutation of the same byte count, so no widened copy is ever held and the
+weight never occupies more memory than the checkpoint gave it.
+
+Measured on one RTX 3090 at batch 1, on the two DeepSeek V4 production shapes:
+**742.9 and 749.9 GB/s, about 88% of that card's measured read ceiling**, with
+the four-bit decode itself costing no measurable time — the kernel is bound by
+reading the weights, which is the floor for any weight-stationary matmul.
+
+On **Gemma 4 31B-IT**, whose 19.5 GB MXFP4 checkpoint is fully resident on one
+24 GB card, substituting this kernel for the scalar FP4 route made decode
+**3.367x faster** — a 131.3 ms/token median reduction, register-fed against
+scalar on identical weights, same prompt, greedy. Experiment 0165 has the arms,
+the spread and the correctness gates.
+
+### When it helps, and when it does not
+
+The kernel reads weights faster. That only moves the wall clock if reading
+weights is what the step is spending its time on, and whether it is depends on
+whether the weights fit on the card:
+
+| Workload | `argmax_r` of a decode step | GPU matmul share | Result |
+|---|---|---:|---|
+| Gemma 4 — dense, fully resident | GPU kernel / HBM service | 99.1% | **3.367x** |
+| Laguna S 2.1 — MoE, 63.7 GiB | routed-expert staging | 6.2% | not built; ceiling 1.066x |
+| Inkling Small — MoE | cache-miss staging / H2D | 5.5% | not built; ceiling ~1.06x |
+| DeepSeek V4 — MoE, 147 GB experts | host-side expert compute | ~2% | measured 0.98x |
+
+For a model whose experts stream from RAM, decode time is moving weights across
+PCIe, not multiplying them. Two things then work against the substitution: the
+fragment prepack is a per-staging cost that lands on the bottleneck term rather
+than a one-off at load, and at batch 1 across many small per-expert matrices the
+dispatch is launch-bound rather than bandwidth-bound — DeepSeek V4 measured
+2.027 ms against 2.038 ms of device MoE kernel time, which is no difference at
+all.
+
+So the register-fed route is opt-in per model rather than global, and the
+streaming-MoE models keep the scalar MXFP4 path. Experiments 0164, 0166 and 0167
+record those as negatives with their measurements; 0165 records the positive.
 
 ## Documentation
 

@@ -248,7 +248,7 @@ bool fill_dsv4_host_moe_partials(
 
 }  // namespace
 
-TEST_CASE("MIX-1 FP8 fragment prepack accepts block-128 weights and refuses others") {
+TEST_CASE("fragment prepack accepts admissible weights and refuses the rest") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;
     strata::CudaBackend backend;
@@ -256,29 +256,29 @@ TEST_CASE("MIX-1 FP8 fragment prepack accepts block-128 weights and refuses othe
     const std::vector<int> selected{device};
     REQUIRE(backend.initialize(selected, true).ok());
 
-    // Shapes matching the DeepSeek V4 shared expert: rows%16 and columns%32.
-    const auto fp8 = upload_fp8(backend, device, 32U, 128U, 0x11U);
-    REQUIRE(backend.dsv4_fp8_prepack_fragment(device, fp8).ok());
+    // FP8 needs both extents on 128; FP4 needs rows%16 and a whole load block
+    // of columns.
+    const auto fp8 = upload_fp8(backend, device, 128U, 128U, 0x11U);
+    REQUIRE(backend.prepack_fragment(device, fp8).ok());
     // The permutation replaces the canonical layout in place, so the weight
     // stays valid and its declared byte count is unchanged.
     REQUIRE(fp8.valid());
 
-    // An FP4 weight is not block-128 FP8 and must be refused rather than
-    // silently permuted with the wrong element size.
+    // FP4 has its own layout, and an admissible FP4 weight must be permuted
+    // rather than refused.
     const auto fp4 = upload_fp4(backend, device, 32U, 128U, 0x22U);
-    const auto refused = backend.dsv4_fp8_prepack_fragment(device, fp4);
-    REQUIRE(!refused.ok());
-    REQUIRE(refused.errors.front().find("Fp8E4m3Block128") != std::string::npos);
+    REQUIRE(backend.prepack_fragment(device, fp4).ok());
+    REQUIRE(strata::CudaBackend::fragment_prepacked(fp4));
 
-    // A row count that is not a multiple of the 16-row MMA tile must be
-    // refused: the fragment map is undefined for a partial tile.
-    const auto ragged = upload_fp8(backend, device, 24U, 128U, 0x33U);
-    const auto rejected = backend.dsv4_fp8_prepack_fragment(device, ragged);
+    // A row count that is not a whole 16-row MMA tile must be refused: the
+    // fragment map is undefined for a partial tile.
+    const auto ragged = upload_fp4(backend, device, 24U, 128U, 0x33U);
+    const auto rejected = backend.prepack_fragment(device, ragged);
     REQUIRE(!rejected.ok());
 
     // An invalid weight must be reported, not dereferenced.
     strata::CudaWeight empty;
-    REQUIRE(!backend.dsv4_fp8_prepack_fragment(device, empty).ok());
+    REQUIRE(!backend.prepack_fragment(device, empty).ok());
 }
 
 TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown encodings") {

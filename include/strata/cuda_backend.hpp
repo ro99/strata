@@ -844,18 +844,13 @@ void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
 
 class CudaBackend {
 public:
-    // MIX-1: permutes an FP8 E4M3 weight from canonical [N][K] into m16n8k16
-    // A-fragment order, in place. The fragment order REPLACES the canonical
-    // device layout -- one-copy residency, not a second buffer -- so every
-    // consumer of that weight must expect fragment order afterwards.
-    [[nodiscard]] ValidationResult dsv4_fp8_prepack_fragment(
-        int device, const CudaWeight& weight);
-
-    // Generic form of the same permutation, covering Fp8E4m3Block128 and
-    // Fp4E2m1Group32. Called automatically at the end of upload() for every
-    // admissible weight, so no architecture adapter has to opt in. Weights
-    // whose extents are inadmissible are left canonical and keep the scalar
-    // route.
+    // Permutes an Fp8E4m3Block128 or Fp4E2m1Group32 weight from its canonical
+    // layout into m16n8k16 fragment order, in place. The fragment order
+    // REPLACES the canonical device layout -- one-copy residency, not a second
+    // buffer -- so every consumer of that weight must expect fragment order
+    // afterwards. matmul_impl and the shared expert call this themselves on
+    // first skinny dispatch; this entry point exists for callers that want the
+    // permutation to have happened before a timed region.
     [[nodiscard]] ValidationResult prepack_fragment(
         int device, const CudaWeight& weight);
     [[nodiscard]] static bool fragment_prepacked(const CudaWeight& weight) noexcept;

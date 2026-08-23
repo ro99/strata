@@ -46,14 +46,7 @@ LagunaCheckpointOpenResult LagunaCheckpointReader::open(
     std::string model_directory) {
     LagunaCheckpointOpenResult result;
     const auto spec = laguna_s21_nvfp4_spec();
-    const auto index_path = (std::filesystem::path(model_directory) /
-                             "model.safetensors.index.json").string();
-    auto text = load_bounded_text_file(index_path, kMaximumIndexBytes);
-    if (!text.ok()) {
-        result.errors = std::move(text.errors);
-        return result;
-    }
-    auto index = parse_safetensors_index(text.value);
+    auto index = load_safetensors_index(model_directory, kMaximumIndexBytes);
     if (!index.ok()) {
         result.errors = std::move(index.errors);
         return result;

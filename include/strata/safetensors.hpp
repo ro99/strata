@@ -58,6 +58,11 @@ struct SafetensorsShard {
 
 [[nodiscard]] ParseResult<SafetensorsIndex> parse_safetensors_index(
     std::string_view json);
+// Loads a conventional multi-shard index, or synthesises the equivalent
+// one-shard index from model.safetensors when no index file is present.
+[[nodiscard]] ParseResult<SafetensorsIndex> load_safetensors_index(
+    const std::string& model_directory,
+    std::uint64_t maximum_index_bytes = 64ULL << 20U);
 [[nodiscard]] ParseResult<SafetensorsShard> parse_safetensors_header(
     std::string_view json, std::uint64_t data_start, std::uint64_t file_size);
 [[nodiscard]] ParseResult<SafetensorsShard> load_safetensors_shard(

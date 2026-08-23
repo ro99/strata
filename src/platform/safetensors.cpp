@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
@@ -194,6 +195,54 @@ ParseResult<SafetensorsIndex> parse_safetensors_index(std::string_view json) {
     } catch (const std::exception& exception) {
         result.errors.emplace_back(exception.what());
     }
+    return result;
+}
+
+ParseResult<SafetensorsIndex> load_safetensors_index(
+    const std::string& model_directory, std::uint64_t maximum_index_bytes) {
+    ParseResult<SafetensorsIndex> result;
+    const auto root = std::filesystem::path(model_directory);
+    const auto index_path = root / "model.safetensors.index.json";
+    std::error_code error;
+    const bool has_index = std::filesystem::exists(index_path, error);
+    if (error) {
+        result.errors.emplace_back(index_path.string() + ": " + error.message());
+        return result;
+    }
+    if (has_index) {
+        auto text = load_bounded_text_file(index_path.string(), maximum_index_bytes);
+        if (!text.ok()) {
+            result.errors = std::move(text.errors);
+            return result;
+        }
+        return parse_safetensors_index(text.value);
+    }
+
+    constexpr std::string_view kSingleShardName = "model.safetensors";
+    const auto shard_path = root / kSingleShardName;
+    const bool has_shard = std::filesystem::exists(shard_path, error);
+    if (error) {
+        result.errors.emplace_back(shard_path.string() + ": " + error.message());
+        return result;
+    }
+    if (!has_shard) {
+        result.errors.emplace_back(
+            model_directory +
+            ": neither model.safetensors.index.json nor model.safetensors exists");
+        return result;
+    }
+
+    auto shard = load_safetensors_shard(shard_path.string());
+    if (!shard.ok()) {
+        result.errors = std::move(shard.errors);
+        return result;
+    }
+    result.value.total_size = shard.value.file_size - shard.value.data_start;
+    result.value.entries.reserve(shard.value.tensors.size());
+    for (const auto& tensor : shard.value.tensors) {
+        result.value.entries.push_back({tensor.name, std::string(kSingleShardName)});
+    }
+    result.value.shards.emplace_back(kSingleShardName);
     return result;
 }
 

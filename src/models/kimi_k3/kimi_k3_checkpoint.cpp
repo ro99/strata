@@ -79,13 +79,7 @@ KimiCheckpointOpenResult KimiCheckpointReader::open(std::string model_directory)
         return result;
     }
 
-    auto text = load_bounded_text_file((root / "model.safetensors.index.json").string(),
-                                       kMaximumIndexBytes);
-    if (!text.ok()) {
-        result.errors = std::move(text.errors);
-        return result;
-    }
-    auto index = parse_safetensors_index(text.value);
+    auto index = load_safetensors_index(model_directory, kMaximumIndexBytes);
     if (!index.ok()) {
         result.errors = std::move(index.errors);
         return result;

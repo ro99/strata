@@ -5,9 +5,12 @@
 
 #include <array>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
 #include <utility>
+#include <unistd.h>
 
 namespace {
 
@@ -132,6 +135,67 @@ TEST_CASE("Safetensors header rejects gaps and overlapping extents") {
         "b":{"dtype":"BF16","shape":[2],"data_offsets":[8,12]}
     })";
     REQUIRE(!strata::parse_safetensors_header(header, 128U, 140U).ok());
+}
+
+TEST_CASE("Safetensors index is synthesized from a lone shard header") {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("strata-safetensors-" + std::to_string(getpid()));
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::filesystem::remove_all(path); }
+    } cleanup{directory};
+
+    const std::string header = R"({
+        "a":{"dtype":"BF16","shape":[2,2],"data_offsets":[0,8]},
+        "b":{"dtype":"I64","shape":[2],"data_offsets":[8,24]}
+    })";
+    std::ofstream shard(directory / "model.safetensors", std::ios::binary);
+    const auto header_size = static_cast<std::uint64_t>(header.size());
+    std::array<unsigned char, 8> length{};
+    for (std::size_t index = 0; index < length.size(); ++index) {
+        length[index] = static_cast<unsigned char>(header_size >> (index * 8U));
+    }
+    shard.write(reinterpret_cast<const char*>(length.data()), length.size());
+    shard.write(header.data(), static_cast<std::streamsize>(header.size()));
+    const std::array<char, 24> payload{};
+    shard.write(payload.data(), payload.size());
+    shard.close();
+
+    const auto result = strata::load_safetensors_index(directory.string());
+    REQUIRE(result.ok());
+    REQUIRE(result.value.total_size == 24U);
+    REQUIRE(result.value.shards == std::vector<std::string>{"model.safetensors"});
+    REQUIRE(result.value.entries.size() == 2U);
+    REQUIRE(result.value.entries[0].name == "a");
+    REQUIRE(result.value.entries[0].shard == "model.safetensors");
+    REQUIRE(result.value.entries[1].name == "b");
+}
+
+TEST_CASE("Safetensors index file takes precedence over a lone shard") {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("strata-safetensors-index-" + std::to_string(getpid()));
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::filesystem::remove_all(path); }
+    } cleanup{directory};
+
+    std::ofstream index(directory / "model.safetensors.index.json");
+    index << R"({"metadata":{"total_size":8},"weight_map":{"indexed":"part.safetensors"}})";
+    index.close();
+    std::ofstream lone_shard(directory / "model.safetensors", std::ios::binary);
+    lone_shard << "not a Safetensors shard";
+    lone_shard.close();
+
+    const auto result = strata::load_safetensors_index(directory.string());
+    REQUIRE(result.ok());
+    REQUIRE(result.value.total_size == 8U);
+    REQUIRE(result.value.shards == std::vector<std::string>{"part.safetensors"});
+    REQUIRE(result.value.entries.size() == 1U);
+    REQUIRE(result.value.entries[0].name == "indexed");
 }
 
 TEST_CASE("GLM W4A16 index classifies every tensor and quantization triplet") {

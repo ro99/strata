@@ -293,19 +293,31 @@ TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown 
     const auto before = strata::cuda_matmul_route_census();
     for (const auto count : before.counts) REQUIRE(count == 0U);
 
-    // An FP4 matmul must be recorded on the FP4 route and nowhere else.
+    // An FP4 matmul must be recorded on exactly one FP4 route, and which one
+    // it is must follow the register-fed switch rather than being ambiguous.
     constexpr std::uint64_t rows = 64U, columns = 128U;
-    const auto weight = upload_fp4(backend, device, rows, columns, 0x5AU);
     std::vector<float> hidden(static_cast<std::size_t>(columns), 0.25F);
     std::vector<float> out(static_cast<std::size_t>(rows));
-    REQUIRE(backend.matmul(weight, hidden, 1U, out).ok());
-
-    const auto after = strata::cuda_matmul_route_census();
     const auto fp4 = static_cast<std::size_t>(
         strata::CudaMatmulRoute::Fp4E2m1Group32);
+    const auto regfed = static_cast<std::size_t>(
+        strata::CudaMatmulRoute::Fp4RegisterFed);
     const auto unsupported = static_cast<std::size_t>(
         strata::CudaMatmulRoute::Unsupported);
+
+    strata::set_register_fed_matmul(false);
+    const auto scalar_weight = upload_fp4(backend, device, rows, columns, 0x5AU);
+    REQUIRE(backend.matmul(scalar_weight, hidden, 1U, out).ok());
+    auto after = strata::cuda_matmul_route_census();
     REQUIRE(after.counts[fp4] == 1U);
+    REQUIRE(after.counts[regfed] == 0U);
+
+    strata::set_register_fed_matmul(true);
+    const auto regfed_weight = upload_fp4(backend, device, rows, columns, 0x5AU);
+    REQUIRE(backend.matmul(regfed_weight, hidden, 1U, out).ok());
+    after = strata::cuda_matmul_route_census();
+    REQUIRE(after.counts[fp4] == 1U);
+    REQUIRE(after.counts[regfed] == 1U);
     REQUIRE(after.counts[unsupported] == 0U);
 
     // Every route name must be distinct and non-empty, so a census dump is
@@ -2692,4 +2704,108 @@ TEST_CASE("rank-local CUDA bridges fail closed before a borrowed lifetime exists
         moe_view).ok());
     REQUIRE(mhc_view.stream == nullptr);
     REQUIRE(moe_view.stream == nullptr);
+}
+
+TEST_CASE("MIX-2 register-fed matmul matches the scalar route it replaces") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // Activation values are exact E4M3 numbers, so matmul_impl's activation
+    // quantization is the identity and both routes see the same operands. That
+    // makes the comparison a statement about the kernels rather than about the
+    // rounding in front of them.
+    constexpr std::array<float, 6> palette{1.0F, -1.0F, 0.5F, 2.0F, -0.5F, -2.0F};
+
+    const auto compare = [&](strata::CudaWeightEncoding encoding,
+                             std::uint64_t rows, std::uint64_t columns,
+                             std::uint32_t batch, std::uint8_t seed) {
+        std::vector<float> activation(
+            static_cast<std::size_t>(columns) * batch);
+        for (std::size_t index = 0U; index < activation.size(); ++index) {
+            activation[index] = palette[(index + seed) % palette.size()];
+        }
+        const auto upload = [&](std::uint8_t s) {
+            return encoding == strata::CudaWeightEncoding::Fp4E2m1Group32
+                       ? upload_fp4(backend, device, rows, columns, s)
+                       : upload_fp8(backend, device, rows, columns, s);
+        };
+        // Two uploads of the same payload: the register-fed route permutes its
+        // weight in place, so the control needs its own canonical copy.
+        const auto control = upload(seed);
+        const auto candidate = upload(seed);
+
+        std::vector<float> expected(static_cast<std::size_t>(rows) * batch);
+        strata::set_register_fed_matmul(false);
+        REQUIRE(backend.matmul(control, activation, batch, expected).ok());
+
+        std::vector<float> measured(expected.size());
+        strata::set_register_fed_matmul(true);
+        REQUIRE(backend.matmul(candidate, activation, batch, measured).ok());
+        REQUIRE(strata::CudaBackend::fragment_prepacked(candidate));
+        REQUIRE(!strata::CudaBackend::fragment_prepacked(control));
+
+        // The two paths multiply the same real numbers and differ only in FP32
+        // accumulation order, so the residual is reordering, not precision. The
+        // bound is relative to the row's own magnitude because these fixtures
+        // have rows whose sums cancel to near zero.
+        double worst = 0.0;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const double scale = std::max(1.0, std::abs(
+                static_cast<double>(expected[index])));
+            worst = std::max(worst, std::abs(static_cast<double>(measured[index]) -
+                                             static_cast<double>(expected[index])) /
+                                        scale);
+        }
+        if (!(worst < 1e-4)) {
+            std::fprintf(stderr,
+                         "register-fed mismatch: encoding %d rows %llu "
+                         "columns %llu batch %u worst relative residual %g\n",
+                         static_cast<int>(encoding),
+                         static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(columns), batch, worst);
+        }
+        REQUIRE(worst < 1e-4);
+    };
+
+    // FP4 needs rows%16 and columns%64; FP8 needs both extents on 128.
+    compare(strata::CudaWeightEncoding::Fp4E2m1Group32, 64U, 128U, 1U, 0x11U);
+    compare(strata::CudaWeightEncoding::Fp4E2m1Group32, 64U, 128U, 8U, 0x23U);
+    compare(strata::CudaWeightEncoding::Fp4E2m1Group32, 128U, 256U, 16U, 0x35U);
+    compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 128U, 1U, 0x11U);
+    compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 256U, 5U, 0x27U);
+    compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 256U, 256U, 16U, 0x41U);
+    strata::set_register_fed_matmul(true);
+}
+
+TEST_CASE("MIX-2 register-fed dispatch leaves inadmissible shapes on the scalar route") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+    strata::set_register_fed_matmul(true);
+
+    // 48 columns is neither a whole FP4 load block (64) nor an FP8 block (128),
+    // so neither weight may be permuted and both must still produce a result.
+    const auto fp4 = upload_fp4(backend, device, 32U, 48U, 0x19U);
+    std::vector<float> activation(48U, 0.5F);
+    std::vector<float> output(32U);
+    REQUIRE(backend.matmul(fp4, activation, 1U, output).ok());
+    REQUIRE(!strata::CudaBackend::fragment_prepacked(fp4));
+
+    const auto fp8 = upload_fp8(backend, device, 32U, 64U, 0x19U);
+    std::vector<float> narrow(64U, 0.5F);
+    std::vector<float> fp8_output(32U);
+    REQUIRE(backend.matmul(fp8, narrow, 1U, fp8_output).ok());
+    REQUIRE(!strata::CudaBackend::fragment_prepacked(fp8));
+
+    // The explicit entry point must say so rather than permute into a layout
+    // the kernel cannot read.
+    REQUIRE(!backend.prepack_fragment(device, fp4).ok());
+    REQUIRE(!backend.prepack_fragment(device, fp8).ok());
 }

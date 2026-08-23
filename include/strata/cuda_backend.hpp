@@ -785,6 +785,13 @@ enum class CudaMatmulRoute : std::uint8_t {
     Fp8TensorPage,
     Fp8E4m3Block128,
     Fp4E2m1Group32,
+    // MIX-2 register-fed skinny kernels. These are the accepted QPN shapes made
+    // model agnostic: any weight whose encoding and extents admit the m16n8k16
+    // fragment layout reaches them, and the scalar routes above remain for the
+    // shapes the fragment layout cannot express. The census distinguishes them
+    // so a run can show which of the two actually served a dispatch.
+    Fp8RegisterFed,
+    Fp4RegisterFed,
     // MoE expert batches dispatch through CudaBackend::enqueue_moe, which
     // experiment 0162 showed is the path production decode actually uses --
     // matmul_impl is load-only. These are counted separately so a census can
@@ -817,6 +824,15 @@ struct CudaMatmulRouteCensus {
 // The census is process-global, not per-backend: a rank-local TP=2 run creates
 // one CudaBackend per rank, and per-instance counters would split the census
 // across them.
+// Process-global A/B switch for the MIX-2 register-fed matmul routes. Reads
+// STRATA_REGFED_MATMUL on first use (default on) and can be overridden at
+// runtime, which is what lets one process compare the two routes on identical
+// inputs. It only affects weights not yet permuted: fragment order replaces the
+// canonical layout, so a weight that has already been prepacked keeps the
+// register-fed route whatever this says.
+[[nodiscard]] bool register_fed_matmul_enabled() noexcept;
+void set_register_fed_matmul(bool enabled) noexcept;
+
 [[nodiscard]] CudaMatmulRouteCensus cuda_matmul_route_census() noexcept;
 void reset_cuda_matmul_route_census() noexcept;
 void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
@@ -830,6 +846,15 @@ public:
     // consumer of that weight must expect fragment order afterwards.
     [[nodiscard]] ValidationResult dsv4_fp8_prepack_fragment(
         int device, const CudaWeight& weight);
+
+    // Generic form of the same permutation, covering Fp8E4m3Block128 and
+    // Fp4E2m1Group32. Called automatically at the end of upload() for every
+    // admissible weight, so no architecture adapter has to opt in. Weights
+    // whose extents are inadmissible are left canonical and keep the scalar
+    // route.
+    [[nodiscard]] ValidationResult prepack_fragment(
+        int device, const CudaWeight& weight);
+    [[nodiscard]] static bool fragment_prepacked(const CudaWeight& weight) noexcept;
 
     [[nodiscard]] CudaMatmulRouteCensus matmul_route_census() const noexcept;
     void reset_matmul_route_census() noexcept;

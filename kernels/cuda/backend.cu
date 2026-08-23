@@ -2,6 +2,7 @@
 #include "strata/numerics.hpp"
 
 #include <cublas_v2.h>
+#include <cstdlib>
 #include <cstdio>
 #include <atomic>
 #include <cuda_bf16.h>
@@ -2991,6 +2992,559 @@ __global__ void dsv4_fp8_regfed_swiglu_kernel(
     activation[row] = bf16_round(bf16_silu[gate_bits] * limited_up);
 }
 
+// ---------------------------------------------------------------------------
+// Generic register-fed W4A16 / W8A16 matmul (campaign milestone MIX-2).
+//
+// The two kernels below are the accepted QPN skinny-kernel shape made model
+// agnostic. Nothing here knows about DeepSeek: they take a weight in
+// m16n8k16 fragment order, an activation already permuted into B-fragment
+// order, and produce the same [M][N] output the scalar kernels produce, so any
+// architecture whose weights carry Fp4E2m1Group32 or Fp8E4m3Block128 encoding
+// reaches them through CudaBackend::matmul_impl.
+//
+// Numerical contract against the incumbent scalar kernels. matmul_impl rounds
+// the activation to E4M3 before either path runs, and an E4M3 value has three
+// mantissa bits, so its BF16 image is exact. An E2M1 code has one mantissa bit
+// and an E4M3 code three; an E8M0 scale is a power of two. Every operand of the
+// tensor op is therefore the same real number the scalar kernel multiplies --
+// the paths differ only in FP32 accumulation order, not in operand precision.
+//
+// Shape admission is explicit and there is no silent fallback: a weight whose
+// shape the fragment layout cannot express keeps the scalar route, and the
+// census records which one ran.
+// ---------------------------------------------------------------------------
+
+constexpr std::uint32_t kRegfedTileN = 16U;   // MMA M dimension = weight rows
+constexpr std::uint32_t kRegfedTileM = 8U;    // MMA N dimension = activation cols
+constexpr std::uint32_t kRegfedTileK = 16U;   // MMA K dimension
+constexpr std::uint32_t kRegfedWarp = 32U;
+constexpr std::uint32_t kRegfedGroup = 32U;   // E8M0 group along K for FP4
+// Experiment 0140 measured argmax as load granularity: one uint4 per lane per
+// four K-tiles makes a warp issue one fully coalesced 512-byte transaction that
+// feeds four MMAs.
+constexpr std::uint32_t kRegfedKPerLoad = 4U;
+constexpr std::uint32_t kRegfedWarpsPerBlock = 4U;
+// One m16n8k16 covers eight activation columns. Two column blocks cover M<=16,
+// which is the whole skinny regime; wider M keeps the scalar route, where the
+// weight read is already amortized across many rows.
+constexpr std::uint32_t kRegfedMaxColBlocks = 2U;
+constexpr std::uint32_t kRegfedMaxM = kRegfedTileM * kRegfedMaxColBlocks;
+// FP8 decode folds a 2^120 exponent correction into the block scale, so the
+// E8M0 code must leave the BF16 multiplier normal: code + 120 in [1, 254].
+constexpr std::uint32_t kRegfedFp8ScaleCodeMaximum = 134U;
+
+__constant__ std::uint32_t kRegfedFp4MagnitudeHigh[2] = {0x3F3F'3F00U,
+                                                         0x4040'4040U};
+__constant__ std::uint32_t kRegfedFp4MagnitudeLow[2] = {0xC080'0000U,
+                                                        0xC080'4000U};
+
+__device__ __forceinline__ std::uint32_t regfed_fp4_scale_pair(
+    std::uint32_t code) {
+    return (code << 7U) * 0x0001'0001U;
+}
+
+// Eight E2M1 codes to four packed BF16 pairs, in MMA A-fragment register order.
+// Registers 0 and 2 carry weight row g, registers 1 and 3 carry row g+8, so the
+// two rows' E8M0 scales are selected by register parity -- experiment 0140's
+// scale-to-K binding defect was exactly this selection applied flat.
+__device__ __forceinline__ void regfed_fp4_decode_fragment(
+    std::uint32_t word, std::uint32_t scale_low_row,
+    std::uint32_t scale_high_row, std::uint32_t (&out)[4]) {
+    const std::uint32_t mag = word & 0x7777'7777U;
+    const std::uint32_t ha =
+        __byte_perm(kRegfedFp4MagnitudeHigh[0], kRegfedFp4MagnitudeHigh[1], mag);
+    const std::uint32_t la =
+        __byte_perm(kRegfedFp4MagnitudeLow[0], kRegfedFp4MagnitudeLow[1], mag);
+    const std::uint32_t hb = __byte_perm(
+        kRegfedFp4MagnitudeHigh[0], kRegfedFp4MagnitudeHigh[1], mag >> 16U);
+    const std::uint32_t lb = __byte_perm(
+        kRegfedFp4MagnitudeLow[0], kRegfedFp4MagnitudeLow[1], mag >> 16U);
+    const std::uint32_t pa = __byte_perm(la, ha, 0x5140U);
+    const std::uint32_t qa = __byte_perm(la, ha, 0x7362U);
+    const std::uint32_t pb = __byte_perm(lb, hb, 0x5140U);
+    const std::uint32_t qb = __byte_perm(lb, hb, 0x7362U);
+    std::uint32_t value[4];
+    value[0] = __byte_perm(pa, pb, 0x5410U);
+    value[1] = __byte_perm(pa, pb, 0x7632U);
+    value[2] = __byte_perm(qa, qb, 0x5410U);
+    value[3] = __byte_perm(qa, qb, 0x7632U);
+#pragma unroll
+    for (std::uint32_t i = 0U; i < 4U; ++i) {
+        const std::uint32_t scale =
+            ((i & 1U) == 0U) ? scale_low_row : scale_high_row;
+        // Code 0x8 is negative zero in E2M1 but the oracle's zero is positive,
+        // so the sign is suppressed when the magnitude is zero.
+        const std::uint32_t signs = (word << (12U - i * 4U)) & 0x8000'8000U;
+        const std::uint32_t non_zero = value[i] + 0x7F80'7F80U;
+        const __nv_bfloat162 scaled =
+            __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&value[i]),
+                    *reinterpret_cast<const __nv_bfloat162*>(&scale));
+        out[i] = *reinterpret_cast<const std::uint32_t*>(&scaled) ^
+                 (signs & non_zero & 0x8000'8000U);
+    }
+}
+
+// ---- layout transforms -----------------------------------------------------
+
+// Canonical FP4 [N][K/2] nibble pairs to fragment order. A pure permutation:
+// the destination holds N*K/2 bytes, exactly what the source holds, so the
+// prepack can run in place through transient scratch.
+__global__ void regfed_fp4_prepack_codes_kernel(
+    std::uint32_t* __restrict__ destination,
+    const unsigned char* __restrict__ source, std::uint32_t rows,
+    std::uint32_t columns) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t total = n_tiles * k_tiles * kRegfedWarp;
+    const std::size_t packed_columns = columns / 2U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t lane = index & 31U;
+        const std::uint32_t k_tile = (index >> 5U) % k_tiles;
+        const std::uint32_t n_tile = (index >> 5U) / k_tiles;
+        const std::uint32_t group = lane >> 2U;
+        const std::uint32_t thread = lane & 3U;
+        std::uint32_t word = 0U;
+#pragma unroll
+        for (std::uint32_t i = 0U; i < 4U; ++i) {
+            const std::uint32_t row =
+                n_tile * kRegfedTileN + group + (((i & 1U) != 0U) ? 8U : 0U);
+            const std::uint32_t column =
+                k_tile * kRegfedTileK + thread * 2U + ((i >= 2U) ? 8U : 0U);
+            // The column is always even, so one byte carries both codes.
+            const unsigned char pair =
+                source[static_cast<std::size_t>(row) * packed_columns +
+                       column / 2U];
+            word |= static_cast<std::uint32_t>(pair & 0x0FU) << (i * 4U);
+            word |= static_cast<std::uint32_t>(pair >> 4U) << ((i + 4U) * 4U);
+        }
+        const std::uint32_t block = k_tile / kRegfedKPerLoad;
+        const std::uint32_t slot = k_tile % kRegfedKPerLoad;
+        destination[((static_cast<std::size_t>(n_tile) *
+                          (k_tiles / kRegfedKPerLoad) + block) * kRegfedWarp +
+                     lane) * kRegfedKPerLoad + slot] = word;
+    }
+}
+
+// Canonical FP4 [N][K/32] E8M0 scales to tile-major order, so one uint4 load
+// per lane covers all sixteen rows of an N-tile for one K-group.
+__global__ void regfed_fp4_prepack_scales_kernel(
+    unsigned char* __restrict__ destination,
+    const unsigned char* __restrict__ source, std::uint32_t rows,
+    std::uint32_t scale_columns) {
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t total = n_tiles * scale_columns * kRegfedTileN;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t row = index % kRegfedTileN;
+        const std::uint32_t group = (index / kRegfedTileN) % scale_columns;
+        const std::uint32_t n_tile = (index / kRegfedTileN) / scale_columns;
+        destination[index] =
+            source[(static_cast<std::size_t>(n_tile) * kRegfedTileN + row) *
+                       scale_columns + group];
+    }
+}
+
+// FP32 activation [M][K] to MMA B-fragment order. For lane (group, thread) of
+// column block c, b0 carries K rows {2t, 2t+1} and b1 carries {2t+8, 2t+9} of
+// activation column c*8 + group. Columns past M are a stored zero rather than a
+// branch in the inner loop.
+__global__ void regfed_activation_fragment_kernel(
+    uint2* __restrict__ destination, const float* __restrict__ source,
+    std::uint32_t m, std::uint32_t columns, std::uint32_t column_blocks,
+    std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t total = k_tiles * column_blocks * groups_per_block * 4U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t thread = index % 4U;
+        const std::uint32_t group = (index / 4U) % groups_per_block;
+        const std::uint32_t block =
+            (index / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile = index / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        std::uint32_t b0 = 0U;
+        std::uint32_t b1 = 0U;
+        if (column < m) {
+            const float* row = source + static_cast<std::size_t>(column) * columns;
+            const auto bits = [&](std::uint32_t offset) {
+                return static_cast<std::uint32_t>(
+                    __bfloat16_as_ushort(__float2bfloat16_rn(
+                        row[k_tile * kRegfedTileK + offset])));
+            };
+            b0 = bits(thread * 2U) | (bits(thread * 2U + 1U) << 16U);
+            b1 = bits(thread * 2U + 8U) | (bits(thread * 2U + 9U) << 16U);
+        }
+        destination[index] = make_uint2(b0, b1);
+    }
+}
+
+// ---- the kernels -----------------------------------------------------------
+
+// One warp owns one (N-tile, K-slice). The last slice of a tile folds the
+// split-K reduction itself: a separate reduce kernel cost a full 4.10 us of
+// dispatch for trivial work, 29% of the step at these matrix sizes.
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp4_matmul_kernel(
+    float* __restrict__ output, const std::uint32_t* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const uint2* __restrict__ activations, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t split, std::uint32_t m,
+    std::uint32_t groups_per_block, float* __restrict__ partials,
+    std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t k_blocks = k_tiles / kRegfedKPerLoad;
+    const std::uint32_t blocks_per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedGroup;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
+
+    bool live[kColBlocks];
+    std::size_t activation_offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        activation_offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t n_tile = work / split;
+        const std::uint32_t slice = work % split;
+        float acc[kColBlocks][4];
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c)
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][i] = 0.0F;
+
+        const uint4* code4 = reinterpret_cast<const uint4*>(codes);
+        const std::uint32_t begin = slice * blocks_per_slice;
+        const std::uint32_t end = begin + blocks_per_slice;
+        for (std::uint32_t block = begin; block < end; ++block) {
+            const uint4 packed =
+                code4[(static_cast<std::size_t>(n_tile) * k_blocks + block) *
+                          kRegfedWarp + lane];
+            const unsigned char* base =
+                scales + (static_cast<std::size_t>(n_tile) * scale_columns +
+                          block * 2U) * kRegfedTileN;
+            const uint4 even = *reinterpret_cast<const uint4*>(base);
+            const uint4 odd =
+                *reinterpret_cast<const uint4*>(base + kRegfedTileN);
+            const std::uint32_t word[kRegfedKPerLoad] = {packed.x, packed.y,
+                                                         packed.z, packed.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                // K-tiles 0 and 1 of the block sit in the even E8M0 group, 2
+                // and 3 in the odd one; the select is compile time.
+                const uint4 chosen = (j < 2U) ? even : odd;
+                const std::uint32_t low_word = (group < 4U) ? chosen.x : chosen.y;
+                const std::uint32_t high_word = (group < 4U) ? chosen.z : chosen.w;
+                std::uint32_t a[4];
+                regfed_fp4_decode_fragment(
+                    word[j], regfed_fp4_scale_pair((low_word >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((high_word >> shift) & 0xFFU), a);
+                const std::size_t tile_base =
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                    kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b =
+                        live[c] ? activations[tile_base + activation_offset[c]]
+                                : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a[0], a[1], a[2], a[3], b.x, b.y);
+                }
+            }
+        }
+
+        // D fragment: row = group + (i>=2 ? 8 : 0), column = thread*2 + (i&1),
+        // offset by the column block. Columns past M are never stored, which
+        // keeps split-K partial traffic proportional to the real M rather than
+        // to the padded tile.
+        float* slot = partials + (static_cast<std::size_t>(work)) *
+                                     kRegfedTileN * kRegfedMaxM;
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column < m) slot[row * m + column] = acc[c][i];
+            }
+        }
+
+        __threadfence();
+        __syncwarp();
+        if (lane == 0U) {
+            arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        }
+        __syncwarp();
+        if (arrived[warp] == split - 1U) {
+            if (lane < kRegfedTileN) {
+                for (std::uint32_t column = 0U; column < m; ++column) {
+                    float sum = 0.0F;
+                    for (std::uint32_t s = 0U; s < split; ++s) {
+                        sum += partials[(static_cast<std::size_t>(n_tile) *
+                                             split + s) * kRegfedTileN *
+                                            kRegfedMaxM + lane * m + column];
+                    }
+                    // matmul_impl's output is [M][N], not [N][M].
+                    output[static_cast<std::size_t>(column) * rows +
+                           n_tile * kRegfedTileN + lane] = sum;
+                }
+            }
+            if (lane == 0U) counters[n_tile] = 0U;
+        }
+    }
+}
+
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp8_matmul_kernel(
+    float* __restrict__ output, const uint4* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const uint2* __restrict__ activations, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t scale_columns, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block,
+    float* __restrict__ partials, std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t pairs_per_slice = pairs / split;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
+
+    bool live[kColBlocks];
+    std::size_t activation_offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        activation_offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t n_tile = work / split;
+        const std::uint32_t slice = work % split;
+        float acc[kColBlocks][4];
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c)
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][i] = 0.0F;
+
+        for (std::uint32_t pair = slice * pairs_per_slice;
+             pair < (slice + 1U) * pairs_per_slice; ++pair) {
+            const std::uint32_t k_tile = pair * 2U;
+            // Block-128 scales are indexed by row block and column block, so
+            // they need no permutation and stay in canonical order.
+            const std::uint32_t factor =
+                ((static_cast<std::uint32_t>(
+                      scales[(n_tile / 8U) * scale_columns + k_tile / 8U]) +
+                  120U) << 7U) * 0x0001'0001U;
+            const uint4 packed =
+                codes[(static_cast<std::size_t>(n_tile) * pairs + pair) * 32U +
+                      lane];
+            const std::uint32_t word[4] = {packed.x, packed.y, packed.z,
+                                           packed.w};
+#pragma unroll
+            for (std::uint32_t half = 0U; half < 2U; ++half) {
+                const std::uint32_t low = word[half * 2U];
+                const std::uint32_t high = word[half * 2U + 1U];
+                const std::uint32_t a0 =
+                    dsv4_fp8_decode_pair(low & 0xFFFFU, factor);
+                const std::uint32_t a1 =
+                    dsv4_fp8_decode_pair(low >> 16U, factor);
+                const std::uint32_t a2 =
+                    dsv4_fp8_decode_pair(high & 0xFFFFU, factor);
+                const std::uint32_t a3 =
+                    dsv4_fp8_decode_pair(high >> 16U, factor);
+                const std::size_t tile_base =
+                    (static_cast<std::size_t>(k_tile) + half) * kColBlocks *
+                    groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b =
+                        live[c] ? activations[tile_base + activation_offset[c]]
+                                : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a0, a1, a2, a3, b.x, b.y);
+                }
+            }
+        }
+
+        float* slot = partials + (static_cast<std::size_t>(work)) *
+                                     kRegfedTileN * kRegfedMaxM;
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column < m) slot[row * m + column] = acc[c][i];
+            }
+        }
+
+        __threadfence();
+        __syncwarp();
+        if (lane == 0U) {
+            arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        }
+        __syncwarp();
+        if (arrived[warp] == split - 1U) {
+            if (lane < kRegfedTileN) {
+                for (std::uint32_t column = 0U; column < m; ++column) {
+                    float sum = 0.0F;
+                    for (std::uint32_t s = 0U; s < split; ++s) {
+                        sum += partials[(static_cast<std::size_t>(n_tile) *
+                                             split + s) * kRegfedTileN *
+                                            kRegfedMaxM + lane * m + column];
+                    }
+                    output[static_cast<std::size_t>(column) * rows +
+                           n_tile * kRegfedTileN + lane] = sum;
+                }
+            }
+            if (lane == 0U) counters[n_tile] = 0U;
+        }
+    }
+}
+
+// Shape admission for the register-fed routes. Stated once, used by both the
+// load-time prepack and the dispatch, so a weight can never be prepacked into a
+// layout the kernel will not read.
+[[nodiscard]] inline bool regfed_fp4_shape_admissible(
+    std::uint64_t rows, std::uint64_t columns) noexcept {
+    return rows % kRegfedTileN == 0U &&
+           columns % (kRegfedTileK * kRegfedKPerLoad) == 0U &&
+           columns % kRegfedGroup == 0U && rows >= kRegfedTileN &&
+           columns >= kRegfedTileK * kRegfedKPerLoad;
+}
+
+[[nodiscard]] inline bool regfed_fp8_shape_admissible(
+    std::uint64_t rows, std::uint64_t columns) noexcept {
+    // Block-128 scales are shared by sixteen-row tiles and by eight K-tiles, so
+    // both extents must be whole multiples of 128 for one code to cover a tile.
+    return rows % 128U == 0U && columns % 128U == 0U;
+}
+
+// Splits K so the tail of the machine stays busy without inflating partial
+// traffic: every slice must be a whole number of load blocks, and the warp
+// count is grown only while the grid is still short of the device.
+[[nodiscard]] inline std::uint32_t regfed_split_k(
+    std::uint32_t units, std::uint32_t n_tiles) noexcept {
+    std::uint32_t split = 1U;
+    while (split < 16U && units % (split * 2U) == 0U &&
+           n_tiles * split * 2U <= 4096U) {
+        split *= 2U;
+    }
+    return split;
+}
+
+// A/B switch for the register-fed routes. Default on: the campaign's gates were
+// measured on these kernels and the scalar routes are the incumbent, so the
+// interesting arm is the one that runs by default and the control is the one
+// that has to be asked for.
+std::atomic<int> g_regfed_matmul_enabled{-1};
+
+[[nodiscard]] bool regfed_matmul_enabled() noexcept {
+    auto current = g_regfed_matmul_enabled.load(std::memory_order_relaxed);
+    if (current < 0) {
+        const char* value = std::getenv("STRATA_REGFED_MATMUL");
+        current = (value == nullptr || (value[0] != '0' && value[0] != 'n' &&
+                                        value[0] != 'N'))
+                      ? 1
+                      : 0;
+        g_regfed_matmul_enabled.store(current, std::memory_order_relaxed);
+    }
+    return current != 0;
+}
+
+// Scratch needed to permute this weight into fragment order, or zero if the
+// encoding or the extents are inadmissible. The permutation cannot be done in
+// place, but the scratch is transient and shared across every weight on the
+// device, so no second persistent copy of any weight exists.
+[[nodiscard]] std::uint64_t fragment_prepack_scratch_bytes(
+    const CudaWeightDescriptor& descriptor) noexcept {
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        if (!regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)) {
+            return 0U;
+        }
+        return descriptor.rows * descriptor.columns;
+    }
+    if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+        if (!regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns)) {
+            return 0U;
+        }
+        return descriptor.rows * descriptor.packed_columns;
+    }
+    return 0U;
+}
+
+// Stream-ordered fragment prepack. Ordering behind the upload copy is a device
+// dependency, not a host one, so this enqueues on the same stream the copy used
+// and never blocks the loader.
+cudaError_t launch_fragment_prepack(const CudaWeightDescriptor& descriptor,
+                                    void* weights, void* scales, void* scratch,
+                                    cudaStream_t stream) {
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    constexpr unsigned int threads = 256U;
+    const auto grid = [](std::uint64_t total) {
+        return static_cast<unsigned int>(
+            std::min<std::uint64_t>((total + threads - 1U) / threads, 65535U));
+    };
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        const std::uint64_t bytes = descriptor.rows * descriptor.columns;
+        if (auto status = cudaMemcpyAsync(scratch, weights,
+                                          static_cast<std::size_t>(bytes),
+                                          cudaMemcpyDeviceToDevice, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+        const std::uint64_t total =
+            (descriptor.rows / 16U) * (descriptor.columns / 32U) * 32U;
+        dsv4_fp8_fragment_prepack_kernel<<<grid(total), threads, 0U, stream>>>(
+            static_cast<uint4*>(weights),
+            static_cast<const unsigned char*>(scratch), rows, columns);
+        return cudaGetLastError();
+    }
+    const std::uint64_t code_bytes = descriptor.rows * descriptor.packed_columns;
+    if (auto status = cudaMemcpyAsync(scratch, weights,
+                                      static_cast<std::size_t>(code_bytes),
+                                      cudaMemcpyDeviceToDevice, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    const std::uint64_t code_total =
+        (descriptor.rows / kRegfedTileN) * (descriptor.columns / kRegfedTileK) *
+        kRegfedWarp;
+    regfed_fp4_prepack_codes_kernel<<<grid(code_total), threads, 0U, stream>>>(
+        static_cast<std::uint32_t*>(weights),
+        static_cast<const unsigned char*>(scratch), rows, columns);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const std::uint64_t scale_bytes = descriptor.rows * descriptor.scale_columns;
+    if (auto status = cudaMemcpyAsync(scratch, scales,
+                                      static_cast<std::size_t>(scale_bytes),
+                                      cudaMemcpyDeviceToDevice, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    regfed_fp4_prepack_scales_kernel<<<grid(scale_bytes), threads, 0U, stream>>>(
+        static_cast<unsigned char*>(scales),
+        static_cast<const unsigned char*>(scratch), rows,
+        static_cast<std::uint32_t>(descriptor.scale_columns));
+    return cudaGetLastError();
+}
+
 __global__ void deepseek_fp8_gate_up_kernel(
     float* activation, const float* hidden,
     const unsigned char* w1, const unsigned char* w1_scales,
@@ -5516,6 +6070,11 @@ struct CudaWeight::Impl {
     void* weights{};
     void* scales{};
     CudaWeightDescriptor descriptor;
+    // Set once, at load, by CudaBackend::prepack_fragment. The fragment order
+    // REPLACES the canonical device layout -- one-copy residency -- so every
+    // consumer of this weight must dispatch a register-fed kernel once this is
+    // true. A consumer that reads it canonically would read a permutation.
+    bool fragment_prepacked{};
     std::uint64_t bytes{};
     int device{-1};
     std::shared_ptr<WeightArena> arena;
@@ -5589,6 +6148,18 @@ struct CudaBackend::Impl {
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};
         std::uint64_t matmul_host_output_bytes{};
+        // Register-fed matmul workspaces: the B-fragment activation, the
+        // split-K partials, and one arrival counter per N-tile. All three are
+        // grown geometrically and kept, so a decode step that repeats the same
+        // shapes allocates nothing after the first call.
+        void* regfed_activation{};
+        float* regfed_partials{};
+        std::uint32_t* regfed_counters{};
+        void* regfed_scratch{};
+        std::uint64_t regfed_activation_bytes{};
+        std::uint64_t regfed_partial_bytes{};
+        std::uint64_t regfed_counter_bytes{};
+        std::uint64_t regfed_scratch_bytes{};
         std::byte* attention_upload{};
         std::byte* attention_download{};
         std::byte* attention_host_upload{};
@@ -5809,6 +6380,18 @@ struct CudaBackend::Impl {
             }
             if (state.gemma_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.gemma_host_staging));
+            }
+            if (state.regfed_activation != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_activation));
+            }
+            if (state.regfed_partials != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_partials));
+            }
+            if (state.regfed_counters != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_counters));
+            }
+            if (state.regfed_scratch != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_scratch));
             }
             if (state.matmul_host_input != nullptr) {
                 static_cast<void>(cudaFreeHost(state.matmul_host_input));
@@ -14030,9 +14613,61 @@ std::atomic<std::uint64_t>
     g_route_census[static_cast<std::size_t>(CudaMatmulRoute::Count)]{};
 }  // namespace
 
+bool register_fed_matmul_enabled() noexcept { return regfed_matmul_enabled(); }
+
+void set_register_fed_matmul(bool enabled) noexcept {
+    g_regfed_matmul_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 void record_cuda_matmul_route(CudaMatmulRoute route) noexcept {
     g_route_census[static_cast<std::size_t>(route)].fetch_add(
         1U, std::memory_order_relaxed);
+}
+
+bool CudaBackend::fragment_prepacked(const CudaWeight& weight) noexcept {
+    return weight.impl_ != nullptr && weight.impl_->fragment_prepacked;
+}
+
+ValidationResult CudaBackend::prepack_fragment(int device,
+                                               const CudaWeight& weight) {
+    ValidationResult result;
+    if (!weight.valid()) {
+        result.errors.emplace_back("fragment prepack received an invalid weight");
+        return result;
+    }
+    const auto& descriptor = weight.impl_->descriptor;
+    const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
+    if (scratch_bytes == 0U) {
+        result.errors.emplace_back(
+            "fragment prepack has no layout for this weight encoding and shape");
+        return result;
+    }
+    if (weight.impl_->fragment_prepacked) return result;
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select device for fragment prepack");
+    }
+    void* scratch = nullptr;
+    if (auto status =
+            cudaMalloc(&scratch, static_cast<std::size_t>(scratch_bytes));
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate fragment prepack scratch");
+    }
+    const auto release = [&](cudaError_t status, const char* what) {
+        static_cast<void>(cudaFree(scratch));
+        return cuda_error(status, what);
+    };
+    if (auto status = launch_fragment_prepack(
+            descriptor, weight.impl_->weights, weight.impl_->scales, scratch,
+            nullptr);
+        status != cudaSuccess) {
+        return release(status, "launch fragment prepack");
+    }
+    if (auto status = cudaDeviceSynchronize(); status != cudaSuccess) {
+        return release(status, "finish fragment prepack");
+    }
+    static_cast<void>(cudaFree(scratch));
+    weight.impl_->fragment_prepacked = true;
+    return result;
 }
 
 ValidationResult CudaBackend::dsv4_fp8_prepack_fragment(
@@ -14087,6 +14722,7 @@ ValidationResult CudaBackend::dsv4_fp8_prepack_fragment(
         return release(status, "finish FP8 fragment prepack");
     }
     static_cast<void>(cudaFree(scratch));
+    weight.impl_->fragment_prepacked = true;
     return result;
 }
 
@@ -14111,6 +14747,8 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
         case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
         case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
+        case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
+        case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
         case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
         case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
         case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
@@ -14160,8 +14798,28 @@ ValidationResult CudaBackend::matmul_impl(
     }
     const auto input_bytes = static_cast<std::uint64_t>(input.size_bytes());
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    // MIX-2 register-fed dispatch. The skinny kernels own M <= 16, which is the
+    // whole decode regime; wider M keeps the tensor-page and scalar routes,
+    // where the weight read is already amortized across many activation rows.
+    //
+    // The prepack is lazy rather than done at load. A weight is permuted the
+    // first time a skinny call reaches it, so no architecture adapter has to
+    // opt in and no large-M caller ever pays for a layout it does not want. It
+    // is one-way: once fragment order has replaced the canonical layout, a
+    // later wide call on that same weight has to chunk through the skinny
+    // kernel, which is recorded as its own census route rather than hidden.
+    const bool regfed_encoding =
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+        descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
+    const bool regfed_shape =
+        regfed_encoding && groups == 0U && softcap == 0.0F &&
+        (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
+             ? regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)
+             : regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns));
+    const bool regfed = regfed_shape && regfed_matmul_enabled() &&
+                        (rows <= kRegfedMaxM || weight.impl_->fragment_prepacked);
     const bool tensor_page =
-        dsv4_fp8_tensor_page &&
+        dsv4_fp8_tensor_page && !regfed &&
         state.dsv4_fp8_tensor_page_supported && rows > 1U && groups == 0U &&
         descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
         descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
@@ -14363,6 +15021,172 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.global_scale, descriptor.packed_columns,
             descriptor.scale_columns, descriptor.group_size, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    } else if (regfed) {
+        // The activation permutation reads state.input, which already holds the
+        // E4M3-rounded FP32 activation the scalar routes consume. An E4M3 value
+        // has three mantissa bits, so its BF16 image is exact and the tensor op
+        // multiplies the same real numbers the scalar kernel multiplies.
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>(rows, kRegfedMaxM) + kRegfedTileM - 1U) /
+            kRegfedTileM);
+        const auto groups_per_block = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto k_tiles =
+            static_cast<std::uint32_t>(descriptor.columns / kRegfedTileK);
+        const auto n_tiles =
+            static_cast<std::uint32_t>(descriptor.rows / kRegfedTileN);
+        const std::uint32_t units =
+            descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
+                ? static_cast<std::uint32_t>(descriptor.columns / 32U)
+                : k_tiles / kRegfedKPerLoad;
+        const std::uint32_t split = regfed_split_k(units, n_tiles);
+        const std::uint64_t activation_bytes =
+            static_cast<std::uint64_t>(k_tiles) * column_blocks *
+            groups_per_block * 4U * sizeof(uint2);
+        const std::uint64_t partial_bytes =
+            static_cast<std::uint64_t>(n_tiles) * split * kRegfedTileN *
+            kRegfedMaxM * sizeof(float);
+        const std::uint64_t counter_bytes =
+            static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required, bool zero) -> cudaError_t {
+            if (required <= capacity) return cudaSuccess;
+            if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            pointer = nullptr;
+            capacity = 0U;
+            if (auto status = cudaMalloc(&pointer,
+                                         static_cast<std::size_t>(required));
+                status != cudaSuccess) {
+                return status;
+            }
+            capacity = required;
+            if (!zero) return cudaSuccess;
+            return cudaMemsetAsync(pointer, 0,
+                                   static_cast<std::size_t>(required),
+                                   state.stream);
+        };
+        if (auto status = grow(state.regfed_activation,
+                               state.regfed_activation_bytes, activation_bytes,
+                               false);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate register-fed activation workspace");
+        }
+        auto* partials = static_cast<void*>(state.regfed_partials);
+        if (auto status =
+                grow(partials, state.regfed_partial_bytes, partial_bytes, false);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate register-fed partial workspace");
+        }
+        state.regfed_partials = static_cast<float*>(partials);
+        auto* counters = static_cast<void*>(state.regfed_counters);
+        if (auto status =
+                grow(counters, state.regfed_counter_bytes, counter_bytes, true);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate register-fed counter workspace");
+        }
+        state.regfed_counters = static_cast<std::uint32_t*>(counters);
+        if (!weight.impl_->fragment_prepacked) {
+            const auto scratch_bytes =
+                fragment_prepack_scratch_bytes(descriptor);
+            if (auto status = grow(state.regfed_scratch,
+                                   state.regfed_scratch_bytes, scratch_bytes,
+                                   false);
+                status != cudaSuccess) {
+                return cuda_error(status, "allocate fragment prepack scratch");
+            }
+            if (auto status = launch_fragment_prepack(
+                    descriptor, weight.impl_->weights, weight.impl_->scales,
+                    state.regfed_scratch, state.stream);
+                status != cudaSuccess) {
+                return cuda_error(status, "prepack weight into fragment order");
+            }
+            weight.impl_->fragment_prepacked = true;
+        }
+        const unsigned int blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(n_tiles) * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
+        // A weight already in fragment order cannot be read canonically, so a
+        // wide call chunks the activation through the skinny kernel rather than
+        // silently taking a route that would misread the layout. Each chunk is
+        // counted, so a run where this happens is visible in the census.
+        for (std::uint32_t start = 0U; start < rows; start += kRegfedMaxM) {
+            const auto chunk = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(kRegfedMaxM, rows - start));
+            const auto chunk_blocks =
+                (std::min<std::uint32_t>(chunk, kRegfedMaxM) + kRegfedTileM - 1U) /
+                kRegfedTileM;
+            const auto chunk_groups = std::min<std::uint32_t>(chunk, kRegfedTileM);
+            const std::uint64_t chunk_activation_bytes =
+                static_cast<std::uint64_t>(k_tiles) * chunk_blocks *
+                chunk_groups * 4U * sizeof(uint2);
+            static_cast<void>(chunk_activation_bytes);
+            const auto fragment_total = static_cast<std::uint64_t>(k_tiles) *
+                                        chunk_blocks * chunk_groups * 4U;
+            regfed_activation_fragment_kernel<<<
+                static_cast<unsigned int>(std::min<std::uint64_t>(
+                    (fragment_total + 255U) / 256U, 65535U)),
+                256U, 0U, state.stream>>>(
+                static_cast<uint2*>(state.regfed_activation),
+                state.input + static_cast<std::size_t>(start) *
+                                  descriptor.columns,
+                chunk, static_cast<std::uint32_t>(descriptor.columns),
+                chunk_blocks, chunk_groups);
+            float* chunk_output =
+                state.output + static_cast<std::size_t>(start) * descriptor.rows;
+            if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+                record_cuda_matmul_route(CudaMatmulRoute::Fp8RegisterFed);
+                if (chunk_blocks == 1U) {
+                    regfed_fp8_matmul_kernel<1U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const uint4*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows),
+                        static_cast<std::uint32_t>(descriptor.scale_columns),
+                        split, chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                } else {
+                    regfed_fp8_matmul_kernel<2U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const uint4*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows),
+                        static_cast<std::uint32_t>(descriptor.scale_columns),
+                        split, chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                }
+            } else {
+                record_cuda_matmul_route(CudaMatmulRoute::Fp4RegisterFed);
+                if (chunk_blocks == 1U) {
+                    regfed_fp4_matmul_kernel<1U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const std::uint32_t*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows), split,
+                        chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                } else {
+                    regfed_fp4_matmul_kernel<2U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const std::uint32_t*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows), split,
+                        chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                }
+            }
+        }
     } else if (tensor_page) {
         record_cuda_matmul_route(CudaMatmulRoute::Fp8TensorPage);
         const dim3 tensor_grid(

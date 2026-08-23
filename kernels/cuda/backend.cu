@@ -3545,6 +3545,67 @@ cudaError_t launch_regfed_fp8_matvec(RegfedWorkspace& workspace,
     return cudaGetLastError();
 }
 
+// One register-fed FP4 matvec against a device-resident activation. Unlike the
+// DeepSeek helper above, Gemma weights have already been explicitly prepacked
+// by their loader after all consumers have been audited.
+cudaError_t launch_regfed_fp4_matvec(
+    RegfedWorkspace& workspace, const CudaWeightDescriptor& descriptor,
+    const void* weights, const void* scales, const float* input, float* output,
+    cudaStream_t stream) {
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t split =
+        regfed_split_k(k_tiles / kRegfedKPerLoad, n_tiles);
+    const std::uint64_t activation_bytes =
+        static_cast<std::uint64_t>(k_tiles) * 4U * sizeof(uint2);
+    const std::uint64_t partial_bytes = static_cast<std::uint64_t>(n_tiles) *
+                                        split * kRegfedTileN * kRegfedMaxM *
+                                        sizeof(float);
+    const std::uint64_t counter_bytes =
+        static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+    if (auto status = regfed_grow(workspace.activation,
+                                  workspace.activation_bytes, activation_bytes,
+                                  false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.partials, workspace.partial_bytes,
+                                  partial_bytes, false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.counters, workspace.counter_bytes,
+                                  counter_bytes, true, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    constexpr unsigned int threads = 256U;
+    const std::uint64_t fragment_total =
+        static_cast<std::uint64_t>(k_tiles) * 4U;
+    regfed_activation_fragment_kernel<<<
+        static_cast<unsigned int>(std::min<std::uint64_t>(
+            (fragment_total + threads - 1U) / threads, 65535U)),
+        threads, 0U, stream>>>(
+        static_cast<uint2*>(workspace.activation), input, 1U, columns, 1U, 1U);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const unsigned int blocks = static_cast<unsigned int>(
+        std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(n_tiles) * split +
+             kRegfedWarpsPerBlock - 1U) /
+                kRegfedWarpsPerBlock,
+            65535U));
+    regfed_fp4_matmul_kernel<1U><<<blocks, kRegfedWarpsPerBlock * 32U, 0U,
+                                   stream>>>(
+        output, static_cast<const std::uint32_t*>(weights),
+        static_cast<const unsigned char*>(scales),
+        static_cast<const uint2*>(workspace.activation), columns, rows, split,
+        1U, 1U, static_cast<float*>(workspace.partials),
+        static_cast<std::uint32_t*>(workspace.counters));
+    return cudaGetLastError();
+}
+
 __global__ void deepseek_fp8_gate_up_kernel(
     float* activation, const float* hidden,
     const unsigned char* w1, const unsigned char* w1_scales,
@@ -6156,6 +6217,7 @@ struct CudaBackend::Impl {
         // routed path, so it keeps workspaces separate from the generic
         // matmul's rather than sharing them.
         RegfedWorkspace moe_regfed{};
+        RegfedWorkspace gemma_regfed{};
         float* moe_regfed_gate{};
         float* moe_regfed_up{};
         std::uint64_t moe_regfed_gate_bytes{};
@@ -6395,6 +6457,12 @@ struct CudaBackend::Impl {
                                   state.moe_regfed.counters,
                                   state.moe_regfed.scratch,
                                   static_cast<void*>(state.moe_regfed_gate)}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            for (void* pointer : {state.gemma_regfed.activation,
+                                  state.gemma_regfed.partials,
+                                  state.gemma_regfed.counters,
+                                  state.gemma_regfed.scratch}) {
                 if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
             }
             if (state.regfed_activation != nullptr) {
@@ -7419,14 +7487,45 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         return buffer != nullptr && buffer->valid() &&
                buffer->device() == device && buffer->device_bytes() == bytes;
     };
-    const auto valid_weight = [device](const CudaWeight* weight) {
-        return weight != nullptr && weight->valid() && weight->device() == device &&
-               weight->impl_->descriptor.encoding ==
-                   CudaWeightEncoding::OffsetPackedInt8 &&
-               weight->impl_->descriptor.group_size == 32U &&
-               weight->impl_->descriptor.columns % 4U == 0U;
+    const bool regfed_enabled = regfed_matmul_enabled();
+    const auto valid_weight = [device, regfed_enabled](const CudaWeight* weight) {
+        if (weight == nullptr || !weight->valid() || weight->device() != device) {
+            return false;
+        }
+        const auto& descriptor = weight->impl_->descriptor;
+        const bool w8a16 =
+            descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
+            descriptor.columns % 4U == 0U;
+        const bool mxfp4 =
+            descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32 &&
+            descriptor.columns % 2U == 0U;
+        if ((!w8a16 && !mxfp4) || descriptor.group_size != 32U) return false;
+        return !weight->impl_->fragment_prepacked ||
+               (mxfp4 && regfed_enabled &&
+                regfed_fp4_shape_admissible(descriptor.rows,
+                                             descriptor.columns));
     };
     for (const auto& layer : layers) {
+        const std::array<const CudaWeight*, 7U> layer_weights{
+            layer.query, layer.key, layer.value, layer.output,
+            layer.gate, layer.up, layer.down};
+        for (const auto* weight : layer_weights) {
+            if (weight == nullptr || !weight->valid() ||
+                !weight->impl_->fragment_prepacked) {
+                continue;
+            }
+            const auto& descriptor = weight->impl_->descriptor;
+            if (!regfed_enabled ||
+                descriptor.encoding != CudaWeightEncoding::Fp4E2m1Group32 ||
+                !regfed_fp4_shape_admissible(descriptor.rows,
+                                              descriptor.columns)) {
+                result.errors.emplace_back(
+                    "Gemma 4 CUDA decode received a fragment-prepacked weight "
+                    "without an admissible enabled register-fed route; "
+                    "refusing a canonical read");
+                return result;
+            }
+        }
         if (!valid_weight(layer.query) || !valid_weight(layer.key) ||
             (layer.value != nullptr && !valid_weight(layer.value)) ||
             !valid_weight(layer.output) || !valid_weight(layer.gate) ||
@@ -7595,6 +7694,12 @@ ValidationResult CudaBackend::gemma4_decode_layers(
     cursor += maximum_intermediate;
     auto* up_output = cursor;
     std::memcpy(state.gemma_host_staging, input.data(), input.size_bytes());
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record Gemma 4 activation upload start");
+        }
+    }
     if (auto status = cudaMemcpyAsync(
             hidden, state.gemma_host_staging, input.size_bytes(),
             cudaMemcpyHostToDevice, state.stream); status != cudaSuccess) {
@@ -7605,11 +7710,48 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         status != cudaSuccess) {
         return cuda_error(status, "clear Gemma 4 decode status");
     }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Gemma 4 activation upload completion");
+        }
+    }
     const auto launch_matvec = [&](const CudaWeight* weight,
                                    const float* activation,
-                                   float* destination) {
+                                   float* destination) -> cudaError_t {
         const auto& descriptor = weight->impl_->descriptor;
         constexpr unsigned int threads = 256U;
+        if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+            const dim3 quantize_grid(
+                static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
+                1U, 1U);
+            quantize_activation_e4m3_kernel<<<
+                quantize_grid, 128U, 0U, state.stream>>>(
+                const_cast<float*>(activation), descriptor.columns, 1U);
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return status;
+            }
+            if (weight->impl_->fragment_prepacked) {
+                const auto status = launch_regfed_fp4_matvec(
+                    state.gemma_regfed, descriptor, weight->impl_->weights,
+                    weight->impl_->scales, activation, destination,
+                    state.stream);
+                if (status == cudaSuccess) {
+                    record_cuda_matmul_route(CudaMatmulRoute::Fp4RegisterFed);
+                }
+                return status;
+            }
+            const dim3 grid(static_cast<unsigned int>(descriptor.rows), 1U, 1U);
+            native_fp4_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+                destination, activation,
+                static_cast<const unsigned char*>(weight->impl_->weights),
+                static_cast<const unsigned char*>(weight->impl_->scales),
+                descriptor.packed_columns, descriptor.scale_columns, 1U,
+                descriptor.columns, descriptor.rows, 0U, 0U);
+            record_cuda_matmul_route(CudaMatmulRoute::Fp4E2m1Group32);
+            return cudaGetLastError();
+        }
         constexpr unsigned int warps = threads / 32U;
         const auto blocks = static_cast<unsigned int>(
             (descriptor.rows + warps - 1U) / warps);
@@ -7620,6 +7762,8 @@ ValidationResult CudaBackend::gemma4_decode_layers(
             static_cast<const __nv_bfloat16*>(weight->impl_->scales),
             descriptor.packed_columns, descriptor.scale_columns,
             descriptor.columns, descriptor.rows);
+        record_cuda_matmul_route(CudaMatmulRoute::PackedInt8Group32);
+        return cudaGetLastError();
     };
     for (const auto& layer : layers) {
         const auto& query = layer.query->impl_->descriptor;
@@ -7633,8 +7777,14 @@ ValidationResult CudaBackend::gemma4_decode_layers(
             normalized, hidden,
             static_cast<const float*>(layer.input_norm->impl_->data),
             hidden_columns, 1.0e-6F, state.gemma_error);
-        launch_matvec(layer.query, normalized, queries);
-        launch_matvec(layer.key, normalized, keys);
+        if (auto status = launch_matvec(layer.query, normalized, queries);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 query projection");
+        }
+        if (auto status = launch_matvec(layer.key, normalized, keys);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 key projection");
+        }
         if (layer.value == nullptr) {
             if (auto status = cudaMemcpyAsync(
                     values, keys, key.rows * sizeof(float),
@@ -7643,7 +7793,10 @@ ValidationResult CudaBackend::gemma4_decode_layers(
                 return cuda_error(status, "copy Gemma 4 shared K/V projection");
             }
         } else {
-            launch_matvec(layer.value, normalized, values);
+            if (auto status = launch_matvec(layer.value, normalized, values);
+                status != cudaSuccess) {
+                return cuda_error(status, "launch Gemma 4 value projection");
+            }
         }
         const bool global = layer.value == nullptr;
         const float theta = global ? 1'000'000.0F : 10'000.0F;
@@ -7669,20 +7822,32 @@ ValidationResult CudaBackend::gemma4_decode_layers(
             context, state.gemma_scores, queries, cache, position,
             layer.cache_capacity_rows, query_heads, kv_heads, head_dim,
             state.gemma_error);
-        launch_matvec(layer.output, context, branch);
+        if (auto status = launch_matvec(layer.output, context, branch);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 output projection");
+        }
         gemma4_post_attention_kernel<<<1U, 256U, 0U, state.stream>>>(
             hidden, normalized, branch,
             static_cast<const float*>(layer.post_attention_norm->impl_->data),
             static_cast<const float*>(layer.pre_feedforward_norm->impl_->data),
             hidden_columns, state.gemma_error);
-        launch_matvec(layer.gate, normalized, gate_output);
-        launch_matvec(layer.up, normalized, up_output);
+        if (auto status = launch_matvec(layer.gate, normalized, gate_output);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 gate projection");
+        }
+        if (auto status = launch_matvec(layer.up, normalized, up_output);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 up projection");
+        }
         gemma4_geglu_kernel<<<
             static_cast<unsigned int>((intermediate.rows + 255U) / 256U),
             256U, 0U, state.stream>>>(
             gate_output, up_output,
             static_cast<std::uint32_t>(intermediate.rows), state.gemma_error);
-        launch_matvec(layer.down, gate_output, branch);
+        if (auto status = launch_matvec(layer.down, gate_output, branch);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 down projection");
+        }
         gemma4_post_feedforward_kernel<<<1U, 256U, 0U, state.stream>>>(
             hidden, normalized, branch,
             static_cast<const float*>(layer.post_feedforward_norm->impl_->data),
@@ -7690,6 +7855,12 @@ ValidationResult CudaBackend::gemma4_decode_layers(
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch Gemma 4 CUDA decode kernels");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record Gemma 4 kernel completion");
+        }
     }
     const auto output_offset = hidden_bytes;
     auto kv_offset = hidden_bytes * 2U;
@@ -7731,6 +7902,14 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         status != cudaSuccess) {
         return cuda_error(status, "download Gemma 4 decode status");
     }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded,
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Gemma 4 activation download completion");
+        }
+    }
     const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream);
         status != cudaSuccess) {
@@ -7739,6 +7918,38 @@ ValidationResult CudaBackend::gemma4_decode_layers(
     const auto wait_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wait_started).count());
+    std::uint64_t activation_h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t activation_d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_milliseconds = 0.0F;
+        float kernel_milliseconds = 0.0F;
+        float d2h_milliseconds = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_milliseconds, state.activation_start,
+                state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Gemma 4 activation upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_milliseconds, state.activation_uploaded,
+                state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Gemma 4 CUDA kernels");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_milliseconds, state.kernel_finished,
+                state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Gemma 4 activation download");
+        }
+        activation_h2d_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(h2d_milliseconds) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(kernel_milliseconds) * 1.0e6));
+        activation_d2h_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(d2h_milliseconds) * 1.0e6));
+    }
     std::memcpy(output.data(), state.gemma_host_staging + output_offset,
                 output.size_bytes());
     kv_offset = hidden_bytes * 2U;
@@ -7764,6 +7975,9 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         stats.matmul_calls += matmul_calls;
         stats.flash_attention_calls += layers.size();
         stats.flash_attention_kernel_launches += layers.size();
+        stats.activation_h2d_nanoseconds += activation_h2d_nanoseconds;
+        stats.kernel_nanoseconds += kernel_nanoseconds;
+        stats.activation_d2h_nanoseconds += activation_d2h_nanoseconds;
         record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
                                wait_nanoseconds);
     }

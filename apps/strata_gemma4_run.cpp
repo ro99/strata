@@ -5,12 +5,14 @@
 // talks to Gemma4Runtime directly so --layer-hash-trace has somewhere to go.
 
 #include "strata/diagnostics_json.hpp"
+#include "strata/cuda_backend.hpp"
 #include "strata/gemma4_runtime.hpp"
 
 #include "cli_common.hpp"
 
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -21,6 +23,7 @@ namespace {
 
 struct Options {
     std::string model;
+    std::string route_census_path;
     std::string prompt{"The capital of France is"};
     std::vector<int> devices{0, 1, 2};
     std::uint32_t maximum_new_tokens{8U};
@@ -31,6 +34,7 @@ struct Options {
     bool json{};
     bool quiet{};
     bool layer_hash_trace{};
+    bool phase_profile{};
 };
 
 void usage() {
@@ -39,7 +43,8 @@ void usage() {
         << "                        [--devices 0,1,2] [--max-context N]\n"
         << "                        [--vram-fraction F] [--temperature F]\n"
         << "                        [--seed N] [--json] [--quiet]\n"
-        << "                        [--layer-hash-trace]\n";
+        << "                        [--layer-hash-trace] [--route-census PATH]\n"
+        << "                        [--phase-profile]\n";
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -99,6 +104,12 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.quiet = true;
         } else if (argument == "--layer-hash-trace") {
             options.layer_hash_trace = true;
+        } else if (argument == "--route-census") {
+            const auto* next = value(argument);
+            if (next == nullptr) return false;
+            options.route_census_path = next;
+        } else if (argument == "--phase-profile") {
+            options.phase_profile = true;
         } else {
             std::cerr << "unrecognized argument: " << argument << '\n';
             return false;
@@ -137,8 +148,10 @@ int main(int argc, char** argv) {
     config.sampling_seed = options.seed;
     config.verbose = !options.quiet;
     config.enable_layer_hash_trace = options.layer_hash_trace;
+    config.enable_cuda_phase_timing = options.phase_profile;
 
     strata::Gemma4Runtime runtime;
+    strata::reset_cuda_matmul_route_census();
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) std::cerr << "error: " << error << '\n';
@@ -159,6 +172,41 @@ int main(int argc, char** argv) {
         strata::cli::print_array(std::cout, generated.prompt_token_ids);
         std::cout << ",\"generated_token_ids\":";
         strata::cli::print_array(std::cout, generated.generated_token_ids);
+        const auto print_cuda_phase = [](std::ostream& output,
+                                         const strata::Gemma4CudaPhaseMetrics& phase) {
+            output << "{\"h2d_bytes\":" << phase.h2d_bytes
+                   << ",\"d2h_bytes\":" << phase.d2h_bytes
+                   << ",\"h2d_seconds\":" << phase.h2d_seconds
+                   << ",\"kernel_seconds\":" << phase.kernel_seconds
+                   << ",\"d2h_seconds\":" << phase.d2h_seconds
+                   << ",\"synchronization_seconds\":"
+                   << phase.synchronization_seconds << '}';
+        };
+        std::cout << ",\"metrics\":{\"prompt_tokens\":"
+                  << generated.metrics.prompt_tokens
+                  << ",\"prefill_tokens\":"
+                  << generated.metrics.prefill_tokens
+                  << ",\"decode_tokens\":"
+                  << generated.metrics.decode_tokens
+                  << ",\"prefill_seconds\":"
+                  << generated.metrics.prefill_seconds
+                  << ",\"decode_seconds\":"
+                  << generated.metrics.decode_seconds
+                  << ",\"first_decode_seconds\":"
+                  << generated.metrics.first_decode_seconds
+                  << ",\"steady_decode_seconds\":"
+                  << generated.metrics.steady_decode_seconds
+                  << ",\"steady_decode_tokens\":"
+                  << generated.metrics.steady_decode_tokens
+                  << ",\"prefill_cuda\":";
+        print_cuda_phase(std::cout, generated.metrics.prefill_cuda);
+        std::cout << ",\"decode_cuda\":";
+        print_cuda_phase(std::cout, generated.metrics.decode_cuda);
+        std::cout << ",\"first_decode_cuda\":";
+        print_cuda_phase(std::cout, generated.metrics.first_decode_cuda);
+        std::cout << ",\"steady_decode_cuda\":";
+        print_cuda_phase(std::cout, generated.metrics.steady_decode_cuda);
+        std::cout << '}';
         std::cout << ",\"diagnostics\":";
         print_diagnostics(std::cout, generated.diagnostics);
         std::cout << "}\n";
@@ -173,6 +221,29 @@ int main(int argc, char** argv) {
                                 strata::hex_u64(generated.diagnostics.layer_hash_trace_hash)
                           : "disabled")
                   << '\n';
+    }
+    if (!options.route_census_path.empty()) {
+        const auto census = strata::cuda_matmul_route_census();
+        std::ofstream file(options.route_census_path);
+        if (!file) {
+            std::cerr << "error: cannot open route census path: "
+                      << options.route_census_path << '\n';
+            return 1;
+        }
+        std::uint64_t total = 0U;
+        for (const auto count : census.counts) total += count;
+        file << "{\n  \"total_matmuls\": " << total
+             << ",\n  \"routes\": {";
+        bool first = true;
+        for (std::size_t i = 0U;
+             i < static_cast<std::size_t>(strata::CudaMatmulRoute::Count); ++i) {
+            file << (first ? "\n" : ",\n") << "    \""
+                 << strata::cuda_matmul_route_name(
+                        static_cast<strata::CudaMatmulRoute>(i))
+                 << "\": " << census.counts[i];
+            first = false;
+        }
+        file << "\n  }\n}\n";
     }
     return 0;
 }

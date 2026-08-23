@@ -16,6 +16,10 @@ namespace strata {
 namespace {
 
 constexpr std::uint64_t kMaximumIndexBytes = 16ULL << 20U;
+constexpr std::uint64_t kMxfp4TensorCount = 1'598U;
+constexpr std::uint64_t kMxfp4TensorBytes = 19'531'296'472ULL;
+constexpr std::uint64_t kMxfp4ShardFileBytes = 19'531'513'296ULL;
+constexpr std::string_view kSingleShardName = "model.safetensors";
 
 void append(std::vector<std::string>& destination,
             std::vector<std::string> source) {
@@ -36,38 +40,41 @@ Gemma4CheckpointOpenResult Gemma4CheckpointReader::open(
     std::string model_directory) {
     Gemma4CheckpointOpenResult result;
     const auto spec = gemma4_31b_it_w8a16_spec();
-    const auto index_path = (std::filesystem::path(model_directory) /
-                             "model.safetensors.index.json").string();
-    auto text = load_bounded_text_file(index_path, kMaximumIndexBytes);
-    if (!text.ok()) {
-        result.errors = std::move(text.errors);
-        return result;
-    }
-    auto index = parse_safetensors_index(text.value);
+    auto index = load_safetensors_index(model_directory, kMaximumIndexBytes);
     if (!index.ok()) {
         result.errors = std::move(index.errors);
         return result;
     }
-    if (index.value.total_size != spec.source.indexed_tensor_bytes ||
-        index.value.entries.size() != spec.source.tensor_count ||
-        index.value.shards.size() != spec.source.main_shards) {
-        result.errors.emplace_back("Gemma 4 checkpoint index extent is not pinned 31B W8A16");
+    const bool w8a16 =
+        index.value.total_size == spec.source.indexed_tensor_bytes &&
+        index.value.entries.size() == spec.source.tensor_count &&
+        index.value.shards.size() == spec.source.main_shards;
+    const bool mxfp4 =
+        index.value.total_size == kMxfp4TensorBytes &&
+        index.value.entries.size() == kMxfp4TensorCount &&
+        index.value.shards ==
+            std::vector<std::string>{std::string(kSingleShardName)};
+    if (!w8a16 && !mxfp4) {
+        result.errors.emplace_back(
+            "Gemma 4 checkpoint extent is neither pinned 31B W8A16 nor MXFP4");
         return result;
     }
-    std::array<bool, 7> shards_seen{};
-    for (const auto& shard : index.value.shards) {
-        bool matched = false;
-        for (std::size_t ordinal = 0U; ordinal < shards_seen.size(); ++ordinal) {
-            char expected[40]{};
-            std::snprintf(expected, sizeof(expected),
-                          "model-%05zu-of-00007.safetensors", ordinal + 1U);
-            if (shard == expected) {
-                shards_seen[ordinal] = true;
-                matched = true;
-                break;
+    if (w8a16) {
+        std::array<bool, 7> shards_seen{};
+        for (const auto& shard : index.value.shards) {
+            bool matched = false;
+            for (std::size_t ordinal = 0U; ordinal < shards_seen.size(); ++ordinal) {
+                char expected[40]{};
+                std::snprintf(expected, sizeof(expected),
+                              "model-%05zu-of-00007.safetensors", ordinal + 1U);
+                if (shard == expected) {
+                    shards_seen[ordinal] = true;
+                    matched = true;
+                    break;
+                }
             }
+            if (!matched) result.errors.emplace_back("unexpected Gemma 4 shard name " + shard);
         }
-        if (!matched) result.errors.emplace_back("unexpected Gemma 4 shard name " + shard);
     }
     if (!result.errors.empty()) return result;
 
@@ -100,8 +107,12 @@ Gemma4CheckpointOpenResult Gemma4CheckpointReader::open(
         }
     }
     if (!result.errors.empty()) return result;
-    if (shard_bytes != spec.source.shard_file_bytes ||
-        reader->tensors_.size() != spec.source.tensor_count) {
+    const auto expected_shard_bytes =
+        w8a16 ? spec.source.shard_file_bytes : kMxfp4ShardFileBytes;
+    const auto expected_tensor_count =
+        w8a16 ? spec.source.tensor_count : kMxfp4TensorCount;
+    if (shard_bytes != expected_shard_bytes ||
+        reader->tensors_.size() != expected_tensor_count) {
         result.errors.emplace_back("Gemma 4 shard extent does not match the pinned checkpoint");
         return result;
     }
@@ -142,19 +153,29 @@ Gemma4CheckpointOpenResult Gemma4CheckpointReader::open(
         const auto* packed = reader->find(packed_name);
         const auto* scales = reader->find(scale_name);
         const auto* logical = reader->find(shape_name);
-        const auto packed_columns = (columns + 3U) / 4U;
+        const auto w8_packed_columns = (columns + 3U) / 4U;
+        const auto fp4_packed_columns = (columns + 1U) / 2U;
         const auto scale_columns = (columns + 31U) / 32U;
-        if (packed == nullptr || scales == nullptr || logical == nullptr ||
-            packed->dtype != SafetensorsDtype::I32 ||
-            scales->dtype != SafetensorsDtype::Bf16 ||
-            logical->dtype != SafetensorsDtype::I64 ||
-            packed->shape != std::vector<std::uint64_t>{rows, packed_columns} ||
-            scales->shape != std::vector<std::uint64_t>{rows, scale_columns} ||
-            logical->shape != std::vector<std::uint64_t>{2U}) {
+        const bool valid_w8 =
+            packed != nullptr && scales != nullptr && logical != nullptr &&
+            packed->dtype == SafetensorsDtype::I32 &&
+            scales->dtype == SafetensorsDtype::Bf16 &&
+            logical->dtype == SafetensorsDtype::I64 &&
+            packed->shape == std::vector<std::uint64_t>{rows, w8_packed_columns} &&
+            scales->shape == std::vector<std::uint64_t>{rows, scale_columns} &&
+            logical->shape == std::vector<std::uint64_t>{2U};
+        const bool valid_fp4 =
+            packed != nullptr && scales != nullptr && logical == nullptr &&
+            packed->dtype == SafetensorsDtype::U8 &&
+            scales->dtype == SafetensorsDtype::U8 &&
+            packed->shape == std::vector<std::uint64_t>{rows, fp4_packed_columns} &&
+            scales->shape == std::vector<std::uint64_t>{rows, scale_columns};
+        if (!valid_w8 && !valid_fp4) {
             result.errors.emplace_back("Gemma 4 compressed tensor shape mismatch: " +
                                        std::string(base));
             return;
         }
+        if (valid_fp4) return;
         auto encoded = reader->read(shape_name, 16U);
         std::array<std::uint64_t, 2> decoded{};
         if (!encoded.ok()) {
@@ -355,13 +376,17 @@ ValidationResult load_gemma4_cuda_linear(
     const std::string scale_name = std::string(base_name) + ".weight_scale";
     const auto* packed = checkpoint.find(packed_name);
     const auto* scales = checkpoint.find(scale_name);
-    const auto packed_columns = (columns + 3U) / 4U;
-    const auto scale_columns = (columns + 31U) / 32U;
-    if (packed == nullptr || scales == nullptr ||
-        packed->shape != std::vector<std::uint64_t>{rows, packed_columns} ||
-        scales->shape != std::vector<std::uint64_t>{rows, scale_columns}) {
-        result.errors.emplace_back("Gemma 4 int8 CUDA linear shape mismatch: " +
+    if (packed == nullptr || scales == nullptr) {
+        result.errors.emplace_back("Gemma 4 compressed CUDA linear is missing: " +
                                    std::string(base_name));
+        return result;
+    }
+    auto described = describe_gemma4_cuda_linear(
+        *packed, *scales, rows, columns);
+    if (!described.ok()) {
+        for (auto& error : described.errors) {
+            result.errors.emplace_back(std::string(base_name) + ": " + error);
+        }
         return result;
     }
     auto packed_data = checkpoint.read(packed_name, packed->bytes);
@@ -369,16 +394,47 @@ ValidationResult load_gemma4_cuda_linear(
     if (!packed_data.ok()) append(result.errors, std::move(packed_data.errors));
     if (!scale_data.ok()) append(result.errors, std::move(scale_data.errors));
     if (!result.ok()) return result;
-    CudaWeightDescriptor descriptor;
-    descriptor.encoding = CudaWeightEncoding::OffsetPackedInt8;
-    descriptor.dtype = SafetensorsDtype::I32;
-    descriptor.rows = rows;
-    descriptor.columns = columns;
-    descriptor.packed_columns = packed_columns;
-    descriptor.scale_columns = scale_columns;
-    descriptor.group_size = 32U;
-    return backend.upload(device, descriptor, packed_data.value,
-                          scale_data.value, output);
+    result = backend.upload(device, described.value, packed_data.value,
+                            scale_data.value, output);
+    if (result.ok() &&
+        described.value.encoding == CudaWeightEncoding::Fp4E2m1Group32 &&
+        register_fed_matmul_enabled()) {
+        result = backend.prepack_fragment(device, output);
+    }
+    return result;
+}
+
+ParseResult<CudaWeightDescriptor> describe_gemma4_cuda_linear(
+    const Gemma4Tensor& packed, const Gemma4Tensor& scales,
+    std::uint64_t rows, std::uint64_t columns) {
+    ParseResult<CudaWeightDescriptor> result;
+    const auto scale_columns = columns / 32U;
+    const bool w8a16 =
+        columns % 4U == 0U && packed.dtype == SafetensorsDtype::I32 &&
+        scales.dtype == SafetensorsDtype::Bf16 &&
+        packed.shape == std::vector<std::uint64_t>{rows, columns / 4U} &&
+        scales.shape == std::vector<std::uint64_t>{rows, scale_columns};
+    const bool mxfp4 =
+        columns % 2U == 0U && packed.dtype == SafetensorsDtype::U8 &&
+        scales.dtype == SafetensorsDtype::U8 &&
+        packed.shape == std::vector<std::uint64_t>{rows, columns / 2U} &&
+        scales.shape == std::vector<std::uint64_t>{rows, scale_columns};
+    if (columns % 32U != 0U || (!w8a16 && !mxfp4)) {
+        result.errors.emplace_back("Gemma 4 CUDA linear dtype or shape mismatch");
+        return result;
+    }
+    result.value.encoding = mxfp4
+        ? CudaWeightEncoding::Fp4E2m1Group32
+        : CudaWeightEncoding::OffsetPackedInt8;
+    // Fp4E2m1Group32 names the byte-level E2M1 code stream as I8 in the
+    // backend contract even when Safetensors stores the same bytes as U8.
+    result.value.dtype = mxfp4 ? SafetensorsDtype::I8 : SafetensorsDtype::I32;
+    result.value.rows = rows;
+    result.value.columns = columns;
+    result.value.packed_columns = mxfp4 ? columns / 2U : columns / 4U;
+    result.value.scale_columns = scale_columns;
+    result.value.group_size = 32U;
+    return result;
 }
 
 }  // namespace strata

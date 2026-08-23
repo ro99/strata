@@ -1314,6 +1314,101 @@ TEST_CASE("native CUDA backend keeps a Gemma 4 decode layer resident") {
                         [](auto item) { return item == 0U; }));
 }
 
+TEST_CASE("native CUDA backend keeps a register-fed MXFP4 Gemma 4 decode layer resident") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto zero_weight = [&](std::uint64_t rows, std::uint64_t columns) {
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::Fp4E2m1Group32;
+        descriptor.dtype = strata::SafetensorsDtype::I8;
+        descriptor.rows = rows;
+        descriptor.columns = columns;
+        descriptor.packed_columns = columns / 2U;
+        descriptor.scale_columns = columns / 32U;
+        descriptor.group_size = 32U;
+        std::vector<std::byte> packed(
+            static_cast<std::size_t>(rows * descriptor.packed_columns),
+            std::byte{0x00U});
+        std::vector<std::byte> scales(
+            static_cast<std::size_t>(rows * descriptor.scale_columns),
+            std::byte{0x7fU});
+        strata::CudaWeight output;
+        REQUIRE(backend.upload(device, descriptor, packed, scales, output).ok());
+        return output;
+    };
+    const auto upload_f32 = [&](std::span<const float> values) {
+        strata::CudaBuffer output;
+        REQUIRE(backend.upload_buffer(device, std::as_bytes(values), output).ok());
+        return output;
+    };
+
+    constexpr std::uint32_t hidden_columns = 64U;
+    constexpr std::uint32_t head_dim = 16U;
+    constexpr std::uint32_t query_columns = 64U;
+    constexpr std::uint32_t kv_columns = 16U;
+    constexpr std::uint32_t intermediate = 64U;
+    auto query = zero_weight(query_columns, hidden_columns);
+    auto key = zero_weight(kv_columns, hidden_columns);
+    auto value_projection = zero_weight(kv_columns, hidden_columns);
+    auto projection = zero_weight(hidden_columns, query_columns);
+    auto gate = zero_weight(intermediate, hidden_columns);
+    auto up = zero_weight(intermediate, hidden_columns);
+    auto down = zero_weight(hidden_columns, intermediate);
+    strata::set_register_fed_matmul(true);
+    for (const auto* weight : {&query, &key, &value_projection, &projection,
+                               &gate, &up, &down}) {
+        REQUIRE(backend.prepack_fragment(device, *weight).ok());
+        REQUIRE(strata::CudaBackend::fragment_prepacked(*weight));
+    }
+    std::array<float, hidden_columns> norms{};
+    norms.fill(1.0F);
+    std::array<float, head_dim> head_norms{};
+    head_norms.fill(1.0F);
+    auto input_norm = upload_f32(norms);
+    auto post_attention_norm = upload_f32(norms);
+    auto pre_feedforward_norm = upload_f32(norms);
+    auto post_feedforward_norm = upload_f32(norms);
+    auto query_norm = upload_f32(head_norms);
+    auto key_norm = upload_f32(head_norms);
+    strata::CudaBuffer cache;
+    constexpr std::uint32_t cache_rows = 4U;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * cache_rows * kv_columns * sizeof(std::uint16_t),
+        cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        cache, {}, {}, 0U, cache_rows, kv_columns).ok());
+
+    std::array<std::uint16_t, kv_columns> next_keys{};
+    std::array<std::uint16_t, kv_columns> next_values{};
+    const std::array<strata::CudaGemma4DecodeLayer, 1> layers{{{
+        &query, &key, &value_projection, &projection, &gate, &up, &down,
+        &input_norm, &post_attention_norm, &pre_feedforward_norm,
+        &post_feedforward_norm, &query_norm, &key_norm, &cache,
+        next_keys, next_values, cache_rows, 0U, 0U, 1.0F,
+    }}};
+    std::array<float, hidden_columns> input{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index) - 16) / 16.0F;
+    }
+    std::array<float, hidden_columns> output{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.gemma4_decode_layers(
+        device, layers, input, 0U, output).ok());
+    for (std::size_t index = 0U; index < output.size(); ++index) {
+        REQUIRE(output[index] == strata::bf16_round_f32(input[index]));
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Fp4E2m1Group32)] == 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Fp4RegisterFed)] == 7U);
+}
+
 TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;
@@ -2797,6 +2892,65 @@ TEST_CASE("MIX-2 register-fed matmul matches the scalar route it replaces") {
     compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 128U, 1U, 0x11U);
     compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 256U, 5U, 0x27U);
     compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 256U, 256U, 16U, 0x41U);
+    strata::set_register_fed_matmul(true);
+}
+
+TEST_CASE("Gemma 4 shaped MXFP4 register-fed matmul matches identical scalar uploads") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::array<float, 6> palette{
+        1.0F, -1.0F, 0.5F, 2.0F, -0.5F, -2.0F};
+    const auto compare = [&](std::uint64_t rows, std::uint64_t columns,
+                             std::uint8_t seed) {
+        std::vector<float> activation(static_cast<std::size_t>(columns));
+        for (std::size_t index = 0U; index < activation.size(); ++index) {
+            activation[index] = palette[(index + seed) % palette.size()];
+        }
+        // The payload generator is deterministic: these are separate uploads
+        // of byte-identical Gemma-shaped weights because fragment prepack
+        // replaces the candidate's canonical layout in place.
+        const auto control = upload_fp4(backend, device, rows, columns, seed);
+        const auto candidate = upload_fp4(backend, device, rows, columns, seed);
+        std::vector<float> expected(static_cast<std::size_t>(rows));
+        std::vector<float> measured(expected.size());
+
+        strata::set_register_fed_matmul(false);
+        REQUIRE(backend.matmul(control, activation, 1U, expected).ok());
+        strata::set_register_fed_matmul(true);
+        REQUIRE(backend.prepack_fragment(device, candidate).ok());
+        REQUIRE(backend.matmul(candidate, activation, 1U, measured).ok());
+
+        double worst = 0.0;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const double scale = std::max(
+                1.0, std::abs(static_cast<double>(expected[index])));
+            worst = std::max(
+                worst,
+                std::abs(static_cast<double>(measured[index]) -
+                         static_cast<double>(expected[index])) /
+                    scale);
+        }
+        if (!(worst < 1e-4)) {
+            std::fprintf(stderr,
+                         "Gemma-shaped register-fed mismatch: rows %llu "
+                         "columns %llu worst relative residual %g\n",
+                         static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(columns), worst);
+        }
+        // Both paths multiply the same values. FP32 accumulation order differs,
+        // so exact bit equality is not an arithmetic invariant for these long K
+        // reductions; keep the route-vs-route residual explicit and tight.
+        REQUIRE(worst < 1e-4);
+    };
+
+    // Real Gemma 4 gate/up and down projection shapes, with no padding.
+    compare(21'504U, 5'376U, 0x31U);
+    compare(5'376U, 21'504U, 0x53U);
     strata::set_register_fed_matmul(true);
 }
 

@@ -40,6 +40,37 @@ void round_bf16(std::span<float> values) {
     for (auto& value : values) value = bf16_round_f32(value);
 }
 
+Gemma4CudaPhaseMetrics cuda_phase_delta(const CudaBackendStats& before,
+                                        const CudaBackendStats& after) {
+    constexpr double nanoseconds_to_seconds = 1.0e-9;
+    Gemma4CudaPhaseMetrics result;
+    result.h2d_bytes = after.activation_h2d_bytes - before.activation_h2d_bytes;
+    result.d2h_bytes = after.activation_d2h_bytes - before.activation_d2h_bytes;
+    result.h2d_seconds = static_cast<double>(
+        after.activation_h2d_nanoseconds - before.activation_h2d_nanoseconds) *
+        nanoseconds_to_seconds;
+    result.kernel_seconds = static_cast<double>(
+        after.kernel_nanoseconds - before.kernel_nanoseconds) *
+        nanoseconds_to_seconds;
+    result.d2h_seconds = static_cast<double>(
+        after.activation_d2h_nanoseconds - before.activation_d2h_nanoseconds) *
+        nanoseconds_to_seconds;
+    result.synchronization_seconds = static_cast<double>(
+        after.synchronization_nanoseconds - before.synchronization_nanoseconds) *
+        nanoseconds_to_seconds;
+    return result;
+}
+
+void add_cuda_phase(Gemma4CudaPhaseMetrics& destination,
+                    const Gemma4CudaPhaseMetrics& source) {
+    destination.h2d_bytes += source.h2d_bytes;
+    destination.d2h_bytes += source.d2h_bytes;
+    destination.h2d_seconds += source.h2d_seconds;
+    destination.kernel_seconds += source.kernel_seconds;
+    destination.d2h_seconds += source.d2h_seconds;
+    destination.synchronization_seconds += source.synchronization_seconds;
+}
+
 float decode_bf16(std::uint16_t value) noexcept {
     return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
 }
@@ -1228,7 +1259,8 @@ ValidationResult Gemma4Runtime::initialize(
         result.errors = std::move(tokenizer.errors);
         return result;
     }
-    result = impl_->cuda.initialize(config.devices);
+    result = impl_->cuda.initialize(config.devices,
+                                    config.enable_cuda_phase_timing);
     if (!result.ok()) return result;
     if (config.enable_flash_attention) {
         for (const int device : config.devices) {
@@ -1519,6 +1551,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
         : 0U;
     impl_->reusable_sequence = false;
     if (reused == 0U) impl_->reset_sequence();
+    const auto prefill_cuda_before = impl_->cuda.stats();
     const auto prefill_started = std::chrono::steady_clock::now();
     const auto prefill = std::span<const std::uint32_t>(
         result.prompt_token_ids).subspan(reused);
@@ -1537,6 +1570,8 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
     }
     result.metrics.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_started).count();
+    result.metrics.prefill_cuda = cuda_phase_delta(
+        prefill_cuda_before, impl_->cuda.stats());
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
     result.metrics.prefill_tokens = prefill.size();
     result.metrics.reused_prompt_tokens = reused;
@@ -1562,17 +1597,39 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
         output.append(next.value, piece.value, on_token);
     }
     auto position = static_cast<std::uint32_t>(result.prompt_token_ids.size());
+    const auto decode_cuda_before = impl_->cuda.stats();
     const auto decode_started = std::chrono::steady_clock::now();
     while (!is_stop(next.value) && !output.stopped() && !output.cancelled() &&
            result.generated_token_ids.size() < maximum_new_tokens) {
         const std::array<std::uint32_t, 1> token{next.value};
+        const auto step_cuda_before = impl_->config.enable_cuda_phase_timing
+            ? impl_->cuda.stats()
+            : CudaBackendStats{};
+        const auto step_started = std::chrono::steady_clock::now();
         next = impl_->forward(token, position++);
+        const double step_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - step_started).count();
         if (!next.ok()) {
             result.errors = std::move(next.errors);
             return result;
         }
         impl_->cached_token_ids.push_back(token.front());
         ++result.metrics.decode_tokens;
+        if (result.metrics.decode_tokens == 1U) {
+            result.metrics.first_decode_seconds = step_seconds;
+        } else {
+            result.metrics.steady_decode_seconds += step_seconds;
+            ++result.metrics.steady_decode_tokens;
+        }
+        if (impl_->config.enable_cuda_phase_timing) {
+            const auto step_cuda = cuda_phase_delta(
+                step_cuda_before, impl_->cuda.stats());
+            if (result.metrics.decode_tokens == 1U) {
+                result.metrics.first_decode_cuda = step_cuda;
+            } else {
+                add_cuda_phase(result.metrics.steady_decode_cuda, step_cuda);
+            }
+        }
         if (!is_stop(next.value)) {
             result.generated_token_ids.push_back(next.value);
             result.logprobs.push_back(impl_->last_sample);
@@ -1589,6 +1646,8 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
     result.stopped = output.stopped();
     result.metrics.decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - decode_started).count();
+    result.metrics.decode_cuda = cuda_phase_delta(
+        decode_cuda_before, impl_->cuda.stats());
     result.metrics.rss_bytes = process_resident_set_bytes();
     result.metrics.device_vram_used_bytes = device_vram_used_bytes(impl_->devices);
     result.diagnostics = std::move(impl_->diagnostics);

@@ -69,10 +69,49 @@ two weight streams that share one activation, so it has twice the memory-level
 parallelism per block; `down` reads one. That makes `down` the larger prize, not
 the smaller one.
 
+## Register-fed arm, same probe
+
+Fragment order is a pure permutation at identical byte count, so the same
+allocations serve both arms and the memory traffic is unchanged. This arm
+measures bandwidth only; the decode's numerics are established by the
+route-against-route test in `tests/test_cuda_backend.cpp` and by Gemma 4's
+3.367x (experiment 0165).
+
+| width | gate_up GB/s | % roofline | vs scalar | down GB/s | % roofline | vs scalar |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 296.7 | 33.7% | 2.89x | 181.3 | 20.6% | 2.67x |
+| 4 | 522.2 | 59.3% | 4.08x | 384.0 | 43.6% | 4.70x |
+| 8 | 607.7 | 69.0% | 4.54x | 502.2 | 57.0% | 5.85x |
+| **10 (Laguna top-k)** | **680.0** | **77.2%** | **5.04x** | **544.0** | **61.7%** | **6.30x** |
+| 16 | 670.1 | 76.0% | 4.90x | 607.3 | 68.9% | 6.93x |
+| 32 | 710.5 | 80.6% | 5.14x | 687.2 | 78.0% | 7.74x |
+| 64 | 710.8 | 80.7% | 5.10x | 768.0 | 87.2% | 8.59x |
+
+At Laguna's real width the substitution is **5.04x on gate_up and 6.30x on
+down**. Unlike the scalar arm this one does climb with width, because a wider
+batch gives the split-K heuristic more warps to cover the device; `down` climbs
+further than `gate_up` because its shorter K loop leaves less latency to hide.
+
+## End-to-end estimate, from measured arms
+
+Per layer at width 10: gate_up 0.2478 -> 0.0492 ms, down 0.1925 -> 0.0307 ms,
+saving 0.3604 ms. Across 47 sparse layers split over two devices that is about
+8.5 ms, less roughly 0.51 ms of prepack.
+
+The prepack is a device-side permutation of the staged bytes: 229.50 MiB/token
+read and written at 880 GB/s is 0.509 ms/token, **0.78% of the 65.05 ms staging
+term** and 0.21% of the step. It was worth checking, because if it had been a
+per-staging cost of the same order as the saving the substitution would have
+been negative for every streaming model; it is not, so no host-side or offline
+layout change is needed to make this admissible.
+
+Net: about 8.0 ms of a 236.98 ms step, **roughly 1.035x end to end**.
+
 ## Verdict
 
 Headroom to the accepted register-fed figure of 88% of roofline (experiment
-0148) is **5.8x on gate_up and 8.9x on down**. The deficit is the scalar
+0148) is 5.8x on gate_up and 8.9x on down, and the arm below collects 5.04x and
+6.30x of it at Laguna's real width. The deficit is the scalar
 decode-and-accumulate loop, which is what the register-fed path replaces.
 
 At Laguna's width 10 the measured per-layer cost is 0.2478 ms gate_up plus

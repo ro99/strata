@@ -1830,7 +1830,8 @@ struct InklingRuntime::Impl {
             auto status = cuda.upload(
                 devices[slot], descriptor, matrix.value.packed,
                 matrix.value.scales, target,
-                CudaBackend::UploadCompletion::Deferred);
+                CudaBackend::UploadCompletion::Deferred,
+                CudaBackend::FragmentLayout::Prepack);
             if (!status.ok()) {
                 result.errors = std::move(status.errors);
                 return;

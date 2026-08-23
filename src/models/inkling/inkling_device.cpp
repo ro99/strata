@@ -76,7 +76,8 @@ ValidationResult load_inkling_cuda_linear(
     descriptor.scale_columns = module.columns / 32U;
     descriptor.group_size = 32U;
     return backend.upload(device, descriptor, packed.value, scale.value, output,
-                          CudaBackend::UploadCompletion::Deferred);
+                          CudaBackend::UploadCompletion::Deferred,
+                          CudaBackend::FragmentLayout::Prepack);
 }
 
 ValidationResult load_inkling_cuda_interleaved_half(
@@ -220,7 +221,8 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
                     .first(matrix.value.packed.size()),
                 std::span<const std::byte>(state.scratch.scales)
                     .first(matrix.value.scales.size()),
-                target);
+                target, CudaBackend::UploadCompletion::Synchronous,
+                CudaBackend::FragmentLayout::Prepack);
             if (!status.ok()) result.errors = std::move(status.errors);
         };
         upload(gate, entry.expert.gate);

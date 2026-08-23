@@ -583,9 +583,15 @@ ValidationResult load_laguna_cuda_linear(
         descriptor.packed_columns = module.columns / 2U;
         descriptor.scale_columns = module.columns / 32U;
         descriptor.group_size = 32U;
+        // Ask for m16n8k16 fragment order. Both consumers of an MXFP4 linear
+        // take a register-fed route when the weight carries it -- the fused MoE
+        // batch in enqueue_moe and the generic matmul -- and a shape the layout
+        // cannot express is left canonical by the backend rather than half
+        // converted. Honoured only while the register-fed switch is on.
         return backend.upload(device, descriptor, packed.value, scale.value,
                               output,
-                              CudaBackend::UploadCompletion::Deferred);
+                              CudaBackend::UploadCompletion::Deferred,
+                              CudaBackend::FragmentLayout::Prepack);
     }
     if (module.packed == nullptr || module.scale == nullptr ||
         module.global_scale == nullptr) {

@@ -3431,6 +3431,300 @@ std::atomic<int> g_regfed_matmul_enabled{-1};
     return current != 0;
 }
 
+// ---------------------------------------------------------------------------
+// Register-fed fused MXFP4 MoE (campaign task A).
+//
+// The scalar mxfp4_moe_gate_up/down kernels above reach 15.3% and 9.9% of this
+// card's measured read roofline at Laguna's real dispatch width, and hold that
+// figure from width 8 to 64 -- bandwidth-bound, not dispatch-bound (experiment
+// 0168). The register-fed decode collects 5.04x and 6.30x of that headroom at
+// the same width by keeping the codes four bits through HBM and decoding
+// straight into MMA operand registers.
+//
+// enqueue_moe already rounds both activations to E4M3 -- the hidden vector
+// before gate/up and the SwiGLU output before down -- and an E4M3 value has
+// three mantissa bits, so its BF16 image is exact. E2M1 codes and power-of-two
+// E8M0 scales are exact in BF16 too, so these kernels multiply the same real
+// numbers the scalar kernels multiply and differ only in accumulation order.
+// ---------------------------------------------------------------------------
+
+// Activation permute into MMA B-fragment order, batched over experts. gate/up
+// share one hidden vector, so they pass experts = 1; down reads a distinct
+// activation block per expert.
+__global__ void regfed_moe_activation_fragment_kernel(
+    uint2* __restrict__ destination, const float* __restrict__ source,
+    std::uint32_t experts, std::uint32_t m, std::uint32_t columns,
+    std::uint32_t column_blocks, std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t per_expert = k_tiles * column_blocks * groups_per_block * 4U;
+    const std::uint64_t total = static_cast<std::uint64_t>(experts) * per_expert;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t local = static_cast<std::uint32_t>(index % per_expert);
+        const std::uint32_t expert = static_cast<std::uint32_t>(index / per_expert);
+        const std::uint32_t thread = local % 4U;
+        const std::uint32_t group = (local / 4U) % groups_per_block;
+        const std::uint32_t block = (local / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile = local / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        std::uint32_t b0 = 0U;
+        std::uint32_t b1 = 0U;
+        if (column < m) {
+            const float* row =
+                source + (static_cast<std::size_t>(expert) * m + column) * columns;
+            const auto bits = [&](std::uint32_t offset) {
+                return static_cast<std::uint32_t>(__bfloat16_as_ushort(
+                    __float2bfloat16_rn(row[k_tile * kRegfedTileK + offset])));
+            };
+            b0 = bits(thread * 2U) | (bits(thread * 2U + 1U) << 16U);
+            b1 = bits(thread * 2U + 8U) | (bits(thread * 2U + 9U) << 16U);
+        }
+        destination[index] = make_uint2(b0, b1);
+    }
+}
+
+// One warp owns one (expert, N-tile, K-slice). Gate and up share the activation
+// fragment, so a single pass over the hidden vector feeds both weight streams.
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_mxfp4_moe_gate_up_kernel(
+    float* __restrict__ gate_partials, float* __restrict__ up_partials,
+    const uint2* __restrict__ activations, Mxfp4MoeBatch batch,
+    std::uint32_t columns, std::uint32_t intermediate, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = intermediate / kRegfedTileN;
+    const std::uint32_t k_blocks = (columns / kRegfedTileK) / kRegfedKPerLoad;
+    const std::uint32_t per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedGroup;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    const std::uint32_t total = batch.count * n_tiles * split;
+
+    bool live[kColBlocks];
+    std::size_t offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        offset[c] = (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < total; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t slice = work % split;
+        const std::uint32_t flat = work / split;
+        const std::uint32_t n_tile = flat % n_tiles;
+        const std::uint32_t expert = flat / n_tiles;
+        const auto* gate4 = reinterpret_cast<const uint4*>(batch.gate_weights[expert]);
+        const auto* up4 = reinterpret_cast<const uint4*>(batch.up_weights[expert]);
+        const unsigned char* gs = batch.gate_scales[expert];
+        const unsigned char* us = batch.up_scales[expert];
+        float gate[kColBlocks][4]{};
+        float up[kColBlocks][4]{};
+
+        for (std::uint32_t block = slice * per_slice;
+             block < (slice + 1U) * per_slice; ++block) {
+            const std::size_t index =
+                (static_cast<std::size_t>(n_tile) * k_blocks + block) * kRegfedWarp + lane;
+            const uint4 gpacked = gate4[index];
+            const uint4 upacked = up4[index];
+            const std::size_t sbase =
+                (static_cast<std::size_t>(n_tile) * scale_columns + block * 2U) *
+                kRegfedTileN;
+            const uint4 g_even = *reinterpret_cast<const uint4*>(gs + sbase);
+            const uint4 g_odd = *reinterpret_cast<const uint4*>(gs + sbase + kRegfedTileN);
+            const uint4 u_even = *reinterpret_cast<const uint4*>(us + sbase);
+            const uint4 u_odd = *reinterpret_cast<const uint4*>(us + sbase + kRegfedTileN);
+            const std::uint32_t gw[4] = {gpacked.x, gpacked.y, gpacked.z, gpacked.w};
+            const std::uint32_t uw[4] = {upacked.x, upacked.y, upacked.z, upacked.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                const uint4 gsel = (j < 2U) ? g_even : g_odd;
+                const uint4 usel = (j < 2U) ? u_even : u_odd;
+                std::uint32_t ga[4];
+                std::uint32_t ua[4];
+                regfed_fp4_decode_fragment(
+                    gw[j],
+                    regfed_fp4_scale_pair((((group < 4U) ? gsel.x : gsel.y) >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((((group < 4U) ? gsel.z : gsel.w) >> shift) & 0xFFU),
+                    ga);
+                regfed_fp4_decode_fragment(
+                    uw[j],
+                    regfed_fp4_scale_pair((((group < 4U) ? usel.x : usel.y) >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((((group < 4U) ? usel.z : usel.w) >> shift) & 0xFFU),
+                    ua);
+                const std::size_t base =
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                    kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b = live[c] ? activations[base + offset[c]]
+                                            : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(gate[c][0], gate[c][1], gate[c][2], gate[c][3],
+                                      ga[0], ga[1], ga[2], ga[3], b.x, b.y);
+                    dsv4_mma_m16n8k16(up[c][0], up[c][1], up[c][2], up[c][3],
+                                      ua[0], ua[1], ua[2], ua[3], b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column = c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column >= m) continue;
+                const std::size_t slot =
+                    ((static_cast<std::size_t>(expert) * intermediate +
+                      n_tile * kRegfedTileN + row) * m + column) * split + slice;
+                gate_partials[slot] = gate[c][i];
+                up_partials[slot] = up[c][i];
+            }
+        }
+    }
+}
+
+// Sums the split-K partials and applies the SwiGLU. The branchy sigmoid is
+// reproduced from mxfp4_moe_gate_up_kernel exactly, so this path is
+// indistinguishable from the incumbent rather than merely close.
+__global__ void regfed_mxfp4_moe_swiglu_kernel(
+    float* __restrict__ activations, const float* __restrict__ gate_partials,
+    const float* __restrict__ up_partials, std::uint32_t experts,
+    std::uint32_t intermediate, std::uint32_t m, std::uint32_t split,
+    unsigned int* __restrict__ error_flag) {
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(experts) * intermediate * m;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t column = static_cast<std::uint32_t>(index % m);
+        const std::uint32_t rest = static_cast<std::uint32_t>(index / m);
+        const std::uint32_t output_row = rest % intermediate;
+        const std::uint32_t expert = rest / intermediate;
+        float gate = 0.0F;
+        float up = 0.0F;
+        for (std::uint32_t slice = 0U; slice < split; ++slice) {
+            gate += gate_partials[index * split + slice];
+            up += up_partials[index * split + slice];
+        }
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            continue;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F ? 1.0F / (1.0F + exponential)
+                                           : exponential / (1.0F + exponential);
+        activations[(static_cast<std::size_t>(expert) * m + column) * intermediate +
+                    output_row] = gate * sigmoid * up;
+    }
+}
+
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_mxfp4_moe_down_kernel(
+    float* __restrict__ partials, const uint2* __restrict__ activations,
+    Mxfp4MoeBatch batch, std::uint32_t columns, std::uint32_t rows,
+    std::uint32_t split, std::uint32_t m, std::uint32_t groups_per_block) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_blocks = (columns / kRegfedTileK) / kRegfedKPerLoad;
+    const std::uint32_t per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedGroup;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    const std::uint32_t total = batch.count * n_tiles * split;
+    const std::size_t per_expert_activation =
+        static_cast<std::size_t>(columns / kRegfedTileK) * kColBlocks *
+        groups_per_block * 4U;
+
+    bool live[kColBlocks];
+    std::size_t offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        offset[c] = (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < total; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t slice = work % split;
+        const std::uint32_t flat = work / split;
+        const std::uint32_t n_tile = flat % n_tiles;
+        const std::uint32_t expert = flat / n_tiles;
+        const auto* codes4 = reinterpret_cast<const uint4*>(batch.down_weights[expert]);
+        const unsigned char* sc = batch.down_scales[expert];
+        float acc[kColBlocks][4]{};
+
+        for (std::uint32_t block = slice * per_slice;
+             block < (slice + 1U) * per_slice; ++block) {
+            const uint4 packed =
+                codes4[(static_cast<std::size_t>(n_tile) * k_blocks + block) *
+                           kRegfedWarp + lane];
+            const std::size_t sbase =
+                (static_cast<std::size_t>(n_tile) * scale_columns + block * 2U) *
+                kRegfedTileN;
+            const uint4 even = *reinterpret_cast<const uint4*>(sc + sbase);
+            const uint4 odd = *reinterpret_cast<const uint4*>(sc + sbase + kRegfedTileN);
+            const std::uint32_t w[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                const uint4 sel = (j < 2U) ? even : odd;
+                std::uint32_t a[4];
+                regfed_fp4_decode_fragment(
+                    w[j],
+                    regfed_fp4_scale_pair((((group < 4U) ? sel.x : sel.y) >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((((group < 4U) ? sel.z : sel.w) >> shift) & 0xFFU),
+                    a);
+                const std::size_t base =
+                    static_cast<std::size_t>(expert) * per_expert_activation +
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                        kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b = live[c] ? activations[base + offset[c]]
+                                            : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a[0], a[1], a[2], a[3], b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column = c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column >= m) continue;
+                const std::size_t slot =
+                    ((static_cast<std::size_t>(expert) * rows +
+                      n_tile * kRegfedTileN + row) * m + column) * split + slice;
+                partials[slot] = acc[c][i];
+            }
+        }
+    }
+}
+
+__global__ void regfed_mxfp4_moe_reduce_kernel(
+    float* __restrict__ output, const float* __restrict__ partials,
+    std::uint32_t experts, std::uint32_t rows, std::uint32_t m,
+    std::uint32_t split, unsigned int* __restrict__ error_flag) {
+    const std::uint64_t total = static_cast<std::uint64_t>(experts) * rows * m;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t column = static_cast<std::uint32_t>(index % m);
+        const std::uint32_t rest = static_cast<std::uint32_t>(index / m);
+        const std::uint32_t output_row = rest % rows;
+        const std::uint32_t expert = rest / rows;
+        float sum = 0.0F;
+        for (std::uint32_t slice = 0U; slice < split; ++slice) {
+            sum += partials[index * split + slice];
+        }
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::size_t>(expert) * m + column) * rows + output_row] = sum;
+    }
+}
+
 // Scratch needed to permute this weight into fragment order, or zero if the
 // encoding or the extents are inadmissible. The permutation cannot be done in
 // place, but the scratch is transient and shared across every weight on the
@@ -6322,6 +6616,25 @@ struct CudaBackend::Impl {
         // routed path, so it keeps workspaces separate from the generic
         // matmul's rather than sharing them.
         RegfedWorkspace moe_regfed{};
+        // Scratch for the upload-path fragment prepack. Uploads for a device
+        // are stream-ordered, so one buffer serves them; only its growth needs
+        // the lock.
+        void* upload_prepack_scratch{};
+        std::uint64_t upload_prepack_scratch_bytes{};
+        // Register-fed fused MoE workspaces: split-K partials for gate, up and
+        // down, plus the two B-fragment activation buffers. Grown geometrically
+        // and kept, so a decode step that repeats the same shapes allocates
+        // nothing after the first token.
+        void* moe_regfed_gate_partials{};
+        void* moe_regfed_up_partials{};
+        void* moe_regfed_down_partials{};
+        void* moe_regfed_hidden_fragment{};
+        void* moe_regfed_activation_fragment{};
+        std::uint64_t moe_regfed_gate_partial_bytes{};
+        std::uint64_t moe_regfed_up_partial_bytes{};
+        std::uint64_t moe_regfed_down_partial_bytes{};
+        std::uint64_t moe_regfed_hidden_fragment_bytes{};
+        std::uint64_t moe_regfed_activation_fragment_bytes{};
         RegfedWorkspace gemma_regfed{};
         float* moe_regfed_gate{};
         float* moe_regfed_up{};
@@ -6557,6 +6870,16 @@ struct CudaBackend::Impl {
             }
             // moe_regfed_up is an interior pointer into the gate allocation,
             // not an allocation of its own: freeing it is cudaErrorInvalidValue.
+            for (void* pointer : {state.moe_regfed_gate_partials,
+                                  state.moe_regfed_up_partials,
+                                  state.moe_regfed_down_partials,
+                                  state.moe_regfed_hidden_fragment,
+                                  state.moe_regfed_activation_fragment}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            if (state.upload_prepack_scratch != nullptr) {
+                static_cast<void>(cudaFree(state.upload_prepack_scratch));
+            }
             for (void* pointer : {state.moe_regfed.activation,
                                   state.moe_regfed.partials,
                                   state.moe_regfed.counters,
@@ -7031,7 +7354,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
                                      std::span<const std::byte> weights,
                                      std::span<const std::byte> scales,
                                      CudaWeight& output,
-                                     UploadCompletion completion) {
+                                     UploadCompletion completion,
+                                     FragmentLayout prepack) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -7230,6 +7554,33 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             return upload_error(status, "upload CUDA scales");
         }
         copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
+    }
+    // Fragment prepack, stream-ordered behind the copies that just landed. This
+    // is a device-side permutation of the staged bytes: for a streaming MoE it
+    // costs one read and one write of what was staged, measured at 0.509
+    // ms/token against Laguna's 65.05 ms staging term (experiment 0168), so it
+    // does not need to move off the staging path.
+    if (prepack == FragmentLayout::Prepack && regfed_matmul_enabled()) {
+        const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
+        if (scratch_bytes != 0U) {
+            bool ready = true;
+            {
+                std::scoped_lock lock(impl_->mutex);
+                ready = regfed_grow(state.upload_prepack_scratch,
+                                    state.upload_prepack_scratch_bytes,
+                                    scratch_bytes, false,
+                                    upload_stream) == cudaSuccess;
+            }
+            if (ready) {
+                if (auto status = launch_fragment_prepack(
+                        descriptor, target->weights, target->scales,
+                        state.upload_prepack_scratch, upload_stream);
+                    status != cudaSuccess) {
+                    return upload_error(status, "prepack weight into fragment order");
+                }
+                target->fragment_prepacked = true;
+            }
+        }
     }
     std::uint64_t wait_nanoseconds = 0U;
     std::uint64_t synchronizations = 0U;
@@ -15033,6 +15384,7 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::MoeFp4E2m1Group32:
             return "moe_fp4_e2m1_group32";
         case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
+        case CudaMatmulRoute::MoeFp4RegisterFed: return "moe_fp4_register_fed";
         case CudaMatmulRoute::Dsv4MoeRoutedFp4: return "dsv4_moe_routed_fp4";
         case CudaMatmulRoute::Dsv4MoeSharedFp8: return "dsv4_moe_shared_fp8";
         case CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed:
@@ -17961,11 +18313,45 @@ ValidationResult CudaBackend::enqueue_moe(
         static_cast<unsigned int>(activation_rows), 1U);
     // Counted once per MoE command on the gate/up dispatch; the down kernel
     // mirrors the same branch, so counting both would double every entry.
+    // Register-fed fused MoE. Fragment order replaces the canonical layout, so
+    // the batch is all-or-nothing: a partially permuted batch is a defect, not
+    // a mixed dispatch, and is refused rather than half-served.
+    bool mxfp4_prepacked = mxfp4_batch;
+    bool mxfp4_any_prepacked = false;
+    if (mxfp4_batch) {
+        for (std::uint32_t index = 0U; index < batch.count; ++index) {
+            const auto* expert = index < routed.size() ? &routed[index] : shared;
+            const bool ready = expert->gate->impl_->fragment_prepacked &&
+                               expert->up->impl_->fragment_prepacked &&
+                               expert->down->impl_->fragment_prepacked;
+            mxfp4_prepacked = mxfp4_prepacked && ready;
+            mxfp4_any_prepacked = mxfp4_any_prepacked ||
+                                  expert->gate->impl_->fragment_prepacked ||
+                                  expert->up->impl_->fragment_prepacked ||
+                                  expert->down->impl_->fragment_prepacked;
+        }
+        if (mxfp4_any_prepacked && !mxfp4_prepacked) {
+            abort_enqueue(cudaErrorInvalidValue,
+                          "MXFP4 MoE batch mixes fragment-prepacked and "
+                          "canonical experts");
+            return result;
+        }
+        if (mxfp4_prepacked && rows > kRegfedMaxM) {
+            // No hidden fallback: the scalar kernel would read fragment order
+            // as canonical weights, which is silent corruption.
+            abort_enqueue(cudaErrorInvalidValue,
+                          "MXFP4 MoE batch is fragment-prepacked but the row "
+                          "count exceeds the register-fed kernel's width");
+            return result;
+        }
+    }
+    const bool mxfp4_regfed = mxfp4_prepacked && regfed_matmul_enabled();
     record_cuda_matmul_route(
-        plain_batch    ? CudaMatmulRoute::MoePlainBf16
-        : nvfp4_batch  ? CudaMatmulRoute::MoeNvfp4Group16
-        : mxfp4_batch  ? CudaMatmulRoute::MoeFp4E2m1Group32
-                       : CudaMatmulRoute::MoePackedInt4);
+        plain_batch      ? CudaMatmulRoute::MoePlainBf16
+        : nvfp4_batch    ? CudaMatmulRoute::MoeNvfp4Group16
+        : mxfp4_regfed   ? CudaMatmulRoute::MoeFp4RegisterFed
+        : mxfp4_batch    ? CudaMatmulRoute::MoeFp4E2m1Group32
+                         : CudaMatmulRoute::MoePackedInt4);
     if (plain_batch) {
         plain_bf16_moe_gate_up_kernel<<<plain_gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, plain_batch_data,
@@ -17975,6 +18361,80 @@ ValidationResult CudaBackend::enqueue_moe(
             state.moe_activations, state.moe_hidden, nvfp4_batch_data,
             hidden_columns, intermediate_columns, gate.packed_columns,
             gate.scale_columns, gate.group_size, state.moe_error);
+    } else if (mxfp4_regfed) {
+        const auto experts = batch.count;
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>(rows, kRegfedMaxM) + kRegfedTileM - 1U) /
+            kRegfedTileM);
+        const auto groups = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto n_tiles =
+            static_cast<std::uint32_t>(intermediate_columns / kRegfedTileN);
+        const auto k_blocks = static_cast<std::uint32_t>(
+            (hidden_columns / kRegfedTileK) / kRegfedKPerLoad);
+        std::uint32_t split = 1U;
+        while (split < 16U && k_blocks % (split * 2U) == 0U &&
+               static_cast<std::uint64_t>(experts) * n_tiles * split * 2U <= 4096U) {
+            split *= 2U;
+        }
+        const std::uint64_t partial_bytes = static_cast<std::uint64_t>(experts) *
+                                            intermediate_columns * rows * split *
+                                            sizeof(float);
+        const std::uint64_t fragment_bytes =
+            static_cast<std::uint64_t>(hidden_columns / kRegfedTileK) *
+            column_blocks * groups * 4U * sizeof(uint2);
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required) {
+            return regfed_grow(pointer, capacity, required, false, state.stream);
+        };
+        if (grow(state.moe_regfed_gate_partials,
+                 state.moe_regfed_gate_partial_bytes, partial_bytes) != cudaSuccess ||
+            grow(state.moe_regfed_up_partials,
+                 state.moe_regfed_up_partial_bytes, partial_bytes) != cudaSuccess ||
+            grow(state.moe_regfed_hidden_fragment,
+                 state.moe_regfed_hidden_fragment_bytes, fragment_bytes) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate register-fed MoE gate/up workspaces");
+            return result;
+        }
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(hidden_columns / kRegfedTileK) *
+            column_blocks * groups * 4U;
+        regfed_moe_activation_fragment_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            static_cast<uint2*>(state.moe_regfed_hidden_fragment),
+            state.moe_hidden, 1U, static_cast<std::uint32_t>(rows),
+            static_cast<std::uint32_t>(hidden_columns), column_blocks, groups);
+        const auto blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(experts) * n_tiles * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_mxfp4_moe_gate_up_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                static_cast<float*>(state.moe_regfed_gate_partials),
+                static_cast<float*>(state.moe_regfed_up_partials),
+                static_cast<const uint2*>(state.moe_regfed_hidden_fragment),
+                mxfp4_batch_data, static_cast<std::uint32_t>(hidden_columns),
+                static_cast<std::uint32_t>(intermediate_columns), split,
+                static_cast<std::uint32_t>(rows), groups);
+        };
+        if (column_blocks == 1U) launch(std::integral_constant<std::uint32_t, 1U>{});
+        else launch(std::integral_constant<std::uint32_t, 2U>{});
+        const std::uint64_t swiglu_total =
+            static_cast<std::uint64_t>(experts) * intermediate_columns * rows;
+        regfed_mxfp4_moe_swiglu_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((swiglu_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            state.moe_activations,
+            static_cast<const float*>(state.moe_regfed_gate_partials),
+            static_cast<const float*>(state.moe_regfed_up_partials), experts,
+            static_cast<std::uint32_t>(intermediate_columns),
+            static_cast<std::uint32_t>(rows), split, state.moe_error);
+        state.moe_kernel_launches += 2U;
     } else if (mxfp4_batch) {
         mxfp4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, mxfp4_batch_data,
@@ -17992,6 +18452,9 @@ ValidationResult CudaBackend::enqueue_moe(
         return result;
     }
     if (mxfp4_batch) {
+        // Runs for both routes: it is what makes the activation E4M3, and an
+        // E4M3 value's BF16 image is exact, which is why the register-fed
+        // tensor op multiplies the same numbers the scalar kernel does.
         const dim3 quantize_grid(
             static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
             static_cast<unsigned int>(activation_rows), 1U);
@@ -18020,6 +18483,75 @@ ValidationResult CudaBackend::enqueue_moe(
             state.moe_output, state.moe_activations, nvfp4_batch_data,
             intermediate_columns, hidden_columns, down.packed_columns,
             down.scale_columns, down.group_size, state.moe_error);
+    } else if (mxfp4_regfed) {
+        const auto experts = batch.count;
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>(rows, kRegfedMaxM) + kRegfedTileM - 1U) /
+            kRegfedTileM);
+        const auto groups = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto n_tiles =
+            static_cast<std::uint32_t>(hidden_columns / kRegfedTileN);
+        const auto k_blocks = static_cast<std::uint32_t>(
+            (intermediate_columns / kRegfedTileK) / kRegfedKPerLoad);
+        std::uint32_t split = 1U;
+        while (split < 16U && k_blocks % (split * 2U) == 0U &&
+               static_cast<std::uint64_t>(experts) * n_tiles * split * 2U <= 4096U) {
+            split *= 2U;
+        }
+        const std::uint64_t partial_bytes = static_cast<std::uint64_t>(experts) *
+                                            hidden_columns * rows * split *
+                                            sizeof(float);
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(experts) *
+            (intermediate_columns / kRegfedTileK) * column_blocks * groups * 4U;
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required) {
+            return regfed_grow(pointer, capacity, required, false, state.stream);
+        };
+        if (grow(state.moe_regfed_down_partials,
+                 state.moe_regfed_down_partial_bytes, partial_bytes) != cudaSuccess ||
+            grow(state.moe_regfed_activation_fragment,
+                 state.moe_regfed_activation_fragment_bytes,
+                 fragment_total * sizeof(uint2)) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate register-fed MoE down workspaces");
+            return result;
+        }
+        regfed_moe_activation_fragment_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            static_cast<uint2*>(state.moe_regfed_activation_fragment),
+            state.moe_activations, experts, static_cast<std::uint32_t>(rows),
+            static_cast<std::uint32_t>(intermediate_columns), column_blocks, groups);
+        const auto blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(experts) * n_tiles * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_mxfp4_moe_down_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                static_cast<float*>(state.moe_regfed_down_partials),
+                static_cast<const uint2*>(state.moe_regfed_activation_fragment),
+                mxfp4_batch_data,
+                static_cast<std::uint32_t>(intermediate_columns),
+                static_cast<std::uint32_t>(hidden_columns), split,
+                static_cast<std::uint32_t>(rows), groups);
+        };
+        if (column_blocks == 1U) launch(std::integral_constant<std::uint32_t, 1U>{});
+        else launch(std::integral_constant<std::uint32_t, 2U>{});
+        const std::uint64_t reduce_total =
+            static_cast<std::uint64_t>(experts) * hidden_columns * rows;
+        regfed_mxfp4_moe_reduce_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((reduce_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            state.moe_output,
+            static_cast<const float*>(state.moe_regfed_down_partials), experts,
+            static_cast<std::uint32_t>(hidden_columns),
+            static_cast<std::uint32_t>(rows), split, state.moe_error);
+        state.moe_kernel_launches += 2U;
     } else if (mxfp4_batch) {
         mxfp4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
             state.moe_output, state.moe_activations, mxfp4_batch_data,

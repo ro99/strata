@@ -3189,3 +3189,104 @@ TEST_CASE("a fragment-prepacked weight is refused by every canonical route") {
     }
     REQUIRE(worst < 1e-4);
 }
+
+TEST_CASE("register-fed MXFP4 MoE batch matches the scalar batch it replaces") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // Laguna's routed-expert shapes. enqueue_moe rounds both activations to
+    // E4M3 -- the hidden vector before gate/up and the SwiGLU output before
+    // down -- and an E4M3 value has three mantissa bits, so its BF16 image is
+    // exact. The two routes therefore multiply the same real numbers and differ
+    // only in FP32 accumulation order.
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+    constexpr std::uint32_t experts = 3U;
+
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] =
+            static_cast<float>(static_cast<int>(index % 29U) - 14) / 32.0F;
+    }
+
+    const auto run = [&](bool prepack, std::vector<float>& out) {
+        std::vector<strata::CudaWeight> gates, ups, downs;
+        for (std::uint32_t e = 0U; e < experts; ++e) {
+            gates.push_back(upload_fp4(backend, device, intermediate_columns,
+                                       hidden_columns, 3U + e));
+            ups.push_back(upload_fp4(backend, device, intermediate_columns,
+                                     hidden_columns, 7U + e));
+            downs.push_back(upload_fp4(backend, device, hidden_columns,
+                                       intermediate_columns, 11U + e));
+            if (prepack) {
+                // The permutation is an explicit opt-in that opts every
+                // consumer in at once; no dispatch site decides it alone.
+                REQUIRE(backend.prepack_fragment(device, gates.back()).ok());
+                REQUIRE(backend.prepack_fragment(device, ups.back()).ok());
+                REQUIRE(backend.prepack_fragment(device, downs.back()).ok());
+            }
+        }
+        std::vector<strata::CudaMoeExpert> routed;
+        for (std::uint32_t e = 0U; e < experts; ++e) {
+            routed.push_back({&gates[e], &ups[e], &downs[e], 1.0F});
+        }
+        REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+        REQUIRE(backend.collect_moe(device, out, {}).ok());
+    };
+
+    // collect_moe returns one hidden-sized block per expert.
+    std::vector<float> scalar(experts * rows * hidden_columns);
+    std::vector<float> regfed(experts * rows * hidden_columns);
+    strata::reset_cuda_matmul_route_census();
+    run(false, scalar);
+    run(true, regfed);
+
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4RegisterFed)] == 1U);
+
+    double worst = 0.0;
+    for (std::size_t index = 0U; index < scalar.size(); ++index) {
+        const double scale =
+            std::max(1.0, std::abs(static_cast<double>(scalar[index])));
+        worst = std::max(worst, std::abs(static_cast<double>(regfed[index]) -
+                                         static_cast<double>(scalar[index])) /
+                                    scale);
+    }
+    if (!(worst < 1e-4)) {
+        std::fprintf(stderr,
+                     "register-fed MoE mismatch: worst relative residual %g\n",
+                     worst);
+    }
+    REQUIRE(worst < 1e-4);
+}
+
+TEST_CASE("a partially prepacked MXFP4 MoE batch is refused, not half-served") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+
+    auto gate = upload_fp4(backend, device, intermediate_columns, hidden_columns, 3U);
+    auto up = upload_fp4(backend, device, intermediate_columns, hidden_columns, 7U);
+    auto down = upload_fp4(backend, device, hidden_columns, intermediate_columns, 11U);
+    // Only one of the three is permuted. Fragment order replaces the canonical
+    // layout, so serving this batch either way reads one of them wrong.
+    REQUIRE(backend.prepack_fragment(device, gate).ok());
+
+    std::array<float, hidden_columns> hidden{};
+    const std::array<strata::CudaMoeExpert, 1> routed{{{&gate, &up, &down, 1.0F}}};
+    const auto refused = backend.enqueue_moe(device, hidden, 1U, routed, nullptr);
+    REQUIRE(!refused.ok());
+}

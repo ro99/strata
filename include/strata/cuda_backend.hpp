@@ -800,6 +800,10 @@ enum class CudaMatmulRoute : std::uint8_t {
     MoeNvfp4Group16,
     MoeFp4E2m1Group32,
     MoePackedInt4,
+    // The fused MXFP4 MoE batch on the register-fed route (task A). Counted
+    // separately from MoeFp4E2m1Group32 so a run shows which of the two served
+    // it.
+    MoeFp4RegisterFed,
     // DeepSeek V4's own MoE path. This is the campaign's mixed dispatch: the
     // routed experts are FP4 E2M1/E8M0 group-32 and the shared expert is FP8
     // E4M3/E8M0 block-128, dispatched by CudaBackend::enqueue_deepseek_moe.
@@ -904,11 +908,20 @@ public:
         Synchronous,
         Deferred,
     };
+    // `prepack` asks for the weight to be permuted into m16n8k16 fragment
+    // order as part of the upload, stream-ordered behind the copy so the loader
+    // never blocks on it. It is honoured only when the register-fed switch is on
+    // and the extents admit the layout; otherwise the weight stays canonical and
+    // keeps the scalar route. Ask for it only where EVERY consumer of the weight
+    // takes a register-fed route -- fragment order replaces the canonical
+    // layout, so a consumer that reads it canonically reads a permutation.
+    enum class FragmentLayout : std::uint8_t { Canonical, Prepack };
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,
         CudaWeight& output,
-        UploadCompletion completion = UploadCompletion::Synchronous);
+        UploadCompletion completion = UploadCompletion::Synchronous,
+        FragmentLayout prepack = FragmentLayout::Canonical);
     // Waits out any deferred uploads issued on this device and attributes the
     // wait. Idempotent, and free when nothing was deferred.
     [[nodiscard]] ValidationResult synchronize_uploads(int device);

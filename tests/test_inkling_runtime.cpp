@@ -121,7 +121,7 @@ TEST_CASE("Inkling runtime generates the expected continuation") {
                 8ULL * (1ULL << 30U));
 }
 
-TEST_CASE("Inkling MXFP4 runtime generates through canonical scalar routes") {
+TEST_CASE("Inkling MXFP4 runtime generates through register-fed routes") {
     if (!inkling_mxfp4_checkpoint_present()) {
         SKIP("pinned Inkling-Small-MXFP4 checkpoint is absent");
     }
@@ -149,13 +149,22 @@ TEST_CASE("Inkling MXFP4 runtime generates through canonical scalar routes") {
     }
     REQUIRE(result.ok());
     REQUIRE(result.text.find("Paris") != std::string::npos);
+    // The loader now asks for m16n8k16 fragment order on MXFP4 linears, so both
+    // the generic matmul and the fused MoE batch serve this run on the
+    // register-fed route. The text check above is the end-to-end statement that
+    // matters: the model still says Paris on the substituted path.
     const auto census = strata::cuda_matmul_route_census();
     REQUIRE(census.counts[static_cast<std::size_t>(
-                strata::CudaMatmulRoute::Fp4E2m1Group32)] > 0U);
+                strata::CudaMatmulRoute::Fp4RegisterFed)] > 0U);
     REQUIRE(census.counts[static_cast<std::size_t>(
-                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] > 0U);
+                strata::CudaMatmulRoute::MoeFp4RegisterFed)] > 0U);
+    // Nothing may quietly fall back to reading fragment order as canonical.
     REQUIRE(census.counts[static_cast<std::size_t>(
-                strata::CudaMatmulRoute::Fp4RegisterFed)] == 0U);
+                strata::CudaMatmulRoute::Fp4E2m1Group32)] == 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Unsupported)] == 0U);
 }
 
 TEST_CASE("Inkling teacher forcing is deterministic and ranks the known token") {

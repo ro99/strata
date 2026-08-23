@@ -344,7 +344,10 @@ struct Gemma4Linear {
     constexpr auto& c = kInklingExecutionContract;
     auto& inventory = result.value;
     inventory.model = PlacementModel::Inkling;
-    inventory.model_name = inkling_small_nvfp4_spec().name;
+    const bool mxfp4 = checkpoint.format() ==
+                       InklingCheckpointFormat::Mxfp4Group32;
+    inventory.model_name = mxfp4 ? inkling_small_mxfp4_spec().name
+                                 : inkling_small_nvfp4_spec().name;
     inventory.layer_count = c.layer_count;
     inventory.maximum_context_tokens = context_tokens;
     inventory.per_device_workspace_bytes = kFlashAttentionWorkspaceReserve;
@@ -362,7 +365,7 @@ struct Gemma4Linear {
         }
         ModuleSizes sizes;
         sizes.layer = layer;
-        sizes.weight_bytes = module.value.weight->bytes;
+        sizes.weight_bytes = module.value.source_bytes();
         inventory.items.push_back(make_item(component, sizes,
                                             sizes.device_bytes(),
                                             PlacementTier::Device, false));
@@ -377,55 +380,98 @@ struct Gemma4Linear {
     std::uint64_t routed_modules = 0U;
     for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
         const auto index = static_cast<std::int32_t>(layer);
-        const auto prefix = inkling_layer_prefix(layer);
-        const auto attention = prefix + "attn.";
+        const auto prefix = mxfp4
+            ? "language_model.model.layers." + std::to_string(layer) + "."
+            : inkling_layer_prefix(layer);
+        const auto attention = prefix + (mxfp4 ? "self_attn." : "attn.");
         const auto mlp = prefix + "mlp.";
-        add_linear(PlacementClass::Attention, index, attention + "wq_du.weight",
+        add_linear(PlacementClass::Attention, index,
+                   attention + (mxfp4 ? "q_proj" : "wq_du.weight"),
                    query_columns, hidden);
-        add_linear(PlacementClass::Attention, index, attention + "wk_dv.weight",
+        add_linear(PlacementClass::Attention, index,
+                   attention + (mxfp4 ? "k_proj" : "wk_dv.weight"),
                    kv_columns, hidden);
-        add_linear(PlacementClass::Attention, index, attention + "wv_dv.weight",
+        add_linear(PlacementClass::Attention, index,
+                   attention + (mxfp4 ? "v_proj" : "wv_dv.weight"),
                    kv_columns, hidden);
-        add_linear(PlacementClass::Attention, index, attention + "wo_ud.weight",
+        add_linear(PlacementClass::Attention, index,
+                   attention + (mxfp4 ? "o_proj" : "wo_ud.weight"),
                    hidden, query_columns);
         // The relative branch is a fourth projection, not an optional extra:
         // without it the layer has no position signal at all.
-        add_linear(PlacementClass::Attention, index, attention + "wr_du.weight",
+        add_linear(PlacementClass::Attention, index,
+                   attention + (mxfp4 ? "r_proj" : "wr_du.weight"),
                    static_cast<std::uint64_t>(c.attention_heads) * c.relative_dim,
                    hidden);
         if (!inkling_sparse_layer(layer)) {
-            add_linear(PlacementClass::FeedForward, index, mlp + "w13_dn.weight",
-                       2ULL * c.dense_intermediate_size, hidden);
-            add_linear(PlacementClass::FeedForward, index, mlp + "w2_md.weight",
+            if (mxfp4) {
+                add_linear(PlacementClass::FeedForward, index,
+                           mlp + "gate_proj", c.dense_intermediate_size, hidden);
+                add_linear(PlacementClass::FeedForward, index,
+                           mlp + "up_proj", c.dense_intermediate_size, hidden);
+            } else {
+                add_linear(PlacementClass::FeedForward, index,
+                           mlp + "w13_dn.weight",
+                           2ULL * c.dense_intermediate_size, hidden);
+            }
+            add_linear(PlacementClass::FeedForward, index,
+                       mlp + (mxfp4 ? "down_proj" : "w2_md.weight"),
                        hidden, c.dense_intermediate_size);
         } else {
-            add_linear(PlacementClass::Router, index, mlp + "gate.weight",
+            add_linear(PlacementClass::Router, index,
+                       mlp + (mxfp4 ? "gate_weight" : "gate.weight"),
                        static_cast<std::uint64_t>(c.routed_experts) +
                            c.shared_experts,
                        hidden);
             // Both sinks run on every token, so they are resident like a
             // shared expert rather than cached like a routed one.
-            for (const auto& name :
-                 {mlp + "shared_experts.shared_w13_weight",
-                  mlp + "shared_experts.shared_w2_weight"}) {
-                const auto* tensor = checkpoint.find(name);
-                if (tensor == nullptr) {
-                    result.errors.push_back("Inkling checkpoint is missing " + name);
+            const auto shared_projections = mxfp4
+                ? std::vector<std::pair<std::string,
+                       std::pair<std::uint64_t, std::uint64_t>>>{
+                      {mlp + "shared_experts.gate_proj",
+                       {c.expert_intermediate_size, hidden}},
+                      {mlp + "shared_experts.up_proj",
+                       {c.expert_intermediate_size, hidden}},
+                      {mlp + "shared_experts.down_proj",
+                       {hidden, c.expert_intermediate_size}}}
+                : std::vector<std::pair<std::string,
+                       std::pair<std::uint64_t, std::uint64_t>>>{
+                      {mlp + "shared_experts.shared_w13_weight",
+                       {2ULL * c.expert_intermediate_size, hidden}},
+                      {mlp + "shared_experts.shared_w2_weight",
+                       {hidden, c.expert_intermediate_size}}};
+            for (const auto& projection : shared_projections) {
+                auto stack = checkpoint.expert_stack(
+                    projection.first, layer, c.shared_experts,
+                    projection.second.first, projection.second.second);
+                if (!stack.ok()) {
+                    result.errors.push_back("Inkling checkpoint is missing " +
+                                            projection.first);
                     return result;
                 }
                 ModuleSizes shared;
                 shared.layer = index;
-                shared.weight_bytes = tensor->bytes;
-                inventory.items.push_back(
-                    make_item(PlacementClass::SharedExpert, shared,
-                              shared.device_bytes(), PlacementTier::Device, false));
+                shared.weight_bytes = stack.value.source_bytes();
+                inventory.items.push_back(make_item(
+                    PlacementClass::SharedExpert, shared, shared.device_bytes(),
+                    PlacementTier::Device, false));
             }
-            for (const auto& projection :
-                 {std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>{
-                      mlp + "experts.w13_weight",
-                      {2ULL * c.expert_intermediate_size, hidden}},
-                  {mlp + "experts.w2_weight",
-                   {hidden, c.expert_intermediate_size}}}) {
+            const auto routed_projections = mxfp4
+                ? std::vector<std::pair<std::string,
+                       std::pair<std::uint64_t, std::uint64_t>>>{
+                      {mlp + "switch_mlp.gate_proj",
+                       {c.expert_intermediate_size, hidden}},
+                      {mlp + "switch_mlp.up_proj",
+                       {c.expert_intermediate_size, hidden}},
+                      {mlp + "switch_mlp.down_proj",
+                       {hidden, c.expert_intermediate_size}}}
+                : std::vector<std::pair<std::string,
+                       std::pair<std::uint64_t, std::uint64_t>>>{
+                      {mlp + "experts.w13_weight",
+                       {2ULL * c.expert_intermediate_size, hidden}},
+                      {mlp + "experts.w2_weight",
+                       {hidden, c.expert_intermediate_size}}};
+            for (const auto& projection : routed_projections) {
                 auto stack = checkpoint.expert_stack(
                     projection.first, layer, c.routed_experts,
                     projection.second.first, projection.second.second);
@@ -471,18 +517,29 @@ struct Gemma4Linear {
 
     add_linear(PlacementClass::OutputHead,
                static_cast<std::int32_t>(c.layer_count - 1U),
-               "model.llm.unembed.weight", c.padded_vocabulary_size, hidden);
+               mxfp4 ? "language_model.lm_head" : "model.llm.unembed.weight",
+               c.padded_vocabulary_size, hidden);
     if (!result.ok()) return result;
     inventory.items.back().decode_read_bytes =
         inventory.items.back().device_bytes;
 
     // The embedding table is read one row per token from the host mapping and
     // is never uploaded.
-    if (const auto* embedding = checkpoint.find("model.llm.embed.weight");
+    const auto embedding_name = mxfp4
+        ? "language_model.model.embed_tokens.weight"
+        : "model.llm.embed.weight";
+    if (const auto* embedding = checkpoint.find(embedding_name);
         embedding != nullptr) {
         ModuleSizes table;
         table.layer = -1;
         table.host_bytes = embedding->bytes;
+        if (mxfp4) {
+            if (const auto* scales = checkpoint.find(
+                    "language_model.model.embed_tokens.scales");
+                scales != nullptr) {
+                table.host_bytes += scales->bytes;
+            }
+        }
         inventory.items.push_back(make_item(PlacementClass::Embedding, table, 0U,
                                             PlacementTier::Host, false));
     }
@@ -492,12 +549,13 @@ struct Gemma4Linear {
         experts.layer = -1;
         experts.weight_bytes = routed.weight_bytes;
         experts.scale_bytes = routed.scale_bytes;
-        // Six of 256 experts per sparse layer are read per token, over two
-        // projections; that ratio is the whole reason the set is cacheable.
+        // Six of 256 experts per sparse layer are read per token. NVFP4 stores
+        // fused gate/up plus down; MXFP4 stores gate, up, and down separately.
         const auto per_module = experts.device_bytes() / routed_modules;
+        const auto projections_per_layer = mxfp4 ? 3ULL : 2ULL;
         inventory.items.push_back(make_item(PlacementClass::RoutedExpert, experts,
                                             per_module * c.experts_per_token *
-                                                2ULL *
+                                                projections_per_layer *
                                                 (c.layer_count -
                                                  c.dense_prefix_layers),
                                             PlacementTier::Host, true));

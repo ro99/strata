@@ -268,5 +268,8 @@ struct ModelSpec {
 [[nodiscard]] ModelSpec inkling_small_nvfp4_spec();
 [[nodiscard]] ValidationResult validate_inkling_small_nvfp4(
     const ModelSpec& spec);
+[[nodiscard]] ModelSpec inkling_small_mxfp4_spec();
+[[nodiscard]] ValidationResult validate_inkling_small_mxfp4(
+    const ModelSpec& spec);
 
 }  // namespace strata

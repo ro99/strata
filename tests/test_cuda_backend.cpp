@@ -1825,6 +1825,45 @@ TEST_CASE("Laguna shaped MXFP4 MoE batch matches canonical scalar matmuls") {
                 strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
 }
 
+TEST_CASE("Inkling shaped MXFP4 MoE batch matches canonical scalar matmuls") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 4096U;
+    constexpr std::uint64_t intermediate_columns = 2048U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 13U);
+    auto up = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 5U);
+    auto down = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 9U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 31U) - 15) /
+                        32.0F;
+    }
+    const auto expected = reference_int4_expert(
+        backend, gate, up, down, hidden, rows, intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    std::array<float, rows * hidden_columns> actual{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+    REQUIRE(backend.collect_moe(device, actual, {}).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
+}
+
 TEST_CASE("existing Laguna NVFP4 MoE batch remains distinct and correct") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

@@ -40,21 +40,43 @@ ValidationResult load_inkling_cuda_linear(
     const InklingCheckpointReader& checkpoint, const InklingLinear& module,
     int device, CudaBackend& backend, CudaWeight& output) {
     ValidationResult result;
-    if (module.weight == nullptr) {
-        result.errors.emplace_back("Inkling linear is not resolved");
-        return result;
-    }
-    auto view = checkpoint.view(module.weight->name);
-    if (!view.ok()) {
-        result.errors = std::move(view.errors);
-        return result;
-    }
     CudaWeightDescriptor descriptor;
-    descriptor.encoding = CudaWeightEncoding::Plain;
-    descriptor.dtype = module.weight->dtype;
     descriptor.rows = module.rows;
     descriptor.columns = module.columns;
-    return backend.upload(device, descriptor, view.value, {}, output);
+    if (module.encoding == InklingTensorEncoding::Plain) {
+        if (module.weight == nullptr) {
+            result.errors.emplace_back("Inkling plain linear is not resolved");
+            return result;
+        }
+        auto view = checkpoint.view(module.weight->name);
+        if (!view.ok()) {
+            result.errors = std::move(view.errors);
+            return result;
+        }
+        descriptor.encoding = CudaWeightEncoding::Plain;
+        descriptor.dtype = module.weight->dtype;
+        return backend.upload(device, descriptor, view.value, {}, output);
+    }
+    if (module.encoding != InklingTensorEncoding::Mxfp4Group32 ||
+        module.packed == nullptr || module.scale == nullptr) {
+        result.errors.emplace_back("Inkling compressed linear is not MXFP4");
+        return result;
+    }
+    auto packed = checkpoint.view(module.packed->name);
+    auto scale = checkpoint.view(module.scale->name);
+    if (!packed.ok()) result.errors = std::move(packed.errors);
+    if (!scale.ok()) {
+        result.errors.insert(result.errors.end(), scale.errors.begin(),
+                             scale.errors.end());
+    }
+    if (!result.ok()) return result;
+    descriptor.encoding = CudaWeightEncoding::Fp4E2m1Group32;
+    descriptor.dtype = SafetensorsDtype::I8;
+    descriptor.packed_columns = module.columns / 2U;
+    descriptor.scale_columns = module.columns / 32U;
+    descriptor.group_size = 32U;
+    return backend.upload(device, descriptor, packed.value, scale.value, output,
+                          CudaBackend::UploadCompletion::Deferred);
 }
 
 ValidationResult load_inkling_cuda_interleaved_half(
@@ -141,7 +163,8 @@ bool InklingExpertCache::evict_locked(State& state, std::uint64_t bytes) {
 
 ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
     std::size_t device_slot, std::uint32_t layer, std::uint32_t expert,
-    const InklingExpertStack& gate_up, const InklingExpertStack& down) {
+    const InklingExpertStack& gate, const InklingExpertStack& up,
+    const InklingExpertStack& down) {
     ParseResult<const InklingDeviceExpert*> result;
     if (device_slot >= states_.size()) {
         result.errors.emplace_back("expert targets an invalid device slot");
@@ -163,11 +186,50 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
 
     const auto started = std::chrono::steady_clock::now();
     Entry entry;
-    const bool quantized = gate_up.encoding == InklingTensorEncoding::Nvfp4Group16;
+    const bool quantized = gate.encoding == InklingTensorEncoding::Nvfp4Group16;
 
-    // Gate and up come out of one interleaved tensor; down is stored plainly.
-    if (quantized) {
-        auto matrix = checkpoint_.nvfp4_expert_view(gate_up, expert);
+    if (gate.encoding == InklingTensorEncoding::Mxfp4Group32) {
+        const auto upload = [&](const InklingExpertStack& stack,
+                                CudaWeight& target) {
+            auto matrix = checkpoint_.mxfp4_expert_view(stack, expert);
+            if (!matrix.ok()) {
+                result.errors = std::move(matrix.errors);
+                return;
+            }
+            if (state.scratch.weights.size() < matrix.value.packed.size() ||
+                state.scratch.scales.size() < matrix.value.scales.size()) {
+                result.errors.emplace_back(
+                    "Inkling MXFP4 staging scratch is too small");
+                return;
+            }
+            std::memcpy(state.scratch.weights.data(), matrix.value.packed.data(),
+                        matrix.value.packed.size());
+            std::memcpy(state.scratch.scales.data(), matrix.value.scales.data(),
+                        matrix.value.scales.size());
+            CudaWeightDescriptor descriptor;
+            descriptor.encoding = CudaWeightEncoding::Fp4E2m1Group32;
+            descriptor.dtype = SafetensorsDtype::I8;
+            descriptor.rows = matrix.value.rows;
+            descriptor.columns = matrix.value.columns;
+            descriptor.packed_columns = matrix.value.packed_columns;
+            descriptor.scale_columns = matrix.value.scale_columns;
+            descriptor.group_size = 32U;
+            auto status = backend_.upload(
+                device, descriptor,
+                std::span<const std::byte>(state.scratch.weights)
+                    .first(matrix.value.packed.size()),
+                std::span<const std::byte>(state.scratch.scales)
+                    .first(matrix.value.scales.size()),
+                target);
+            if (!status.ok()) result.errors = std::move(status.errors);
+        };
+        upload(gate, entry.expert.gate);
+        if (result.ok()) upload(up, entry.expert.up);
+        if (result.ok()) upload(down, entry.expert.down);
+        if (!result.ok()) return result;
+    // Gate and up come out of one interleaved tensor in the NVFP4 checkpoint.
+    } else if (quantized) {
+        auto matrix = checkpoint_.nvfp4_expert_view(gate, expert);
         if (!matrix.ok()) {
             result.errors = std::move(matrix.errors);
             return result;
@@ -198,14 +260,14 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
         // ModelOpt scale is a multiplier, so the reciprocal is what makes the
         // shared kernel compute e2m1 * e4m3 * scale2.
         descriptor.global_scale = 1.0F / matrix.value.global_scale;
-        for (const bool up : {false, true}) {
+        for (const bool is_up : {false, true}) {
             deinterleave_rows(matrix.value.packed, packed, matrix.value.rows,
-                              packed_stride, up);
+                              packed_stride, is_up);
             deinterleave_rows(matrix.value.scales, scales, matrix.value.rows,
-                              scale_stride, up);
+                              scale_stride, is_up);
             auto status = backend_.upload(device, descriptor, packed, scales,
-                                          up ? entry.expert.up
-                                             : entry.expert.gate);
+                                          is_up ? entry.expert.up
+                                                : entry.expert.gate);
             if (!status.ok()) {
                 result.errors = std::move(status.errors);
                 return result;
@@ -249,13 +311,13 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
         }
     } else {
         // Layer 2 ships plain BF16 experts.
-        auto gate_up_view = checkpoint_.view(gate_up.weight->name);
+        auto gate_up_view = checkpoint_.view(gate.weight->name);
         if (!gate_up_view.ok()) {
             result.errors = std::move(gate_up_view.errors);
             return result;
         }
-        const auto stride = gate_up.columns * sizeof(std::uint16_t);
-        const auto block = gate_up.rows * stride;
+        const auto stride = gate.columns * sizeof(std::uint16_t);
+        const auto block = gate.rows * stride;
         const auto half_bytes = static_cast<std::size_t>(block / 2U);
         if (state.scratch.weights.size() < half_bytes) {
             result.errors.emplace_back("Inkling staging scratch is too small");
@@ -265,17 +327,17 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
         CudaWeightDescriptor descriptor;
         descriptor.encoding = CudaWeightEncoding::Plain;
         descriptor.dtype = SafetensorsDtype::Bf16;
-        descriptor.rows = gate_up.rows / 2U;
-        descriptor.columns = gate_up.columns;
-        for (const bool up : {false, true}) {
+        descriptor.rows = gate.rows / 2U;
+        descriptor.columns = gate.columns;
+        for (const bool is_up : {false, true}) {
             deinterleave_rows(
                 gate_up_view.value.subspan(
                     static_cast<std::size_t>(expert * block),
                     static_cast<std::size_t>(block)),
-                half, gate_up.rows, stride, up);
+                half, gate.rows, stride, is_up);
             auto status = backend_.upload(device, descriptor, half, {},
-                                          up ? entry.expert.up
-                                             : entry.expert.gate);
+                                          is_up ? entry.expert.up
+                                                : entry.expert.gate);
             if (!status.ok()) {
                 result.errors = std::move(status.errors);
                 return result;

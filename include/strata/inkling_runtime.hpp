@@ -26,10 +26,10 @@ struct InklingRuntimeConfig {
     // Runs the experts and the resident spine on the devices. Off falls back
     // to the host reference path, which is the correctness oracle.
     bool enable_cuda{true};
-    // Faults the routed expert set into page cache at load. The set is 154 GiB
-    // and host memory is larger, so steady-state decode should never touch
-    // NVMe; without this the VRAM cache misses fault cold pages and the device
-    // waits on storage instead of on PCIe.
+    // Faults the routed expert set into page cache at load. Host memory is
+    // larger than either supported checkpoint, so steady-state decode should
+    // never touch NVMe; without this the VRAM cache misses fault cold pages and
+    // the device waits on storage instead of on PCIe.
     bool warm_expert_pages{true};
     std::uint32_t maximum_context_tokens{2048U};
     // Rows per prefill page. Zero or one keeps the token-at-a-time path.
@@ -117,7 +117,9 @@ struct InklingRunMetrics {
     InklingGraphStats prefill_graph;
     InklingSpeculationStats speculation;
     InklingDeviceStats device;
+    InklingDeviceStats prefill_device;
     CudaBackendStats cuda;
+    CudaBackendStats prefill_cuda;
     std::uint64_t rss_bytes{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {

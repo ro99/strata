@@ -12,11 +12,10 @@
 
 namespace strata {
 
-// One routed expert staged on a device. Inkling stores gate and up interleaved
-// in a single w13 tensor, but the device MoE command wants them separately, so
-// the halves are split during staging: rows 0, 2, 4, ... are gate and rows
-// 1, 3, 5, ... are up. Splitting the tensor in half instead silently mixes
-// gate rows into up rows and still produces fluent text.
+// One routed expert staged on a device. The NVFP4 checkpoint stores gate and
+// up interleaved in one w13 tensor, so staging splits alternating rows. The
+// MXFP4 checkpoint already stores three separate projections and bypasses that
+// transform.
 struct InklingDeviceExpert {
     CudaWeight gate;
     CudaWeight up;
@@ -39,8 +38,9 @@ struct InklingCacheStats {
 };
 
 // A per-device LRU of routed experts backed by the host mapping. Capacity is
-// what the resident spine leaves behind; the whole routed set is 154 GiB and
-// cannot fit, so the cache exists to convert repeat routing into avoided H2D.
+// what the resident spine leaves behind; the routed set cannot fit in the
+// supported device budget, so the cache converts repeat routing into avoided
+// H2D.
 class InklingExpertCache {
 public:
     InklingExpertCache(const InklingCheckpointReader& checkpoint,
@@ -57,7 +57,8 @@ public:
     // a weight out from under an in-flight device command.
     [[nodiscard]] ParseResult<const InklingDeviceExpert*> acquire(
         std::size_t device_slot, std::uint32_t layer, std::uint32_t expert,
-        const InklingExpertStack& gate_up, const InklingExpertStack& down);
+        const InklingExpertStack& gate, const InklingExpertStack& up,
+        const InklingExpertStack& down);
     void release(std::size_t device_slot, std::uint32_t layer,
                  std::uint32_t expert) noexcept;
 
@@ -71,7 +72,7 @@ private:
         std::uint64_t bytes{};
     };
     // Per-device page-locked staging. Every miss is a different cold slice of
-    // a 160 GiB mapping, so a pageable source makes the driver stage through
+    // a checkpoint mapping, so a pageable source makes the driver stage through
     // its own buffer and H2D collapses to a few GiB/s. De-interleaving into a
     // registered scratch buffer and uploading from there restores DMA.
     struct Scratch {

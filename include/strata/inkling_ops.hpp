@@ -32,6 +32,20 @@ struct InklingNvfp4MatrixView {
     std::uint32_t group_size{kInklingExecutionContract.nvfp4_group_size};
 };
 
+// One Inkling MXFP4 matrix in the MLX safetensors representation. The packed
+// tensor is declared U32, eight low-nibble-first E2M1 codes per word; viewed as
+// bytes it is the canonical two-codes-per-byte stream consumed by the backend.
+// Scales are one E8M0 exponent byte per 32 logical columns.
+struct InklingMxfp4MatrixView {
+    std::span<const std::byte> packed;
+    std::span<const std::byte> scales;
+    std::uint64_t rows{};
+    std::uint64_t columns{};
+    std::uint64_t packed_columns{};
+    std::uint64_t scale_columns{};
+    std::uint32_t group_size{32U};
+};
+
 // The router's decision for one token. `experts` holds the selected routed
 // expert ids followed by the shared sink ids, which are numbered from
 // `routed_experts` upwards. `weights` is index-aligned and already carries the
@@ -55,6 +69,12 @@ struct InklingRouteResult {
     std::span<float> output);
 [[nodiscard]] ValidationResult inkling_nvfp4_matvec_rows(
     const InklingNvfp4MatrixView& matrix, std::span<const float> input,
+    std::span<float> output, std::uint64_t row_begin, std::uint64_t row_end);
+[[nodiscard]] ValidationResult inkling_mxfp4_matvec_reference(
+    const InklingMxfp4MatrixView& matrix, std::span<const float> input,
+    std::span<float> output);
+[[nodiscard]] ValidationResult inkling_mxfp4_matvec_rows(
+    const InklingMxfp4MatrixView& matrix, std::span<const float> input,
     std::span<float> output, std::uint64_t row_begin, std::uint64_t row_end);
 
 // Depthwise causal convolution over one channel-major stream, with the

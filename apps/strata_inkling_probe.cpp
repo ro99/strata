@@ -32,6 +32,8 @@ int main(int argc, char** argv) {
     std::uint32_t repeats = 1U;
     bool host_only = false;
     bool chat = false;
+    bool warm_experts = true;
+    std::vector<int> devices;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--model" && index + 1 < argc) {
@@ -44,12 +46,24 @@ int main(int argc, char** argv) {
             chat = true;
         } else if (argument == "--host") {
             host_only = true;
+        } else if (argument == "--no-warm") {
+            warm_experts = false;
+        } else if (argument == "--devices" && index + 1 < argc) {
+            std::string list = argv[++index];
+            std::size_t begin = 0U;
+            while (begin < list.size()) {
+                const auto comma = list.find(',', begin);
+                devices.push_back(std::stoi(list.substr(begin, comma - begin)));
+                if (comma == std::string::npos) break;
+                begin = comma + 1U;
+            }
         } else if (argument == "--repeat" && index + 1 < argc) {
             repeats = static_cast<std::uint32_t>(std::stoul(argv[++index]));
         } else {
             std::fprintf(stderr,
                          "usage: strata-inkling-probe [--model DIR] "
-                         "[--prompt TEXT] [--tokens N]\n");
+                         "[--prompt TEXT] [--tokens N] [--devices LIST] "
+                         "[--no-warm]\n");
             return 2;
         }
     }
@@ -61,9 +75,12 @@ int main(int argc, char** argv) {
     }
     strata::InklingRuntimeConfig config;
     config.enable_cuda = !host_only;
+    config.devices = devices;
+    config.warm_expert_pages = warm_experts;
     config.maximum_context_tokens = 512U;
     config.load_progress = true;
     strata::InklingRuntime runtime;
+    strata::reset_cuda_matmul_route_census();
     const auto started = std::chrono::steady_clock::now();
     const auto initialized = runtime.initialize(model_directory, config);
     if (!initialized.ok()) {
@@ -155,6 +172,7 @@ int main(int argc, char** argv) {
                     ? 0.0
                     : expert_gib / static_cast<double>(graph.forward_tokens));
     const auto& device = result.metrics.device;
+    const auto& prefill_device = result.metrics.prefill_device;
     std::printf("cuda %s", device.enabled ? "on" : "off");
     if (device.enabled) {
         std::printf(", expert cache %llu hits / %llu misses (%.1f%%), "
@@ -169,6 +187,20 @@ int main(int argc, char** argv) {
             static_cast<double>(device.expert_stage_nanoseconds) / 1.0e9;
         std::printf("\n  staged %.2f GiB in %.2f s (%.2f GiB/s H2D)", staged,
                     seconds, seconds > 0.0 ? staged / seconds : 0.0);
+        const auto decode_stage_bytes = device.expert_staged_bytes -
+                                        prefill_device.expert_staged_bytes;
+        const auto decode_stage_ns = device.expert_stage_nanoseconds -
+                                     prefill_device.expert_stage_nanoseconds;
+        const double decode_stage_gib =
+            static_cast<double>(decode_stage_bytes) /
+            (1024.0 * 1024.0 * 1024.0);
+        const double decode_stage_seconds =
+            static_cast<double>(decode_stage_ns) / 1.0e9;
+        std::printf("\n  decode staged %.2f GiB in %.3f s (%.2f GiB/s)",
+                    decode_stage_gib, decode_stage_seconds,
+                    decode_stage_seconds > 0.0
+                        ? decode_stage_gib / decode_stage_seconds
+                        : 0.0);
         for (std::size_t slot = 0U; slot < device.cache_capacity_bytes.size();
              ++slot) {
             const double capacity =
@@ -184,12 +216,27 @@ int main(int argc, char** argv) {
         }
     }
     const auto& cuda = result.metrics.cuda;
+    const auto& prefill_cuda = result.metrics.prefill_cuda;
     std::printf("\n  upload split: alloc %.2f s, copy %.2f s, wait %.2f s, "
                 "kernel %.2f s\n",
                 static_cast<double>(cuda.weight_allocation_nanoseconds) / 1.0e9,
                 static_cast<double>(cuda.weight_copy_nanoseconds) / 1.0e9,
                 static_cast<double>(cuda.upload_wait_nanoseconds) / 1.0e9,
                 static_cast<double>(cuda.kernel_nanoseconds) / 1.0e9);
+    std::printf("  decode upload/kernel: alloc %.3f s, copy %.3f s, wait %.3f s, "
+                "kernel %.3f s\n",
+                static_cast<double>(cuda.weight_allocation_nanoseconds -
+                                    prefill_cuda.weight_allocation_nanoseconds) /
+                    1.0e9,
+                static_cast<double>(cuda.weight_copy_nanoseconds -
+                                    prefill_cuda.weight_copy_nanoseconds) /
+                    1.0e9,
+                static_cast<double>(cuda.upload_wait_nanoseconds -
+                                    prefill_cuda.upload_wait_nanoseconds) /
+                    1.0e9,
+                static_cast<double>(cuda.kernel_nanoseconds -
+                                    prefill_cuda.kernel_nanoseconds) /
+                    1.0e9);
     std::printf("rss %.2f GiB\n",
                 static_cast<double>(result.metrics.rss_bytes) /
                     (1024.0 * 1024.0 * 1024.0));
@@ -200,5 +247,15 @@ int main(int argc, char** argv) {
     std::printf("prompt: %s\n", prompt.c_str());
     std::printf("continuation: <<%s>>\n", result.text.c_str());
     std::printf("full: %s%s\n", prompt.c_str(), result.text.c_str());
+    const auto census = strata::cuda_matmul_route_census();
+    std::printf("route census:");
+    for (std::size_t index = 0U; index < census.counts.size(); ++index) {
+        if (census.counts[index] == 0U) continue;
+        std::printf(" %s=%llu",
+                    strata::cuda_matmul_route_name(
+                        static_cast<strata::CudaMatmulRoute>(index)),
+                    static_cast<unsigned long long>(census.counts[index]));
+    }
+    std::printf("\n");
     return 0;
 }

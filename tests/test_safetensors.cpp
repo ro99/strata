@@ -129,6 +129,20 @@ TEST_CASE("Safetensors header validates dtype shape and contiguous extents") {
     REQUIRE(result.value.tensors[1].absolute_begin == data_start + 8U);
 }
 
+TEST_CASE("Safetensors header accepts unsigned 32-bit packed weights") {
+    constexpr auto header = R"({
+        "packed":{"dtype":"U32","shape":[2,4],"data_offsets":[0,32]}
+    })";
+    const auto data_start = 8U + sizeof(header) - 1U;
+    const auto result = strata::parse_safetensors_header(
+        header, data_start, data_start + 32U);
+    REQUIRE(result.ok());
+    REQUIRE(result.value.tensors.size() == 1U);
+    REQUIRE(result.value.tensors[0].dtype == strata::SafetensorsDtype::U32);
+    REQUIRE(strata::safetensors_dtype_bytes(strata::SafetensorsDtype::U32) == 4U);
+    REQUIRE(strata::to_string(strata::SafetensorsDtype::U32) == "U32");
+}
+
 TEST_CASE("Safetensors header rejects gaps and overlapping extents") {
     constexpr auto header = R"({
         "a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},

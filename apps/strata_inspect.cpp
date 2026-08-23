@@ -3,6 +3,7 @@
 #include "strata/cuda_backend.hpp"
 #include "strata/deepseek_manifest.hpp"
 #include "strata/gemma4_checkpoint.hpp"
+#include "strata/inkling_checkpoint.hpp"
 #include "strata/laguna_checkpoint.hpp"
 #include "strata/model.hpp"
 #include "strata/safetensors.hpp"
@@ -387,6 +388,80 @@ int main(int argc, char** argv) {
                       << "shards=" << parsed.value.shards.size() << '\n'
                       << "quantized_modules=" << quantized_modules << '\n'
                       << "int8_group32_modules=" << quantized_modules << '\n'
+                      << "scanned_shards="
+                      << (headers ? parsed.value.shards.size() : 0U) << '\n';
+        }
+        return 0;
+    }
+    const bool inkling_mxfp4 = std::any_of(
+        parsed.value.entries.begin(), parsed.value.entries.end(),
+        [](const auto& entry) {
+            return entry.name ==
+                   "language_model.model.embed_tokens.weight";
+        });
+    if (inkling_mxfp4) {
+        const auto spec = strata::inkling_small_mxfp4_spec();
+        const auto quantized_modules = std::count_if(
+            parsed.value.entries.begin(), parsed.value.entries.end(),
+            [](const auto& entry) { return entry.name.ends_with(".scales"); });
+        const auto& contract = strata::kInklingExecutionContract;
+        const auto expected_modules =
+            2 + static_cast<std::ptrdiff_t>(contract.layer_count) * 5 +
+            static_cast<std::ptrdiff_t>(contract.dense_prefix_layers) * 3 +
+            static_cast<std::ptrdiff_t>(contract.layer_count -
+                                        contract.dense_prefix_layers) *
+                6;
+        if (parsed.value.total_size != spec.source.indexed_tensor_bytes ||
+            parsed.value.entries.size() != spec.source.tensor_count ||
+            parsed.value.shards.size() != spec.source.main_shards ||
+            quantized_modules != expected_modules) {
+            std::cerr << "error: index does not match the pinned Inkling-Small "
+                         "MXFP4 checkpoint\n";
+            return 1;
+        }
+        if (headers) {
+            if (model_directory.empty()) {
+                std::cerr << "error: --headers requires --model DIR\n";
+                return 2;
+            }
+            if (allow_incomplete) {
+                std::cerr << "error: Inkling exact validation requires all "
+                             "30 shards\n";
+                return 2;
+            }
+            const auto checkpoint =
+                strata::InklingCheckpointReader::open(model_directory);
+            if (!checkpoint.ok()) {
+                for (const auto& error : checkpoint.errors) {
+                    std::cerr << "error: " << error << '\n';
+                }
+                return 1;
+            }
+        }
+        if (json) {
+            std::cout << "{\n"
+                      << "  \"status\": \"ok\",\n"
+                      << "  \"architecture\": \"inkling_small_mxfp4\",\n"
+                      << "  \"tensor_count\": " << parsed.value.entries.size()
+                      << ",\n"
+                      << "  \"indexed_tensor_bytes\": "
+                      << parsed.value.total_size << ",\n"
+                      << "  \"shards\": " << parsed.value.shards.size() << ",\n"
+                      << "  \"quantized_modules\": " << quantized_modules
+                      << ",\n"
+                      << "  \"mxfp4_group32_modules\": " << quantized_modules
+                      << ",\n"
+                      << "  \"scanned_shards\": "
+                      << (headers ? parsed.value.shards.size() : 0U) << "\n}\n";
+        } else {
+            std::cout << "status=ok\n"
+                      << "architecture=inkling_small_mxfp4\n"
+                      << "tensor_count=" << parsed.value.entries.size() << '\n'
+                      << "indexed_tensor_bytes=" << parsed.value.total_size
+                      << '\n'
+                      << "shards=" << parsed.value.shards.size() << '\n'
+                      << "quantized_modules=" << quantized_modules << '\n'
+                      << "mxfp4_group32_modules=" << quantized_modules << '\n'
                       << "scanned_shards="
                       << (headers ? parsed.value.shards.size() : 0U) << '\n';
         }

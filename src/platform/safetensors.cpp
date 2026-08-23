@@ -30,6 +30,7 @@ using detail::JsonCursor;
     }
     if (value == "I8") return SafetensorsDtype::I8;
     if (value == "U8") return SafetensorsDtype::U8;
+    if (value == "U32") return SafetensorsDtype::U32;
     if (value == "I32") return SafetensorsDtype::I32;
     if (value == "I64") return SafetensorsDtype::I64;
     return SafetensorsDtype::Other;
@@ -122,6 +123,7 @@ std::uint32_t safetensors_dtype_bytes(SafetensorsDtype dtype) noexcept {
         case SafetensorsDtype::Bf16:
         case SafetensorsDtype::F16: return 2;
         case SafetensorsDtype::F32:
+        case SafetensorsDtype::U32:
         case SafetensorsDtype::I32: return 4;
         case SafetensorsDtype::I64: return 8;
         case SafetensorsDtype::I8:
@@ -142,6 +144,7 @@ std::string_view to_string(SafetensorsDtype dtype) noexcept {
         case SafetensorsDtype::F8E8M0: return "F8_E8M0";
         case SafetensorsDtype::I8: return "I8";
         case SafetensorsDtype::U8: return "U8";
+        case SafetensorsDtype::U32: return "U32";
         case SafetensorsDtype::I32: return "I32";
         case SafetensorsDtype::I64: return "I64";
         case SafetensorsDtype::Other: return "OTHER";

@@ -19,6 +19,7 @@ enum class SafetensorsDtype : std::uint8_t {
     F8E8M0,
     I8,
     U8,
+    U32,
     I32,
     I64,
     Other,

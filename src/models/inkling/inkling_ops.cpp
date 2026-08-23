@@ -1,5 +1,7 @@
 #include "strata/inkling_ops.hpp"
 
+#include "strata/compressed_tensors.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -73,6 +75,60 @@ ValidationResult inkling_nvfp4_matvec_reference(
     const InklingNvfp4MatrixView& matrix, std::span<const float> input,
     std::span<float> output) {
     return inkling_nvfp4_matvec_rows(matrix, input, output, 0U, matrix.rows);
+}
+
+ValidationResult inkling_mxfp4_matvec_rows(
+    const InklingMxfp4MatrixView& matrix, std::span<const float> input,
+    std::span<float> output, std::uint64_t row_begin, std::uint64_t row_end) {
+    ValidationResult result;
+    if (matrix.rows == 0U || matrix.columns == 0U ||
+        matrix.group_size != 32U || matrix.columns % 32U != 0U ||
+        matrix.packed_columns != matrix.columns / 2U ||
+        matrix.scale_columns != matrix.columns / 32U ||
+        matrix.packed.size() != matrix.rows * matrix.packed_columns ||
+        matrix.scales.size() != matrix.rows * matrix.scale_columns) {
+        result.errors.emplace_back("Inkling MXFP4 matrix layout is not group-32");
+        return result;
+    }
+    if (input.size() != matrix.columns || output.size() != matrix.rows ||
+        row_begin > row_end || row_end > matrix.rows) {
+        result.errors.emplace_back("Inkling MXFP4 matvec shape mismatch");
+        return result;
+    }
+    for (std::uint64_t row = row_begin; row < row_end; ++row) {
+        const auto packed = matrix.packed.subspan(
+            static_cast<std::size_t>(row * matrix.packed_columns),
+            static_cast<std::size_t>(matrix.packed_columns));
+        const auto scales = matrix.scales.subspan(
+            static_cast<std::size_t>(row * matrix.scale_columns),
+            static_cast<std::size_t>(matrix.scale_columns));
+        float sum = 0.0F;
+        for (std::uint64_t group = 0U; group < matrix.scale_columns; ++group) {
+            const float scale = mxfp4_scale_from_e8m0(
+                std::to_integer<std::uint8_t>(scales[group]));
+            if (!std::isfinite(scale)) {
+                result.errors.emplace_back(
+                    "Inkling MXFP4 matrix contains a reserved E8M0 scale");
+                return result;
+            }
+            for (std::uint64_t offset = 0U; offset < 32U; ++offset) {
+                const auto column = group * 32U + offset;
+                const auto byte = std::to_integer<std::uint8_t>(
+                    packed[column / 2U]);
+                const auto code = static_cast<std::uint8_t>(
+                    offset % 2U == 0U ? byte & 0x0FU : byte >> 4U);
+                sum += input[column] * kMxfp4Values[code] * scale;
+            }
+        }
+        output[row] = sum;
+    }
+    return result;
+}
+
+ValidationResult inkling_mxfp4_matvec_reference(
+    const InklingMxfp4MatrixView& matrix, std::span<const float> input,
+    std::span<float> output) {
+    return inkling_mxfp4_matvec_rows(matrix, input, output, 0U, matrix.rows);
 }
 
 ValidationResult inkling_short_conv_f32(

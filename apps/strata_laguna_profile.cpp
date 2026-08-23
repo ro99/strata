@@ -2,6 +2,7 @@
 // measures W_r and B_r for every resource at a chosen operating point and
 // prints the per-phase breakdown of one step in milliseconds, so argmax_r is
 // named from measurement rather than assumed.
+#include "strata/cuda_backend.hpp"
 #include "strata/laguna_runtime.hpp"
 
 #include <charconv>
@@ -352,6 +353,21 @@ int main(int argc, char** argv) {
         report(result.metrics.decode, result.metrics.decode_tokens,
                result.metrics.decode_seconds, "decode");
         std::cout << "\ntext: " << result.text << '\n';
+    }
+    // Which matmul route actually served the run. Without this a
+    // register-fed A/B cannot tell "no speedup" from "never dispatched".
+    {
+        const auto census = strata::cuda_matmul_route_census();
+        std::cout << "\n-- matmul route census --\n";
+        for (std::size_t i = 0U;
+             i < static_cast<std::size_t>(strata::CudaMatmulRoute::Count); ++i) {
+            const auto count = census.counts[i];
+            if (count == 0U) continue;
+            std::cout << "  " << std::left << std::setw(34)
+                      << strata::cuda_matmul_route_name(
+                             static_cast<strata::CudaMatmulRoute>(i))
+                      << std::right << count << "\n";
+        }
     }
     return 0;
 }

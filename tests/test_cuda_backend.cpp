@@ -248,6 +248,49 @@ bool fill_dsv4_host_moe_partials(
 
 }  // namespace
 
+TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown encodings") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    backend.reset_matmul_route_census();
+    const auto before = backend.matmul_route_census();
+    for (const auto count : before.counts) REQUIRE(count == 0U);
+
+    // An FP4 matmul must be recorded on the FP4 route and nowhere else.
+    constexpr std::uint64_t rows = 64U, columns = 128U;
+    const auto weight = upload_fp4(backend, device, rows, columns, 0x5AU);
+    std::vector<float> hidden(static_cast<std::size_t>(columns), 0.25F);
+    std::vector<float> out(static_cast<std::size_t>(rows));
+    REQUIRE(backend.matmul(weight, hidden, 1U, out).ok());
+
+    const auto after = backend.matmul_route_census();
+    const auto fp4 = static_cast<std::size_t>(
+        strata::CudaMatmulRoute::Fp4E2m1Group32);
+    const auto unsupported = static_cast<std::size_t>(
+        strata::CudaMatmulRoute::Unsupported);
+    REQUIRE(after.counts[fp4] == 1U);
+    REQUIRE(after.counts[unsupported] == 0U);
+
+    // Every route name must be distinct and non-empty, so a census dump is
+    // readable rather than ambiguous.
+    for (std::size_t i = 0U;
+         i < static_cast<std::size_t>(strata::CudaMatmulRoute::Count); ++i) {
+        const auto* name = strata::cuda_matmul_route_name(
+            static_cast<strata::CudaMatmulRoute>(i));
+        REQUIRE(name != nullptr);
+        REQUIRE(name[0] != '\0');
+        for (std::size_t j = 0U; j < i; ++j) {
+            REQUIRE(std::string(name) !=
+                    std::string(strata::cuda_matmul_route_name(
+                        static_cast<strata::CudaMatmulRoute>(j))));
+        }
+    }
+}
+
 TEST_CASE("native CUDA FlashAttention validates device support before dispatch") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

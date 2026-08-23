@@ -13812,6 +13812,40 @@ ValidationResult CudaBackend::glm_absorbed_attention(
     return result;
 }
 
+void CudaBackend::record_matmul_route(CudaMatmulRoute route) const noexcept {
+    std::atomic_ref<std::uint64_t>(
+        route_census_[static_cast<std::size_t>(route)])
+        .fetch_add(1U, std::memory_order_relaxed);
+}
+
+const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
+    switch (route) {
+        case CudaMatmulRoute::PlainBf16Matvec: return "plain_bf16_matvec";
+        case CudaMatmulRoute::PlainGeneric: return "plain_generic";
+        case CudaMatmulRoute::PackedInt8Group32: return "packed_int8_group32";
+        case CudaMatmulRoute::PackedOffsetInt: return "packed_offset_int";
+        case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
+        case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
+        case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
+        case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
+        case CudaMatmulRoute::Unsupported: return "unsupported";
+        default: return "invalid";
+    }
+}
+
+CudaMatmulRouteCensus CudaBackend::matmul_route_census() const noexcept {
+    CudaMatmulRouteCensus out;
+    for (std::size_t i = 0; i < out.counts.size(); ++i)
+        out.counts[i] = std::atomic_ref<std::uint64_t>(route_census_[i])
+                            .load(std::memory_order_relaxed);
+    return out;
+}
+
+void CudaBackend::reset_matmul_route_census() noexcept {
+    for (auto& c : route_census_)
+        std::atomic_ref<std::uint64_t>(c).store(0U, std::memory_order_relaxed);
+}
+
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
@@ -14000,6 +14034,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const __nv_bfloat16*>(weight.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
+        record_matmul_route(CudaMatmulRoute::PlainGeneric);
         if (rows == 1U) {
             plain_matmul_kernel<1U><<<grid, threads, 0, state.stream>>>(
                 state.output, state.input, weight.impl_->weights,
@@ -14022,6 +14057,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
             descriptor.rows, groups, rows_per_group);
     } else if (w8_group32) {
+        record_matmul_route(CudaMatmulRoute::PackedInt8Group32);
         constexpr unsigned int warps_per_block = threads / 32U;
         const auto blocks = static_cast<unsigned int>(
             (descriptor.rows + warps_per_block - 1U) / warps_per_block);
@@ -14034,6 +14070,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
                descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
+        record_matmul_route(CudaMatmulRoute::PackedOffsetInt);
         const auto bits = descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ? 4U : 8U;
         packed_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input, static_cast<const std::uint32_t*>(weight.impl_->weights),
@@ -14042,6 +14079,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        record_matmul_route(CudaMatmulRoute::Nvfp4Group16);
         nvfp4_group16_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
@@ -14050,6 +14088,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.scale_columns, descriptor.group_size, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
     } else if (tensor_page) {
+        record_matmul_route(CudaMatmulRoute::Fp8TensorPage);
         const dim3 tensor_grid(
             static_cast<unsigned int>(
                 descriptor.rows / kDsv4Fp8TensorBlockN),
@@ -14066,19 +14105,33 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<std::uint32_t>(descriptor.columns),
             static_cast<std::uint32_t>(descriptor.rows));
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        record_matmul_route(CudaMatmulRoute::Fp8E4m3Block128);
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
             static_cast<const unsigned char*>(weight.impl_->scales),
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
-    } else {
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+        record_matmul_route(CudaMatmulRoute::Fp4E2m1Group32);
         native_fp4_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
             static_cast<const unsigned char*>(weight.impl_->scales),
             descriptor.packed_columns, descriptor.scale_columns, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    } else {
+        // MIX-1: no hidden fallback. This branch previously routed every
+        // unrecognised encoding into the FP4 kernel, which would decode the
+        // wrong format silently. An unsupported case must fail explicitly.
+        record_matmul_route(CudaMatmulRoute::Unsupported);
+        ValidationResult unsupported;
+        unsupported.errors.emplace_back(
+            "CUDA matmul has no approved exact route for weight encoding " +
+            std::to_string(
+                static_cast<unsigned>(descriptor.encoding)) +
+            "; refusing to substitute a different format");
+        return unsupported;
     }
     if (softcap > 0.0F) {
         gemma4_softcap_logits_kernel<<<

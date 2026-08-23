@@ -5,6 +5,8 @@
 #include "strata/safetensors.hpp"
 
 #include <cstddef>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -769,8 +771,40 @@ struct CudaGemma4DecodeLayer {
     float scalar{1.0F};
 };
 
+// MIX-1 route census. The campaign contract requires that every production
+// dispatch choice be observable and that an unsupported case fail explicitly
+// rather than disappear into a hidden fallback. Before this, matmul_impl's
+// dispatch chain ended in a bare `else` that routed any unrecognised encoding
+// into the FP4 kernel.
+enum class CudaMatmulRoute : std::uint8_t {
+    PlainBf16Matvec,
+    PlainGeneric,
+    PackedInt8Group32,
+    PackedOffsetInt,
+    Nvfp4Group16,
+    Fp8TensorPage,
+    Fp8E4m3Block128,
+    Fp4E2m1Group32,
+    Unsupported,
+    Count,
+};
+
+[[nodiscard]] const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept;
+
+struct CudaMatmulRouteCensus {
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(CudaMatmulRoute::Count)> counts{};
+};
+
 class CudaBackend {
 public:
+    // MIX-1 route census. Snapshot of how many matmuls took each route since
+    // process start; Unsupported is always zero in a healthy run, because
+    // reaching it is a hard error rather than a fallback.
+    [[nodiscard]] CudaMatmulRouteCensus matmul_route_census() const noexcept;
+    void reset_matmul_route_census() noexcept;
+    void record_matmul_route(CudaMatmulRoute route) const noexcept;
+
     CudaBackend();
     ~CudaBackend();
     CudaBackend(CudaBackend&&) noexcept;
@@ -1156,6 +1190,14 @@ public:
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
 private:
+    // One counter per route; atomic because the backend is called from the
+    // rank-local worker pool.
+    // Plain counters incremented through std::atomic_ref, so CudaBackend stays
+    // copyable while the census is still safe under the rank-local worker pool.
+    mutable std::array<std::uint64_t,
+                       static_cast<std::size_t>(CudaMatmulRoute::Count)>
+        route_census_{};
+
     [[nodiscard]] ValidationResult dsv4_mhc_begin_impl(
         int device, const CudaDsv4MhcWeights& weights,
         std::span<const float> hidden, std::span<float> weighted,
@@ -1174,6 +1216,8 @@ private:
         CudaDsv4HostMoeCallback callback, void* callback_context,
         CudaDsv4DeviceInputHostMoeCallback device_input_callback,
         bool mhc_source_and_destination);
+    // Snapshot of how many matmuls took each route since process start.
+    // Unsupported is always zero in a healthy run: reaching it is a hard error.
     [[nodiscard]] ValidationResult matmul_impl(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,

@@ -2778,6 +2778,219 @@ __global__ void deepseek_fp4_tiled_page_down_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Register-fed W8A16 shared expert (campaign milestone MIX-1).
+//
+// The incumbent deepseek_fp8_gate_up/down kernels are scalar matvecs: one block
+// per output row, one weight byte per lane, no tensor cores. Experiment 0143
+// measured that shape at about 13.5% of DRAM and 68% issue-bound. The accepted
+// QPN8-derived path (experiments 0158-0159) reaches 83-86% of the local read
+// roofline on these same E4M3/E8M0 block-128 shapes by keeping codes compressed
+// through HBM, pre-permuting them into m16n8k16 fragment order at load, and
+// decoding straight into MMA operand registers.
+//
+// Weights are prepacked in place: the fragment order REPLACES the canonical
+// device layout rather than adding a second copy, which is what the contract's
+// one-copy residency rule requires.
+// ---------------------------------------------------------------------------
+
+// Canonical [N][K] E4M3 bytes to m16n8k16 A-fragment order. One uint4 per lane
+// per 32-column pair-group, matching the layout the decode below expects.
+__global__ void dsv4_fp8_fragment_prepack_kernel(
+    uint4* __restrict__ destination, const unsigned char* __restrict__ source,
+    std::uint32_t rows, std::uint32_t columns) {
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t tiles = rows / 16U;
+    const std::uint32_t total = tiles * pairs * 32U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t lane = index & 31U;
+        const std::uint32_t pair = (index >> 5U) % pairs;
+        const std::uint32_t tile = (index >> 5U) / pairs;
+        std::uint32_t word[4]{};
+        for (std::uint32_t j = 0U; j < 2U; ++j) {
+            for (std::uint32_t i = 0U; i < 8U; ++i) {
+                const bool upper = i == 2U || i == 3U || i == 6U || i == 7U;
+                const std::uint32_t row =
+                    tile * 16U + (lane >> 2U) + (upper ? 8U : 0U);
+                const std::uint32_t column = (pair * 2U + j) * 16U +
+                                             (lane & 3U) * 2U + (i & 1U) +
+                                             (i >= 4U ? 8U : 0U);
+                word[j * 2U + (i >= 4U ? 1U : 0U)] |=
+                    static_cast<std::uint32_t>(
+                        source[static_cast<std::size_t>(row) * columns + column])
+                    << ((i & 3U) * 8U);
+            }
+        }
+        destination[index] = make_uint4(word[0], word[1], word[2], word[3]);
+    }
+}
+
+// Two packed E4M3 codes to a packed BF16 pair, scaled, entirely in registers.
+__device__ __forceinline__ std::uint32_t dsv4_fp8_decode_pair(
+    std::uint32_t pair, std::uint32_t factor) {
+    const auto permuted = __byte_perm(pair, 0U, 0x4140U);
+    const std::uint32_t widened =
+        ((permuted << 8U) & 0x8000'8000U) | ((permuted << 4U) & 0x07F0'07F0U);
+    const auto scaled =
+        __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&widened),
+                *reinterpret_cast<const __nv_bfloat162*>(&factor));
+    return *reinterpret_cast<const std::uint32_t*>(&scaled);
+}
+
+__device__ __forceinline__ void dsv4_mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3, std::uint32_t a0,
+    std::uint32_t a1, std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
+    std::uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Gate and up share the activation, so one pass over the hidden vector feeds
+// both weight streams. kAccs independent accumulators keep the FP32 chain short
+// over deep K and are tree-combined at the end.
+template <int kAccs>
+__global__ __launch_bounds__(128, 4) void dsv4_fp8_regfed_gate_up_kernel(
+    float* __restrict__ activation, const std::uint16_t* __restrict__ hidden,
+    const uint4* __restrict__ w1, const unsigned char* __restrict__ w1_scales,
+    const uint4* __restrict__ w3, const unsigned char* __restrict__ w3_scales,
+    std::uint32_t columns, std::uint32_t intermediate,
+    std::uint32_t scale_columns, float swiglu_limit, std::uint32_t split,
+    float* __restrict__ partials, std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t tiles = intermediate / 16U;
+    const std::uint32_t per_slice = pairs / split;
+
+    for (std::uint32_t work = blockIdx.x * 4U + warp; work < tiles * split;
+         work += gridDim.x * 4U) {
+        const std::uint32_t tile = work / split;
+        const std::uint32_t slice = work % split;
+        float gate[kAccs][4]{};
+        float up[kAccs][4]{};
+        for (std::uint32_t pair = slice * per_slice;
+             pair < (slice + 1U) * per_slice; pair += kAccs / 2U) {
+#pragma unroll
+            for (int chunk = 0; chunk < kAccs / 2; ++chunk) {
+                const std::uint32_t current = pair + std::uint32_t(chunk);
+                if (current >= (slice + 1U) * per_slice) break;
+                const std::uint32_t ktile = current * 2U;
+                const std::uint32_t scale_index =
+                    (tile / 8U) * scale_columns + ktile / 8U;
+                const std::uint32_t gate_factor =
+                    ((std::uint32_t(w1_scales[scale_index]) + 120U) << 7U) *
+                    0x0001'0001U;
+                const std::uint32_t up_factor =
+                    ((std::uint32_t(w3_scales[scale_index]) + 120U) << 7U) *
+                    0x0001'0001U;
+                const uint4 gate_codes =
+                    w1[(std::size_t(tile) * pairs + current) * 32U + lane];
+                const uint4 up_codes =
+                    w3[(std::size_t(tile) * pairs + current) * 32U + lane];
+                const std::uint32_t gw[4] = {gate_codes.x, gate_codes.y,
+                                             gate_codes.z, gate_codes.w};
+                const std::uint32_t uw[4] = {up_codes.x, up_codes.y,
+                                             up_codes.z, up_codes.w};
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    // Only activation column 0 is live at M=1; the other seven
+                    // MMA columns are zero and cost nothing extra.
+                    std::uint32_t b0 = 0U, b1 = 0U;
+                    if (group == 0U) {
+                        const std::uint32_t base =
+                            (ktile + std::uint32_t(half)) * 16U + thread * 2U;
+                        b0 = std::uint32_t(hidden[base]) |
+                             (std::uint32_t(hidden[base + 1U]) << 16U);
+                        b1 = std::uint32_t(hidden[base + 8U]) |
+                             (std::uint32_t(hidden[base + 9U]) << 16U);
+                    }
+                    const int slot = chunk * 2 + half;
+                    const std::uint32_t lo = half == 0 ? gw[0] : gw[2];
+                    const std::uint32_t hi = half == 0 ? gw[1] : gw[3];
+                    dsv4_mma_m16n8k16(
+                        gate[slot][0], gate[slot][1], gate[slot][2],
+                        gate[slot][3],
+                        dsv4_fp8_decode_pair(lo & 0xFFFFU, gate_factor),
+                        dsv4_fp8_decode_pair(lo >> 16U, gate_factor),
+                        dsv4_fp8_decode_pair(hi & 0xFFFFU, gate_factor),
+                        dsv4_fp8_decode_pair(hi >> 16U, gate_factor), b0, b1);
+                    const std::uint32_t ulo = half == 0 ? uw[0] : uw[2];
+                    const std::uint32_t uhi = half == 0 ? uw[1] : uw[3];
+                    dsv4_mma_m16n8k16(
+                        up[slot][0], up[slot][1], up[slot][2], up[slot][3],
+                        dsv4_fp8_decode_pair(ulo & 0xFFFFU, up_factor),
+                        dsv4_fp8_decode_pair(ulo >> 16U, up_factor),
+                        dsv4_fp8_decode_pair(uhi & 0xFFFFU, up_factor),
+                        dsv4_fp8_decode_pair(uhi >> 16U, up_factor), b0, b1);
+                }
+            }
+        }
+#pragma unroll
+        for (int step = 1; step < kAccs; step *= 2)
+#pragma unroll
+            for (int base = 0; base < kAccs; base += step * 2)
+#pragma unroll
+                for (int reg = 0; reg < 4; ++reg) {
+                    gate[base][reg] += gate[base + step][reg];
+                    up[base][reg] += up[base + step][reg];
+                }
+        // D column 0 lives in registers 0 and 2 of the lanes with thread == 0.
+        if (thread == 0U) {
+            const std::uint32_t rows[2] = {group, group + 8U};
+            const int regs[2] = {0, 2};
+            for (int which = 0; which < 2; ++which) {
+                const std::uint32_t row = tile * 16U + rows[which];
+                float* slot =
+                    partials + (std::size_t(row) * split + slice) * 2U;
+                slot[0] = gate[0][regs[which]];
+                slot[1] = up[0][regs[which]];
+            }
+        }
+    }
+    (void)activation;
+    (void)intermediate;
+    (void)swiglu_limit;
+    (void)counters;
+}
+
+// Sums the split-K partials and applies the shared expert's swiglu. The
+// rounding, the finite check, the clamp order and the BF16 SiLU table lookup
+// are reproduced exactly from deepseek_fp8_gate_up_kernel: this path must be
+// numerically indistinguishable from the incumbent, not merely close.
+__global__ void dsv4_fp8_regfed_swiglu_kernel(
+    float* __restrict__ activation, const float* __restrict__ partials,
+    std::uint32_t intermediate, std::uint32_t split, float swiglu_limit,
+    const float* __restrict__ bf16_silu, unsigned int* __restrict__ error_flag) {
+    const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= intermediate) return;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint32_t slice = 0U; slice < split; ++slice) {
+        const float* slot = partials + (std::size_t(row) * split + slice) * 2U;
+        gate += slot[0];
+        up += slot[1];
+    }
+    const float rounded_gate = bf16_round(gate);
+    const float rounded_up = bf16_round(up);
+    if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+        atomicExch(error_flag, 1U);
+        activation[row] = __uint_as_float(0x7FC0'0000U);
+        return;
+    }
+    const float limited_gate = fminf(rounded_gate, swiglu_limit);
+    const float limited_up =
+        fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+    const auto gate_bits =
+        static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+    activation[row] = bf16_round(bf16_silu[gate_bits] * limited_up);
+}
+
 __global__ void deepseek_fp8_gate_up_kernel(
     float* activation, const float* hidden,
     const unsigned char* w1, const unsigned char* w1_scales,
@@ -13820,6 +14033,61 @@ std::atomic<std::uint64_t>
 void record_cuda_matmul_route(CudaMatmulRoute route) noexcept {
     g_route_census[static_cast<std::size_t>(route)].fetch_add(
         1U, std::memory_order_relaxed);
+}
+
+ValidationResult CudaBackend::dsv4_fp8_prepack_fragment(
+    int device, const CudaWeight& weight) {
+    ValidationResult result;
+    if (!weight.valid()) {
+        result.errors.emplace_back("FP8 fragment prepack received an invalid weight");
+        return result;
+    }
+    const auto& descriptor = weight.impl_->descriptor;
+    if (descriptor.encoding != CudaWeightEncoding::Fp8E4m3Block128) {
+        result.errors.emplace_back(
+            "FP8 fragment prepack requires Fp8E4m3Block128 encoding");
+        return result;
+    }
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    if (rows % 16U != 0U || columns % 32U != 0U) {
+        result.errors.emplace_back(
+            "FP8 fragment prepack requires rows%16 == 0 and columns%32 == 0");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select device for FP8 fragment prepack");
+    }
+    const std::size_t bytes = std::size_t(rows) * columns;
+    // Transient scratch: the permutation cannot be done in place, but the
+    // scratch is released immediately so no second persistent copy exists.
+    void* scratch = nullptr;
+    if (auto status = cudaMalloc(&scratch, bytes); status != cudaSuccess) {
+        return cuda_error(status, "allocate FP8 fragment prepack scratch");
+    }
+    const auto release = [&](cudaError_t status, const char* what) {
+        static_cast<void>(cudaFree(scratch));
+        return cuda_error(status, what);
+    };
+    if (auto status = cudaMemcpy(scratch, weight.impl_->weights, bytes,
+                                 cudaMemcpyDeviceToDevice);
+        status != cudaSuccess) {
+        return release(status, "stage FP8 weights for fragment prepack");
+    }
+    const std::uint32_t total = (rows / 16U) * (columns / 32U) * 32U;
+    const unsigned int blocks =
+        static_cast<unsigned int>(std::min<std::uint32_t>((total + 255U) / 256U, 65535U));
+    dsv4_fp8_fragment_prepack_kernel<<<blocks, 256U>>>(
+        static_cast<uint4*>(weight.impl_->weights),
+        static_cast<const unsigned char*>(scratch), rows, columns);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return release(status, "launch FP8 fragment prepack");
+    }
+    if (auto status = cudaDeviceSynchronize(); status != cudaSuccess) {
+        return release(status, "finish FP8 fragment prepack");
+    }
+    static_cast<void>(cudaFree(scratch));
+    return result;
 }
 
 CudaMatmulRouteCensus cuda_matmul_route_census() noexcept {

@@ -1253,6 +1253,19 @@ struct Nvfp4MoeBatch {
     std::uint32_t rows{};
 };
 
+// compressed-tensors MXFP4: E2M1 nibble pairs with power-of-two E8M0 scales
+// per group of 32 columns. Unlike NVFP4 there is no per-tensor divisor.
+struct Mxfp4MoeBatch {
+    const unsigned char* gate_weights[kMaxMoeExperts]{};
+    const unsigned char* gate_scales[kMaxMoeExperts]{};
+    const unsigned char* up_weights[kMaxMoeExperts]{};
+    const unsigned char* up_scales[kMaxMoeExperts]{};
+    const unsigned char* down_weights[kMaxMoeExperts]{};
+    const unsigned char* down_scales[kMaxMoeExperts]{};
+    std::uint32_t count{};
+    std::uint32_t rows{};
+};
+
 // Laguna carries the routed experts of layers 40-47 as plain BF16.
 struct PlainBf16MoeBatch {
     const __nv_bfloat16* gate_weights[kMaxMoeExperts]{};
@@ -2060,6 +2073,98 @@ __global__ void nvfp4_moe_down_kernel(
         sum += activations[input_base + column] * fp4_e2m1_value(encoded) *
                (fp8_e4m3_value(scales[scale_base + column / group_size]) /
                 global_scale);
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
+               output_row] = sum;
+    }
+}
+
+// Canonical MXFP4 counterparts. The hidden and intermediate activations are
+// rounded to E4M3 by enqueue_moe immediately before these kernels, matching
+// the scalar Fp4E2m1Group32 matmul route on the same weights.
+__global__ void mxfp4_moe_gate_up_kernel(
+    float* activations, const float* hidden, Mxfp4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto* gate_weights = batch.gate_weights[expert];
+    const auto* gate_scales = batch.gate_scales[expert];
+    const auto* up_weights = batch.up_weights[expert];
+    const auto* up_scales = batch.up_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base = static_cast<std::uint64_t>(row) * columns;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const auto packed_index = weight_base + column / 2U;
+        const auto scale_index = scale_base + column / 32U;
+        const unsigned char gate_packed = gate_weights[packed_index];
+        const unsigned char up_packed = up_weights[packed_index];
+        const unsigned int gate_encoded =
+            column % 2U == 0U ? gate_packed & 0x0FU : gate_packed >> 4U;
+        const unsigned int up_encoded =
+            column % 2U == 0U ? up_packed & 0x0FU : up_packed >> 4U;
+        const float input = hidden[input_base + column];
+        gate += input * fp4_e2m1_value(gate_encoded) *
+                fp8_e8m0_scale_bits(gate_scales[scale_index]);
+        up += input * fp4_e2m1_value(up_encoded) *
+              fp8_e8m0_scale_bits(up_scales[scale_index]);
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F
+                                  ? 1.0F / (1.0F + exponential)
+                                  : exponential / (1.0F + exponential);
+        const auto activation =
+            (static_cast<std::uint64_t>(expert) * batch.rows + row) *
+                intermediate + output_row;
+        activations[activation] = gate * sigmoid * up;
+    }
+}
+
+__global__ void mxfp4_moe_down_kernel(
+    float* output, const float* activations, Mxfp4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= rows || expert >= batch.count) return;
+
+    const auto* weights = batch.down_weights[expert];
+    const auto* scales = batch.down_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base =
+        (static_cast<std::uint64_t>(expert) * batch.rows + row) * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const unsigned char packed = weights[weight_base + column / 2U];
+        const unsigned int encoded =
+            column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        sum += activations[input_base + column] * fp4_e2m1_value(encoded) *
+               fp8_e8m0_scale_bits(scales[scale_base + column / 32U]);
     }
     sum = reduce_block(sum);
     if (threadIdx.x == 0U) {
@@ -14925,6 +15030,8 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
         case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
         case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
+        case CudaMatmulRoute::MoeFp4E2m1Group32:
+            return "moe_fp4_e2m1_group32";
         case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
         case CudaMatmulRoute::Dsv4MoeRoutedFp4: return "dsv4_moe_routed_fp4";
         case CudaMatmulRoute::Dsv4MoeSharedFp8: return "dsv4_moe_shared_fp8";
@@ -17522,8 +17629,10 @@ ValidationResult CudaBackend::enqueue_moe(
     }
     const auto batch_encoding = first_gate->impl_->descriptor.encoding;
     const bool nvfp4_batch = batch_encoding == CudaWeightEncoding::Nvfp4Group16;
+    const bool mxfp4_batch =
+        batch_encoding == CudaWeightEncoding::Fp4E2m1Group32;
     const bool plain_batch = batch_encoding == CudaWeightEncoding::Plain;
-    if (!nvfp4_batch && !plain_batch &&
+    if (!nvfp4_batch && !mxfp4_batch && !plain_batch &&
         batch_encoding != CudaWeightEncoding::OffsetPackedInt4) {
         result.errors.emplace_back("MoE command has an unsupported weight encoding");
         return result;
@@ -17545,6 +17654,9 @@ ValidationResult CudaBackend::enqueue_moe(
                         weight->impl_->descriptor.group_size == 16U &&
                         std::isfinite(weight->impl_->descriptor.global_scale) &&
                         weight->impl_->descriptor.global_scale > 0.0F)
+                 : mxfp4_batch
+                     ? (weight->impl_->descriptor.dtype == SafetensorsDtype::I8 &&
+                        weight->impl_->descriptor.group_size == 32U)
                  : plain_batch
                      ? weight->impl_->descriptor.dtype == SafetensorsDtype::Bf16
                      : (weight->impl_->descriptor.dtype == SafetensorsDtype::I32 &&
@@ -17558,10 +17670,12 @@ ValidationResult CudaBackend::enqueue_moe(
         const auto& gate = expert.gate->impl_->descriptor;
         const auto& up = expert.up->impl_->descriptor;
         const auto& down = expert.down->impl_->descriptor;
-        const auto expected_down_packed = nvfp4_batch
+        const auto expected_down_packed = (nvfp4_batch || mxfp4_batch)
             ? (down.columns + 1U) / 2U : (down.columns + 7U) / 8U;
         const auto expected_down_scales = nvfp4_batch
-            ? (down.columns + 15U) / 16U : (down.columns + 127U) / 128U;
+            ? (down.columns + 15U) / 16U
+            : mxfp4_batch ? (down.columns + 31U) / 32U
+                           : (down.columns + 127U) / 128U;
         const bool packing_valid = plain_batch ||
             (gate.packed_columns == up.packed_columns &&
              gate.scale_columns == up.scale_columns &&
@@ -17578,7 +17692,7 @@ ValidationResult CudaBackend::enqueue_moe(
         // because scaling before the down projection is not float-equal to
         // scaling after it and Laguna's reference scales after.
         if (!std::isfinite(expert.coefficient) ||
-            ((shared_expert || nvfp4_batch || plain_batch) &&
+            ((shared_expert || nvfp4_batch || mxfp4_batch || plain_batch) &&
              expert.coefficient != 1.0F)) {
             result.errors.emplace_back("MoE expert coefficient is invalid");
             return false;
@@ -17690,6 +17804,7 @@ ValidationResult CudaBackend::enqueue_moe(
 
     PackedInt4MoeBatch batch;
     Nvfp4MoeBatch nvfp4_batch_data;
+    Mxfp4MoeBatch mxfp4_batch_data;
     PlainBf16MoeBatch plain_batch_data;
     state.moe_weights.clear();
     state.moe_weights.reserve(expert_count * 3U);
@@ -17721,6 +17836,19 @@ ValidationResult CudaBackend::enqueue_moe(
                 expert.up->impl_->descriptor.global_scale;
             nvfp4_batch_data.down_global_scales[index] =
                 expert.down->impl_->descriptor.global_scale;
+        } else if (mxfp4_batch) {
+            mxfp4_batch_data.gate_weights[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->weights);
+            mxfp4_batch_data.gate_scales[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->scales);
+            mxfp4_batch_data.up_weights[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->weights);
+            mxfp4_batch_data.up_scales[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->scales);
+            mxfp4_batch_data.down_weights[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->weights);
+            mxfp4_batch_data.down_scales[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->scales);
         } else {
             batch.gate_weights[index] = static_cast<const std::uint32_t*>(
                 expert.gate->impl_->weights);
@@ -17748,6 +17876,8 @@ ValidationResult CudaBackend::enqueue_moe(
     batch.rows = rows;
     nvfp4_batch_data.count = batch.count;
     nvfp4_batch_data.rows = rows;
+    mxfp4_batch_data.count = batch.count;
+    mxfp4_batch_data.rows = rows;
     plain_batch_data.count = batch.count;
     plain_batch_data.rows = rows;
 
@@ -17803,6 +17933,19 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "record MoE hidden upload");
         return result;
     }
+    if (mxfp4_batch) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((hidden_columns + 127U) / 128U), rows,
+            1U);
+        quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            state.moe_hidden, hidden_columns, rows);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch MXFP4 MoE hidden quantization");
+            return result;
+        }
+    }
 
     const auto& gate = (routed.empty() ? shared->gate : routed.front().gate)
                            ->impl_->descriptor;
@@ -17818,9 +17961,11 @@ ValidationResult CudaBackend::enqueue_moe(
         static_cast<unsigned int>(activation_rows), 1U);
     // Counted once per MoE command on the gate/up dispatch; the down kernel
     // mirrors the same branch, so counting both would double every entry.
-    record_cuda_matmul_route(plain_batch    ? CudaMatmulRoute::MoePlainBf16
-                             : nvfp4_batch  ? CudaMatmulRoute::MoeNvfp4Group16
-                                            : CudaMatmulRoute::MoePackedInt4);
+    record_cuda_matmul_route(
+        plain_batch    ? CudaMatmulRoute::MoePlainBf16
+        : nvfp4_batch  ? CudaMatmulRoute::MoeNvfp4Group16
+        : mxfp4_batch  ? CudaMatmulRoute::MoeFp4E2m1Group32
+                       : CudaMatmulRoute::MoePackedInt4);
     if (plain_batch) {
         plain_bf16_moe_gate_up_kernel<<<plain_gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, plain_batch_data,
@@ -17830,6 +17975,11 @@ ValidationResult CudaBackend::enqueue_moe(
             state.moe_activations, state.moe_hidden, nvfp4_batch_data,
             hidden_columns, intermediate_columns, gate.packed_columns,
             gate.scale_columns, gate.group_size, state.moe_error);
+    } else if (mxfp4_batch) {
+        mxfp4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, mxfp4_batch_data,
+            hidden_columns, intermediate_columns, gate.packed_columns,
+            gate.scale_columns, state.moe_error);
     } else {
         packed_int4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, batch, hidden_columns,
@@ -17840,6 +17990,20 @@ ValidationResult CudaBackend::enqueue_moe(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch MoE gate/up SwiGLU");
         return result;
+    }
+    if (mxfp4_batch) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            static_cast<unsigned int>(activation_rows), 1U);
+        quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            state.moe_activations, intermediate_columns,
+            static_cast<std::uint32_t>(activation_rows));
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch MXFP4 MoE activation quantization");
+            return result;
+        }
     }
     const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
                          static_cast<unsigned int>(activation_rows), 1U);
@@ -17856,6 +18020,11 @@ ValidationResult CudaBackend::enqueue_moe(
             state.moe_output, state.moe_activations, nvfp4_batch_data,
             intermediate_columns, hidden_columns, down.packed_columns,
             down.scale_columns, down.group_size, state.moe_error);
+    } else if (mxfp4_batch) {
+        mxfp4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, mxfp4_batch_data,
+            intermediate_columns, hidden_columns, down.packed_columns,
+            down.scale_columns, state.moe_error);
     } else {
         packed_int4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
             state.moe_output, state.moe_activations, batch, intermediate_columns,

@@ -513,7 +513,10 @@ struct Gemma4Linear {
     constexpr auto& c = kLagunaExecutionContract;
     auto& inventory = result.value;
     inventory.model = PlacementModel::Laguna;
-    inventory.model_name = laguna_s21_nvfp4_spec().name;
+    inventory.model_name =
+        checkpoint.format() == LagunaCheckpointFormat::Mxfp4Group32
+            ? laguna_s21_mxfp4_spec().name
+            : laguna_s21_nvfp4_spec().name;
     inventory.layer_count = c.layer_count;
     inventory.maximum_context_tokens = context_tokens;
     inventory.per_device_workspace_bytes = kFlashAttentionWorkspaceReserve;

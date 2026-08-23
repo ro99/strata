@@ -1295,16 +1295,19 @@ ValidationResult LagunaRuntime::initialize(const std::string& model_directory,
             "Laguna runtime context exceeds the declared model ceiling");
         return result;
     }
-    const auto spec = laguna_s21_nvfp4_spec();
-    result = validate_laguna_s21_nvfp4(spec);
-    if (!result.ok()) return result;
-
     impl_ = std::make_unique<Impl>();
     auto checkpoint = LagunaCheckpointReader::open(model_directory);
     if (!checkpoint.ok()) {
         result.errors = std::move(checkpoint.errors);
         return result;
     }
+    const bool mxfp4 =
+        checkpoint.value->format() == LagunaCheckpointFormat::Mxfp4Group32;
+    const auto spec = mxfp4 ? laguna_s21_mxfp4_spec()
+                            : laguna_s21_nvfp4_spec();
+    result = mxfp4 ? validate_laguna_s21_mxfp4(spec)
+                   : validate_laguna_s21_nvfp4(spec);
+    if (!result.ok()) return result;
     auto tokenizer = ModelTokenizer::load(
         (std::filesystem::path(model_directory) / "tokenizer.json").string());
     if (!tokenizer.ok()) {

@@ -21,6 +21,12 @@ namespace strata {
 enum class LagunaTensorEncoding : std::uint8_t {
     Plain,
     Nvfp4Group16,
+    Mxfp4Group32,
+};
+
+enum class LagunaCheckpointFormat : std::uint8_t {
+    Nvfp4Mixed,
+    Mxfp4Group32,
 };
 
 struct LagunaTensor {
@@ -34,7 +40,8 @@ struct LagunaTensor {
 
 // One resolved linear module. `encoding` decides which component tensors are
 // populated: Plain uses `weight` alone, Nvfp4Group16 uses the packed/scale/
-// global-scale triplet.
+// global-scale triplet, and Mxfp4Group32 uses packed/scale without a global
+// scale.
 struct LagunaLinear {
     LagunaTensorEncoding encoding{LagunaTensorEncoding::Plain};
     std::uint64_t rows{};
@@ -72,9 +79,9 @@ public:
     LagunaCheckpointReader(const LagunaCheckpointReader&) = delete;
     LagunaCheckpointReader& operator=(const LagunaCheckpointReader&) = delete;
 
-    // Opens and validates the checkpoint against the pinned Laguna S 2.1-NVFP4
-    // contract. Every declared module must be present with the declared shape
-    // and encoding; there is no partial-load mode.
+    // Opens and validates either pinned Laguna S 2.1 compressed checkpoint.
+    // Every declared module must be present with the format's exact shape and
+    // encoding; there is no partial-load mode or precision fallback.
     [[nodiscard]] static LagunaCheckpointOpenResult open(
         std::string model_directory);
 
@@ -106,12 +113,16 @@ public:
     [[nodiscard]] std::uint64_t shard_file_bytes() const noexcept {
         return shard_file_bytes_;
     }
+    [[nodiscard]] LagunaCheckpointFormat format() const noexcept {
+        return format_;
+    }
     [[nodiscard]] CheckpointReadStats stats() const noexcept;
 
 private:
     LagunaCheckpointReader() = default;
 
     std::string model_directory_;
+    LagunaCheckpointFormat format_{LagunaCheckpointFormat::Nvfp4Mixed};
     std::vector<LagunaTensor> tensors_;
     std::unordered_map<std::string_view, std::size_t> by_name_;
     CheckpointShardSet shards_;

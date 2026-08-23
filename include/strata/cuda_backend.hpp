@@ -798,6 +798,7 @@ enum class CudaMatmulRoute : std::uint8_t {
     // distinguish a load-time dispatch from a per-token one.
     MoePlainBf16,
     MoeNvfp4Group16,
+    MoeFp4E2m1Group32,
     MoePackedInt4,
     // DeepSeek V4's own MoE path. This is the campaign's mixed dispatch: the
     // routed experts are FP4 E2M1/E8M0 group-32 and the shared expert is FP8

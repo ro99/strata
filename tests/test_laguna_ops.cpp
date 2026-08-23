@@ -41,6 +41,28 @@ TEST_CASE("Laguna S 2.1 pinned spec validates") {
     REQUIRE(!strata::validate_laguna_s21_nvfp4(softmax).ok());
 }
 
+TEST_CASE("Laguna S 2.1 MXFP4 spec is distinct and keeps the model contract") {
+    const auto nvfp4 = strata::laguna_s21_nvfp4_spec();
+    const auto mxfp4 = strata::laguna_s21_mxfp4_spec();
+    REQUIRE(strata::validate_laguna_s21_nvfp4(nvfp4).ok());
+    REQUIRE(strata::validate_laguna_s21_mxfp4(mxfp4).ok());
+    REQUIRE(mxfp4.source.repository == "olka-fi/Laguna-S-2.1-MXFP4");
+    REQUIRE(mxfp4.source.repository != nvfp4.source.repository);
+    REQUIRE(mxfp4.mixed_quantization.kind ==
+            strata::QuantizationKind::CompressedTensorsW4A16);
+    REQUIRE(mxfp4.mixed_quantization.routed_experts.group_size == 32U);
+    REQUIRE(mxfp4.laguna.quantized_expert_layers == mxfp4.layer_count);
+    REQUIRE(mxfp4.router.experts_per_token == nvfp4.router.experts_per_token);
+    REQUIRE(mxfp4.hidden_size == nvfp4.hidden_size);
+
+    auto wrong_group = mxfp4;
+    wrong_group.mixed_quantization.routed_experts.group_size = 16U;
+    REQUIRE(!strata::validate_laguna_s21_mxfp4(wrong_group).ok());
+    auto wrong_source = mxfp4;
+    wrong_source.source.repository = nvfp4.source.repository;
+    REQUIRE(!strata::validate_laguna_s21_mxfp4(wrong_source).ok());
+}
+
 TEST_CASE("Laguna attention layout alternates global and sliding layers") {
     REQUIRE(strata::laguna_global_attention_layer(0U));
     REQUIRE(!strata::laguna_global_attention_layer(1U));

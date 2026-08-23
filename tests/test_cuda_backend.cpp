@@ -98,6 +98,35 @@ strata::CudaWeight upload_fp4(
     return result;
 }
 
+strata::CudaWeight upload_nvfp4(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns, std::uint8_t seed) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Nvfp4Group16;
+    descriptor.dtype = strata::SafetensorsDtype::U8;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = columns / 2U;
+    descriptor.scale_columns = columns / 16U;
+    descriptor.group_size = 16U;
+    descriptor.global_scale = 1.0F;
+    std::vector<std::byte> weights(
+        static_cast<std::size_t>(rows * descriptor.packed_columns));
+    for (std::size_t index = 0U; index < weights.size(); ++index) {
+        const auto low = static_cast<std::uint8_t>((index + seed) & 0x0FU);
+        const auto high =
+            static_cast<std::uint8_t>((index * 3U + seed + 1U) & 0x0FU);
+        weights[index] =
+            static_cast<std::byte>(low | static_cast<std::uint8_t>(high << 4U));
+    }
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(rows * descriptor.scale_columns),
+        std::byte{0x38U});
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
+    return result;
+}
+
 strata::CudaWeight upload_fp8(
     strata::CudaBackend& backend, int device, std::uint64_t rows,
     std::uint64_t columns, std::uint8_t seed) {
@@ -1755,6 +1784,86 @@ TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE comman
     REQUIRE(second.deepseek_moe_calls - first.deepseek_moe_calls == 1U);
     REQUIRE(second.deepseek_moe_kernel_launches -
                 first.deepseek_moe_kernel_launches == 2U);
+}
+
+TEST_CASE("Laguna shaped MXFP4 MoE batch matches canonical scalar matmuls") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto up = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 7U);
+    auto down = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 29U) - 14) /
+                        32.0F;
+    }
+    const auto expected = reference_int4_expert(
+        backend, gate, up, down, hidden, rows, intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    std::array<float, rows * hidden_columns> actual{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+    REQUIRE(backend.collect_moe(device, actual, {}).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
+}
+
+TEST_CASE("existing Laguna NVFP4 MoE batch remains distinct and correct") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate = upload_nvfp4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto up = upload_nvfp4(
+        backend, device, intermediate_columns, hidden_columns, 7U);
+    auto down = upload_nvfp4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 29U) - 14) /
+                        32.0F;
+    }
+    const auto expected = reference_int4_expert(
+        backend, gate, up, down, hidden, rows, intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    std::array<float, rows * hidden_columns> actual{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+    REQUIRE(backend.collect_moe(device, actual, {}).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeNvfp4Group16)] == 1U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 0U);
 }
 
 TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when available") {

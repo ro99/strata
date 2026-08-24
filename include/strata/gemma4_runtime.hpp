@@ -36,11 +36,23 @@ struct Gemma4RuntimeConfig {
     // host-visible layer boundary, so it is not covered -- the same
     // limitation DeepSeek's own device-resident decode path has.
     bool enable_layer_hash_trace{};
+    // Opt-in CUDA event attribution for the cost-model probe. Off by default;
+    // event recording would otherwise perturb every production projection.
+    bool enable_cuda_phase_timing{};
     // Optional pre-solved placement. When present and prescriptive it supplies
     // the layer-to-device assignment and the admitted per-device budgets, so
     // the load performs exactly the placement a dry run printed. Borrowed for
     // the duration of initialize only.
     const PlacementPlan* placement{};
+};
+
+struct Gemma4CudaPhaseMetrics {
+    std::uint64_t h2d_bytes{};
+    std::uint64_t d2h_bytes{};
+    double h2d_seconds{};
+    double kernel_seconds{};
+    double d2h_seconds{};
+    double synchronization_seconds{};
 };
 
 struct Gemma4RunMetrics {
@@ -50,9 +62,16 @@ struct Gemma4RunMetrics {
     std::uint64_t decode_tokens{};
     double prefill_seconds{};
     double decode_seconds{};
+    double first_decode_seconds{};
+    double steady_decode_seconds{};
+    std::uint64_t steady_decode_tokens{};
     std::uint64_t rss_bytes{};
     std::vector<std::uint64_t> device_vram_used_bytes;
     bool incremental_kv_continuation{};
+    Gemma4CudaPhaseMetrics prefill_cuda;
+    Gemma4CudaPhaseMetrics decode_cuda;
+    Gemma4CudaPhaseMetrics first_decode_cuda;
+    Gemma4CudaPhaseMetrics steady_decode_cuda;
 };
 
 struct Gemma4GenerationResult {

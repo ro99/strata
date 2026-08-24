@@ -21,6 +21,7 @@ comparison without running the rest of the suite.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,9 +30,14 @@ ROOT = Path(__file__).resolve().parent.parent
 SKIP_EXIT_CODE = 77
 
 MODEL_DIR = ROOT / "models" / "gemma4"
-CHECKPOINT_MARKER = MODEL_DIR / "model.safetensors.index.json"
-FIXTURE = ROOT / "tests" / "fixtures" / "gemma4" / "layer-hash-trace.json"
-BINARY = ROOT / "build" / "strata-gemma4-run"
+CHECKPOINT_INDEX = MODEL_DIR / "model.safetensors.index.json"
+SINGLE_SHARD = MODEL_DIR / "model.safetensors"
+W8A16_FIXTURE = ROOT / "tests" / "fixtures" / "gemma4" / "layer-hash-trace.json"
+MXFP4_FIXTURE = (ROOT / "tests" / "fixtures" / "gemma4" /
+                 "layer-hash-trace-mxfp4.json")
+BINARY = Path(os.environ.get(
+    "STRATA_GEMMA4_EQUIVALENCE_BINARY",
+    ROOT / "build" / "strata-gemma4-run"))
 
 PROMPT = "The capital of France is"
 MAX_NEW = "8"
@@ -73,20 +79,32 @@ def first_divergence(reference: dict, actual: dict) -> str | None:
 
 
 def main() -> int:
-    if not CHECKPOINT_MARKER.exists():
+    if not CHECKPOINT_INDEX.exists() and not SINGLE_SHARD.exists():
         return skip(f"pinned Gemma 4 checkpoint is absent "
-                    f"({CHECKPOINT_MARKER} does not exist)")
+                    f"(neither {CHECKPOINT_INDEX} nor {SINGLE_SHARD} exists)")
     if not BINARY.exists():
         return fail(f"{BINARY} does not exist -- build first "
                     f"(cmake --build build --parallel)")
-    if not FIXTURE.exists():
-        return fail(f"{FIXTURE} does not exist -- nothing to compare against")
+    # The indexed checkpoint is the pinned W8A16 model; the lone-shard format
+    # is the separately pinned MXFP4 model. Their quantized weights and thus
+    # their layer hashes differ, so each needs its own oracle. Index precedence
+    # mirrors load_safetensors_index when both files happen to exist.
+    fixture = W8A16_FIXTURE if CHECKPOINT_INDEX.exists() else MXFP4_FIXTURE
+    if not fixture.exists():
+        return fail(f"{fixture} does not exist -- nothing to compare against")
 
+    environment = os.environ.copy()
+    # Equivalence is an architecture oracle, not a register-fed oracle. Keep
+    # the canonical scalar layout so this gate remains stable across the A/B.
+    environment["STRATA_REGFED_MATMUL"] = "0"
+    command = [str(BINARY), "--model", str(MODEL_DIR), "--prompt", PROMPT,
+               "--max-new", MAX_NEW, "--temperature", "0",
+               "--layer-hash-trace", "--json"]
+    if devices := os.environ.get("STRATA_GEMMA4_EQUIVALENCE_DEVICES"):
+        command.extend(["--devices", devices])
     proc = subprocess.run(
-        [str(BINARY), "--model", str(MODEL_DIR), "--prompt", PROMPT,
-         "--max-new", MAX_NEW, "--temperature", "0", "--layer-hash-trace",
-         "--json"],
-        capture_output=True, text=True)
+        command,
+        capture_output=True, text=True, env=environment)
     if proc.returncode != 0:
         return fail(f"{BINARY} exited {proc.returncode}\nstderr:\n{proc.stderr}")
 
@@ -95,7 +113,7 @@ def main() -> int:
     except json.JSONDecodeError as error:
         return fail(f"could not parse {BINARY} output as JSON: {error}")
 
-    reference = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    reference = json.loads(fixture.read_text(encoding="utf-8"))
     divergence = first_divergence(reference, actual)
     if divergence is not None:
         return fail(f"oracle disagrees with the committed fixture: {divergence}")
@@ -103,7 +121,7 @@ def main() -> int:
     entry_count = len(reference["diagnostics"]["layer_hidden_hashes"]["entries"])
     print(f"PASS gemma4 equivalence oracle: {entry_count} layer hashes, "
           f"generated_token_ids and answer all match "
-          f"{FIXTURE.relative_to(ROOT)}")
+          f"{fixture.relative_to(ROOT)}")
     return 0
 
 

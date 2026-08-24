@@ -58,6 +58,10 @@ private:
     CheckpointShardSet shards_;
 };
 
+[[nodiscard]] ParseResult<CudaWeightDescriptor> describe_gemma4_cuda_linear(
+    const Gemma4Tensor& packed, const Gemma4Tensor& scales,
+    std::uint64_t rows, std::uint64_t columns);
+
 [[nodiscard]] ValidationResult load_gemma4_cuda_linear(
     const Gemma4CheckpointReader& checkpoint, std::string_view base_name,
     std::uint64_t rows, std::uint64_t columns, int device,

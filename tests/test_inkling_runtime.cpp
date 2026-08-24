@@ -21,8 +21,17 @@ std::filesystem::path inkling_model_path() {
     return std::filesystem::path(STRATA_SOURCE_DIR) / "models/inkling-s";
 }
 
+std::filesystem::path inkling_mxfp4_model_path() {
+    return std::filesystem::path(STRATA_SOURCE_DIR) / "models/inkling";
+}
+
 bool inkling_checkpoint_present() {
     return std::filesystem::exists(inkling_model_path() /
+                                   "model.safetensors.index.json");
+}
+
+bool inkling_mxfp4_checkpoint_present() {
+    return std::filesystem::exists(inkling_mxfp4_model_path() /
                                    "model.safetensors.index.json");
 }
 
@@ -75,6 +84,18 @@ TEST_CASE("Inkling runtime rejects use before initialization") {
     REQUIRE(!runtime.generate_stream("hello", 1U).ok());
 }
 
+TEST_CASE("Inkling runtime rejects context outside the model contract") {
+    strata::InklingRuntimeConfig config;
+    config.maximum_context_tokens = 0U;
+    strata::InklingRuntime zero;
+    REQUIRE(!zero.initialize("unused", config).ok());
+
+    config.maximum_context_tokens =
+        strata::kInklingExecutionContract.maximum_context_tokens + 1U;
+    strata::InklingRuntime excessive;
+    REQUIRE(!excessive.initialize("unused", config).ok());
+}
+
 TEST_CASE("Inkling runtime generates the expected continuation") {
     if (!inkling_checkpoint_present()) {
         SKIP("pinned Inkling-Small-NVFP4 checkpoint is absent");
@@ -110,6 +131,52 @@ TEST_CASE("Inkling runtime generates the expected continuation") {
     REQUIRE(result.metrics.graph.routed_expert_bytes <
             static_cast<std::uint64_t>(result.metrics.graph.forward_tokens) *
                 8ULL * (1ULL << 30U));
+}
+
+TEST_CASE("Inkling MXFP4 runtime generates through register-fed routes") {
+    if (!inkling_mxfp4_checkpoint_present()) {
+        SKIP("pinned Inkling-Small-MXFP4 checkpoint is absent");
+    }
+    const auto available = strata::CudaBackend::available_devices();
+    if (available.empty()) SKIP("no CUDA device is available");
+
+    strata::InklingRuntimeConfig config;
+    config.maximum_context_tokens = 64U;
+    config.warm_expert_pages = false;
+    config.devices.assign(available.begin(),
+                          available.begin() +
+                              std::min<std::size_t>(2U, available.size()));
+    strata::InklingRuntime runtime;
+    const auto initialized =
+        runtime.initialize(inkling_mxfp4_model_path().string(), config);
+    for (const auto& error : initialized.errors) {
+        std::cerr << "initialize: " << error << '\n';
+    }
+    REQUIRE(initialized.ok());
+
+    strata::reset_cuda_matmul_route_census();
+    const auto result = runtime.generate_stream("The capital of France is", 2U);
+    for (const auto& error : result.errors) {
+        std::cerr << "generate: " << error << '\n';
+    }
+    REQUIRE(result.ok());
+    REQUIRE(result.text.find("Paris") != std::string::npos);
+    // The loader now asks for m16n8k16 fragment order on MXFP4 linears, so both
+    // the generic matmul and the fused MoE batch serve this run on the
+    // register-fed route. The text check above is the end-to-end statement that
+    // matters: the model still says Paris on the substituted path.
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Fp4RegisterFed)] > 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4RegisterFed)] > 0U);
+    // Nothing may quietly fall back to reading fragment order as canonical.
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Fp4E2m1Group32)] == 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Unsupported)] == 0U);
 }
 
 TEST_CASE("Inkling teacher forcing is deterministic and ranks the known token") {

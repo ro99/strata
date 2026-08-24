@@ -21,6 +21,12 @@ namespace strata {
 enum class InklingTensorEncoding : std::uint8_t {
     Plain,
     Nvfp4Group16,
+    Mxfp4Group32,
+};
+
+enum class InklingCheckpointFormat : std::uint8_t {
+    Nvfp4Mixed,
+    Mxfp4Group32,
 };
 
 struct InklingTensor {
@@ -32,23 +38,31 @@ struct InklingTensor {
     std::uint64_t bytes{};
 };
 
-// One resolved BF16 linear. Every non-expert module in the checkpoint is BF16,
-// including the router gate, the shared experts and the whole MTP stack.
+// One resolved linear. The original NVFP4 checkpoint uses Plain for every
+// non-routed module. The MLX MXFP4 checkpoint stores every matrix except the
+// router gate as U32-packed E2M1 plus per-32 U8 E8M0 scales.
 struct InklingLinear {
+    InklingTensorEncoding encoding{InklingTensorEncoding::Plain};
     std::uint64_t rows{};
     std::uint64_t columns{};
     const InklingTensor* weight{};
+    const InklingTensor* packed{};
+    const InklingTensor* scale{};
 
     [[nodiscard]] std::uint64_t source_bytes() const noexcept {
-        return weight == nullptr ? 0U : weight->bytes;
+        if (encoding == InklingTensorEncoding::Plain) {
+            return weight == nullptr ? 0U : weight->bytes;
+        }
+        return (packed == nullptr ? 0U : packed->bytes) +
+               (scale == nullptr ? 0U : scale->bytes);
     }
 };
 
 // One layer's routed experts. Inkling stacks all 256 experts of a projection
 // into a single tensor rather than shipping one tensor per expert, so a layer
 // is three tensors instead of 768. `encoding` decides which members are
-// populated: Plain uses `weight` alone (layer 2), Nvfp4Group16 uses the
-// packed/scale/scale2 triplet (layers 3 and up).
+// populated: Plain uses `weight`; NVFP4 and MXFP4 use `packed` and `scale`,
+// with only NVFP4 carrying `global_scale`.
 struct InklingExpertStack {
     InklingTensorEncoding encoding{InklingTensorEncoding::Plain};
     std::uint64_t experts{};
@@ -57,7 +71,7 @@ struct InklingExpertStack {
     const InklingTensor* weight{};
     const InklingTensor* packed{};
     const InklingTensor* scale{};
-    // Per-expert FP32 multipliers, one per expert in the stack.
+    // Per-expert FP32 multipliers, one per expert in the NVFP4 stack.
     const InklingTensor* global_scale{};
 
     [[nodiscard]] std::uint64_t source_bytes() const noexcept {
@@ -122,6 +136,10 @@ public:
     // Host-side NVFP4 view of one expert inside a stacked projection.
     [[nodiscard]] ParseResult<InklingNvfp4MatrixView> nvfp4_expert_view(
         const InklingExpertStack& stack, std::uint64_t expert) const;
+    [[nodiscard]] ParseResult<InklingMxfp4MatrixView> mxfp4_view(
+        const InklingLinear& module) const;
+    [[nodiscard]] ParseResult<InklingMxfp4MatrixView> mxfp4_expert_view(
+        const InklingExpertStack& stack, std::uint64_t expert) const;
 
     [[nodiscard]] std::span<const InklingTensor> tensors() const noexcept {
         return tensors_;
@@ -129,12 +147,16 @@ public:
     [[nodiscard]] std::uint64_t shard_file_bytes() const noexcept {
         return shard_file_bytes_;
     }
+    [[nodiscard]] InklingCheckpointFormat format() const noexcept {
+        return format_;
+    }
     [[nodiscard]] CheckpointReadStats stats() const noexcept;
 
 private:
     InklingCheckpointReader() = default;
 
     std::string model_directory_;
+    InklingCheckpointFormat format_{InklingCheckpointFormat::Nvfp4Mixed};
     std::vector<InklingTensor> tensors_;
     std::unordered_map<std::string_view, std::size_t> by_name_;
     CheckpointShardSet shards_;

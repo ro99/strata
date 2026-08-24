@@ -348,6 +348,28 @@ TEST_CASE("Inkling NVFP4 matvec rejects malformed views") {
     REQUIRE(!strata::inkling_nvfp4_matvec_reference(matrix, input, output).ok());
 }
 
+TEST_CASE("Inkling MXFP4 decodes U32 bytes low nibble first with E8M0 groups") {
+    strata::InklingMxfp4MatrixView matrix;
+    // One row and one group. Alternating codes +1 (0x2) and -2 (0xc), with
+    // the even column in the low nibble: every byte is 0xc2.
+    std::vector<std::byte> packed(16U, std::byte{0xc2});
+    std::vector<std::byte> scales(1U, std::byte{127U});  // 2^(127-127)
+    matrix.packed = packed;
+    matrix.scales = scales;
+    matrix.rows = 1U;
+    matrix.columns = 32U;
+    matrix.packed_columns = 16U;
+    matrix.scale_columns = 1U;
+    matrix.group_size = 32U;
+    std::vector<float> input(32U, 1.0F);
+    std::vector<float> output(1U);
+    REQUIRE(strata::inkling_mxfp4_matvec_reference(matrix, input, output).ok());
+    // Sixteen pairs of (+1) + (-2).
+    REQUIRE(output[0] == -16.0F);
+    matrix.scale_columns = 2U;
+    REQUIRE(!strata::inkling_mxfp4_matvec_reference(matrix, input, output).ok());
+}
+
 TEST_CASE("shared log-sigmoid matches the naive form where it is stable") {
     for (const float value : {-4.0F, -1.0F, -0.25F, 0.0F, 0.25F, 1.0F, 4.0F}) {
         const float naive = std::log(1.0F / (1.0F + std::exp(-value)));

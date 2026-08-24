@@ -262,12 +262,19 @@ find_library(NUMA_LIBRARY_PROBE numa REQUIRED)
 target_link_libraries(strata-kimi-compute-probe PRIVATE strata_core ${NUMA_LIBRARY_PROBE})
 add_executable(strata-inkling-probe apps/strata_inkling_probe.cpp)
 target_link_libraries(strata-inkling-probe PRIVATE strata_core)
+add_executable(strata-inkling-attention-probe
+    apps/strata_inkling_attention_probe.cpp)
+target_link_libraries(strata-inkling-attention-probe PRIVATE strata_core)
 
 add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
 target_link_libraries(strata-laguna-profile PRIVATE strata_core)
 
 add_executable(strata-laguna-stage-probe apps/strata_laguna_stage_probe.cpp)
 target_link_libraries(strata-laguna-stage-probe PRIVATE strata_core)
+
+add_executable(strata-laguna-spine-tp-probe
+    apps/strata_laguna_spine_tp_probe.cpp)
+target_link_libraries(strata-laguna-spine-tp-probe PRIVATE strata_core)
 
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
@@ -319,6 +326,156 @@ if(STRATA_HAS_CUDA)
     set_property(TARGET strata-dsv4-fp8-tensor-gemm-probe PROPERTY
         CUDA_STANDARD_REQUIRED ON)
     target_compile_options(strata-dsv4-fp8-tensor-gemm-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-qpn-baseline-probe
+        apps/strata_dsv4_sm86_qpn_baseline_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-qpn-baseline-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-qpn-baseline-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-qpn-baseline-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-qpn-baseline-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-qpn-baseline-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-fp8-baseline-probe
+        apps/strata_dsv4_sm86_fp8_baseline_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-baseline-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-baseline-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-baseline-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-baseline-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-baseline-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-bf16-mma-probe
+        apps/strata_dsv4_sm86_bf16_mma_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-bf16-mma-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-bf16-mma-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-bf16-mma-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-bf16-mma-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-bf16-mma-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-fp8-register-feed-probe
+        apps/strata_dsv4_sm86_fp8_register_feed_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-register-feed-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-register-feed-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-register-feed-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-register-feed-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-register-feed-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-fp8-launch-ceiling-probe
+        apps/strata_dsv4_sm86_fp8_launch_ceiling_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-launch-ceiling-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-launch-ceiling-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-launch-ceiling-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-launch-ceiling-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-launch-ceiling-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-fp8-qpn-probe
+        apps/strata_dsv4_sm86_fp8_qpn_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-qpn-probe PRIVATE CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-qpn-probe PROPERTY CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-qpn-probe PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-qpn-probe PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-qpn-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+
+    add_executable(strata-dsv4-sm86-fp8-scheduler-probe
+        apps/strata_dsv4_sm86_fp8_scheduler_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-scheduler-probe PRIVATE CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-scheduler-probe PROPERTY CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-scheduler-probe PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-scheduler-probe PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-scheduler-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+
+    add_executable(strata-dsv4-sm86-fp8-real-accuracy-probe
+        apps/strata_dsv4_sm86_fp8_real_accuracy_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-real-accuracy-probe PRIVATE
+        strata_platform CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-real-accuracy-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-real-accuracy-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-real-accuracy-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-real-accuracy-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+
+    add_executable(strata-dsv4-sm86-fp4-decode-ceiling-probe
+        apps/strata_dsv4_sm86_fp4_decode_ceiling_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp4-decode-ceiling-probe PRIVATE
+        CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp4-decode-ceiling-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp4-decode-ceiling-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp4-decode-ceiling-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp4-decode-ceiling-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-dsv4-sm86-fp8-mcurve-probe
+        apps/strata_dsv4_sm86_fp8_mcurve_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp8-mcurve-probe PRIVATE CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp8-mcurve-probe PROPERTY CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp8-mcurve-probe PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp8-mcurve-probe PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp8-mcurve-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+
+    add_executable(strata-moe-fp4-bandwidth-probe
+        apps/strata_moe_fp4_bandwidth_probe.cu)
+    target_link_libraries(strata-moe-fp4-bandwidth-probe PRIVATE
+        strata_platform CUDA::cudart)
+    set_property(TARGET strata-moe-fp4-bandwidth-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-moe-fp4-bandwidth-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-moe-fp4-bandwidth-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+
+    add_executable(strata-dsv4-sm86-fp4-prepack-probe
+        apps/strata_dsv4_sm86_fp4_prepack_probe.cu)
+    target_link_libraries(strata-dsv4-sm86-fp4-prepack-probe PRIVATE
+        strata_platform CUDA::cudart)
+    set_property(TARGET strata-dsv4-sm86-fp4-prepack-probe PROPERTY
+        CUDA_ARCHITECTURES 86)
+    set_property(TARGET strata-dsv4-sm86-fp4-prepack-probe PROPERTY
+        CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-sm86-fp4-prepack-probe PROPERTY
+        CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-sm86-fp4-prepack-probe PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
     )
 

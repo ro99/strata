@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -49,30 +50,28 @@ InklingCheckpointReader::~InklingCheckpointReader() { release_mapped_views(); }
 InklingCheckpointOpenResult InklingCheckpointReader::open(
     std::string model_directory) {
     InklingCheckpointOpenResult result;
-    const auto spec = inkling_small_nvfp4_spec();
-    const auto index_path = (std::filesystem::path(model_directory) /
-                             "model.safetensors.index.json").string();
-    auto text = load_bounded_text_file(index_path, kMaximumIndexBytes);
-    if (!text.ok()) {
-        result.errors = std::move(text.errors);
-        return result;
-    }
-    auto index = parse_safetensors_index(text.value);
+    const auto nvfp4_spec = inkling_small_nvfp4_spec();
+    const auto mxfp4_spec = inkling_small_mxfp4_spec();
+    auto index = load_safetensors_index(model_directory, kMaximumIndexBytes);
     if (!index.ok()) {
         result.errors = std::move(index.errors);
         return result;
     }
-    // The MTP heads ride in the same index as the backbone, so the shard count
-    // is the main shards plus the single MTP shard.
-    const auto expected_shards =
-        static_cast<std::size_t>(spec.source.main_shards) + spec.source.mtp_shards;
-    if (index.value.total_size != spec.source.indexed_tensor_bytes ||
-        index.value.entries.size() != spec.source.tensor_count ||
-        index.value.shards.size() != expected_shards) {
+    const auto matches = [&](const ModelSpec& spec) {
+        return index.value.total_size == spec.source.indexed_tensor_bytes &&
+               index.value.entries.size() == spec.source.tensor_count &&
+               index.value.shards.size() ==
+                   static_cast<std::size_t>(spec.source.main_shards) +
+                       spec.source.mtp_shards;
+    };
+    const bool nvfp4 = matches(nvfp4_spec);
+    const bool mxfp4 = matches(mxfp4_spec);
+    if (!nvfp4 && !mxfp4) {
         result.errors.emplace_back(
-            "Inkling checkpoint index extent is not pinned Small-NVFP4");
+            "Inkling checkpoint index extent is neither pinned Small-NVFP4 nor Small-MXFP4");
         return result;
     }
+    const auto& spec = nvfp4 ? nvfp4_spec : mxfp4_spec;
     for (const auto& shard : index.value.shards) {
         if (shard == kMtpShard) continue;
         char expected[48]{};
@@ -96,6 +95,8 @@ InklingCheckpointOpenResult InklingCheckpointReader::open(
     auto reader = std::unique_ptr<InklingCheckpointReader>(
         new InklingCheckpointReader());
     reader->model_directory_ = std::move(model_directory);
+    reader->format_ = nvfp4 ? InklingCheckpointFormat::Nvfp4Mixed
+                            : InklingCheckpointFormat::Mxfp4Group32;
     std::unordered_map<std::string, std::string> indexed;
     indexed.reserve(index.value.entries.size());
     for (const auto& entry : index.value.entries) {
@@ -145,6 +146,150 @@ InklingCheckpointOpenResult InklingCheckpointReader::open(
                                        index.value.shards, "Inkling");
     if (!opened.ok()) {
         result.errors = std::move(opened.errors);
+        return result;
+    }
+
+    if (reader->format_ == InklingCheckpointFormat::Mxfp4Group32) {
+        const auto require = [&](std::string_view name, SafetensorsDtype dtype,
+                                 std::initializer_list<std::uint64_t> shape) {
+            const auto* tensor = reader->find(name);
+            if (tensor == nullptr || tensor->dtype != dtype ||
+                tensor->shape != std::vector<std::uint64_t>(shape)) {
+                if (result.errors.size() < kMaximumOpenErrors) {
+                    result.errors.emplace_back(
+                        "Inkling MXFP4 tensor shape mismatch: " +
+                        std::string(name));
+                }
+            }
+        };
+        const auto require_plain = [&](std::string_view name,
+                                       std::initializer_list<std::uint64_t> shape) {
+            require(name, SafetensorsDtype::Bf16, shape);
+        };
+        const auto require_mxfp4 = [&](const std::string& base,
+                                       std::initializer_list<std::uint64_t> outer,
+                                       std::uint64_t rows,
+                                       std::uint64_t columns) {
+            std::vector<std::uint64_t> packed(outer);
+            packed.push_back(rows);
+            packed.push_back(columns / 8U);
+            std::vector<std::uint64_t> scales(outer);
+            scales.push_back(rows);
+            scales.push_back(columns / 32U);
+            const auto* weight = reader->find(base + ".weight");
+            const auto* scale = reader->find(base + ".scales");
+            if (columns % 32U != 0U || weight == nullptr || scale == nullptr ||
+                weight->dtype != SafetensorsDtype::U32 ||
+                scale->dtype != SafetensorsDtype::U8 ||
+                weight->shape != packed || scale->shape != scales) {
+                if (result.errors.size() < kMaximumOpenErrors) {
+                    result.errors.emplace_back(
+                        "Inkling MXFP4 matrix layout mismatch: " + base);
+                }
+            }
+        };
+
+        const auto hidden = static_cast<std::uint64_t>(kContract.hidden_size);
+        const auto head_dim = static_cast<std::uint64_t>(kContract.head_dim);
+        const auto query =
+            static_cast<std::uint64_t>(kContract.attention_heads) * head_dim;
+        const auto kv =
+            static_cast<std::uint64_t>(kContract.key_value_heads) * head_dim;
+        const auto relative =
+            static_cast<std::uint64_t>(kContract.attention_heads) *
+            kContract.relative_dim;
+        const auto dense =
+            static_cast<std::uint64_t>(kContract.dense_intermediate_size);
+        const auto expert =
+            static_cast<std::uint64_t>(kContract.expert_intermediate_size);
+        const auto vocabulary =
+            static_cast<std::uint64_t>(kContract.padded_vocabulary_size);
+        const std::string model = "language_model.model.";
+        require_mxfp4(model + "embed_tokens", {}, vocabulary, hidden);
+        require_plain(model + "embed_norm.weight", {hidden});
+        require_plain(model + "norm.weight", {hidden});
+        require_mxfp4("language_model.lm_head", {}, vocabulary, hidden);
+
+        for (std::uint32_t layer = 0U; layer < kContract.layer_count; ++layer) {
+            const auto prefix = model + "layers." + std::to_string(layer) + ".";
+            const auto attention = prefix + "self_attn.";
+            const auto mlp = prefix + "mlp.";
+            require_plain(prefix + "input_layernorm.weight", {hidden});
+            require_plain(prefix + "post_attention_layernorm.weight", {hidden});
+            require_plain(prefix + "attn_sconv.conv.weight",
+                          {hidden, kContract.short_conv_kernel, 1U});
+            require_plain(prefix + "mlp_sconv.conv.weight",
+                          {hidden, kContract.short_conv_kernel, 1U});
+            require_mxfp4(attention + "q_proj", {}, query, hidden);
+            require_mxfp4(attention + "k_proj", {}, kv, hidden);
+            require_mxfp4(attention + "v_proj", {}, kv, hidden);
+            require_mxfp4(attention + "r_proj", {}, relative, hidden);
+            require_mxfp4(attention + "o_proj", {}, hidden, query);
+            require_plain(attention + "q_norm.weight", {head_dim});
+            require_plain(attention + "k_norm.weight", {head_dim});
+            require_plain(attention + "k_sconv.conv.weight",
+                          {kv, kContract.short_conv_kernel, 1U});
+            require_plain(attention + "v_sconv.conv.weight",
+                          {kv, kContract.short_conv_kernel, 1U});
+            require_plain(attention + "rel_proj",
+                          {kContract.relative_dim,
+                           inkling_relative_extent(layer)});
+            if (!inkling_sparse_layer(layer)) {
+                require_plain(mlp + "global_scale", {1U});
+                require_mxfp4(mlp + "gate_proj", {}, dense, hidden);
+                require_mxfp4(mlp + "up_proj", {}, dense, hidden);
+                require_mxfp4(mlp + "down_proj", {}, hidden, dense);
+                continue;
+            }
+            require_plain(mlp + "gate_weight",
+                          {kContract.routed_experts + kContract.shared_experts,
+                           hidden});
+            require(mlp + "e_score_correction_bias", SafetensorsDtype::F32,
+                    {kContract.routed_experts});
+            require(mlp + "global_scale", SafetensorsDtype::F32, {1U});
+            for (const auto& bank : {std::string("shared_experts"),
+                                     std::string("switch_mlp")}) {
+                const auto experts = bank == "shared_experts"
+                    ? static_cast<std::uint64_t>(kContract.shared_experts)
+                    : static_cast<std::uint64_t>(kContract.routed_experts);
+                require_mxfp4(mlp + bank + ".gate_proj", {experts}, expert,
+                              hidden);
+                require_mxfp4(mlp + bank + ".up_proj", {experts}, expert,
+                              hidden);
+                require_mxfp4(mlp + bank + ".down_proj", {experts}, hidden,
+                              expert);
+            }
+            require(mlp + "switch_mlp.gate_scale", SafetensorsDtype::F32,
+                    {kContract.routed_experts});
+            require(mlp + "switch_mlp.out_scale", SafetensorsDtype::F32,
+                    {kContract.routed_experts});
+            if (result.errors.size() >= kMaximumOpenErrors) break;
+        }
+        if (!result.errors.empty()) return result;
+
+        // These arrays carry the NVFP4 conversion's per-expert scale factors.
+        // The MXFP4 converter deliberately preserves them as identities; any
+        // non-one value would require a distinct executor contract.
+        for (std::uint32_t layer = kContract.dense_prefix_layers;
+             layer < kContract.layer_count; ++layer) {
+            const auto prefix = model + "layers." + std::to_string(layer) +
+                                ".mlp.switch_mlp.";
+            for (const auto& name : {prefix + "gate_scale",
+                                     prefix + "out_scale"}) {
+                auto values = reader->read_f32(name, kContract.routed_experts);
+                if (!values.ok()) {
+                    append(result.errors, std::move(values.errors));
+                    continue;
+                }
+                if (!std::all_of(values.value.begin(), values.value.end(),
+                                 [](float value) { return value == 1.0F; })) {
+                    result.errors.emplace_back(
+                        "Inkling MXFP4 expert scale is not identity: " + name);
+                }
+            }
+        }
+        if (!result.errors.empty()) return result;
+        result.value = std::move(reader);
         return result;
     }
 
@@ -301,6 +446,37 @@ ParseResult<InklingLinear> InklingCheckpointReader::linear(
     ParseResult<InklingLinear> result;
     result.value.rows = rows;
     result.value.columns = columns;
+    if (format_ == InklingCheckpointFormat::Mxfp4Group32) {
+        const std::string base(name);
+        if (const auto* plain = find(base); plain != nullptr) {
+            if (plain->dtype != SafetensorsDtype::Bf16 ||
+                plain->shape != std::vector<std::uint64_t>{rows, columns}) {
+                result.errors.emplace_back(
+                    "Inkling MXFP4 plain linear is mismatched: " + base);
+                return result;
+            }
+            result.value.encoding = InklingTensorEncoding::Plain;
+            result.value.weight = plain;
+            return result;
+        }
+        const auto* packed = find(base + ".weight");
+        const auto* scale = find(base + ".scales");
+        if (packed == nullptr || scale == nullptr || columns % 32U != 0U ||
+            packed->dtype != SafetensorsDtype::U32 ||
+            scale->dtype != SafetensorsDtype::U8 ||
+            packed->shape !=
+                std::vector<std::uint64_t>{rows, columns / 8U} ||
+            scale->shape !=
+                std::vector<std::uint64_t>{rows, columns / 32U}) {
+            result.errors.emplace_back(
+                "Inkling MXFP4 linear is missing or mismatched: " + base);
+            return result;
+        }
+        result.value.encoding = InklingTensorEncoding::Mxfp4Group32;
+        result.value.packed = packed;
+        result.value.scale = scale;
+        return result;
+    }
     const auto* weight = find(name);
     if (weight == nullptr || weight->dtype != SafetensorsDtype::Bf16 ||
         weight->shape != std::vector<std::uint64_t>{rows, columns}) {
@@ -320,6 +496,25 @@ ParseResult<InklingExpertStack> InklingCheckpointReader::expert_stack(
     result.value.experts = experts;
     result.value.rows = rows;
     result.value.columns = columns;
+    if (format_ == InklingCheckpointFormat::Mxfp4Group32) {
+        const auto* packed = find(base + ".weight");
+        const auto* scale = find(base + ".scales");
+        if (packed == nullptr || scale == nullptr || columns % 32U != 0U ||
+            packed->dtype != SafetensorsDtype::U32 ||
+            scale->dtype != SafetensorsDtype::U8 ||
+            packed->shape != std::vector<std::uint64_t>{
+                experts, rows, columns / 8U} ||
+            scale->shape != std::vector<std::uint64_t>{
+                experts, rows, columns / 32U}) {
+            result.errors.emplace_back(
+                "Inkling MXFP4 expert stack is missing or mismatched: " + base);
+            return result;
+        }
+        result.value.encoding = InklingTensorEncoding::Mxfp4Group32;
+        result.value.packed = packed;
+        result.value.scale = scale;
+        return result;
+    }
     if (!inkling_quantized_expert_layer(layer)) {
         const auto* weight = find(base);
         if (weight == nullptr || weight->dtype != SafetensorsDtype::Bf16 ||
@@ -571,6 +766,72 @@ ParseResult<InklingNvfp4MatrixView> InklingCheckpointReader::nvfp4_expert_view(
     result.value.packed_columns = packed_columns;
     result.value.scale_columns = scale_columns;
     result.value.group_size = kContract.nvfp4_group_size;
+    return result;
+}
+
+ParseResult<InklingMxfp4MatrixView> InklingCheckpointReader::mxfp4_view(
+    const InklingLinear& module) const {
+    ParseResult<InklingMxfp4MatrixView> result;
+    if (module.encoding != InklingTensorEncoding::Mxfp4Group32 ||
+        module.packed == nullptr || module.scale == nullptr) {
+        result.errors.emplace_back("linear is not an Inkling MXFP4 module");
+        return result;
+    }
+    auto packed = view(module.packed->name);
+    auto scale = view(module.scale->name);
+    if (!packed.ok()) append(result.errors, std::move(packed.errors));
+    if (!scale.ok()) append(result.errors, std::move(scale.errors));
+    if (!result.ok()) return result;
+    const auto packed_columns = module.columns / 2U;
+    const auto scale_columns = module.columns / 32U;
+    if (packed.value.size() != module.rows * packed_columns ||
+        scale.value.size() != module.rows * scale_columns) {
+        result.errors.emplace_back("Inkling MXFP4 linear payload size mismatch");
+        return result;
+    }
+    result.value = {packed.value, scale.value, module.rows, module.columns,
+                    packed_columns, scale_columns, 32U};
+    return result;
+}
+
+ParseResult<InklingMxfp4MatrixView>
+InklingCheckpointReader::mxfp4_expert_view(
+    const InklingExpertStack& stack, std::uint64_t expert) const {
+    ParseResult<InklingMxfp4MatrixView> result;
+    if (stack.encoding != InklingTensorEncoding::Mxfp4Group32 ||
+        stack.packed == nullptr || stack.scale == nullptr) {
+        result.errors.emplace_back("expert stack is not an Inkling MXFP4 module");
+        return result;
+    }
+    if (expert >= stack.experts) {
+        result.errors.emplace_back("expert index is outside the MXFP4 stack");
+        return result;
+    }
+    auto packed = view(stack.packed->name);
+    auto scale = view(stack.scale->name);
+    if (!packed.ok()) append(result.errors, std::move(packed.errors));
+    if (!scale.ok()) append(result.errors, std::move(scale.errors));
+    if (!result.ok()) return result;
+    const auto packed_columns = stack.columns / 2U;
+    const auto scale_columns = stack.columns / 32U;
+    const auto packed_stride = stack.rows * packed_columns;
+    const auto scale_stride = stack.rows * scale_columns;
+    if (packed.value.size() != stack.experts * packed_stride ||
+        scale.value.size() != stack.experts * scale_stride) {
+        result.errors.emplace_back("Inkling MXFP4 expert payload size mismatch");
+        return result;
+    }
+    result.value.packed = packed.value.subspan(
+        static_cast<std::size_t>(expert * packed_stride),
+        static_cast<std::size_t>(packed_stride));
+    result.value.scales = scale.value.subspan(
+        static_cast<std::size_t>(expert * scale_stride),
+        static_cast<std::size_t>(scale_stride));
+    result.value.rows = stack.rows;
+    result.value.columns = stack.columns;
+    result.value.packed_columns = packed_columns;
+    result.value.scale_columns = scale_columns;
+    result.value.group_size = 32U;
     return result;
 }
 

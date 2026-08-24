@@ -27,6 +27,10 @@ struct LagunaRuntimeConfig {
     bool verbose{};
     bool load_progress{};
     bool enable_flash_attention{true};
+    // Keep the exact BF16 decode KV ring on the attention layer's device. This
+    // changes placement only: the host mirror remains authoritative for exact
+    // prompt continuation and the numerical contract is unchanged.
+    bool enable_device_resident_kv_decode{true};
     bool enable_incremental_kv_continuation{true};
     bool enable_thinking{true};
     // Records CUDA events around every activation upload, kernel, and download
@@ -103,6 +107,7 @@ struct LagunaRunMetrics {
     std::uint64_t rss_bytes{};
     std::vector<std::uint64_t> device_vram_used_bytes;
     bool flash_attention_enabled{};
+    bool device_resident_kv_decode{};
     bool incremental_kv_continuation{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {

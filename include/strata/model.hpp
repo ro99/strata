@@ -262,8 +262,14 @@ struct ModelSpec {
 [[nodiscard]] ModelSpec laguna_s21_nvfp4_spec();
 [[nodiscard]] ValidationResult validate_laguna_s21_nvfp4(
     const ModelSpec& spec);
+[[nodiscard]] ModelSpec laguna_s21_mxfp4_spec();
+[[nodiscard]] ValidationResult validate_laguna_s21_mxfp4(
+    const ModelSpec& spec);
 [[nodiscard]] ModelSpec inkling_small_nvfp4_spec();
 [[nodiscard]] ValidationResult validate_inkling_small_nvfp4(
+    const ModelSpec& spec);
+[[nodiscard]] ModelSpec inkling_small_mxfp4_spec();
+[[nodiscard]] ValidationResult validate_inkling_small_mxfp4(
     const ModelSpec& spec);
 
 }  // namespace strata

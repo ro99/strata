@@ -278,3 +278,49 @@ TEST_CASE("real DeepSeek V4 Flash 0731 checkpoint opens without format conversio
     REQUIRE(!strata::plan_dsv4_resident_topology(
                  checkpoint.value->manifest(), config).ok());
 }
+
+TEST_CASE("MIX-1 E8M0 admission accepts real scale codes and rejects 0 and 255") {
+    // The real DeepSeek V4 checkpoint spans codes [119, 125] (experiment 0156),
+    // so a healthy region must be admitted untouched.
+    std::vector<std::byte> healthy(4096U);
+    for (std::size_t i = 0U; i < healthy.size(); ++i) {
+        healthy[i] = static_cast<std::byte>(119U + (i % 7U));
+    }
+    const auto ok = strata::dsv4_admit_e8m0_scales(healthy);
+    REQUIRE(ok.admitted());
+    REQUIRE(ok.inadmissible == 0U);
+    REQUIRE(strata::dsv4_admit_e8m0_scales_for("healthy.scale", healthy).ok());
+
+    // The window boundaries themselves must be admitted: 1 is 2^-126, the
+    // smallest normal BF16 exponent, and 254 is 2^127.
+    const std::vector<std::byte> edges{std::byte{1U}, std::byte{254U}};
+    REQUIRE(strata::dsv4_admit_e8m0_scales(edges).admitted());
+
+    // Code 255 is the E8M0 NaN encoding and would decode to +inf.
+    auto nan_case = healthy;
+    nan_case[1234] = std::byte{255U};
+    const auto rejected_nan = strata::dsv4_admit_e8m0_scales(nan_case);
+    REQUIRE(!rejected_nan.admitted());
+    REQUIRE(rejected_nan.inadmissible == 1U);
+    REQUIRE(rejected_nan.code_255 == 1U);
+    REQUIRE(rejected_nan.code_zero == 0U);
+    REQUIRE(rejected_nan.first_offset == 1234U);
+    REQUIRE(rejected_nan.first_code == 255U);
+    const auto reported = strata::dsv4_admit_e8m0_scales_for("q.scale", nan_case);
+    REQUIRE(!reported.ok());
+    REQUIRE(reported.errors.front().find("q.scale") != std::string::npos);
+    REQUIRE(reported.errors.front().find("255") != std::string::npos);
+    REQUIRE(reported.errors.front().find("1234") != std::string::npos);
+
+    // Code 0 is 2^-127, subnormal in BF16, and would decode to +0.
+    auto zero_case = healthy;
+    zero_case[7] = std::byte{0U};
+    const auto rejected_zero = strata::dsv4_admit_e8m0_scales(zero_case);
+    REQUIRE(!rejected_zero.admitted());
+    REQUIRE(rejected_zero.code_zero == 1U);
+    REQUIRE(rejected_zero.code_255 == 0U);
+    REQUIRE(rejected_zero.first_offset == 7U);
+
+    // An empty region is vacuously admissible, not a failure.
+    REQUIRE(strata::dsv4_admit_e8m0_scales({}).admitted());
+}

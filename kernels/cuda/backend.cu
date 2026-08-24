@@ -2,6 +2,7 @@
 #include "strata/numerics.hpp"
 
 #include <cublas_v2.h>
+#include <cstdlib>
 #include <cstdio>
 #include <atomic>
 #include <cuda_bf16.h>
@@ -1252,6 +1253,19 @@ struct Nvfp4MoeBatch {
     std::uint32_t rows{};
 };
 
+// compressed-tensors MXFP4: E2M1 nibble pairs with power-of-two E8M0 scales
+// per group of 32 columns. Unlike NVFP4 there is no per-tensor divisor.
+struct Mxfp4MoeBatch {
+    const unsigned char* gate_weights[kMaxMoeExperts]{};
+    const unsigned char* gate_scales[kMaxMoeExperts]{};
+    const unsigned char* up_weights[kMaxMoeExperts]{};
+    const unsigned char* up_scales[kMaxMoeExperts]{};
+    const unsigned char* down_weights[kMaxMoeExperts]{};
+    const unsigned char* down_scales[kMaxMoeExperts]{};
+    std::uint32_t count{};
+    std::uint32_t rows{};
+};
+
 // Laguna carries the routed experts of layers 40-47 as plain BF16.
 struct PlainBf16MoeBatch {
     const __nv_bfloat16* gate_weights[kMaxMoeExperts]{};
@@ -2068,6 +2082,98 @@ __global__ void nvfp4_moe_down_kernel(
     }
 }
 
+// Canonical MXFP4 counterparts. The hidden and intermediate activations are
+// rounded to E4M3 by enqueue_moe immediately before these kernels, matching
+// the scalar Fp4E2m1Group32 matmul route on the same weights.
+__global__ void mxfp4_moe_gate_up_kernel(
+    float* activations, const float* hidden, Mxfp4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto* gate_weights = batch.gate_weights[expert];
+    const auto* gate_scales = batch.gate_scales[expert];
+    const auto* up_weights = batch.up_weights[expert];
+    const auto* up_scales = batch.up_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base = static_cast<std::uint64_t>(row) * columns;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const auto packed_index = weight_base + column / 2U;
+        const auto scale_index = scale_base + column / 32U;
+        const unsigned char gate_packed = gate_weights[packed_index];
+        const unsigned char up_packed = up_weights[packed_index];
+        const unsigned int gate_encoded =
+            column % 2U == 0U ? gate_packed & 0x0FU : gate_packed >> 4U;
+        const unsigned int up_encoded =
+            column % 2U == 0U ? up_packed & 0x0FU : up_packed >> 4U;
+        const float input = hidden[input_base + column];
+        gate += input * fp4_e2m1_value(gate_encoded) *
+                fp8_e8m0_scale_bits(gate_scales[scale_index]);
+        up += input * fp4_e2m1_value(up_encoded) *
+              fp8_e8m0_scale_bits(up_scales[scale_index]);
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F
+                                  ? 1.0F / (1.0F + exponential)
+                                  : exponential / (1.0F + exponential);
+        const auto activation =
+            (static_cast<std::uint64_t>(expert) * batch.rows + row) *
+                intermediate + output_row;
+        activations[activation] = gate * sigmoid * up;
+    }
+}
+
+__global__ void mxfp4_moe_down_kernel(
+    float* output, const float* activations, Mxfp4MoeBatch batch,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t packed_columns, std::uint64_t scale_columns,
+    unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= rows || expert >= batch.count) return;
+
+    const auto* weights = batch.down_weights[expert];
+    const auto* scales = batch.down_scales[expert];
+    const auto weight_base = output_row * packed_columns;
+    const auto scale_base = output_row * scale_columns;
+    const auto input_base =
+        (static_cast<std::uint64_t>(expert) * batch.rows + row) * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const unsigned char packed = weights[weight_base + column / 2U];
+        const unsigned int encoded =
+            column % 2U == 0U ? packed & 0x0FU : packed >> 4U;
+        sum += activations[input_base + column] * fp4_e2m1_value(encoded) *
+               fp8_e8m0_scale_bits(scales[scale_base + column / 32U]);
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
+               output_row] = sum;
+    }
+}
+
 // Plain BF16 counterparts. These keep bf16_matvec_kernel's one-warp-per-output-
 // row layout and its __fadd_rn/__shfl_down_sync reduction rather than the
 // block reduction the quantized batches use, so the dot product is summed in
@@ -2778,6 +2884,1127 @@ __global__ void deepseek_fp4_tiled_page_down_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Register-fed W8A16 shared expert (campaign milestone MIX-1).
+//
+// The incumbent deepseek_fp8_gate_up/down kernels are scalar matvecs: one block
+// per output row, one weight byte per lane, no tensor cores. Experiment 0143
+// measured that shape at about 13.5% of DRAM and 68% issue-bound. The accepted
+// QPN8-derived path (experiments 0158-0159) reaches 83-86% of the local read
+// roofline on these same E4M3/E8M0 block-128 shapes by keeping codes compressed
+// through HBM, pre-permuting them into m16n8k16 fragment order at load, and
+// decoding straight into MMA operand registers.
+//
+// Weights are prepacked in place: the fragment order REPLACES the canonical
+// device layout rather than adding a second copy, which is what the contract's
+// one-copy residency rule requires.
+// ---------------------------------------------------------------------------
+
+// Canonical [N][K] E4M3 bytes to m16n8k16 A-fragment order. One uint4 per lane
+// per 32-column pair-group, matching the layout the decode below expects.
+__global__ void dsv4_fp8_fragment_prepack_kernel(
+    uint4* __restrict__ destination, const unsigned char* __restrict__ source,
+    std::uint32_t rows, std::uint32_t columns) {
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t tiles = rows / 16U;
+    const std::uint32_t total = tiles * pairs * 32U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t lane = index & 31U;
+        const std::uint32_t pair = (index >> 5U) % pairs;
+        const std::uint32_t tile = (index >> 5U) / pairs;
+        std::uint32_t word[4]{};
+        for (std::uint32_t j = 0U; j < 2U; ++j) {
+            for (std::uint32_t i = 0U; i < 8U; ++i) {
+                const bool upper = i == 2U || i == 3U || i == 6U || i == 7U;
+                const std::uint32_t row =
+                    tile * 16U + (lane >> 2U) + (upper ? 8U : 0U);
+                const std::uint32_t column = (pair * 2U + j) * 16U +
+                                             (lane & 3U) * 2U + (i & 1U) +
+                                             (i >= 4U ? 8U : 0U);
+                word[j * 2U + (i >= 4U ? 1U : 0U)] |=
+                    static_cast<std::uint32_t>(
+                        source[static_cast<std::size_t>(row) * columns + column])
+                    << ((i & 3U) * 8U);
+            }
+        }
+        destination[index] = make_uint4(word[0], word[1], word[2], word[3]);
+    }
+}
+
+// Two packed E4M3 codes to a packed BF16 pair, scaled, entirely in registers.
+__device__ __forceinline__ std::uint32_t dsv4_fp8_decode_pair(
+    std::uint32_t pair, std::uint32_t factor) {
+    const auto permuted = __byte_perm(pair, 0U, 0x4140U);
+    const std::uint32_t widened =
+        ((permuted << 8U) & 0x8000'8000U) | ((permuted << 4U) & 0x07F0'07F0U);
+    const auto scaled =
+        __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&widened),
+                *reinterpret_cast<const __nv_bfloat162*>(&factor));
+    return *reinterpret_cast<const std::uint32_t*>(&scaled);
+}
+
+__device__ __forceinline__ void dsv4_mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3, std::uint32_t a0,
+    std::uint32_t a1, std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
+    std::uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// ---------------------------------------------------------------------------
+// Generic register-fed W4A16 / W8A16 matmul (campaign milestone MIX-2).
+//
+// The two kernels below are the accepted QPN skinny-kernel shape made model
+// agnostic. Nothing here knows about DeepSeek: they take a weight in
+// m16n8k16 fragment order, an activation already permuted into B-fragment
+// order, and produce the same [M][N] output the scalar kernels produce, so any
+// architecture whose weights carry Fp4E2m1Group32 or Fp8E4m3Block128 encoding
+// reaches them through CudaBackend::matmul_impl.
+//
+// Numerical contract against the incumbent scalar kernels. matmul_impl rounds
+// the activation to E4M3 before either path runs, and an E4M3 value has three
+// mantissa bits, so its BF16 image is exact. An E2M1 code has one mantissa bit
+// and an E4M3 code three; an E8M0 scale is a power of two. Every operand of the
+// tensor op is therefore the same real number the scalar kernel multiplies --
+// the paths differ only in FP32 accumulation order, not in operand precision.
+//
+// Shape admission is explicit and there is no silent fallback: a weight whose
+// shape the fragment layout cannot express keeps the scalar route, and the
+// census records which one ran.
+// ---------------------------------------------------------------------------
+
+constexpr std::uint32_t kRegfedTileN = 16U;   // MMA M dimension = weight rows
+constexpr std::uint32_t kRegfedTileM = 8U;    // MMA N dimension = activation cols
+constexpr std::uint32_t kRegfedTileK = 16U;   // MMA K dimension
+constexpr std::uint32_t kRegfedWarp = 32U;
+constexpr std::uint32_t kRegfedGroup = 32U;   // E8M0 group along K for FP4
+// Experiment 0140 measured argmax as load granularity: one uint4 per lane per
+// four K-tiles makes a warp issue one fully coalesced 512-byte transaction that
+// feeds four MMAs.
+constexpr std::uint32_t kRegfedKPerLoad = 4U;
+constexpr std::uint32_t kRegfedWarpsPerBlock = 4U;
+// One m16n8k16 covers eight activation columns. Two column blocks cover M<=16,
+// which is the whole skinny regime; wider M keeps the scalar route, where the
+// weight read is already amortized across many rows.
+constexpr std::uint32_t kRegfedMaxColBlocks = 2U;
+constexpr std::uint32_t kRegfedMaxM = kRegfedTileM * kRegfedMaxColBlocks;
+// FP8 decode folds a 2^120 exponent correction into the block scale, so the
+// E8M0 code must leave the BF16 multiplier normal: code + 120 in [1, 254].
+constexpr std::uint32_t kRegfedFp8ScaleCodeMaximum = 134U;
+
+__constant__ std::uint32_t kRegfedFp4MagnitudeHigh[2] = {0x3F3F'3F00U,
+                                                         0x4040'4040U};
+__constant__ std::uint32_t kRegfedFp4MagnitudeLow[2] = {0xC080'0000U,
+                                                        0xC080'4000U};
+
+__device__ __forceinline__ std::uint32_t regfed_fp4_scale_pair(
+    std::uint32_t code) {
+    return (code << 7U) * 0x0001'0001U;
+}
+
+// Eight E2M1 codes to four packed BF16 pairs, in MMA A-fragment register order.
+// Registers 0 and 2 carry weight row g, registers 1 and 3 carry row g+8, so the
+// two rows' E8M0 scales are selected by register parity -- experiment 0140's
+// scale-to-K binding defect was exactly this selection applied flat.
+__device__ __forceinline__ void regfed_fp4_decode_fragment(
+    std::uint32_t word, std::uint32_t scale_low_row,
+    std::uint32_t scale_high_row, std::uint32_t (&out)[4]) {
+    const std::uint32_t mag = word & 0x7777'7777U;
+    const std::uint32_t ha =
+        __byte_perm(kRegfedFp4MagnitudeHigh[0], kRegfedFp4MagnitudeHigh[1], mag);
+    const std::uint32_t la =
+        __byte_perm(kRegfedFp4MagnitudeLow[0], kRegfedFp4MagnitudeLow[1], mag);
+    const std::uint32_t hb = __byte_perm(
+        kRegfedFp4MagnitudeHigh[0], kRegfedFp4MagnitudeHigh[1], mag >> 16U);
+    const std::uint32_t lb = __byte_perm(
+        kRegfedFp4MagnitudeLow[0], kRegfedFp4MagnitudeLow[1], mag >> 16U);
+    const std::uint32_t pa = __byte_perm(la, ha, 0x5140U);
+    const std::uint32_t qa = __byte_perm(la, ha, 0x7362U);
+    const std::uint32_t pb = __byte_perm(lb, hb, 0x5140U);
+    const std::uint32_t qb = __byte_perm(lb, hb, 0x7362U);
+    std::uint32_t value[4];
+    value[0] = __byte_perm(pa, pb, 0x5410U);
+    value[1] = __byte_perm(pa, pb, 0x7632U);
+    value[2] = __byte_perm(qa, qb, 0x5410U);
+    value[3] = __byte_perm(qa, qb, 0x7632U);
+#pragma unroll
+    for (std::uint32_t i = 0U; i < 4U; ++i) {
+        const std::uint32_t scale =
+            ((i & 1U) == 0U) ? scale_low_row : scale_high_row;
+        // Code 0x8 is negative zero in E2M1 but the oracle's zero is positive,
+        // so the sign is suppressed when the magnitude is zero.
+        const std::uint32_t signs = (word << (12U - i * 4U)) & 0x8000'8000U;
+        const std::uint32_t non_zero = value[i] + 0x7F80'7F80U;
+        const __nv_bfloat162 scaled =
+            __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&value[i]),
+                    *reinterpret_cast<const __nv_bfloat162*>(&scale));
+        out[i] = *reinterpret_cast<const std::uint32_t*>(&scaled) ^
+                 (signs & non_zero & 0x8000'8000U);
+    }
+}
+
+// ---- layout transforms -----------------------------------------------------
+
+// Canonical FP4 [N][K/2] nibble pairs to fragment order. A pure permutation:
+// the destination holds N*K/2 bytes, exactly what the source holds, so the
+// prepack can run in place through transient scratch.
+__global__ void regfed_fp4_prepack_codes_kernel(
+    std::uint32_t* __restrict__ destination,
+    const unsigned char* __restrict__ source, std::uint32_t rows,
+    std::uint32_t columns) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t total = n_tiles * k_tiles * kRegfedWarp;
+    const std::size_t packed_columns = columns / 2U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t lane = index & 31U;
+        const std::uint32_t k_tile = (index >> 5U) % k_tiles;
+        const std::uint32_t n_tile = (index >> 5U) / k_tiles;
+        const std::uint32_t group = lane >> 2U;
+        const std::uint32_t thread = lane & 3U;
+        std::uint32_t word = 0U;
+#pragma unroll
+        for (std::uint32_t i = 0U; i < 4U; ++i) {
+            const std::uint32_t row =
+                n_tile * kRegfedTileN + group + (((i & 1U) != 0U) ? 8U : 0U);
+            const std::uint32_t column =
+                k_tile * kRegfedTileK + thread * 2U + ((i >= 2U) ? 8U : 0U);
+            // The column is always even, so one byte carries both codes.
+            const unsigned char pair =
+                source[static_cast<std::size_t>(row) * packed_columns +
+                       column / 2U];
+            word |= static_cast<std::uint32_t>(pair & 0x0FU) << (i * 4U);
+            word |= static_cast<std::uint32_t>(pair >> 4U) << ((i + 4U) * 4U);
+        }
+        const std::uint32_t block = k_tile / kRegfedKPerLoad;
+        const std::uint32_t slot = k_tile % kRegfedKPerLoad;
+        destination[((static_cast<std::size_t>(n_tile) *
+                          (k_tiles / kRegfedKPerLoad) + block) * kRegfedWarp +
+                     lane) * kRegfedKPerLoad + slot] = word;
+    }
+}
+
+// Canonical FP4 [N][K/32] E8M0 scales to tile-major order, so one uint4 load
+// per lane covers all sixteen rows of an N-tile for one K-group.
+__global__ void regfed_fp4_prepack_scales_kernel(
+    unsigned char* __restrict__ destination,
+    const unsigned char* __restrict__ source, std::uint32_t rows,
+    std::uint32_t scale_columns) {
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t total = n_tiles * scale_columns * kRegfedTileN;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t row = index % kRegfedTileN;
+        const std::uint32_t group = (index / kRegfedTileN) % scale_columns;
+        const std::uint32_t n_tile = (index / kRegfedTileN) / scale_columns;
+        destination[index] =
+            source[(static_cast<std::size_t>(n_tile) * kRegfedTileN + row) *
+                       scale_columns + group];
+    }
+}
+
+// FP32 activation [M][K] to MMA B-fragment order. For lane (group, thread) of
+// column block c, b0 carries K rows {2t, 2t+1} and b1 carries {2t+8, 2t+9} of
+// activation column c*8 + group. Columns past M are a stored zero rather than a
+// branch in the inner loop.
+__global__ void regfed_activation_fragment_kernel(
+    uint2* __restrict__ destination, const float* __restrict__ source,
+    std::uint32_t m, std::uint32_t columns, std::uint32_t column_blocks,
+    std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t total = k_tiles * column_blocks * groups_per_block * 4U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t thread = index % 4U;
+        const std::uint32_t group = (index / 4U) % groups_per_block;
+        const std::uint32_t block =
+            (index / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile = index / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        std::uint32_t b0 = 0U;
+        std::uint32_t b1 = 0U;
+        if (column < m) {
+            const float* row = source + static_cast<std::size_t>(column) * columns;
+            const auto bits = [&](std::uint32_t offset) {
+                return static_cast<std::uint32_t>(
+                    __bfloat16_as_ushort(__float2bfloat16_rn(
+                        row[k_tile * kRegfedTileK + offset])));
+            };
+            b0 = bits(thread * 2U) | (bits(thread * 2U + 1U) << 16U);
+            b1 = bits(thread * 2U + 8U) | (bits(thread * 2U + 9U) << 16U);
+        }
+        destination[index] = make_uint2(b0, b1);
+    }
+}
+
+// ---- the kernels -----------------------------------------------------------
+
+// One warp owns one (N-tile, K-slice). The last slice of a tile folds the
+// split-K reduction itself: a separate reduce kernel cost a full 4.10 us of
+// dispatch for trivial work, 29% of the step at these matrix sizes.
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp4_matmul_kernel(
+    float* __restrict__ output, const std::uint32_t* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const uint2* __restrict__ activations, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t split, std::uint32_t m,
+    std::uint32_t groups_per_block, float* __restrict__ partials,
+    std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t k_blocks = k_tiles / kRegfedKPerLoad;
+    const std::uint32_t blocks_per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedGroup;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
+
+    bool live[kColBlocks];
+    std::size_t activation_offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        activation_offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t n_tile = work / split;
+        const std::uint32_t slice = work % split;
+        float acc[kColBlocks][4];
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c)
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][i] = 0.0F;
+
+        const uint4* code4 = reinterpret_cast<const uint4*>(codes);
+        const std::uint32_t begin = slice * blocks_per_slice;
+        const std::uint32_t end = begin + blocks_per_slice;
+        for (std::uint32_t block = begin; block < end; ++block) {
+            const uint4 packed =
+                code4[(static_cast<std::size_t>(n_tile) * k_blocks + block) *
+                          kRegfedWarp + lane];
+            const unsigned char* base =
+                scales + (static_cast<std::size_t>(n_tile) * scale_columns +
+                          block * 2U) * kRegfedTileN;
+            const uint4 even = *reinterpret_cast<const uint4*>(base);
+            const uint4 odd =
+                *reinterpret_cast<const uint4*>(base + kRegfedTileN);
+            const std::uint32_t word[kRegfedKPerLoad] = {packed.x, packed.y,
+                                                         packed.z, packed.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                // K-tiles 0 and 1 of the block sit in the even E8M0 group, 2
+                // and 3 in the odd one; the select is compile time.
+                const uint4 chosen = (j < 2U) ? even : odd;
+                const std::uint32_t low_word = (group < 4U) ? chosen.x : chosen.y;
+                const std::uint32_t high_word = (group < 4U) ? chosen.z : chosen.w;
+                std::uint32_t a[4];
+                regfed_fp4_decode_fragment(
+                    word[j], regfed_fp4_scale_pair((low_word >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((high_word >> shift) & 0xFFU), a);
+                const std::size_t tile_base =
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                    kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b =
+                        live[c] ? activations[tile_base + activation_offset[c]]
+                                : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a[0], a[1], a[2], a[3], b.x, b.y);
+                }
+            }
+        }
+
+        // D fragment: row = group + (i>=2 ? 8 : 0), column = thread*2 + (i&1),
+        // offset by the column block. Columns past M are never stored, which
+        // keeps split-K partial traffic proportional to the real M rather than
+        // to the padded tile.
+        float* slot = partials + (static_cast<std::size_t>(work)) *
+                                     kRegfedTileN * kRegfedMaxM;
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column < m) slot[row * m + column] = acc[c][i];
+            }
+        }
+
+        __threadfence();
+        __syncwarp();
+        if (lane == 0U) {
+            arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        }
+        __syncwarp();
+        if (arrived[warp] == split - 1U) {
+            if (lane < kRegfedTileN) {
+                for (std::uint32_t column = 0U; column < m; ++column) {
+                    float sum = 0.0F;
+                    for (std::uint32_t s = 0U; s < split; ++s) {
+                        sum += partials[(static_cast<std::size_t>(n_tile) *
+                                             split + s) * kRegfedTileN *
+                                            kRegfedMaxM + lane * m + column];
+                    }
+                    // matmul_impl's output is [M][N], not [N][M].
+                    output[static_cast<std::size_t>(column) * rows +
+                           n_tile * kRegfedTileN + lane] = sum;
+                }
+            }
+            if (lane == 0U) counters[n_tile] = 0U;
+        }
+    }
+}
+
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp8_matmul_kernel(
+    float* __restrict__ output, const uint4* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const uint2* __restrict__ activations, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t scale_columns, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block,
+    float* __restrict__ partials, std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t pairs_per_slice = pairs / split;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
+
+    bool live[kColBlocks];
+    std::size_t activation_offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        activation_offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t n_tile = work / split;
+        const std::uint32_t slice = work % split;
+        float acc[kColBlocks][4];
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c)
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][i] = 0.0F;
+
+        for (std::uint32_t pair = slice * pairs_per_slice;
+             pair < (slice + 1U) * pairs_per_slice; ++pair) {
+            const std::uint32_t k_tile = pair * 2U;
+            // Block-128 scales are indexed by row block and column block, so
+            // they need no permutation and stay in canonical order.
+            const std::uint32_t factor =
+                ((static_cast<std::uint32_t>(
+                      scales[(n_tile / 8U) * scale_columns + k_tile / 8U]) +
+                  120U) << 7U) * 0x0001'0001U;
+            const uint4 packed =
+                codes[(static_cast<std::size_t>(n_tile) * pairs + pair) * 32U +
+                      lane];
+            const std::uint32_t word[4] = {packed.x, packed.y, packed.z,
+                                           packed.w};
+#pragma unroll
+            for (std::uint32_t half = 0U; half < 2U; ++half) {
+                const std::uint32_t low = word[half * 2U];
+                const std::uint32_t high = word[half * 2U + 1U];
+                const std::uint32_t a0 =
+                    dsv4_fp8_decode_pair(low & 0xFFFFU, factor);
+                const std::uint32_t a1 =
+                    dsv4_fp8_decode_pair(low >> 16U, factor);
+                const std::uint32_t a2 =
+                    dsv4_fp8_decode_pair(high & 0xFFFFU, factor);
+                const std::uint32_t a3 =
+                    dsv4_fp8_decode_pair(high >> 16U, factor);
+                const std::size_t tile_base =
+                    (static_cast<std::size_t>(k_tile) + half) * kColBlocks *
+                    groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b =
+                        live[c] ? activations[tile_base + activation_offset[c]]
+                                : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a0, a1, a2, a3, b.x, b.y);
+                }
+            }
+        }
+
+        float* slot = partials + (static_cast<std::size_t>(work)) *
+                                     kRegfedTileN * kRegfedMaxM;
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column < m) slot[row * m + column] = acc[c][i];
+            }
+        }
+
+        __threadfence();
+        __syncwarp();
+        if (lane == 0U) {
+            arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        }
+        __syncwarp();
+        if (arrived[warp] == split - 1U) {
+            if (lane < kRegfedTileN) {
+                for (std::uint32_t column = 0U; column < m; ++column) {
+                    float sum = 0.0F;
+                    for (std::uint32_t s = 0U; s < split; ++s) {
+                        sum += partials[(static_cast<std::size_t>(n_tile) *
+                                             split + s) * kRegfedTileN *
+                                            kRegfedMaxM + lane * m + column];
+                    }
+                    output[static_cast<std::size_t>(column) * rows +
+                           n_tile * kRegfedTileN + lane] = sum;
+                }
+            }
+            if (lane == 0U) counters[n_tile] = 0U;
+        }
+    }
+}
+
+// Shape admission for the register-fed routes. Stated once, used by both the
+// load-time prepack and the dispatch, so a weight can never be prepacked into a
+// layout the kernel will not read.
+[[nodiscard]] inline bool regfed_fp4_shape_admissible(
+    std::uint64_t rows, std::uint64_t columns) noexcept {
+    return rows % kRegfedTileN == 0U &&
+           columns % (kRegfedTileK * kRegfedKPerLoad) == 0U &&
+           columns % kRegfedGroup == 0U && rows >= kRegfedTileN &&
+           columns >= kRegfedTileK * kRegfedKPerLoad;
+}
+
+[[nodiscard]] inline bool regfed_fp8_shape_admissible(
+    std::uint64_t rows, std::uint64_t columns) noexcept {
+    // Block-128 scales are shared by sixteen-row tiles and by eight K-tiles, so
+    // both extents must be whole multiples of 128 for one code to cover a tile.
+    return rows % 128U == 0U && columns % 128U == 0U;
+}
+
+// Splits K so the tail of the machine stays busy without inflating partial
+// traffic: every slice must be a whole number of load blocks, and the warp
+// count is grown only while the grid is still short of the device.
+[[nodiscard]] inline std::uint32_t regfed_split_k(
+    std::uint32_t units, std::uint32_t n_tiles) noexcept {
+    std::uint32_t split = 1U;
+    while (split < 16U && units % (split * 2U) == 0U &&
+           n_tiles * split * 2U <= 4096U) {
+        split *= 2U;
+    }
+    return split;
+}
+
+// A/B switch for the register-fed routes. Default on: the campaign's gates were
+// measured on these kernels and the scalar routes are the incumbent, so the
+// interesting arm is the one that runs by default and the control is the one
+// that has to be asked for.
+std::atomic<int> g_regfed_matmul_enabled{-1};
+
+[[nodiscard]] bool regfed_matmul_enabled() noexcept {
+    auto current = g_regfed_matmul_enabled.load(std::memory_order_relaxed);
+    if (current < 0) {
+        const char* value = std::getenv("STRATA_REGFED_MATMUL");
+        current = (value == nullptr || (value[0] != '0' && value[0] != 'n' &&
+                                        value[0] != 'N'))
+                      ? 1
+                      : 0;
+        g_regfed_matmul_enabled.store(current, std::memory_order_relaxed);
+    }
+    return current != 0;
+}
+
+// ---------------------------------------------------------------------------
+// Register-fed fused MXFP4 MoE (campaign task A).
+//
+// The scalar mxfp4_moe_gate_up/down kernels above reach 15.3% and 9.9% of this
+// card's measured read roofline at Laguna's real dispatch width, and hold that
+// figure from width 8 to 64 -- bandwidth-bound, not dispatch-bound (experiment
+// 0168). The register-fed decode collects 5.04x and 6.30x of that headroom at
+// the same width by keeping the codes four bits through HBM and decoding
+// straight into MMA operand registers.
+//
+// enqueue_moe already rounds both activations to E4M3 -- the hidden vector
+// before gate/up and the SwiGLU output before down -- and an E4M3 value has
+// three mantissa bits, so its BF16 image is exact. E2M1 codes and power-of-two
+// E8M0 scales are exact in BF16 too, so these kernels multiply the same real
+// numbers the scalar kernels multiply and differ only in accumulation order.
+// ---------------------------------------------------------------------------
+
+// Activation permute into MMA B-fragment order, batched over experts. gate/up
+// share one hidden vector, so they pass experts = 1; down reads a distinct
+// activation block per expert.
+__global__ void regfed_moe_activation_fragment_kernel(
+    uint2* __restrict__ destination, const float* __restrict__ source,
+    std::uint32_t experts, std::uint32_t m, std::uint32_t columns,
+    std::uint32_t column_blocks, std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t per_expert = k_tiles * column_blocks * groups_per_block * 4U;
+    const std::uint64_t total = static_cast<std::uint64_t>(experts) * per_expert;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t local = static_cast<std::uint32_t>(index % per_expert);
+        const std::uint32_t expert = static_cast<std::uint32_t>(index / per_expert);
+        const std::uint32_t thread = local % 4U;
+        const std::uint32_t group = (local / 4U) % groups_per_block;
+        const std::uint32_t block = (local / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile = local / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        std::uint32_t b0 = 0U;
+        std::uint32_t b1 = 0U;
+        if (column < m) {
+            const float* row =
+                source + (static_cast<std::size_t>(expert) * m + column) * columns;
+            const auto bits = [&](std::uint32_t offset) {
+                return static_cast<std::uint32_t>(__bfloat16_as_ushort(
+                    __float2bfloat16_rn(row[k_tile * kRegfedTileK + offset])));
+            };
+            b0 = bits(thread * 2U) | (bits(thread * 2U + 1U) << 16U);
+            b1 = bits(thread * 2U + 8U) | (bits(thread * 2U + 9U) << 16U);
+        }
+        destination[index] = make_uint2(b0, b1);
+    }
+}
+
+// One warp owns one (expert, N-tile, K-slice). Gate and up share the activation
+// fragment, so a single pass over the hidden vector feeds both weight streams.
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_mxfp4_moe_gate_up_kernel(
+    float* __restrict__ gate_partials, float* __restrict__ up_partials,
+    const uint2* __restrict__ activations, Mxfp4MoeBatch batch,
+    std::uint32_t columns, std::uint32_t intermediate, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = intermediate / kRegfedTileN;
+    const std::uint32_t k_blocks = (columns / kRegfedTileK) / kRegfedKPerLoad;
+    const std::uint32_t per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedGroup;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    const std::uint32_t total = batch.count * n_tiles * split;
+
+    bool live[kColBlocks];
+    std::size_t offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        offset[c] = (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < total; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t slice = work % split;
+        const std::uint32_t flat = work / split;
+        const std::uint32_t n_tile = flat % n_tiles;
+        const std::uint32_t expert = flat / n_tiles;
+        const auto* gate4 = reinterpret_cast<const uint4*>(batch.gate_weights[expert]);
+        const auto* up4 = reinterpret_cast<const uint4*>(batch.up_weights[expert]);
+        const unsigned char* gs = batch.gate_scales[expert];
+        const unsigned char* us = batch.up_scales[expert];
+        float gate[kColBlocks][4]{};
+        float up[kColBlocks][4]{};
+
+        for (std::uint32_t block = slice * per_slice;
+             block < (slice + 1U) * per_slice; ++block) {
+            const std::size_t index =
+                (static_cast<std::size_t>(n_tile) * k_blocks + block) * kRegfedWarp + lane;
+            const uint4 gpacked = gate4[index];
+            const uint4 upacked = up4[index];
+            const std::size_t sbase =
+                (static_cast<std::size_t>(n_tile) * scale_columns + block * 2U) *
+                kRegfedTileN;
+            const uint4 g_even = *reinterpret_cast<const uint4*>(gs + sbase);
+            const uint4 g_odd = *reinterpret_cast<const uint4*>(gs + sbase + kRegfedTileN);
+            const uint4 u_even = *reinterpret_cast<const uint4*>(us + sbase);
+            const uint4 u_odd = *reinterpret_cast<const uint4*>(us + sbase + kRegfedTileN);
+            const std::uint32_t gw[4] = {gpacked.x, gpacked.y, gpacked.z, gpacked.w};
+            const std::uint32_t uw[4] = {upacked.x, upacked.y, upacked.z, upacked.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                const uint4 gsel = (j < 2U) ? g_even : g_odd;
+                const uint4 usel = (j < 2U) ? u_even : u_odd;
+                std::uint32_t ga[4];
+                std::uint32_t ua[4];
+                regfed_fp4_decode_fragment(
+                    gw[j],
+                    regfed_fp4_scale_pair((((group < 4U) ? gsel.x : gsel.y) >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((((group < 4U) ? gsel.z : gsel.w) >> shift) & 0xFFU),
+                    ga);
+                regfed_fp4_decode_fragment(
+                    uw[j],
+                    regfed_fp4_scale_pair((((group < 4U) ? usel.x : usel.y) >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((((group < 4U) ? usel.z : usel.w) >> shift) & 0xFFU),
+                    ua);
+                const std::size_t base =
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                    kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b = live[c] ? activations[base + offset[c]]
+                                            : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(gate[c][0], gate[c][1], gate[c][2], gate[c][3],
+                                      ga[0], ga[1], ga[2], ga[3], b.x, b.y);
+                    dsv4_mma_m16n8k16(up[c][0], up[c][1], up[c][2], up[c][3],
+                                      ua[0], ua[1], ua[2], ua[3], b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column = c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column >= m) continue;
+                const std::size_t slot =
+                    ((static_cast<std::size_t>(expert) * intermediate +
+                      n_tile * kRegfedTileN + row) * m + column) * split + slice;
+                gate_partials[slot] = gate[c][i];
+                up_partials[slot] = up[c][i];
+            }
+        }
+    }
+}
+
+// Sums the split-K partials and applies the SwiGLU. The branchy sigmoid is
+// reproduced from mxfp4_moe_gate_up_kernel exactly, so this path is
+// indistinguishable from the incumbent rather than merely close.
+__global__ void regfed_mxfp4_moe_swiglu_kernel(
+    float* __restrict__ activations, const float* __restrict__ gate_partials,
+    const float* __restrict__ up_partials, std::uint32_t experts,
+    std::uint32_t intermediate, std::uint32_t m, std::uint32_t split,
+    unsigned int* __restrict__ error_flag) {
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(experts) * intermediate * m;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t column = static_cast<std::uint32_t>(index % m);
+        const std::uint32_t rest = static_cast<std::uint32_t>(index / m);
+        const std::uint32_t output_row = rest % intermediate;
+        const std::uint32_t expert = rest / intermediate;
+        float gate = 0.0F;
+        float up = 0.0F;
+        for (std::uint32_t slice = 0U; slice < split; ++slice) {
+            gate += gate_partials[index * split + slice];
+            up += up_partials[index * split + slice];
+        }
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            continue;
+        }
+        const float exponential = gate >= 0.0F ? expf(-gate) : expf(gate);
+        const float sigmoid = gate >= 0.0F ? 1.0F / (1.0F + exponential)
+                                           : exponential / (1.0F + exponential);
+        activations[(static_cast<std::size_t>(expert) * m + column) * intermediate +
+                    output_row] = gate * sigmoid * up;
+    }
+}
+
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_mxfp4_moe_down_kernel(
+    float* __restrict__ partials, const uint2* __restrict__ activations,
+    Mxfp4MoeBatch batch, std::uint32_t columns, std::uint32_t rows,
+    std::uint32_t split, std::uint32_t m, std::uint32_t groups_per_block) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_blocks = (columns / kRegfedTileK) / kRegfedKPerLoad;
+    const std::uint32_t per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedGroup;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    const std::uint32_t total = batch.count * n_tiles * split;
+    const std::size_t per_expert_activation =
+        static_cast<std::size_t>(columns / kRegfedTileK) * kColBlocks *
+        groups_per_block * 4U;
+
+    bool live[kColBlocks];
+    std::size_t offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        offset[c] = (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < total; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t slice = work % split;
+        const std::uint32_t flat = work / split;
+        const std::uint32_t n_tile = flat % n_tiles;
+        const std::uint32_t expert = flat / n_tiles;
+        const auto* codes4 = reinterpret_cast<const uint4*>(batch.down_weights[expert]);
+        const unsigned char* sc = batch.down_scales[expert];
+        float acc[kColBlocks][4]{};
+
+        for (std::uint32_t block = slice * per_slice;
+             block < (slice + 1U) * per_slice; ++block) {
+            const uint4 packed =
+                codes4[(static_cast<std::size_t>(n_tile) * k_blocks + block) *
+                           kRegfedWarp + lane];
+            const std::size_t sbase =
+                (static_cast<std::size_t>(n_tile) * scale_columns + block * 2U) *
+                kRegfedTileN;
+            const uint4 even = *reinterpret_cast<const uint4*>(sc + sbase);
+            const uint4 odd = *reinterpret_cast<const uint4*>(sc + sbase + kRegfedTileN);
+            const std::uint32_t w[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                const uint4 sel = (j < 2U) ? even : odd;
+                std::uint32_t a[4];
+                regfed_fp4_decode_fragment(
+                    w[j],
+                    regfed_fp4_scale_pair((((group < 4U) ? sel.x : sel.y) >> shift) & 0xFFU),
+                    regfed_fp4_scale_pair((((group < 4U) ? sel.z : sel.w) >> shift) & 0xFFU),
+                    a);
+                const std::size_t base =
+                    static_cast<std::size_t>(expert) * per_expert_activation +
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                        kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b = live[c] ? activations[base + offset[c]]
+                                            : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a[0], a[1], a[2], a[3], b.x, b.y);
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column = c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column >= m) continue;
+                const std::size_t slot =
+                    ((static_cast<std::size_t>(expert) * rows +
+                      n_tile * kRegfedTileN + row) * m + column) * split + slice;
+                partials[slot] = acc[c][i];
+            }
+        }
+    }
+}
+
+__global__ void regfed_mxfp4_moe_reduce_kernel(
+    float* __restrict__ output, const float* __restrict__ partials,
+    std::uint32_t experts, std::uint32_t rows, std::uint32_t m,
+    std::uint32_t split, unsigned int* __restrict__ error_flag) {
+    const std::uint64_t total = static_cast<std::uint64_t>(experts) * rows * m;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t column = static_cast<std::uint32_t>(index % m);
+        const std::uint32_t rest = static_cast<std::uint32_t>(index / m);
+        const std::uint32_t output_row = rest % rows;
+        const std::uint32_t expert = rest / rows;
+        float sum = 0.0F;
+        for (std::uint32_t slice = 0U; slice < split; ++slice) {
+            sum += partials[index * split + slice];
+        }
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::size_t>(expert) * m + column) * rows + output_row] = sum;
+    }
+}
+
+// Scratch needed to permute this weight into fragment order, or zero if the
+// encoding or the extents are inadmissible. The permutation cannot be done in
+// place, but the scratch is transient and shared across every weight on the
+// device, so no second persistent copy of any weight exists.
+[[nodiscard]] std::uint64_t fragment_prepack_scratch_bytes(
+    const CudaWeightDescriptor& descriptor) noexcept {
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        if (!regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)) {
+            return 0U;
+        }
+        return descriptor.rows * descriptor.columns;
+    }
+    if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+        if (!regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns)) {
+            return 0U;
+        }
+        return descriptor.rows * descriptor.packed_columns;
+    }
+    return 0U;
+}
+
+// Stream-ordered fragment prepack. Ordering behind the upload copy is a device
+// dependency, not a host one, so this enqueues on the same stream the copy used
+// and never blocks the loader.
+cudaError_t launch_fragment_prepack(const CudaWeightDescriptor& descriptor,
+                                    void* weights, void* scales, void* scratch,
+                                    cudaStream_t stream) {
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    constexpr unsigned int threads = 256U;
+    const auto grid = [](std::uint64_t total) {
+        return static_cast<unsigned int>(
+            std::min<std::uint64_t>((total + threads - 1U) / threads, 65535U));
+    };
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        const std::uint64_t bytes = descriptor.rows * descriptor.columns;
+        if (auto status = cudaMemcpyAsync(scratch, weights,
+                                          static_cast<std::size_t>(bytes),
+                                          cudaMemcpyDeviceToDevice, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+        const std::uint64_t total =
+            (descriptor.rows / 16U) * (descriptor.columns / 32U) * 32U;
+        dsv4_fp8_fragment_prepack_kernel<<<grid(total), threads, 0U, stream>>>(
+            static_cast<uint4*>(weights),
+            static_cast<const unsigned char*>(scratch), rows, columns);
+        return cudaGetLastError();
+    }
+    const std::uint64_t code_bytes = descriptor.rows * descriptor.packed_columns;
+    if (auto status = cudaMemcpyAsync(scratch, weights,
+                                      static_cast<std::size_t>(code_bytes),
+                                      cudaMemcpyDeviceToDevice, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    const std::uint64_t code_total =
+        (descriptor.rows / kRegfedTileN) * (descriptor.columns / kRegfedTileK) *
+        kRegfedWarp;
+    regfed_fp4_prepack_codes_kernel<<<grid(code_total), threads, 0U, stream>>>(
+        static_cast<std::uint32_t*>(weights),
+        static_cast<const unsigned char*>(scratch), rows, columns);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const std::uint64_t scale_bytes = descriptor.rows * descriptor.scale_columns;
+    if (auto status = cudaMemcpyAsync(scratch, scales,
+                                      static_cast<std::size_t>(scale_bytes),
+                                      cudaMemcpyDeviceToDevice, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    regfed_fp4_prepack_scales_kernel<<<grid(scale_bytes), threads, 0U, stream>>>(
+        static_cast<unsigned char*>(scales),
+        static_cast<const unsigned char*>(scratch), rows,
+        static_cast<std::uint32_t>(descriptor.scale_columns));
+    return cudaGetLastError();
+}
+
+// Standalone SwiGLU for the register-fed shared expert. The rounding, the
+// finite check, the clamp order and the BF16 SiLU table lookup are reproduced
+// from deepseek_fp8_gate_up_kernel exactly, so substituting the projections
+// underneath cannot move the activation by itself.
+__global__ void regfed_shared_swiglu_kernel(
+    float* __restrict__ activation, const float* __restrict__ gate,
+    const float* __restrict__ up, std::uint32_t intermediate,
+    float swiglu_limit, const float* __restrict__ bf16_silu,
+    unsigned int* __restrict__ error_flag) {
+    const std::uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= intermediate) return;
+    const float rounded_gate = bf16_round(gate[row]);
+    const float rounded_up = bf16_round(up[row]);
+    if (!isfinite(rounded_gate) || !isfinite(rounded_up)) {
+        atomicExch(error_flag, 1U);
+        activation[row] = __uint_as_float(0x7FC0'0000U);
+        return;
+    }
+    const float limited_gate = fminf(rounded_gate, swiglu_limit);
+    const float limited_up =
+        fmaxf(-swiglu_limit, fminf(rounded_up, swiglu_limit));
+    const auto gate_bits =
+        static_cast<std::uint16_t>(__float_as_uint(limited_gate) >> 16U);
+    activation[row] = bf16_round(bf16_silu[gate_bits] * limited_up);
+}
+
+// Workspaces for a register-fed dispatch made outside matmul_impl. Every buffer
+// is grown geometrically and kept, so a decode step that repeats the same shapes
+// allocates nothing after the first token.
+struct RegfedWorkspace {
+    void* activation{};
+    void* partials{};
+    void* counters{};
+    void* scratch{};
+    std::uint64_t activation_bytes{};
+    std::uint64_t partial_bytes{};
+    std::uint64_t counter_bytes{};
+    std::uint64_t scratch_bytes{};
+};
+
+cudaError_t regfed_grow(void*& pointer, std::uint64_t& capacity,
+                        std::uint64_t required, bool zero,
+                        cudaStream_t stream) {
+    if (required <= capacity) return cudaSuccess;
+    if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+    pointer = nullptr;
+    capacity = 0U;
+    if (auto status = cudaMalloc(&pointer, static_cast<std::size_t>(required));
+        status != cudaSuccess) {
+        return status;
+    }
+    capacity = required;
+    if (!zero) return cudaSuccess;
+    // Zeroing the whole allocation, not just the range in use, is what lets a
+    // later call with more N-tiles reuse the buffer: the fold resets every
+    // counter it touches, and everything it has not touched is still zero.
+    return cudaMemsetAsync(pointer, 0, static_cast<std::size_t>(required),
+                           stream);
+}
+
+// One register-fed FP8 matvec against a device-resident activation. Used by the
+// DeepSeek shared expert, which never reaches matmul_impl because its operands
+// never leave the device.
+cudaError_t launch_regfed_fp8_matvec(RegfedWorkspace& workspace,
+                                     const CudaWeightDescriptor& descriptor,
+                                     void* weights, void* scales,
+                                     bool& prepacked, const float* input,
+                                     float* output, cudaStream_t stream,
+                                     bool reuse_activation = false) {
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t split = regfed_split_k(columns / 32U, n_tiles);
+    const std::uint64_t activation_bytes =
+        static_cast<std::uint64_t>(k_tiles) * 4U * sizeof(uint2);
+    const std::uint64_t partial_bytes = static_cast<std::uint64_t>(n_tiles) *
+                                        split * kRegfedTileN * kRegfedMaxM *
+                                        sizeof(float);
+    const std::uint64_t counter_bytes =
+        static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+    if (auto status = regfed_grow(workspace.activation,
+                                  workspace.activation_bytes, activation_bytes,
+                                  false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.partials, workspace.partial_bytes,
+                                  partial_bytes, false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.counters, workspace.counter_bytes,
+                                  counter_bytes, true, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (!prepacked) {
+        if (auto status = regfed_grow(
+                workspace.scratch, workspace.scratch_bytes,
+                fragment_prepack_scratch_bytes(descriptor), false, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+        if (auto status = launch_fragment_prepack(descriptor, weights, scales,
+                                                  workspace.scratch, stream);
+            status != cudaSuccess) {
+            return status;
+        }
+        prepacked = true;
+    }
+    constexpr unsigned int threads = 256U;
+    // Gate and up read the same hidden vector, so the second of the pair reuses
+    // the permutation the first one wrote rather than recomputing it.
+    if (!reuse_activation) {
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(k_tiles) * 4U;
+        regfed_activation_fragment_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((fragment_total + threads - 1U) / threads,
+                                        65535U)),
+            threads, 0U, stream>>>(
+            static_cast<uint2*>(workspace.activation), input, 1U, columns, 1U,
+            1U);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    }
+    const unsigned int blocks = static_cast<unsigned int>(
+        std::min<std::uint64_t>((static_cast<std::uint64_t>(n_tiles) * split +
+                                 kRegfedWarpsPerBlock - 1U) /
+                                    kRegfedWarpsPerBlock,
+                                65535U));
+    regfed_fp8_matmul_kernel<1U><<<blocks, kRegfedWarpsPerBlock * 32U, 0U,
+                                   stream>>>(
+        output, static_cast<const uint4*>(weights),
+        static_cast<const unsigned char*>(scales),
+        static_cast<const uint2*>(workspace.activation), columns, rows,
+        static_cast<std::uint32_t>(descriptor.scale_columns), split, 1U, 1U,
+        static_cast<float*>(workspace.partials),
+        static_cast<std::uint32_t*>(workspace.counters));
+    return cudaGetLastError();
+}
+
+// One register-fed FP4 matvec against a device-resident activation. Unlike the
+// DeepSeek helper above, Gemma weights have already been explicitly prepacked
+// by their loader after all consumers have been audited.
+cudaError_t launch_regfed_fp4_matvec(
+    RegfedWorkspace& workspace, const CudaWeightDescriptor& descriptor,
+    const void* weights, const void* scales, const float* input, float* output,
+    cudaStream_t stream) {
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t split =
+        regfed_split_k(k_tiles / kRegfedKPerLoad, n_tiles);
+    const std::uint64_t activation_bytes =
+        static_cast<std::uint64_t>(k_tiles) * 4U * sizeof(uint2);
+    const std::uint64_t partial_bytes = static_cast<std::uint64_t>(n_tiles) *
+                                        split * kRegfedTileN * kRegfedMaxM *
+                                        sizeof(float);
+    const std::uint64_t counter_bytes =
+        static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+    if (auto status = regfed_grow(workspace.activation,
+                                  workspace.activation_bytes, activation_bytes,
+                                  false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.partials, workspace.partial_bytes,
+                                  partial_bytes, false, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    if (auto status = regfed_grow(workspace.counters, workspace.counter_bytes,
+                                  counter_bytes, true, stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    constexpr unsigned int threads = 256U;
+    const std::uint64_t fragment_total =
+        static_cast<std::uint64_t>(k_tiles) * 4U;
+    regfed_activation_fragment_kernel<<<
+        static_cast<unsigned int>(std::min<std::uint64_t>(
+            (fragment_total + threads - 1U) / threads, 65535U)),
+        threads, 0U, stream>>>(
+        static_cast<uint2*>(workspace.activation), input, 1U, columns, 1U, 1U);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const unsigned int blocks = static_cast<unsigned int>(
+        std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(n_tiles) * split +
+             kRegfedWarpsPerBlock - 1U) /
+                kRegfedWarpsPerBlock,
+            65535U));
+    regfed_fp4_matmul_kernel<1U><<<blocks, kRegfedWarpsPerBlock * 32U, 0U,
+                                   stream>>>(
+        output, static_cast<const std::uint32_t*>(weights),
+        static_cast<const unsigned char*>(scales),
+        static_cast<const uint2*>(workspace.activation), columns, rows, split,
+        1U, 1U, static_cast<float*>(workspace.partials),
+        static_cast<std::uint32_t*>(workspace.counters));
+    return cudaGetLastError();
+}
+
 __global__ void deepseek_fp8_gate_up_kernel(
     float* activation, const float* hidden,
     const unsigned char* w1, const unsigned char* w1_scales,
@@ -3422,6 +4649,103 @@ __global__ void flash_attention_reference_all_f32_kernel(
             destination[dimension] = accumulator[slot];
             if (!isfinite(accumulator[slot])) atomicExch(error_flag, 3U);
         }
+    }
+}
+
+__device__ float bf16_kv_sequential_dot_f32(
+    const float* query, const __nv_bfloat16* key,
+    std::uint32_t dimensions) {
+    float dot = 0.0F;
+    for (std::uint32_t dimension = 0U; dimension < dimensions; ++dimension) {
+        dot = __fadd_rn(
+            dot, __fmul_rn(query[dimension],
+                           __bfloat162float(key[dimension])));
+    }
+    return dot;
+}
+
+// Batch-1 counterpart of flash_attention_reference_all_f32_kernel over a
+// persistent two-plane BF16 KV ring. Reading a BF16 cache element through
+// __bfloat162float produces exactly the F32 fixed point the host compatibility
+// path used to upload, while preserving every sequential reduction order.
+__global__ void bf16_kv_attention_reference_all_f32_kernel(
+    float* output, float* scores, const float* queries,
+    const __nv_bfloat16* keys,
+    const __nv_bfloat16* values, const float* relative_bias,
+    std::uint32_t relative_bias_extent, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t head_dim,
+    std::uint32_t capacity_rows, std::uint32_t cache_start,
+    std::uint32_t cached_rows, float scale, unsigned int* error_flag) {
+    constexpr std::uint32_t threads = 256U;
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= query_heads) return;
+    const auto heads_per_kv = query_heads / key_value_heads;
+    const auto kv_head = head / heads_per_kv;
+    const auto* query = queries + static_cast<std::uint64_t>(head) * head_dim;
+    auto* head_scores = scores +
+        static_cast<std::uint64_t>(head) * capacity_rows;
+    __shared__ float maximum;
+    __shared__ float denominator;
+
+    // Rows are independent. Parallelizing them preserves the reference dot's
+    // dimension order while removing the old three serial score passes from
+    // thread zero. Softmax and value accumulation below retain their original
+    // logical-row order exactly.
+    for (std::uint32_t row = threadIdx.x; row < cached_rows;
+         row += blockDim.x) {
+        const auto physical = (cache_start + row) % capacity_rows;
+        const auto* key = keys +
+            (static_cast<std::uint64_t>(physical) * key_value_heads + kv_head) *
+                head_dim;
+        float score = __fmul_rn(
+            bf16_kv_sequential_dot_f32(query, key, head_dim), scale);
+        const auto distance = cached_rows - 1U - row;
+        if (distance < relative_bias_extent) {
+            score = __fadd_rn(
+                score, relative_bias[
+                    static_cast<std::uint64_t>(head) * relative_bias_extent +
+                    distance]);
+        }
+        head_scores[row] = score;
+        if (!isfinite(head_scores[row])) atomicExch(error_flag, 1U);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0U) {
+        maximum = -INFINITY;
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            maximum = fmaxf(maximum, head_scores[row]);
+        }
+        denominator = 0.0F;
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            head_scores[row] = expf(__fsub_rn(head_scores[row], maximum));
+            denominator = __fadd_rn(denominator, head_scores[row]);
+        }
+        if (!isfinite(denominator) || denominator <= 0.0F) {
+            atomicExch(error_flag, 2U);
+        }
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            head_scores[row] = __fdiv_rn(head_scores[row], denominator);
+        }
+    }
+    __syncthreads();
+
+    auto* destination = output + static_cast<std::uint64_t>(head) * head_dim;
+    for (std::uint32_t dimension = threadIdx.x; dimension < head_dim;
+         dimension += threads) {
+        float accumulator = 0.0F;
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            const auto physical = (cache_start + row) % capacity_rows;
+            const auto* value = values +
+                (static_cast<std::uint64_t>(physical) * key_value_heads +
+                 kv_head) * head_dim;
+            accumulator = __fadd_rn(
+                accumulator,
+                __fmul_rn(head_scores[row],
+                           __bfloat162float(value[dimension])));
+        }
+        destination[dimension] = accumulator;
+        if (!isfinite(accumulator)) atomicExch(error_flag, 3U);
     }
 }
 
@@ -5352,6 +6676,11 @@ struct CudaWeight::Impl {
     void* weights{};
     void* scales{};
     CudaWeightDescriptor descriptor;
+    // Set once, at load, by CudaBackend::prepack_fragment. The fragment order
+    // REPLACES the canonical device layout -- one-copy residency -- so every
+    // consumer of this weight must dispatch a register-fed kernel once this is
+    // true. A consumer that reads it canonically would read a permutation.
+    bool fragment_prepacked{};
     std::uint64_t bytes{};
     int device{-1};
     std::shared_ptr<WeightArena> arena;
@@ -5425,6 +6754,45 @@ struct CudaBackend::Impl {
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};
         std::uint64_t matmul_host_output_bytes{};
+        // Register-fed matmul workspaces: the B-fragment activation, the
+        // split-K partials, and one arrival counter per N-tile. All three are
+        // grown geometrically and kept, so a decode step that repeats the same
+        // shapes allocates nothing after the first call.
+        // The shared expert dispatches on its own stream, concurrently with the
+        // routed path, so it keeps workspaces separate from the generic
+        // matmul's rather than sharing them.
+        RegfedWorkspace moe_regfed{};
+        // Scratch for the upload-path fragment prepack. Uploads for a device
+        // are stream-ordered, so one buffer serves them; only its growth needs
+        // the lock.
+        void* upload_prepack_scratch{};
+        std::uint64_t upload_prepack_scratch_bytes{};
+        // Register-fed fused MoE workspaces: split-K partials for gate, up and
+        // down, plus the two B-fragment activation buffers. Grown geometrically
+        // and kept, so a decode step that repeats the same shapes allocates
+        // nothing after the first token.
+        void* moe_regfed_gate_partials{};
+        void* moe_regfed_up_partials{};
+        void* moe_regfed_down_partials{};
+        void* moe_regfed_hidden_fragment{};
+        void* moe_regfed_activation_fragment{};
+        std::uint64_t moe_regfed_gate_partial_bytes{};
+        std::uint64_t moe_regfed_up_partial_bytes{};
+        std::uint64_t moe_regfed_down_partial_bytes{};
+        std::uint64_t moe_regfed_hidden_fragment_bytes{};
+        std::uint64_t moe_regfed_activation_fragment_bytes{};
+        RegfedWorkspace gemma_regfed{};
+        float* moe_regfed_gate{};
+        float* moe_regfed_up{};
+        std::uint64_t moe_regfed_gate_bytes{};
+        void* regfed_activation{};
+        float* regfed_partials{};
+        std::uint32_t* regfed_counters{};
+        void* regfed_scratch{};
+        std::uint64_t regfed_activation_bytes{};
+        std::uint64_t regfed_partial_bytes{};
+        std::uint64_t regfed_counter_bytes{};
+        std::uint64_t regfed_scratch_bytes{};
         std::byte* attention_upload{};
         std::byte* attention_download{};
         std::byte* attention_host_upload{};
@@ -5655,6 +7023,43 @@ struct CudaBackend::Impl {
             }
             if (state.gemma_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.gemma_host_staging));
+            }
+            // moe_regfed_up is an interior pointer into the gate allocation,
+            // not an allocation of its own: freeing it is cudaErrorInvalidValue.
+            for (void* pointer : {state.moe_regfed_gate_partials,
+                                  state.moe_regfed_up_partials,
+                                  state.moe_regfed_down_partials,
+                                  state.moe_regfed_hidden_fragment,
+                                  state.moe_regfed_activation_fragment}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            if (state.upload_prepack_scratch != nullptr) {
+                static_cast<void>(cudaFree(state.upload_prepack_scratch));
+            }
+            for (void* pointer : {state.moe_regfed.activation,
+                                  state.moe_regfed.partials,
+                                  state.moe_regfed.counters,
+                                  state.moe_regfed.scratch,
+                                  static_cast<void*>(state.moe_regfed_gate)}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            for (void* pointer : {state.gemma_regfed.activation,
+                                  state.gemma_regfed.partials,
+                                  state.gemma_regfed.counters,
+                                  state.gemma_regfed.scratch}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            if (state.regfed_activation != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_activation));
+            }
+            if (state.regfed_partials != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_partials));
+            }
+            if (state.regfed_counters != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_counters));
+            }
+            if (state.regfed_scratch != nullptr) {
+                static_cast<void>(cudaFree(state.regfed_scratch));
             }
             if (state.matmul_host_input != nullptr) {
                 static_cast<void>(cudaFreeHost(state.matmul_host_input));
@@ -6105,7 +7510,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
                                      std::span<const std::byte> weights,
                                      std::span<const std::byte> scales,
                                      CudaWeight& output,
-                                     UploadCompletion completion) {
+                                     UploadCompletion completion,
+                                     FragmentLayout prepack) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -6304,6 +7710,33 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             return upload_error(status, "upload CUDA scales");
         }
         copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
+    }
+    // Fragment prepack, stream-ordered behind the copies that just landed. This
+    // is a device-side permutation of the staged bytes: for a streaming MoE it
+    // costs one read and one write of what was staged, measured at 0.509
+    // ms/token against Laguna's 65.05 ms staging term (experiment 0168), so it
+    // does not need to move off the staging path.
+    if (prepack == FragmentLayout::Prepack && regfed_matmul_enabled()) {
+        const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
+        if (scratch_bytes != 0U) {
+            bool ready = true;
+            {
+                std::scoped_lock lock(impl_->mutex);
+                ready = regfed_grow(state.upload_prepack_scratch,
+                                    state.upload_prepack_scratch_bytes,
+                                    scratch_bytes, false,
+                                    upload_stream) == cudaSuccess;
+            }
+            if (ready) {
+                if (auto status = launch_fragment_prepack(
+                        descriptor, target->weights, target->scales,
+                        state.upload_prepack_scratch, upload_stream);
+                    status != cudaSuccess) {
+                    return upload_error(status, "prepack weight into fragment order");
+                }
+                target->fragment_prepacked = true;
+            }
+        }
     }
     std::uint64_t wait_nanoseconds = 0U;
     std::uint64_t synchronizations = 0U;
@@ -6636,6 +8069,299 @@ ValidationResult CudaBackend::upload_gemma4_kv(
     return result;
 }
 
+ValidationResult CudaBackend::bf16_kv_attention(
+    int device, const CudaBf16KvAttentionRequest& request,
+    std::span<float> output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    const auto query_elements = static_cast<std::uint64_t>(request.query_heads) *
+                                request.head_dim;
+    const auto kv_elements = static_cast<std::uint64_t>(request.key_value_heads) *
+                             request.head_dim;
+    std::uint64_t plane_bytes = 0U;
+    const auto relative_bias_elements =
+        static_cast<std::uint64_t>(request.query_heads) *
+        request.relative_bias_extent;
+    const bool relative_bias_valid =
+        (request.relative_bias.empty() && request.relative_bias_extent == 0U) ||
+        (request.relative_bias_extent != 0U &&
+         request.relative_bias.size() == relative_bias_elements &&
+         std::all_of(request.relative_bias.begin(), request.relative_bias.end(),
+                     [](float value) { return std::isfinite(value); }));
+    if (found == impl_->devices.end() || request.cache == nullptr ||
+        !request.cache->valid() || request.cache->device() != device ||
+        request.query_heads == 0U || request.key_value_heads == 0U ||
+        request.query_heads % request.key_value_heads != 0U ||
+        request.head_dim == 0U || request.head_dim > 1'024U ||
+        request.capacity_rows == 0U || request.cached_rows == 0U ||
+        request.cached_rows > request.capacity_rows ||
+        request.queries.size() != query_elements || output.size() != query_elements ||
+        request.next_keys.size() != kv_elements ||
+        request.next_values.size() != kv_elements ||
+        request.cache_start > request.position ||
+        static_cast<std::uint64_t>(request.cache_start) + request.cached_rows !=
+            static_cast<std::uint64_t>(request.position) + 1U ||
+        !std::isfinite(request.scale) || request.scale <= 0.0F ||
+        !checked_bytes(request.capacity_rows, kv_elements,
+                       sizeof(std::uint16_t), plane_bytes) ||
+        plane_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
+        request.cache->device_bytes() != plane_bytes * 2U ||
+        !relative_bias_valid ||
+        std::any_of(request.queries.begin(), request.queries.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back("BF16 KV attention request is invalid");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.flash_attention_supported) {
+        result.errors.emplace_back(
+            "BF16 KV attention CUDA kernel supports only SM86 and SM120 devices");
+        return result;
+    }
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "BF16 KV attention cannot overlap an in-flight MoE command");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for BF16 KV attention");
+    }
+
+    const auto query_bytes = static_cast<std::uint64_t>(request.queries.size_bytes());
+    const auto row_bytes = static_cast<std::uint64_t>(request.next_keys.size_bytes());
+    const auto relative_bias_bytes =
+        static_cast<std::uint64_t>(request.relative_bias.size_bytes());
+    const auto upload_bytes = query_bytes + 2U * row_bytes + relative_bias_bytes;
+    const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    const auto download_bytes = output_bytes + sizeof(unsigned int);
+    std::uint64_t score_bytes = 0U;
+    if (!checked_bytes(request.query_heads, request.capacity_rows,
+                       sizeof(float), score_bytes)) {
+        result.errors.emplace_back("BF16 KV attention score workspace overflows");
+        return result;
+    }
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    const auto ensure_device = [&](std::byte*& pointer, std::uint64_t& capacity,
+                                   std::uint64_t required,
+                                   const char* operation) {
+        if (required <= capacity) return true;
+        std::byte* replacement = nullptr;
+        if (auto status = cudaMalloc(&replacement, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = replacement;
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return true;
+    };
+    const auto ensure_host = [&](std::byte*& pointer, std::uint64_t& capacity,
+                                 std::uint64_t required,
+                                 const char* operation) {
+        if (required <= capacity) return true;
+        void* replacement = nullptr;
+        if (auto status = cudaMallocHost(&replacement,
+                                         static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFreeHost(pointer));
+        pointer = static_cast<std::byte*>(replacement);
+        capacity = required;
+        return true;
+    };
+    if (!ensure_device(state.attention_upload, state.attention_upload_bytes,
+                       upload_bytes, "allocate BF16 KV attention upload") ||
+        !ensure_device(state.attention_download, state.attention_download_bytes,
+                       download_bytes, "allocate BF16 KV attention download") ||
+        !ensure_host(state.attention_host_upload,
+                     state.attention_host_upload_bytes, upload_bytes,
+                     "allocate BF16 KV attention host upload") ||
+        !ensure_host(state.attention_host_download,
+                     state.attention_host_download_bytes, download_bytes,
+                     "allocate BF16 KV attention host download")) {
+        return result;
+    }
+    if (score_bytes > state.attention_score_bytes) {
+        float* replacement = nullptr;
+        if (auto status = cudaMalloc(
+                &replacement, static_cast<std::size_t>(score_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate BF16 KV attention scores");
+        }
+        if (state.attention_scores != nullptr) {
+            static_cast<void>(cudaFree(state.attention_scores));
+        }
+        state.attention_scores = replacement;
+        state.attention_score_bytes = score_bytes;
+        ++allocation_calls;
+        allocation_bytes += score_bytes;
+    }
+
+    std::memcpy(state.attention_host_upload, request.queries.data(), query_bytes);
+    std::memcpy(state.attention_host_upload + query_bytes,
+                request.next_keys.data(), row_bytes);
+    std::memcpy(state.attention_host_upload + query_bytes + row_bytes,
+                request.next_values.data(), row_bytes);
+    if (relative_bias_bytes != 0U) {
+        std::memcpy(state.attention_host_upload + query_bytes + 2U * row_bytes,
+                    request.relative_bias.data(), relative_bias_bytes);
+    }
+    const auto operation_started = std::chrono::steady_clock::now();
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention upload start");
+        }
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.attention_upload, state.attention_host_upload,
+            static_cast<std::size_t>(upload_bytes), cudaMemcpyHostToDevice,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "upload BF16 KV attention inputs");
+    }
+    auto* cache_keys = static_cast<__nv_bfloat16*>(request.cache->impl_->data);
+    auto* cache_values = reinterpret_cast<__nv_bfloat16*>(
+        static_cast<std::byte*>(request.cache->impl_->data) + plane_bytes);
+    const auto physical = request.position % request.capacity_rows;
+    auto* device_next_keys = reinterpret_cast<const __nv_bfloat16*>(
+        state.attention_upload + query_bytes);
+    auto* device_next_values = reinterpret_cast<const __nv_bfloat16*>(
+        state.attention_upload + query_bytes + row_bytes);
+    auto* device_relative_bias = reinterpret_cast<const float*>(
+        state.attention_upload + query_bytes + 2U * row_bytes);
+    if (auto status = cudaMemcpyAsync(
+            cache_keys + static_cast<std::uint64_t>(physical) * kv_elements,
+            device_next_keys, static_cast<std::size_t>(row_bytes),
+            cudaMemcpyDeviceToDevice, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "store BF16 KV attention key row");
+    }
+    if (auto status = cudaMemcpyAsync(
+            cache_values + static_cast<std::uint64_t>(physical) * kv_elements,
+            device_next_values, static_cast<std::size_t>(row_bytes),
+            cudaMemcpyDeviceToDevice, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "store BF16 KV attention value row");
+    }
+    auto* device_output = reinterpret_cast<float*>(state.attention_download);
+    auto* device_error = reinterpret_cast<unsigned int*>(
+        state.attention_download + output_bytes);
+    if (auto status = cudaMemsetAsync(device_error, 0, sizeof(*device_error),
+                                      state.stream); status != cudaSuccess) {
+        return cuda_error(status, "clear BF16 KV attention status");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention upload completion");
+        }
+    }
+    bf16_kv_attention_reference_all_f32_kernel<<<
+        request.query_heads, 256U, 0U, state.stream>>>(
+        device_output, state.attention_scores,
+        reinterpret_cast<const float*>(state.attention_upload), cache_keys,
+        cache_values, device_relative_bias, request.relative_bias_extent,
+        request.query_heads, request.key_value_heads,
+        request.head_dim, request.capacity_rows, request.cache_start,
+        request.cached_rows, request.scale, device_error);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch BF16 KV attention");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention kernel completion");
+        }
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.attention_host_download, state.attention_download,
+            static_cast<std::size_t>(download_bytes), cudaMemcpyDeviceToHost,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "download BF16 KV attention output");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize BF16 KV attention");
+    }
+    const auto wait_nanoseconds = elapsed_nanoseconds_since(wait_started);
+    const auto operation_nanoseconds = elapsed_nanoseconds_since(operation_started);
+    unsigned int numerical_error = 0U;
+    std::memcpy(&numerical_error, state.attention_host_download + output_bytes,
+                sizeof(numerical_error));
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_ms = 0.0F;
+        float kernel_ms = 0.0F;
+        float d2h_ms = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_ms, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure BF16 KV attention upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_ms, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure BF16 KV attention kernel");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_ms, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure BF16 KV attention download");
+        }
+        h2d_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
+        d2h_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++stats.flash_attention_calls;
+        ++stats.flash_attention_kernel_launches;
+        ++stats.flash_attention_h2d_transfers;
+        ++stats.flash_attention_d2h_transfers;
+        stats.flash_attention_h2d_bytes += upload_bytes;
+        stats.flash_attention_d2h_bytes += download_bytes;
+        stats.flash_attention_useful_staging_bytes +=
+            2U * row_bytes + relative_bias_bytes;
+        stats.flash_attention_h2d_nanoseconds += h2d_nanoseconds;
+        stats.flash_attention_kernel_nanoseconds += kernel_nanoseconds;
+        stats.flash_attention_d2h_nanoseconds += d2h_nanoseconds;
+        stats.flash_attention_nanoseconds += operation_nanoseconds;
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
+    }
+    if (numerical_error != 0U) {
+        result.errors.emplace_back(
+            numerical_error == 1U
+                ? "BF16 KV attention score is non-finite"
+                : numerical_error == 2U
+                    ? "BF16 KV attention softmax denominator is invalid"
+                    : "BF16 KV attention output is non-finite");
+        return result;
+    }
+    std::memcpy(output.data(), state.attention_host_download, output_bytes);
+    return result;
+}
+
 ValidationResult CudaBackend::gemma4_decode_layers(
     int device, std::span<const CudaGemma4DecodeLayer> layers,
     std::span<const float> input, std::uint32_t position,
@@ -6666,14 +8392,45 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         return buffer != nullptr && buffer->valid() &&
                buffer->device() == device && buffer->device_bytes() == bytes;
     };
-    const auto valid_weight = [device](const CudaWeight* weight) {
-        return weight != nullptr && weight->valid() && weight->device() == device &&
-               weight->impl_->descriptor.encoding ==
-                   CudaWeightEncoding::OffsetPackedInt8 &&
-               weight->impl_->descriptor.group_size == 32U &&
-               weight->impl_->descriptor.columns % 4U == 0U;
+    const bool regfed_enabled = regfed_matmul_enabled();
+    const auto valid_weight = [device, regfed_enabled](const CudaWeight* weight) {
+        if (weight == nullptr || !weight->valid() || weight->device() != device) {
+            return false;
+        }
+        const auto& descriptor = weight->impl_->descriptor;
+        const bool w8a16 =
+            descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
+            descriptor.columns % 4U == 0U;
+        const bool mxfp4 =
+            descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32 &&
+            descriptor.columns % 2U == 0U;
+        if ((!w8a16 && !mxfp4) || descriptor.group_size != 32U) return false;
+        return !weight->impl_->fragment_prepacked ||
+               (mxfp4 && regfed_enabled &&
+                regfed_fp4_shape_admissible(descriptor.rows,
+                                             descriptor.columns));
     };
     for (const auto& layer : layers) {
+        const std::array<const CudaWeight*, 7U> layer_weights{
+            layer.query, layer.key, layer.value, layer.output,
+            layer.gate, layer.up, layer.down};
+        for (const auto* weight : layer_weights) {
+            if (weight == nullptr || !weight->valid() ||
+                !weight->impl_->fragment_prepacked) {
+                continue;
+            }
+            const auto& descriptor = weight->impl_->descriptor;
+            if (!regfed_enabled ||
+                descriptor.encoding != CudaWeightEncoding::Fp4E2m1Group32 ||
+                !regfed_fp4_shape_admissible(descriptor.rows,
+                                              descriptor.columns)) {
+                result.errors.emplace_back(
+                    "Gemma 4 CUDA decode received a fragment-prepacked weight "
+                    "without an admissible enabled register-fed route; "
+                    "refusing a canonical read");
+                return result;
+            }
+        }
         if (!valid_weight(layer.query) || !valid_weight(layer.key) ||
             (layer.value != nullptr && !valid_weight(layer.value)) ||
             !valid_weight(layer.output) || !valid_weight(layer.gate) ||
@@ -6842,6 +8599,12 @@ ValidationResult CudaBackend::gemma4_decode_layers(
     cursor += maximum_intermediate;
     auto* up_output = cursor;
     std::memcpy(state.gemma_host_staging, input.data(), input.size_bytes());
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record Gemma 4 activation upload start");
+        }
+    }
     if (auto status = cudaMemcpyAsync(
             hidden, state.gemma_host_staging, input.size_bytes(),
             cudaMemcpyHostToDevice, state.stream); status != cudaSuccess) {
@@ -6852,11 +8615,48 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         status != cudaSuccess) {
         return cuda_error(status, "clear Gemma 4 decode status");
     }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Gemma 4 activation upload completion");
+        }
+    }
     const auto launch_matvec = [&](const CudaWeight* weight,
                                    const float* activation,
-                                   float* destination) {
+                                   float* destination) -> cudaError_t {
         const auto& descriptor = weight->impl_->descriptor;
         constexpr unsigned int threads = 256U;
+        if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+            const dim3 quantize_grid(
+                static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
+                1U, 1U);
+            quantize_activation_e4m3_kernel<<<
+                quantize_grid, 128U, 0U, state.stream>>>(
+                const_cast<float*>(activation), descriptor.columns, 1U);
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return status;
+            }
+            if (weight->impl_->fragment_prepacked) {
+                const auto status = launch_regfed_fp4_matvec(
+                    state.gemma_regfed, descriptor, weight->impl_->weights,
+                    weight->impl_->scales, activation, destination,
+                    state.stream);
+                if (status == cudaSuccess) {
+                    record_cuda_matmul_route(CudaMatmulRoute::Fp4RegisterFed);
+                }
+                return status;
+            }
+            const dim3 grid(static_cast<unsigned int>(descriptor.rows), 1U, 1U);
+            native_fp4_matmul_kernel<<<grid, threads, 0U, state.stream>>>(
+                destination, activation,
+                static_cast<const unsigned char*>(weight->impl_->weights),
+                static_cast<const unsigned char*>(weight->impl_->scales),
+                descriptor.packed_columns, descriptor.scale_columns, 1U,
+                descriptor.columns, descriptor.rows, 0U, 0U);
+            record_cuda_matmul_route(CudaMatmulRoute::Fp4E2m1Group32);
+            return cudaGetLastError();
+        }
         constexpr unsigned int warps = threads / 32U;
         const auto blocks = static_cast<unsigned int>(
             (descriptor.rows + warps - 1U) / warps);
@@ -6867,6 +8667,8 @@ ValidationResult CudaBackend::gemma4_decode_layers(
             static_cast<const __nv_bfloat16*>(weight->impl_->scales),
             descriptor.packed_columns, descriptor.scale_columns,
             descriptor.columns, descriptor.rows);
+        record_cuda_matmul_route(CudaMatmulRoute::PackedInt8Group32);
+        return cudaGetLastError();
     };
     for (const auto& layer : layers) {
         const auto& query = layer.query->impl_->descriptor;
@@ -6880,8 +8682,14 @@ ValidationResult CudaBackend::gemma4_decode_layers(
             normalized, hidden,
             static_cast<const float*>(layer.input_norm->impl_->data),
             hidden_columns, 1.0e-6F, state.gemma_error);
-        launch_matvec(layer.query, normalized, queries);
-        launch_matvec(layer.key, normalized, keys);
+        if (auto status = launch_matvec(layer.query, normalized, queries);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 query projection");
+        }
+        if (auto status = launch_matvec(layer.key, normalized, keys);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 key projection");
+        }
         if (layer.value == nullptr) {
             if (auto status = cudaMemcpyAsync(
                     values, keys, key.rows * sizeof(float),
@@ -6890,7 +8698,10 @@ ValidationResult CudaBackend::gemma4_decode_layers(
                 return cuda_error(status, "copy Gemma 4 shared K/V projection");
             }
         } else {
-            launch_matvec(layer.value, normalized, values);
+            if (auto status = launch_matvec(layer.value, normalized, values);
+                status != cudaSuccess) {
+                return cuda_error(status, "launch Gemma 4 value projection");
+            }
         }
         const bool global = layer.value == nullptr;
         const float theta = global ? 1'000'000.0F : 10'000.0F;
@@ -6916,20 +8727,32 @@ ValidationResult CudaBackend::gemma4_decode_layers(
             context, state.gemma_scores, queries, cache, position,
             layer.cache_capacity_rows, query_heads, kv_heads, head_dim,
             state.gemma_error);
-        launch_matvec(layer.output, context, branch);
+        if (auto status = launch_matvec(layer.output, context, branch);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 output projection");
+        }
         gemma4_post_attention_kernel<<<1U, 256U, 0U, state.stream>>>(
             hidden, normalized, branch,
             static_cast<const float*>(layer.post_attention_norm->impl_->data),
             static_cast<const float*>(layer.pre_feedforward_norm->impl_->data),
             hidden_columns, state.gemma_error);
-        launch_matvec(layer.gate, normalized, gate_output);
-        launch_matvec(layer.up, normalized, up_output);
+        if (auto status = launch_matvec(layer.gate, normalized, gate_output);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 gate projection");
+        }
+        if (auto status = launch_matvec(layer.up, normalized, up_output);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 up projection");
+        }
         gemma4_geglu_kernel<<<
             static_cast<unsigned int>((intermediate.rows + 255U) / 256U),
             256U, 0U, state.stream>>>(
             gate_output, up_output,
             static_cast<std::uint32_t>(intermediate.rows), state.gemma_error);
-        launch_matvec(layer.down, gate_output, branch);
+        if (auto status = launch_matvec(layer.down, gate_output, branch);
+            status != cudaSuccess) {
+            return cuda_error(status, "launch Gemma 4 down projection");
+        }
         gemma4_post_feedforward_kernel<<<1U, 256U, 0U, state.stream>>>(
             hidden, normalized, branch,
             static_cast<const float*>(layer.post_feedforward_norm->impl_->data),
@@ -6937,6 +8760,12 @@ ValidationResult CudaBackend::gemma4_decode_layers(
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch Gemma 4 CUDA decode kernels");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record Gemma 4 kernel completion");
+        }
     }
     const auto output_offset = hidden_bytes;
     auto kv_offset = hidden_bytes * 2U;
@@ -6978,6 +8807,14 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         status != cudaSuccess) {
         return cuda_error(status, "download Gemma 4 decode status");
     }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded,
+                                          state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "record Gemma 4 activation download completion");
+        }
+    }
     const auto wait_started = std::chrono::steady_clock::now();
     if (auto status = cudaStreamSynchronize(state.stream);
         status != cudaSuccess) {
@@ -6986,6 +8823,38 @@ ValidationResult CudaBackend::gemma4_decode_layers(
     const auto wait_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wait_started).count());
+    std::uint64_t activation_h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t activation_d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_milliseconds = 0.0F;
+        float kernel_milliseconds = 0.0F;
+        float d2h_milliseconds = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_milliseconds, state.activation_start,
+                state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Gemma 4 activation upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_milliseconds, state.activation_uploaded,
+                state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Gemma 4 CUDA kernels");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_milliseconds, state.kernel_finished,
+                state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure Gemma 4 activation download");
+        }
+        activation_h2d_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(h2d_milliseconds) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(kernel_milliseconds) * 1.0e6));
+        activation_d2h_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(d2h_milliseconds) * 1.0e6));
+    }
     std::memcpy(output.data(), state.gemma_host_staging + output_offset,
                 output.size_bytes());
     kv_offset = hidden_bytes * 2U;
@@ -7011,6 +8880,9 @@ ValidationResult CudaBackend::gemma4_decode_layers(
         stats.matmul_calls += matmul_calls;
         stats.flash_attention_calls += layers.size();
         stats.flash_attention_kernel_launches += layers.size();
+        stats.activation_h2d_nanoseconds += activation_h2d_nanoseconds;
+        stats.kernel_nanoseconds += kernel_nanoseconds;
+        stats.activation_d2h_nanoseconds += activation_d2h_nanoseconds;
         record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
                                wait_nanoseconds);
     }
@@ -13871,6 +15743,107 @@ ValidationResult CudaBackend::glm_absorbed_attention(
     return result;
 }
 
+namespace {
+std::atomic<std::uint64_t>
+    g_route_census[static_cast<std::size_t>(CudaMatmulRoute::Count)]{};
+}  // namespace
+
+bool register_fed_matmul_enabled() noexcept { return regfed_matmul_enabled(); }
+
+void set_register_fed_matmul(bool enabled) noexcept {
+    g_regfed_matmul_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+void record_cuda_matmul_route(CudaMatmulRoute route) noexcept {
+    g_route_census[static_cast<std::size_t>(route)].fetch_add(
+        1U, std::memory_order_relaxed);
+}
+
+bool CudaBackend::fragment_prepacked(const CudaWeight& weight) noexcept {
+    return weight.impl_ != nullptr && weight.impl_->fragment_prepacked;
+}
+
+ValidationResult CudaBackend::prepack_fragment(int device,
+                                               const CudaWeight& weight) {
+    ValidationResult result;
+    if (!weight.valid()) {
+        result.errors.emplace_back("fragment prepack received an invalid weight");
+        return result;
+    }
+    const auto& descriptor = weight.impl_->descriptor;
+    const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
+    if (scratch_bytes == 0U) {
+        result.errors.emplace_back(
+            "fragment prepack has no layout for this weight encoding and shape");
+        return result;
+    }
+    if (weight.impl_->fragment_prepacked) return result;
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select device for fragment prepack");
+    }
+    void* scratch = nullptr;
+    if (auto status =
+            cudaMalloc(&scratch, static_cast<std::size_t>(scratch_bytes));
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate fragment prepack scratch");
+    }
+    const auto release = [&](cudaError_t status, const char* what) {
+        static_cast<void>(cudaFree(scratch));
+        return cuda_error(status, what);
+    };
+    if (auto status = launch_fragment_prepack(
+            descriptor, weight.impl_->weights, weight.impl_->scales, scratch,
+            nullptr);
+        status != cudaSuccess) {
+        return release(status, "launch fragment prepack");
+    }
+    if (auto status = cudaDeviceSynchronize(); status != cudaSuccess) {
+        return release(status, "finish fragment prepack");
+    }
+    static_cast<void>(cudaFree(scratch));
+    weight.impl_->fragment_prepacked = true;
+    return result;
+}
+
+CudaMatmulRouteCensus cuda_matmul_route_census() noexcept {
+    CudaMatmulRouteCensus out;
+    for (std::size_t i = 0; i < out.counts.size(); ++i)
+        out.counts[i] = g_route_census[i].load(std::memory_order_relaxed);
+    return out;
+}
+
+void reset_cuda_matmul_route_census() noexcept {
+    for (auto& c : g_route_census) c.store(0U, std::memory_order_relaxed);
+}
+
+const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
+    switch (route) {
+        case CudaMatmulRoute::PlainBf16Matvec: return "plain_bf16_matvec";
+        case CudaMatmulRoute::PlainGeneric: return "plain_generic";
+        case CudaMatmulRoute::PackedInt8Group32: return "packed_int8_group32";
+        case CudaMatmulRoute::PackedOffsetInt: return "packed_offset_int";
+        case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
+        case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
+        case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
+        case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
+        case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
+        case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
+        case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
+        case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
+        case CudaMatmulRoute::MoeFp4E2m1Group32:
+            return "moe_fp4_e2m1_group32";
+        case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
+        case CudaMatmulRoute::MoeFp4RegisterFed: return "moe_fp4_register_fed";
+        case CudaMatmulRoute::Dsv4MoeRoutedFp4: return "dsv4_moe_routed_fp4";
+        case CudaMatmulRoute::Dsv4MoeSharedFp8: return "dsv4_moe_shared_fp8";
+        case CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed:
+            return "dsv4_moe_shared_fp8_register_fed";
+        case CudaMatmulRoute::Dsv4MoeTierFp4: return "dsv4_moe_tier_fp4";
+        case CudaMatmulRoute::Unsupported: return "unsupported";
+        default: return "invalid";
+    }
+}
+
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight& weight, std::span<const float> input,
     std::uint32_t rows, std::uint32_t groups,
@@ -13909,8 +15882,44 @@ ValidationResult CudaBackend::matmul_impl(
     }
     const auto input_bytes = static_cast<std::uint64_t>(input.size_bytes());
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    // MIX-2 register-fed dispatch. The skinny kernels own M <= 16, which is the
+    // whole decode regime; wider M keeps the tensor-page and scalar routes,
+    // where the weight read is already amortized across many activation rows.
+    //
+    // The prepack is lazy rather than done at load. A weight is permuted the
+    // first time a skinny call reaches it, so no architecture adapter has to
+    // opt in and no large-M caller ever pays for a layout it does not want. It
+    // is one-way: once fragment order has replaced the canonical layout, a
+    // later wide call on that same weight has to chunk through the skinny
+    // kernel, which is recorded as its own census route rather than hidden.
+    const bool regfed_encoding =
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+        descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
+    const bool regfed_shape =
+        regfed_encoding && groups == 0U && softcap == 0.0F &&
+        (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
+             ? regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)
+             : regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns));
+    // The register-fed route requires a weight already permuted by an explicit
+    // prepack_fragment call. matmul_impl must NOT decide this for itself: the
+    // layout is a property of the weight, and matmul_impl cannot see the
+    // weight's other consumers. Deciding it here corrupted the DeepSeek V4
+    // attention output projection, which matmul_impl touches 129 times a run
+    // and the attention path then reads canonically.
+    const bool regfed = regfed_shape && regfed_matmul_enabled() &&
+                        weight.impl_->fragment_prepacked;
+    // No hidden fallback. Fragment order replaces the canonical layout, so a
+    // permuted weight reaching a canonical kernel does not degrade -- it
+    // decodes a permutation as if it were weights. Refuse instead.
+    if (weight.impl_->fragment_prepacked && !regfed) {
+        result.errors.emplace_back(
+            "CUDA matmul received a fragment-prepacked weight but has no "
+            "register-fed route for this call; refusing to read fragment order "
+            "as canonical layout");
+        return result;
+    }
     const bool tensor_page =
-        dsv4_fp8_tensor_page &&
+        dsv4_fp8_tensor_page && !regfed &&
         state.dsv4_fp8_tensor_page_supported && rows > 1U && groups == 0U &&
         descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
         descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
@@ -14059,6 +16068,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const __nv_bfloat16*>(weight.impl_->weights),
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::Plain) {
+        record_cuda_matmul_route(CudaMatmulRoute::PlainGeneric);
         if (rows == 1U) {
             plain_matmul_kernel<1U><<<grid, threads, 0, state.stream>>>(
                 state.output, state.input, weight.impl_->weights,
@@ -14081,6 +16091,7 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<int>(descriptor.dtype), rows, descriptor.columns,
             descriptor.rows, groups, rows_per_group);
     } else if (w8_group32) {
+        record_cuda_matmul_route(CudaMatmulRoute::PackedInt8Group32);
         constexpr unsigned int warps_per_block = threads / 32U;
         const auto blocks = static_cast<unsigned int>(
             (descriptor.rows + warps_per_block - 1U) / warps_per_block);
@@ -14093,6 +16104,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.columns, descriptor.rows);
     } else if (descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ||
                descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8) {
+        record_cuda_matmul_route(CudaMatmulRoute::PackedOffsetInt);
         const auto bits = descriptor.encoding == CudaWeightEncoding::OffsetPackedInt4 ? 4U : 8U;
         packed_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input, static_cast<const std::uint32_t*>(weight.impl_->weights),
@@ -14101,6 +16113,7 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        record_cuda_matmul_route(CudaMatmulRoute::Nvfp4Group16);
         nvfp4_group16_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
@@ -14108,7 +16121,157 @@ ValidationResult CudaBackend::matmul_impl(
             descriptor.global_scale, descriptor.packed_columns,
             descriptor.scale_columns, descriptor.group_size, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    } else if (regfed) {
+        // The activation permutation reads state.input, which already holds the
+        // E4M3-rounded FP32 activation the scalar routes consume. An E4M3 value
+        // has three mantissa bits, so its BF16 image is exact and the tensor op
+        // multiplies the same real numbers the scalar kernel multiplies.
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>(rows, kRegfedMaxM) + kRegfedTileM - 1U) /
+            kRegfedTileM);
+        const auto groups_per_block = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto k_tiles =
+            static_cast<std::uint32_t>(descriptor.columns / kRegfedTileK);
+        const auto n_tiles =
+            static_cast<std::uint32_t>(descriptor.rows / kRegfedTileN);
+        const std::uint32_t units =
+            descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
+                ? static_cast<std::uint32_t>(descriptor.columns / 32U)
+                : k_tiles / kRegfedKPerLoad;
+        const std::uint32_t split = regfed_split_k(units, n_tiles);
+        const std::uint64_t activation_bytes =
+            static_cast<std::uint64_t>(k_tiles) * column_blocks *
+            groups_per_block * 4U * sizeof(uint2);
+        const std::uint64_t partial_bytes =
+            static_cast<std::uint64_t>(n_tiles) * split * kRegfedTileN *
+            kRegfedMaxM * sizeof(float);
+        const std::uint64_t counter_bytes =
+            static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required, bool zero) -> cudaError_t {
+            if (required <= capacity) return cudaSuccess;
+            if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            pointer = nullptr;
+            capacity = 0U;
+            if (auto status = cudaMalloc(&pointer,
+                                         static_cast<std::size_t>(required));
+                status != cudaSuccess) {
+                return status;
+            }
+            capacity = required;
+            if (!zero) return cudaSuccess;
+            return cudaMemsetAsync(pointer, 0,
+                                   static_cast<std::size_t>(required),
+                                   state.stream);
+        };
+        if (auto status = grow(state.regfed_activation,
+                               state.regfed_activation_bytes, activation_bytes,
+                               false);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate register-fed activation workspace");
+        }
+        auto* partials = static_cast<void*>(state.regfed_partials);
+        if (auto status =
+                grow(partials, state.regfed_partial_bytes, partial_bytes, false);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate register-fed partial workspace");
+        }
+        state.regfed_partials = static_cast<float*>(partials);
+        auto* counters = static_cast<void*>(state.regfed_counters);
+        if (auto status =
+                grow(counters, state.regfed_counter_bytes, counter_bytes, true);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate register-fed counter workspace");
+        }
+        state.regfed_counters = static_cast<std::uint32_t*>(counters);
+        const unsigned int blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(n_tiles) * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
+        // A weight already in fragment order cannot be read canonically, so a
+        // wide call chunks the activation through the skinny kernel rather than
+        // silently taking a route that would misread the layout. Each chunk is
+        // counted, so a run where this happens is visible in the census.
+        for (std::uint32_t start = 0U; start < rows; start += kRegfedMaxM) {
+            const auto chunk = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(kRegfedMaxM, rows - start));
+            const auto chunk_blocks =
+                (std::min<std::uint32_t>(chunk, kRegfedMaxM) + kRegfedTileM - 1U) /
+                kRegfedTileM;
+            const auto chunk_groups = std::min<std::uint32_t>(chunk, kRegfedTileM);
+            const std::uint64_t chunk_activation_bytes =
+                static_cast<std::uint64_t>(k_tiles) * chunk_blocks *
+                chunk_groups * 4U * sizeof(uint2);
+            static_cast<void>(chunk_activation_bytes);
+            const auto fragment_total = static_cast<std::uint64_t>(k_tiles) *
+                                        chunk_blocks * chunk_groups * 4U;
+            regfed_activation_fragment_kernel<<<
+                static_cast<unsigned int>(std::min<std::uint64_t>(
+                    (fragment_total + 255U) / 256U, 65535U)),
+                256U, 0U, state.stream>>>(
+                static_cast<uint2*>(state.regfed_activation),
+                state.input + static_cast<std::size_t>(start) *
+                                  descriptor.columns,
+                chunk, static_cast<std::uint32_t>(descriptor.columns),
+                chunk_blocks, chunk_groups);
+            float* chunk_output =
+                state.output + static_cast<std::size_t>(start) * descriptor.rows;
+            if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+                record_cuda_matmul_route(CudaMatmulRoute::Fp8RegisterFed);
+                if (chunk_blocks == 1U) {
+                    regfed_fp8_matmul_kernel<1U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const uint4*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows),
+                        static_cast<std::uint32_t>(descriptor.scale_columns),
+                        split, chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                } else {
+                    regfed_fp8_matmul_kernel<2U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const uint4*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows),
+                        static_cast<std::uint32_t>(descriptor.scale_columns),
+                        split, chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                }
+            } else {
+                record_cuda_matmul_route(CudaMatmulRoute::Fp4RegisterFed);
+                if (chunk_blocks == 1U) {
+                    regfed_fp4_matmul_kernel<1U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const std::uint32_t*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows), split,
+                        chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                } else {
+                    regfed_fp4_matmul_kernel<2U><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                        chunk_output,
+                        static_cast<const std::uint32_t*>(weight.impl_->weights),
+                        static_cast<const unsigned char*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows), split,
+                        chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                }
+            }
+        }
     } else if (tensor_page) {
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8TensorPage);
         const dim3 tensor_grid(
             static_cast<unsigned int>(
                 descriptor.rows / kDsv4Fp8TensorBlockN),
@@ -14125,19 +16288,33 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<std::uint32_t>(descriptor.columns),
             static_cast<std::uint32_t>(descriptor.rows));
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8E4m3Block128);
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
             static_cast<const unsigned char*>(weight.impl_->scales),
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
-    } else {
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
+        record_cuda_matmul_route(CudaMatmulRoute::Fp4E2m1Group32);
         native_fp4_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
             static_cast<const unsigned char*>(weight.impl_->scales),
             descriptor.packed_columns, descriptor.scale_columns, rows,
             descriptor.columns, descriptor.rows, groups, rows_per_group);
+    } else {
+        // MIX-1: no hidden fallback. This branch previously routed every
+        // unrecognised encoding into the FP4 kernel, which would decode the
+        // wrong format silently. An unsupported case must fail explicitly.
+        record_cuda_matmul_route(CudaMatmulRoute::Unsupported);
+        ValidationResult unsupported;
+        unsupported.errors.emplace_back(
+            "CUDA matmul has no approved exact route for weight encoding " +
+            std::to_string(
+                static_cast<unsigned>(descriptor.encoding)) +
+            "; refusing to substitute a different format");
+        return unsupported;
     }
     if (softcap > 0.0F) {
         gemma4_softcap_logits_kernel<<<
@@ -14583,6 +16760,9 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
     }
 
     if (!routed.empty()) {
+        // Counted once per command on the gate/up dispatch; the down kernel
+        // mirrors the branch, so counting both would double every entry.
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeRoutedFp4);
         const auto& w1 = routed.front().w1->impl_->descriptor;
         const auto& w2 = routed.front().w2->impl_->descriptor;
         const dim3 gate_grid(static_cast<unsigned int>(intermediate_columns),
@@ -14628,17 +16808,83 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
             static_cast<std::uint64_t>(routed_batch.count) * intermediate_columns;
         float* shared_output = state.moe_output +
             static_cast<std::uint64_t>(routed_batch.count) * hidden_columns;
-        deepseek_fp8_gate_up_kernel<<<
-            static_cast<unsigned int>(intermediate_columns), threads, 0U,
-            state.stream>>>(
-            shared_activation, state.moe_hidden,
-            static_cast<const unsigned char*>(shared->w1->impl_->weights),
-            static_cast<const unsigned char*>(shared->w1->impl_->scales),
-            static_cast<const unsigned char*>(shared->w3->impl_->weights),
-            static_cast<const unsigned char*>(shared->w3->impl_->scales),
-            hidden_columns, intermediate_columns, w1.scale_columns,
-            swiglu_limit, state.moe_bf16_silu, state.moe_error);
-        ++state.moe_kernel_launches;
+        const auto& w3_descriptor = shared->w3->impl_->descriptor;
+        const bool shared_regfed =
+            regfed_matmul_enabled() &&
+            // All three must already be permuted. These same weights are also read
+            // canonically by enqueue_deepseek_moe_rows through the paged kernels, so
+            // this site may not decide their layout on its own. An explicit
+            // prepack_fragment call is the opt-in, and it opts every consumer in.
+            shared->w1->impl_->fragment_prepacked &&
+            shared->w3->impl_->fragment_prepacked &&
+            shared->w2->impl_->fragment_prepacked &&
+            regfed_fp8_shape_admissible(w1.rows, w1.columns) &&
+            regfed_fp8_shape_admissible(w3_descriptor.rows, w3_descriptor.columns) &&
+            regfed_fp8_shape_admissible(w2.rows, w2.columns);
+        if (!shared_regfed &&
+            (shared->w1->impl_->fragment_prepacked ||
+             shared->w3->impl_->fragment_prepacked ||
+             shared->w2->impl_->fragment_prepacked)) {
+            // Refuse rather than let the scalar kernel read fragment order as
+            // canonical weights, which is silent corruption, not degradation.
+            abort_enqueue(cudaErrorInvalidValue,
+                          "DeepSeek shared expert weights are fragment-prepacked "
+                          "but the register-fed route is unavailable");
+            return result;
+        }
+        if (shared_regfed) {
+            record_cuda_matmul_route(
+                CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed);
+            // Gate and up share one buffer so a single allocation covers both.
+            void* gate_buffer = state.moe_regfed_gate;
+            if (auto status = regfed_grow(
+                    gate_buffer, state.moe_regfed_gate_bytes,
+                    intermediate_columns * 2U * sizeof(float), false, state.stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "allocate register-fed shared expert buffers");
+                return result;
+            }
+            state.moe_regfed_gate = static_cast<float*>(gate_buffer);
+            state.moe_regfed_up = state.moe_regfed_gate + intermediate_columns;
+            if (auto status = launch_regfed_fp8_matvec(
+                    state.moe_regfed, w1, shared->w1->impl_->weights,
+                    shared->w1->impl_->scales,
+                    shared->w1->impl_->fragment_prepacked, state.moe_hidden,
+                    state.moe_regfed_gate, state.stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "launch register-fed shared expert gate");
+                return result;
+            }
+            if (auto status = launch_regfed_fp8_matvec(
+                    state.moe_regfed, w3_descriptor, shared->w3->impl_->weights,
+                    shared->w3->impl_->scales,
+                    shared->w3->impl_->fragment_prepacked, state.moe_hidden,
+                    state.moe_regfed_up, state.stream, true);
+                status != cudaSuccess) {
+                abort_enqueue(status, "launch register-fed shared expert up");
+                return result;
+            }
+            regfed_shared_swiglu_kernel<<<
+                static_cast<unsigned int>((intermediate_columns + 255U) / 256U),
+                256U, 0U, state.stream>>>(
+                shared_activation, state.moe_regfed_gate, state.moe_regfed_up,
+                static_cast<std::uint32_t>(intermediate_columns), swiglu_limit,
+                state.moe_bf16_silu, state.moe_error);
+            state.moe_kernel_launches += 4U;
+        } else {
+            record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
+            deepseek_fp8_gate_up_kernel<<<
+                static_cast<unsigned int>(intermediate_columns), threads, 0U,
+                state.stream>>>(
+                shared_activation, state.moe_hidden,
+                static_cast<const unsigned char*>(shared->w1->impl_->weights),
+                static_cast<const unsigned char*>(shared->w1->impl_->scales),
+                static_cast<const unsigned char*>(shared->w3->impl_->weights),
+                static_cast<const unsigned char*>(shared->w3->impl_->scales),
+                hidden_columns, intermediate_columns, w1.scale_columns,
+                swiglu_limit, state.moe_bf16_silu, state.moe_error);
+            ++state.moe_kernel_launches;
+        }
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared FP8 W1/W3 SwiGLU");
             return result;
@@ -14667,14 +16913,27 @@ ValidationResult CudaBackend::enqueue_deepseek_moe(
                           "record DeepSeek shared activation quantization");
             return result;
         }
-        deepseek_fp8_down_kernel<<<
-            static_cast<unsigned int>(hidden_columns), threads, 0U,
-            state.stream>>>(
-            shared_output, shared_activation,
-            static_cast<const unsigned char*>(shared->w2->impl_->weights),
-            static_cast<const unsigned char*>(shared->w2->impl_->scales),
-            intermediate_columns, hidden_columns, w2.scale_columns);
-        ++state.moe_kernel_launches;
+        if (shared_regfed) {
+            if (auto status = launch_regfed_fp8_matvec(
+                    state.moe_regfed, w2, shared->w2->impl_->weights,
+                    shared->w2->impl_->scales,
+                    shared->w2->impl_->fragment_prepacked, shared_activation,
+                    shared_output, state.stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "launch register-fed shared expert down");
+                return result;
+            }
+            state.moe_kernel_launches += 2U;
+        } else {
+            deepseek_fp8_down_kernel<<<
+                static_cast<unsigned int>(hidden_columns), threads, 0U,
+                state.stream>>>(
+                shared_output, shared_activation,
+                static_cast<const unsigned char*>(shared->w2->impl_->weights),
+                static_cast<const unsigned char*>(shared->w2->impl_->scales),
+                intermediate_columns, hidden_columns, w2.scale_columns);
+            ++state.moe_kernel_launches;
+        }
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek shared FP8 W2");
             return result;
@@ -15183,17 +17442,82 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     }
 
     constexpr unsigned int threads = 256U;
-    deepseek_fp8_gate_up_kernel<<<
-        static_cast<unsigned int>(intermediate_columns), threads, 0U,
-        state.moe_shared_stream>>>(
-        state.moe_activations, state.moe_hidden,
-        static_cast<const unsigned char*>(shared.w1->impl_->weights),
-        static_cast<const unsigned char*>(shared.w1->impl_->scales),
-        static_cast<const unsigned char*>(shared.w3->impl_->weights),
-        static_cast<const unsigned char*>(shared.w3->impl_->scales),
-        hidden_columns, intermediate_columns, w1.scale_columns,
-        swiglu_limit, state.moe_bf16_silu, state.moe_error);
-    ++state.moe_kernel_launches;
+    const auto& w3_descriptor = shared.w3->impl_->descriptor;
+    const bool shared_regfed =
+        regfed_matmul_enabled() &&
+        // All three must already be permuted. These same weights are also read
+        // canonically by enqueue_deepseek_moe_rows through the paged kernels, so
+        // this site may not decide their layout on its own. An explicit
+        // prepack_fragment call is the opt-in, and it opts every consumer in.
+        shared.w1->impl_->fragment_prepacked &&
+        shared.w3->impl_->fragment_prepacked &&
+        shared.w2->impl_->fragment_prepacked &&
+        regfed_fp8_shape_admissible(w1.rows, w1.columns) &&
+        regfed_fp8_shape_admissible(w3_descriptor.rows, w3_descriptor.columns) &&
+        regfed_fp8_shape_admissible(w2.rows, w2.columns);
+    if (!shared_regfed &&
+        (shared.w1->impl_->fragment_prepacked ||
+         shared.w3->impl_->fragment_prepacked ||
+         shared.w2->impl_->fragment_prepacked)) {
+        // Refuse rather than let the scalar kernel read fragment order as
+        // canonical weights, which is silent corruption, not degradation.
+        abort_enqueue(cudaErrorInvalidValue,
+                      "DeepSeek shared expert weights are fragment-prepacked "
+                      "but the register-fed route is unavailable");
+        return result;
+    }
+    if (shared_regfed) {
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed);
+        void* gate_buffer = state.moe_regfed_gate;
+        if (auto status = regfed_grow(
+                gate_buffer, state.moe_regfed_gate_bytes,
+                intermediate_columns * 2U * sizeof(float), false,
+                state.moe_shared_stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "allocate register-fed shared expert buffers");
+            return result;
+        }
+        state.moe_regfed_gate = static_cast<float*>(gate_buffer);
+        state.moe_regfed_up = state.moe_regfed_gate + intermediate_columns;
+        if (auto status = launch_regfed_fp8_matvec(
+                state.moe_regfed, w1, shared.w1->impl_->weights,
+                shared.w1->impl_->scales, shared.w1->impl_->fragment_prepacked,
+                state.moe_hidden, state.moe_regfed_gate,
+                state.moe_shared_stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "launch register-fed shared expert gate");
+            return result;
+        }
+        if (auto status = launch_regfed_fp8_matvec(
+                state.moe_regfed, w3_descriptor, shared.w3->impl_->weights,
+                shared.w3->impl_->scales, shared.w3->impl_->fragment_prepacked,
+                state.moe_hidden, state.moe_regfed_up,
+                state.moe_shared_stream, true);
+            status != cudaSuccess) {
+            abort_enqueue(status, "launch register-fed shared expert up");
+            return result;
+        }
+        regfed_shared_swiglu_kernel<<<
+            static_cast<unsigned int>((intermediate_columns + 255U) / 256U),
+            256U, 0U, state.moe_shared_stream>>>(
+            state.moe_activations, state.moe_regfed_gate, state.moe_regfed_up,
+            static_cast<std::uint32_t>(intermediate_columns), swiglu_limit,
+            state.moe_bf16_silu, state.moe_error);
+        state.moe_kernel_launches += 4U;
+    } else {
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeSharedFp8);
+        deepseek_fp8_gate_up_kernel<<<
+            static_cast<unsigned int>(intermediate_columns), threads, 0U,
+            state.moe_shared_stream>>>(
+            state.moe_activations, state.moe_hidden,
+            static_cast<const unsigned char*>(shared.w1->impl_->weights),
+            static_cast<const unsigned char*>(shared.w1->impl_->scales),
+            static_cast<const unsigned char*>(shared.w3->impl_->weights),
+            static_cast<const unsigned char*>(shared.w3->impl_->scales),
+            hidden_columns, intermediate_columns, w1.scale_columns,
+            swiglu_limit, state.moe_bf16_silu, state.moe_error);
+        ++state.moe_kernel_launches;
+    }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch DeepSeek host MoE shared W1/W3");
         return result;
@@ -15223,14 +17547,27 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
                       "record DeepSeek shared activation quantization");
         return result;
     }
-    deepseek_fp8_down_kernel<<<
-        static_cast<unsigned int>(hidden_columns), threads, 0U,
-        state.moe_shared_stream>>>(
-        state.moe_output, state.moe_activations,
-        static_cast<const unsigned char*>(shared.w2->impl_->weights),
-        static_cast<const unsigned char*>(shared.w2->impl_->scales),
-        intermediate_columns, hidden_columns, w2.scale_columns);
-    ++state.moe_kernel_launches;
+    if (shared_regfed) {
+        if (auto status = launch_regfed_fp8_matvec(
+                state.moe_regfed, w2, shared.w2->impl_->weights,
+                shared.w2->impl_->scales, shared.w2->impl_->fragment_prepacked,
+                state.moe_activations, state.moe_output,
+                state.moe_shared_stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "launch register-fed shared expert down");
+            return result;
+        }
+        state.moe_kernel_launches += 2U;
+    } else {
+        deepseek_fp8_down_kernel<<<
+            static_cast<unsigned int>(hidden_columns), threads, 0U,
+            state.moe_shared_stream>>>(
+            state.moe_output, state.moe_activations,
+            static_cast<const unsigned char*>(shared.w2->impl_->weights),
+            static_cast<const unsigned char*>(shared.w2->impl_->scales),
+            intermediate_columns, hidden_columns, w2.scale_columns);
+        ++state.moe_kernel_launches;
+    }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch DeepSeek host MoE shared W2");
         return result;
@@ -15363,6 +17700,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         const dim3 tier_gate_grid(
             static_cast<unsigned int>(intermediate_columns),
             kMaxDeepSeekRoutedExperts, 1U);
+        record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeTierFp4);
         deepseek_fp4_tier_gate_up_kernel<<<
             tier_gate_grid, threads, 0U, tier_stream>>>(
             state.tier_activations, state.moe_hidden, table, tier_selection,
@@ -16171,8 +18509,10 @@ ValidationResult CudaBackend::enqueue_moe(
     }
     const auto batch_encoding = first_gate->impl_->descriptor.encoding;
     const bool nvfp4_batch = batch_encoding == CudaWeightEncoding::Nvfp4Group16;
+    const bool mxfp4_batch =
+        batch_encoding == CudaWeightEncoding::Fp4E2m1Group32;
     const bool plain_batch = batch_encoding == CudaWeightEncoding::Plain;
-    if (!nvfp4_batch && !plain_batch &&
+    if (!nvfp4_batch && !mxfp4_batch && !plain_batch &&
         batch_encoding != CudaWeightEncoding::OffsetPackedInt4) {
         result.errors.emplace_back("MoE command has an unsupported weight encoding");
         return result;
@@ -16194,6 +18534,9 @@ ValidationResult CudaBackend::enqueue_moe(
                         weight->impl_->descriptor.group_size == 16U &&
                         std::isfinite(weight->impl_->descriptor.global_scale) &&
                         weight->impl_->descriptor.global_scale > 0.0F)
+                 : mxfp4_batch
+                     ? (weight->impl_->descriptor.dtype == SafetensorsDtype::I8 &&
+                        weight->impl_->descriptor.group_size == 32U)
                  : plain_batch
                      ? weight->impl_->descriptor.dtype == SafetensorsDtype::Bf16
                      : (weight->impl_->descriptor.dtype == SafetensorsDtype::I32 &&
@@ -16207,10 +18550,12 @@ ValidationResult CudaBackend::enqueue_moe(
         const auto& gate = expert.gate->impl_->descriptor;
         const auto& up = expert.up->impl_->descriptor;
         const auto& down = expert.down->impl_->descriptor;
-        const auto expected_down_packed = nvfp4_batch
+        const auto expected_down_packed = (nvfp4_batch || mxfp4_batch)
             ? (down.columns + 1U) / 2U : (down.columns + 7U) / 8U;
         const auto expected_down_scales = nvfp4_batch
-            ? (down.columns + 15U) / 16U : (down.columns + 127U) / 128U;
+            ? (down.columns + 15U) / 16U
+            : mxfp4_batch ? (down.columns + 31U) / 32U
+                           : (down.columns + 127U) / 128U;
         const bool packing_valid = plain_batch ||
             (gate.packed_columns == up.packed_columns &&
              gate.scale_columns == up.scale_columns &&
@@ -16227,7 +18572,7 @@ ValidationResult CudaBackend::enqueue_moe(
         // because scaling before the down projection is not float-equal to
         // scaling after it and Laguna's reference scales after.
         if (!std::isfinite(expert.coefficient) ||
-            ((shared_expert || nvfp4_batch || plain_batch) &&
+            ((shared_expert || nvfp4_batch || mxfp4_batch || plain_batch) &&
              expert.coefficient != 1.0F)) {
             result.errors.emplace_back("MoE expert coefficient is invalid");
             return false;
@@ -16339,6 +18684,7 @@ ValidationResult CudaBackend::enqueue_moe(
 
     PackedInt4MoeBatch batch;
     Nvfp4MoeBatch nvfp4_batch_data;
+    Mxfp4MoeBatch mxfp4_batch_data;
     PlainBf16MoeBatch plain_batch_data;
     state.moe_weights.clear();
     state.moe_weights.reserve(expert_count * 3U);
@@ -16370,6 +18716,19 @@ ValidationResult CudaBackend::enqueue_moe(
                 expert.up->impl_->descriptor.global_scale;
             nvfp4_batch_data.down_global_scales[index] =
                 expert.down->impl_->descriptor.global_scale;
+        } else if (mxfp4_batch) {
+            mxfp4_batch_data.gate_weights[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->weights);
+            mxfp4_batch_data.gate_scales[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->scales);
+            mxfp4_batch_data.up_weights[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->weights);
+            mxfp4_batch_data.up_scales[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->scales);
+            mxfp4_batch_data.down_weights[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->weights);
+            mxfp4_batch_data.down_scales[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->scales);
         } else {
             batch.gate_weights[index] = static_cast<const std::uint32_t*>(
                 expert.gate->impl_->weights);
@@ -16397,6 +18756,8 @@ ValidationResult CudaBackend::enqueue_moe(
     batch.rows = rows;
     nvfp4_batch_data.count = batch.count;
     nvfp4_batch_data.rows = rows;
+    mxfp4_batch_data.count = batch.count;
+    mxfp4_batch_data.rows = rows;
     plain_batch_data.count = batch.count;
     plain_batch_data.rows = rows;
 
@@ -16452,6 +18813,19 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "record MoE hidden upload");
         return result;
     }
+    if (mxfp4_batch) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((hidden_columns + 127U) / 128U), rows,
+            1U);
+        quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            state.moe_hidden, hidden_columns, rows);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch MXFP4 MoE hidden quantization");
+            return result;
+        }
+    }
 
     const auto& gate = (routed.empty() ? shared->gate : routed.front().gate)
                            ->impl_->descriptor;
@@ -16465,6 +18839,47 @@ ValidationResult CudaBackend::enqueue_moe(
         static_cast<unsigned int>((intermediate_columns + warps_per_block - 1U) /
                                   warps_per_block),
         static_cast<unsigned int>(activation_rows), 1U);
+    // Counted once per MoE command on the gate/up dispatch; the down kernel
+    // mirrors the same branch, so counting both would double every entry.
+    // Register-fed fused MoE. Fragment order replaces the canonical layout, so
+    // the batch is all-or-nothing: a partially permuted batch is a defect, not
+    // a mixed dispatch, and is refused rather than half-served.
+    bool mxfp4_prepacked = mxfp4_batch;
+    bool mxfp4_any_prepacked = false;
+    if (mxfp4_batch) {
+        for (std::uint32_t index = 0U; index < batch.count; ++index) {
+            const auto* expert = index < routed.size() ? &routed[index] : shared;
+            const bool ready = expert->gate->impl_->fragment_prepacked &&
+                               expert->up->impl_->fragment_prepacked &&
+                               expert->down->impl_->fragment_prepacked;
+            mxfp4_prepacked = mxfp4_prepacked && ready;
+            mxfp4_any_prepacked = mxfp4_any_prepacked ||
+                                  expert->gate->impl_->fragment_prepacked ||
+                                  expert->up->impl_->fragment_prepacked ||
+                                  expert->down->impl_->fragment_prepacked;
+        }
+        if (mxfp4_any_prepacked && !mxfp4_prepacked) {
+            abort_enqueue(cudaErrorInvalidValue,
+                          "MXFP4 MoE batch mixes fragment-prepacked and "
+                          "canonical experts");
+            return result;
+        }
+        if (mxfp4_prepacked && rows > kRegfedMaxM) {
+            // No hidden fallback: the scalar kernel would read fragment order
+            // as canonical weights, which is silent corruption.
+            abort_enqueue(cudaErrorInvalidValue,
+                          "MXFP4 MoE batch is fragment-prepacked but the row "
+                          "count exceeds the register-fed kernel's width");
+            return result;
+        }
+    }
+    const bool mxfp4_regfed = mxfp4_prepacked && regfed_matmul_enabled();
+    record_cuda_matmul_route(
+        plain_batch      ? CudaMatmulRoute::MoePlainBf16
+        : nvfp4_batch    ? CudaMatmulRoute::MoeNvfp4Group16
+        : mxfp4_regfed   ? CudaMatmulRoute::MoeFp4RegisterFed
+        : mxfp4_batch    ? CudaMatmulRoute::MoeFp4E2m1Group32
+                         : CudaMatmulRoute::MoePackedInt4);
     if (plain_batch) {
         plain_bf16_moe_gate_up_kernel<<<plain_gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, plain_batch_data,
@@ -16474,6 +18889,85 @@ ValidationResult CudaBackend::enqueue_moe(
             state.moe_activations, state.moe_hidden, nvfp4_batch_data,
             hidden_columns, intermediate_columns, gate.packed_columns,
             gate.scale_columns, gate.group_size, state.moe_error);
+    } else if (mxfp4_regfed) {
+        const auto experts = batch.count;
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>(rows, kRegfedMaxM) + kRegfedTileM - 1U) /
+            kRegfedTileM);
+        const auto groups = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto n_tiles =
+            static_cast<std::uint32_t>(intermediate_columns / kRegfedTileN);
+        const auto k_blocks = static_cast<std::uint32_t>(
+            (hidden_columns / kRegfedTileK) / kRegfedKPerLoad);
+        std::uint32_t split = 1U;
+        while (split < 16U && k_blocks % (split * 2U) == 0U &&
+               static_cast<std::uint64_t>(experts) * n_tiles * split * 2U <= 4096U) {
+            split *= 2U;
+        }
+        const std::uint64_t partial_bytes = static_cast<std::uint64_t>(experts) *
+                                            intermediate_columns * rows * split *
+                                            sizeof(float);
+        const std::uint64_t fragment_bytes =
+            static_cast<std::uint64_t>(hidden_columns / kRegfedTileK) *
+            column_blocks * groups * 4U * sizeof(uint2);
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required) {
+            return regfed_grow(pointer, capacity, required, false, state.stream);
+        };
+        if (grow(state.moe_regfed_gate_partials,
+                 state.moe_regfed_gate_partial_bytes, partial_bytes) != cudaSuccess ||
+            grow(state.moe_regfed_up_partials,
+                 state.moe_regfed_up_partial_bytes, partial_bytes) != cudaSuccess ||
+            grow(state.moe_regfed_hidden_fragment,
+                 state.moe_regfed_hidden_fragment_bytes, fragment_bytes) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate register-fed MoE gate/up workspaces");
+            return result;
+        }
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(hidden_columns / kRegfedTileK) *
+            column_blocks * groups * 4U;
+        regfed_moe_activation_fragment_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            static_cast<uint2*>(state.moe_regfed_hidden_fragment),
+            state.moe_hidden, 1U, static_cast<std::uint32_t>(rows),
+            static_cast<std::uint32_t>(hidden_columns), column_blocks, groups);
+        const auto blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(experts) * n_tiles * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_mxfp4_moe_gate_up_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                static_cast<float*>(state.moe_regfed_gate_partials),
+                static_cast<float*>(state.moe_regfed_up_partials),
+                static_cast<const uint2*>(state.moe_regfed_hidden_fragment),
+                mxfp4_batch_data, static_cast<std::uint32_t>(hidden_columns),
+                static_cast<std::uint32_t>(intermediate_columns), split,
+                static_cast<std::uint32_t>(rows), groups);
+        };
+        if (column_blocks == 1U) launch(std::integral_constant<std::uint32_t, 1U>{});
+        else launch(std::integral_constant<std::uint32_t, 2U>{});
+        const std::uint64_t swiglu_total =
+            static_cast<std::uint64_t>(experts) * intermediate_columns * rows;
+        regfed_mxfp4_moe_swiglu_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((swiglu_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            state.moe_activations,
+            static_cast<const float*>(state.moe_regfed_gate_partials),
+            static_cast<const float*>(state.moe_regfed_up_partials), experts,
+            static_cast<std::uint32_t>(intermediate_columns),
+            static_cast<std::uint32_t>(rows), split, state.moe_error);
+        state.moe_kernel_launches += 2U;
+    } else if (mxfp4_batch) {
+        mxfp4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, mxfp4_batch_data,
+            hidden_columns, intermediate_columns, gate.packed_columns,
+            gate.scale_columns, state.moe_error);
     } else {
         packed_int4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, batch, hidden_columns,
@@ -16484,6 +18978,23 @@ ValidationResult CudaBackend::enqueue_moe(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         abort_enqueue(status, "launch MoE gate/up SwiGLU");
         return result;
+    }
+    if (mxfp4_batch) {
+        // Runs for both routes: it is what makes the activation E4M3, and an
+        // E4M3 value's BF16 image is exact, which is why the register-fed
+        // tensor op multiplies the same numbers the scalar kernel does.
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            static_cast<unsigned int>(activation_rows), 1U);
+        quantize_activation_e4m3_kernel<<<quantize_grid, 128U, 0U,
+                                          state.stream>>>(
+            state.moe_activations, intermediate_columns,
+            static_cast<std::uint32_t>(activation_rows));
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch MXFP4 MoE activation quantization");
+            return result;
+        }
     }
     const dim3 down_grid(static_cast<unsigned int>(hidden_columns),
                          static_cast<unsigned int>(activation_rows), 1U);
@@ -16500,6 +19011,80 @@ ValidationResult CudaBackend::enqueue_moe(
             state.moe_output, state.moe_activations, nvfp4_batch_data,
             intermediate_columns, hidden_columns, down.packed_columns,
             down.scale_columns, down.group_size, state.moe_error);
+    } else if (mxfp4_regfed) {
+        const auto experts = batch.count;
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (std::min<std::uint64_t>(rows, kRegfedMaxM) + kRegfedTileM - 1U) /
+            kRegfedTileM);
+        const auto groups = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto n_tiles =
+            static_cast<std::uint32_t>(hidden_columns / kRegfedTileN);
+        const auto k_blocks = static_cast<std::uint32_t>(
+            (intermediate_columns / kRegfedTileK) / kRegfedKPerLoad);
+        std::uint32_t split = 1U;
+        while (split < 16U && k_blocks % (split * 2U) == 0U &&
+               static_cast<std::uint64_t>(experts) * n_tiles * split * 2U <= 4096U) {
+            split *= 2U;
+        }
+        const std::uint64_t partial_bytes = static_cast<std::uint64_t>(experts) *
+                                            hidden_columns * rows * split *
+                                            sizeof(float);
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(experts) *
+            (intermediate_columns / kRegfedTileK) * column_blocks * groups * 4U;
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required) {
+            return regfed_grow(pointer, capacity, required, false, state.stream);
+        };
+        if (grow(state.moe_regfed_down_partials,
+                 state.moe_regfed_down_partial_bytes, partial_bytes) != cudaSuccess ||
+            grow(state.moe_regfed_activation_fragment,
+                 state.moe_regfed_activation_fragment_bytes,
+                 fragment_total * sizeof(uint2)) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate register-fed MoE down workspaces");
+            return result;
+        }
+        regfed_moe_activation_fragment_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            static_cast<uint2*>(state.moe_regfed_activation_fragment),
+            state.moe_activations, experts, static_cast<std::uint32_t>(rows),
+            static_cast<std::uint32_t>(intermediate_columns), column_blocks, groups);
+        const auto blocks = static_cast<unsigned int>(std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(experts) * n_tiles * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock, 65535U));
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_mxfp4_moe_down_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                static_cast<float*>(state.moe_regfed_down_partials),
+                static_cast<const uint2*>(state.moe_regfed_activation_fragment),
+                mxfp4_batch_data,
+                static_cast<std::uint32_t>(intermediate_columns),
+                static_cast<std::uint32_t>(hidden_columns), split,
+                static_cast<std::uint32_t>(rows), groups);
+        };
+        if (column_blocks == 1U) launch(std::integral_constant<std::uint32_t, 1U>{});
+        else launch(std::integral_constant<std::uint32_t, 2U>{});
+        const std::uint64_t reduce_total =
+            static_cast<std::uint64_t>(experts) * hidden_columns * rows;
+        regfed_mxfp4_moe_reduce_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>((reduce_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            state.moe_output,
+            static_cast<const float*>(state.moe_regfed_down_partials), experts,
+            static_cast<std::uint32_t>(hidden_columns),
+            static_cast<std::uint32_t>(rows), split, state.moe_error);
+        state.moe_kernel_launches += 2U;
+    } else if (mxfp4_batch) {
+        mxfp4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, mxfp4_batch_data,
+            intermediate_columns, hidden_columns, down.packed_columns,
+            down.scale_columns, state.moe_error);
     } else {
         packed_int4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
             state.moe_output, state.moe_activations, batch, intermediate_columns,

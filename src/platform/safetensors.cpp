@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
@@ -29,6 +30,7 @@ using detail::JsonCursor;
     }
     if (value == "I8") return SafetensorsDtype::I8;
     if (value == "U8") return SafetensorsDtype::U8;
+    if (value == "U32") return SafetensorsDtype::U32;
     if (value == "I32") return SafetensorsDtype::I32;
     if (value == "I64") return SafetensorsDtype::I64;
     return SafetensorsDtype::Other;
@@ -121,6 +123,7 @@ std::uint32_t safetensors_dtype_bytes(SafetensorsDtype dtype) noexcept {
         case SafetensorsDtype::Bf16:
         case SafetensorsDtype::F16: return 2;
         case SafetensorsDtype::F32:
+        case SafetensorsDtype::U32:
         case SafetensorsDtype::I32: return 4;
         case SafetensorsDtype::I64: return 8;
         case SafetensorsDtype::I8:
@@ -141,6 +144,7 @@ std::string_view to_string(SafetensorsDtype dtype) noexcept {
         case SafetensorsDtype::F8E8M0: return "F8_E8M0";
         case SafetensorsDtype::I8: return "I8";
         case SafetensorsDtype::U8: return "U8";
+        case SafetensorsDtype::U32: return "U32";
         case SafetensorsDtype::I32: return "I32";
         case SafetensorsDtype::I64: return "I64";
         case SafetensorsDtype::Other: return "OTHER";
@@ -194,6 +198,54 @@ ParseResult<SafetensorsIndex> parse_safetensors_index(std::string_view json) {
     } catch (const std::exception& exception) {
         result.errors.emplace_back(exception.what());
     }
+    return result;
+}
+
+ParseResult<SafetensorsIndex> load_safetensors_index(
+    const std::string& model_directory, std::uint64_t maximum_index_bytes) {
+    ParseResult<SafetensorsIndex> result;
+    const auto root = std::filesystem::path(model_directory);
+    const auto index_path = root / "model.safetensors.index.json";
+    std::error_code error;
+    const bool has_index = std::filesystem::exists(index_path, error);
+    if (error) {
+        result.errors.emplace_back(index_path.string() + ": " + error.message());
+        return result;
+    }
+    if (has_index) {
+        auto text = load_bounded_text_file(index_path.string(), maximum_index_bytes);
+        if (!text.ok()) {
+            result.errors = std::move(text.errors);
+            return result;
+        }
+        return parse_safetensors_index(text.value);
+    }
+
+    constexpr std::string_view kSingleShardName = "model.safetensors";
+    const auto shard_path = root / kSingleShardName;
+    const bool has_shard = std::filesystem::exists(shard_path, error);
+    if (error) {
+        result.errors.emplace_back(shard_path.string() + ": " + error.message());
+        return result;
+    }
+    if (!has_shard) {
+        result.errors.emplace_back(
+            model_directory +
+            ": neither model.safetensors.index.json nor model.safetensors exists");
+        return result;
+    }
+
+    auto shard = load_safetensors_shard(shard_path.string());
+    if (!shard.ok()) {
+        result.errors = std::move(shard.errors);
+        return result;
+    }
+    result.value.total_size = shard.value.file_size - shard.value.data_start;
+    result.value.entries.reserve(shard.value.tensors.size());
+    for (const auto& tensor : shard.value.tensors) {
+        result.value.entries.push_back({tensor.name, std::string(kSingleShardName)});
+    }
+    result.value.shards.emplace_back(kSingleShardName);
     return result;
 }
 

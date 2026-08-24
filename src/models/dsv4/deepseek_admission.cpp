@@ -10,6 +10,45 @@
 
 namespace strata {
 
+Dsv4E8m0Admission dsv4_admit_e8m0_scales(
+    std::span<const std::byte> scales) noexcept {
+    Dsv4E8m0Admission admission;
+    for (std::size_t index = 0U; index < scales.size(); ++index) {
+        const auto code = static_cast<std::uint8_t>(scales[index]);
+        if (code >= kDsv4E8m0AdmissibleMinimum &&
+            code <= kDsv4E8m0AdmissibleMaximum) {
+            continue;
+        }
+        if (admission.inadmissible == 0U) {
+            admission.first_offset = index;
+            admission.first_code = code;
+        }
+        ++admission.inadmissible;
+        if (code == 0U) {
+            ++admission.code_zero;
+        } else {
+            ++admission.code_255;
+        }
+    }
+    return admission;
+}
+
+ValidationResult dsv4_admit_e8m0_scales_for(
+    std::string_view tensor_name, std::span<const std::byte> scales) {
+    ValidationResult result;
+    const auto admission = dsv4_admit_e8m0_scales(scales);
+    if (admission.admitted()) return result;
+    result.errors.emplace_back(
+        std::string(tensor_name) + " carries " +
+        std::to_string(admission.inadmissible) +
+        " inadmissible E8M0 scale codes (first: code " +
+        std::to_string(static_cast<unsigned>(admission.first_code)) +
+        " at byte offset " + std::to_string(admission.first_offset) +
+        "); exact mode reports failure rather than substituting");
+    return result;
+}
+
+
 namespace {
 
 [[nodiscard]] bool ends_with(std::string_view text,

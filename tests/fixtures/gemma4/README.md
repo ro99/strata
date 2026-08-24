@@ -1,7 +1,11 @@
 # Gemma 4 layer-hash-trace fixture
 
 `layer-hash-trace.json` is the tier-1 (per-layer, per-operation BF16 hash) and
-tier-2 (generated token IDs) equivalence-oracle fixture for Gemma 4.
+tier-2 (generated token IDs) equivalence-oracle fixture for the indexed W8A16
+Gemma 4 checkpoint. `layer-hash-trace-mxfp4.json` is the corresponding oracle
+for the single-shard MXFP4 checkpoint. `scripts/check_equivalence.py` selects
+between them with the same index-first rule as the checkpoint loader and forces
+the scalar FP4 route for the MXFP4 oracle.
 
 **Re-captured** after closing the P3 blind spot (brief 00c task 3 / brief 01
 task 0): a fourth operation-hash checkpoint, `mlp_residual`, was added right

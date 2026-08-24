@@ -26,11 +26,35 @@ struct InklingRuntimeConfig {
     // Runs the experts and the resident spine on the devices. Off falls back
     // to the host reference path, which is the correctness oracle.
     bool enable_cuda{true};
-    // Faults the routed expert set into page cache at load. The set is 154 GiB
-    // and host memory is larger, so steady-state decode should never touch
-    // NVMe; without this the VRAM cache misses fault cold pages and the device
-    // waits on storage instead of on PCIe.
+    // Faults the routed expert set into page cache at load. Host memory is
+    // larger than either supported checkpoint, so steady-state decode should
+    // never touch NVMe; without this the VRAM cache misses fault cold pages and
+    // the device waits on storage instead of on PCIe.
     bool warm_expert_pages{true};
+    // MXFP4 experts already have the canonical three-stack layout, so upload
+    // from the resident mapping without an extra host memcpy into pinned
+    // scratch. False retains the measured control path for profiling. NVFP4
+    // still needs scratch to de-interleave gate/up and is unaffected.
+    bool direct_mapped_mxfp4_staging{true};
+    // Suballocate resident and cached weights from one bounded CUDA allocation
+    // per device. False retains the per-projection cudaMalloc/cudaFree control
+    // for the allocator-stall experiment.
+    bool use_weight_arena{true};
+    // MXFP4 miss sources are persistent checkpoint mappings, so their uploads
+    // may run on the copy stream and be ordered once before the MoE batch.
+    // False retains three host-blocking upload synchronizations per expert.
+    bool defer_mapped_mxfp4_uploads{true};
+    // Keep the exact BF16 K/V ring on each layer's assigned device and run
+    // Inkling's relative-bias attention there. False retains the scalar host
+    // oracle for controlled comparisons.
+    bool enable_device_kv_attention{true};
+    // Keep short generations on the scalar oracle. Although the device
+    // operation crosses over near 32 rows, a route-sensitive 64-token run
+    // regressed after its numerically equivalent route changed. At 512 rows
+    // the target-shape operation is already 35x faster on SM86, so this
+    // conservative boundary preserves the short-context path while removing
+    // the unbounded host-attention term at long context.
+    std::uint32_t minimum_device_attention_rows{512U};
     std::uint32_t maximum_context_tokens{2048U};
     // Rows per prefill page. Zero or one keeps the token-at-a-time path.
     // Above one, a page runs attention and the short convolutions row by row
@@ -82,6 +106,7 @@ struct InklingDeviceStats {
     std::vector<std::uint64_t> cache_capacity_bytes;
     std::vector<std::uint64_t> cache_peak_bytes;
     std::vector<std::uint64_t> resident_spine_bytes;
+    std::vector<std::uint64_t> resident_kv_bytes;
     bool enabled{};
 
     [[nodiscard]] double hit_rate() const noexcept {
@@ -117,7 +142,9 @@ struct InklingRunMetrics {
     InklingGraphStats prefill_graph;
     InklingSpeculationStats speculation;
     InklingDeviceStats device;
+    InklingDeviceStats prefill_device;
     CudaBackendStats cuda;
+    CudaBackendStats prefill_cuda;
     std::uint64_t rss_bytes{};
 
     [[nodiscard]] double prefill_tokens_per_second() const noexcept {

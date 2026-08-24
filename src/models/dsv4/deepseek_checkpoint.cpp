@@ -1,3 +1,4 @@
+#include "strata/deepseek_admission.hpp"
 #include "strata/deepseek_checkpoint.hpp"
 
 #include "../common/checkpoint_common.hpp"
@@ -37,14 +38,7 @@ Dsv4CheckpointReader::~Dsv4CheckpointReader() = default;
 Dsv4CheckpointOpenResult Dsv4CheckpointReader::open(std::string model_directory,
                                                     bool require_read_only) {
     Dsv4CheckpointOpenResult result;
-    const auto index_path =
-        (std::filesystem::path(model_directory) / "model.safetensors.index.json").string();
-    auto text = load_bounded_text_file(index_path, kMaximumIndexBytes);
-    if (!text.ok()) {
-        result.errors = std::move(text.errors);
-        return result;
-    }
-    auto index = parse_safetensors_index(text.value);
+    auto index = load_safetensors_index(model_directory, kMaximumIndexBytes);
     if (!index.ok()) {
         result.errors = std::move(index.errors);
         return result;
@@ -713,6 +707,13 @@ ValidationResult load_dsv4_cuda_linear(
             scale_data = owned_scale;
         }
         if (weight->encoding == Dsv4TensorEncoding::Fp4E2m1Group32) {
+            // MIX-1 admission: reject E8M0 codes 0 and 255 at load rather than
+            // decoding them to +0 and +inf in the kernel.
+            auto admitted = dsv4_admit_e8m0_scales_for(scale_name, scale_data);
+            if (!admitted.ok()) {
+                move_errors(result, std::move(admitted.errors));
+                return result;
+            }
             descriptor.encoding = CudaWeightEncoding::Fp4E2m1Group32;
             descriptor.packed_columns = (expected_columns + 1U) / 2U;
             descriptor.scale_columns = (expected_columns + 31U) / 32U;

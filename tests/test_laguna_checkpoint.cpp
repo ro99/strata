@@ -122,3 +122,54 @@ TEST_CASE("Laguna NVFP4 dequantization matches the target-format oracle") {
     }
     checkpoint.value->release_mapped_views();
 }
+
+TEST_CASE("real Laguna S 2.1-MXFP4 checkpoint validates without replacing NVFP4") {
+    const auto path =
+        std::filesystem::path(STRATA_SOURCE_DIR) / "models/laguna";
+    if (!std::filesystem::exists(path / "model.safetensors.index.json")) {
+        SKIP("pinned Laguna S 2.1-MXFP4 checkpoint is absent");
+    }
+    const auto& contract = strata::kLagunaExecutionContract;
+    const auto spec = strata::laguna_s21_mxfp4_spec();
+    REQUIRE(strata::validate_laguna_s21_mxfp4(spec).ok());
+    const auto checkpoint = strata::LagunaCheckpointReader::open(path.string());
+    REQUIRE(checkpoint.ok());
+    REQUIRE(checkpoint.value->format() ==
+            strata::LagunaCheckpointFormat::Mxfp4Group32);
+    REQUIRE(checkpoint.value->tensors().size() == spec.source.tensor_count);
+    REQUIRE(checkpoint.value->shard_file_bytes() == spec.source.shard_file_bytes);
+
+    const auto early = checkpoint.value->linear(
+        "model.layers.1.mlp.experts.7.gate_proj",
+        contract.expert_intermediate_size, contract.hidden_size);
+    REQUIRE(early.ok());
+    REQUIRE(early.value.encoding == strata::LagunaTensorEncoding::Mxfp4Group32);
+    REQUIRE(early.value.packed->dtype == strata::SafetensorsDtype::U8);
+    REQUIRE(early.value.packed->shape ==
+            std::vector<std::uint64_t>(
+                {contract.expert_intermediate_size,
+                 contract.hidden_size / 2U}));
+    REQUIRE(early.value.scale->dtype == strata::SafetensorsDtype::U8);
+    REQUIRE(early.value.scale->shape ==
+            std::vector<std::uint64_t>(
+                {contract.expert_intermediate_size,
+                 contract.hidden_size / 32U}));
+    REQUIRE(early.value.global_scale == nullptr);
+
+    // The old checkpoint switches layers 40-47 back to BF16. MXFP4 does not.
+    const auto late = checkpoint.value->linear(
+        "model.layers.47.mlp.experts.7.down_proj", contract.hidden_size,
+        contract.expert_intermediate_size);
+    REQUIRE(late.ok());
+    REQUIRE(late.value.encoding == strata::LagunaTensorEncoding::Mxfp4Group32);
+    REQUIRE(late.value.scale->shape ==
+            std::vector<std::uint64_t>(
+                {contract.hidden_size,
+                 contract.expert_intermediate_size / 32U}));
+
+    const auto attention = checkpoint.value->linear(
+        "model.layers.1.self_attn.q_proj", 72U * contract.head_dim,
+        contract.hidden_size);
+    REQUIRE(attention.ok());
+    REQUIRE(attention.value.encoding == strata::LagunaTensorEncoding::Plain);
+}

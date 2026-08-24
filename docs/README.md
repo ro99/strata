@@ -8,6 +8,9 @@ benchmark must not be used as evidence of current behavior.
 
 - `../README.md` — current capabilities, validation limits, commands, and promoted
   machine baselines.
+- `models/` — operator runbooks with copy-paste build, chat, server, and
+  benchmark commands tied to measured operating points. Start with
+  `models/laguna.md`.
 - `current-architecture.md` — implemented dependency and execution boundaries,
   including explicit scheduler gaps and the placement planner behind
   `--dry-run`.

@@ -2,6 +2,7 @@
 // measures W_r and B_r for every resource at a chosen operating point and
 // prints the per-phase breakdown of one step in milliseconds, so argmax_r is
 // named from measurement rather than assumed.
+#include "strata/cuda_backend.hpp"
 #include "strata/laguna_runtime.hpp"
 
 #include <charconv>
@@ -24,6 +25,8 @@ struct Options {
     std::uint32_t max_new{16U};
     std::uint32_t repetitions{1U};
     double vram_fraction{0.85};
+    bool device_resident_kv{true};
+    bool detailed_cuda_timing{true};
     std::string prompt{
         "Explain in one short paragraph why a hash map gives constant expected "
         "lookup time."};
@@ -64,6 +67,8 @@ bool parse_options(int argc, char** argv, Options& options) {
         else if (flag == "--max-new") { if (!parse_u32(next(), options.max_new)) return false; }
         else if (flag == "--repetitions") { if (!parse_u32(next(), options.repetitions)) return false; }
         else if (flag == "--vram-fraction") options.vram_fraction = std::atof(std::string(next()).c_str());
+        else if (flag == "--host-kv") options.device_resident_kv = false;
+        else if (flag == "--no-detailed-cuda-timing") options.detailed_cuda_timing = false;
         else if (flag == "--prompt") options.prompt = std::string(next());
         else return false;
     }
@@ -296,7 +301,8 @@ int main(int argc, char** argv) {
     if (!parse_options(argc, argv, options)) {
         std::cerr << "usage: strata-laguna-profile --model DIR [--devices 0,1,2]"
                      " [--context N] [--max-new N] [--repetitions N]"
-                     " [--vram-fraction F] [--prompt TEXT]\n";
+                     " [--vram-fraction F] [--host-kv]"
+                     " [--no-detailed-cuda-timing] [--prompt TEXT]\n";
         return 2;
     }
 
@@ -307,8 +313,9 @@ int main(int argc, char** argv) {
     config.sampling_temperature = 0.0;
     config.load_progress = true;
     config.enable_flash_attention = true;
+    config.enable_device_resident_kv_decode = options.device_resident_kv;
     config.enable_incremental_kv_continuation = false;
-    config.detailed_cuda_timing = true;
+    config.detailed_cuda_timing = options.detailed_cuda_timing;
 
     strata::LagunaRuntime runtime;
     const auto load_started = std::chrono::steady_clock::now();
@@ -352,6 +359,21 @@ int main(int argc, char** argv) {
         report(result.metrics.decode, result.metrics.decode_tokens,
                result.metrics.decode_seconds, "decode");
         std::cout << "\ntext: " << result.text << '\n';
+    }
+    // Which matmul route actually served the run. Without this a
+    // register-fed A/B cannot tell "no speedup" from "never dispatched".
+    {
+        const auto census = strata::cuda_matmul_route_census();
+        std::cout << "\n-- matmul route census --\n";
+        for (std::size_t i = 0U;
+             i < static_cast<std::size_t>(strata::CudaMatmulRoute::Count); ++i) {
+            const auto count = census.counts[i];
+            if (count == 0U) continue;
+            std::cout << "  " << std::left << std::setw(34)
+                      << strata::cuda_matmul_route_name(
+                             static_cast<strata::CudaMatmulRoute>(i))
+                      << std::right << count << "\n";
+        }
     }
     return 0;
 }

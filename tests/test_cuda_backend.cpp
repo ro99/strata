@@ -98,6 +98,35 @@ strata::CudaWeight upload_fp4(
     return result;
 }
 
+strata::CudaWeight upload_nvfp4(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns, std::uint8_t seed) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Nvfp4Group16;
+    descriptor.dtype = strata::SafetensorsDtype::U8;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = columns / 2U;
+    descriptor.scale_columns = columns / 16U;
+    descriptor.group_size = 16U;
+    descriptor.global_scale = 1.0F;
+    std::vector<std::byte> weights(
+        static_cast<std::size_t>(rows * descriptor.packed_columns));
+    for (std::size_t index = 0U; index < weights.size(); ++index) {
+        const auto low = static_cast<std::uint8_t>((index + seed) & 0x0FU);
+        const auto high =
+            static_cast<std::uint8_t>((index * 3U + seed + 1U) & 0x0FU);
+        weights[index] =
+            static_cast<std::byte>(low | static_cast<std::uint8_t>(high << 4U));
+    }
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(rows * descriptor.scale_columns),
+        std::byte{0x38U});
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
+    return result;
+}
+
 strata::CudaWeight upload_fp8(
     strata::CudaBackend& backend, int device, std::uint64_t rows,
     std::uint64_t columns, std::uint8_t seed) {
@@ -247,6 +276,95 @@ bool fill_dsv4_host_moe_partials(
 }
 
 }  // namespace
+
+TEST_CASE("fragment prepack accepts admissible weights and refuses the rest") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // FP8 needs both extents on 128; FP4 needs rows%16 and a whole load block
+    // of columns.
+    const auto fp8 = upload_fp8(backend, device, 128U, 128U, 0x11U);
+    REQUIRE(backend.prepack_fragment(device, fp8).ok());
+    // The permutation replaces the canonical layout in place, so the weight
+    // stays valid and its declared byte count is unchanged.
+    REQUIRE(fp8.valid());
+
+    // FP4 has its own layout, and an admissible FP4 weight must be permuted
+    // rather than refused.
+    const auto fp4 = upload_fp4(backend, device, 32U, 128U, 0x22U);
+    REQUIRE(backend.prepack_fragment(device, fp4).ok());
+    REQUIRE(strata::CudaBackend::fragment_prepacked(fp4));
+
+    // A row count that is not a whole 16-row MMA tile must be refused: the
+    // fragment map is undefined for a partial tile.
+    const auto ragged = upload_fp4(backend, device, 24U, 128U, 0x33U);
+    const auto rejected = backend.prepack_fragment(device, ragged);
+    REQUIRE(!rejected.ok());
+
+    // An invalid weight must be reported, not dereferenced.
+    strata::CudaWeight empty;
+    REQUIRE(!backend.prepack_fragment(device, empty).ok());
+}
+
+TEST_CASE("MIX-1 matmul route census records every dispatch and refuses unknown encodings") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    strata::reset_cuda_matmul_route_census();
+    const auto before = strata::cuda_matmul_route_census();
+    for (const auto count : before.counts) REQUIRE(count == 0U);
+
+    // An FP4 matmul must be recorded on exactly one FP4 route, and which one
+    // it is must follow the register-fed switch rather than being ambiguous.
+    constexpr std::uint64_t rows = 64U, columns = 128U;
+    std::vector<float> hidden(static_cast<std::size_t>(columns), 0.25F);
+    std::vector<float> out(static_cast<std::size_t>(rows));
+    const auto fp4 = static_cast<std::size_t>(
+        strata::CudaMatmulRoute::Fp4E2m1Group32);
+    const auto regfed = static_cast<std::size_t>(
+        strata::CudaMatmulRoute::Fp4RegisterFed);
+    const auto unsupported = static_cast<std::size_t>(
+        strata::CudaMatmulRoute::Unsupported);
+
+    strata::set_register_fed_matmul(false);
+    const auto scalar_weight = upload_fp4(backend, device, rows, columns, 0x5AU);
+    REQUIRE(backend.matmul(scalar_weight, hidden, 1U, out).ok());
+    auto after = strata::cuda_matmul_route_census();
+    REQUIRE(after.counts[fp4] == 1U);
+    REQUIRE(after.counts[regfed] == 0U);
+
+    strata::set_register_fed_matmul(true);
+    const auto regfed_weight = upload_fp4(backend, device, rows, columns, 0x5AU);
+    REQUIRE(backend.prepack_fragment(device, regfed_weight).ok());
+    REQUIRE(backend.matmul(regfed_weight, hidden, 1U, out).ok());
+    after = strata::cuda_matmul_route_census();
+    REQUIRE(after.counts[fp4] == 1U);
+    REQUIRE(after.counts[regfed] == 1U);
+    REQUIRE(after.counts[unsupported] == 0U);
+
+    // Every route name must be distinct and non-empty, so a census dump is
+    // readable rather than ambiguous.
+    for (std::size_t i = 0U;
+         i < static_cast<std::size_t>(strata::CudaMatmulRoute::Count); ++i) {
+        const auto* name = strata::cuda_matmul_route_name(
+            static_cast<strata::CudaMatmulRoute>(i));
+        REQUIRE(name != nullptr);
+        REQUIRE(name[0] != '\0');
+        for (std::size_t j = 0U; j < i; ++j) {
+            REQUIRE(std::string(name) !=
+                    std::string(strata::cuda_matmul_route_name(
+                        static_cast<strata::CudaMatmulRoute>(j))));
+        }
+    }
+}
 
 TEST_CASE("native CUDA FlashAttention validates device support before dispatch") {
     const auto devices = strata::CudaBackend::available_devices();
@@ -1225,6 +1343,290 @@ TEST_CASE("native CUDA backend keeps a Gemma 4 decode layer resident") {
                         [](auto item) { return item == 0U; }));
 }
 
+TEST_CASE("persistent BF16 KV ring matches Laguna's target-shape F32 attention contract") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t query_heads = 72U;
+    constexpr std::uint32_t kv_heads = 8U;
+    constexpr std::uint32_t head_dim = 128U;
+    constexpr std::uint32_t query_elements = query_heads * head_dim;
+    constexpr std::uint32_t kv_elements = kv_heads * head_dim;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto encode = [](float value) {
+        return static_cast<std::uint16_t>(
+            std::bit_cast<std::uint32_t>(strata::bf16_round_f32(value)) >> 16U);
+    };
+    const auto decode = [](std::uint16_t value) {
+        return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
+    };
+    std::array<float, query_elements> queries{};
+    for (std::size_t index = 0U; index < queries.size(); ++index) {
+        queries[index] = static_cast<float>(static_cast<int>(index % 31U) - 15) /
+                         32.0F;
+    }
+    constexpr std::uint32_t capacity = 4U;
+    std::vector<std::uint16_t> initial_keys(2U * kv_elements);
+    std::vector<std::uint16_t> initial_values(2U * kv_elements);
+    std::array<std::uint16_t, kv_elements> next_keys{};
+    std::array<std::uint16_t, kv_elements> next_values{};
+    for (std::size_t index = 0U; index < initial_keys.size(); ++index) {
+        initial_keys[index] = encode(
+            static_cast<float>(static_cast<int>(index % 23U) - 11) / 16.0F);
+        initial_values[index] = encode(
+            static_cast<float>(static_cast<int>(index % 19U) - 9) / 8.0F);
+    }
+    for (std::size_t index = 0U; index < next_keys.size(); ++index) {
+        next_keys[index] = encode(
+            static_cast<float>(static_cast<int>(index % 17U) - 8) / 16.0F);
+        next_values[index] = encode(
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 8.0F);
+    }
+    std::vector<float> host_keys(3U * kv_elements);
+    std::vector<float> host_values(3U * kv_elements);
+    std::transform(initial_keys.begin(), initial_keys.end(), host_keys.begin(),
+                   decode);
+    std::transform(initial_values.begin(), initial_values.end(),
+                   host_values.begin(), decode);
+    std::transform(next_keys.begin(), next_keys.end(),
+                   host_keys.begin() + 2U * kv_elements, decode);
+    std::transform(next_values.begin(), next_values.end(),
+                   host_values.begin() + 2U * kv_elements, decode);
+    const std::array<strata::FlashAttentionSegment, 1> segments{{{
+        host_keys, host_values, {},
+    }}};
+    strata::FlashAttentionRequest reference;
+    reference.queries = queries;
+    reference.segments = segments;
+    reference.query_rows = 1U;
+    reference.query_heads = query_heads;
+    reference.key_value_heads = kv_heads;
+    reference.query_key_dim = head_dim;
+    reference.value_dim = head_dim;
+    reference.scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
+    reference.numerics =
+        strata::FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
+    std::array<float, query_elements> expected{};
+    REQUIRE(backend.flash_attention(device, reference, expected).ok());
+
+    strata::CudaBuffer cache;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * capacity * kv_elements * sizeof(std::uint16_t),
+        cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        cache, initial_keys, initial_values, 0U, capacity, kv_elements).ok());
+    strata::CudaBf16KvAttentionRequest request;
+    request.cache = &cache;
+    request.queries = queries;
+    request.next_keys = next_keys;
+    request.next_values = next_values;
+    request.query_heads = query_heads;
+    request.key_value_heads = kv_heads;
+    request.head_dim = head_dim;
+    request.capacity_rows = capacity;
+    request.cache_start = 0U;
+    request.cached_rows = 3U;
+    request.position = 2U;
+    request.scale = reference.scale;
+    std::array<float, query_elements> actual{};
+    REQUIRE(backend.bf16_kv_attention(device, request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE(actual[index] == expected[index]);
+    }
+
+    // Inkling adds a learned per-head bias by distance after the scaled dot.
+    // Column zero is the current row; entries beyond the declared extent are
+    // exactly zero. Reproduce the adapter's sequential F32 arithmetic here.
+    constexpr std::uint32_t bias_extent = 2U;
+    std::array<float, query_heads * bias_extent> relative_bias{};
+    for (std::size_t index = 0U; index < relative_bias.size(); ++index) {
+        relative_bias[index] =
+            static_cast<float>(static_cast<int>(index % 7U) - 3) / 32.0F;
+    }
+    std::array<float, query_elements> biased_expected{};
+    const auto heads_per_kv = query_heads / kv_heads;
+    std::array<float, 3> scores{};
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+        const auto kv_head = head / heads_per_kv;
+        float maximum = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t row = 0U; row < 3U; ++row) {
+            float dot = 0.0F;
+            for (std::uint32_t element = 0U; element < head_dim; ++element) {
+                dot += queries[static_cast<std::size_t>(head) * head_dim + element] *
+                       host_keys[(static_cast<std::size_t>(row) * kv_heads +
+                                  kv_head) * head_dim + element];
+            }
+            float score = dot * request.scale;
+            const auto distance = 2U - row;
+            if (distance < bias_extent) {
+                score += relative_bias[
+                    static_cast<std::size_t>(head) * bias_extent + distance];
+            }
+            scores[row] = score;
+            maximum = std::max(maximum, score);
+        }
+        float denominator = 0.0F;
+        for (auto& score : scores) {
+            score = std::exp(score - maximum);
+            denominator += score;
+        }
+        for (auto& score : scores) score /= denominator;
+        for (std::uint32_t element = 0U; element < head_dim; ++element) {
+            float accumulator = 0.0F;
+            for (std::uint32_t row = 0U; row < 3U; ++row) {
+                accumulator +=
+                    scores[row] *
+                    host_values[(static_cast<std::size_t>(row) * kv_heads +
+                                 kv_head) * head_dim + element];
+            }
+            biased_expected[static_cast<std::size_t>(head) * head_dim + element] =
+                accumulator;
+        }
+    }
+    request.relative_bias = relative_bias;
+    request.relative_bias_extent = bias_extent;
+    REQUIRE(backend.bf16_kv_attention(device, request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], biased_expected[index], 1.0e-6F);
+    }
+    request.relative_bias = {};
+    request.relative_bias_extent = 0U;
+
+    // Exercise the physical wrap used once a sliding layer reaches its
+    // 512-token capacity. Logical rows 1 and 2 occupy physical slots 1 and 0;
+    // the new row 3 overwrites slot 1 and leaves logical rows 2 and 3 visible.
+    constexpr std::uint32_t ring_capacity = 2U;
+    strata::CudaBuffer wrapped_cache;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * ring_capacity * kv_elements * sizeof(std::uint16_t),
+        wrapped_cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        wrapped_cache, initial_keys, initial_values, 1U, ring_capacity,
+        kv_elements).ok());
+    std::vector<float> wrapped_host_keys(2U * kv_elements);
+    std::vector<float> wrapped_host_values(2U * kv_elements);
+    std::transform(initial_keys.begin() + kv_elements, initial_keys.end(),
+                   wrapped_host_keys.begin(), decode);
+    std::transform(initial_values.begin() + kv_elements, initial_values.end(),
+                   wrapped_host_values.begin(), decode);
+    std::transform(next_keys.begin(), next_keys.end(),
+                   wrapped_host_keys.begin() + kv_elements, decode);
+    std::transform(next_values.begin(), next_values.end(),
+                   wrapped_host_values.begin() + kv_elements, decode);
+    const std::array<strata::FlashAttentionSegment, 1> wrapped_segments{{{
+        wrapped_host_keys, wrapped_host_values, {},
+    }}};
+    reference.segments = wrapped_segments;
+    REQUIRE(backend.flash_attention(device, reference, expected).ok());
+    request.cache = &wrapped_cache;
+    request.capacity_rows = ring_capacity;
+    request.cache_start = 2U;
+    request.cached_rows = 2U;
+    request.position = 3U;
+    REQUIRE(backend.bf16_kv_attention(device, request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE(actual[index] == expected[index]);
+    }
+}
+
+TEST_CASE("native CUDA backend keeps a register-fed MXFP4 Gemma 4 decode layer resident") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto zero_weight = [&](std::uint64_t rows, std::uint64_t columns) {
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::Fp4E2m1Group32;
+        descriptor.dtype = strata::SafetensorsDtype::I8;
+        descriptor.rows = rows;
+        descriptor.columns = columns;
+        descriptor.packed_columns = columns / 2U;
+        descriptor.scale_columns = columns / 32U;
+        descriptor.group_size = 32U;
+        std::vector<std::byte> packed(
+            static_cast<std::size_t>(rows * descriptor.packed_columns),
+            std::byte{0x00U});
+        std::vector<std::byte> scales(
+            static_cast<std::size_t>(rows * descriptor.scale_columns),
+            std::byte{0x7fU});
+        strata::CudaWeight output;
+        REQUIRE(backend.upload(device, descriptor, packed, scales, output).ok());
+        return output;
+    };
+    const auto upload_f32 = [&](std::span<const float> values) {
+        strata::CudaBuffer output;
+        REQUIRE(backend.upload_buffer(device, std::as_bytes(values), output).ok());
+        return output;
+    };
+
+    constexpr std::uint32_t hidden_columns = 64U;
+    constexpr std::uint32_t head_dim = 16U;
+    constexpr std::uint32_t query_columns = 64U;
+    constexpr std::uint32_t kv_columns = 16U;
+    constexpr std::uint32_t intermediate = 64U;
+    auto query = zero_weight(query_columns, hidden_columns);
+    auto key = zero_weight(kv_columns, hidden_columns);
+    auto value_projection = zero_weight(kv_columns, hidden_columns);
+    auto projection = zero_weight(hidden_columns, query_columns);
+    auto gate = zero_weight(intermediate, hidden_columns);
+    auto up = zero_weight(intermediate, hidden_columns);
+    auto down = zero_weight(hidden_columns, intermediate);
+    strata::set_register_fed_matmul(true);
+    for (const auto* weight : {&query, &key, &value_projection, &projection,
+                               &gate, &up, &down}) {
+        REQUIRE(backend.prepack_fragment(device, *weight).ok());
+        REQUIRE(strata::CudaBackend::fragment_prepacked(*weight));
+    }
+    std::array<float, hidden_columns> norms{};
+    norms.fill(1.0F);
+    std::array<float, head_dim> head_norms{};
+    head_norms.fill(1.0F);
+    auto input_norm = upload_f32(norms);
+    auto post_attention_norm = upload_f32(norms);
+    auto pre_feedforward_norm = upload_f32(norms);
+    auto post_feedforward_norm = upload_f32(norms);
+    auto query_norm = upload_f32(head_norms);
+    auto key_norm = upload_f32(head_norms);
+    strata::CudaBuffer cache;
+    constexpr std::uint32_t cache_rows = 4U;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * cache_rows * kv_columns * sizeof(std::uint16_t),
+        cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        cache, {}, {}, 0U, cache_rows, kv_columns).ok());
+
+    std::array<std::uint16_t, kv_columns> next_keys{};
+    std::array<std::uint16_t, kv_columns> next_values{};
+    const std::array<strata::CudaGemma4DecodeLayer, 1> layers{{{
+        &query, &key, &value_projection, &projection, &gate, &up, &down,
+        &input_norm, &post_attention_norm, &pre_feedforward_norm,
+        &post_feedforward_norm, &query_norm, &key_norm, &cache,
+        next_keys, next_values, cache_rows, 0U, 0U, 1.0F,
+    }}};
+    std::array<float, hidden_columns> input{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index) - 16) / 16.0F;
+    }
+    std::array<float, hidden_columns> output{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.gemma4_decode_layers(
+        device, layers, input, 0U, output).ok());
+    for (std::size_t index = 0U; index < output.size(); ++index) {
+        REQUIRE(output[index] == strata::bf16_round_f32(input[index]));
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Fp4E2m1Group32)] == 0U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::Fp4RegisterFed)] == 7U);
+}
+
 TEST_CASE("native CUDA backend executes DeepSeek FP4 FP8 and grouped projections") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;
@@ -1571,6 +1973,125 @@ TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE comman
     REQUIRE(second.deepseek_moe_calls - first.deepseek_moe_calls == 1U);
     REQUIRE(second.deepseek_moe_kernel_launches -
                 first.deepseek_moe_kernel_launches == 2U);
+}
+
+TEST_CASE("Laguna shaped MXFP4 MoE batch matches canonical scalar matmuls") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto up = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 7U);
+    auto down = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 29U) - 14) /
+                        32.0F;
+    }
+    const auto expected = reference_int4_expert(
+        backend, gate, up, down, hidden, rows, intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    std::array<float, rows * hidden_columns> actual{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+    REQUIRE(backend.collect_moe(device, actual, {}).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
+}
+
+TEST_CASE("Inkling shaped MXFP4 MoE batch matches canonical scalar matmuls") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 4096U;
+    constexpr std::uint64_t intermediate_columns = 2048U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 13U);
+    auto up = upload_fp4(
+        backend, device, intermediate_columns, hidden_columns, 5U);
+    auto down = upload_fp4(
+        backend, device, hidden_columns, intermediate_columns, 9U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 31U) - 15) /
+                        32.0F;
+    }
+    const auto expected = reference_int4_expert(
+        backend, gate, up, down, hidden, rows, intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    std::array<float, rows * hidden_columns> actual{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+    REQUIRE(backend.collect_moe(device, actual, {}).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
+}
+
+TEST_CASE("existing Laguna NVFP4 MoE batch remains distinct and correct") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto gate = upload_nvfp4(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto up = upload_nvfp4(
+        backend, device, intermediate_columns, hidden_columns, 7U);
+    auto down = upload_nvfp4(
+        backend, device, hidden_columns, intermediate_columns, 11U);
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 29U) - 14) /
+                        32.0F;
+    }
+    const auto expected = reference_int4_expert(
+        backend, gate, up, down, hidden, rows, intermediate_columns);
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    std::array<float, rows * hidden_columns> actual{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+    REQUIRE(backend.collect_moe(device, actual, {}).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeNvfp4Group16)] == 1U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 0U);
 }
 
 TEST_CASE("native CUDA backend enqueues exact grouped DeepSeek MoE when available") {
@@ -2510,6 +3031,9 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
     // The live device path leaves the exact shared/routed BF16 result in
     // the persistent mHC branch buffer. Its consumer must reject missing or
     // stale producers and match the retained host bridge bit for bit.
+    // Earlier cases flip the process-global register-fed switch, so this one
+    // states which route it is measuring rather than inheriting it.
+    strata::set_register_fed_matmul(true);
     constexpr std::uint64_t shared_intermediate = 128U;
     auto shared_w1 = upload_fp8(
         backend, device, shared_intermediate, hidden, 1U);
@@ -2517,6 +3041,12 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
         backend, device, shared_intermediate, hidden, 4U);
     auto shared_w2 = upload_fp8(
         backend, device, hidden, shared_intermediate, 7U);
+    // Opt the shared expert into fragment order explicitly. These same weights
+    // are read canonically by the paged MoE path, so no dispatch site may make
+    // this decision on its own.
+    REQUIRE(backend.prepack_fragment(device, shared_w1).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_w3).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_w2).ok());
     const strata::CudaDeepSeekMoeExpert shared{
         &shared_w1, &shared_w3, &shared_w2, 1.0F};
     Dsv4HostMoeCallbackFixture fixture;
@@ -2579,8 +3109,14 @@ TEST_CASE("native CUDA DeepSeek device mHC keeps the residual across transitions
         &fixture).ok());
     REQUIRE(backend.collect_deepseek_moe(device, {}, {}).ok());
     const auto bridge_after = backend.stats();
+    // Nine launches on the register-fed shared expert against five on the
+    // incumbent: the fused gate/up/SwiGLU kernel becomes an activation permute,
+    // two projections and a standalone SwiGLU, and the down projection becomes a
+    // permute plus a projection. The permute is written once and read by both
+    // gate and up, which is why this is nine and not ten. The count is asserted
+    // because a silent change to it is a change to the dispatch shape.
     REQUIRE(bridge_after.deepseek_moe_kernel_launches -
-                bridge_before.deepseek_moe_kernel_launches == 5U);
+                bridge_before.deepseek_moe_kernel_launches == 9U);
     REQUIRE(bridge_after.deepseek_moe_h2d_transfers -
                 bridge_before.deepseek_moe_h2d_transfers == 1U);
     REQUIRE(bridge_after.deepseek_moe_h2d_bytes -
@@ -2616,4 +3152,330 @@ TEST_CASE("rank-local CUDA bridges fail closed before a borrowed lifetime exists
         moe_view).ok());
     REQUIRE(mhc_view.stream == nullptr);
     REQUIRE(moe_view.stream == nullptr);
+}
+
+TEST_CASE("MIX-2 register-fed matmul matches the scalar route it replaces") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // Activation values are exact E4M3 numbers, so matmul_impl's activation
+    // quantization is the identity and both routes see the same operands. That
+    // makes the comparison a statement about the kernels rather than about the
+    // rounding in front of them.
+    constexpr std::array<float, 6> palette{1.0F, -1.0F, 0.5F, 2.0F, -0.5F, -2.0F};
+
+    const auto compare = [&](strata::CudaWeightEncoding encoding,
+                             std::uint64_t rows, std::uint64_t columns,
+                             std::uint32_t batch, std::uint8_t seed) {
+        std::vector<float> activation(
+            static_cast<std::size_t>(columns) * batch);
+        for (std::size_t index = 0U; index < activation.size(); ++index) {
+            activation[index] = palette[(index + seed) % palette.size()];
+        }
+        const auto upload = [&](std::uint8_t s) {
+            return encoding == strata::CudaWeightEncoding::Fp4E2m1Group32
+                       ? upload_fp4(backend, device, rows, columns, s)
+                       : upload_fp8(backend, device, rows, columns, s);
+        };
+        // Two uploads of the same payload: the register-fed route permutes its
+        // weight in place, so the control needs its own canonical copy.
+        const auto control = upload(seed);
+        const auto candidate = upload(seed);
+
+        std::vector<float> expected(static_cast<std::size_t>(rows) * batch);
+        strata::set_register_fed_matmul(false);
+        REQUIRE(backend.matmul(control, activation, batch, expected).ok());
+
+        std::vector<float> measured(expected.size());
+        strata::set_register_fed_matmul(true);
+        // The permutation is an explicit opt-in: matmul_impl cannot see a
+        // weight's other consumers, so it may not decide the layout itself.
+        REQUIRE(backend.prepack_fragment(device, candidate).ok());
+        REQUIRE(strata::CudaBackend::fragment_prepacked(candidate));
+        REQUIRE(backend.matmul(candidate, activation, batch, measured).ok());
+        REQUIRE(!strata::CudaBackend::fragment_prepacked(control));
+
+        // The two paths multiply the same real numbers and differ only in FP32
+        // accumulation order, so the residual is reordering, not precision. The
+        // bound is relative to the row's own magnitude because these fixtures
+        // have rows whose sums cancel to near zero.
+        double worst = 0.0;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const double scale = std::max(1.0, std::abs(
+                static_cast<double>(expected[index])));
+            worst = std::max(worst, std::abs(static_cast<double>(measured[index]) -
+                                             static_cast<double>(expected[index])) /
+                                        scale);
+        }
+        if (!(worst < 1e-4)) {
+            std::fprintf(stderr,
+                         "register-fed mismatch: encoding %d rows %llu "
+                         "columns %llu batch %u worst relative residual %g\n",
+                         static_cast<int>(encoding),
+                         static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(columns), batch, worst);
+        }
+        REQUIRE(worst < 1e-4);
+    };
+
+    // FP4 needs rows%16 and columns%64; FP8 needs both extents on 128.
+    compare(strata::CudaWeightEncoding::Fp4E2m1Group32, 64U, 128U, 1U, 0x11U);
+    compare(strata::CudaWeightEncoding::Fp4E2m1Group32, 64U, 128U, 8U, 0x23U);
+    compare(strata::CudaWeightEncoding::Fp4E2m1Group32, 128U, 256U, 16U, 0x35U);
+    compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 128U, 1U, 0x11U);
+    compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 256U, 5U, 0x27U);
+    compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 256U, 256U, 16U, 0x41U);
+    strata::set_register_fed_matmul(true);
+}
+
+TEST_CASE("Gemma 4 shaped MXFP4 register-fed matmul matches identical scalar uploads") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::array<float, 6> palette{
+        1.0F, -1.0F, 0.5F, 2.0F, -0.5F, -2.0F};
+    const auto compare = [&](std::uint64_t rows, std::uint64_t columns,
+                             std::uint8_t seed) {
+        std::vector<float> activation(static_cast<std::size_t>(columns));
+        for (std::size_t index = 0U; index < activation.size(); ++index) {
+            activation[index] = palette[(index + seed) % palette.size()];
+        }
+        // The payload generator is deterministic: these are separate uploads
+        // of byte-identical Gemma-shaped weights because fragment prepack
+        // replaces the candidate's canonical layout in place.
+        const auto control = upload_fp4(backend, device, rows, columns, seed);
+        const auto candidate = upload_fp4(backend, device, rows, columns, seed);
+        std::vector<float> expected(static_cast<std::size_t>(rows));
+        std::vector<float> measured(expected.size());
+
+        strata::set_register_fed_matmul(false);
+        REQUIRE(backend.matmul(control, activation, 1U, expected).ok());
+        strata::set_register_fed_matmul(true);
+        REQUIRE(backend.prepack_fragment(device, candidate).ok());
+        REQUIRE(backend.matmul(candidate, activation, 1U, measured).ok());
+
+        double worst = 0.0;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const double scale = std::max(
+                1.0, std::abs(static_cast<double>(expected[index])));
+            worst = std::max(
+                worst,
+                std::abs(static_cast<double>(measured[index]) -
+                         static_cast<double>(expected[index])) /
+                    scale);
+        }
+        if (!(worst < 1e-4)) {
+            std::fprintf(stderr,
+                         "Gemma-shaped register-fed mismatch: rows %llu "
+                         "columns %llu worst relative residual %g\n",
+                         static_cast<unsigned long long>(rows),
+                         static_cast<unsigned long long>(columns), worst);
+        }
+        // Both paths multiply the same values. FP32 accumulation order differs,
+        // so exact bit equality is not an arithmetic invariant for these long K
+        // reductions; keep the route-vs-route residual explicit and tight.
+        REQUIRE(worst < 1e-4);
+    };
+
+    // Real Gemma 4 gate/up and down projection shapes, with no padding.
+    compare(21'504U, 5'376U, 0x31U);
+    compare(5'376U, 21'504U, 0x53U);
+    strata::set_register_fed_matmul(true);
+}
+
+TEST_CASE("MIX-2 register-fed dispatch leaves inadmissible shapes on the scalar route") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+    strata::set_register_fed_matmul(true);
+
+    // 48 columns is neither a whole FP4 load block (64) nor an FP8 block (128),
+    // so neither weight may be permuted and both must still produce a result.
+    const auto fp4 = upload_fp4(backend, device, 32U, 48U, 0x19U);
+    std::vector<float> activation(48U, 0.5F);
+    std::vector<float> output(32U);
+    REQUIRE(backend.matmul(fp4, activation, 1U, output).ok());
+    REQUIRE(!strata::CudaBackend::fragment_prepacked(fp4));
+
+    const auto fp8 = upload_fp8(backend, device, 32U, 64U, 0x19U);
+    std::vector<float> narrow(64U, 0.5F);
+    std::vector<float> fp8_output(32U);
+    REQUIRE(backend.matmul(fp8, narrow, 1U, fp8_output).ok());
+    REQUIRE(!strata::CudaBackend::fragment_prepacked(fp8));
+
+    // The explicit entry point must say so rather than permute into a layout
+    // the kernel cannot read.
+    REQUIRE(!backend.prepack_fragment(device, fp4).ok());
+    REQUIRE(!backend.prepack_fragment(device, fp8).ok());
+}
+
+TEST_CASE("a fragment-prepacked weight is refused by every canonical route") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    const std::vector<int> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // Fragment order REPLACES the canonical layout, so a permuted weight
+    // reaching a scalar kernel does not lose a little accuracy -- it decodes a
+    // permutation as though it were weights. That is exactly the defect that
+    // corrupted a real DeepSeek V4 run: matmul_impl permuted the attention
+    // output projection, which the attention path then read canonically, and
+    // every generated token was wrong from the first one. The contract's rule
+    // is that an unsupported case fails explicitly, so this must be an error
+    // and never a silent result.
+    const auto weight = upload_fp8(backend, device, 128U, 128U, 0x11U);
+    std::vector<float> activation(128U, 0.5F);
+    std::vector<float> output(128U);
+    REQUIRE(backend.prepack_fragment(device, weight).ok());
+
+    strata::set_register_fed_matmul(false);
+    const auto refused = backend.matmul(weight, activation, 1U, output);
+    REQUIRE(!refused.ok());
+    REQUIRE(refused.errors.front().find("fragment-prepacked") !=
+            std::string::npos);
+
+    // With the route available the same weight must succeed.
+    strata::set_register_fed_matmul(true);
+    REQUIRE(backend.matmul(weight, activation, 1U, output).ok());
+
+    // A batch wider than the skinny kernel's 16 columns is chunked through it
+    // rather than handed to a canonical kernel that would misread the layout.
+    // That is slow for a large batch, and the census counts every chunk so the
+    // cost is visible, but it must still be correct.
+    constexpr std::uint32_t wide_rows = 64U;
+    std::vector<float> wide(128U * wide_rows);
+    for (std::size_t index = 0U; index < wide.size(); ++index) {
+        wide[index] = (index % 4U == 0U) ? 0.5F : -0.25F;
+    }
+    std::vector<float> chunked(128U * wide_rows);
+    REQUIRE(backend.matmul(weight, wide, wide_rows, chunked).ok());
+
+    const auto canonical = upload_fp8(backend, device, 128U, 128U, 0x11U);
+    std::vector<float> reference(chunked.size());
+    strata::set_register_fed_matmul(false);
+    REQUIRE(backend.matmul(canonical, wide, wide_rows, reference).ok());
+    strata::set_register_fed_matmul(true);
+    double worst = 0.0;
+    for (std::size_t index = 0U; index < chunked.size(); ++index) {
+        const double scale =
+            std::max(1.0, std::abs(static_cast<double>(reference[index])));
+        worst = std::max(worst, std::abs(static_cast<double>(chunked[index]) -
+                                         static_cast<double>(reference[index])) /
+                                    scale);
+    }
+    REQUIRE(worst < 1e-4);
+}
+
+TEST_CASE("register-fed MXFP4 MoE batch matches the scalar batch it replaces") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    // Laguna's routed-expert shapes. enqueue_moe rounds both activations to
+    // E4M3 -- the hidden vector before gate/up and the SwiGLU output before
+    // down -- and an E4M3 value has three mantissa bits, so its BF16 image is
+    // exact. The two routes therefore multiply the same real numbers and differ
+    // only in FP32 accumulation order.
+    constexpr std::uint32_t rows = 1U;
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+    constexpr std::uint32_t experts = 3U;
+
+    std::array<float, rows * hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] =
+            static_cast<float>(static_cast<int>(index % 29U) - 14) / 32.0F;
+    }
+
+    const auto run = [&](bool prepack, std::vector<float>& out) {
+        std::vector<strata::CudaWeight> gates, ups, downs;
+        for (std::uint32_t e = 0U; e < experts; ++e) {
+            gates.push_back(upload_fp4(backend, device, intermediate_columns,
+                                       hidden_columns, 3U + e));
+            ups.push_back(upload_fp4(backend, device, intermediate_columns,
+                                     hidden_columns, 7U + e));
+            downs.push_back(upload_fp4(backend, device, hidden_columns,
+                                       intermediate_columns, 11U + e));
+            if (prepack) {
+                // The permutation is an explicit opt-in that opts every
+                // consumer in at once; no dispatch site decides it alone.
+                REQUIRE(backend.prepack_fragment(device, gates.back()).ok());
+                REQUIRE(backend.prepack_fragment(device, ups.back()).ok());
+                REQUIRE(backend.prepack_fragment(device, downs.back()).ok());
+            }
+        }
+        std::vector<strata::CudaMoeExpert> routed;
+        for (std::uint32_t e = 0U; e < experts; ++e) {
+            routed.push_back({&gates[e], &ups[e], &downs[e], 1.0F});
+        }
+        REQUIRE(backend.enqueue_moe(device, hidden, rows, routed, nullptr).ok());
+        REQUIRE(backend.collect_moe(device, out, {}).ok());
+    };
+
+    // collect_moe returns one hidden-sized block per expert.
+    std::vector<float> scalar(experts * rows * hidden_columns);
+    std::vector<float> regfed(experts * rows * hidden_columns);
+    strata::reset_cuda_matmul_route_census();
+    run(false, scalar);
+    run(true, regfed);
+
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4E2m1Group32)] == 1U);
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp4RegisterFed)] == 1U);
+
+    double worst = 0.0;
+    for (std::size_t index = 0U; index < scalar.size(); ++index) {
+        const double scale =
+            std::max(1.0, std::abs(static_cast<double>(scalar[index])));
+        worst = std::max(worst, std::abs(static_cast<double>(regfed[index]) -
+                                         static_cast<double>(scalar[index])) /
+                                    scale);
+    }
+    if (!(worst < 1e-4)) {
+        std::fprintf(stderr,
+                     "register-fed MoE mismatch: worst relative residual %g\n",
+                     worst);
+    }
+    REQUIRE(worst < 1e-4);
+}
+
+TEST_CASE("a partially prepacked MXFP4 MoE batch is refused, not half-served") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+    constexpr std::uint64_t hidden_columns = 3072U;
+    constexpr std::uint64_t intermediate_columns = 1024U;
+
+    auto gate = upload_fp4(backend, device, intermediate_columns, hidden_columns, 3U);
+    auto up = upload_fp4(backend, device, intermediate_columns, hidden_columns, 7U);
+    auto down = upload_fp4(backend, device, hidden_columns, intermediate_columns, 11U);
+    // Only one of the three is permuted. Fragment order replaces the canonical
+    // layout, so serving this batch either way reads one of them wrong.
+    REQUIRE(backend.prepack_fragment(device, gate).ok());
+
+    std::array<float, hidden_columns> hidden{};
+    const std::array<strata::CudaMoeExpert, 1> routed{{{&gate, &up, &down, 1.0F}}};
+    const auto refused = backend.enqueue_moe(device, hidden, 1U, routed, nullptr);
+    REQUIRE(!refused.ok());
 }

@@ -45,26 +45,26 @@ LagunaCheckpointReader::~LagunaCheckpointReader() { release_mapped_views(); }
 LagunaCheckpointOpenResult LagunaCheckpointReader::open(
     std::string model_directory) {
     LagunaCheckpointOpenResult result;
-    const auto spec = laguna_s21_nvfp4_spec();
-    const auto index_path = (std::filesystem::path(model_directory) /
-                             "model.safetensors.index.json").string();
-    auto text = load_bounded_text_file(index_path, kMaximumIndexBytes);
-    if (!text.ok()) {
-        result.errors = std::move(text.errors);
-        return result;
-    }
-    auto index = parse_safetensors_index(text.value);
+    const auto nvfp4_spec = laguna_s21_nvfp4_spec();
+    const auto mxfp4_spec = laguna_s21_mxfp4_spec();
+    auto index = load_safetensors_index(model_directory, kMaximumIndexBytes);
     if (!index.ok()) {
         result.errors = std::move(index.errors);
         return result;
     }
-    if (index.value.total_size != spec.source.indexed_tensor_bytes ||
-        index.value.entries.size() != spec.source.tensor_count ||
-        index.value.shards.size() != spec.source.main_shards) {
+    const auto matches = [&](const ModelSpec& spec) {
+        return index.value.total_size == spec.source.indexed_tensor_bytes &&
+               index.value.entries.size() == spec.source.tensor_count &&
+               index.value.shards.size() == spec.source.main_shards;
+    };
+    const bool nvfp4 = matches(nvfp4_spec);
+    const bool mxfp4 = matches(mxfp4_spec);
+    if (!nvfp4 && !mxfp4) {
         result.errors.emplace_back(
-            "Laguna checkpoint index extent is not pinned S 2.1-NVFP4");
+            "Laguna checkpoint index extent is neither pinned S 2.1 NVFP4 nor MXFP4");
         return result;
     }
+    const auto& spec = nvfp4 ? nvfp4_spec : mxfp4_spec;
     for (const auto& shard : index.value.shards) {
         char expected[48]{};
         bool matched = false;
@@ -87,6 +87,8 @@ LagunaCheckpointOpenResult LagunaCheckpointReader::open(
     auto reader = std::unique_ptr<LagunaCheckpointReader>(
         new LagunaCheckpointReader());
     reader->model_directory_ = std::move(model_directory);
+    reader->format_ = nvfp4 ? LagunaCheckpointFormat::Nvfp4Mixed
+                            : LagunaCheckpointFormat::Mxfp4Group32;
     std::unordered_map<std::string, std::string> indexed;
     indexed.reserve(index.value.entries.size());
     for (const auto& entry : index.value.entries) {
@@ -161,9 +163,11 @@ LagunaCheckpointOpenResult LagunaCheckpointReader::open(
         const auto* global = reader->find(base + ".weight_global_scale");
         const auto* activation = reader->find(base + ".input_global_scale");
         const auto packed_columns = columns / 2U;
-        const auto scale_columns =
-            (columns + kContract.nvfp4_group_size - 1U) / kContract.nvfp4_group_size;
-        const bool valid =
+        const auto nvfp4_scale_columns =
+            (columns + kContract.nvfp4_group_size - 1U) /
+            kContract.nvfp4_group_size;
+        const bool valid_nvfp4 =
+            reader->format_ == LagunaCheckpointFormat::Nvfp4Mixed &&
             packed != nullptr && scale != nullptr && global != nullptr &&
             activation != nullptr && columns % 2U == 0U &&
             packed->dtype == SafetensorsDtype::U8 &&
@@ -171,11 +175,21 @@ LagunaCheckpointOpenResult LagunaCheckpointReader::open(
             global->dtype == SafetensorsDtype::F32 &&
             activation->dtype == SafetensorsDtype::F32 &&
             packed->shape == std::vector<std::uint64_t>{rows, packed_columns} &&
-            scale->shape == std::vector<std::uint64_t>{rows, scale_columns} &&
+            scale->shape ==
+                std::vector<std::uint64_t>{rows, nvfp4_scale_columns} &&
             global->shape.empty() && activation->shape.empty();
-        if (!valid && result.errors.size() < kMaximumOpenErrors) {
+        const bool valid_mxfp4 =
+            reader->format_ == LagunaCheckpointFormat::Mxfp4Group32 &&
+            packed != nullptr && scale != nullptr && global == nullptr &&
+            activation == nullptr && columns % 32U == 0U &&
+            packed->dtype == SafetensorsDtype::U8 &&
+            scale->dtype == SafetensorsDtype::U8 &&
+            packed->shape == std::vector<std::uint64_t>{rows, packed_columns} &&
+            scale->shape == std::vector<std::uint64_t>{rows, columns / 32U};
+        if (!valid_nvfp4 && !valid_mxfp4 &&
+            result.errors.size() < kMaximumOpenErrors) {
             result.errors.emplace_back(
-                "Laguna NVFP4 tensor layout mismatch: " + base);
+                "Laguna compressed tensor layout mismatch: " + base);
         }
     };
 
@@ -218,7 +232,7 @@ LagunaCheckpointOpenResult LagunaCheckpointReader::open(
                        kContract.shared_expert_intermediate_size, hidden, false);
         require_linear(mlp + "shared_expert.down_proj", hidden,
                        kContract.shared_expert_intermediate_size, false);
-        const bool quantized = laguna_quantized_expert_layer(layer);
+        const bool quantized = mxfp4 || laguna_quantized_expert_layer(layer);
         for (std::uint32_t expert = 0U; expert < kContract.routed_experts;
              ++expert) {
             const auto base = mlp + "experts." + std::to_string(expert) + ".";
@@ -263,19 +277,32 @@ ParseResult<LagunaLinear> LagunaCheckpointReader::linear(
     const auto* scale = find(base + ".weight_scale");
     const auto* global = find(base + ".weight_global_scale");
     const auto packed_columns = columns / 2U;
-    const auto scale_columns =
+    const auto nvfp4_scale_columns =
         (columns + kContract.nvfp4_group_size - 1U) / kContract.nvfp4_group_size;
-    if (packed == nullptr || scale == nullptr || global == nullptr ||
-        columns % 2U != 0U || packed->dtype != SafetensorsDtype::U8 ||
-        scale->dtype != SafetensorsDtype::F8E4M3 ||
-        global->dtype != SafetensorsDtype::F32 ||
-        packed->shape != std::vector<std::uint64_t>{rows, packed_columns} ||
-        scale->shape != std::vector<std::uint64_t>{rows, scale_columns}) {
-        result.errors.emplace_back("Laguna NVFP4 linear is missing or mismatched: " +
-                                   base);
+    const bool valid_nvfp4 =
+        format_ == LagunaCheckpointFormat::Nvfp4Mixed && packed != nullptr &&
+        scale != nullptr && global != nullptr && columns % 2U == 0U &&
+        packed->dtype == SafetensorsDtype::U8 &&
+        scale->dtype == SafetensorsDtype::F8E4M3 &&
+        global->dtype == SafetensorsDtype::F32 &&
+        packed->shape == std::vector<std::uint64_t>{rows, packed_columns} &&
+        scale->shape ==
+            std::vector<std::uint64_t>{rows, nvfp4_scale_columns};
+    const bool valid_mxfp4 =
+        format_ == LagunaCheckpointFormat::Mxfp4Group32 && packed != nullptr &&
+        scale != nullptr && global == nullptr && columns % 32U == 0U &&
+        packed->dtype == SafetensorsDtype::U8 &&
+        scale->dtype == SafetensorsDtype::U8 &&
+        packed->shape == std::vector<std::uint64_t>{rows, packed_columns} &&
+        scale->shape == std::vector<std::uint64_t>{rows, columns / 32U};
+    if (!valid_nvfp4 && !valid_mxfp4) {
+        result.errors.emplace_back(
+            "Laguna compressed linear is missing or mismatched: " + base);
         return result;
     }
-    result.value.encoding = LagunaTensorEncoding::Nvfp4Group16;
+    result.value.encoding = valid_mxfp4
+        ? LagunaTensorEncoding::Mxfp4Group32
+        : LagunaTensorEncoding::Nvfp4Group16;
     result.value.packed = packed;
     result.value.scale = scale;
     result.value.global_scale = global;
@@ -528,6 +555,43 @@ ValidationResult load_laguna_cuda_linear(
         descriptor.columns = module.columns;
         return backend.upload(device, descriptor, data.value, {}, output,
                               CudaBackend::UploadCompletion::Deferred);
+    }
+    if (module.encoding == LagunaTensorEncoding::Mxfp4Group32) {
+        if (module.packed == nullptr || module.scale == nullptr ||
+            module.global_scale != nullptr) {
+            result.errors.emplace_back("Laguna MXFP4 linear is incomplete");
+            return result;
+        }
+        auto packed = checkpoint.view(module.packed->name);
+        auto scale = checkpoint.view(module.scale->name);
+        if (!packed.ok()) append(result.errors, std::move(packed.errors));
+        if (!scale.ok()) append(result.errors, std::move(scale.errors));
+        if (!result.ok()) return result;
+        if (packed.value.size() != module.packed->bytes ||
+            scale.value.size() != module.scale->bytes) {
+            result.errors.emplace_back("Laguna MXFP4 mapping size mismatch: " +
+                                       module.packed->name);
+            return result;
+        }
+        CudaWeightDescriptor descriptor;
+        descriptor.encoding = CudaWeightEncoding::Fp4E2m1Group32;
+        // The backend names the byte-level E2M1 stream I8 even when the
+        // Safetensors container declares those same bytes U8.
+        descriptor.dtype = SafetensorsDtype::I8;
+        descriptor.rows = module.rows;
+        descriptor.columns = module.columns;
+        descriptor.packed_columns = module.columns / 2U;
+        descriptor.scale_columns = module.columns / 32U;
+        descriptor.group_size = 32U;
+        // Ask for m16n8k16 fragment order. Both consumers of an MXFP4 linear
+        // take a register-fed route when the weight carries it -- the fused MoE
+        // batch in enqueue_moe and the generic matmul -- and a shape the layout
+        // cannot express is left canonical by the backend rather than half
+        // converted. Honoured only while the register-fed switch is on.
+        return backend.upload(device, descriptor, packed.value, scale.value,
+                              output,
+                              CudaBackend::UploadCompletion::Deferred,
+                              CudaBackend::FragmentLayout::Prepack);
     }
     if (module.packed == nullptr || module.scale == nullptr ||
         module.global_scale == nullptr) {

@@ -17,6 +17,10 @@ std::filesystem::path inkling_model_path() {
     return std::filesystem::path(STRATA_SOURCE_DIR) / "models/inkling-s";
 }
 
+std::filesystem::path inkling_mxfp4_model_path() {
+    return std::filesystem::path(STRATA_SOURCE_DIR) / "models/inkling";
+}
+
 }  // namespace
 
 TEST_CASE("Inkling-Small spec validates against itself") {
@@ -26,6 +30,63 @@ TEST_CASE("Inkling-Small spec validates against itself") {
         std::cerr << "unexpected validation error: " << error << '\n';
     }
     REQUIRE(result.ok());
+}
+
+TEST_CASE("Inkling-Small MXFP4 spec is distinct and validates") {
+    const auto nvfp4 = strata::inkling_small_nvfp4_spec();
+    const auto mxfp4 = strata::inkling_small_mxfp4_spec();
+    REQUIRE(strata::validate_inkling_small_mxfp4(mxfp4).ok());
+    REQUIRE(mxfp4.source.repository == "mlx-community/Inkling-Small-mxfp4");
+    REQUIRE(mxfp4.source.repository != nvfp4.source.repository);
+    REQUIRE(mxfp4.source.main_shards == 30U);
+    REQUIRE(mxfp4.source.mtp_shards == 0U);
+    REQUIRE(mxfp4.mixed_quantization.routed_experts.group_size == 32U);
+    REQUIRE(!mxfp4.inkling.interleaved_gate_up);
+}
+
+TEST_CASE("real Inkling-Small MXFP4 checkpoint validates exact U32 layouts") {
+    const auto path = inkling_mxfp4_model_path();
+    if (!std::filesystem::exists(path / "model.safetensors.index.json")) {
+        SKIP("pinned Inkling-Small-MXFP4 checkpoint is absent");
+    }
+    const auto checkpoint = strata::InklingCheckpointReader::open(path.string());
+    for (const auto& error : checkpoint.errors) {
+        std::cerr << "checkpoint error: " << error << '\n';
+    }
+    REQUIRE(checkpoint.ok());
+    REQUIRE(checkpoint.value->format() ==
+            strata::InklingCheckpointFormat::Mxfp4Group32);
+    const auto spec = strata::inkling_small_mxfp4_spec();
+    REQUIRE(checkpoint.value->tensors().size() == spec.source.tensor_count);
+    REQUIRE(checkpoint.value->shard_file_bytes() == spec.source.shard_file_bytes);
+
+    const auto q = checkpoint.value->linear(
+        "language_model.model.layers.0.self_attn.q_proj", 4096U, 4096U);
+    REQUIRE(q.ok());
+    REQUIRE(q.value.encoding == strata::InklingTensorEncoding::Mxfp4Group32);
+    REQUIRE(q.value.packed->dtype == strata::SafetensorsDtype::U32);
+    REQUIRE((q.value.packed->shape ==
+             std::vector<std::uint64_t>{4096U, 512U}));
+    REQUIRE(q.value.scale->dtype == strata::SafetensorsDtype::U8);
+    REQUIRE((q.value.scale->shape ==
+             std::vector<std::uint64_t>{4096U, 128U}));
+
+    const auto routed = checkpoint.value->expert_stack(
+        "language_model.model.layers.2.mlp.switch_mlp.down_proj", 2U,
+        256U, 4096U, 2048U);
+    REQUIRE(routed.ok());
+    REQUIRE(routed.value.encoding ==
+            strata::InklingTensorEncoding::Mxfp4Group32);
+    REQUIRE((routed.value.packed->shape ==
+             std::vector<std::uint64_t>{256U, 4096U, 256U}));
+    REQUIRE((routed.value.scale->shape ==
+             std::vector<std::uint64_t>{256U, 4096U, 64U}));
+
+    const auto router = checkpoint.value->linear(
+        "language_model.model.layers.2.mlp.gate_weight", 258U, 4096U);
+    REQUIRE(router.ok());
+    REQUIRE(router.value.encoding == strata::InklingTensorEncoding::Plain);
+    REQUIRE(router.value.weight->dtype == strata::SafetensorsDtype::Bf16);
 }
 
 TEST_CASE("Inkling-Small validation rejects silent contract drift") {

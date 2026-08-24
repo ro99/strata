@@ -261,7 +261,9 @@ ValidationResult validate_model(const ModelSpec& spec) {
             result.errors.emplace_back(
                 "Inkling adapter requires sink experts with log-sigmoid renormalization");
         }
-        if (!inkling.interleaved_gate_up) {
+        if (!inkling.interleaved_gate_up &&
+            spec.mixed_quantization.kind !=
+                QuantizationKind::CompressedTensorsW4A16) {
             result.errors.emplace_back(
                 "Inkling adapter requires interleaved gate/up checkpoint rows");
         }
@@ -816,6 +818,97 @@ ValidationResult validate_laguna_s21_nvfp4(const ModelSpec& spec) {
     return result;
 }
 
+ModelSpec laguna_s21_mxfp4_spec() {
+    auto spec = laguna_s21_nvfp4_spec();
+    spec.name = "olka-fi/Laguna-S-2.1-MXFP4";
+    spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsW4A16;
+    spec.mixed_quantization.routed_experts = {
+        4U, QuantizationGranularity::Group, 32U, true};
+    spec.source.repository = "olka-fi/Laguna-S-2.1-MXFP4";
+    spec.source.index_sha256 =
+        "9a3ce5a1e798b20f6fba133472c1e25a137ddf18c46354e8d88375d0fb19cbfb";
+    spec.source.tensor_count = 72'865U;
+    spec.source.indexed_tensor_bytes = 68'350'039'552ULL;
+    spec.source.shard_file_bytes = 68'359'318'472ULL;
+    spec.source.main_shards = 46U;
+    // All 47 sparse layers carry MXFP4 routed experts in this checkpoint.
+    spec.laguna.quantized_expert_layers = kLagunaExecutionContract.layer_count;
+    return spec;
+}
+
+ValidationResult validate_laguna_s21_mxfp4(const ModelSpec& spec) {
+    auto result = validate_model(spec);
+    const auto expected = laguna_s21_mxfp4_spec();
+    const auto require = [&result](bool condition, std::string_view message) {
+        if (!condition) result.errors.emplace_back(message);
+    };
+    require(spec.source.repository == expected.source.repository &&
+                spec.source.index_sha256 == expected.source.index_sha256,
+            "unexpected Laguna S 2.1 MXFP4 source identity");
+    require(spec.source.tensor_count == expected.source.tensor_count &&
+                spec.source.indexed_tensor_bytes ==
+                    expected.source.indexed_tensor_bytes &&
+                spec.source.shard_file_bytes == expected.source.shard_file_bytes &&
+                spec.source.main_shards == expected.source.main_shards,
+            "unexpected Laguna S 2.1 MXFP4 checkpoint extent");
+    require(spec.architecture == expected.architecture &&
+                spec.attention == expected.attention &&
+                spec.hidden_size == expected.hidden_size &&
+                spec.layer_count == expected.layer_count &&
+                spec.dense_prefix_layers == expected.dense_prefix_layers &&
+                spec.shared_experts == expected.shared_experts &&
+                spec.expert_intermediate_size == expected.expert_intermediate_size &&
+                spec.max_context_tokens == expected.max_context_tokens,
+            "unexpected Laguna S 2.1 MXFP4 architecture dimensions");
+    require(spec.router.selection == expected.router.selection &&
+                spec.router.scoring == expected.router.scoring &&
+                spec.router.routed_experts == expected.router.routed_experts &&
+                spec.router.experts_per_token == expected.router.experts_per_token &&
+                spec.router.normalize_topk == expected.router.normalize_topk &&
+                spec.router.selection_bias == expected.router.selection_bias &&
+                spec.router.routed_scale == expected.router.routed_scale,
+            "unexpected Laguna S 2.1 MXFP4 router semantics");
+    const auto& actual = spec.laguna;
+    const auto& wanted = expected.laguna;
+    require(actual.global_attention_heads == wanted.global_attention_heads &&
+                actual.sliding_attention_heads == wanted.sliding_attention_heads &&
+                actual.key_value_heads == wanted.key_value_heads &&
+                actual.head_dim == wanted.head_dim &&
+                actual.sliding_window == wanted.sliding_window &&
+                actual.global_attention_stride == wanted.global_attention_stride &&
+                actual.dense_intermediate_size == wanted.dense_intermediate_size &&
+                actual.shared_expert_intermediate_size ==
+                    wanted.shared_expert_intermediate_size &&
+                actual.quantized_expert_layers == wanted.quantized_expert_layers &&
+                actual.rms_epsilon == wanted.rms_epsilon &&
+                actual.router_logit_softcapping == wanted.router_logit_softcapping &&
+                actual.per_head_output_gating == wanted.per_head_output_gating &&
+                actual.query_key_norm == wanted.query_key_norm,
+            "unexpected Laguna S 2.1 MXFP4 attention or MoE contract");
+    require(actual.global_rope_theta == wanted.global_rope_theta &&
+                actual.global_rope_factor == wanted.global_rope_factor &&
+                actual.global_rope_attention_factor ==
+                    wanted.global_rope_attention_factor &&
+                actual.global_rope_beta_fast == wanted.global_rope_beta_fast &&
+                actual.global_rope_beta_slow == wanted.global_rope_beta_slow &&
+                actual.global_rope_partial == wanted.global_rope_partial &&
+                actual.global_rope_original_context ==
+                    wanted.global_rope_original_context &&
+                actual.sliding_rope_theta == wanted.sliding_rope_theta &&
+                actual.sliding_rope_partial == wanted.sliding_rope_partial,
+            "unexpected Laguna S 2.1 MXFP4 rotary contract");
+    const auto& quantization = spec.mixed_quantization;
+    require(quantization.kind == QuantizationKind::CompressedTensorsW4A16 &&
+                quantization.activation_bits == 16U &&
+                quantization.routed_experts.bits == 4U &&
+                quantization.routed_experts.granularity ==
+                    QuantizationGranularity::Group &&
+                quantization.routed_experts.group_size == 32U &&
+                quantization.routed_experts.symmetric && spec.quant_bits == 4U,
+            "unexpected Laguna S 2.1 MXFP4 quantization semantics");
+    return result;
+}
+
 ModelSpec inkling_small_nvfp4_spec() {
     ModelSpec spec;
     const auto& contract = kInklingExecutionContract;
@@ -968,6 +1061,98 @@ ValidationResult validate_inkling_small_nvfp4(const ModelSpec& spec) {
                     kInklingExecutionContract.nvfp4_group_size &&
                 quantization.routed_experts.symmetric && spec.quant_bits == 4U,
             "unexpected Inkling-Small NVFP4 quantization semantics");
+    return result;
+}
+
+ModelSpec inkling_small_mxfp4_spec() {
+    auto spec = inkling_small_nvfp4_spec();
+    spec.name = "mlx-community/Inkling-Small-mxfp4";
+    spec.source.repository = spec.name;
+    spec.source.index_sha256 =
+        "a62dd17e5d1bbfa2a5722dfb5ce4e708d8b953ae22bc51af7761dadf7f9ebdde";
+    spec.source.tensor_count = 1'508U;
+    spec.source.indexed_tensor_bytes = 140'271'331'492ULL;
+    spec.source.shard_file_bytes = 140'271'531'888ULL;
+    spec.source.main_shards = 30U;
+    spec.source.mtp_shards = 0U;
+    spec.mixed_quantization.kind = QuantizationKind::CompressedTensorsW4A16;
+    spec.mixed_quantization.activation_bits = 16U;
+    spec.mixed_quantization.quantized_linear_start_layer = 0U;
+    spec.mixed_quantization.quantized_expert_start_layer = 0U;
+    spec.mixed_quantization.routed_experts = {
+        4U, QuantizationGranularity::Group, 32U, true};
+    spec.mixed_quantization.linears = spec.mixed_quantization.routed_experts;
+    spec.mixed_quantization.mtp = spec.mixed_quantization.routed_experts;
+    spec.inkling.quantized_expert_start_layer = 0U;
+    spec.inkling.interleaved_gate_up = false;
+    return spec;
+}
+
+ValidationResult validate_inkling_small_mxfp4(const ModelSpec& spec) {
+    auto result = validate_model(spec);
+    const auto expected = inkling_small_mxfp4_spec();
+    const auto require = [&result](bool condition, std::string_view message) {
+        if (!condition) result.errors.emplace_back(message);
+    };
+    require(spec.source.repository == expected.source.repository &&
+                spec.source.index_sha256 == expected.source.index_sha256,
+            "unexpected Inkling-Small MXFP4 source identity");
+    require(spec.source.tensor_count == expected.source.tensor_count &&
+                spec.source.indexed_tensor_bytes ==
+                    expected.source.indexed_tensor_bytes &&
+                spec.source.shard_file_bytes == expected.source.shard_file_bytes &&
+                spec.source.main_shards == expected.source.main_shards &&
+                spec.source.mtp_shards == 0U,
+            "unexpected Inkling-Small MXFP4 checkpoint extent");
+    require(spec.architecture == expected.architecture &&
+                spec.attention == expected.attention &&
+                spec.hidden_size == expected.hidden_size &&
+                spec.layer_count == expected.layer_count &&
+                spec.dense_prefix_layers == expected.dense_prefix_layers &&
+                spec.shared_experts == expected.shared_experts &&
+                spec.expert_intermediate_size == expected.expert_intermediate_size &&
+                spec.max_context_tokens == expected.max_context_tokens,
+            "unexpected Inkling-Small MXFP4 architecture dimensions");
+    require(spec.router.selection == expected.router.selection &&
+                spec.router.scoring == expected.router.scoring &&
+                spec.router.routed_experts == expected.router.routed_experts &&
+                spec.router.experts_per_token == expected.router.experts_per_token &&
+                spec.router.normalize_topk == expected.router.normalize_topk &&
+                spec.router.selection_bias == expected.router.selection_bias &&
+                spec.router.routed_scale == expected.router.routed_scale,
+            "unexpected Inkling-Small MXFP4 router semantics");
+    const auto& actual = spec.inkling;
+    const auto& wanted = expected.inkling;
+    require(actual.attention_heads == wanted.attention_heads &&
+                actual.key_value_heads == wanted.key_value_heads &&
+                actual.head_dim == wanted.head_dim &&
+                actual.relative_dim == wanted.relative_dim &&
+                actual.global_relative_extent == wanted.global_relative_extent &&
+                actual.local_relative_extent == wanted.local_relative_extent &&
+                actual.sliding_window == wanted.sliding_window &&
+                actual.global_attention_period == wanted.global_attention_period &&
+                actual.short_conv_kernel == wanted.short_conv_kernel &&
+                actual.dense_intermediate_size == wanted.dense_intermediate_size &&
+                actual.padded_vocabulary_size == wanted.padded_vocabulary_size &&
+                actual.rms_epsilon == wanted.rms_epsilon &&
+                actual.attention_scale == wanted.attention_scale &&
+                actual.logits_width_multiplier == wanted.logits_width_multiplier &&
+                actual.short_conv_streams && actual.shared_expert_sink &&
+                actual.log_sigmoid_renormalization &&
+                actual.router_global_scale && !actual.interleaved_gate_up &&
+                actual.embedding_norm && actual.query_key_norm,
+            "unexpected Inkling-Small MXFP4 execution contract");
+    const auto& quantization = spec.mixed_quantization;
+    require(quantization.kind == QuantizationKind::CompressedTensorsW4A16 &&
+                quantization.activation_bits == 16U &&
+                quantization.quantized_linear_start_layer == 0U &&
+                quantization.quantized_expert_start_layer == 0U &&
+                quantization.routed_experts.bits == 4U &&
+                quantization.routed_experts.granularity ==
+                    QuantizationGranularity::Group &&
+                quantization.routed_experts.group_size == 32U &&
+                quantization.routed_experts.symmetric && spec.quant_bits == 4U,
+            "unexpected Inkling-Small MXFP4 quantization semantics");
     return result;
 }
 

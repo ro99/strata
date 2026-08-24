@@ -5,6 +5,8 @@
 #include "strata/safetensors.hpp"
 
 #include <cstddef>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -264,6 +266,31 @@ struct CudaBackendStats {
 struct CudaDeviceMemory {
     std::uint64_t free_bytes{};
     std::uint64_t total_bytes{};
+};
+
+// One exact batch-1 attention step over a persistent BF16 KV ring. Queries
+// remain F32 because the model adapter owns QK norm and RoPE; only the newly
+// produced BF16 cache row crosses PCIe. The backend evaluates the same
+// sequential F32 dot, softmax and value accumulation as
+// FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum.
+struct CudaBf16KvAttentionRequest {
+    const CudaBuffer* cache{};
+    std::span<const float> queries;
+    std::span<const std::uint16_t> next_keys;
+    std::span<const std::uint16_t> next_values;
+    // Optional [query_heads, relative_bias_extent] score bias indexed by
+    // distance from the current row: column zero is the just-appended row.
+    // An empty span with extent zero preserves the Laguna contract.
+    std::span<const float> relative_bias;
+    std::uint32_t query_heads{};
+    std::uint32_t key_value_heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t capacity_rows{};
+    std::uint32_t cache_start{};
+    std::uint32_t cached_rows{};
+    std::uint32_t position{};
+    std::uint32_t relative_bias_extent{};
+    float scale{};
 };
 
 // Each segment contains contiguous packed FP4 E2M1 keys followed by their
@@ -790,8 +817,98 @@ struct CudaGemma4DecodeLayer {
     float scalar{1.0F};
 };
 
+// MIX-1 route census. The campaign contract requires that every production
+// dispatch choice be observable and that an unsupported case fail explicitly
+// rather than disappear into a hidden fallback. Before this, matmul_impl's
+// dispatch chain ended in a bare `else` that routed any unrecognised encoding
+// into the FP4 kernel.
+enum class CudaMatmulRoute : std::uint8_t {
+    PlainBf16Matvec,
+    PlainGeneric,
+    PackedInt8Group32,
+    PackedOffsetInt,
+    Nvfp4Group16,
+    Fp8TensorPage,
+    Fp8E4m3Block128,
+    Fp4E2m1Group32,
+    // MIX-2 register-fed skinny kernels. These are the accepted QPN shapes made
+    // model agnostic: any weight whose encoding and extents admit the m16n8k16
+    // fragment layout reaches them, and the scalar routes above remain for the
+    // shapes the fragment layout cannot express. The census distinguishes them
+    // so a run can show which of the two actually served a dispatch.
+    Fp8RegisterFed,
+    Fp4RegisterFed,
+    // MoE expert batches dispatch through CudaBackend::enqueue_moe, which
+    // experiment 0162 showed is the path production decode actually uses --
+    // matmul_impl is load-only. These are counted separately so a census can
+    // distinguish a load-time dispatch from a per-token one.
+    MoePlainBf16,
+    MoeNvfp4Group16,
+    MoeFp4E2m1Group32,
+    MoePackedInt4,
+    // The fused MXFP4 MoE batch on the register-fed route (task A). Counted
+    // separately from MoeFp4E2m1Group32 so a run shows which of the two served
+    // it.
+    MoeFp4RegisterFed,
+    // DeepSeek V4's own MoE path. This is the campaign's mixed dispatch: the
+    // routed experts are FP4 E2M1/E8M0 group-32 and the shared expert is FP8
+    // E4M3/E8M0 block-128, dispatched by CudaBackend::enqueue_deepseek_moe.
+    // The generic enqueue_moe above is used by GLM-5.2, Laguna and Inkling and
+    // is never called by the DeepSeek V4 runtime.
+    Dsv4MoeRoutedFp4,
+    Dsv4MoeSharedFp8,
+    // The same shared expert on the register-fed route. Its three projections
+    // never reach matmul_impl -- their operands never leave the device -- so it
+    // is wired at its own dispatch site and counted separately.
+    Dsv4MoeSharedFp8RegisterFed,
+    // Host-routed MoE still runs a device FP4 path: the resident routed-expert
+    // tier, dispatched from enqueue_dsv4_host_moe_impl. Experts that miss the
+    // tier are computed on the host and never reach a CUDA route at all.
+    Dsv4MoeTierFp4,
+    Unsupported,
+    Count,
+};
+
+struct CudaMatmulRouteCensus {
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(CudaMatmulRoute::Count)> counts{};
+};
+
+[[nodiscard]] const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept;
+
+// The census is process-global, not per-backend: a rank-local TP=2 run creates
+// one CudaBackend per rank, and per-instance counters would split the census
+// across them.
+// Process-global A/B switch for the MIX-2 register-fed matmul routes. Reads
+// STRATA_REGFED_MATMUL on first use (default on) and can be overridden at
+// runtime, which is what lets one process compare the two routes on identical
+// inputs. It only affects weights not yet permuted: fragment order replaces the
+// canonical layout, so a weight that has already been prepacked keeps the
+// register-fed route whatever this says.
+[[nodiscard]] bool register_fed_matmul_enabled() noexcept;
+void set_register_fed_matmul(bool enabled) noexcept;
+
+[[nodiscard]] CudaMatmulRouteCensus cuda_matmul_route_census() noexcept;
+void reset_cuda_matmul_route_census() noexcept;
+void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
+
+
 class CudaBackend {
 public:
+    // Permutes an Fp8E4m3Block128 or Fp4E2m1Group32 weight from its canonical
+    // layout into m16n8k16 fragment order, in place. The fragment order
+    // REPLACES the canonical device layout -- one-copy residency, not a second
+    // buffer -- so every consumer of that weight must expect fragment order
+    // afterwards. matmul_impl and the shared expert call this themselves on
+    // first skinny dispatch; this entry point exists for callers that want the
+    // permutation to have happened before a timed region.
+    [[nodiscard]] ValidationResult prepack_fragment(
+        int device, const CudaWeight& weight);
+    [[nodiscard]] static bool fragment_prepacked(const CudaWeight& weight) noexcept;
+
+    [[nodiscard]] CudaMatmulRouteCensus matmul_route_census() const noexcept;
+    void reset_matmul_route_census() noexcept;
+
     CudaBackend();
     ~CudaBackend();
     CudaBackend(CudaBackend&&) noexcept;
@@ -837,11 +954,20 @@ public:
         Synchronous,
         Deferred,
     };
+    // `prepack` asks for the weight to be permuted into m16n8k16 fragment
+    // order as part of the upload, stream-ordered behind the copy so the loader
+    // never blocks on it. It is honoured only when the register-fed switch is on
+    // and the extents admit the layout; otherwise the weight stays canonical and
+    // keeps the scalar route. Ask for it only where EVERY consumer of the weight
+    // takes a register-fed route -- fragment order replaces the canonical
+    // layout, so a consumer that reads it canonically reads a permutation.
+    enum class FragmentLayout : std::uint8_t { Canonical, Prepack };
     [[nodiscard]] ValidationResult upload(
         int device, const CudaWeightDescriptor& descriptor,
         std::span<const std::byte> weights, std::span<const std::byte> scales,
         CudaWeight& output,
-        UploadCompletion completion = UploadCompletion::Synchronous);
+        UploadCompletion completion = UploadCompletion::Synchronous,
+        FragmentLayout prepack = FragmentLayout::Canonical);
     // Waits out any deferred uploads issued on this device and attributes the
     // wait. Idempotent, and free when nothing was deferred.
     [[nodiscard]] ValidationResult synchronize_uploads(int device);
@@ -863,6 +989,9 @@ public:
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
         std::span<const std::uint16_t> values, std::uint32_t start,
         std::uint32_t capacity_rows, std::uint32_t columns);
+    [[nodiscard]] ValidationResult bf16_kv_attention(
+        int device, const CudaBf16KvAttentionRequest& request,
+        std::span<float> output);
     [[nodiscard]] ValidationResult gemma4_decode_layers(
         int device, std::span<const CudaGemma4DecodeLayer> layers,
         std::span<const float> input, std::uint32_t position,
@@ -1182,6 +1311,9 @@ public:
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
 private:
+    // One counter per route; atomic because the backend is called from the
+    // rank-local worker pool.
+
     [[nodiscard]] ValidationResult dsv4_mhc_begin_impl(
         int device, const CudaDsv4MhcWeights& weights,
         std::span<const float> hidden, std::span<float> weighted,
@@ -1201,6 +1333,8 @@ private:
         CudaDsv4DeviceInputHostMoeCallback device_input_callback,
         bool mhc_source_and_destination,
         CudaDsv4DeviceInputHostMoeRouteCallback route_callback = nullptr);
+    // Snapshot of how many matmuls took each route since process start.
+    // Unsupported is always zero in a healthy run: reaching it is a hard error.
     [[nodiscard]] ValidationResult matmul_impl(
         const CudaWeight& weight, std::span<const float> input,
         std::uint32_t rows, std::uint32_t groups,

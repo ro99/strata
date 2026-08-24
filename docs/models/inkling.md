@@ -1,7 +1,6 @@
 # Inkling Small: fast-path runbook
 
-This is the copy-paste path for Inkling Small (sometimes called “Inklink” in
-conversation) on Strata's fastest accepted configuration. The commands use the
+This is the copy-paste path for Inkling Small on Strata's fastest accepted configuration. The commands use the
 MXFP4 checkpoint at `models/inkling`; the native NVFP4 checkpoint is also
 supported. Strata reads Safetensors directly, so there is no conversion step.
 

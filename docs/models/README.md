@@ -8,4 +8,4 @@ different context length or machine.
 | Model | Runbook | Fastest accepted single-stream decode |
 |---|---|---:|
 | Laguna S 2.1 | [Build, chat, serve, and benchmark](laguna.md) | 18.626 tok/s steady-state median |
-
+| Inkling Small | [Build, chat, serve, and benchmark](inkling.md) | 9.072 tok/s fresh / 28.010 tok/s same-route warm |

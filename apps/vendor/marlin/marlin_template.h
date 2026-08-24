@@ -477,7 +477,11 @@ __global__ void Marlin(
 
     if (slice_col == n_tiles) {
       A += 16 * thread_m_blocks * lda / (is_a_8bit ? 16 : 8);
+#ifdef STRATA_MARLIN_FP32_OUTPUT
+      C += 16 * thread_m_blocks * prob_n / 4;
+#else
       C += 16 * thread_m_blocks * prob_n / 8;
+#endif
       slice_col = 0;
       par_id++;
     }
@@ -496,7 +500,11 @@ __global__ void Marlin(
       slice_col = slice_col_par % n_tiles;
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
+#ifdef STRATA_MARLIN_FP32_OUTPUT
+      C = C0 + 16 * thread_m_blocks / 4 * par_id * prob_n;
+#else
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+#endif
       if (is_a_8bit) {
         __syncthreads();
         int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
@@ -514,7 +522,11 @@ __global__ void Marlin(
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
+#ifdef STRATA_MARLIN_FP32_OUTPUT
+      C = C0 + 16 * thread_m_blocks / 4 * par_id * prob_n;
+#else
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+#endif
     }
     if (!in_part2) {
       init_part1_slice();
@@ -1649,13 +1661,28 @@ __global__ void Marlin(
                   (threadIdx.x % (2 * thread_n_blocks));
 
     int c_gl_wr_end = c_gl_stride * prob_m;
-    // We first reorder in shared memory to guarantee the most efficient final
-    // global write patterns
+    // We first reorder to guarantee efficient final global write patterns.
+    // Upstream Marlin uses shared BF16 storage. Strata's MXFP4 contract keeps
+    // the FP32 accumulator boundary, so the standalone acceptance probe uses
+    // one padded FP32 reorder tile per CTA instead.
+#ifdef STRATA_MARLIN_FP32_OUTPUT
+    constexpr int fp32_reorder_stride = 2 * thread_n_blocks * 8 + 8;
+    float* fp32_reorder = const_cast<float*>(global_scale_ptr) +
+                          blockIdx.x * 16 * thread_m_blocks *
+                              fp32_reorder_stride;
+#endif
     auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {
       if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
         c0 *= global_scale_f32;
         c1 *= global_scale_f32;
       }
+#ifdef STRATA_MARLIN_FP32_OUTPUT
+      static_assert(b_type == vllm::kFE2M1f &&
+                    s_type == vllm::kFE8M0fnu && group_blocks == 2,
+                    "Strata FP32 epilogue is scoped to MXFP4 group-32");
+      fp32_reorder[2 * idx] = c0;
+      fp32_reorder[2 * idx + 1] = c1;
+#else
       c_scalar_t2 res =
           Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
 
@@ -1686,6 +1713,7 @@ __global__ void Marlin(
       } else {
         ((c_scalar_t2*)sh_red)[idx] = res;
       }
+#endif
     };
 
     if (threadIdx.x / 32 < tb_n_warps) {
@@ -1727,6 +1755,15 @@ __global__ void Marlin(
          i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
          i++) {
       if (c_gl_wr < c_gl_wr_end) {
+#ifdef STRATA_MARLIN_FP32_OUTPUT
+        float* C_float = reinterpret_cast<float*>(C);
+        const int src = c_sh_rd * 8;
+        const int dst = c_gl_wr * 8;
+  #pragma unroll
+        for (int a = 0; a < 8; a++) {
+          C_float[dst + a] = fp32_reorder[src + a];
+        }
+#else
         if (use_atomic_add && slice_count > 1) {
           c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[c_gl_wr]);
           c_scalar_t2* sh_red_half2 =
@@ -1738,6 +1775,7 @@ __global__ void Marlin(
         } else {
           C[c_gl_wr] = sh_red[c_sh_rd];
         }
+#endif
         c_gl_wr += c_gl_wr_delta;
         c_sh_rd += c_sh_rd_delta;
       }

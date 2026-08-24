@@ -38,6 +38,7 @@
 #include <string_view>
 #include <vector>
 
+#define STRATA_MARLIN_FP32_OUTPUT 1
 #include "vendor/marlin/marlin_template.h"
 
 namespace {
@@ -1193,7 +1194,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     DeviceBuffer d_marlin_scales(marlin_scales.size());
     DeviceBuffer d_marlin_act(marlin_activation.size() * sizeof(std::uint16_t));
     DeviceBuffer d_marlin_out(static_cast<std::size_t>(n) * g_m *
-                              sizeof(std::uint16_t));
+                              sizeof(float));
     int selected_device = 0;
     int multiprocessors = 0;
     int maximum_shared = 0;
@@ -1208,6 +1209,9 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
           "query Marlin shared-memory ceiling");
     DeviceBuffer d_marlin_tmp(static_cast<std::size_t>(multiprocessors) * 64U *
                               256U * sizeof(float));
+    DeviceBuffer d_marlin_reorder(
+        static_cast<std::size_t>(multiprocessors) * 64U * (256U + 8U) *
+        sizeof(float));
     DeviceBuffer d_marlin_locks(static_cast<std::size_t>(multiprocessors) *
                                 sizeof(std::int32_t));
     DeviceBuffer d_partials(static_cast<std::size_t>(n_tiles) * g_batch *
@@ -1225,7 +1229,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                      d_canonical_act.bytes() + d_marlin_codes.bytes() +
                      d_marlin_scales.bytes() + d_marlin_act.bytes() +
                      d_marlin_out.bytes() + d_marlin_tmp.bytes() +
-                     d_marlin_locks.bytes();
+                     d_marlin_reorder.bytes() + d_marlin_locks.bytes();
 
     for (std::uint32_t b = 0U; b < g_batch; ++b) {
         check(cudaMemcpyAsync(
@@ -1303,7 +1307,8 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                         static_cast<int4*>(d_marlin_tmp.get()), nullptr,
                         nullptr,
                         static_cast<const int4*>(d_marlin_scales.get()),
-                        nullptr, nullptr, nullptr,
+                        static_cast<const float*>(d_marlin_reorder.get()),
+                        nullptr, nullptr,
                         static_cast<int>(k / kGroup), static_cast<int>(g_m),
                         static_cast<int>(n), static_cast<int>(k),
                         static_cast<int>(k),
@@ -1411,14 +1416,11 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
 
     std::vector<float> out(static_cast<std::size_t>(n) * g_m);
     if (g_page_marlin) {
-        std::vector<std::uint16_t> encoded(out.size());
-        check(cudaMemcpyAsync(encoded.data(), d_marlin_out.get(),
-                              encoded.size() * sizeof(std::uint16_t),
+        check(cudaMemcpyAsync(out.data(), d_marlin_out.get(),
+                              out.size() * sizeof(float),
                               cudaMemcpyDeviceToHost, stream),
               "download Marlin output");
         check(cudaStreamSynchronize(stream), "finish Marlin download");
-        for (std::size_t i = 0U; i < encoded.size(); ++i)
-            out[i] = bf16_to_float(encoded[i]);
     } else {
         check(cudaMemcpyAsync(out.data(), d_out.get(),
                               out.size() * sizeof(float),

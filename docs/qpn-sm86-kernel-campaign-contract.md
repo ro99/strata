@@ -592,6 +592,16 @@ Last updated: 2026-08-24
   integrated. The next screen may change only reduction/output to preserve
   FP32 while retaining <=0.63 ms.
 
+- **Experiment 0184 accepts the FP32-output Marlin projection primitive.**
+  Three fresh processes measure 0.563712 ms gate/up and 0.522779 ms down at
+  M=128, with every run within 0.000482 ms. Worst maximum-relative error is
+  1.39e-7 against the canonical oracle and peak probe allocation is
+  233,697,608 bytes. This clears the isolated speed, precision, and memory
+  gates, but it does not reduce the production 2,419.841 ms `sum_serial` term
+  by itself and therefore carries no end-to-end prefill claim. The next branch
+  must integrate it through a device-owned page executor, not substitute it
+  into the current host-serialized loop.
+
 - **Experiment 0167 stops Inkling register-fed work at the mandatory cost
   gate.** The distinct 130.638 GiB, 30-shard
   `mlx-community/Inkling-Small-mxfp4` checkpoint now maps its exact U32-packed
@@ -912,11 +922,13 @@ experiment 0165.** Do not repeat the decode A/B. Experiment 0180 confirms the
 generic M=128 matmul reads the projected weight set eight times and rejects the
 decode-oriented register-fed page-kernel family at 36.9--111.4 GB/s against a
 600 GB/s gate. Do not integrate it or select a favorable ownership setting per
-shape. The exact next Gemma action is an isolated page-shaped tiled MXFP4 GEMM
-probe at M=128, informed by the production engine's load-time tiled repack and
-multi-stage global-to-shared pipeline. Keep W8A16 as an equal correctness and
-dispatch gate. DeepSeek V4 register-fed work remains stopped by experiment
-0164's host-MoE bottleneck result.
+shape. Experiments 0182--0184 establish and accept an FP32-output standalone
+Marlin projection primitive at M=128. The exact next Gemma action is a bounded
+device-owned page executor that uses this accepted primitive and reduces the
+measured 2,419.841 ms serial handoff term; a projection-only substitution into
+the current host loop is forbidden because it does not attack `argmax_r`.
+Keep W8A16 as an equal correctness and dispatch gate. DeepSeek V4 register-fed
+work remains stopped by experiment 0164's host-MoE bottleneck result.
 
 **Two tracks are running concurrently on this branch. Read both.**
 
@@ -1052,3 +1064,4 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-24T20:45:00-03:00 | Codex / experiment 0181 | `fix/gemma4-device-page-prefill@<this result commit>` | External Gemma prefill/decode reference | Benchmarked vLLM 2.3.8 on the exact 19,531,513,296-byte checkpoint at 1605 MHz/250 W, prefix caching off and one sequence; three interleaved server-metric repetitions per prefill shape, then three 127-step decode windows requested by the owner. See experiment 0181 | TP=1 prefill medians 881.67 tok/s at about 127 tokens and 912.17 at 2070; TP=2 987.78 and 1101.69. TP=1 decode 36.187/36.249/36.214 tok/s, median 36.214. TP=2 uses PHB/PYNCCL, not NVLink | 3000 tok/s is not reproduced. The comparable TP=1 page is about 44.8x faster than Strata's 6.355 s page, and vLLM decode is 2.01x Strata's accepted 18.03 tok/s | Re-price the tiled-page probe from the measured vLLM reference and projection profile; preserve both the 900--1000 prefill and about 36 decode tok/s targets |
 | 2026-08-24T21:05:00-03:00 | Codex / experiment 0182 | `fix/gemma4-page-tiled-prefill@<this result commit>` | Conventional Gemma WMMA page control | Measured vLLM's actual Marlin operator and a Strata 64x128x32 shared-BF16 WMMA control on both exact Gemma MLP shapes at M=128, three fresh Strata processes. See experiment 0182 | Marlin 0.490811/0.506624 ms; Strata medians 3.643520/6.293433 ms, 7.42x/12.42x slower; oracle <=5.564e-6; probe peak 148,979,712 bytes | Sixty layers of MLP projections alone project to 814.83 ms and exceed the complete 635.5 ms 10x page budget. No runtime integration | Reproduce Marlin's fragment repack, register dequantization, multi-stage async loading and scheduler in isolation; require proximity to the measured shape ruler before executor integration |
 | 2026-08-24T21:35:00-03:00 | Codex / experiment 0183 | `fix/gemma4-marlin-page-kernel@<this result commit>` | Standalone Marlin exact-shape screen | Specialized the Apache Marlin core without Torch, implemented its load-time code/scale permutations, and ran the exact M=128 Gemma MLP shapes. See experiment 0183 | Speed passes: 0.486875/0.493824 ms versus vLLM 0.490811/0.506624; useful 126.14/124.37 GB/s; 222,650,696 probe bytes. Precision fails: max relative 0.003474/0.003669 versus <=1e-4 because upstream writes BF16 output | Binding correctness stop after one process; no runtime integration and no repeated speed claim | Change only cross-CTA reduction and output to preserve FP32 `[M,N]`; require <=0.63 ms and <=1e-4 before executor work |
+| 2026-08-24T18:57:48-03:00 | Codex / experiment 0184 | `fix/gemma4-marlin-fp32-epilogue@<this result commit>` | FP32 Marlin epilogue screen | Changed only the result publication path to retain FP32 through the canonical `[M,N]` boundary; ran one correctness-first process then three fresh timed processes at the locked production point. See experiment 0184 | **ACCEPTED primitive:** medians 0.563712/0.522779 ms, worst spread 0.000482 ms, max relative 5.9e-8/1.39e-7, peak 233,697,608 bytes; all predeclared gates pass | No system throughput claim: production `argmax_r` is still 2,419.841 ms of serial handoffs, which an isolated projection cannot reduce | Integrate only through a bounded device-owned M=128 page executor and measure reduction of `sum_serial`; preserve W8A16 and full Gemma oracles |

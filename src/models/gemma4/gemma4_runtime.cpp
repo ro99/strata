@@ -7,21 +7,26 @@
 #include "strata/gemma4_image.hpp"
 #include "strata/gemma4_ops.hpp"
 #include "strata/model_adapter.hpp"
+#include "strata/numa_topology.hpp"
 #include "strata/numerics.hpp"
 #include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -31,6 +36,25 @@ namespace {
 constexpr auto& c = kGemma4ExecutionContract;
 constexpr std::uint32_t kPrefillChunk = 128U;
 constexpr std::uint64_t kMinimumAttentionWorkspace = 768ULL << 20U;
+
+double elapsed_seconds(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
+std::unique_ptr<HostWorkerPool> make_gemma4_prefill_workers() {
+    const auto* enabled = std::getenv("STRATA_GEMMA4_PARALLEL_PREFILL");
+    if (enabled != nullptr && std::string_view(enabled) == "0") return {};
+    const auto topology = NumaTopology::detect();
+    std::vector<int> cpus;
+    for (const auto& node : topology.node_primary_cpus) {
+        cpus.insert(cpus.end(), node.begin(), node.end());
+    }
+    if (!cpus.empty()) return std::make_unique<HostWorkerPool>(std::move(cpus));
+    const auto logical = std::thread::hardware_concurrency();
+    const auto workers = logical <= 1U ? 1U : logical / 2U;
+    return std::make_unique<HostWorkerPool>(workers);
+}
 
 std::string layer_prefix(std::uint32_t layer) {
     return "model.language_model.layers." + std::to_string(layer) + ".";
@@ -186,6 +210,8 @@ struct Gemma4Runtime::Impl {
     bool reusable_sequence{};
     bool device_kv_ready{};
     DiagnosticTrace diagnostics;
+    Gemma4PrefillPhaseMetrics prefill_phases;
+    std::unique_ptr<HostWorkerPool> prefill_workers;
 
     std::size_t layer_device(std::uint32_t layer) const {
         return schedule[layer % schedule.size()];
@@ -735,9 +761,12 @@ struct Gemma4Runtime::Impl {
                                      : c.local_key_value_heads;
         const auto query_columns = c.attention_heads * head_dim;
         const auto kv_columns = kv_heads * head_dim;
+        const bool profile = config.enable_cuda_phase_timing && rows > 1U;
         std::vector<float> queries(static_cast<std::size_t>(rows) * query_columns);
         std::vector<float> new_keys(static_cast<std::size_t>(rows) * kv_columns);
         std::vector<float> new_values(static_cast<std::size_t>(rows) * kv_columns);
+        auto phase_started = std::chrono::steady_clock::time_point{};
+        if (profile) phase_started = std::chrono::steady_clock::now();
         result = linear(weights.query, input, rows, queries);
         if (!result.ok()) return result;
         result = linear(weights.key, input, rows, new_keys);
@@ -747,6 +776,11 @@ struct Gemma4Runtime::Impl {
             if (!result.ok()) return result;
         } else {
             new_values = new_keys;
+        }
+        if (profile) {
+            prefill_phases.qkv_projection_seconds +=
+                elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
         }
         const float theta = global ? c.global_rope_theta : c.local_rope_theta;
         const float proportion = global ? c.global_rope_proportion : 1.0F;
@@ -781,6 +815,12 @@ struct Gemma4Runtime::Impl {
                     value, std::span<const float>(value), unscaled);
                 if (!result.ok()) return result;
             }
+        }
+
+        if (profile) {
+            prefill_phases.qkv_transform_seconds +=
+                elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
         }
 
         const auto old_rows = cache.keys.size() / kv_columns;
@@ -839,6 +879,10 @@ struct Gemma4Runtime::Impl {
             }
             request.query_key_mask = mask;
         }
+        if (profile) {
+            prefill_phases.kv_prepare_seconds += elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
+        }
         std::vector<float> context(
             static_cast<std::size_t>(rows) * c.attention_heads * head_dim);
         result = config.enable_flash_attention
@@ -846,8 +890,18 @@ struct Gemma4Runtime::Impl {
             : flash_attention_reference_f32(request, context);
         if (!result.ok()) return result;
         round_bf16(context);
+        if (profile) {
+            prefill_phases.attention_seconds += elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
+        }
         result = linear(weights.output, context, rows, output);
         if (!result.ok()) return result;
+
+        if (profile) {
+            prefill_phases.attention_output_projection_seconds +=
+                elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
+        }
 
         cache.keys.reserve((old_rows + rows) * kv_columns);
         cache.values.reserve((old_rows + rows) * kv_columns);
@@ -862,6 +916,9 @@ struct Gemma4Runtime::Impl {
                                cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
             cache.start += static_cast<std::uint32_t>(drop_rows);
         }
+        if (profile) {
+            prefill_phases.kv_commit_seconds += elapsed_seconds(phase_started);
+        }
         return result;
     }
 
@@ -870,15 +927,54 @@ struct Gemma4Runtime::Impl {
                          std::uint32_t rows,
                          std::span<float> output) {
         ValidationResult result;
+        const bool profile = config.enable_cuda_phase_timing && rows > 1U;
         std::vector<float> gate(static_cast<std::size_t>(rows) * c.intermediate_size);
         std::vector<float> up(gate.size());
+        auto phase_started = std::chrono::steady_clock::time_point{};
+        if (profile) phase_started = std::chrono::steady_clock::now();
         result = linear(weights.gate, input, rows, gate);
         if (!result.ok()) return result;
         result = linear(weights.up, input, rows, up);
         if (!result.ok()) return result;
-        result = gemma4_geglu_bf16(gate, gate, up);
+        if (profile) {
+            prefill_phases.mlp_gate_up_projection_seconds +=
+                elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
+        }
+        if (rows > 1U && prefill_workers != nullptr &&
+            prefill_workers->size() > 1U) {
+            std::atomic<bool> invalid{};
+            const auto tasks = std::min<std::size_t>(
+                prefill_workers->size(), gate.size());
+            result = prefill_workers->parallel_for(
+                tasks, [&](std::size_t task) {
+                    const auto begin = gate.size() * task / tasks;
+                    const auto end = gate.size() * (task + 1U) / tasks;
+                    const auto status = gemma4_geglu_bf16(
+                        std::span<float>(gate).subspan(begin, end - begin),
+                        std::span<const float>(gate).subspan(begin, end - begin),
+                        std::span<const float>(up).subspan(begin, end - begin));
+                    if (!status.ok()) invalid.store(true, std::memory_order_relaxed);
+                });
+            if (result.ok() && invalid.load(std::memory_order_relaxed)) {
+                result.errors.emplace_back(
+                    "Gemma 4 parallel GeGLU input is non-finite");
+            }
+        } else {
+            result = gemma4_geglu_bf16(gate, gate, up);
+        }
         if (!result.ok()) return result;
-        return linear(weights.down, gate, rows, output);
+        if (profile) {
+            prefill_phases.mlp_activation_seconds +=
+                elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
+        }
+        result = linear(weights.down, gate, rows, output);
+        if (profile) {
+            prefill_phases.mlp_down_projection_seconds +=
+                elapsed_seconds(phase_started);
+        }
+        return result;
     }
 
     ValidationResult sync_device_kv() {
@@ -973,6 +1069,7 @@ struct Gemma4Runtime::Impl {
         ValidationResult result;
         std::vector<float> normalized(hidden.size());
         std::vector<float> branch(hidden.size());
+        const bool profile = config.enable_cuda_phase_timing && rows > 1U;
         for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
             const auto started = std::chrono::steady_clock::now();
             auto& weights = layers[layer];
@@ -980,9 +1077,13 @@ struct Gemma4Runtime::Impl {
             result = norm_rows(normalized, hidden, weights.input_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
+            if (profile) prefill_phases.input_norm_seconds +=
+                elapsed_seconds(started);
+            auto phase_started = std::chrono::steady_clock::now();
             result = attention(layer, normalized, rows, position_base,
                                multimodal_groups, branch);
             if (!result.ok()) return result;
+            if (profile) phase_started = std::chrono::steady_clock::now();
             if (config.enable_layer_hash_trace) {
                 for (std::uint32_t row = 0U; row < rows; ++row) {
                     const auto position = position_base + row;
@@ -998,8 +1099,18 @@ struct Gemma4Runtime::Impl {
             result = norm_rows(normalized, branch, weights.post_attention_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
+            if (profile) {
+                prefill_phases.post_attention_norm_seconds +=
+                    elapsed_seconds(phase_started);
+                phase_started = std::chrono::steady_clock::now();
+            }
             for (std::size_t index = 0U; index < hidden.size(); ++index) {
                 hidden[index] = bf16_round_f32(hidden[index] + normalized[index]);
+            }
+            if (profile) {
+                prefill_phases.attention_residual_seconds +=
+                    elapsed_seconds(phase_started);
+                phase_started = std::chrono::steady_clock::now();
             }
             if (config.enable_layer_hash_trace) {
                 for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -1014,8 +1125,13 @@ struct Gemma4Runtime::Impl {
             result = norm_rows(normalized, hidden, weights.pre_feedforward_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
+            if (profile) {
+                prefill_phases.pre_feedforward_norm_seconds +=
+                    elapsed_seconds(phase_started);
+            }
             result = mlp(weights, normalized, rows, branch);
             if (!result.ok()) return result;
+            if (profile) phase_started = std::chrono::steady_clock::now();
             if (config.enable_layer_hash_trace) {
                 for (std::uint32_t row = 0U; row < rows; ++row) {
                     const auto position = position_base + row;
@@ -1029,10 +1145,19 @@ struct Gemma4Runtime::Impl {
             result = norm_rows(normalized, branch, weights.post_feedforward_norm,
                                rows, c.hidden_size);
             if (!result.ok()) return result;
+            if (profile) {
+                prefill_phases.post_feedforward_norm_seconds +=
+                    elapsed_seconds(phase_started);
+                phase_started = std::chrono::steady_clock::now();
+            }
             for (std::size_t index = 0U; index < hidden.size(); ++index) {
                 hidden[index] = bf16_round_f32(
                     bf16_round_f32(hidden[index] + normalized[index]) *
                     weights.scalar);
+            }
+            if (profile) {
+                prefill_phases.mlp_residual_seconds +=
+                    elapsed_seconds(phase_started);
             }
             if (config.enable_layer_hash_trace) {
                 for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -1071,19 +1196,34 @@ struct Gemma4Runtime::Impl {
             return result;
         }
         std::vector<float> hidden(token_ids.size() * c.hidden_size);
+        const bool profile = config.enable_cuda_phase_timing && token_ids.size() > 1U;
+        auto phase_started = std::chrono::steady_clock::time_point{};
+        if (profile) phase_started = std::chrono::steady_clock::now();
         result = embed(token_ids, replacements, replacement_mask, hidden);
         if (!result.ok()) return result;
+        if (profile) {
+            prefill_phases.embedding_seconds += elapsed_seconds(phase_started);
+        }
         result = forward_layers(hidden, static_cast<std::uint32_t>(token_ids.size()),
                                 position_base, multimodal_groups, token_ids);
         if (!result.ok()) return result;
         std::vector<float> normalized(c.hidden_size);
+        if (profile) phase_started = std::chrono::steady_clock::now();
         result = gemma4_rms_norm_bf16(
             normalized, std::span<const float>(hidden).last(c.hidden_size),
             final_norm);
         if (!result.ok()) return result;
+        if (profile) {
+            prefill_phases.final_norm_seconds += elapsed_seconds(phase_started);
+            phase_started = std::chrono::steady_clock::now();
+        }
         logits.assign(c.vocabulary_size, 0.0F);
-        return cuda.matmul_softcap(
+        result = cuda.matmul_softcap(
             output_head.weight, normalized, c.final_logit_softcap, logits);
+        if (profile) {
+            prefill_phases.output_head_seconds += elapsed_seconds(phase_started);
+        }
+        return result;
     }
 
     ParseResult<std::uint32_t> forward(std::span<const std::uint32_t> token_ids,
@@ -1140,9 +1280,15 @@ struct Gemma4Runtime::Impl {
                     static_cast<std::uint32_t>(cached_tokens), entropy);
             };
         }
+        const bool profile = config.enable_cuda_phase_timing && token_ids.size() > 1U;
+        const auto sample_started = profile ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
         last_sample = sample_logits(
             logits, active_sampling, SamplingHistory{sampled_counts, sampled_ids},
             sampler, lookahead);
+        if (profile) {
+            prefill_phases.sampling_seconds += elapsed_seconds(sample_started);
+        }
         if (!last_sample.ok()) {
             result.errors = last_sample.errors;
             return result;
@@ -1376,6 +1522,7 @@ ValidationResult Gemma4Runtime::initialize(
         }
     }
     impl_->config = config;
+    impl_->prefill_workers = make_gemma4_prefill_workers();
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->devices = config.devices;
@@ -1501,6 +1648,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
     }
     result.prompt_token_ids = std::move(encoded.value);
     impl_->reset_diagnostics();
+    impl_->prefill_phases = {};
     std::vector<float> replacements;
     std::vector<std::uint8_t> replacement_mask;
     std::vector<std::int32_t> multimodal_groups;
@@ -1565,7 +1713,14 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
             : std::span<const std::uint8_t>(replacement_mask).subspan(reused),
         multimodal_groups);
     if (next.ok()) {
+        const auto kv_upload_started = impl_->config.enable_cuda_phase_timing
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         auto synced = impl_->sync_device_kv();
+        if (impl_->config.enable_cuda_phase_timing) {
+            impl_->prefill_phases.kv_upload_seconds +=
+                elapsed_seconds(kv_upload_started);
+        }
         if (!synced.ok()) next.errors = std::move(synced.errors);
     }
     result.metrics.prefill_seconds = std::chrono::duration<double>(
@@ -1574,6 +1729,7 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
         prefill_cuda_before, impl_->cuda.stats());
     result.metrics.prompt_tokens = result.prompt_token_ids.size();
     result.metrics.prefill_tokens = prefill.size();
+    result.metrics.prefill_phases = impl_->prefill_phases;
     result.metrics.reused_prompt_tokens = reused;
     result.metrics.incremental_kv_continuation = reused != 0U;
     if (!next.ok()) {

@@ -182,6 +182,37 @@ int main(int argc, char** argv) {
                    << ",\"synchronization_seconds\":"
                    << phase.synchronization_seconds << '}';
         };
+        const auto print_prefill_phases = [](
+            std::ostream& output,
+            const strata::Gemma4PrefillPhaseMetrics& phase) {
+            output << "{\"embedding_seconds\":" << phase.embedding_seconds
+                   << ",\"input_norm_seconds\":" << phase.input_norm_seconds
+                   << ",\"qkv_projection_seconds\":" << phase.qkv_projection_seconds
+                   << ",\"qkv_transform_seconds\":" << phase.qkv_transform_seconds
+                   << ",\"kv_prepare_seconds\":" << phase.kv_prepare_seconds
+                   << ",\"attention_seconds\":" << phase.attention_seconds
+                   << ",\"attention_output_projection_seconds\":"
+                   << phase.attention_output_projection_seconds
+                   << ",\"kv_commit_seconds\":" << phase.kv_commit_seconds
+                   << ",\"post_attention_norm_seconds\":"
+                   << phase.post_attention_norm_seconds
+                   << ",\"attention_residual_seconds\":"
+                   << phase.attention_residual_seconds
+                   << ",\"pre_feedforward_norm_seconds\":"
+                   << phase.pre_feedforward_norm_seconds
+                   << ",\"mlp_gate_up_projection_seconds\":"
+                   << phase.mlp_gate_up_projection_seconds
+                   << ",\"mlp_activation_seconds\":" << phase.mlp_activation_seconds
+                   << ",\"mlp_down_projection_seconds\":"
+                   << phase.mlp_down_projection_seconds
+                   << ",\"post_feedforward_norm_seconds\":"
+                   << phase.post_feedforward_norm_seconds
+                   << ",\"mlp_residual_seconds\":" << phase.mlp_residual_seconds
+                   << ",\"final_norm_seconds\":" << phase.final_norm_seconds
+                   << ",\"output_head_seconds\":" << phase.output_head_seconds
+                   << ",\"sampling_seconds\":" << phase.sampling_seconds
+                   << ",\"kv_upload_seconds\":" << phase.kv_upload_seconds << '}';
+        };
         std::cout << ",\"metrics\":{\"prompt_tokens\":"
                   << generated.metrics.prompt_tokens
                   << ",\"prefill_tokens\":"
@@ -198,6 +229,9 @@ int main(int argc, char** argv) {
                   << generated.metrics.steady_decode_seconds
                   << ",\"steady_decode_tokens\":"
                   << generated.metrics.steady_decode_tokens
+                  << ",\"prefill_phases\":";
+        print_prefill_phases(std::cout, generated.metrics.prefill_phases);
+        std::cout
                   << ",\"prefill_cuda\":";
         print_cuda_phase(std::cout, generated.metrics.prefill_cuda);
         std::cout << ",\"decode_cuda\":";

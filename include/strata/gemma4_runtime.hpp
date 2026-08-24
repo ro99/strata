@@ -55,6 +55,33 @@ struct Gemma4CudaPhaseMetrics {
     double synchronization_seconds{};
 };
 
+// Opt-in wall attribution for the host-orchestrated prefill path. These terms
+// are non-overlapping except that CUDA service inside a projection/attention
+// phase is also reported by Gemma4CudaPhaseMetrics as a parallel-resource
+// load. Production runs leave the profiler disabled and pay no clock reads.
+struct Gemma4PrefillPhaseMetrics {
+    double embedding_seconds{};
+    double input_norm_seconds{};
+    double qkv_projection_seconds{};
+    double qkv_transform_seconds{};
+    double kv_prepare_seconds{};
+    double attention_seconds{};
+    double attention_output_projection_seconds{};
+    double kv_commit_seconds{};
+    double post_attention_norm_seconds{};
+    double attention_residual_seconds{};
+    double pre_feedforward_norm_seconds{};
+    double mlp_gate_up_projection_seconds{};
+    double mlp_activation_seconds{};
+    double mlp_down_projection_seconds{};
+    double post_feedforward_norm_seconds{};
+    double mlp_residual_seconds{};
+    double final_norm_seconds{};
+    double output_head_seconds{};
+    double sampling_seconds{};
+    double kv_upload_seconds{};
+};
+
 struct Gemma4RunMetrics {
     std::uint64_t prompt_tokens{};
     std::uint64_t prefill_tokens{};
@@ -68,6 +95,7 @@ struct Gemma4RunMetrics {
     std::uint64_t rss_bytes{};
     std::vector<std::uint64_t> device_vram_used_bytes;
     bool incremental_kv_continuation{};
+    Gemma4PrefillPhaseMetrics prefill_phases;
     Gemma4CudaPhaseMetrics prefill_cuda;
     Gemma4CudaPhaseMetrics decode_cuda;
     Gemma4CudaPhaseMetrics first_decode_cuda;

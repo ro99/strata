@@ -217,6 +217,10 @@ target_link_libraries(strata-deepseek-run PRIVATE strata_core)
 add_executable(strata-gemma4-run apps/strata_gemma4_run.cpp)
 target_link_libraries(strata-gemma4-run PRIVATE strata_core)
 
+add_executable(strata-gemma4-host-ops-probe
+    apps/strata_gemma4_host_ops_probe.cpp)
+target_link_libraries(strata-gemma4-host-ops-probe PRIVATE strata_core)
+
 add_executable(strata-chat apps/strata_chat.cpp)
 target_link_libraries(strata-chat PRIVATE strata_core)
 

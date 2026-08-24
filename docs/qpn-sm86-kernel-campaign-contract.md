@@ -552,7 +552,26 @@ MIX milestones depend on acceptance of both tracks. A failed hypothesis is
 
 ## Current position
 
-Last updated: 2026-08-23
+Last updated: 2026-08-24
+
+- **Experiment 0180 rejects the decode-oriented register-fed kernel as a
+  Gemma M=128 page kernel.** The mandatory 128-token profile confirms eight
+  full projected-weight passes (about 147.0 GB instead of 18.377 GB), 2.420 s
+  of CUDA/host synchronization, and 20.14 tok/s. Five isolated ownership and
+  broadcast arms on both 61.4 MB Gemma MLP shapes reach only 36.9--111.4 GB/s
+  medians against the predeclared 600 GB/s gate. Nsight attributes the
+  eight-warp arm to 89.8% L2 throughput, 95.2% L2 hits, and 68.4% ALU while
+  DRAM is only 11.1% busy: sharing HBM misses merely moves the duplicate reads
+  and FP4 decode on chip. No runtime route was integrated. The separate
+  prefill defect remains open.
+
+- **Experiment 0181 corrects the external Gemma prefill reference.** Direct
+  vLLM 2.3.8 measurement of the exact checkpoint at the locked production
+  point gives 881.67 tok/s for the comparable TP=1 short page and about
+  912 tok/s at 2070 tokens, not 3000 tok/s. The 600 GB/s gate in 0180 remains
+  its predeclared historical gate but is invalid for successor admission.
+  Strata is still about 44x slower in page time. The next gate must be derived
+  from the measured reference and a projection-level profile.
 
 - **Experiment 0167 stops Inkling register-fed work at the mandatory cost
   gate.** The distinct 130.638 GiB, 30-shard
@@ -602,8 +621,11 @@ Last updated: 2026-08-23
   prepack.
 - **Open defect found by the plausibility guard:** Gemma prefill costs 1.245x
   scalar and 1.464x register-fed decode per token, where page reuse predicts
-  below 0.25x. Generic prefill rereads/chunks weights instead of batching them.
-  This is not a decode falsification and has no throughput claim in 0165.
+  below 0.25x. Experiment 0180 confirms generic M=128 prefill rereads every
+  projected weight eight times, but rejects a widened-row version of the
+  decode-oriented register-fed kernel. The next mechanism must be a true
+  page-shaped tiled GEMM, not another skinny-kernel ownership setting. This is
+  not a decode falsification and has no throughput claim in 0165.
 
 - **Current milestones:** C2, F4-1 and F4-3 are complete. F4-2 is cleared at
   eight or more routed experts per launch and awaits the real dispatch-width
@@ -867,12 +889,15 @@ hypothesis; its prefill batching defect is also separate. Preserve the older
 NVFP4 path as an equal correctness gate.
 
 **The Gemma 4 MXFP4 decode integration and MIX-2 proof are complete in
-experiment 0165.** Do not repeat the decode A/B. The next Gemma work, if the
-owner chooses it, is a separate prefill-batching hypothesis: first profile the
-generic multi-row matmul's weight-read volume, then design a page kernel only
-if that measurement confirms the recorded 1.245x/1.464x implausibility. Keep
-W8A16 as an equal correctness and dispatch gate. DeepSeek V4 register-fed work
-remains stopped by experiment 0164's host-MoE bottleneck result.
+experiment 0165.** Do not repeat the decode A/B. Experiment 0180 confirms the
+generic M=128 matmul reads the projected weight set eight times and rejects the
+decode-oriented register-fed page-kernel family at 36.9--111.4 GB/s against a
+600 GB/s gate. Do not integrate it or select a favorable ownership setting per
+shape. The exact next Gemma action is an isolated page-shaped tiled MXFP4 GEMM
+probe at M=128, informed by the production engine's load-time tiled repack and
+multi-stage global-to-shared pipeline. Keep W8A16 as an equal correctness and
+dispatch gate. DeepSeek V4 register-fed work remains stopped by experiment
+0164's host-MoE bottleneck result.
 
 **Two tracks are running concurrently on this branch. Read both.**
 
@@ -1004,3 +1029,5 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-23T14:33:35-03:00 | Codex / experiment 0165 | `fix/gemma4-single-shard-regfed@<this result commit>` | MIX-1 / MIX-2 on Gemma 4 MXFP4 | Closed issue #35's lone-shard load path with one shared index-synthesis helper, mapped Gemma MXFP4 by exact shapes while preserving W8A16, extended both audited text-weight consumers to fragment order, and explicitly prepacked only MXFP4 at load. Added route-vs-route tests at real Gemma gate/up and down shapes, a register-fed fused-decode census test, a format-specific scalar layer-hash oracle, route census output and cost/A-B scripts. See experiment 0165 | **Correctness passes every gate:** scalar output `Paris.`; scalar and register-fed full-model output identical (`[50429,236761]`, first divergence none); 1,080-layer-hash equivalence passes; all six speed arms produce the same 32 greedy tokens; final `make check` green. W8 descriptor/resident decode tests pass and W8 weights are never prepacked | **Gemma decode is the positive regime:** scalar profile attributes 184.984 of 186.708 ms/token (99.1%) to GPU kernel/HBM service. At the production capped point (one RTX 3090, 250 W, 1605 MHz), three interleaved reps measure register-fed 55.498/55.467/55.286 against scalar 186.757/186.767/186.655 ms/token: medians 55.467 vs 186.757, **3.367x**, maximum spread 0.212 ms. Candidate census is 13,530 register-fed/zero scalar in every arm; control is zero/13,120. DeepSeek's negative 0164 result stands. Prefill's 1.245x/1.464x decode per-token cost fails the expected <0.25 plausibility bound and is recorded as a separate batching defect | Do not repeat Gemma decode optimization: MIX-2 is closed positive for this workload. If pursued, make Gemma prefill batching a separate measured hypothesis and keep W8A16 as an equal dispatch/correctness gate. Do not revive DeepSeek register-fed work without first changing its host-MoE `argmax_r` |
 | 2026-08-23T16:24:36-03:00 | Codex / experiment 0166 | `feat/laguna-register-fed@<this result commit>` | MIX-1 cost gate on Laguna MXFP4 | Added exact support for the distinct 46-shard `olka-fi/Laguna-S-2.1-MXFP4` checkpoint while preserving the older Laguna NVFP4 format: pinned source/extent, exact shape-based E2M1/E8M0 group-32 mapping, canonical fused-MoE dispatch and route census. Ran the shortest real scalar oracle/profile before any fragment prepack. See experiment 0166 | **Scalar correctness passes; register-fed substitution NOT ADMITTED.** Real output is coherent (`Okay, the user is asking for the capital of France...`), target-shape MXFP4 fused versus generic scalar and separate NVFP4 preservation tests pass, all 46 headers validate 36,096 MXFP4 modules, and final `make check` is green | Decode is 236.98 ms/token with routed-expert service `argmax_r` at 150.02 ms, including 65.05 ms miss staging, while all matmul kernels are only 14.70 ms. No prepack, route A/B, or first-divergence claim was built because GPU kernel time is not the bottleneck. Prefill/decode per-token ratio 0.926 is a separate batching defect | Stop Laguna register-fed work at this operating point. A successor must first reduce or overlap routed-expert acquisition/staging under a separate measured hypothesis; preserve NVFP4 as an equal correctness gate |
 | 2026-08-23T18:06:37-03:00 | Codex / experiment 0167 | `feat/inkling-mxfp4@<this result commit>` | MIX-1 cost gate on Inkling MXFP4 | Added exact support for the distinct 30-shard `mlx-community/Inkling-Small-mxfp4` checkpoint while preserving the older Inkling NVFP4 format: pinned source/extent, U32 safetensors support, exact shape-based E2M1/E8M0 group-32 mapping for every matrix, canonical generic/fused-MoE dispatch, and real-model census. Ran the shortest real scalar oracle/profile before any fragment prepack. See experiment 0167 | **Scalar correctness passes; register-fed substitution NOT ADMITTED.** Real output is `Paris.`; the target-shape Inkling MXFP4 fused route matches generic scalar matmuls on identical uploads, exact checkpoint validation passes, the real census records both canonical FP4 routes and zero register-fed dispatches, and final `make check` is green | One decode forward spends 495.7 ms (90.7%) in routed experts, including 466 ms staging 1.18 GiB at 2.54 GiB/s, while all recorded CUDA kernels total 30 ms. No prepack, route A/B, or first-divergence claim was built because serial staging/H2D is `argmax_r`. Token-at-a-time prefill/decode ratio 1.74 is a separate batching defect | Stop Inkling register-fed work at this operating point. A successor must first reduce or overlap routed-expert staging under a separate measured hypothesis; preserve NVFP4 as an equal correctness gate |
+| 2026-08-24T17:57:43-03:00 | Codex / experiment 0180 | `fix/gemma4-device-page-prefill@<this result commit>` | Gemma M=128 page-kernel falsifier | Confirmed eight projected-weight passes at M=128, then measured cache broadcast, compact shared broadcast, and 1/2/4/8-warp ownership on both real Gemma MLP shapes in three interleaved processes; profiled the fastest eligible family before choosing another mechanism. See experiment 0180 | **REJECTED:** all arms 36.9--111.4 GB/s against the predeclared 600; sampled canonical oracle <=5.564e-6; no runtime integration. Nsight: L2 89.8%, hit 95.2%, ALU 68.4%, DRAM 11.1% | The prefill defect remains open; the decode-oriented register-fed dataflow cannot become the page kernel. Experiment 0181 subsequently invalidated the external 3000 tok/s premise behind the numeric gate | Build only an isolated M=128 page-shaped tiled MXFP4 GEMM probe with a load-time tiled repack and multi-stage global-to-shared pipeline; derive its integration gate from the measured reference |
+| 2026-08-24T20:45:00-03:00 | Codex / experiment 0181 | `fix/gemma4-device-page-prefill@<this result commit>` | External Gemma prefill reference | Benchmarked vLLM 2.3.8 on the exact 19,531,513,296-byte checkpoint at 1605 MHz/250 W, prefix caching off, one sequence and one output token; three interleaved server-metric repetitions per shape. See experiment 0181 | TP=1 medians 881.67 tok/s at about 127 tokens and 912.17 at 2070; TP=2 medians 987.78 and 1101.69. TP=2 uses PHB/PYNCCL, not NVLink | 3000 tok/s is not reproduced. The comparable TP=1 page is nevertheless about 44.8x faster than Strata's 6.355 s page | Re-price the tiled-page probe from the measured vLLM reference and projection profile; do not inherit 0180's 600 GB/s gate |

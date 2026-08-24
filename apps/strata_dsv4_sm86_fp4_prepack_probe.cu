@@ -63,6 +63,8 @@ constexpr std::uint32_t kUnroll = 1U;
 // kernel.
 constexpr std::uint32_t kMaxColBlocks = 2U;
 constexpr std::uint32_t kWarpsPerBlock = 4U;
+constexpr std::uint32_t kPageWarps = 8U;
+constexpr std::uint32_t kPageM = kPageWarps * kMaxColBlocks * kTileM;
 std::uint32_t g_split_k = 8U;
 constexpr std::uint32_t kWarmups = 3U;
 constexpr std::uint32_t kSamples = 11U;
@@ -264,10 +266,18 @@ bool g_split_reduce = false;
 // the operating point the kernel will actually run at.
 std::uint32_t g_batch = 1U;
 std::uint32_t g_m = 1U;
+bool g_gemma_page = false;
+bool g_page_shared = false;
+std::uint32_t g_page_warps = kPageWarps;
 
 constexpr Shape kShapes[] = {
     {"gate_up_w1", 2048U, 4096U},
     {"down_w2", 4096U, 2048U},
+};
+
+constexpr Shape kGemmaPageShapes[] = {
+    {"gemma_gate_up", 21504U, 5376U},
+    {"gemma_down", 5376U, 21504U},
 };
 
 void check(cudaError_t status, std::string_view op) {
@@ -579,6 +589,197 @@ __global__ void prepacked_matmul_kernel(
     }
 }
 
+__device__ __forceinline__ void mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3, std::uint32_t a0,
+    std::uint32_t a1, std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
+    std::uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Gemma prefill page falsifier. One CTA owns one 16-row weight tile and its
+// eight warps own disjoint 16-token bands. Every warp must decode the compact
+// weight into its own MMA A registers, but the weight bytes themselves should
+// reach HBM only once. The two arms decide whether Ampere's cache/miss merging
+// is sufficient or whether the compact 544-byte code+scale tile must be
+// broadcast explicitly through shared memory. No widened weight tile exists.
+template <bool kSharedBroadcast>
+__global__ __launch_bounds__(kPageWarps * kWarp) void page_matmul_kernel(
+    const std::uint32_t* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const uint2* __restrict__ activations, std::uint32_t k_extent,
+    float* __restrict__ output, std::uint32_t n_tiles) {
+    constexpr std::uint32_t kPageColBlocks = kPageM / kTileM;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    const std::uint32_t k_tiles = k_extent / kTileK;
+    const std::uint32_t k_blocks = k_tiles / kKPerLoad;
+    const std::uint32_t scale_columns = k_extent / kGroup;
+    __shared__ uint4 shared_codes[kWarp];
+    __shared__ uint4 shared_scales[2];
+
+    for (std::uint32_t n_tile = blockIdx.x; n_tile < n_tiles;
+         n_tile += gridDim.x) {
+        float acc[kMaxColBlocks][4]{};
+        const uint4* code4 = reinterpret_cast<const uint4*>(codes);
+        for (std::uint32_t block = 0U; block < k_blocks; ++block) {
+            const unsigned char* scale_base =
+                scales + (static_cast<std::size_t>(n_tile) * scale_columns +
+                          block * 2U) * kTileN;
+            uint4 packed{};
+            uint4 even{};
+            uint4 odd{};
+            if constexpr (kSharedBroadcast) {
+                if (warp == 0U) {
+                    shared_codes[lane] =
+                        code4[(static_cast<std::size_t>(n_tile) * k_blocks +
+                               block) * kWarp + lane];
+                    if (lane < 2U) {
+                        shared_scales[lane] = *reinterpret_cast<const uint4*>(
+                            scale_base + lane * kTileN);
+                    }
+                }
+                __syncthreads();
+                packed = shared_codes[lane];
+                even = shared_scales[0];
+                odd = shared_scales[1];
+            } else {
+                packed = code4[(static_cast<std::size_t>(n_tile) * k_blocks +
+                                block) * kWarp + lane];
+                even = *reinterpret_cast<const uint4*>(scale_base);
+                odd = *reinterpret_cast<const uint4*>(scale_base + kTileN);
+            }
+            const std::uint32_t words[kKPerLoad] = {
+                packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kKPerLoad; ++j) {
+                const uint4 selected = j < 2U ? even : odd;
+                const std::uint32_t low = group < 4U ? selected.x : selected.y;
+                const std::uint32_t high = group < 4U ? selected.z : selected.w;
+                std::uint32_t a[4];
+                decode_fragment<false>(
+                    words[j], scale_pair_bf16((low >> shift) & 0xFFU),
+                    scale_pair_bf16((high >> shift) & 0xFFU), a);
+                const std::uint32_t k_tile = block * kKPerLoad + j;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kMaxColBlocks; ++c) {
+                    const std::uint32_t column_block =
+                        warp * kMaxColBlocks + c;
+                    const std::size_t activation_index =
+                        ((static_cast<std::size_t>(k_tile) * kPageColBlocks +
+                          column_block) * kTileM + group) * 4U + thread;
+                    const uint2 b = activations[activation_index];
+                    mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                 a[0], a[1], a[2], a[3], b.x, b.y);
+                }
+            }
+            if constexpr (kSharedBroadcast) __syncthreads();
+        }
+
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kMaxColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row =
+                    n_tile * kTileN + group + (i >= 2U ? 8U : 0U);
+                const std::uint32_t column =
+                    (warp * kMaxColBlocks + c) * kTileM +
+                    thread * 2U + (i & 1U);
+                output[static_cast<std::size_t>(row) * kPageM + column] =
+                    acc[c][i];
+            }
+        }
+    }
+}
+
+// Ownership sweep prompted by the profile of page_matmul_kernel<false>:
+// DRAM was only 11% busy while duplicate cache hits saturated L2 at 89.8% and
+// duplicate FP4 decode drove ALU to 68.4%. Fewer warps per tile give each warp
+// more activation columns, keeping the MMA count fixed while reducing both
+// measured terms in direct proportion. Four warps per CTA pack independent
+// N-tiles when one tile needs fewer than four warps.
+template <std::uint32_t kWarpsPerTile>
+__global__ __launch_bounds__(4U * kWarp) void page_owned_matmul_kernel(
+    const std::uint32_t* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const uint2* __restrict__ activations, std::uint32_t k_extent,
+    float* __restrict__ output, std::uint32_t n_tiles) {
+    static_assert(kWarpsPerTile == 1U || kWarpsPerTile == 2U ||
+                  kWarpsPerTile == 4U);
+    constexpr std::uint32_t kPageColBlocks = kPageM / kTileM;
+    constexpr std::uint32_t kLocalColBlocks =
+        kPageColBlocks / kWarpsPerTile;
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp_in_block = threadIdx.x >> 5U;
+    const std::uint32_t global_warp = blockIdx.x * 4U + warp_in_block;
+    const std::uint32_t n_tile = global_warp / kWarpsPerTile;
+    if (n_tile >= n_tiles) return;
+    const std::uint32_t tile_warp = global_warp % kWarpsPerTile;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    const std::uint32_t k_tiles = k_extent / kTileK;
+    const std::uint32_t k_blocks = k_tiles / kKPerLoad;
+    const std::uint32_t scale_columns = k_extent / kGroup;
+    float acc[kLocalColBlocks][4]{};
+    const uint4* code4 = reinterpret_cast<const uint4*>(codes);
+
+    for (std::uint32_t block = 0U; block < k_blocks; ++block) {
+        const uint4 packed =
+            code4[(static_cast<std::size_t>(n_tile) * k_blocks + block) *
+                      kWarp + lane];
+        const unsigned char* scale_base =
+            scales + (static_cast<std::size_t>(n_tile) * scale_columns +
+                      block * 2U) * kTileN;
+        const uint4 even = *reinterpret_cast<const uint4*>(scale_base);
+        const uint4 odd =
+            *reinterpret_cast<const uint4*>(scale_base + kTileN);
+        const std::uint32_t words[kKPerLoad] = {
+            packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+        for (std::uint32_t j = 0U; j < kKPerLoad; ++j) {
+            const uint4 selected = j < 2U ? even : odd;
+            const std::uint32_t low = group < 4U ? selected.x : selected.y;
+            const std::uint32_t high = group < 4U ? selected.z : selected.w;
+            std::uint32_t a[4];
+            decode_fragment<false>(
+                words[j], scale_pair_bf16((low >> shift) & 0xFFU),
+                scale_pair_bf16((high >> shift) & 0xFFU), a);
+            const std::uint32_t k_tile = block * kKPerLoad + j;
+#pragma unroll
+            for (std::uint32_t c = 0U; c < kLocalColBlocks; ++c) {
+                const std::uint32_t column_block =
+                    tile_warp * kLocalColBlocks + c;
+                const std::size_t activation_index =
+                    ((static_cast<std::size_t>(k_tile) * kPageColBlocks +
+                      column_block) * kTileM + group) * 4U + thread;
+                const uint2 b = activations[activation_index];
+                mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                             a[0], a[1], a[2], a[3], b.x, b.y);
+            }
+        }
+    }
+
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kLocalColBlocks; ++c) {
+#pragma unroll
+        for (std::uint32_t i = 0U; i < 4U; ++i) {
+            const std::uint32_t row =
+                n_tile * kTileN + group + (i >= 2U ? 8U : 0U);
+            const std::uint32_t column =
+                (tile_warp * kLocalColBlocks + c) * kTileM +
+                thread * 2U + (i & 1U);
+            output[static_cast<std::size_t>(row) * kPageM + column] = acc[c][i];
+        }
+    }
+}
+
 __global__ void reduce_kernel(const float* __restrict__ partials,
                               std::uint32_t n_tiles, std::uint32_t split_k,
                               std::uint32_t m, float* __restrict__ out) {
@@ -803,12 +1004,52 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     const std::uint32_t k_tiles_per_slice = k_tiles / g_split_k;
 
     const auto launch_reduce = [&] {
+        if (g_gemma_page) return;
         reduce_kernel<<<(n * g_batch * g_m + 255U) / 256U, 256U, 0U, stream>>>(
             static_cast<const float*>(d_partials.get()), n_tiles * g_batch,
             g_split_k, g_m, static_cast<float*>(d_out.get()));
     };
     const auto launch_matmul = [&] {
-        if (g_no_mma)
+        if (g_gemma_page) {
+            if (g_page_shared) {
+                page_matmul_kernel<true><<<
+                    std::min<std::uint32_t>(n_tiles, 65535U),
+                    kPageWarps * kWarp, 0U, stream>>>(
+                    static_cast<const std::uint32_t*>(d_codes.get()),
+                    static_cast<const unsigned char*>(d_scales.get()),
+                    static_cast<const uint2*>(d_act.get()), k,
+                    static_cast<float*>(d_out.get()), n_tiles);
+            } else if (g_page_warps == 1U) {
+                page_owned_matmul_kernel<1U><<<
+                    (n_tiles + 3U) / 4U, 4U * kWarp, 0U, stream>>>(
+                    static_cast<const std::uint32_t*>(d_codes.get()),
+                    static_cast<const unsigned char*>(d_scales.get()),
+                    static_cast<const uint2*>(d_act.get()), k,
+                    static_cast<float*>(d_out.get()), n_tiles);
+            } else if (g_page_warps == 2U) {
+                page_owned_matmul_kernel<2U><<<
+                    (n_tiles * 2U + 3U) / 4U, 4U * kWarp, 0U, stream>>>(
+                    static_cast<const std::uint32_t*>(d_codes.get()),
+                    static_cast<const unsigned char*>(d_scales.get()),
+                    static_cast<const uint2*>(d_act.get()), k,
+                    static_cast<float*>(d_out.get()), n_tiles);
+            } else if (g_page_warps == 4U) {
+                page_owned_matmul_kernel<4U><<<
+                    n_tiles, 4U * kWarp, 0U, stream>>>(
+                    static_cast<const std::uint32_t*>(d_codes.get()),
+                    static_cast<const unsigned char*>(d_scales.get()),
+                    static_cast<const uint2*>(d_act.get()), k,
+                    static_cast<float*>(d_out.get()), n_tiles);
+            } else {
+                page_matmul_kernel<false><<<
+                    std::min<std::uint32_t>(n_tiles, 65535U),
+                    kPageWarps * kWarp, 0U, stream>>>(
+                    static_cast<const std::uint32_t*>(d_codes.get()),
+                    static_cast<const unsigned char*>(d_scales.get()),
+                    static_cast<const uint2*>(d_act.get()), k,
+                    static_cast<float*>(d_out.get()), n_tiles);
+            }
+        } else if (g_no_mma)
             prepacked_matmul_kernel<false, false, 1U>
                 <<<blocks, kWarpsPerBlock * kWarp, 0U, stream>>>(
                     static_cast<const std::uint32_t*>(d_codes.get()),
@@ -869,8 +1110,12 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     check(cudaStreamSynchronize(stream), "finish download");
 
     // ---- oracle: double precision, from the CANONICAL layout ----
-    for (std::uint32_t row = 0U; row < n; ++row) {
-        for (std::uint32_t mcol = 0U; mcol < g_m; ++mcol) {
+    const std::uint32_t oracle_row_step =
+        g_gemma_page ? std::max<std::uint32_t>(n / 32U, 1U) : 1U;
+    const std::uint32_t oracle_column_step = g_gemma_page ? 16U : 1U;
+    for (std::uint32_t row = 0U; row < n; row += oracle_row_step) {
+        for (std::uint32_t mcol = 0U; mcol < g_m;
+             mcol += oracle_column_step) {
             double sum = 0.0;
             for (std::uint32_t col = 0U; col < k; ++col) {
                 const double w =
@@ -1025,10 +1270,23 @@ int main(int argc, char** argv) {
             else if (f == "--inject-scale-nan") g_inject_bad_scale = 1;
             else if (f == "--inject-scale-zero") g_inject_bad_scale = -1;
             else if (f == "--split-reduce") g_split_reduce = true;
+            else if (f == "--gemma-page") g_gemma_page = true;
+            else if (f == "--page-shared") {
+                g_gemma_page = true;
+                g_page_shared = true;
+            }
+            else if (f == "--page-warps" && i + 1 < argc) {
+                g_gemma_page = true;
+                g_page_warps =
+                    static_cast<std::uint32_t>(std::stoul(argv[++i]));
+                if (g_page_warps != 1U && g_page_warps != 2U &&
+                    g_page_warps != 4U && g_page_warps != 8U)
+                    throw std::runtime_error("page warps must be 1, 2, 4, or 8");
+            }
             else if (f == "--m" && i + 1 < argc) {
                 g_m = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-                if (g_m == 0U || g_m > kMaxColBlocks * kTileM)
-                    throw std::runtime_error("M must be 1..16");
+                if (g_m == 0U || g_m > kPageM)
+                    throw std::runtime_error("M must be 1..128");
             }
             else if (f == "--batch" && i + 1 < argc)
                 g_batch = static_cast<std::uint32_t>(std::stoul(argv[++i]));
@@ -1037,6 +1295,16 @@ int main(int argc, char** argv) {
             else { std::cerr << "usage: " << argv[0]
                              << " [--device INDEX] [--output PATH]\n";
                    return EXIT_FAILURE; }
+        }
+        if (g_gemma_page) {
+            if (g_m != 1U && g_m != kPageM)
+                throw std::runtime_error("Gemma page arm requires M=128");
+            g_m = kPageM;
+            g_split_k = 1U;
+            g_batch = 1U;
+            g_split_reduce = false;
+        } else if (g_m > kMaxColBlocks * kTileM) {
+            throw std::runtime_error("skinny arm requires M=1..16");
         }
         check(cudaSetDevice(device), "select device");
         cudaDeviceProp p{};
@@ -1047,7 +1315,12 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         check(cudaStreamCreate(&stream), "create stream");
         std::vector<Result> results;
-        for (const Shape& s : kShapes) results.push_back(run_shape(s, stream));
+        if (g_gemma_page) {
+            for (const Shape& s : kGemmaPageShapes)
+                results.push_back(run_shape(s, stream));
+        } else {
+            for (const Shape& s : kShapes) results.push_back(run_shape(s, stream));
+        }
         check(cudaStreamDestroy(stream), "destroy stream");
 
         std::ostringstream json;
@@ -1055,9 +1328,19 @@ int main(int argc, char** argv) {
              << "  \"device_name\": \"" << p.name << "\",\n"
              << "  \"device_capability\": \"" << p.major << "." << p.minor
              << "\",\n"
-             << "  \"milestone\": \"F4-1 step 2 fragment prepack\",\n"
-             << "  \"operating_point\": \"experimentation: single RTX 3090, "
-                "350 W, unlocked clocks\",\n"
+             << "  \"milestone\": \""
+             << (g_gemma_page ? "Gemma MXFP4 M128 page-kernel falsifier"
+                              : "F4-1 step 2 fragment prepack")
+             << "\",\n"
+             << "  \"operating_point\": \""
+             << (g_gemma_page
+                     ? "production: single RTX 3090, 250 W, 1605 MHz locked"
+                     : "experimentation: single RTX 3090, 350 W, unlocked clocks")
+             << "\",\n"
+             << "  \"page_shared_broadcast\": "
+             << (g_page_shared ? "true" : "false") << ",\n"
+             << "  \"page_warps_per_weight_tile\": " << g_page_warps
+             << ",\n"
              << "  \"split_k\": " << g_split_k << ",\n"
              << "  \"shapes\": [\n";
         for (std::size_t i = 0U; i < results.size(); ++i) {

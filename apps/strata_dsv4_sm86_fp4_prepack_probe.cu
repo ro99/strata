@@ -38,6 +38,8 @@
 #include <string_view>
 #include <vector>
 
+#include "vendor/marlin/marlin_template.h"
+
 namespace {
 
 constexpr std::uint32_t kGroup = 32U;      // E8M0 scale group along K
@@ -270,6 +272,7 @@ std::uint32_t g_m = 1U;
 bool g_gemma_page = false;
 bool g_page_shared = false;
 bool g_page_wmma = false;
+bool g_page_marlin = false;
 std::uint32_t g_page_warps = kPageWarps;
 
 constexpr Shape kShapes[] = {
@@ -1027,6 +1030,75 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
             canon_codes[byte * 2U] | (canon_codes[byte * 2U + 1U] << 4U));
     }
 
+    // Exact no-permutation GPTQ-Marlin repack for 4-bit K16/N64 tiles. This is
+    // the load-time pure permutation used by the standalone Marlin control.
+    std::vector<std::uint32_t> marlin_codes(
+        static_cast<std::size_t>(n) * k / 8U);
+    constexpr std::uint32_t marlin_n_tile = 64U;
+    constexpr std::uint32_t marlin_k_tile = 16U;
+    constexpr std::uint32_t tensor_offsets[4] = {0U, 1U, 8U, 9U};
+    constexpr std::uint32_t pack_order[8] = {0U, 2U, 4U, 6U,
+                                              1U, 3U, 5U, 7U};
+    const std::uint32_t marlin_n_tiles = n / marlin_n_tile;
+    for (std::uint32_t kt = 0U; kt < k / marlin_k_tile; ++kt) {
+        for (std::uint32_t nt = 0U; nt < marlin_n_tiles; ++nt) {
+            const std::size_t tile_offset =
+                (static_cast<std::size_t>(kt) * marlin_n_tiles + nt) *
+                (marlin_k_tile * marlin_n_tile / 8U);
+            for (std::uint32_t warp = 0U; warp < 4U; ++warp) {
+                for (std::uint32_t lane = 0U; lane < 32U; ++lane) {
+                    const std::uint32_t tensor_column = lane / 4U;
+                    const std::uint32_t tensor_row = (lane % 4U) * 2U;
+                    const std::uint32_t first_n =
+                        nt * marlin_n_tile + warp * 16U + tensor_column;
+                    std::uint32_t values[8];
+                    for (std::uint32_t i = 0U; i < 4U; ++i) {
+                        const std::uint32_t column =
+                            kt * marlin_k_tile + tensor_row + tensor_offsets[i];
+                        values[i] = canon_codes[
+                            static_cast<std::size_t>(first_n) * k + column];
+                        values[4U + i] = canon_codes[
+                            static_cast<std::size_t>(first_n + 8U) * k + column];
+                    }
+                    std::uint32_t packed = 0U;
+                    for (std::uint32_t i = 0U; i < 8U; ++i)
+                        packed |= values[pack_order[i]] << (i * 4U);
+                    marlin_codes[tile_offset + lane * 4U + warp] = packed;
+                }
+            }
+        }
+    }
+
+    // Scale layout: canonical [N][K/32] -> [K/32][N], Marlin's 64-value
+    // tensor permutation, then the MXFP4 [0,2,1,3] E8M0 lane permutation.
+    std::vector<std::uint8_t> transposed_scales(r.scale_bytes);
+    const std::uint32_t scale_groups = k / kGroup;
+    for (std::uint32_t group = 0U; group < scale_groups; ++group)
+        for (std::uint32_t row = 0U; row < n; ++row)
+            transposed_scales[static_cast<std::size_t>(group) * n + row] =
+                canon_scales[static_cast<std::size_t>(row) * scale_groups +
+                             group];
+    std::vector<std::uint8_t> marlin_scales(r.scale_bytes);
+    std::array<std::uint32_t, 64U> scale_permutation{};
+    std::size_t scale_position = 0U;
+    for (std::uint32_t i = 0U; i < 8U; ++i)
+        for (std::uint32_t j = 0U; j < 8U; ++j)
+            scale_permutation[scale_position++] = i + 8U * j;
+    for (std::size_t base = 0U; base < transposed_scales.size(); base += 64U)
+        for (std::uint32_t i = 0U; i < 64U; ++i)
+            marlin_scales[base + i] =
+                transposed_scales[base + scale_permutation[i]];
+    for (std::size_t base = 0U; base < marlin_scales.size(); base += 4U)
+        std::swap(marlin_scales[base + 1U], marlin_scales[base + 2U]);
+
+    std::vector<std::uint16_t> marlin_activation(
+        static_cast<std::size_t>(g_m) * k);
+    for (std::uint32_t row = 0U; row < g_m; ++row)
+        for (std::uint32_t column = 0U; column < k; ++column)
+            marlin_activation[static_cast<std::size_t>(row) * k + column] =
+                bf16_bits(activation[static_cast<std::size_t>(column) * g_m +
+                                     row]);
+
     // ---- prepack: pure permutation into fragment order ----
     const std::uint32_t n_tiles = n / kTileN;
     const std::uint32_t k_tiles = k / kTileK;
@@ -1117,6 +1189,27 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     DeviceBuffer d_canonical_codes(canonical_packed_codes.size());
     DeviceBuffer d_canonical_scales(canon_scales.size());
     DeviceBuffer d_canonical_act(activation.size() * sizeof(float));
+    DeviceBuffer d_marlin_codes(marlin_codes.size() * sizeof(std::uint32_t));
+    DeviceBuffer d_marlin_scales(marlin_scales.size());
+    DeviceBuffer d_marlin_act(marlin_activation.size() * sizeof(std::uint16_t));
+    DeviceBuffer d_marlin_out(static_cast<std::size_t>(n) * g_m *
+                              sizeof(std::uint16_t));
+    int selected_device = 0;
+    int multiprocessors = 0;
+    int maximum_shared = 0;
+    check(cudaGetDevice(&selected_device), "query selected Marlin device");
+    check(cudaDeviceGetAttribute(&multiprocessors,
+                                 cudaDevAttrMultiProcessorCount,
+                                 selected_device),
+          "query Marlin multiprocessors");
+    check(cudaDeviceGetAttribute(&maximum_shared,
+                                 cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                 selected_device),
+          "query Marlin shared-memory ceiling");
+    DeviceBuffer d_marlin_tmp(static_cast<std::size_t>(multiprocessors) * 64U *
+                              256U * sizeof(float));
+    DeviceBuffer d_marlin_locks(static_cast<std::size_t>(multiprocessors) *
+                                sizeof(std::int32_t));
     DeviceBuffer d_partials(static_cast<std::size_t>(n_tiles) * g_batch *
                             g_split_k * kTileN * g_m * sizeof(float));
     DeviceBuffer d_out(static_cast<std::size_t>(n) * g_batch * g_m *
@@ -1129,7 +1222,10 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     r.device_bytes = d_codes.bytes() + d_scales.bytes() + d_act.bytes() +
                      d_partials.bytes() + d_out.bytes() +
                      d_canonical_codes.bytes() + d_canonical_scales.bytes() +
-                     d_canonical_act.bytes();
+                     d_canonical_act.bytes() + d_marlin_codes.bytes() +
+                     d_marlin_scales.bytes() + d_marlin_act.bytes() +
+                     d_marlin_out.bytes() + d_marlin_tmp.bytes() +
+                     d_marlin_locks.bytes();
 
     for (std::uint32_t b = 0U; b < g_batch; ++b) {
         check(cudaMemcpyAsync(
@@ -1155,7 +1251,25 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     check(cudaMemcpyAsync(d_canonical_act.get(), activation.data(),
                           d_canonical_act.bytes(), cudaMemcpyHostToDevice,
                           stream), "upload canonical activations");
+    check(cudaMemcpyAsync(d_marlin_codes.get(), marlin_codes.data(),
+                          d_marlin_codes.bytes(), cudaMemcpyHostToDevice,
+                          stream), "upload Marlin codes");
+    check(cudaMemcpyAsync(d_marlin_scales.get(), marlin_scales.data(),
+                          d_marlin_scales.bytes(), cudaMemcpyHostToDevice,
+                          stream), "upload Marlin scales");
+    check(cudaMemcpyAsync(d_marlin_act.get(), marlin_activation.data(),
+                          d_marlin_act.bytes(), cudaMemcpyHostToDevice,
+                          stream), "upload Marlin activations");
+    check(cudaMemsetAsync(d_marlin_locks.get(), 0, d_marlin_locks.bytes(),
+                          stream), "clear Marlin locks");
     check(cudaStreamSynchronize(stream), "finish uploads");
+
+    check(cudaFuncSetAttribute(
+              marlin::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                             vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                             256, 4, 16, 4, false, 4, 2, false>,
+              cudaFuncAttributeMaxDynamicSharedMemorySize, maximum_shared),
+          "set standalone Marlin shared memory");
 
     const std::uint32_t k_blocks_total = k_tiles / kKPerLoad;
     if (k_blocks_total % (g_split_k * kUnroll) != 0U) {
@@ -1177,7 +1291,25 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     };
     const auto launch_matmul = [&] {
         if (g_gemma_page) {
-            if (g_page_wmma) {
+            if (g_page_marlin) {
+                marlin::Marlin<
+                    vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                    vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                    256, 4, 16, 4, false, 4, 2, false>
+                    <<<multiprocessors, 256U, maximum_shared, stream>>>(
+                        static_cast<const int4*>(d_marlin_act.get()),
+                        static_cast<const int4*>(d_marlin_codes.get()),
+                        static_cast<int4*>(d_marlin_out.get()),
+                        static_cast<int4*>(d_marlin_tmp.get()), nullptr,
+                        nullptr,
+                        static_cast<const int4*>(d_marlin_scales.get()),
+                        nullptr, nullptr, nullptr,
+                        static_cast<int>(k / kGroup), static_cast<int>(g_m),
+                        static_cast<int>(n), static_cast<int>(k),
+                        static_cast<int>(k),
+                        static_cast<int*>(d_marlin_locks.get()), false, false,
+                        true, maximum_shared);
+            } else if (g_page_wmma) {
                 const dim3 grid((n + kWmmaBlockN - 1U) / kWmmaBlockN,
                                 (g_m + kWmmaBlockM - 1U) / kWmmaBlockM, 1U);
                 page_wmma_matmul_kernel<<<grid, 8U * kWarp, 0U, stream>>>(
@@ -1278,9 +1410,21 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     check(cudaStreamSynchronize(stream), "finish correctness launch");
 
     std::vector<float> out(static_cast<std::size_t>(n) * g_m);
-    check(cudaMemcpyAsync(out.data(), d_out.get(),
-                          out.size() * sizeof(float),
-                          cudaMemcpyDeviceToHost, stream), "download output");
+    if (g_page_marlin) {
+        std::vector<std::uint16_t> encoded(out.size());
+        check(cudaMemcpyAsync(encoded.data(), d_marlin_out.get(),
+                              encoded.size() * sizeof(std::uint16_t),
+                              cudaMemcpyDeviceToHost, stream),
+              "download Marlin output");
+        check(cudaStreamSynchronize(stream), "finish Marlin download");
+        for (std::size_t i = 0U; i < encoded.size(); ++i)
+            out[i] = bf16_to_float(encoded[i]);
+    } else {
+        check(cudaMemcpyAsync(out.data(), d_out.get(),
+                              out.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream),
+              "download output");
+    }
     check(cudaStreamSynchronize(stream), "finish download");
 
     // ---- oracle: double precision, from the CANONICAL layout ----
@@ -1301,7 +1445,7 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                                activation[static_cast<std::size_t>(col) * g_m +
                                           mcol]);
             }
-            const float got = g_page_wmma
+            const float got = (g_page_wmma || g_page_marlin)
                 ? out[static_cast<std::size_t>(mcol) * n + row]
                 : out[static_cast<std::size_t>(row) * g_m + mcol];
             r.oracle_max_abs = std::max(r.oracle_max_abs, std::abs(sum));
@@ -1455,6 +1599,10 @@ int main(int argc, char** argv) {
                 g_gemma_page = true;
                 g_page_wmma = true;
             }
+            else if (f == "--page-marlin") {
+                g_gemma_page = true;
+                g_page_marlin = true;
+            }
             else if (f == "--page-warps" && i + 1 < argc) {
                 g_gemma_page = true;
                 g_page_warps =
@@ -1509,7 +1657,9 @@ int main(int argc, char** argv) {
              << "  \"device_capability\": \"" << p.major << "." << p.minor
              << "\",\n"
              << "  \"milestone\": \""
-             << (g_page_wmma
+             << (g_page_marlin
+                     ? "Gemma MXFP4 M128 standalone Marlin control"
+                     : g_page_wmma
                      ? "Gemma MXFP4 M128 conventional WMMA control"
                      : g_gemma_page
                          ? "Gemma MXFP4 M128 page-kernel falsifier"
@@ -1524,6 +1674,8 @@ int main(int argc, char** argv) {
              << (g_page_shared ? "true" : "false") << ",\n"
              << "  \"page_wmma\": " << (g_page_wmma ? "true" : "false")
              << ",\n"
+             << "  \"page_marlin\": "
+             << (g_page_marlin ? "true" : "false") << ",\n"
              << "  \"page_warps_per_weight_tile\": " << g_page_warps
              << ",\n"
              << "  \"split_k\": " << g_split_k << ",\n"

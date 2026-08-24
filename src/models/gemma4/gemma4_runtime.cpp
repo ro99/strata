@@ -56,6 +56,11 @@ std::unique_ptr<HostWorkerPool> make_gemma4_prefill_workers() {
     return std::make_unique<HostWorkerPool>(workers);
 }
 
+bool gemma4_device_page_enabled() {
+    const auto* enabled = std::getenv("STRATA_GEMMA4_DEVICE_PAGE");
+    return enabled == nullptr || std::string_view(enabled) != "0";
+}
+
 std::string layer_prefix(std::uint32_t layer) {
     return "model.language_model.layers." + std::to_string(layer) + ".";
 }
@@ -169,15 +174,15 @@ struct VisionWeights {
 struct LayerKv {
     std::vector<std::uint16_t> keys;
     std::vector<std::uint16_t> values;
-    std::vector<std::uint16_t> next_keys;
-    std::vector<std::uint16_t> next_values;
     CudaBuffer device;
     std::uint32_t capacity_rows{};
     std::uint32_t start{};
+    std::uint32_t cached_rows{};
 };
 
 struct KvMark {
     std::uint32_t start{};
+    std::uint32_t cached_rows{};
     std::size_t key_size{};
     std::size_t value_size{};
     std::vector<std::uint16_t> first_key;
@@ -209,6 +214,8 @@ struct Gemma4Runtime::Impl {
     bool initialized{};
     bool reusable_sequence{};
     bool device_kv_ready{};
+    bool host_kv_ready{true};
+    bool device_first_page_allowed{};
     DiagnosticTrace diagnostics;
     Gemma4PrefillPhaseMetrics prefill_phases;
     std::unique_ptr<HostWorkerPool> prefill_workers;
@@ -384,9 +391,6 @@ struct Gemma4Runtime::Impl {
                 result = cuda.allocate_buffer(
                     devices[weights.device],
                     cache_elements * sizeof(std::uint16_t), cache.device);
-                cache.next_keys.resize(
-                    static_cast<std::size_t>(kv_heads) * head_dim);
-                cache.next_values.resize(cache.next_keys.size());
             }
             if ((config.verbose || config.load_progress) && result.ok()) {
                 std::cerr << "[load] Gemma 4 layer " << layer + 1U << '/'
@@ -823,8 +827,16 @@ struct Gemma4Runtime::Impl {
             phase_started = std::chrono::steady_clock::now();
         }
 
-        const auto old_rows = cache.keys.size() / kv_columns;
-        if (cache.values.size() != cache.keys.size() ||
+        if (!host_kv_ready) {
+            result.errors.emplace_back(
+                "Gemma 4 host attention cannot read a device-only KV cache");
+            return result;
+        }
+        const auto old_rows = cache.cached_rows;
+        const auto old_elements =
+            static_cast<std::size_t>(old_rows) * kv_columns;
+        if (cache.keys.size() != old_elements ||
+            cache.values.size() != old_elements ||
             cache.start + old_rows != position_base) {
             result.errors.emplace_back("Gemma 4 KV cache is not contiguous");
             return result;
@@ -916,6 +928,9 @@ struct Gemma4Runtime::Impl {
                                cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
             cache.start += static_cast<std::uint32_t>(drop_rows);
         }
+        cache.cached_rows = static_cast<std::uint32_t>(
+            std::min<std::size_t>(old_rows + rows, cache.capacity_rows));
+        device_kv_ready = false;
         if (profile) {
             prefill_phases.kv_commit_seconds += elapsed_seconds(phase_started);
         }
@@ -979,12 +994,25 @@ struct Gemma4Runtime::Impl {
 
     ValidationResult sync_device_kv() {
         ValidationResult result;
+        if (device_kv_ready) return result;
+        if (!host_kv_ready) {
+            result.errors.emplace_back(
+                "Gemma 4 cannot upload a stale host KV cache");
+            return result;
+        }
         for (std::uint32_t layer = 0U; layer < c.layer_count; ++layer) {
             auto& cache = kv[layer];
             const bool global = gemma4_global_attention_layer(layer);
             const auto columns =
                 (global ? c.global_key_value_heads * c.global_head_dim
                         : c.local_key_value_heads * c.local_head_dim);
+            if (cache.keys.size() !=
+                    static_cast<std::size_t>(cache.cached_rows) * columns ||
+                cache.values.size() != cache.keys.size()) {
+                result.errors.emplace_back(
+                    "Gemma 4 host KV cache extent is inconsistent");
+                return result;
+            }
             result = cuda.upload_gemma4_kv(
                 cache.device, cache.keys, cache.values, cache.start,
                 cache.capacity_rows, columns);
@@ -1022,12 +1050,11 @@ struct Gemma4Runtime::Impl {
                     &weights.query_norm_device,
                     &weights.key_norm_device,
                     &cache.device,
-                    cache.next_keys,
-                    cache.next_values,
+                    {},
+                    {},
                     cache.capacity_rows,
                     cache.start,
-                    static_cast<std::uint32_t>(
-                        cache.keys.size() / cache.next_keys.size()),
+                    cache.cached_rows,
                     weights.scalar,
                 });
             }
@@ -1036,25 +1063,12 @@ struct Gemma4Runtime::Impl {
             if (!result.ok()) return result;
             for (auto layer = begin; layer < end; ++layer) {
                 auto& cache = kv[layer];
-                cache.keys.insert(cache.keys.end(), cache.next_keys.begin(),
-                                  cache.next_keys.end());
-                cache.values.insert(cache.values.end(), cache.next_values.begin(),
-                                    cache.next_values.end());
-                const auto rows = cache.keys.size() / cache.next_keys.size();
-                if (rows > cache.capacity_rows) {
-                    const auto drop_rows = rows - cache.capacity_rows;
-                    const auto drop = drop_rows * cache.next_keys.size();
-                    cache.keys.erase(
-                        cache.keys.begin(),
-                        cache.keys.begin() + static_cast<std::ptrdiff_t>(drop));
-                    cache.values.erase(
-                        cache.values.begin(),
-                        cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
-                    cache.start += static_cast<std::uint32_t>(drop_rows);
-                }
+                if (cache.cached_rows == cache.capacity_rows) ++cache.start;
+                else ++cache.cached_rows;
             }
             begin = end;
         }
+        host_kv_ready = false;
         return result;
     }
 
@@ -1065,6 +1079,64 @@ struct Gemma4Runtime::Impl {
                                     std::span<const std::uint32_t> tokens) {
         if (rows == 1U && device_kv_ready && multimodal_groups.empty()) {
             return forward_decode_layers(hidden, position_base);
+        }
+        if (rows > 1U && device_kv_ready && multimodal_groups.empty() &&
+            !config.enable_layer_hash_trace) {
+            ValidationResult result;
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = forward_decode_layers(
+                    hidden.subspan(
+                        static_cast<std::size_t>(row) * c.hidden_size,
+                        c.hidden_size),
+                    position_base + row);
+                if (!result.ok()) return result;
+            }
+            return result;
+        }
+        const bool one_device = std::all_of(
+            layers.begin(), layers.end(), [this](const TextLayer& layer) {
+                return layer.device == layers.front().device;
+            });
+        if (rows > 1U && device_first_page_allowed && position_base == 0U &&
+            multimodal_groups.empty() && !config.enable_layer_hash_trace &&
+            one_device && !layers.empty() &&
+            CudaBackend::marlin_prepacked(layers.front().query.weight)) {
+            std::vector<CudaGemma4DecodeLayer> request;
+            request.reserve(layers.size());
+            for (std::uint32_t layer = 0U; layer < layers.size(); ++layer) {
+                auto& weights = layers[layer];
+                auto& cache = kv[layer];
+                request.push_back({
+                    &weights.query.weight,
+                    &weights.key.weight,
+                    weights.value.has_value() ? &weights.value->weight : nullptr,
+                    &weights.output.weight,
+                    &weights.gate.weight,
+                    &weights.up.weight,
+                    &weights.down.weight,
+                    &weights.input_norm_device,
+                    &weights.post_attention_norm_device,
+                    &weights.pre_feedforward_norm_device,
+                    &weights.post_feedforward_norm_device,
+                    &weights.query_norm_device,
+                    &weights.key_norm_device,
+                    &cache.device,
+                    {},
+                    {},
+                    cache.capacity_rows,
+                    cache.start,
+                    0U,
+                    weights.scalar,
+                });
+            }
+            auto page = cuda.gemma4_prefill_layers(
+                devices[layers.front().device], request, hidden, rows,
+                position_base, hidden);
+            if (!page.ok()) return page;
+            for (auto& cache : kv) cache.cached_rows = rows;
+            device_kv_ready = true;
+            host_kv_ready = false;
+            return page;
         }
         ValidationResult result;
         std::vector<float> normalized(hidden.size());
@@ -1233,6 +1305,9 @@ struct Gemma4Runtime::Impl {
                                        std::span<const std::int32_t> multimodal_groups = {}) {
         ParseResult<std::uint32_t> result;
         std::vector<float> logits;
+        device_first_page_allowed = gemma4_device_page_enabled() &&
+            token_ids.size() <= kPrefillChunk &&
+            position_base == 0U && multimodal_groups.empty();
         std::size_t offset = 0U;
         while (offset < token_ids.size()) {
             auto count = std::min<std::size_t>(
@@ -1270,6 +1345,7 @@ struct Gemma4Runtime::Impl {
             }
             offset += count;
         }
+        device_first_page_allowed = false;
         const auto cached_tokens = position_base + token_ids.size();
         FutureEntropyEvaluator lookahead;
         if (active_sampling.future_entropy_candidates != 0U) {
@@ -1305,6 +1381,7 @@ struct Gemma4Runtime::Impl {
             const auto& cache = kv[layer];
             auto& mark = marks[layer];
             mark.start = cache.start;
+            mark.cached_rows = cache.cached_rows;
             mark.key_size = cache.keys.size();
             mark.value_size = cache.values.size();
             if (!gemma4_global_attention_layer(layer) &&
@@ -1334,6 +1411,7 @@ struct Gemma4Runtime::Impl {
             cache.keys.resize(mark.key_size);
             cache.values.resize(mark.value_size);
             cache.start = mark.start;
+            cache.cached_rows = mark.cached_rows;
         }
     }
 
@@ -1362,11 +1440,14 @@ struct Gemma4Runtime::Impl {
     void reset_sequence() {
         reusable_sequence = false;
         device_kv_ready = false;
+        host_kv_ready = true;
+        device_first_page_allowed = false;
         cached_token_ids.clear();
         for (auto& cache : kv) {
             cache.keys.clear();
             cache.values.clear();
             cache.start = 0U;
+            cache.cached_rows = 0U;
         }
     }
 };
@@ -1553,6 +1634,23 @@ ValidationResult Gemma4Runtime::initialize(
     if (!result.ok()) return result;
     result = impl_->load_vision_weights();
     if (!result.ok()) return result;
+    const bool one_text_device = !impl_->layers.empty() && std::all_of(
+        impl_->layers.begin(), impl_->layers.end(), [impl = impl_.get()](
+            const TextLayer& layer) {
+            return layer.device == impl->layers.front().device;
+        });
+    if (one_text_device && CudaBackend::marlin_prepacked(
+            impl_->layers.front().query.weight)) {
+        const auto maximum_query_columns = c.attention_heads *
+            std::max(c.local_head_dim, c.global_head_dim);
+        const auto maximum_kv_columns = std::max(
+            c.local_key_value_heads * c.local_head_dim,
+            c.global_key_value_heads * c.global_head_dim);
+        result = impl_->cuda.reserve_gemma4_workspace(
+            impl_->devices[impl_->layers.front().device], c.hidden_size,
+            maximum_query_columns, maximum_kv_columns, c.intermediate_size);
+        if (!result.ok()) return result;
+    }
     impl_->initialized = true;
     return result;
 }
@@ -1692,18 +1790,25 @@ Gemma4GenerationResult Gemma4Runtime::generate_chat_stream(
             return result;
         }
     }
-    const auto reused = impl_->config.enable_incremental_kv_continuation &&
+    auto reused = impl_->config.enable_incremental_kv_continuation &&
         impl_->reusable_sequence
         ? incremental_kv_prefix_tokens(impl_->cached_token_ids,
                                        result.prompt_token_ids)
         : 0U;
+    // Image embeddings require the host attention path. A device-only cache
+    // has no lossy placeholder mirror to reuse, so rebuild it exactly.
+    if (reused != 0U && !impl_->host_kv_ready && !multimodal_groups.empty()) {
+        reused = 0U;
+    }
     impl_->reusable_sequence = false;
     if (reused == 0U) impl_->reset_sequence();
     const auto prefill_cuda_before = impl_->cuda.stats();
     const auto prefill_started = std::chrono::steady_clock::now();
     const auto prefill = std::span<const std::uint32_t>(
         result.prompt_token_ids).subspan(reused);
-    impl_->device_kv_ready = false;
+    if (reused != 0U && impl_->host_kv_ready) {
+        impl_->device_kv_ready = false;
+    }
     auto next = impl_->forward(
         prefill, static_cast<std::uint32_t>(reused),
         replacements.empty() ? std::span<const float>{}

@@ -399,7 +399,7 @@ ValidationResult load_gemma4_cuda_linear(
     if (result.ok() &&
         described.value.encoding == CudaWeightEncoding::Fp4E2m1Group32 &&
         register_fed_matmul_enabled()) {
-        result = backend.prepack_fragment(device, output);
+        result = backend.prepack_marlin(device, output);
     }
     return result;
 }

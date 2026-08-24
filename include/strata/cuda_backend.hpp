@@ -809,6 +809,9 @@ struct CudaGemma4DecodeLayer {
     const CudaBuffer* query_norm{};
     const CudaBuffer* key_norm{};
     const CudaBuffer* kv_cache{};
+    // Both spans may be empty when the persistent device ring is authoritative.
+    // If either is present, both must contain exactly one KV row and the
+    // backend downloads the newly committed row for a host mirror.
     std::span<std::uint16_t> next_keys;
     std::span<std::uint16_t> next_values;
     std::uint32_t cache_capacity_rows{};
@@ -838,6 +841,7 @@ enum class CudaMatmulRoute : std::uint8_t {
     // so a run can show which of the two actually served a dispatch.
     Fp8RegisterFed,
     Fp4RegisterFed,
+    GemmaMarlin,
     // MoE expert batches dispatch through CudaBackend::enqueue_moe, which
     // experiment 0162 showed is the path production decode actually uses --
     // matmul_impl is load-only. These are counted separately so a census can
@@ -905,6 +909,12 @@ public:
     [[nodiscard]] ValidationResult prepack_fragment(
         int device, const CudaWeight& weight);
     [[nodiscard]] static bool fragment_prepacked(const CudaWeight& weight) noexcept;
+    // Gemma's page/decode layout: GPTQ-Marlin K16/N64 code order and the
+    // corresponding E8M0 scale permutation. Like fragment prepack this is an
+    // in-place, one-copy replacement of canonical order.
+    [[nodiscard]] ValidationResult prepack_marlin(
+        int device, const CudaWeight& weight);
+    [[nodiscard]] static bool marlin_prepacked(const CudaWeight& weight) noexcept;
 
     [[nodiscard]] CudaMatmulRouteCensus matmul_route_census() const noexcept;
     void reset_matmul_route_census() noexcept;
@@ -996,6 +1006,19 @@ public:
         int device, std::span<const CudaGemma4DecodeLayer> layers,
         std::span<const float> input, std::uint32_t position,
         std::span<float> output);
+    // Allocates the fixed first-page executor and Marlin scratch during model
+    // initialization so allocator setup is not charged to the first prompt.
+    [[nodiscard]] ValidationResult reserve_gemma4_workspace(
+        int device, std::uint32_t hidden_columns,
+        std::uint32_t maximum_query_columns,
+        std::uint32_t maximum_kv_columns,
+        std::uint32_t maximum_intermediate_columns);
+    // First-page text prefill. The complete layer chain stays device-resident;
+    // all MXFP4 weights must carry the single Marlin layout.
+    [[nodiscard]] ValidationResult gemma4_prefill_layers(
+        int device, std::span<const CudaGemma4DecodeLayer> layers,
+        std::span<const float> input, std::uint32_t rows,
+        std::uint32_t position_base, std::span<float> output);
     // `round_bf16_output` applies the caller's BF16 boundary on the device,
     // before the download, instead of in a host pass over the result.
     [[nodiscard]] ValidationResult matmul(

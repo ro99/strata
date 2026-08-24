@@ -1341,6 +1341,13 @@ TEST_CASE("native CUDA backend keeps a Gemma 4 decode layer resident") {
                         [](auto item) { return item == 0U; }));
     REQUIRE(std::all_of(next_values.begin(), next_values.end(),
                         [](auto item) { return item == 0U; }));
+
+    auto device_only_layers = layers;
+    device_only_layers.front().next_keys = {};
+    device_only_layers.front().next_values = {};
+    device_only_layers.front().cached_rows = 1U;
+    REQUIRE(backend.gemma4_decode_layers(
+        device, device_only_layers, input, 1U, output).ok());
 }
 
 TEST_CASE("persistent BF16 KV ring matches Laguna's target-shape F32 attention contract") {
@@ -3289,6 +3296,63 @@ TEST_CASE("Gemma 4 shaped MXFP4 register-fed matmul matches identical scalar upl
     compare(21'504U, 5'376U, 0x31U);
     compare(5'376U, 21'504U, 0x53U);
     strata::set_register_fed_matmul(true);
+}
+
+TEST_CASE("Gemma 4 Marlin layout matches scalar at decode and page widths") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    REQUIRE(backend.initialize(std::vector<int>{device}, true).ok());
+
+    constexpr std::array<float, 6> palette{
+        1.0F, -1.0F, 0.5F, 2.0F, -0.5F, -2.0F};
+    const auto compare = [&](std::uint64_t output_rows,
+                             std::uint64_t columns,
+                             std::uint32_t batch,
+                             std::uint8_t seed) {
+        std::vector<float> activation(
+            static_cast<std::size_t>(columns) * batch);
+        for (std::size_t index = 0U; index < activation.size(); ++index) {
+            activation[index] = palette[(index + seed) % palette.size()];
+        }
+        const auto control =
+            upload_fp4(backend, device, output_rows, columns, seed);
+        const auto candidate =
+            upload_fp4(backend, device, output_rows, columns, seed);
+        std::vector<float> expected(
+            static_cast<std::size_t>(output_rows) * batch);
+        std::vector<float> measured(expected.size());
+        REQUIRE(backend.matmul(
+            control, activation, batch, expected, true).ok());
+        REQUIRE(backend.prepack_marlin(device, candidate).ok());
+        REQUIRE(strata::CudaBackend::marlin_prepacked(candidate));
+        REQUIRE(!strata::CudaBackend::fragment_prepacked(candidate));
+        REQUIRE(backend.matmul(
+            candidate, activation, batch, measured, true).ok());
+
+        double worst = 0.0;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const double scale = std::max(
+                1.0, std::abs(static_cast<double>(expected[index])));
+            worst = std::max(
+                worst,
+                std::abs(static_cast<double>(measured[index]) -
+                         static_cast<double>(expected[index])) / scale);
+        }
+        if (!(worst < 1e-4)) {
+            std::fprintf(stderr,
+                         "Gemma Marlin mismatch: N %llu K %llu M %u "
+                         "worst relative residual %g\n",
+                         static_cast<unsigned long long>(output_rows),
+                         static_cast<unsigned long long>(columns), batch,
+                         worst);
+        }
+        REQUIRE(worst < 1e-4);
+    };
+
+    compare(21'504U, 5'376U, 1U, 0x31U);
+    compare(5'376U, 21'504U, 128U, 0x53U);
 }
 
 TEST_CASE("MIX-2 register-fed dispatch leaves inadmissible shapes on the scalar route") {

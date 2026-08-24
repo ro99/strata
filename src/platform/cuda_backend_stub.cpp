@@ -307,7 +307,8 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input(
 
 ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input_device_view(
     int, const CudaDeepSeekMoeExpert&, float,
-    CudaDsv4DeviceInputHostMoeCallback, void*, CudaDsv4HostMoeDeviceView&) {
+    CudaDsv4DeviceInputHostMoeCallback, void*, CudaDsv4HostMoeDeviceView&,
+    CudaDsv4DeviceInputHostMoeRouteCallback) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

@@ -6800,11 +6800,39 @@ ValidationResult DeepSeekV4Runtime::Impl::admit_rank_local() {
         const auto tier_reserved =
             config.static_expert_plan_path.empty()
                 ? 0U : config.static_expert_tier_bytes;
+        // The shared expert is acquired from this same cache once per layer on
+        // every forward pass -- experiment 0163 measured it as the only
+        // per-token CUDA dispatch decode makes -- so its whole set has to stay
+        // stageable no matter how many routed experts the cache has admitted.
+        // Routed entries must therefore not be allowed to claim it.
+        //
+        // Without this the cache's logical capacity equals the arena's free
+        // space exactly, which is only survivable while something else is the
+        // binding minimum. A routed-expert tier makes `arena_expert_bytes` the
+        // binding term, the slack goes to zero, and the next shared-expert
+        // re-stage fails: experiment 0178 measured `layers.19.ffn.
+        // shared_experts.w2` wanting 8.0 MiB against 20.0 MiB free of
+        // 20504.2 MiB, in three blocks whose largest was 6.8 MiB. That is
+        // exhaustion, not fragmentation, and it bricks the server -- every
+        // later request returns a sticky mHC ordering error.
+        constexpr auto shared_expert_reserve = []() constexpr {
+            const std::uint64_t gate_up =
+                2ULL * static_cast<std::uint64_t>(kExpertIntermediate) * kHidden;
+            const std::uint64_t down =
+                static_cast<std::uint64_t>(kHidden) * kExpertIntermediate;
+            // One E8M0 scale per 128-element block, as the checkpoint declares.
+            const std::uint64_t payload = gate_up + down;
+            return static_cast<std::uint64_t>(kLayers) *
+                   (payload + payload / 128ULL);
+        }();
+        const auto reserved_total =
+            sharded[rank] + cache_pinned + tier_reserved + shared_expert_reserve;
         const auto arena_after_tier =
-            capacities[rank] > sharded[rank] + cache_pinned + tier_reserved
-                ? capacities[rank] - sharded[rank] - cache_pinned - tier_reserved
+            capacities[rank] > reserved_total
+                ? capacities[rank] - reserved_total
                 : 0U;
-        const auto arena_expert_bytes = arena_after_tier;
+        const auto arena_expert_bytes =
+            static_cast<std::uint64_t>(arena_after_tier);
         const auto cache_expert_bytes =
             rank < cache.capacity_bytes.size() &&
                     cache.capacity_bytes[rank] > cache_pinned

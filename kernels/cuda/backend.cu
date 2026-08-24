@@ -16,10 +16,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -4092,14 +4094,25 @@ __global__ void deepseek_fp8_down_kernel(
 // The CPU callback emits one partial per reconstructed TP rank. Match the
 // retained host association exactly: round the rank sum first, round the
 // shared output independently, then round their final sum.
+// `tier_partials` is null unless the routed-expert tier ran overlapped, in
+// which case its contribution could not be accumulated into the rank partials
+// directly: the tier stream and the rank-partial upload would then be writing
+// the same buffer concurrently. It is summed into the first rank's term, which
+// is where the serial ordering accumulated it, before the same rounding.
+// Cross-slot order inside the tier's own sum is unfixed either way -- the
+// down kernel accumulates its slots by atomicAdd.
 __global__ void dsv4_host_moe_join_kernel(
     float* shared_and_output, const float* rank_partials,
-    std::uint64_t hidden_columns, unsigned int* error_flag) {
+    const float* tier_partials, std::uint64_t hidden_columns,
+    unsigned int* error_flag) {
     const auto column = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                         threadIdx.x;
     if (column >= hidden_columns) return;
+    const float first = tier_partials == nullptr
+        ? rank_partials[column]
+        : rank_partials[column] + tier_partials[column];
     const float routed = bf16_round(
-        rank_partials[column] + rank_partials[hidden_columns + column]);
+        first + rank_partials[hidden_columns + column]);
     const float shared = bf16_round(shared_and_output[column]);
     const float output = bf16_round(routed + shared);
     shared_and_output[column] = output;
@@ -4108,13 +4121,16 @@ __global__ void dsv4_host_moe_join_kernel(
 
 __global__ void dsv4_host_moe_join_mhc_kernel(
     float* shared_and_output, const float* rank_partials,
-    __nv_bfloat16* mhc_branch, std::uint64_t hidden_columns,
-    unsigned int* error_flag) {
+    const float* tier_partials, __nv_bfloat16* mhc_branch,
+    std::uint64_t hidden_columns, unsigned int* error_flag) {
     const auto column = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
                         threadIdx.x;
     if (column >= hidden_columns) return;
+    const float first = tier_partials == nullptr
+        ? rank_partials[column]
+        : rank_partials[column] + tier_partials[column];
     const float routed = bf16_round(
-        rank_partials[column] + rank_partials[hidden_columns + column]);
+        first + rank_partials[hidden_columns + column]);
     const float shared = bf16_round(shared_and_output[column]);
     const float output = bf16_round(routed + shared);
     shared_and_output[column] = output;
@@ -6416,9 +6432,35 @@ public:
     };
 
     WeightArena(int device, void* base, std::uint64_t capacity)
-        : device_(device), base_(static_cast<std::byte*>(base)) {
+        : device_(device), base_(static_cast<std::byte*>(base)),
+          capacity_(capacity) {
         free_.reserve(16'384U);
         free_.push_back({0U, capacity});
+    }
+
+    // Exhaustion and fragmentation both surface as a failed allocate() and
+    // need opposite fixes: one is a budget that is too small, the other is a
+    // budget that is big enough but cut into pieces none of which fit. The
+    // error path reports both so the next reader does not have to guess.
+    struct Occupancy {
+        std::uint64_t capacity{};
+        std::uint64_t free_bytes{};
+        std::uint64_t largest_free{};
+        std::size_t free_blocks{};
+    };
+
+    [[nodiscard]] Occupancy occupancy() {
+        std::scoped_lock lock(mutex_);
+        Occupancy report;
+        report.capacity = capacity_;
+        report.free_blocks = free_.size();
+        for (const auto& block : free_) {
+            report.free_bytes += block.bytes;
+            if (block.bytes > report.largest_free) {
+                report.largest_free = block.bytes;
+            }
+        }
+        return report;
     }
 
     ~WeightArena() {
@@ -6487,6 +6529,7 @@ private:
 
     int device_{-1};
     std::byte* base_{};
+    std::uint64_t capacity_{};
     std::vector<Block> free_;
     std::mutex mutex_;
     bool metadata_failed_{};
@@ -6495,6 +6538,11 @@ private:
 struct Dsv4HostMoeCallbackState {
     CudaDsv4HostMoeCallback function{};
     CudaDsv4DeviceInputHostMoeCallback device_input_function{};
+    // Optional first half. When present it runs as its own host node, an
+    // event is recorded behind it, and the tier stream is released by that
+    // event while this node's second half is still computing the host share.
+    CudaDsv4DeviceInputHostMoeRouteCallback route_function{};
+    bool route_failed{};
     void* context{};
     float* rank_partials{};
     std::uint64_t rank_partial_elements{};
@@ -6515,6 +6563,32 @@ constexpr std::uint64_t kDsv4DeferredAttentionPrepareUploadSlotBytes =
 constexpr std::uint64_t kDsv4DeferredAttentionUploadSlotBytes = 32ULL << 10U;
 constexpr std::uint64_t kDsv4DeferredAttentionDownloadSlotBytes = 16ULL << 10U;
 
+// Route half. Deliberately does no more than decide the route and publish the
+// tier selection: every microsecond spent here is a microsecond the tier
+// stream is still waiting, and the whole point of the split is that the tier
+// starts early.
+void CUDART_CB run_dsv4_host_moe_route_callback(void* opaque) {
+    auto& state = *static_cast<Dsv4HostMoeCallbackState*>(opaque);
+    bool accepted = false;
+    try {
+        state.upstream_failure_value = state.upstream_failure == nullptr
+            ? 0U : *state.upstream_failure;
+        if (state.upstream_failure_value == 0U &&
+            state.route_function != nullptr &&
+            state.encoded_hidden != nullptr && state.router_logits != nullptr) {
+            accepted = state.route_function(
+                state.context,
+                std::span<const std::uint16_t>(state.encoded_hidden,
+                                               state.hidden_elements),
+                std::span<const float>(state.router_logits,
+                                       state.router_elements));
+        }
+    } catch (...) {
+        accepted = false;
+    }
+    state.route_failed = !accepted;
+}
+
 void CUDART_CB run_dsv4_host_moe_callback(void* opaque) {
     auto& state = *static_cast<Dsv4HostMoeCallbackState*>(opaque);
     state.started = std::chrono::steady_clock::now();
@@ -6522,6 +6596,10 @@ void CUDART_CB run_dsv4_host_moe_callback(void* opaque) {
     try {
         state.upstream_failure_value = state.upstream_failure == nullptr
             ? 0U : *state.upstream_failure;
+        // A failed route half is not short-circuited here: the callback owns
+        // zeroing its own rank partials on failure, and skipping it would
+        // leave the join reading whatever the previous layer left behind. It
+        // sees the failure through its own state and fails the command.
         const bool upstream_accepted =
             state.upstream_failure_value == 0U;
         if (upstream_accepted && state.device_input_function != nullptr &&
@@ -6864,6 +6942,16 @@ struct CudaBackend::Impl {
         std::uint64_t tier_down_scale_columns{};
         float* tier_activations{};
         std::uint64_t tier_activation_bytes{};
+        // Overlapped dispatch. The tier runs on its own stream, released by
+        // `tier_route_ready` -- recorded between the route half and the host
+        // share -- and rejoined through `tier_finished` before the join. Its
+        // contribution lands in `tier_partials` rather than in the rank
+        // partials, because with the two concurrent the rank-partial upload
+        // would race the tier's accumulation into the same buffer.
+        cudaStream_t tier_stream{};
+        cudaEvent_t tier_route_ready{};
+        cudaEvent_t tier_finished{};
+        float* tier_partials{};
         std::uint64_t moe_hidden_bytes{};
         std::uint64_t moe_activation_bytes{};
         std::uint64_t moe_output_bytes{};
@@ -7588,8 +7676,20 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         WeightArena::Allocation allocation;
         if (target->bytes == 0U ||
             !state.weight_arena->allocate(target->bytes, allocation)) {
-            result.errors.emplace_back(
-                "CUDA weight arena is exhausted; refusing per-weight allocation fallback");
+            const auto report = state.weight_arena->occupancy();
+            const auto mib = [](std::uint64_t bytes) {
+                return static_cast<double>(bytes) / (1024.0 * 1024.0);
+            };
+            std::ostringstream detail;
+            detail.setf(std::ios::fixed);
+            detail.precision(1);
+            detail << "CUDA weight arena is exhausted; refusing per-weight "
+                      "allocation fallback (device " << device << ", wanted "
+                   << mib(target->bytes) << " MiB, free " << mib(report.free_bytes)
+                   << " MiB of " << mib(report.capacity) << " MiB in "
+                   << report.free_blocks << " blocks, largest "
+                   << mib(report.largest_free) << " MiB)";
+            result.errors.emplace_back(detail.str());
             return result;
         }
         target->arena = state.weight_arena;
@@ -16966,10 +17066,12 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input(
 ValidationResult CudaBackend::enqueue_dsv4_host_moe_from_device_input_device_view(
     int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
     CudaDsv4DeviceInputHostMoeCallback callback, void* callback_context,
-    CudaDsv4HostMoeDeviceView& view) {
+    CudaDsv4HostMoeDeviceView& view,
+    CudaDsv4DeviceInputHostMoeRouteCallback route_callback) {
     view = {};
-    auto result = enqueue_dsv4_host_moe_from_device_input(
-        device, shared, swiglu_limit, callback, callback_context);
+    auto result = enqueue_dsv4_host_moe_impl(
+        device, {}, shared, swiglu_limit, nullptr, callback_context,
+        callback, true, route_callback);
     if (!result.ok()) return result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end() ||
@@ -17001,7 +17103,8 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
     CudaDsv4HostMoeCallback callback, void* callback_context,
     CudaDsv4DeviceInputHostMoeCallback device_input_callback,
-    bool mhc_source_and_destination) {
+    bool mhc_source_and_destination,
+    CudaDsv4DeviceInputHostMoeRouteCallback route_callback) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -17233,6 +17336,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     host_callback_state = {};
     host_callback_state.function = callback;
     host_callback_state.device_input_function = device_input_callback;
+    host_callback_state.route_function = route_callback;
     host_callback_state.context = callback_context;
     host_callback_state.rank_partials =
         static_cast<float*>(state.moe_host_staging);
@@ -17517,6 +17621,30 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     }
     state.moe_shared_phase_timing_valid = true;
 
+    // Overlapped dispatch is used only when the caller supplied a route half
+    // and this device actually holds a tier. Everything else keeps the
+    // original ordering byte for byte, which is the rollback.
+    const bool tier_present =
+        state.tier_committed && state.tier_installed != 0U;
+    const bool overlapped = tier_present && route_callback != nullptr;
+    if (overlapped) {
+        if (auto status = cudaLaunchHostFunc(
+                state.stream, run_dsv4_host_moe_route_callback,
+                &host_callback_state);
+            status != cudaSuccess) {
+            abort_enqueue(status, "enqueue DeepSeek route callback");
+            return result;
+        }
+        // Recorded between the two halves. This is the whole mechanism: the
+        // tier stream is released here, while the host share below is still
+        // to run.
+        if (auto status = cudaEventRecord(
+                state.tier_route_ready, state.stream);
+            status != cudaSuccess) {
+            abort_enqueue(status, "record DeepSeek tier route event");
+            return result;
+        }
+    }
     if (auto status = cudaLaunchHostFunc(
             state.stream, run_dsv4_host_moe_callback,
             &host_callback_state);
@@ -17538,7 +17666,41 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     // memory, and after the rank-partial upload, so it accumulates into the
     // same buffer the join below already consumes. No host wait, no worker
     // thread, no change to the join itself.
-    if (state.tier_committed && state.tier_installed != 0U) {
+    if (tier_present) {
+        // Overlapped, everything below runs on the tier stream, gated by the
+        // route event and accumulating into its own partials. Serial, it is
+        // the original: the rank stream, behind the one callback, straight
+        // into the rank partials.
+        const auto tier_stream = overlapped ? state.tier_stream : state.stream;
+        auto* tier_destination = overlapped ? state.tier_partials : rank_partials;
+        if (overlapped) {
+            if (state.tier_partials == nullptr) {
+                void* partials = nullptr;
+                if (const auto status = cudaMalloc(
+                        &partials,
+                        static_cast<std::size_t>(hidden_columns) * sizeof(float));
+                    status != cudaSuccess) {
+                    abort_enqueue(status, "allocate DeepSeek tier partials");
+                    return result;
+                }
+                state.tier_partials = static_cast<float*>(partials);
+                tier_destination = state.tier_partials;
+            }
+            if (auto status = cudaStreamWaitEvent(
+                    tier_stream, state.tier_route_ready, 0U);
+                status != cudaSuccess) {
+                abort_enqueue(status, "gate DeepSeek tier stream");
+                return result;
+            }
+            if (auto status = cudaMemsetAsync(
+                    tier_destination, 0,
+                    static_cast<std::size_t>(hidden_columns) * sizeof(float),
+                    tier_stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "clear DeepSeek tier partials");
+                return result;
+            }
+        }
         const std::uint64_t tier_activation_bytes =
             kMaxDeepSeekRoutedExperts * intermediate_columns * sizeof(float);
         if (tier_activation_bytes > state.tier_activation_bytes) {
@@ -17560,7 +17722,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         if (auto status = cudaMemcpyAsync(
                 state.tier_selection_device, state.tier_selection_host,
                 sizeof(CudaDsv4TierSelection), cudaMemcpyHostToDevice,
-                state.stream);
+                tier_stream);
             status != cudaSuccess) {
             abort_enqueue(status, "upload DeepSeek tier selection");
             return result;
@@ -17581,7 +17743,7 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
             kMaxDeepSeekRoutedExperts, 1U);
         record_cuda_matmul_route(CudaMatmulRoute::Dsv4MoeTierFp4);
         deepseek_fp4_tier_gate_up_kernel<<<
-            tier_gate_grid, threads, 0U, state.stream>>>(
+            tier_gate_grid, threads, 0U, tier_stream>>>(
             state.tier_activations, state.moe_hidden, table, tier_selection,
             hidden_columns, intermediate_columns,
             state.tier_gate_packed_columns, state.tier_gate_scale_columns);
@@ -17593,14 +17755,30 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
         const dim3 tier_down_grid(static_cast<unsigned int>(hidden_columns),
                                   kMaxDeepSeekRoutedExperts, 1U);
         deepseek_fp4_tier_down_kernel<<<
-            tier_down_grid, threads, 0U, state.stream>>>(
-            rank_partials, state.tier_activations, table, tier_selection,
+            tier_down_grid, threads, 0U, tier_stream>>>(
+            tier_destination, state.tier_activations, table, tier_selection,
             intermediate_columns, hidden_columns,
             state.tier_down_packed_columns, state.tier_down_scale_columns);
         ++state.moe_kernel_launches;
         if (auto status = cudaGetLastError(); status != cudaSuccess) {
             abort_enqueue(status, "launch DeepSeek tier W2");
             return result;
+        }
+        if (overlapped) {
+            // Rejoin before the join reads the tier partials. This also keeps
+            // the next layer's route half from overwriting the one pinned
+            // selection slot while this layer's tier is still reading it.
+            if (auto status = cudaEventRecord(state.tier_finished, tier_stream);
+                status != cudaSuccess) {
+                abort_enqueue(status, "record DeepSeek tier completion");
+                return result;
+            }
+            if (auto status = cudaStreamWaitEvent(
+                    state.stream, state.tier_finished, 0U);
+                status != cudaSuccess) {
+                abort_enqueue(status, "rejoin DeepSeek tier stream");
+                return result;
+            }
         }
     }
     if (auto status = cudaStreamWaitEvent(
@@ -17612,17 +17790,18 @@ ValidationResult CudaBackend::enqueue_dsv4_host_moe_impl(
     constexpr unsigned int join_threads = 256U;
     const auto join_blocks = static_cast<unsigned int>(
         (hidden_columns + join_threads - 1U) / join_threads);
+    const float* join_tier_partials = overlapped ? state.tier_partials : nullptr;
     if (mhc_source_and_destination) {
         dsv4_host_moe_join_mhc_kernel<<<
             join_blocks, join_threads, 0U, state.stream>>>(
-            state.moe_output, rank_partials,
+            state.moe_output, rank_partials, join_tier_partials,
             state.dsv4_mhc_workspace->branch, hidden_columns,
             state.moe_error);
     } else {
         dsv4_host_moe_join_kernel<<<
             join_blocks, join_threads, 0U, state.stream>>>(
-            state.moe_output, rank_partials, hidden_columns,
-            state.moe_error);
+            state.moe_output, rank_partials, join_tier_partials,
+            hidden_columns, state.moe_error);
     }
     ++state.moe_kernel_launches;
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
@@ -19126,6 +19305,31 @@ ValidationResult CudaBackend::dsv4_tier_commit(int device) {
                 entries * sizeof(const unsigned char*), cudaMemcpyHostToDevice);
             status != cudaSuccess) {
             return cuda_error(status, "upload DeepSeek tier pointer table");
+        }
+    }
+    // Overlapped dispatch needs a stream of its own, two events, and a
+    // partial buffer the rank-partial upload does not also write. They are
+    // built once here rather than per layer; a command that does not pass a
+    // route half simply never touches them.
+    if (state.tier_stream == nullptr) {
+        if (const auto status = cudaStreamCreateWithFlags(
+                &state.tier_stream, cudaStreamNonBlocking);
+            status != cudaSuccess) {
+            return cuda_error(status, "create DeepSeek tier stream");
+        }
+    }
+    if (state.tier_route_ready == nullptr) {
+        if (const auto status = cudaEventCreateWithFlags(
+                &state.tier_route_ready, cudaEventDisableTiming);
+            status != cudaSuccess) {
+            return cuda_error(status, "create DeepSeek tier route event");
+        }
+    }
+    if (state.tier_finished == nullptr) {
+        if (const auto status = cudaEventCreateWithFlags(
+                &state.tier_finished, cudaEventDisableTiming);
+            status != cudaSuccess) {
+            return cuda_error(status, "create DeepSeek tier completion event");
         }
     }
     state.tier_committed = true;

@@ -729,6 +729,27 @@ using CudaDsv4DeviceInputHostMoeCallback = bool (*)(
     void* context, std::span<const std::uint16_t> encoded_hidden,
     std::span<const float> router_logits, std::span<float> rank_partials);
 
+// First half of that boundary, split out so the routed-expert tier can run
+// concurrently with the host share instead of behind it.
+//
+// The tier's kernels need the route, which only the host knows, so the first
+// implementation enqueued them behind the one callback -- and that callback
+// runs the host MoE inline, which made the two strictly serial. Measured on
+// this box, that ordering costs 1.13x to 2.72x of the achievable `max`
+// depending on how much the tier covers: the better the tier works, the more
+// the ordering costs. Splitting the route out lets an event recorded between
+// the two halves release the tier stream while the host share is still
+// running; `strata-dsv4-tier-overlap-probe` measures the join at 1.00x of max,
+// same-device and cross-device alike.
+//
+// This half must only decide the route and publish the tier selection into
+// pinned memory. It performs host arithmetic only, and the matching
+// CudaDsv4DeviceInputHostMoeCallback consumes the route it left behind rather
+// than recomputing it -- two routers would be two things to keep bit-identical.
+using CudaDsv4DeviceInputHostMoeRouteCallback = bool (*)(
+    void* context, std::span<const std::uint16_t> encoded_hidden,
+    std::span<const float> router_logits);
+
 // Stream-ordered exact output-head reduction. The callback consumes the final
 // four-copy BF16 mHC residual and writes the normalized 4096-wide FP32 input
 // for the resident vocabulary projection. It may perform host arithmetic only;
@@ -1217,11 +1238,16 @@ public:
         int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4DeviceInputHostMoeCallback callback,
         void* callback_context);
+    // `route_callback` is optional. When it is null the command keeps the
+    // original single-callback ordering with the tier enqueued behind it;
+    // when it is supplied the tier runs on its own stream, released by an
+    // event recorded between the two halves. Passing null is the rollback.
     [[nodiscard]] ValidationResult
     enqueue_dsv4_host_moe_from_device_input_device_view(
         int device, const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4DeviceInputHostMoeCallback callback,
-        void* callback_context, CudaDsv4HostMoeDeviceView& view);
+        void* callback_context, CudaDsv4HostMoeDeviceView& view,
+        CudaDsv4DeviceInputHostMoeRouteCallback route_callback = nullptr);
     // Device-resident routed-expert tier.
     //
     // reserve allocates the per-(layer, expert) pointer table on `device`;
@@ -1305,7 +1331,8 @@ private:
         const CudaDeepSeekMoeExpert& shared, float swiglu_limit,
         CudaDsv4HostMoeCallback callback, void* callback_context,
         CudaDsv4DeviceInputHostMoeCallback device_input_callback,
-        bool mhc_source_and_destination);
+        bool mhc_source_and_destination,
+        CudaDsv4DeviceInputHostMoeRouteCallback route_callback = nullptr);
     // Snapshot of how many matmuls took each route since process start.
     // Unsupported is always zero in a healthy run: reaching it is a hard error.
     [[nodiscard]] ValidationResult matmul_impl(

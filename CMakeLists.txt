@@ -278,6 +278,18 @@ target_link_libraries(strata-laguna-spine-tp-probe PRIVATE strata_core)
 
 if(STRATA_HAS_CUDA)
     find_library(NUMA_LIBRARY numa REQUIRED)
+    add_executable(strata-dsv4-tier-overlap-probe
+        apps/strata_dsv4_tier_overlap_probe.cu)
+    target_link_libraries(strata-dsv4-tier-overlap-probe PRIVATE strata_core)
+    set_property(TARGET strata-dsv4-tier-overlap-probe
+        PROPERTY CUDA_ARCHITECTURES 86 120)
+    set_property(TARGET strata-dsv4-tier-overlap-probe PROPERTY CUDA_STANDARD 20)
+    set_property(TARGET strata-dsv4-tier-overlap-probe
+        PROPERTY CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(strata-dsv4-tier-overlap-probe PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-Wall,-Wextra>
+    )
+
     add_executable(strata-topology-probe apps/strata_topology_probe.cu)
     target_link_libraries(strata-topology-probe PRIVATE strata_core ${NUMA_LIBRARY})
     set_property(TARGET strata-topology-probe PROPERTY CUDA_ARCHITECTURES 86 120)

@@ -1,5 +1,15 @@
 # Experiment 0170 — Laguna register-fed A/B: routes substituted, wall clock unmoved
 
+> **2026-08-23 correction:** the route census below is process-global and
+> includes the 47-row prefill. The 1,307 generic expert projections were
+> incorrectly attributed to decode. `LagunaRuntime::sparse_mlp` dispatches
+> every `rows == 1` decode layer through `run_batched_experts` and
+> `CudaBackend::enqueue_moe`; only the multi-row prefill uses the generic
+> per-expert path. The measured 4.20 ms kernel reduction remains valid, but the
+> proposed decode-batching follow-up and the claim that experiment 0166 was
+> contradicted are withdrawn. A phase-scoped census is required before making
+> any future route-volume claim.
+
 Status: **SUBSTITUTION CONFIRMED, NO MEASURABLE END-TO-END WIN.** The census
 proves both the generic matmul and the fused MoE batch served the run on the
 register-fed route with zero scalar dispatches. The matmul-kernel term fell

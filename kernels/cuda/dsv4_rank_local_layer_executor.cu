@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <limits>
@@ -465,6 +466,30 @@ struct ActiveCallGuard {
     return false;
 }
 
+// The overlapped split is off by default because it is measured worse than the
+// serial ordering it replaced, on both axes that matter.
+//
+// Experiment 0127, 10 GB tier, two RTX 3090s, median of 3-7 reps at the
+// production operating point:
+//
+//   no tier              118.7 ms/tok   8.424 tok/s   deterministic
+//   serial (pre-483d563) 106.1 ms/tok   9.425 tok/s   deterministic, 5/5
+//   overlapped split     115.2 ms/tok   8.680 tok/s   two outputs, one corrupt
+//
+// So the split gives back 9.1 ms of the serial ordering's 12.6 ms gain, and it
+// is not exact: seven greedy reps at temperature 0 produced exactly two
+// distinct completions, roughly 4:3, one of them opening on a garbage token.
+// A bimodal distribution is a race with two outcomes, not float reassociation,
+// which would smear rather than cluster. The tier itself is deterministic --
+// arm C above is 5/5 identical -- so the defect is in the split, not the tier.
+//
+// STRATA_DSV4_TIER_OVERLAP=1 re-enables it for anyone working the defect.
+// Until that is found and gated, the serial ordering is what ships.
+[[nodiscard]] bool tier_split_enabled() noexcept {
+    const char* setting = std::getenv("STRATA_DSV4_TIER_OVERLAP");
+    return setting != nullptr && setting[0] != '\0' && setting[0] != '0';
+}
+
 // Decides the route and publishes the tier selection, leaving both in the
 // rank's scratch for the host share to consume. Shared by the split and
 // unsplit entry points so that there is exactly one router: two would be two
@@ -845,7 +870,8 @@ ValidationResult Dsv4RankLocalLayerExecutor::initialize(
         return result;
     }
     impl_->options = options;
-    impl_->split_route_callback = any_tier_active(*impl_);
+    impl_->split_route_callback =
+        any_tier_active(*impl_) && tier_split_enabled();
     impl_->router_spec = deepseek_v4_flash_0731_spec().router;
     devices_ = options.devices;
     for (std::size_t rank = 0U; rank < kWorld; ++rank) {

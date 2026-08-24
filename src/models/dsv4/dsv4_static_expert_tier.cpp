@@ -2,6 +2,7 @@
 
 #include "strata/model_adapter.hpp"
 
+#include <cstdio>
 #include <string>
 #include <utility>
 
@@ -101,6 +102,16 @@ ValidationResult Dsv4StaticExpertTier::initialize(
 
     admitted_ = plan.size();
     bytes_ = plan.bytes(kTripletBytes);
+    // The tier build was previously silent, which left "how big is the tier
+    // that was actually built" unanswerable from a run: experiment 0127 could
+    // compute 802 pairs from the plan and the truncation math but could not
+    // observe them, so a partial build and a full one looked identical.
+    std::fprintf(stderr,
+                 "[deepseek-tier] device=%d rank=%zu/%zu pairs=%zu bytes=%llu "
+                 "(%.2f GiB)\n",
+                 device, slice_offset, slice_stride, admitted_,
+                 static_cast<unsigned long long>(bytes_),
+                 static_cast<double>(bytes_) / static_cast<double>(1ULL << 30U));
     plan_ = std::move(plan);
     active_ = true;
     return result;

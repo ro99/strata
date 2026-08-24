@@ -1680,8 +1680,13 @@ __global__ void Marlin(
       static_assert(b_type == vllm::kFE2M1f &&
                     s_type == vllm::kFE8M0fnu && group_blocks == 2,
                     "Strata FP32 epilogue is scoped to MXFP4 group-32");
-      fp32_reorder[2 * idx] = c0;
-      fp32_reorder[2 * idx + 1] = c1;
+      if constexpr (m_block_size_8) {
+        fp32_reorder[idx] = c0;
+        fp32_reorder[idx + 8 * c_sh_stride] = c1;
+      } else {
+        fp32_reorder[2 * idx] = c0;
+        fp32_reorder[2 * idx + 1] = c1;
+      }
 #else
       c_scalar_t2 res =
           Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));

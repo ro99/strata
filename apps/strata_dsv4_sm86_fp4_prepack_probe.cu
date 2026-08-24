@@ -274,6 +274,7 @@ bool g_gemma_page = false;
 bool g_page_shared = false;
 bool g_page_wmma = false;
 bool g_page_marlin = false;
+bool g_marlin_m1 = false;
 std::uint32_t g_page_warps = kPageWarps;
 
 constexpr Shape kShapes[] = {
@@ -1274,6 +1275,15 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                              256, 4, 16, 4, false, 4, 2, false>,
               cudaFuncAttributeMaxDynamicSharedMemorySize, maximum_shared),
           "set standalone Marlin shared memory");
+    if (g_marlin_m1) {
+        check(cudaFuncSetAttribute(
+                  marlin::Marlin<
+                      vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                      vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                      256, 1, 8, 8, true, 4, 2, false>,
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, maximum_shared),
+              "set standalone M1 Marlin shared memory");
+    }
 
     const std::uint32_t k_blocks_total = k_tiles / kKPerLoad;
     if (k_blocks_total % (g_split_k * kUnroll) != 0U) {
@@ -1294,8 +1304,27 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
             g_split_k, g_m, static_cast<float*>(d_out.get()));
     };
     const auto launch_matmul = [&] {
-        if (g_gemma_page) {
-            if (g_page_marlin) {
+        if (g_page_marlin) {
+            if (g_marlin_m1) {
+                marlin::Marlin<
+                    vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                    vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                    256, 1, 8, 8, true, 4, 2, false>
+                    <<<multiprocessors, 256U, maximum_shared, stream>>>(
+                        static_cast<const int4*>(d_marlin_act.get()),
+                        static_cast<const int4*>(d_marlin_codes.get()),
+                        static_cast<int4*>(d_marlin_out.get()),
+                        static_cast<int4*>(d_marlin_tmp.get()), nullptr,
+                        nullptr,
+                        static_cast<const int4*>(d_marlin_scales.get()),
+                        static_cast<const float*>(d_marlin_reorder.get()),
+                        nullptr, nullptr,
+                        static_cast<int>(k / kGroup), static_cast<int>(g_m),
+                        static_cast<int>(n), static_cast<int>(k),
+                        static_cast<int>(k),
+                        static_cast<int*>(d_marlin_locks.get()), false, false,
+                        true, maximum_shared);
+            } else {
                 marlin::Marlin<
                     vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                     vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
@@ -1314,7 +1343,9 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                         static_cast<int>(k),
                         static_cast<int*>(d_marlin_locks.get()), false, false,
                         true, maximum_shared);
-            } else if (g_page_wmma) {
+            }
+        } else if (g_gemma_page) {
+            if (g_page_wmma) {
                 const dim3 grid((n + kWmmaBlockN - 1U) / kWmmaBlockN,
                                 (g_m + kWmmaBlockM - 1U) / kWmmaBlockM, 1U);
                 page_wmma_matmul_kernel<<<grid, 8U * kWarp, 0U, stream>>>(
@@ -1431,7 +1462,8 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
 
     // ---- oracle: double precision, from the CANONICAL layout ----
     const std::uint32_t oracle_row_step =
-        g_gemma_page ? std::max<std::uint32_t>(n / 32U, 1U) : 1U;
+        (g_gemma_page || g_marlin_m1)
+            ? std::max<std::uint32_t>(n / 32U, 1U) : 1U;
     const std::uint32_t oracle_column_step = g_gemma_page ? 16U : 1U;
     for (std::uint32_t row = 0U; row < n; row += oracle_row_step) {
         for (std::uint32_t mcol = 0U; mcol < g_m;
@@ -1605,6 +1637,12 @@ int main(int argc, char** argv) {
                 g_gemma_page = true;
                 g_page_marlin = true;
             }
+            else if (f == "--marlin-m1") {
+                g_page_marlin = true;
+                g_marlin_m1 = true;
+                g_m = 1U;
+                g_split_k = 1U;
+            }
             else if (f == "--page-warps" && i + 1 < argc) {
                 g_gemma_page = true;
                 g_page_warps =
@@ -1645,7 +1683,7 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         check(cudaStreamCreate(&stream), "create stream");
         std::vector<Result> results;
-        if (g_gemma_page) {
+        if (g_gemma_page || g_marlin_m1) {
             for (const Shape& s : kGemmaPageShapes)
                 results.push_back(run_shape(s, stream));
         } else {
@@ -1660,7 +1698,9 @@ int main(int argc, char** argv) {
              << "\",\n"
              << "  \"milestone\": \""
              << (g_page_marlin
-                     ? "Gemma MXFP4 M128 standalone Marlin control"
+                     ? (g_marlin_m1
+                            ? "Gemma MXFP4 M1 standalone Marlin control"
+                            : "Gemma MXFP4 M128 standalone Marlin control")
                      : g_page_wmma
                      ? "Gemma MXFP4 M128 conventional WMMA control"
                      : g_gemma_page
@@ -1668,7 +1708,7 @@ int main(int argc, char** argv) {
                          : "F4-1 step 2 fragment prepack")
              << "\",\n"
              << "  \"operating_point\": \""
-             << (g_gemma_page
+             << (g_gemma_page || g_marlin_m1
                      ? "production: single RTX 3090, 250 W, 1605 MHz locked"
                      : "experimentation: single RTX 3090, 350 W, unlocked clocks")
              << "\",\n"

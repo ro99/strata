@@ -36,6 +36,10 @@ struct InklingRuntimeConfig {
     // scratch. False retains the measured control path for profiling. NVFP4
     // still needs scratch to de-interleave gate/up and is unaffected.
     bool direct_mapped_mxfp4_staging{true};
+    // Suballocate resident and cached weights from one bounded CUDA allocation
+    // per device. False retains the per-projection cudaMalloc/cudaFree control
+    // for the allocator-stall experiment.
+    bool use_weight_arena{true};
     // Keep the exact BF16 K/V ring on each layer's assigned device and run
     // Inkling's relative-bias attention there. False retains the scalar host
     // oracle for controlled comparisons.

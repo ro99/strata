@@ -21,6 +21,9 @@ fi
 if [[ -n ${DEVICE_ATTENTION_MIN_ROWS:-} ]]; then
     stage_args+=(--device-attention-min-rows "${DEVICE_ATTENTION_MIN_ROWS}")
 fi
+if [[ ${WEIGHT_ARENA:-1} == 0 ]]; then
+    stage_args+=(--no-weight-arena)
+fi
 
 mkdir -p "${result_dir}"
 export CUDA_DEVICE_ORDER=FASTEST_FIRST

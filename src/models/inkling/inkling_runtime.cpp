@@ -1840,8 +1840,24 @@ struct InklingRuntime::Impl {
             }
         }
         if (devices.empty()) return result;
-        result = cuda.initialize(devices, config.vram_cache_fraction);
+        result = cuda.initialize(devices, true);
         if (!result.ok()) return result;
+        std::vector<std::uint64_t> arena_capacities;
+        if (config.use_weight_arena) {
+            auto plan = plan_runtime_devices(
+                devices, config.vram_cache_fraction, 0U, 2ULL << 30U,
+                "Inkling");
+            if (!plan.ok()) {
+                result.errors = std::move(plan.errors);
+                return result;
+            }
+            arena_capacities = std::move(plan.value.weight_capacities);
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                result = cuda.reserve_weight_arena(
+                    devices[slot], arena_capacities[slot]);
+                if (!result.ok()) return result;
+            }
+        }
         resident_spine_bytes.assign(devices.size(), 0U);
         resident_kv_bytes.assign(devices.size(), 0U);
         const bool configure_device_attention =
@@ -2060,14 +2076,40 @@ struct InklingRuntime::Impl {
         // Whatever the spine left is expert cache. A device that cannot hold
         // several experts is worse than useless, so it is reported rather than
         // quietly configured to thrash.
-        std::vector<std::uint64_t> capacities;
-        capacities.reserve(devices.size());
-        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
-            auto memory = CudaBackend::device_memory(devices[slot]);
-            const auto free_bytes = memory.ok() ? memory.value.free_bytes : 0U;
-            const auto budget = static_cast<std::uint64_t>(
-                static_cast<double>(free_bytes) * config.vram_cache_fraction);
-            capacities.push_back(budget);
+        std::vector<std::uint64_t> capacities = std::move(arena_capacities);
+        if (config.use_weight_arena) {
+            // acquire() uploads a miss before it inserts the entry and applies
+            // the LRU capacity check. Keep one worst-case plain-BF16 expert
+            // inside the already admitted arena as transient upload space;
+            // otherwise the bounded allocator correctly refuses the temporary
+            // peak that per-weight cudaMalloc used to hide in free VRAM.
+            const auto expert_upload_headroom =
+                3ULL * CudaBackend::weight_storage_bytes(
+                           static_cast<std::uint64_t>(kExpertInner) * kHidden *
+                               sizeof(std::uint16_t),
+                           0U);
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                if (resident_spine_bytes[slot] >= capacities[slot] ||
+                    expert_upload_headroom >=
+                        capacities[slot] - resident_spine_bytes[slot]) {
+                    result.errors.emplace_back(
+                        "Inkling resident spine exhausts the admitted VRAM "
+                        "budget on device " + std::to_string(devices[slot]));
+                    return result;
+                }
+                capacities[slot] -=
+                    resident_spine_bytes[slot] + expert_upload_headroom;
+            }
+        } else {
+            capacities.reserve(devices.size());
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                auto memory = CudaBackend::device_memory(devices[slot]);
+                const auto free_bytes = memory.ok() ? memory.value.free_bytes : 0U;
+                const auto budget = static_cast<std::uint64_t>(
+                    static_cast<double>(free_bytes) *
+                    config.vram_cache_fraction);
+                capacities.push_back(budget);
+            }
         }
         expert_cache = std::make_unique<InklingExpertCache>(
             *checkpoint, cuda, devices, capacities,

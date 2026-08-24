@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
     bool chat = false;
     bool warm_experts = true;
     bool direct_stage = true;
+    bool weight_arena = true;
     bool device_attention = true;
     std::uint32_t device_attention_minimum_rows = 512U;
     std::uint32_t context_tokens = 512U;
@@ -56,6 +57,8 @@ int main(int argc, char** argv) {
             direct_stage = true;
         } else if (argument == "--pinned-stage") {
             direct_stage = false;
+        } else if (argument == "--no-weight-arena") {
+            weight_arena = false;
         } else if (argument == "--host-attention") {
             device_attention = false;
         } else if (argument == "--device-attention-min-rows" &&
@@ -81,6 +84,7 @@ int main(int argc, char** argv) {
                          "usage: strata-inkling-probe [--model DIR] "
                          "[--prompt TEXT] [--tokens N] [--devices LIST] "
                          "[--no-warm] [--direct-stage|--pinned-stage] "
+                         "[--no-weight-arena] "
                          "[--host-attention] [--device-attention-min-rows N] "
                          "[--context N]\n");
             return 2;
@@ -97,6 +101,7 @@ int main(int argc, char** argv) {
     config.devices = devices;
     config.warm_expert_pages = warm_experts;
     config.direct_mapped_mxfp4_staging = direct_stage;
+    config.use_weight_arena = weight_arena;
     config.enable_device_kv_attention = device_attention;
     config.minimum_device_attention_rows = device_attention_minimum_rows;
     config.maximum_context_tokens = context_tokens;

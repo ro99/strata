@@ -1343,6 +1343,137 @@ TEST_CASE("native CUDA backend keeps a Gemma 4 decode layer resident") {
                         [](auto item) { return item == 0U; }));
 }
 
+TEST_CASE("persistent BF16 KV ring matches Laguna's target-shape F32 attention contract") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t query_heads = 72U;
+    constexpr std::uint32_t kv_heads = 8U;
+    constexpr std::uint32_t head_dim = 128U;
+    constexpr std::uint32_t query_elements = query_heads * head_dim;
+    constexpr std::uint32_t kv_elements = kv_heads * head_dim;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto encode = [](float value) {
+        return static_cast<std::uint16_t>(
+            std::bit_cast<std::uint32_t>(strata::bf16_round_f32(value)) >> 16U);
+    };
+    const auto decode = [](std::uint16_t value) {
+        return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
+    };
+    std::array<float, query_elements> queries{};
+    for (std::size_t index = 0U; index < queries.size(); ++index) {
+        queries[index] = static_cast<float>(static_cast<int>(index % 31U) - 15) /
+                         32.0F;
+    }
+    constexpr std::uint32_t capacity = 4U;
+    std::vector<std::uint16_t> initial_keys(2U * kv_elements);
+    std::vector<std::uint16_t> initial_values(2U * kv_elements);
+    std::array<std::uint16_t, kv_elements> next_keys{};
+    std::array<std::uint16_t, kv_elements> next_values{};
+    for (std::size_t index = 0U; index < initial_keys.size(); ++index) {
+        initial_keys[index] = encode(
+            static_cast<float>(static_cast<int>(index % 23U) - 11) / 16.0F);
+        initial_values[index] = encode(
+            static_cast<float>(static_cast<int>(index % 19U) - 9) / 8.0F);
+    }
+    for (std::size_t index = 0U; index < next_keys.size(); ++index) {
+        next_keys[index] = encode(
+            static_cast<float>(static_cast<int>(index % 17U) - 8) / 16.0F);
+        next_values[index] = encode(
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 8.0F);
+    }
+    std::vector<float> host_keys(3U * kv_elements);
+    std::vector<float> host_values(3U * kv_elements);
+    std::transform(initial_keys.begin(), initial_keys.end(), host_keys.begin(),
+                   decode);
+    std::transform(initial_values.begin(), initial_values.end(),
+                   host_values.begin(), decode);
+    std::transform(next_keys.begin(), next_keys.end(),
+                   host_keys.begin() + 2U * kv_elements, decode);
+    std::transform(next_values.begin(), next_values.end(),
+                   host_values.begin() + 2U * kv_elements, decode);
+    const std::array<strata::FlashAttentionSegment, 1> segments{{{
+        host_keys, host_values, {},
+    }}};
+    strata::FlashAttentionRequest reference;
+    reference.queries = queries;
+    reference.segments = segments;
+    reference.query_rows = 1U;
+    reference.query_heads = query_heads;
+    reference.key_value_heads = kv_heads;
+    reference.query_key_dim = head_dim;
+    reference.value_dim = head_dim;
+    reference.scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
+    reference.numerics =
+        strata::FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
+    std::array<float, query_elements> expected{};
+    REQUIRE(backend.flash_attention(device, reference, expected).ok());
+
+    strata::CudaBuffer cache;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * capacity * kv_elements * sizeof(std::uint16_t),
+        cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        cache, initial_keys, initial_values, 0U, capacity, kv_elements).ok());
+    strata::CudaBf16KvAttentionRequest request;
+    request.cache = &cache;
+    request.queries = queries;
+    request.next_keys = next_keys;
+    request.next_values = next_values;
+    request.query_heads = query_heads;
+    request.key_value_heads = kv_heads;
+    request.head_dim = head_dim;
+    request.capacity_rows = capacity;
+    request.cache_start = 0U;
+    request.cached_rows = 3U;
+    request.position = 2U;
+    request.scale = reference.scale;
+    std::array<float, query_elements> actual{};
+    REQUIRE(backend.bf16_kv_attention(device, request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE(actual[index] == expected[index]);
+    }
+
+    // Exercise the physical wrap used once a sliding layer reaches its
+    // 512-token capacity. Logical rows 1 and 2 occupy physical slots 1 and 0;
+    // the new row 3 overwrites slot 1 and leaves logical rows 2 and 3 visible.
+    constexpr std::uint32_t ring_capacity = 2U;
+    strata::CudaBuffer wrapped_cache;
+    REQUIRE(backend.allocate_buffer(
+        device, 2ULL * ring_capacity * kv_elements * sizeof(std::uint16_t),
+        wrapped_cache).ok());
+    REQUIRE(backend.upload_gemma4_kv(
+        wrapped_cache, initial_keys, initial_values, 1U, ring_capacity,
+        kv_elements).ok());
+    std::vector<float> wrapped_host_keys(2U * kv_elements);
+    std::vector<float> wrapped_host_values(2U * kv_elements);
+    std::transform(initial_keys.begin() + kv_elements, initial_keys.end(),
+                   wrapped_host_keys.begin(), decode);
+    std::transform(initial_values.begin() + kv_elements, initial_values.end(),
+                   wrapped_host_values.begin(), decode);
+    std::transform(next_keys.begin(), next_keys.end(),
+                   wrapped_host_keys.begin() + kv_elements, decode);
+    std::transform(next_values.begin(), next_values.end(),
+                   wrapped_host_values.begin() + kv_elements, decode);
+    const std::array<strata::FlashAttentionSegment, 1> wrapped_segments{{{
+        wrapped_host_keys, wrapped_host_values, {},
+    }}};
+    reference.segments = wrapped_segments;
+    REQUIRE(backend.flash_attention(device, reference, expected).ok());
+    request.cache = &wrapped_cache;
+    request.capacity_rows = ring_capacity;
+    request.cache_start = 2U;
+    request.cached_rows = 2U;
+    request.position = 3U;
+    REQUIRE(backend.bf16_kv_attention(device, request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE(actual[index] == expected[index]);
+    }
+}
+
 TEST_CASE("native CUDA backend keeps a register-fed MXFP4 Gemma 4 decode layer resident") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

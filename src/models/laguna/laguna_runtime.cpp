@@ -123,6 +123,8 @@ struct LayerKv {
     // global layers keep all.
     std::vector<float> keys;
     std::vector<float> values;
+    CudaBuffer device;
+    std::uint32_t capacity_rows{};
     std::uint32_t start{};
 };
 
@@ -737,6 +739,25 @@ struct LagunaRuntime::Impl {
         return result;
     }
 
+    ValidationResult sync_device_kv(std::uint32_t layer) {
+        ValidationResult result;
+        auto& cache = kv[layer];
+        if (!cache.device.valid() || cache.keys.size() != cache.values.size()) {
+            result.errors.emplace_back(
+                "Laguna device KV cache is not initialized");
+            return result;
+        }
+        std::vector<std::uint16_t> keys(cache.keys.size());
+        std::vector<std::uint16_t> values(cache.values.size());
+        std::transform(cache.keys.begin(), cache.keys.end(), keys.begin(),
+                       bf16_encode);
+        std::transform(cache.values.begin(), cache.values.end(), values.begin(),
+                       bf16_encode);
+        return cuda.upload_gemma4_kv(
+            cache.device, keys, values, cache.start, cache.capacity_rows,
+            kKvColumns);
+    }
+
     ValidationResult attention(std::uint32_t layer,
                                std::span<const float> input,
                                std::uint32_t rows, std::uint32_t position_base,
@@ -807,48 +828,102 @@ struct LagunaRuntime::Impl {
         cache.values.reserve(cache.values.size() + new_values.size());
         for (const auto value : new_keys) cache.keys.push_back(bf16_round(value));
         for (const auto value : new_values) cache.values.push_back(bf16_round(value));
-
-        const std::array<FlashAttentionSegment, 1> segments{
-            {{cache.keys, cache.values, {}}}};
-        FlashAttentionRequest request;
-        request.queries = queries;
-        request.segments = segments;
-        request.query_rows = rows;
-        request.query_heads = heads;
-        request.key_value_heads = kKvHeads;
-        request.query_key_dim = kHeadDim;
-        request.value_dim = kHeadDim;
-        request.scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-        request.numerics = FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
-        request.maximum_workspace_bytes = kFlashAttentionWorkspaceReserve;
-        std::vector<std::uint32_t> causal;
-        std::vector<std::uint8_t> mask;
-        if (weights.global) {
-            causal.resize(rows);
-            for (std::uint32_t row = 0U; row < rows; ++row) {
-                causal[row] = position_base + row + 1U - cache.start;
-            }
-            request.causal_key_counts = causal;
-        } else {
-            const auto total = cached_rows + rows;
-            mask.resize(static_cast<std::size_t>(rows) * total);
-            for (std::uint32_t row = 0U; row < rows; ++row) {
-                const auto query = static_cast<std::uint64_t>(position_base + row);
-                for (std::size_t key_row = 0U; key_row < total; ++key_row) {
-                    mask[static_cast<std::size_t>(row) * total + key_row] =
-                        static_cast<std::uint8_t>(laguna_attention_visible(
-                            query, cache.start + key_row, true, kSlidingWindow));
-                }
-            }
-            request.query_key_mask = mask;
-        }
         std::vector<float> context(static_cast<std::size_t>(rows) * query_columns);
+        const auto trim_sliding = [&]() {
+            if (weights.global || cache.keys.size() / kKvColumns <= kSlidingWindow) {
+                return;
+            }
+            const auto drop_rows =
+                cache.keys.size() / kKvColumns - kSlidingWindow;
+            const auto drop = drop_rows * kKvColumns;
+            cache.keys.erase(
+                cache.keys.begin(),
+                cache.keys.begin() + static_cast<std::ptrdiff_t>(drop));
+            cache.values.erase(
+                cache.values.begin(),
+                cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
+            cache.start += static_cast<std::uint32_t>(drop_rows);
+        };
         graph_stats.attention_kv_stage_nanoseconds +=
             elapsed_nanoseconds(stage_started);
         stage_started = std::chrono::steady_clock::now();
-        result = config.enable_flash_attention
-            ? cuda.flash_attention(devices[weights.device], request, context)
-            : flash_attention_reference_f32(request, context);
+        if (config.enable_flash_attention &&
+            config.enable_device_resident_kv_decode && rows == 1U) {
+            // The old compatibility path uploaded every retained K/V row on
+            // every token. Keep the exact BF16 cache on the layer's device and
+            // cross PCIe with only Q plus the newly produced K/V row.
+            trim_sliding();
+            std::vector<std::uint16_t> encoded_keys(new_keys.size());
+            std::vector<std::uint16_t> encoded_values(new_values.size());
+            std::transform(new_keys.begin(), new_keys.end(), encoded_keys.begin(),
+                           bf16_encode);
+            std::transform(new_values.begin(), new_values.end(),
+                           encoded_values.begin(), bf16_encode);
+            CudaBf16KvAttentionRequest request;
+            request.cache = &cache.device;
+            request.queries = queries;
+            request.next_keys = encoded_keys;
+            request.next_values = encoded_values;
+            request.query_heads = heads;
+            request.key_value_heads = kKvHeads;
+            request.head_dim = kHeadDim;
+            request.capacity_rows = cache.capacity_rows;
+            request.cache_start = cache.start;
+            request.cached_rows = static_cast<std::uint32_t>(
+                cache.keys.size() / kKvColumns);
+            request.position = position_base;
+            request.scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+            result = cuda.bf16_kv_attention(
+                devices[weights.device], request, context);
+        } else {
+            const std::array<FlashAttentionSegment, 1> segments{
+                {{cache.keys, cache.values, {}}}};
+            FlashAttentionRequest request;
+            request.queries = queries;
+            request.segments = segments;
+            request.query_rows = rows;
+            request.query_heads = heads;
+            request.key_value_heads = kKvHeads;
+            request.query_key_dim = kHeadDim;
+            request.value_dim = kHeadDim;
+            request.scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+            request.numerics =
+                FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum;
+            request.maximum_workspace_bytes = kFlashAttentionWorkspaceReserve;
+            std::vector<std::uint32_t> causal;
+            std::vector<std::uint8_t> mask;
+            if (weights.global) {
+                causal.resize(rows);
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    causal[row] = position_base + row + 1U - cache.start;
+                }
+                request.causal_key_counts = causal;
+            } else {
+                const auto total = cached_rows + rows;
+                mask.resize(static_cast<std::size_t>(rows) * total);
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    const auto query =
+                        static_cast<std::uint64_t>(position_base + row);
+                    for (std::size_t key_row = 0U; key_row < total; ++key_row) {
+                        mask[static_cast<std::size_t>(row) * total + key_row] =
+                            static_cast<std::uint8_t>(laguna_attention_visible(
+                                query, cache.start + key_row, true,
+                                kSlidingWindow));
+                    }
+                }
+                request.query_key_mask = mask;
+            }
+            result = config.enable_flash_attention
+                ? cuda.flash_attention(devices[weights.device], request, context)
+                : flash_attention_reference_f32(request, context);
+            if (result.ok()) {
+                trim_sliding();
+                if (config.enable_flash_attention &&
+                    config.enable_device_resident_kv_decode) {
+                    result = sync_device_kv(layer);
+                }
+            }
+        }
         graph_stats.attention_flash_nanoseconds +=
             elapsed_nanoseconds(stage_started);
         if (!result.ok()) return result;
@@ -869,16 +944,6 @@ struct LagunaRuntime::Impl {
         result = spine_matmul(weights.output, context, rows, output);
         if (!result.ok()) return result;
 
-        if (!weights.global && cached_rows + rows > kSlidingWindow) {
-            const auto drop_rows = cached_rows + rows - kSlidingWindow;
-            const auto drop = drop_rows * kKvColumns;
-            cache.keys.erase(cache.keys.begin(),
-                             cache.keys.begin() + static_cast<std::ptrdiff_t>(drop));
-            cache.values.erase(
-                cache.values.begin(),
-                cache.values.begin() + static_cast<std::ptrdiff_t>(drop));
-            cache.start += static_cast<std::uint32_t>(drop_rows);
-        }
         graph_stats.attention_output_nanoseconds +=
             elapsed_nanoseconds(stage_started);
         return result;
@@ -1390,10 +1455,25 @@ ValidationResult LagunaRuntime::initialize(const std::string& model_directory,
             const auto rows = laguna_global_attention_layer(layer)
                 ? config.maximum_context_tokens
                 : std::min(config.maximum_context_tokens, kSlidingWindow);
+            impl_->kv[layer].capacity_rows = rows;
             impl_->kv[layer].keys.reserve(
                 static_cast<std::size_t>(rows) * kKvColumns);
             impl_->kv[layer].values.reserve(
                 static_cast<std::size_t>(rows) * kKvColumns);
+            if (config.enable_flash_attention &&
+                config.enable_device_resident_kv_decode) {
+                const auto device_bytes = static_cast<std::uint64_t>(rows) *
+                                          kKvColumns * sizeof(std::uint16_t) * 2U;
+                result = impl_->cuda.allocate_buffer(
+                    impl_->devices[impl_->layers[layer].device], device_bytes,
+                    impl_->kv[layer].device);
+                if (!result.ok()) {
+                    result.errors.emplace_back(
+                        "cannot allocate Laguna device KV cache for layer " +
+                        std::to_string(layer));
+                    return result;
+                }
+            }
         }
     } catch (const std::bad_alloc&) {
         result.errors.emplace_back("cannot reserve the configured Laguna KV cache");
@@ -1575,6 +1655,9 @@ LagunaGenerationResult LagunaRuntime::generate_chat_stream(
     result.metrics.rss_bytes = process_resident_set_bytes();
     result.metrics.device_vram_used_bytes = device_vram_used_bytes(impl_->devices);
     result.metrics.flash_attention_enabled = impl_->config.enable_flash_attention;
+    result.metrics.device_resident_kv_decode =
+        impl_->config.enable_flash_attention &&
+        impl_->config.enable_device_resident_kv_decode;
     if (impl_->route_trace.is_open()) {
         auto flushed = impl_->route_trace.flush();
         move_errors(result.errors, std::move(flushed));

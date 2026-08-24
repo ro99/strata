@@ -4638,6 +4638,94 @@ __global__ void flash_attention_reference_all_f32_kernel(
     }
 }
 
+__device__ float bf16_kv_sequential_dot_f32(
+    const float* query, const __nv_bfloat16* key,
+    std::uint32_t dimensions) {
+    float dot = 0.0F;
+    for (std::uint32_t dimension = 0U; dimension < dimensions; ++dimension) {
+        dot = __fadd_rn(
+            dot, __fmul_rn(query[dimension],
+                           __bfloat162float(key[dimension])));
+    }
+    return dot;
+}
+
+// Batch-1 counterpart of flash_attention_reference_all_f32_kernel over a
+// persistent two-plane BF16 KV ring. Reading a BF16 cache element through
+// __bfloat162float produces exactly the F32 fixed point the host compatibility
+// path used to upload, while preserving every sequential reduction order.
+__global__ void bf16_kv_attention_reference_all_f32_kernel(
+    float* output, float* scores, const float* queries,
+    const __nv_bfloat16* keys,
+    const __nv_bfloat16* values, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t head_dim,
+    std::uint32_t capacity_rows, std::uint32_t cache_start,
+    std::uint32_t cached_rows, float scale, unsigned int* error_flag) {
+    constexpr std::uint32_t threads = 256U;
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= query_heads) return;
+    const auto heads_per_kv = query_heads / key_value_heads;
+    const auto kv_head = head / heads_per_kv;
+    const auto* query = queries + static_cast<std::uint64_t>(head) * head_dim;
+    auto* head_scores = scores +
+        static_cast<std::uint64_t>(head) * capacity_rows;
+    __shared__ float maximum;
+    __shared__ float denominator;
+
+    // Rows are independent. Parallelizing them preserves the reference dot's
+    // dimension order while removing the old three serial score passes from
+    // thread zero. Softmax and value accumulation below retain their original
+    // logical-row order exactly.
+    for (std::uint32_t row = threadIdx.x; row < cached_rows;
+         row += blockDim.x) {
+        const auto physical = (cache_start + row) % capacity_rows;
+        const auto* key = keys +
+            (static_cast<std::uint64_t>(physical) * key_value_heads + kv_head) *
+                head_dim;
+        head_scores[row] = __fmul_rn(
+            bf16_kv_sequential_dot_f32(query, key, head_dim), scale);
+        if (!isfinite(head_scores[row])) atomicExch(error_flag, 1U);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0U) {
+        maximum = -INFINITY;
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            maximum = fmaxf(maximum, head_scores[row]);
+        }
+        denominator = 0.0F;
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            head_scores[row] = expf(__fsub_rn(head_scores[row], maximum));
+            denominator = __fadd_rn(denominator, head_scores[row]);
+        }
+        if (!isfinite(denominator) || denominator <= 0.0F) {
+            atomicExch(error_flag, 2U);
+        }
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            head_scores[row] = __fdiv_rn(head_scores[row], denominator);
+        }
+    }
+    __syncthreads();
+
+    auto* destination = output + static_cast<std::uint64_t>(head) * head_dim;
+    for (std::uint32_t dimension = threadIdx.x; dimension < head_dim;
+         dimension += threads) {
+        float accumulator = 0.0F;
+        for (std::uint32_t row = 0U; row < cached_rows; ++row) {
+            const auto physical = (cache_start + row) % capacity_rows;
+            const auto* value = values +
+                (static_cast<std::uint64_t>(physical) * key_value_heads +
+                 kv_head) * head_dim;
+            accumulator = __fadd_rn(
+                accumulator,
+                __fmul_rn(head_scores[row],
+                           __bfloat162float(value[dimension])));
+        }
+        destination[dimension] = accumulator;
+        if (!isfinite(accumulator)) atomicExch(error_flag, 3U);
+    }
+}
+
 constexpr std::uint32_t kGlmHeads = 64U;
 constexpr std::uint32_t kGlmNope = 192U;
 constexpr std::uint32_t kGlmRope = 64U;
@@ -7910,6 +7998,279 @@ ValidationResult CudaBackend::upload_gemma4_kv(
         status != cudaSuccess) {
         return cuda_error(status, "synchronize Gemma 4 CUDA KV upload");
     }
+    return result;
+}
+
+ValidationResult CudaBackend::bf16_kv_attention(
+    int device, const CudaBf16KvAttentionRequest& request,
+    std::span<float> output) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    const auto query_elements = static_cast<std::uint64_t>(request.query_heads) *
+                                request.head_dim;
+    const auto kv_elements = static_cast<std::uint64_t>(request.key_value_heads) *
+                             request.head_dim;
+    std::uint64_t plane_bytes = 0U;
+    if (found == impl_->devices.end() || request.cache == nullptr ||
+        !request.cache->valid() || request.cache->device() != device ||
+        request.query_heads == 0U || request.key_value_heads == 0U ||
+        request.query_heads % request.key_value_heads != 0U ||
+        request.head_dim == 0U || request.head_dim > 1'024U ||
+        request.capacity_rows == 0U || request.cached_rows == 0U ||
+        request.cached_rows > request.capacity_rows ||
+        request.queries.size() != query_elements || output.size() != query_elements ||
+        request.next_keys.size() != kv_elements ||
+        request.next_values.size() != kv_elements ||
+        request.cache_start > request.position ||
+        static_cast<std::uint64_t>(request.cache_start) + request.cached_rows !=
+            static_cast<std::uint64_t>(request.position) + 1U ||
+        !std::isfinite(request.scale) || request.scale <= 0.0F ||
+        !checked_bytes(request.capacity_rows, kv_elements,
+                       sizeof(std::uint16_t), plane_bytes) ||
+        plane_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
+        request.cache->device_bytes() != plane_bytes * 2U ||
+        std::any_of(request.queries.begin(), request.queries.end(),
+                    [](float value) { return !std::isfinite(value); })) {
+        result.errors.emplace_back("BF16 KV attention request is invalid");
+        return result;
+    }
+    auto& state = found->second;
+    if (!state.flash_attention_supported) {
+        result.errors.emplace_back(
+            "BF16 KV attention CUDA kernel supports only SM86 and SM120 devices");
+        return result;
+    }
+    if (state.moe_in_flight) {
+        result.errors.emplace_back(
+            "BF16 KV attention cannot overlap an in-flight MoE command");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for BF16 KV attention");
+    }
+
+    const auto query_bytes = static_cast<std::uint64_t>(request.queries.size_bytes());
+    const auto row_bytes = static_cast<std::uint64_t>(request.next_keys.size_bytes());
+    const auto upload_bytes = query_bytes + 2U * row_bytes;
+    const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
+    const auto download_bytes = output_bytes + sizeof(unsigned int);
+    std::uint64_t score_bytes = 0U;
+    if (!checked_bytes(request.query_heads, request.capacity_rows,
+                       sizeof(float), score_bytes)) {
+        result.errors.emplace_back("BF16 KV attention score workspace overflows");
+        return result;
+    }
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    const auto ensure_device = [&](std::byte*& pointer, std::uint64_t& capacity,
+                                   std::uint64_t required,
+                                   const char* operation) {
+        if (required <= capacity) return true;
+        std::byte* replacement = nullptr;
+        if (auto status = cudaMalloc(&replacement, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = replacement;
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return true;
+    };
+    const auto ensure_host = [&](std::byte*& pointer, std::uint64_t& capacity,
+                                 std::uint64_t required,
+                                 const char* operation) {
+        if (required <= capacity) return true;
+        void* replacement = nullptr;
+        if (auto status = cudaMallocHost(&replacement,
+                                         static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            result = cuda_error(status, operation);
+            return false;
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFreeHost(pointer));
+        pointer = static_cast<std::byte*>(replacement);
+        capacity = required;
+        return true;
+    };
+    if (!ensure_device(state.attention_upload, state.attention_upload_bytes,
+                       upload_bytes, "allocate BF16 KV attention upload") ||
+        !ensure_device(state.attention_download, state.attention_download_bytes,
+                       download_bytes, "allocate BF16 KV attention download") ||
+        !ensure_host(state.attention_host_upload,
+                     state.attention_host_upload_bytes, upload_bytes,
+                     "allocate BF16 KV attention host upload") ||
+        !ensure_host(state.attention_host_download,
+                     state.attention_host_download_bytes, download_bytes,
+                     "allocate BF16 KV attention host download")) {
+        return result;
+    }
+    if (score_bytes > state.attention_score_bytes) {
+        float* replacement = nullptr;
+        if (auto status = cudaMalloc(
+                &replacement, static_cast<std::size_t>(score_bytes));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate BF16 KV attention scores");
+        }
+        if (state.attention_scores != nullptr) {
+            static_cast<void>(cudaFree(state.attention_scores));
+        }
+        state.attention_scores = replacement;
+        state.attention_score_bytes = score_bytes;
+        ++allocation_calls;
+        allocation_bytes += score_bytes;
+    }
+
+    std::memcpy(state.attention_host_upload, request.queries.data(), query_bytes);
+    std::memcpy(state.attention_host_upload + query_bytes,
+                request.next_keys.data(), row_bytes);
+    std::memcpy(state.attention_host_upload + query_bytes + row_bytes,
+                request.next_values.data(), row_bytes);
+    const auto operation_started = std::chrono::steady_clock::now();
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_start, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention upload start");
+        }
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.attention_upload, state.attention_host_upload,
+            static_cast<std::size_t>(upload_bytes), cudaMemcpyHostToDevice,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "upload BF16 KV attention inputs");
+    }
+    auto* cache_keys = static_cast<__nv_bfloat16*>(request.cache->impl_->data);
+    auto* cache_values = reinterpret_cast<__nv_bfloat16*>(
+        static_cast<std::byte*>(request.cache->impl_->data) + plane_bytes);
+    const auto physical = request.position % request.capacity_rows;
+    auto* device_next_keys = reinterpret_cast<const __nv_bfloat16*>(
+        state.attention_upload + query_bytes);
+    auto* device_next_values = reinterpret_cast<const __nv_bfloat16*>(
+        state.attention_upload + query_bytes + row_bytes);
+    if (auto status = cudaMemcpyAsync(
+            cache_keys + static_cast<std::uint64_t>(physical) * kv_elements,
+            device_next_keys, static_cast<std::size_t>(row_bytes),
+            cudaMemcpyDeviceToDevice, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "store BF16 KV attention key row");
+    }
+    if (auto status = cudaMemcpyAsync(
+            cache_values + static_cast<std::uint64_t>(physical) * kv_elements,
+            device_next_values, static_cast<std::size_t>(row_bytes),
+            cudaMemcpyDeviceToDevice, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "store BF16 KV attention value row");
+    }
+    auto* device_output = reinterpret_cast<float*>(state.attention_download);
+    auto* device_error = reinterpret_cast<unsigned int*>(
+        state.attention_download + output_bytes);
+    if (auto status = cudaMemsetAsync(device_error, 0, sizeof(*device_error),
+                                      state.stream); status != cudaSuccess) {
+        return cuda_error(status, "clear BF16 KV attention status");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_uploaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention upload completion");
+        }
+    }
+    bf16_kv_attention_reference_all_f32_kernel<<<
+        request.query_heads, 256U, 0U, state.stream>>>(
+        device_output, state.attention_scores,
+        reinterpret_cast<const float*>(state.attention_upload), cache_keys,
+        cache_values, request.query_heads, request.key_value_heads,
+        request.head_dim, request.capacity_rows, request.cache_start,
+        request.cached_rows, request.scale, device_error);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch BF16 KV attention");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.kernel_finished, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention kernel completion");
+        }
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.attention_host_download, state.attention_download,
+            static_cast<std::size_t>(download_bytes), cudaMemcpyDeviceToHost,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "download BF16 KV attention output");
+    }
+    if (impl_->detailed_timing) {
+        if (auto status = cudaEventRecord(state.activation_downloaded, state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "record BF16 KV attention download completion");
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize BF16 KV attention");
+    }
+    const auto wait_nanoseconds = elapsed_nanoseconds_since(wait_started);
+    const auto operation_nanoseconds = elapsed_nanoseconds_since(operation_started);
+    unsigned int numerical_error = 0U;
+    std::memcpy(&numerical_error, state.attention_host_download + output_bytes,
+                sizeof(numerical_error));
+    std::uint64_t h2d_nanoseconds = 0U;
+    std::uint64_t kernel_nanoseconds = 0U;
+    std::uint64_t d2h_nanoseconds = 0U;
+    if (impl_->detailed_timing) {
+        float h2d_ms = 0.0F;
+        float kernel_ms = 0.0F;
+        float d2h_ms = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &h2d_ms, state.activation_start, state.activation_uploaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure BF16 KV attention upload");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &kernel_ms, state.activation_uploaded, state.kernel_finished);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure BF16 KV attention kernel");
+        }
+        if (auto status = cudaEventElapsedTime(
+                &d2h_ms, state.kernel_finished, state.activation_downloaded);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure BF16 KV attention download");
+        }
+        h2d_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(h2d_ms) * 1.0e6));
+        kernel_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(kernel_ms) * 1.0e6));
+        d2h_nanoseconds = static_cast<std::uint64_t>(
+            std::llround(static_cast<double>(d2h_ms) * 1.0e6));
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        ++stats.flash_attention_calls;
+        ++stats.flash_attention_kernel_launches;
+        ++stats.flash_attention_h2d_transfers;
+        ++stats.flash_attention_d2h_transfers;
+        stats.flash_attention_h2d_bytes += upload_bytes;
+        stats.flash_attention_d2h_bytes += download_bytes;
+        stats.flash_attention_useful_staging_bytes += 2U * row_bytes;
+        stats.flash_attention_h2d_nanoseconds += h2d_nanoseconds;
+        stats.flash_attention_kernel_nanoseconds += kernel_nanoseconds;
+        stats.flash_attention_d2h_nanoseconds += d2h_nanoseconds;
+        stats.flash_attention_nanoseconds += operation_nanoseconds;
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+        record_synchronization(stats, SynchronizationSubsystem::Attention, 1U,
+                               wait_nanoseconds);
+    }
+    if (numerical_error != 0U) {
+        result.errors.emplace_back(
+            numerical_error == 1U
+                ? "BF16 KV attention score is non-finite"
+                : numerical_error == 2U
+                    ? "BF16 KV attention softmax denominator is invalid"
+                    : "BF16 KV attention output is non-finite");
+        return result;
+    }
+    std::memcpy(output.data(), state.attention_host_download, output_bytes);
     return result;
 }
 

@@ -268,6 +268,26 @@ struct CudaDeviceMemory {
     std::uint64_t total_bytes{};
 };
 
+// One exact batch-1 attention step over a persistent BF16 KV ring. Queries
+// remain F32 because the model adapter owns QK norm and RoPE; only the newly
+// produced BF16 cache row crosses PCIe. The backend evaluates the same
+// sequential F32 dot, softmax and value accumulation as
+// FlashAttentionNumerics::f32_dot_f32_softmax_f32_accum.
+struct CudaBf16KvAttentionRequest {
+    const CudaBuffer* cache{};
+    std::span<const float> queries;
+    std::span<const std::uint16_t> next_keys;
+    std::span<const std::uint16_t> next_values;
+    std::uint32_t query_heads{};
+    std::uint32_t key_value_heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t capacity_rows{};
+    std::uint32_t cache_start{};
+    std::uint32_t cached_rows{};
+    std::uint32_t position{};
+    float scale{};
+};
+
 // Each segment contains contiguous packed FP4 E2M1 keys followed by their
 // per-32 E8M0 scales. Exactly one source must be present. Device buffers let
 // the indexer consume cache blocks without restaging the compressed history.
@@ -943,6 +963,9 @@ public:
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
         std::span<const std::uint16_t> values, std::uint32_t start,
         std::uint32_t capacity_rows, std::uint32_t columns);
+    [[nodiscard]] ValidationResult bf16_kv_attention(
+        int device, const CudaBf16KvAttentionRequest& request,
+        std::span<float> output);
     [[nodiscard]] ValidationResult gemma4_decode_layers(
         int device, std::span<const CudaGemma4DecodeLayer> layers,
         std::span<const float> input, std::uint32_t position,

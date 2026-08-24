@@ -46,7 +46,7 @@ There is also an OpenAI-compatible server (`strata-server`) and a terminal UI.
 
 | Model | Layout | Native precision | On a 64 GiB-VRAM / 251 GiB-RAM workstation |
 |---|---|---|---|
-| **Gemma 4 31B-IT** | 60 dense hybrid-attention layers + 27-layer vision tower | INT8 group-32 or MXFP4 text, BF16 vision/KV | Fully resident in VRAM; text and image input. **MXFP4 decode runs the register-fed kernel, 3.367x** |
+| **Gemma 4 31B-IT** | 60 dense hybrid-attention layers + 27-layer vision tower | INT8 group-32 or MXFP4 text, BF16 vision/KV | Fully resident in VRAM; text and image input. **668.99 tok/s at 128-token prefill; 29.747 tok/s decode** |
 | **DeepSeek-V4-Flash-0731** | 43 layers, 256 experts, top-6 | FP4 E2M1 experts, FP8 E4M3 spine | Resident in RAM; zero checkpoint reads during decode |
 | **Laguna S 2.1** | 48 layers 1:3 global/sliding, 256 experts + 1 shared, top-10 | NVFP4 or MXFP4 experts, BF16 elsewhere | Spine in VRAM; experts stream from RAM |
 | **Inkling Small** | 42 layers, 256 experts + 2 sinks, top-6, no rotary | NVFP4 or MXFP4 experts, BF16 elsewhere | Experts stream from RAM |
@@ -96,10 +96,11 @@ the four-bit decode itself costing no measurable time — the kernel is bound by
 reading the weights, which is the floor for any weight-stationary matmul.
 
 On **Gemma 4 31B-IT**, whose 19.5 GB MXFP4 checkpoint is fully resident on one
-24 GB card, substituting this kernel for the scalar FP4 route made decode
-**3.367x faster** — a 131.3 ms/token median reduction, register-fed against
-scalar on identical weights, same prompt, greedy. Experiment 0165 has the arms,
-the spread and the correctness gates.
+24 GB card, the first register-fed substitution made decode **3.367x faster**
+than the scalar route. The current runtime uses one FP32-output Marlin layout
+for both M=128 pages and M=1 decode: it reaches **668.99 prefill tok/s** at 128
+tokens and **29.747 steady decode tok/s**. Experiments 0165 and 0186 contain the
+respective arms, spreads, and correctness gates.
 
 ### When it helps, and when it does not
 
@@ -109,7 +110,7 @@ whether the weights fit on the card:
 
 | Workload | `argmax_r` of a decode step | GPU matmul share | Result |
 |---|---|---:|---|
-| Gemma 4 — dense, fully resident | GPU kernel / HBM service | 99.1% | **3.367x** |
+| Gemma 4 — dense, fully resident | GPU kernel / HBM service | 99.1% | **32.18x M=128 page; 29.747 decode tok/s** |
 | Laguna S 2.1 — MoE, 63.7 GiB | routed-expert staging | 6.2% | not built; ceiling 1.066x |
 | Inkling Small — MoE | cache-miss staging / H2D | 5.5% | not built; ceiling ~1.06x |
 | DeepSeek V4 — MoE, 147 GB experts | host-side expert compute | ~2% | measured 0.98x |

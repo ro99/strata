@@ -607,7 +607,20 @@ Last updated: 2026-08-24
   with worst maximum-relative error 5.6e-8. The code/scale representation is
   the same pure permutation accepted at M=128, so device-page integration does
   not require a duplicate persistent weight or a decode-only layout. Full
-  runtime decode remains unmeasured and carries no throughput claim.
+  runtime decode was still unmeasured at that gate; experiment 0186
+  subsequently closes the integration.
+
+- **Experiment 0186 accepts the bounded Gemma device-page runtime and closes
+  the prefill plausibility defect.** Three counterbalanced M=128 repetitions
+  measure 668.87/669.89/668.99 tok/s, median 668.99, against a 20.79 tok/s
+  serialized median: **32.18x**. Three 126-step decode windows measure a
+  29.747 tok/s median. Prefill costs 1.495 ms/token against 33.617 ms/token for
+  decode, ratio **0.0445**, below the predeclared 0.25 bound. The executor
+  reduces the 2,419.841 ms serial-handoff argmax to a page whose new argmax is
+  186.964 ms of CUDA kernel/HBM service. A release-blocking fake host-KV mirror
+  and 1.97 MB/token KV download were removed before promotion; full-generation
+  candidate/control IDs match. Issue #36 tracks the remaining 668.99-to-881.67
+  prefill and 29.747-to-36.214 decode parity gaps.
 
 - **Experiment 0167 stops Inkling register-fed work at the mandatory cost
   gate.** The distinct 130.638 GiB, 30-shard
@@ -655,13 +668,12 @@ Last updated: 2026-08-24
   descriptor mapping, the W8 resident-decode kernel and its original
   equivalence fixture are unchanged. Only MXFP4 weights opt into fragment
   prepack.
-- **Open defect found by the plausibility guard:** Gemma prefill costs 1.245x
-  scalar and 1.464x register-fed decode per token, where page reuse predicts
-  below 0.25x. Experiment 0180 confirms generic M=128 prefill rereads every
-  projected weight eight times, but rejects a widened-row version of the
-  decode-oriented register-fed kernel. The next mechanism must be a true
-  page-shaped tiled GEMM, not another skinny-kernel ownership setting. This is
-  not a decode falsification and has no throughput claim in 0165.
+- **Gemma plausibility defect closed by experiment 0186:** the 1.245x/1.464x
+  bad ratios recorded in 0165 are replaced by a measured **0.0445**
+  prefill/decode per-token ratio. The accepted device-owned page uses one
+  page-shaped Marlin weight pass and eliminates the host-serialized graph.
+  The remaining work is vLLM parity and wider-than-128 page admission, tracked
+  in issue #36, not an unexplained ratio.
 
 - **Current milestones:** C2, F4-1 and F4-3 are complete. F4-2 is cleared at
   eight or more routed experts per launch and awaits the real dispatch-width
@@ -924,18 +936,15 @@ Laguna work must first reduce or overlap that measured term under a separate
 hypothesis; its prefill batching defect is also separate. Preserve the older
 NVFP4 path as an equal correctness gate.
 
-**The Gemma 4 MXFP4 decode integration and MIX-2 proof are complete in
-experiment 0165.** Do not repeat the decode A/B. Experiment 0180 confirms the
-generic M=128 matmul reads the projected weight set eight times and rejects the
-decode-oriented register-fed page-kernel family at 36.9--111.4 GB/s against a
-600 GB/s gate. Do not integrate it or select a favorable ownership setting per
-shape. Experiments 0182--0184 establish and accept an FP32-output standalone
-Marlin projection primitive at M=128. The exact next Gemma action is a bounded
-device-owned page executor that uses this accepted primitive and reduces the
-measured 2,419.841 ms serial handoff term; a projection-only substitution into
-the current host loop is forbidden because it does not attack `argmax_r`.
-Keep W8A16 as an equal correctness and dispatch gate. DeepSeek V4 register-fed
-work remains stopped by experiment 0164's host-MoE bottleneck result.
+**The Gemma 4 MXFP4 device-page and unified Marlin integration are complete in
+experiment 0186.** Do not repeat the rejected register-fed/ordinary-WMMA page
+families or weaken FP64 RMS accumulation. The exact next Gemma action is issue
+#36: instantiate the new GPU-kernel/HBM argmax at the same locked operating
+point and close the 668.99-to-881.67 prefill and 29.747-to-36.214 decode gaps.
+Extend page ownership beyond 128 text-only first-page rows only behind its own
+measured context/working-set gate. Keep W8A16 as an equal correctness and
+dispatch gate. DeepSeek V4 register-fed work remains stopped by experiment
+0164's host-MoE bottleneck result.
 
 **Two tracks are running concurrently on this branch. Read both.**
 
@@ -1073,3 +1082,4 @@ Timestamps use America/Sao_Paulo (`-03:00`).
 | 2026-08-24T21:35:00-03:00 | Codex / experiment 0183 | `fix/gemma4-marlin-page-kernel@<this result commit>` | Standalone Marlin exact-shape screen | Specialized the Apache Marlin core without Torch, implemented its load-time code/scale permutations, and ran the exact M=128 Gemma MLP shapes. See experiment 0183 | Speed passes: 0.486875/0.493824 ms versus vLLM 0.490811/0.506624; useful 126.14/124.37 GB/s; 222,650,696 probe bytes. Precision fails: max relative 0.003474/0.003669 versus <=1e-4 because upstream writes BF16 output | Binding correctness stop after one process; no runtime integration and no repeated speed claim | Change only cross-CTA reduction and output to preserve FP32 `[M,N]`; require <=0.63 ms and <=1e-4 before executor work |
 | 2026-08-24T18:57:48-03:00 | Codex / experiment 0184 | `fix/gemma4-marlin-fp32-epilogue@<this result commit>` | FP32 Marlin epilogue screen | Changed only the result publication path to retain FP32 through the canonical `[M,N]` boundary; ran one correctness-first process then three fresh timed processes at the locked production point. See experiment 0184 | **ACCEPTED primitive:** medians 0.563712/0.522779 ms, worst spread 0.000482 ms, max relative 5.9e-8/1.39e-7, peak 233,697,608 bytes; all predeclared gates pass | No system throughput claim: production `argmax_r` is still 2,419.841 ms of serial handoffs, which an isolated projection cannot reduce | Integrate only through a bounded device-owned M=128 page executor and measure reduction of `sum_serial`; preserve W8A16 and full Gemma oracles |
 | 2026-08-24T19:04:00-03:00 | Codex / experiment 0185 | `fix/gemma4-device-page-executor@<this result commit>` | Unified Marlin layout M=1 screen | Applied the same code/scale permutation to Marlin's 8-row M=1 specialization and retained the FP32 output boundary; ran three fresh processes on both exact Gemma MLP shapes. See experiment 0185 | **ACCEPTED layout:** 81.212/78.496 us medians, 756.22/782.40 GB/s, worst max-relative 5.6e-8, peak 195,463,496 bytes | End-to-end decode is not yet measured; every Gemma consumer must move together before replacing the existing register-fed representation | Implement the bounded device-owned M=128 page executor with one Marlin-packed representation; gate full Gemma correctness, prefill >=900 tok/s, decode near 36.21 tok/s |
+| 2026-08-24T20:36:06-03:00 | Codex / experiment 0186 | `fix/gemma4-device-page-runtime@<this result commit>` | Gemma device-owned page and unified Marlin integration | Integrated one in-place Marlin layout across M=128/M=1, moved the 60-layer first-page graph and KV ownership to the device, retained exact FP64 RMS/BF16 boundaries, and fixed the release-blocking fake host-KV mirror plus redundant KV downloads. See experiment 0186 | **ACCEPTED:** M=128 candidate 668.87/669.89/668.99 tok/s, median 668.99, versus serialized median 20.79 (**32.18x**); 126-step decode median 29.747 tok/s; per-token ratio 0.0445; candidate/control generation IDs equal; final `make check` passes all three targets including the 1,080-hash Gemma oracle | New argmax is CUDA kernel/HBM at 186.964 ms/page. Strata reaches 75.88%/82.14% of measured vLLM prefill/decode; issue #36 tracks parity. The first-page graph is bounded to <=128 text tokens on one GPU | Execute issue #36 only from the new measured GPU-kernel/HBM cost model; preserve the locked operating point, one-copy MXFP4 layout, FP64 RMS requirement, W8A16 path, and full oracle |

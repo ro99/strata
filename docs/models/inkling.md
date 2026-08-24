@@ -47,9 +47,9 @@ If preflight says the placement fits, start interactive chat:
   --vram-fraction 0.85
 ```
 
-Type one user turn per line. Keep the process alive: the checkpoint's host
-pages and routed-expert VRAM cache are reused across turns. The final decode
-rate appears on stderr as `[done] ... tok/s`.
+Keep the process alive: the checkpoint's host pages and routed-expert VRAM
+cache are reused across turns. Each answer is followed by that turn's prefill
+and decode rates, and `/exit` (or Ctrl+D) prints the session averages.
 
 For one prompt:
 

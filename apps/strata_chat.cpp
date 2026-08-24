@@ -1,14 +1,29 @@
+// strata-chat: the interactive front end.
+//
+// Three modes share one option surface:
+//   * a tty gets the line editor, slash commands and a per-turn timing line;
+//   * a pipe gets one prompt per line and plain output;
+//   * --protocol jsonl gets the machine framing strata-tui speaks, unchanged.
+//
+// Throughput is reported where it can be believed: once per turn, and as a
+// session aggregate on exit. A live counter would only ever show the last few
+// tokens, and none of it belongs in the terminal title.
+
 #include "strata/chat_protocol.hpp"
 #include "strata/runtime.hpp"
 
 #include "cli_common.hpp"
+#include "cli_console.hpp"
 
+#include <algorithm>
 #include <array>
-#include <charconv>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -19,12 +34,41 @@
 
 #include <unistd.h>
 
+namespace term = strata::cli::term;
+
 namespace {
+
+// ------------------------------------------------------------- interrupt ---
+
+// Set by SIGINT while a generation is running. The token callback returns
+// false on it, which the runtimes' decode loops read as a cancellation; a
+// second interrupt inside the same generation gives up and exits, because a
+// model that does not check cancellation would otherwise trap the terminal.
+std::atomic<int> g_interrupts{0};
+
+extern "C" void handle_interrupt(int) {
+    if (g_interrupts.fetch_add(1) + 1 >= 2) {
+        const char message[] = "\n";
+        (void)!write(2, message, sizeof(message) - 1U);
+        std::_Exit(130);
+    }
+}
+
+void install_interrupt_handler() {
+    struct sigaction action {};
+    action.sa_handler = handle_interrupt;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+}
+
+// --------------------------------------------------------------- options ---
 
 struct Options {
     std::string model;
     std::string model_type;
     std::string prompt;
+    std::string system_prompt;
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
@@ -39,6 +83,7 @@ struct Options {
     bool pin_resident_arena{};
     bool prepack_mhc{true};
     bool jsonl_protocol{};
+    bool no_colour{};
     std::string plan_cache;
     bool dry_run{};
     bool use_plan_cache{true};
@@ -78,7 +123,7 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
         // Costs 21 forward passes per token, not one. min_p is not optional
         // here: broken word-fragments have maximally uncertain futures, so
         // without a relative-plausibility cut the entropy term selects them.
-        // DRY is what the reference implementation reports missing — an
+        // DRY is what the reference implementation reports missing -- an
         // entropy-scored loop, once entered, is locked in by min_p.
         sampling.temperature = 1.0;
         sampling.min_p = 0.05;
@@ -95,70 +140,104 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
     return false;
 }
 
+// Flags that consume the following argument. Listed beside the parser so an
+// unknown flag in the last position is reported as unknown rather than as a
+// known flag missing its value.
+bool takes_value(std::string_view argument) {
+    static constexpr std::string_view names[] = {
+        "--model", "--model-type", "--prompt", "--system", "--plan-cache",
+        "--decode-topology", "--context-size", "--max-context", "--max-new",
+        "--temperature", "--vram-fraction", "--seed", "--preset", "--top-k",
+        "--top-p", "--min-p", "--typical-p", "--xtc-probability",
+        "--xtc-threshold", "--presence-penalty", "--frequency-penalty",
+        "--repetition-penalty", "--penalty-window", "--dry-multiplier",
+        "--dry-base", "--dry-allowed-length", "--dry-window",
+        "--no-repeat-ngram", "--future-entropy", "--future-entropy-top-n",
+        "--alpha", "--future-entropy-curve", "--alpha-wave-amplitude",
+        "--alpha-wave-period", "--devices", "--protocol",
+    };
+    return std::find(std::begin(names), std::end(names), argument) !=
+           std::end(names);
+}
+
 void usage() {
-    std::cerr
-        << "usage: strata-chat --model DIR --model-type "
-           "gemma4|deepseek|glm|laguna|inkling|kimi-k3\n"
-        << "                    [--context-size N] [--max-new N]\n"
-        << "                    [--devices 0,1,2] [--vram-fraction F]\n"
-        << "                    [--flash-attention] [--full-reprefill]\n"
-        << "                    [--block-kv-cache] [--pin-resident-arena]\n"
-        << "                    [--no-prepack-mhc]\n"
-        << "                    [--protocol jsonl]\n"
-        << "                    [--prompt TEXT]\n\n"
-        << "deepseek decode:    [--device-resident-runtime]\n"
-        << "                    [--decode-topology centralized|rank-local-tp2]\n\n"
-        << "placement:          [--dry-run] [--replan]\n"
-        << "                    [--plan-cache DIR] [--no-plan-cache]\n\n"
-        << "sampler:            [--preset precise|balanced|creative|future-entropy]\n"
-        << "                    [--temperature F] [--seed N]\n"
-        << "                    [--top-k N] [--top-p F] [--min-p F] [--typical-p F]\n"
-        << "                    [--xtc-probability F] [--xtc-threshold F]\n"
-        << "                    [--presence-penalty F] [--frequency-penalty F]\n"
-        << "                    [--repetition-penalty F] [--penalty-window N]\n"
-        << "                    [--dry-multiplier F] [--dry-base F]\n"
-        << "                    [--dry-allowed-length N] [--dry-window N]\n"
-        << "                    [--no-repeat-ngram N]\n\n"
-        << "future entropy:     [--future-entropy N] [--future-entropy-top-n N]\n"
-        << "                    [--alpha F] [--future-entropy-curve article|crossfade]\n"
-        << "                    [--alpha-wave-amplitude F] [--alpha-wave-period F]\n\n"
-        << "Truncation reads the model's own distribution, so --min-p and\n"
-        << "--top-p mean the same thing at any temperature. --preset writes\n"
-        << "defaults; flags given after it override them.\n\n"
-        << "--temperature alone, with no --preset, is plain temperature\n"
-        << "sampling and nothing else: no truncation, no penalties, no XTC.\n\n"
-        << "--future-entropy N scores each of the N likeliest candidates by how\n"
-        << "open the distribution one step past it is, and costs one extra\n"
-        << "forward pass per candidate: a token takes N+1 decode steps, not\n"
-        << "one. --alpha crossfades from -1 (ordinary sampling, the stage is\n"
-        << "a no-op) to +1 (future entropy alone). Pair it with --min-p 0.05\n"
-        << "or higher; entropy favours broken word-fragments otherwise.\n\n"
-        << "--device-resident-runtime is the DeepSeek device-resident decode\n"
-        << "contract as a whole: physical KV pages, device-resident mHC, CUDA\n"
-        << "attention, the scalar lightning indexer, and routed experts in the\n"
-        << "two NUMA-local CPU shards. It overrides the individual cache and\n"
-        << "attention flags rather than combining with them.\n\n"
-        << "--decode-topology rank-local-tp2 adds rank-local decode on top of\n"
-        << "that contract, and needs a build with NCCL and exactly two devices.\n"
-        << "It is admitted fail-closed before the checkpoint is opened and never\n"
-        << "falls back once admitted. It supports at most 65,536 context tokens:\n"
-        << "above that the ratio-128 layers exceed the attention kernel's\n"
-        << "candidate bound and the step fails (issue #22). Both flags are\n"
-        << "DeepSeek-only and are rejected by every other --model-type.\n\n"
-        << "Each topology is deterministic and exact against its own oracle,\n"
-        << "but they are not token-identical to each other: rank-local reduces\n"
-        << "in a different order, so greedy decode can pick a different token\n"
-        << "a dozen steps in and the wording diverges from there. Switching\n"
-        << "topology mid-project changes the text, not just the speed.\n\n"
-        << "Without --prompt, read one question per line until EOF.\n"
-        << "The jsonl protocol reads prompt text and an optional messages array.\n\n"
-        << "--dry-run sizes every component against this machine, prints where\n"
-        << "each one would go, writes the plan to the cache, and exits without\n"
-        << "reading a single weight. The next real load reuses that plan, so it\n"
-        << "places exactly what the dry run printed. --replan recomputes and\n"
-        << "overwrites a cached plan; --no-plan-cache neither reads nor writes\n"
-        << "one. A plan is keyed by checkpoint, GPUs, context size, and device\n"
-        << "list: change any of them and it is recomputed automatically.\n";
+    std::cerr <<
+R"(strata-chat -- interactive chat against a Strata runtime
+
+usage:
+  strata-chat --model DIR --model-type TYPE [options]
+  strata-chat --model DIR --model-type TYPE --prompt "..."   one-shot
+  strata-chat --model DIR --model-type TYPE --dry-run        place, do not load
+
+required:
+  --model DIR                 checkpoint directory
+  --model-type TYPE           gemma4 | deepseek | glm | laguna | inkling | kimi-k3
+
+session:
+  --prompt TEXT               answer TEXT and exit instead of prompting
+  --system TEXT               prepend a system message to the conversation
+  --context-size N            context window in tokens (default 2048)
+  --max-new N                 tokens generated per turn (default 256)
+  --devices 0,1,2             CUDA devices to use
+  --vram-fraction F           share of each device given to caches (default 0.85)
+  --no-color                  plain output even on a terminal
+  --protocol jsonl            machine framing for a frontend, not for humans
+
+execution:
+  --flash-attention           CUDA FlashAttention instead of the scalar path
+  --full-reprefill            re-prefill each turn instead of reusing the KV prefix
+  --block-kv-cache            DeepSeek physical KV pages
+  --device-resident-runtime   the whole DeepSeek device-resident decode contract
+  --decode-topology T         centralized (default) | rank-local-tp2
+  --pin-resident-arena        pin the resident weight arena
+  --no-prepack-mhc            keep mHC projections in their stored layout
+
+placement:
+  --dry-run                   size and place every component, then exit
+  --replan                    recompute a cached plan
+  --plan-cache DIR            where plans are read and written
+  --no-plan-cache             neither read nor write a plan
+
+sampler:
+  --preset NAME               precise | balanced | creative | future-entropy
+  --temperature F             --seed N --top-k N --top-p F --min-p F --typical-p F
+  --xtc-probability F         --xtc-threshold F
+  --presence-penalty F        --frequency-penalty F
+  --repetition-penalty F      --penalty-window N
+  --dry-multiplier F          --dry-base F --dry-allowed-length N --dry-window N
+  --no-repeat-ngram N
+
+future entropy:
+  --future-entropy N          --future-entropy-top-n N --alpha F
+  --future-entropy-curve C    article | crossfade
+  --alpha-wave-amplitude F    --alpha-wave-period F
+
+commands, once running:
+  /help /clear /regen /stats /save FILE /exit
+
+notes:
+  --preset writes defaults; flags after it override them. --temperature with no
+  preset is plain temperature sampling: no truncation, penalties, or XTC.
+  Truncation reads the model's own distribution, so --min-p and --top-p mean
+  the same thing at any temperature.
+
+  --future-entropy N scores each of the N likeliest candidates by how open the
+  distribution one step past it is, at one extra forward pass per candidate: a
+  token takes N+1 decode steps. Pair it with --min-p 0.05 or higher.
+
+  --device-resident-runtime is a bundle, not a knob: physical KV pages,
+  device-resident mHC, CUDA attention, the scalar lightning indexer, and routed
+  experts in the two NUMA-local CPU shards. It overrides the individual cache
+  and attention flags. --decode-topology rank-local-tp2 adds rank-local decode
+  on top and needs an NCCL build with exactly two devices; it is admitted
+  fail-closed and supports at most 65,536 context tokens (issue #22). Both are
+  DeepSeek-only. Each topology is exact against its own oracle but they are not
+  token-identical to each other, so switching one mid-project changes the text.
+
+  --dry-run reads no weights. It writes the plan to the cache, so the next real
+  load places exactly what it printed. A plan is keyed by checkpoint, GPUs,
+  context size and device list, and is recomputed when any of them change.
+)";
 }
 
 bool parse_options(int argc, char** argv, Options& options) {
@@ -184,9 +263,9 @@ bool parse_options(int argc, char** argv, Options& options) {
         if (argument == "--device-resident-runtime") {
             options.block_kv_cache = true;
             options.device_resident_runtime = true;
-            // Implications of the contract, applied here so the hello event
-            // reports what will actually run. The runtime enforces them again
-            // for embedders that never pass through this parser.
+            // Implications of the contract, applied here so the banner and the
+            // hello event report what will actually run. The runtime enforces
+            // them again for embedders that never pass through this parser.
             options.flash_attention = true;
             options.prepack_mhc = false;
             continue;
@@ -197,6 +276,10 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--no-prepack-mhc") {
             options.prepack_mhc = false;
+            continue;
+        }
+        if (argument == "--no-color" || argument == "--no-colour") {
+            options.no_colour = true;
             continue;
         }
         if (argument == "--dry-run") {
@@ -211,11 +294,27 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.replan = true;
             continue;
         }
-        if (index + 1 >= argc) return false;
+        if (!takes_value(argument)) {
+            std::cerr << "error: unknown argument: " << argument << '\n';
+            return false;
+        }
+        if (index + 1 >= argc) {
+            std::cerr << "error: " << argument << " needs a value\n";
+            return false;
+        }
         const auto next = [&]() { return std::string_view(argv[++index]); };
+        // Every rejected value says which flag rejected it; a bare "false"
+        // from the parser leaves the user guessing which of thirty flags it
+        // was.
+        const auto reject = [&](std::string_view value) {
+            std::cerr << "error: " << argument << ": bad value '" << value
+                      << "'\n";
+            return false;
+        };
         if (argument == "--model") options.model = std::string(next());
         else if (argument == "--model-type") options.model_type = std::string(next());
         else if (argument == "--prompt") options.prompt = std::string(next());
+        else if (argument == "--system") options.system_prompt = std::string(next());
         else if (argument == "--plan-cache") options.plan_cache = std::string(next());
         else if (argument == "--decode-topology") {
             const auto topology = next();
@@ -234,57 +333,130 @@ bool parse_options(int argc, char** argv, Options& options) {
                 options.flash_attention = true;
                 options.prepack_mhc = false;
             } else {
+                std::cerr << "error: unknown --decode-topology: " << topology << '\n';
                 return false;
             }
         }
         else if (argument == "--context-size" || argument == "--max-context") {
-            if (!strata::cli::parse_positive_u32(next(), options.context_size)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_positive_u32(value, options.context_size)) return reject(value);
+            }
         } else if (argument == "--max-new") {
-            if (!strata::cli::parse_positive_u32(next(), options.max_new_tokens)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_positive_u32(value, options.max_new_tokens)) return reject(value);
+            }
         } else if (argument == "--temperature") {
-            if (!strata::cli::parse_double(next(), options.sampling.temperature, 0.0, 10.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.temperature, 0.0, 10.0)) return reject(value);
+            }
         } else if (argument == "--vram-fraction") {
-            if (!strata::cli::parse_double(next(), options.vram_fraction, 0.0, 0.95)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.vram_fraction, 0.0, 0.95)) return reject(value);
+            }
         } else if (argument == "--seed") {
-            if (!strata::cli::parse_u64(next(), options.sampling.seed)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u64(value, options.sampling.seed)) return reject(value);
+            }
         } else if (argument == "--preset") {
-            if (!apply_sampler_preset(next(), options.sampling)) return false;
+            {
+                const auto value = next();
+                if (!apply_sampler_preset(value, options.sampling)) return reject(value);
+            }
         } else if (argument == "--top-k") {
-            if (!strata::cli::parse_u32(next(), options.sampling.top_k)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u32(value, options.sampling.top_k)) return reject(value);
+            }
         } else if (argument == "--top-p") {
-            if (!strata::cli::parse_double(next(), options.sampling.top_p, 0.0, 1.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.top_p, 0.0, 1.0)) return reject(value);
+            }
         } else if (argument == "--min-p") {
-            if (!strata::cli::parse_double(next(), options.sampling.min_p, 0.0, 1.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.min_p, 0.0, 1.0)) return reject(value);
+            }
         } else if (argument == "--typical-p") {
-            if (!strata::cli::parse_double(next(), options.sampling.typical_p, 0.0, 1.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.typical_p, 0.0, 1.0)) return reject(value);
+            }
         } else if (argument == "--xtc-probability") {
-            if (!strata::cli::parse_double(next(), options.sampling.xtc_probability, 0.0, 1.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.xtc_probability, 0.0, 1.0)) return reject(value);
+            }
         } else if (argument == "--xtc-threshold") {
-            if (!strata::cli::parse_double(next(), options.sampling.xtc_threshold, 0.0, 1.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.xtc_threshold, 0.0, 1.0)) return reject(value);
+            }
         } else if (argument == "--presence-penalty") {
-            if (!strata::cli::parse_double(next(), options.sampling.presence_penalty, -2.0, 2.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.presence_penalty, -2.0, 2.0)) return reject(value);
+            }
         } else if (argument == "--frequency-penalty") {
-            if (!strata::cli::parse_double(next(), options.sampling.frequency_penalty, -2.0, 2.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.frequency_penalty, -2.0, 2.0)) return reject(value);
+            }
         } else if (argument == "--repetition-penalty") {
-            if (!strata::cli::parse_double(next(), options.sampling.repetition_penalty, 0.0, 10.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.repetition_penalty, 0.0, 10.0)) return reject(value);
+            }
         } else if (argument == "--penalty-window") {
-            if (!strata::cli::parse_u32(next(), options.sampling.penalty_window)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u32(value, options.sampling.penalty_window)) return reject(value);
+            }
         } else if (argument == "--dry-multiplier") {
-            if (!strata::cli::parse_double(next(), options.sampling.dry_multiplier, 0.0, 10.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.dry_multiplier, 0.0, 10.0)) return reject(value);
+            }
         } else if (argument == "--dry-base") {
-            if (!strata::cli::parse_double(next(), options.sampling.dry_base, 1.0, 8.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.dry_base, 1.0, 8.0)) return reject(value);
+            }
         } else if (argument == "--dry-allowed-length") {
-            if (!strata::cli::parse_positive_u32(next(), options.sampling.dry_allowed_length)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_positive_u32(value, options.sampling.dry_allowed_length)) return reject(value);
+            }
         } else if (argument == "--dry-window") {
-            if (!strata::cli::parse_u32(next(), options.sampling.dry_window)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u32(value, options.sampling.dry_window)) return reject(value);
+            }
         } else if (argument == "--no-repeat-ngram") {
-            if (!strata::cli::parse_u32(next(), options.sampling.no_repeat_ngram)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u32(value, options.sampling.no_repeat_ngram)) return reject(value);
+            }
         } else if (argument == "--future-entropy") {
-            if (!strata::cli::parse_u32(next(), options.sampling.future_entropy_candidates)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u32(value, options.sampling.future_entropy_candidates)) return reject(value);
+            }
         } else if (argument == "--future-entropy-top-n") {
-            if (!strata::cli::parse_u32(next(), options.sampling.future_entropy_top_n)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_u32(value, options.sampling.future_entropy_top_n)) return reject(value);
+            }
         } else if (argument == "--alpha") {
-            if (!strata::cli::parse_double(next(), options.sampling.future_entropy_alpha, -1.0, 1.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.future_entropy_alpha, -1.0, 1.0)) return reject(value);
+            }
         } else if (argument == "--future-entropy-curve") {
             const auto curve = next();
             if (curve == "article") {
@@ -292,33 +464,59 @@ bool parse_options(int argc, char** argv, Options& options) {
             } else if (curve == "crossfade") {
                 options.sampling.future_entropy_curve = strata::FutureEntropyCurve::Crossfade;
             } else {
+                std::cerr << "error: unknown --future-entropy-curve: " << curve << '\n';
                 return false;
             }
         } else if (argument == "--alpha-wave-amplitude") {
-            if (!strata::cli::parse_double(next(), options.sampling.future_entropy_wave_amplitude, 0.0, 2.0)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.future_entropy_wave_amplitude, 0.0, 2.0)) return reject(value);
+            }
         } else if (argument == "--alpha-wave-period") {
-            if (!strata::cli::parse_double(next(), options.sampling.future_entropy_wave_period, 1.0, 1e6)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_double(value, options.sampling.future_entropy_wave_period, 1.0, 1e6)) return reject(value);
+            }
         } else if (argument == "--devices") {
-            if (!strata::cli::parse_devices(next(), options.devices)) return false;
+            {
+                const auto value = next();
+                if (!strata::cli::parse_devices(value, options.devices)) return reject(value);
+            }
             options.devices_explicit = true;
         } else if (argument == "--protocol") {
-            if (next() != "jsonl") return false;
+            const auto protocol = next();
+            if (protocol != "jsonl") {
+                std::cerr << "error: unknown --protocol: " << protocol << '\n';
+                return false;
+            }
             options.jsonl_protocol = true;
         } else {
-            std::cerr << "unknown argument: " << argument << '\n';
+            // Unreachable while takes_value() and this chain agree; kept so a
+            // flag added to one and not the other is rejected instead of
+            // silently swallowing its value.
+            std::cerr << "error: unknown argument: " << argument << '\n';
             return false;
         }
     }
     if (!options.devices_explicit) options.devices = {0, 1, 2};
     std::string sampling_error;
     if (!strata::validate_sampling_options(options.sampling, sampling_error)) {
-        std::cerr << "invalid sampler option: " << sampling_error << '\n';
+        std::cerr << "error: invalid sampler option: " << sampling_error << '\n';
+        return false;
+    }
+    if (options.model.empty()) {
+        std::cerr << "error: --model is required\n";
         return false;
     }
     // Resolved through the model registry rather than a hardcoded list, so a
     // new model needs no edit here.
-    return !options.model.empty() &&
-           strata::find_model_by_cli_name(options.model_type) != nullptr;
+    if (strata::find_model_by_cli_name(options.model_type) == nullptr) {
+        std::cerr << "error: unknown --model-type: "
+                  << (options.model_type.empty() ? "(missing)" : options.model_type)
+                  << '\n';
+        return false;
+    }
+    return true;
 }
 
 // A run is reproducible when nothing stochastic is enabled. Temperature alone
@@ -327,9 +525,9 @@ bool deterministic(const strata::SamplingOptions& sampling) {
     return sampling.temperature == 0.0 && sampling.xtc_probability == 0.0;
 }
 
-// Compact description of which stages are actually on, for the startup banner
-// and the JSONL handshake. Silent stages are omitted rather than printed at
-// their identity value.
+// Compact description of which stages are actually on, for the banner and the
+// JSONL handshake. Silent stages are omitted rather than printed at their
+// identity value.
 std::string sampler_summary(const strata::SamplingOptions& sampling) {
     std::ostringstream text;
     text << "temperature=" << sampling.temperature;
@@ -371,6 +569,8 @@ std::string sampler_summary(const strata::SamplingOptions& sampling) {
     return text.str();
 }
 
+// ---------------------------------------------------------- jsonl framing ---
+
 void protocol_event(std::string_view event, std::string_view fields = {}) {
     std::cout << "{\"protocol\":\"strata-chat\",\"version\":"
               << strata::chat_protocol_version << ",\"event\":\""
@@ -387,25 +587,114 @@ void protocol_message(std::string_view event, std::string_view message,
     protocol_event(event, fields.str());
 }
 
-class StreamDisplay {
-public:
-    explicit StreamDisplay(bool protocol)
-        : protocol_(protocol), interactive_(!protocol && isatty(STDOUT_FILENO) != 0) {
-        if (interactive_) {
-            std::cerr << "[decode] live token speed is shown in the terminal title\n";
-            set_title("strata-chat | waiting for first token");
-        }
-        if (!protocol_) std::cout << "assistant> " << std::flush;
+// ------------------------------------------------------------ statistics ---
+
+std::string with_thousands(std::uint64_t value) {
+    std::string digits = std::to_string(value);
+    for (std::size_t position = digits.size(); position > 3U;) {
+        position -= 3U;
+        digits.insert(position, ",");
     }
+    return digits;
+}
+
+double rate(std::uint64_t tokens, double seconds) {
+    return seconds > 0.0 ? static_cast<double>(tokens) / seconds : 0.0;
+}
+
+// What one turn cost. The runtime measures prefill and decode separately, and
+// they are never averaged together: a prompt token and a generated token do
+// not cost the same thing and a combined figure means nothing.
+struct TurnStats {
+    std::uint64_t prompt_tokens{};
+    std::uint64_t prefill_tokens{};
+    std::uint64_t decode_tokens{};
+    double prefill_seconds{};
+    double decode_seconds{};
+    bool interrupted{};
+};
+
+struct SessionStats {
+    std::uint64_t turns{};
+    std::uint64_t prompt_tokens{};
+    std::uint64_t prefill_tokens{};
+    std::uint64_t decode_tokens{};
+    double prefill_seconds{};
+    double decode_seconds{};
+    double load_seconds{};
+
+    void add(const TurnStats& turn) {
+        ++turns;
+        prompt_tokens += turn.prompt_tokens;
+        prefill_tokens += turn.prefill_tokens;
+        decode_tokens += turn.decode_tokens;
+        prefill_seconds += turn.prefill_seconds;
+        decode_seconds += turn.decode_seconds;
+    }
+};
+
+// The per-turn line. Dim, one line, after the answer -- the only place a live
+// counter could have gone that does not fight with the text being streamed.
+void print_turn_stats(const TurnStats& turn) {
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(2);
+    line << "prefill " << with_thousands(turn.prefill_tokens) << " tok in "
+         << turn.prefill_seconds << " s (" << rate(turn.prefill_tokens, turn.prefill_seconds)
+         << " tok/s)   decode " << with_thousands(turn.decode_tokens) << " tok in "
+         << turn.decode_seconds << " s (" << rate(turn.decode_tokens, turn.decode_seconds)
+         << " tok/s)";
+    if (turn.prefill_tokens != turn.prompt_tokens) {
+        line << "   reused " << with_thousands(turn.prompt_tokens - turn.prefill_tokens)
+             << " tok";
+    }
+    if (turn.interrupted) line << "   [interrupted]";
+    std::cerr << '\n' << term::grey() << "  " << line.str() << term::reset()
+              << "\n" << std::flush;
+}
+
+// The session aggregate, printed once on exit. Each rate is total tokens over
+// total seconds for that phase, not a mean of per-turn rates: a two-token turn
+// should not weigh the same as a two-hundred-token one.
+void print_session_stats(const SessionStats& session) {
+    if (session.turns == 0U) return;
+    std::ostringstream report;
+    report << std::fixed << std::setprecision(2);
+    report << '\n' << term::bold() << "  session" << term::reset() << '\n'
+           << term::grey()
+           << "    turns     " << session.turns << '\n'
+           << "    prefill   " << with_thousands(session.prefill_tokens)
+           << " tok in " << session.prefill_seconds << " s   "
+           << rate(session.prefill_tokens, session.prefill_seconds)
+           << " tok/s average\n"
+           << "    decode    " << with_thousands(session.decode_tokens)
+           << " tok in " << session.decode_seconds << " s   "
+           << rate(session.decode_tokens, session.decode_seconds)
+           << " tok/s average\n";
+    if (session.prompt_tokens > session.prefill_tokens) {
+        report << "    reused    "
+               << with_thousands(session.prompt_tokens - session.prefill_tokens)
+               << " prompt tok not re-prefilled\n";
+    }
+    report << "    load      " << session.load_seconds << " s\n" << term::reset();
+    std::cerr << report.str() << std::flush;
+}
+
+// --------------------------------------------------------------- display ---
+
+// Streams one answer. In protocol mode it emits a token event per complete
+// UTF-8 run; on a terminal it writes the text and nothing else, so the answer
+// can be selected, piped, or copied without stripping decoration out of it.
+class AnswerStream {
+public:
+    explicit AnswerStream(bool protocol) : protocol_(protocol) {}
 
     void token(std::uint32_t token_id, std::string_view piece) {
         last_token_id_ = token_id;
         ++emitted_;
         const auto now = std::chrono::steady_clock::now();
-        if (!decode_started_) decode_started_ = now;
         if (last_token_time_) {
-            const double interval = std::chrono::duration<double>(
-                now - *last_token_time_).count();
+            const double interval =
+                std::chrono::duration<double>(now - *last_token_time_).count();
             if (interval_count_ == intervals_.size()) {
                 interval_total_ -= intervals_[interval_cursor_];
             } else {
@@ -416,181 +705,51 @@ public:
             interval_cursor_ = (interval_cursor_ + 1U) % intervals_.size();
         }
         last_token_time_ = now;
-        pending_utf8_.append(piece.data(), piece.size());
-        flush_pending_utf8();
-        if (interactive_) {
-            if (pending_utf8_.empty()) {
-                std::ostringstream title;
-                title << "strata-chat | " << emitted_ << " tokens | "
-                      << std::fixed << std::setprecision(2)
-                      << tokens_per_second(now) << " tok/s";
-                set_title(title.str());
-            }
-        } else if (!protocol_ && emitted_ % 16U == 0U && pending_utf8_.empty()) {
-            std::cerr << "[decode] " << emitted_ << " tokens | "
-                      << tokens_per_second(now) << " tok/s\n";
-        }
+        assembler_.push(piece, [this](std::string_view text) { write(text); });
     }
 
-    void finish(double runtime_tok_s) {
-        flush_pending_utf8();
-        if (!pending_utf8_.empty()) {
-            const char replacement[] = "\xEF\xBF\xBD";
-            write_text(std::string_view(replacement, 3));
-            pending_utf8_.clear();
-        }
-        if (interactive_) set_title("strata-chat | ready");
-        if (!protocol_) {
-            std::cout << '\n';
-            std::cerr << std::fixed << std::setprecision(2)
-                      << "[done] " << emitted_ << " tokens | "
-                      << runtime_tok_s << " tok/s\n";
-        }
+    void finish() {
+        assembler_.finish([this](std::string_view text) { write(text); });
+        if (!protocol_ && wrote_any_ && !ends_with_newline_) std::cout << '\n';
+        std::cout << std::flush;
     }
 
-    void abort() {
-        flush_pending_utf8();
-        if (!pending_utf8_.empty()) {
-            const char replacement[] = "\xEF\xBF\xBD";
-            write_text(std::string_view(replacement, 3));
-            pending_utf8_.clear();
-        }
-        if (interactive_) set_title("strata-chat | error");
-        if (!protocol_) std::cout << '\n';
-    }
+    [[nodiscard]] std::uint64_t emitted() const noexcept { return emitted_; }
 
 private:
-    // Returns >0 for a complete valid UTF-8 sequence, 0 if incomplete, -1 if invalid.
-    int consume_utf8_at(std::size_t pos) const {
-        const unsigned char lead = static_cast<unsigned char>(pending_utf8_[pos]);
-        const std::size_t remain = pending_utf8_.size() - pos;
-
-        if (lead <= 0x7FU) return 1;
-
-        if (lead >= 0xC2U && lead <= 0xDFU) {
-            if (remain < 2) return 0;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
-            return 2;
-        }
-
-        if (lead == 0xE0U) {
-            if (remain < 3) return 0;
-            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
-            if ((b2 & 0xC0U) != 0x80U || b2 < 0xA0U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            return 3;
-        }
-
-        if (lead >= 0xE1U && lead <= 0xECU) {
-            if (remain < 3) return 0;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            return 3;
-        }
-
-        if (lead == 0xEDU) {
-            if (remain < 3) return 0;
-            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
-            if ((b2 & 0xC0U) != 0x80U || b2 > 0x9FU) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            return 3;
-        }
-
-        if (lead >= 0xEEU && lead <= 0xEFU) {
-            if (remain < 3) return 0;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            return 3;
-        }
-
-        if (lead == 0xF0U) {
-            if (remain < 4) return 0;
-            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
-            if ((b2 & 0xC0U) != 0x80U || b2 < 0x90U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 3U]) & 0xC0U) != 0x80U) return -1;
-            return 4;
-        }
-
-        if (lead >= 0xF1U && lead <= 0xF3U) {
-            if (remain < 4) return 0;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 1U]) & 0xC0U) != 0x80U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 3U]) & 0xC0U) != 0x80U) return -1;
-            return 4;
-        }
-
-        if (lead == 0xF4U) {
-            if (remain < 4) return 0;
-            const auto b2 = static_cast<unsigned char>(pending_utf8_[pos + 1U]);
-            if ((b2 & 0xC0U) != 0x80U || b2 > 0x8FU) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 2U]) & 0xC0U) != 0x80U) return -1;
-            if ((static_cast<unsigned char>(pending_utf8_[pos + 3U]) & 0xC0U) != 0x80U) return -1;
-            return 4;
-        }
-
-        return -1;
-    }
-
-    void flush_pending_utf8() {
-        if (pending_utf8_.empty()) return;
-        std::size_t pos = 0;
-        while (pos < pending_utf8_.size()) {
-            const int result = consume_utf8_at(pos);
-            if (result > 0) {
-                pos += static_cast<std::size_t>(result);
-            } else if (result == 0) {
-                break;
-            } else {
-                if (pos > 0) {
-                    write_text(std::string_view(pending_utf8_.data(), pos));
-                    pending_utf8_.erase(0, pos);
-                    pos = 0;
-                }
-                const char replacement[] = "\xEF\xBF\xBD";
-                write_text(std::string_view(replacement, 3));
-                pending_utf8_.erase(0, 1);
-            }
-        }
-        if (pos > 0) {
-            write_text(std::string_view(pending_utf8_.data(), pos));
-            pending_utf8_.erase(0, pos);
-        }
-    }
-
-    void write_text(std::string_view text) const {
+    void write(std::string_view text) {
+        if (text.empty()) return;
         if (!protocol_) {
+            wrote_any_ = true;
+            ends_with_newline_ = text.back() == '\n';
             std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
             std::cout << std::flush;
             return;
         }
-        const auto now = std::chrono::steady_clock::now();
         std::ostringstream fields;
         fields << "\"token_id\":" << last_token_id_
                << ",\"tokens\":" << emitted_
                << ",\"tok_s\":" << std::fixed << std::setprecision(4)
-               << tokens_per_second(now)
+               << windowed_rate()
                << ",\"text\":\"" << strata::cli::json_escape(text) << '"';
         protocol_event("token", fields.str());
     }
 
-    double tokens_per_second(std::chrono::steady_clock::time_point now) const {
-        (void)now;
+    // A short trailing window, reported only in the protocol stream where a
+    // frontend wants something live to draw. The turn and session figures come
+    // from the runtime's own measurement instead.
+    [[nodiscard]] double windowed_rate() const {
         return interval_total_ > 0.0
-            ? static_cast<double>(interval_count_) / interval_total_
-            : 0.0;
-    }
-
-    void set_title(std::string_view title) const {
-        std::cerr << "\033]0;" << title << '\a' << std::flush;
+                   ? static_cast<double>(interval_count_) / interval_total_
+                   : 0.0;
     }
 
     bool protocol_{};
-    bool interactive_{};
+    bool wrote_any_{};
+    bool ends_with_newline_{};
     std::uint32_t last_token_id_{};
     std::uint64_t emitted_{};
-    std::string pending_utf8_;
-    std::optional<std::chrono::steady_clock::time_point> decode_started_;
+    term::Utf8Assembler assembler_;
     std::optional<std::chrono::steady_clock::time_point> last_token_time_;
     std::array<double, 16> intervals_{};
     std::size_t interval_cursor_{};
@@ -598,42 +757,80 @@ private:
     double interval_total_{};
 };
 
-bool answer(strata::RuntimeSession& runtime, const Options& options,
-            std::span<const strata::ChatMessage> messages,
-            std::string& answer_text) {
-    const auto& prompt = messages.back().content;
-    std::cerr << "[prefill] processing prompt...\n";
+// ------------------------------------------------------------------ turn ---
+
+struct TurnOutcome {
+    bool ok{};
+    std::string text;
+    TurnStats stats;
+};
+
+TurnOutcome run_turn(strata::RuntimeSession& runtime, const Options& options,
+                     std::span<const strata::ChatMessage> messages) {
+    TurnOutcome outcome;
     if (options.jsonl_protocol) {
         std::ostringstream fields;
-        fields << "\"prompt_bytes\":" << prompt.size();
+        fields << "\"prompt_bytes\":" << messages.back().content.size();
         protocol_event("turn_start", fields.str());
     }
-    StreamDisplay display(options.jsonl_protocol);
-    const strata::TokenStreamCallback stream = [&](std::uint32_t token,
-                                                    std::string_view piece) {
-        display.token(token, piece);
-        return true;
-    };
-    const auto result = runtime.generate_chat_stream(
-        messages, options.max_new_tokens, stream);
-    if (!result.ok()) {
-        display.abort();
-        for (const auto& error : result.errors) {
-            std::cerr << "error: " << error << '\n';
-            if (options.jsonl_protocol) protocol_message("error", error);
-        }
-        return false;
+
+    // Echo off for the whole turn, so a keystroke during generation cannot
+    // land in the middle of the answer.
+    const std::optional<term::QuietInput> quiet =
+        options.jsonl_protocol ? std::nullopt
+                               : std::optional<term::QuietInput>(std::in_place);
+
+    term::Spinner spinner;
+    bool spinning = false;
+    if (!options.jsonl_protocol) {
+        // The separator goes out before the spinner starts, or the spinner
+        // thread races it and draws its first frame on the wrong line.
+        std::cerr << '\n' << std::flush;
+        // Prefill prints nothing and can run for minutes on a long prompt.
+        spinner.start("thinking");
+        spinning = true;
     }
-    const double runtime_tok_s = result.metrics.decode_seconds > 0.0
-        ? static_cast<double>(result.metrics.decode_tokens) /
-              result.metrics.decode_seconds
-        : 0.0;
-    display.finish(runtime_tok_s);
+
+    g_interrupts.store(0);
+    AnswerStream stream(options.jsonl_protocol);
+    const strata::TokenStreamCallback on_token =
+        [&](std::uint32_t token, std::string_view piece) {
+            if (spinning) {
+                spinner.stop();
+                spinning = false;
+            }
+            stream.token(token, piece);
+            return g_interrupts.load() == 0;
+        };
+
+    const auto result = runtime.generate_chat_stream(
+        messages, options.max_new_tokens, on_token);
+    if (spinning) spinner.stop();
+    stream.finish();
+
+    if (!result.ok()) {
+        for (const auto& error : result.errors) {
+            if (options.jsonl_protocol) {
+                protocol_message("error", error);
+            } else {
+                std::cerr << term::red() << "  error: " << term::reset()
+                          << error << '\n';
+            }
+        }
+        return outcome;
+    }
+
+    outcome.ok = true;
+    outcome.text = result.text;
+    outcome.stats.prompt_tokens = result.metrics.prompt_tokens;
+    outcome.stats.prefill_tokens = result.metrics.prefill_tokens;
+    outcome.stats.decode_tokens = result.metrics.decode_tokens;
+    outcome.stats.prefill_seconds = result.metrics.prefill_seconds;
+    outcome.stats.decode_seconds = result.metrics.decode_seconds;
+    outcome.stats.interrupted = g_interrupts.load() != 0;
+    g_interrupts.store(0);
+
     if (options.jsonl_protocol) {
-        const double prefill_tok_s = result.metrics.prefill_seconds > 0.0
-            ? static_cast<double>(result.metrics.prefill_tokens) /
-                  result.metrics.prefill_seconds
-            : 0.0;
         std::ostringstream fields;
         fields << std::fixed << std::setprecision(6)
                << "\"prompt_tokens\":" << result.metrics.prompt_tokens
@@ -645,9 +842,11 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
                        ? "true" : "false")
                << ",\"decode_tokens\":" << result.metrics.decode_tokens
                << ",\"prefill_seconds\":" << result.metrics.prefill_seconds
-               << ",\"prefill_tok_s\":" << prefill_tok_s
+               << ",\"prefill_tok_s\":" << rate(result.metrics.prefill_tokens,
+                                                result.metrics.prefill_seconds)
                << ",\"decode_seconds\":" << result.metrics.decode_seconds
-               << ",\"decode_tok_s\":" << runtime_tok_s
+               << ",\"decode_tok_s\":" << rate(result.metrics.decode_tokens,
+                                               result.metrics.decode_seconds)
                << ",\"generated_token_ids\":[";
         for (std::size_t index = 0U;
              index < result.generated_token_ids.size(); ++index) {
@@ -656,11 +855,288 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
         }
         fields << ']';
         protocol_event("turn_done", fields.str());
-    } else {
-        std::cout << '\n';
     }
-    answer_text = result.text;
-    return true;
+    return outcome;
+}
+
+// ---------------------------------------------------------------- banner ---
+
+void print_field(std::string_view label, std::string_view value) {
+    std::cerr << term::grey() << "  " << std::left << std::setw(12)
+              << std::string(label) << term::reset() << value << '\n';
+}
+
+// Protocol mode has no banner, but a frontend still shows the child's stderr
+// in a log pane -- strata-tui colours the [ready] line green there. These are
+// diagnostics, not framing; everything a client acts on goes over JSON.
+void print_protocol_log(const Options& options,
+                        const strata::ModelRegistration& registration) {
+    std::cerr << "[startup] model_type=" << options.model_type
+              << " devices=" << strata::cli::devices_text(options.devices)
+              << " context=" << options.context_size
+              << " max_new=" << options.max_new_tokens
+              << " vram_fraction=" << options.vram_fraction
+              << " seed=" << options.sampling.seed << '\n'
+              << "[sampler] " << sampler_summary(options.sampling) << '\n'
+              << "[attention] "
+              << ((options.flash_attention ||
+                   registration.flash_attention_by_default)
+                      ? "CUDA FlashAttention" : "scalar reference")
+              << '\n'
+              << "[contract] "
+              << (deterministic(options.sampling) ? "exact greedy"
+                                                  : "seeded Gumbel-max sampled")
+              << " base-model decode; no hidden fallback\n";
+}
+
+void print_banner(const Options& options,
+                  const strata::ModelRegistration& registration) {
+    std::cerr << '\n'
+              << "  " << term::bold() << term::cyan() << "strata" << term::reset()
+              << term::grey() << "  ·  " << term::reset() << registration.name
+              << "\n\n";
+    print_field("model", options.model);
+    print_field("devices", strata::cli::devices_text(options.devices) +
+                               "   context " + std::to_string(options.context_size) +
+                               " tokens   vram " +
+                               [&] {
+                                   std::ostringstream text;
+                                   text << std::fixed << std::setprecision(2)
+                                        << options.vram_fraction;
+                                   return text.str();
+                               }());
+    print_field("attention",
+                (options.flash_attention || registration.flash_attention_by_default)
+                    ? "CUDA FlashAttention" : "scalar reference");
+    if (options.device_resident_runtime) {
+        print_field("decode", options.rank_local_decode
+                                  ? "device-resident, rank-local TP2"
+                                  : "device-resident, centralized");
+    }
+    print_field("sampler", sampler_summary(options.sampling) +
+                               (deterministic(options.sampling)
+                                    ? "   exact greedy, no hidden fallback"
+                                    : "   seeded Gumbel-max"));
+    if (options.sampling.future_entropy_candidates != 0U) {
+        std::cerr << term::yellow() << "  note        " << term::reset()
+                  << "future entropy costs about "
+                  << (options.sampling.future_entropy_candidates + 1U)
+                  << "x the decode time of the same settings without it\n";
+    }
+    std::cerr << std::flush;
+}
+
+// -------------------------------------------------------- slash commands ---
+
+enum class Command : std::uint8_t { None, Handled, Regenerate, Quit };
+
+void print_commands() {
+    std::cerr << term::grey()
+              << "\n  /help          this list\n"
+                 "  /clear         forget the conversation so far\n"
+                 "  /regen         generate the last answer again\n"
+                 "  /stats         throughput so far this session\n"
+                 "  /save FILE     write the transcript to FILE\n"
+                 "  /exit          quit (Ctrl+D does the same)\n\n"
+                 "  Ctrl+C stops a generation; on an empty prompt it quits.\n"
+              << term::reset() << std::flush;
+}
+
+void save_transcript(const std::string& path,
+                     const std::vector<strata::ChatMessage>& conversation) {
+    std::ofstream file(path);
+    if (!file) {
+        std::cerr << term::red() << "  cannot write " << path << term::reset() << '\n';
+        return;
+    }
+    for (const auto& message : conversation) {
+        const char* role = message.role == strata::ChatRole::User      ? "user"
+                           : message.role == strata::ChatRole::System  ? "system"
+                           : message.role == strata::ChatRole::Tool    ? "tool"
+                                                                       : "assistant";
+        file << "## " << role << "\n\n" << message.content << "\n\n";
+    }
+    std::cerr << term::grey() << "  wrote " << path << term::reset() << '\n';
+}
+
+Command handle_command(std::string_view line,
+                       std::vector<strata::ChatMessage>& conversation,
+                       const SessionStats& session,
+                       std::size_t retained_prefix) {
+    if (line.empty() || line.front() != '/') return Command::None;
+    const auto space = line.find(' ');
+    const auto name = line.substr(0U, space);
+    const auto argument = space == std::string_view::npos
+                              ? std::string_view{}
+                              : line.substr(space + 1U);
+
+    if (name == "/help" || name == "/?") {
+        print_commands();
+        return Command::Handled;
+    }
+    if (name == "/exit" || name == "/quit") return Command::Quit;
+    if (name == "/clear") {
+        conversation.resize(retained_prefix);
+        std::cerr << term::grey() << "  conversation cleared\n" << term::reset();
+        return Command::Handled;
+    }
+    if (name == "/stats") {
+        print_session_stats(session);
+        return Command::Handled;
+    }
+    if (name == "/save") {
+        if (argument.empty()) {
+            std::cerr << term::red() << "  /save needs a filename\n" << term::reset();
+        } else {
+            save_transcript(std::string(argument), conversation);
+        }
+        return Command::Handled;
+    }
+    if (name == "/regen") {
+        if (conversation.size() < retained_prefix + 2U) {
+            std::cerr << term::red() << "  nothing to regenerate\n" << term::reset();
+            return Command::Handled;
+        }
+        conversation.pop_back();  // the previous answer
+        return Command::Regenerate;
+    }
+    std::cerr << term::red() << "  unknown command: " << name << term::reset()
+              << term::grey() << "   /help for the list\n" << term::reset();
+    return Command::Handled;
+}
+
+// ------------------------------------------------------------------ main ---
+
+int run_dry_run(const Options& options, const strata::RuntimeConfig& config) {
+    const auto resolved = strata::resolve_placement_plan(
+        strata::placement_request_for(options.model, config),
+        options.plan_cache, options.use_plan_cache, options.replan);
+    if (!resolved.ok()) {
+        for (const auto& error : resolved.errors) {
+            std::cerr << "error: " << error << '\n';
+            if (options.jsonl_protocol) protocol_message("error", error, true);
+        }
+        return 1;
+    }
+    if (options.jsonl_protocol) {
+        std::cout << strata::encode_placement_plan(resolved.value.plan) << std::flush;
+    } else {
+        std::cout << strata::render_placement_report(resolved.value.plan);
+    }
+    if (resolved.value.from_cache) {
+        std::cerr << "  reused cached plan " << resolved.value.cache_path << '\n';
+    } else if (resolved.value.stored) {
+        std::cerr << "  wrote plan " << resolved.value.cache_path << '\n';
+    } else {
+        std::cerr << "  plan not cached (--no-plan-cache)\n";
+    }
+    std::cerr << "  no weights were read"
+              << (resolved.value.stored || resolved.value.from_cache
+                      ? "; the next load reuses this plan\n" : "\n");
+    return resolved.value.plan.fits ? 0 : 1;
+}
+
+int run_interactive(strata::RuntimeSession& runtime, const Options& options,
+                    std::vector<strata::ChatMessage>& conversation,
+                    SessionStats& session) {
+    const std::size_t retained_prefix = conversation.size();
+    term::LineEditor editor;
+    const std::string prompt = term::colour_enabled()
+                                   ? std::string(term::bold()) + term::cyan() +
+                                         "› " + term::reset()
+                                   : "> ";
+    std::cerr << term::grey()
+              << "\n  /help for commands · Ctrl+C stops a generation · Ctrl+D quits\n"
+              << term::reset() << std::flush;
+
+    std::string line;
+    for (;;) {
+        const auto status = editor.read(prompt, line);
+        if (status == term::LineEditor::Status::Eof) break;
+        if (status == term::LineEditor::Status::Interrupt) {
+            // Ctrl+C on an empty prompt is the conventional way out; with text
+            // in the buffer it just drops the text.
+            if (line.empty()) break;
+            continue;
+        }
+
+        // Trim, so a stray trailing space does not become a distinct history
+        // entry or a one-space prompt.
+        const auto first = line.find_first_not_of(" \t");
+        const auto last = line.find_last_not_of(" \t");
+        const std::string text = first == std::string::npos
+                                     ? std::string{}
+                                     : line.substr(first, last - first + 1U);
+        if (text.empty()) continue;
+        editor.remember(text);
+
+        bool regenerate = false;
+        if (text.front() == '/') {
+            switch (handle_command(text, conversation, session, retained_prefix)) {
+                case Command::Quit: return 0;
+                case Command::Handled: continue;
+                case Command::Regenerate: regenerate = true; break;
+                case Command::None: break;
+            }
+        }
+        if (!regenerate) {
+            conversation.push_back({strata::ChatRole::User, text});
+        }
+
+        auto outcome = run_turn(runtime, options, conversation);
+        if (!outcome.ok) {
+            // Drop the turn that failed rather than leaving the conversation
+            // holding a question with no answer.
+            conversation.pop_back();
+            continue;
+        }
+        session.add(outcome.stats);
+        print_turn_stats(outcome.stats);
+        conversation.push_back(
+            {strata::ChatRole::Assistant, std::move(outcome.text)});
+    }
+    return 0;
+}
+
+int run_piped(strata::RuntimeSession& runtime, const Options& options,
+              std::vector<strata::ChatMessage>& conversation,
+              SessionStats& session) {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        conversation.push_back({strata::ChatRole::User, line});
+        auto outcome = run_turn(runtime, options, conversation);
+        if (!outcome.ok) return 1;
+        session.add(outcome.stats);
+        print_turn_stats(outcome.stats);
+        conversation.push_back(
+            {strata::ChatRole::Assistant, std::move(outcome.text)});
+    }
+    return 0;
+}
+
+int run_protocol(strata::RuntimeSession& runtime, const Options& options,
+                 std::vector<strata::ChatMessage>& conversation) {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        strata::ChatRequest request;
+        std::string error;
+        if (!strata::parse_chat_request(line, request, error)) {
+            protocol_message("error", error);
+            continue;
+        }
+        auto messages = request.includes_history ? std::move(request.messages)
+                                                 : conversation;
+        if (!request.includes_history) {
+            messages.push_back({strata::ChatRole::User, std::move(request.prompt)});
+        }
+        auto outcome = run_turn(runtime, options, messages);
+        if (!outcome.ok) return 1;
+        messages.push_back(
+            {strata::ChatRole::Assistant, std::move(outcome.text)});
+        conversation = std::move(messages);
+    }
+    return 0;
 }
 
 }  // namespace
@@ -668,9 +1144,12 @@ bool answer(strata::RuntimeSession& runtime, const Options& options,
 int main(int argc, char** argv) {
     Options options;
     if (!parse_options(argc, argv, options)) {
-        usage();
+        std::cerr << "\nrun with --help for the full option list\n";
         return 2;
     }
+
+    const bool human = !options.jsonl_protocol;
+    term::detect_colour(human && !options.no_colour && term::stderr_is_tty());
 
     if (options.jsonl_protocol) {
         std::ostringstream fields;
@@ -703,8 +1182,7 @@ int main(int argc, char** argv) {
     }
 
     // parse_options already rejected an unregistered --model-type.
-    const auto* registration =
-        strata::find_model_by_cli_name(options.model_type);
+    const auto* registration = strata::find_model_by_cli_name(options.model_type);
     strata::RuntimeConfig config;
     config.model = registration->model;
     config.devices = options.devices;
@@ -715,8 +1193,7 @@ int main(int argc, char** argv) {
     config.sampling = options.sampling;
     config.enable_flash_attention =
         options.flash_attention || registration->flash_attention_by_default;
-    config.enable_incremental_kv_continuation =
-        options.incremental_kv_continuation;
+    config.enable_incremental_kv_continuation = options.incremental_kv_continuation;
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
     config.deepseek_rank_local_decode = options.rank_local_decode;
@@ -727,120 +1204,75 @@ int main(int argc, char** argv) {
     config.refresh_placement_plan = options.replan;
     config.report_placement_plan = true;
 
-    if (options.dry_run) {
-        const auto resolved = strata::resolve_placement_plan(
-            strata::placement_request_for(options.model, config),
-            options.plan_cache, options.use_plan_cache, options.replan);
-        if (!resolved.ok()) {
-            for (const auto& error : resolved.errors) {
-                std::cerr << "error: " << error << '\n';
-                if (options.jsonl_protocol) protocol_message("error", error, true);
-            }
-            return 1;
-        }
-        if (options.jsonl_protocol) {
-            std::cout << strata::encode_placement_plan(resolved.value.plan)
-                      << std::flush;
-        } else {
-            std::cout << strata::render_placement_report(resolved.value.plan);
-        }
-        if (resolved.value.from_cache) {
-            std::cerr << "[dry-run] reused cached plan "
-                      << resolved.value.cache_path << '\n';
-        } else if (resolved.value.stored) {
-            std::cerr << "[dry-run] wrote plan " << resolved.value.cache_path
-                      << '\n';
-        } else {
-            std::cerr << "[dry-run] plan not cached (--no-plan-cache)\n";
-        }
-        std::cerr << "[dry-run] no weights were read"
-                  << (resolved.value.stored || resolved.value.from_cache
-                          ? "; the next load reuses this plan\n" : "\n");
-        return resolved.value.plan.fits ? 0 : 1;
+    if (options.dry_run) return run_dry_run(options, config);
+
+    if (human) {
+        print_banner(options, *registration);
+    } else {
+        print_protocol_log(options, *registration);
     }
 
     strata::RuntimeSession runtime;
-    std::cerr << "[startup] model_type=" << options.model_type
-              << " devices=" << strata::cli::devices_text(options.devices)
-              << " context=" << options.context_size
-              << " max_new=" << options.max_new_tokens
-              << " vram_fraction=" << options.vram_fraction
-              << " seed=" << options.sampling.seed << '\n'
-              << "[sampler] " << sampler_summary(options.sampling) << '\n'
-              << "[attention] "
-              << ((options.flash_attention || options.model_type == "gemma4" ||
-                   options.model_type == "laguna")
-                      ? "CUDA FlashAttention" : "scalar reference")
-              << '\n'
-              << "[contract] "
-              << (deterministic(options.sampling) ? "exact greedy"
-                                                  : "seeded Gumbel-max sampled")
-              << " base-model decode; no hidden fallback\n";
-    if (options.sampling.future_entropy_candidates != 0U) {
-        std::cerr << "[sampler] future entropy looks ahead one step per "
-                  << "candidate: expect about "
-                  << (options.sampling.future_entropy_candidates + 1U)
-                  << "x the decode time of the same settings without it\n";
+    if (human) {
+        std::cerr << '\n' << term::grey()
+                  << "  loading; a large checkpoint can take several minutes\n"
+                  << term::reset() << std::flush;
     }
-    std::cerr << "[startup] loading model; this can take several minutes...\n";
-    const auto initialization_started = std::chrono::steady_clock::now();
+    const auto load_started = std::chrono::steady_clock::now();
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {
-            std::cerr << "error: " << error << '\n';
-            if (options.jsonl_protocol) protocol_message("error", error, true);
+            if (options.jsonl_protocol) {
+                protocol_message("error", error, true);
+            } else {
+                std::cerr << term::red() << "  error: " << term::reset()
+                          << error << '\n';
+            }
         }
         return 1;
     }
-    const double load_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - initialization_started).count();
-    std::cerr << "[ready] model loaded in " << std::fixed << std::setprecision(2)
-              << load_seconds
-              << " s; enter a prompt\n";
+    SessionStats session;
+    session.load_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - load_started).count();
+
     if (options.jsonl_protocol) {
         std::ostringstream fields;
         fields << std::fixed << std::setprecision(6)
-               << "\"load_seconds\":" << load_seconds;
+               << "\"load_seconds\":" << session.load_seconds;
         protocol_event("ready", fields.str());
-    }
-    if (!options.prompt.empty()) {
-        const std::array messages{strata::ChatMessage{
-            strata::ChatRole::User, options.prompt}};
-        std::string answer_text;
-        return answer(runtime, options, messages, answer_text) ? 0 : 1;
-    }
-    std::string prompt;
-    std::vector<strata::ChatMessage> conversation;
-    if (options.jsonl_protocol) {
-        while (std::getline(std::cin, prompt)) {
-            strata::ChatRequest request;
-            std::string error;
-            if (!strata::parse_chat_request(prompt, request, error)) {
-                protocol_message("error", error);
-                continue;
-            }
-            auto messages = request.includes_history
-                ? std::move(request.messages)
-                : conversation;
-            if (!request.includes_history) {
-                messages.push_back({strata::ChatRole::User,
-                                    std::move(request.prompt)});
-            }
-            std::string answer_text;
-            if (!answer(runtime, options, messages, answer_text)) return 1;
-            messages.push_back({strata::ChatRole::Assistant,
-                                std::move(answer_text)});
-            conversation = std::move(messages);
-        }
+        std::cerr << "[ready] model loaded in " << std::fixed
+                  << std::setprecision(2) << session.load_seconds << " s\n";
     } else {
-        while (std::cout << "> " && std::getline(std::cin, prompt)) {
-            if (prompt.empty()) continue;
-            conversation.push_back({strata::ChatRole::User, prompt});
-            std::string answer_text;
-            if (!answer(runtime, options, conversation, answer_text)) return 1;
-            conversation.push_back({strata::ChatRole::Assistant,
-                                    std::move(answer_text)});
-        }
+        std::cerr << term::green() << "  ready" << term::reset() << term::grey()
+                  << " in " << std::fixed << std::setprecision(2)
+                  << session.load_seconds << " s\n"
+                  << term::reset() << std::flush;
     }
-    return 0;
+
+    std::vector<strata::ChatMessage> conversation;
+    if (!options.system_prompt.empty()) {
+        conversation.push_back(
+            {strata::ChatRole::System, options.system_prompt});
+    }
+
+    install_interrupt_handler();
+
+    int status = 0;
+    if (!options.prompt.empty()) {
+        conversation.push_back({strata::ChatRole::User, options.prompt});
+        auto outcome = run_turn(runtime, options, conversation);
+        if (!outcome.ok) return 1;
+        session.add(outcome.stats);
+        print_turn_stats(outcome.stats);
+    } else if (options.jsonl_protocol) {
+        status = run_protocol(runtime, options, conversation);
+    } else if (term::stdin_is_tty()) {
+        status = run_interactive(runtime, options, conversation, session);
+    } else {
+        status = run_piped(runtime, options, conversation, session);
+    }
+
+    if (human) print_session_stats(session);
+    return status;
 }

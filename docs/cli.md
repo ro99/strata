@@ -157,7 +157,75 @@ first and the routed experts fill whatever VRAM is left:
   --context-size 2048 --max-new 256 --devices 0,1,2
 ```
 
-Startup prints the selected devices, the VRAM budget per device, load progress, elapsed load time, and the active sampler. Decoding defaults to greedy (`--temperature 0`) for reproducible output. Multi-turn chat reuses the cached prefix and only prefills new tokens.
+Startup prints a banner with the checkpoint, the selected devices, the VRAM
+budget, the attention path and the active sampler, then load progress and the
+elapsed load time. Decoding defaults to greedy (`--temperature 0`) for
+reproducible output. Multi-turn chat reuses the cached prefix and only prefills
+new tokens.
+
+### The interactive session
+
+Once loaded, `strata-chat` prompts with `›`. The prompt is a real line editor:
+history on `↑`/`↓`, `←`/`→` and `Home`/`End` to move, and the usual
+`Ctrl+A`/`Ctrl+E`/`Ctrl+U`/`Ctrl+K`/`Ctrl+W` edits. It moves over whole
+characters, so a prompt containing non-ASCII text edits correctly.
+
+| Command | |
+|---|---|
+| `/help` | list the commands |
+| `/clear` | forget the conversation so far (a `--system` message is kept) |
+| `/regen` | generate the last answer again |
+| `/stats` | throughput so far this session |
+| `/save FILE` | write the transcript to `FILE` as Markdown |
+| `/exit` | quit; `Ctrl+D` does the same |
+
+`Ctrl+C` stops a generation in progress and keeps the partial answer, marking
+the turn `[interrupted]`; on an empty prompt it quits. A second `Ctrl+C` during
+the same generation exits immediately, which is the way out if a model's decode
+loop does not honour cancellation.
+
+#### Where the numbers are reported
+
+Throughput is reported twice, and never as a live counter — a running figure
+only ever describes the last few tokens.
+
+After each answer, that turn:
+
+```
+  prefill 3,565 tok in 5.57 s (640.21 tok/s)   decode 128 tok in 20.29 s (6.31 tok/s)
+```
+
+and on exit, the session:
+
+```
+  session
+    turns     3
+    prefill   10,695 tok in 16.71 s   640.02 tok/s average
+    decode    312 tok in 49.70 s   6.28 tok/s average
+    load      51.32 s
+```
+
+Each average is that phase's total tokens over its total seconds, so a
+two-token turn does not weigh as much as a two-hundred-token one. Prefill and
+decode are never combined: a prompt token and a generated token do not cost the
+same thing. When a turn reuses a cached prefix, the prompt tokens that were not
+re-prefilled are reported separately rather than counted as prefill work.
+
+#### Streams
+
+**Only generated text goes to stdout.** The banner, load progress, the prompt,
+slash-command output, per-turn and session figures, and every error go to
+stderr. So this writes exactly the answer, with the chrome still on the
+terminal:
+
+```bash
+./build/strata-chat --model models/gemma4 --model-type gemma4 \
+  --prompt "Name three primary colors." > answer.txt
+```
+
+Colour is used only when stderr is a terminal, and is disabled by `--no-color`
+or by setting `NO_COLOR`. With stdin redirected, `strata-chat` reads one prompt
+per line and prints one answer per line, with no editor and no colour.
 
 ### Planning a load before making it (`--dry-run`)
 
@@ -233,6 +301,10 @@ Flags worth knowing:
 |---|---|
 | `--devices 0,1,2` | CUDA devices to use |
 | `--context-size N` | Context ceiling enforced by the runtime |
+| `--max-new N` | Tokens generated per turn (default `256`) |
+| `--prompt TEXT` | Answer `TEXT` and exit instead of prompting |
+| `--system TEXT` | Prepend a system message to the conversation |
+| `--no-color` | Plain output even when stderr is a terminal (`NO_COLOR` does the same) |
 | `--vram-fraction F` | Fraction of free VRAM budgeted for weight caching (default `0.85`) |
 | `--host-memory 216G` | Host RAM ceiling for the resident weight arena |
 | `--pin-resident-arena` | Page-lock DeepSeek's resident weights for faster host-to-device demand loads |

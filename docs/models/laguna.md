@@ -48,9 +48,9 @@ same placement flags:
   --vram-fraction 0.85
 ```
 
-Type one user turn per line. Keep the process open: Laguna's routed-expert cache
-warms during the first response and is reused by later turns. The final decode
-measurement appears on stderr as `[done] ... tok/s`.
+Keep the process open: Laguna's routed-expert cache warms during the first
+response and is reused by later turns. Each answer is followed by that turn's
+prefill and decode rates, and `/exit` (or Ctrl+D) prints the session averages.
 
 For a one-shot prompt:
 

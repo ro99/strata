@@ -15,6 +15,12 @@ fi
 if [[ ${WARM_EXPERT_PAGES:-1} == 0 ]]; then
     stage_args+=(--no-warm)
 fi
+if [[ ${HOST_ATTENTION:-0} == 1 ]]; then
+    stage_args+=(--host-attention)
+fi
+if [[ -n ${DEVICE_ATTENTION_MIN_ROWS:-} ]]; then
+    stage_args+=(--device-attention-min-rows "${DEVICE_ATTENTION_MIN_ROWS}")
+fi
 
 mkdir -p "${result_dir}"
 export CUDA_DEVICE_ORDER=FASTEST_FIRST

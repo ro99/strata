@@ -4657,7 +4657,8 @@ __device__ float bf16_kv_sequential_dot_f32(
 __global__ void bf16_kv_attention_reference_all_f32_kernel(
     float* output, float* scores, const float* queries,
     const __nv_bfloat16* keys,
-    const __nv_bfloat16* values, std::uint32_t query_heads,
+    const __nv_bfloat16* values, const float* relative_bias,
+    std::uint32_t relative_bias_extent, std::uint32_t query_heads,
     std::uint32_t key_value_heads, std::uint32_t head_dim,
     std::uint32_t capacity_rows, std::uint32_t cache_start,
     std::uint32_t cached_rows, float scale, unsigned int* error_flag) {
@@ -4682,8 +4683,16 @@ __global__ void bf16_kv_attention_reference_all_f32_kernel(
         const auto* key = keys +
             (static_cast<std::uint64_t>(physical) * key_value_heads + kv_head) *
                 head_dim;
-        head_scores[row] = __fmul_rn(
+        float score = __fmul_rn(
             bf16_kv_sequential_dot_f32(query, key, head_dim), scale);
+        const auto distance = cached_rows - 1U - row;
+        if (distance < relative_bias_extent) {
+            score = __fadd_rn(
+                score, relative_bias[
+                    static_cast<std::uint64_t>(head) * relative_bias_extent +
+                    distance]);
+        }
+        head_scores[row] = score;
         if (!isfinite(head_scores[row])) atomicExch(error_flag, 1U);
     }
     __syncthreads();
@@ -8011,6 +8020,15 @@ ValidationResult CudaBackend::bf16_kv_attention(
     const auto kv_elements = static_cast<std::uint64_t>(request.key_value_heads) *
                              request.head_dim;
     std::uint64_t plane_bytes = 0U;
+    const auto relative_bias_elements =
+        static_cast<std::uint64_t>(request.query_heads) *
+        request.relative_bias_extent;
+    const bool relative_bias_valid =
+        (request.relative_bias.empty() && request.relative_bias_extent == 0U) ||
+        (request.relative_bias_extent != 0U &&
+         request.relative_bias.size() == relative_bias_elements &&
+         std::all_of(request.relative_bias.begin(), request.relative_bias.end(),
+                     [](float value) { return std::isfinite(value); }));
     if (found == impl_->devices.end() || request.cache == nullptr ||
         !request.cache->valid() || request.cache->device() != device ||
         request.query_heads == 0U || request.key_value_heads == 0U ||
@@ -8029,6 +8047,7 @@ ValidationResult CudaBackend::bf16_kv_attention(
                        sizeof(std::uint16_t), plane_bytes) ||
         plane_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
         request.cache->device_bytes() != plane_bytes * 2U ||
+        !relative_bias_valid ||
         std::any_of(request.queries.begin(), request.queries.end(),
                     [](float value) { return !std::isfinite(value); })) {
         result.errors.emplace_back("BF16 KV attention request is invalid");
@@ -8051,7 +8070,9 @@ ValidationResult CudaBackend::bf16_kv_attention(
 
     const auto query_bytes = static_cast<std::uint64_t>(request.queries.size_bytes());
     const auto row_bytes = static_cast<std::uint64_t>(request.next_keys.size_bytes());
-    const auto upload_bytes = query_bytes + 2U * row_bytes;
+    const auto relative_bias_bytes =
+        static_cast<std::uint64_t>(request.relative_bias.size_bytes());
+    const auto upload_bytes = query_bytes + 2U * row_bytes + relative_bias_bytes;
     const auto output_bytes = static_cast<std::uint64_t>(output.size_bytes());
     const auto download_bytes = output_bytes + sizeof(unsigned int);
     std::uint64_t score_bytes = 0U;
@@ -8128,6 +8149,10 @@ ValidationResult CudaBackend::bf16_kv_attention(
                 request.next_keys.data(), row_bytes);
     std::memcpy(state.attention_host_upload + query_bytes + row_bytes,
                 request.next_values.data(), row_bytes);
+    if (relative_bias_bytes != 0U) {
+        std::memcpy(state.attention_host_upload + query_bytes + 2U * row_bytes,
+                    request.relative_bias.data(), relative_bias_bytes);
+    }
     const auto operation_started = std::chrono::steady_clock::now();
     if (impl_->detailed_timing) {
         if (auto status = cudaEventRecord(state.activation_start, state.stream);
@@ -8149,6 +8174,8 @@ ValidationResult CudaBackend::bf16_kv_attention(
         state.attention_upload + query_bytes);
     auto* device_next_values = reinterpret_cast<const __nv_bfloat16*>(
         state.attention_upload + query_bytes + row_bytes);
+    auto* device_relative_bias = reinterpret_cast<const float*>(
+        state.attention_upload + query_bytes + 2U * row_bytes);
     if (auto status = cudaMemcpyAsync(
             cache_keys + static_cast<std::uint64_t>(physical) * kv_elements,
             device_next_keys, static_cast<std::size_t>(row_bytes),
@@ -8178,7 +8205,8 @@ ValidationResult CudaBackend::bf16_kv_attention(
         request.query_heads, 256U, 0U, state.stream>>>(
         device_output, state.attention_scores,
         reinterpret_cast<const float*>(state.attention_upload), cache_keys,
-        cache_values, request.query_heads, request.key_value_heads,
+        cache_values, device_relative_bias, request.relative_bias_extent,
+        request.query_heads, request.key_value_heads,
         request.head_dim, request.capacity_rows, request.cache_start,
         request.cached_rows, request.scale, device_error);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
@@ -8251,7 +8279,8 @@ ValidationResult CudaBackend::bf16_kv_attention(
         ++stats.flash_attention_d2h_transfers;
         stats.flash_attention_h2d_bytes += upload_bytes;
         stats.flash_attention_d2h_bytes += download_bytes;
-        stats.flash_attention_useful_staging_bytes += 2U * row_bytes;
+        stats.flash_attention_useful_staging_bytes +=
+            2U * row_bytes + relative_bias_bytes;
         stats.flash_attention_h2d_nanoseconds += h2d_nanoseconds;
         stats.flash_attention_kernel_nanoseconds += kernel_nanoseconds;
         stats.flash_attention_d2h_nanoseconds += d2h_nanoseconds;

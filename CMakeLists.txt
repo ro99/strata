@@ -262,6 +262,9 @@ find_library(NUMA_LIBRARY_PROBE numa REQUIRED)
 target_link_libraries(strata-kimi-compute-probe PRIVATE strata_core ${NUMA_LIBRARY_PROBE})
 add_executable(strata-inkling-probe apps/strata_inkling_probe.cpp)
 target_link_libraries(strata-inkling-probe PRIVATE strata_core)
+add_executable(strata-inkling-attention-probe
+    apps/strata_inkling_attention_probe.cpp)
+target_link_libraries(strata-inkling-attention-probe PRIVATE strata_core)
 
 add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
 target_link_libraries(strata-laguna-profile PRIVATE strata_core)

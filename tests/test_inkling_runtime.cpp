@@ -84,6 +84,18 @@ TEST_CASE("Inkling runtime rejects use before initialization") {
     REQUIRE(!runtime.generate_stream("hello", 1U).ok());
 }
 
+TEST_CASE("Inkling runtime rejects context outside the model contract") {
+    strata::InklingRuntimeConfig config;
+    config.maximum_context_tokens = 0U;
+    strata::InklingRuntime zero;
+    REQUIRE(!zero.initialize("unused", config).ok());
+
+    config.maximum_context_tokens =
+        strata::kInklingExecutionContract.maximum_context_tokens + 1U;
+    strata::InklingRuntime excessive;
+    REQUIRE(!excessive.initialize("unused", config).ok());
+}
+
 TEST_CASE("Inkling runtime generates the expected continuation") {
     if (!inkling_checkpoint_present()) {
         SKIP("pinned Inkling-Small-NVFP4 checkpoint is absent");

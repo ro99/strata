@@ -1437,6 +1437,64 @@ TEST_CASE("persistent BF16 KV ring matches Laguna's target-shape F32 attention c
         REQUIRE(actual[index] == expected[index]);
     }
 
+    // Inkling adds a learned per-head bias by distance after the scaled dot.
+    // Column zero is the current row; entries beyond the declared extent are
+    // exactly zero. Reproduce the adapter's sequential F32 arithmetic here.
+    constexpr std::uint32_t bias_extent = 2U;
+    std::array<float, query_heads * bias_extent> relative_bias{};
+    for (std::size_t index = 0U; index < relative_bias.size(); ++index) {
+        relative_bias[index] =
+            static_cast<float>(static_cast<int>(index % 7U) - 3) / 32.0F;
+    }
+    std::array<float, query_elements> biased_expected{};
+    const auto heads_per_kv = query_heads / kv_heads;
+    std::array<float, 3> scores{};
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+        const auto kv_head = head / heads_per_kv;
+        float maximum = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t row = 0U; row < 3U; ++row) {
+            float dot = 0.0F;
+            for (std::uint32_t element = 0U; element < head_dim; ++element) {
+                dot += queries[static_cast<std::size_t>(head) * head_dim + element] *
+                       host_keys[(static_cast<std::size_t>(row) * kv_heads +
+                                  kv_head) * head_dim + element];
+            }
+            float score = dot * request.scale;
+            const auto distance = 2U - row;
+            if (distance < bias_extent) {
+                score += relative_bias[
+                    static_cast<std::size_t>(head) * bias_extent + distance];
+            }
+            scores[row] = score;
+            maximum = std::max(maximum, score);
+        }
+        float denominator = 0.0F;
+        for (auto& score : scores) {
+            score = std::exp(score - maximum);
+            denominator += score;
+        }
+        for (auto& score : scores) score /= denominator;
+        for (std::uint32_t element = 0U; element < head_dim; ++element) {
+            float accumulator = 0.0F;
+            for (std::uint32_t row = 0U; row < 3U; ++row) {
+                accumulator +=
+                    scores[row] *
+                    host_values[(static_cast<std::size_t>(row) * kv_heads +
+                                 kv_head) * head_dim + element];
+            }
+            biased_expected[static_cast<std::size_t>(head) * head_dim + element] =
+                accumulator;
+        }
+    }
+    request.relative_bias = relative_bias;
+    request.relative_bias_extent = bias_extent;
+    REQUIRE(backend.bf16_kv_attention(device, request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], biased_expected[index], 1.0e-6F);
+    }
+    request.relative_bias = {};
+    request.relative_bias_extent = 0U;
+
     // Exercise the physical wrap used once a sliding layer reaches its
     // 512-token capacity. Logical rows 1 and 2 occupy physical slots 1 and 0;
     // the new row 3 overwrites slot 1 and leaves logical rows 2 and 3 visible.

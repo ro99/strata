@@ -36,6 +36,17 @@ struct InklingRuntimeConfig {
     // scratch. False retains the measured control path for profiling. NVFP4
     // still needs scratch to de-interleave gate/up and is unaffected.
     bool direct_mapped_mxfp4_staging{true};
+    // Keep the exact BF16 K/V ring on each layer's assigned device and run
+    // Inkling's relative-bias attention there. False retains the scalar host
+    // oracle for controlled comparisons.
+    bool enable_device_kv_attention{true};
+    // Keep short generations on the scalar oracle. Although the device
+    // operation crosses over near 32 rows, a route-sensitive 64-token run
+    // regressed after its numerically equivalent route changed. At 512 rows
+    // the target-shape operation is already 35x faster on SM86, so this
+    // conservative boundary preserves the short-context path while removing
+    // the unbounded host-attention term at long context.
+    std::uint32_t minimum_device_attention_rows{512U};
     std::uint32_t maximum_context_tokens{2048U};
     // Rows per prefill page. Zero or one keeps the token-at-a-time path.
     // Above one, a page runs attention and the short convolutions row by row
@@ -87,6 +98,7 @@ struct InklingDeviceStats {
     std::vector<std::uint64_t> cache_capacity_bytes;
     std::vector<std::uint64_t> cache_peak_bytes;
     std::vector<std::uint64_t> resident_spine_bytes;
+    std::vector<std::uint64_t> resident_kv_bytes;
     bool enabled{};
 
     [[nodiscard]] double hit_rate() const noexcept {

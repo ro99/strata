@@ -113,6 +113,8 @@ struct DeviceLayer {
     std::array<CudaWeight, 2U> shared_gate;
     std::array<CudaWeight, 2U> shared_up;
     std::array<CudaWeight, 2U> shared_down;
+    CudaBuffer kv_cache;
+    std::uint32_t kv_capacity_rows{};
     bool resident{};
 };
 
@@ -159,6 +161,7 @@ struct LayerState {
     std::vector<float> values;
     std::uint64_t rows{};
     std::uint64_t base_position{};
+    bool device_kv_ready{};
     // Rolling conv inputs, kConvTaps rows per stream, oldest first.
     std::array<std::vector<float>, kConvStreams> conv_history;
 };
@@ -200,6 +203,7 @@ struct InklingRuntime::Impl {
     std::unique_ptr<InklingExpertCache> expert_cache;
     CudaWeight device_unembed;
     std::vector<std::uint64_t> resident_spine_bytes;
+    std::vector<std::uint64_t> resident_kv_bytes;
     bool cuda_enabled{};
     std::uint64_t position{};
     InklingGraphStats graph;
@@ -507,62 +511,119 @@ struct InklingRuntime::Impl {
 
         const bool local = !weights.global;
         const auto window = kContract.sliding_window;
+        if (local && layer_state.rows > window) {
+            const auto drop = layer_state.rows - window;
+            layer_state.keys.erase(
+                layer_state.keys.begin(),
+                layer_state.keys.begin() +
+                    static_cast<std::ptrdiff_t>(drop * kKvWidth));
+            layer_state.values.erase(
+                layer_state.values.begin(),
+                layer_state.values.begin() +
+                    static_cast<std::ptrdiff_t>(drop * kKvWidth));
+            layer_state.rows -= drop;
+            layer_state.base_position += drop;
+        }
         std::vector<float> context(kQueryWidth, 0.0F);
         const auto heads_per_kv = kHeads / kKvHeads;
-        std::vector<float> scores(static_cast<std::size_t>(layer_state.rows));
-        std::vector<std::uint64_t> visible;
-        visible.reserve(static_cast<std::size_t>(layer_state.rows));
-        for (std::uint64_t row = 0U; row < layer_state.rows; ++row) {
-            const auto key_position = layer_state.base_position + row;
-            if (inkling_attention_visible(token_position, key_position, local,
-                                          window)) {
-                visible.push_back(row);
+        const bool use_device =
+            config.enable_device_kv_attention && device.kv_cache.valid() &&
+            layer_state.rows >= config.minimum_device_attention_rows;
+        if (use_device) {
+            if (!layer_state.device_kv_ready) {
+                std::vector<std::uint16_t> encoded_keys(layer_state.keys.size());
+                std::vector<std::uint16_t> encoded_values(layer_state.values.size());
+                std::transform(layer_state.keys.begin(), layer_state.keys.end(),
+                               encoded_keys.begin(), bf16_encode);
+                std::transform(layer_state.values.begin(), layer_state.values.end(),
+                               encoded_values.begin(), bf16_encode);
+                result = cuda.upload_gemma4_kv(
+                    device.kv_cache, encoded_keys, encoded_values,
+                    static_cast<std::uint32_t>(layer_state.base_position),
+                    device.kv_capacity_rows, kKvWidth);
+                if (!result.ok()) return result;
+                layer_state.device_kv_ready = true;
             }
-        }
-        if (visible.empty()) {
-            result.errors.emplace_back("Inkling attention has no visible keys");
-            return result;
-        }
-
-        for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            const auto kv_head = head / heads_per_kv;
-            const auto* query_row =
-                query.data() + static_cast<std::size_t>(head) * kHeadDim;
-            const auto* bias_row =
-                bias.data() + static_cast<std::size_t>(head) * extent;
-            float maximum = -std::numeric_limits<float>::infinity();
-            for (std::size_t index = 0U; index < visible.size(); ++index) {
-                const auto row = visible[index];
+            std::vector<std::uint16_t> encoded_key(kKvWidth);
+            std::vector<std::uint16_t> encoded_value(kKvWidth);
+            std::transform(key.begin(), key.end(), encoded_key.begin(), bf16_encode);
+            std::transform(value.begin(), value.end(), encoded_value.begin(),
+                           bf16_encode);
+            CudaBf16KvAttentionRequest request;
+            request.cache = &device.kv_cache;
+            request.queries = query;
+            request.next_keys = encoded_key;
+            request.next_values = encoded_value;
+            request.relative_bias = bias;
+            request.query_heads = kHeads;
+            request.key_value_heads = kKvHeads;
+            request.head_dim = kHeadDim;
+            request.capacity_rows = device.kv_capacity_rows;
+            request.cache_start =
+                static_cast<std::uint32_t>(layer_state.base_position);
+            request.cached_rows = static_cast<std::uint32_t>(layer_state.rows);
+            request.position = static_cast<std::uint32_t>(token_position);
+            request.relative_bias_extent = extent;
+            request.scale = kContract.attention_scale;
+            result = cuda.bf16_kv_attention(
+                devices[device.slot], request, context);
+            if (!result.ok()) return result;
+        } else {
+            std::vector<float> scores(static_cast<std::size_t>(layer_state.rows));
+            std::vector<std::uint64_t> visible;
+            visible.reserve(static_cast<std::size_t>(layer_state.rows));
+            for (std::uint64_t row = 0U; row < layer_state.rows; ++row) {
                 const auto key_position = layer_state.base_position + row;
-                const auto* key_row =
-                    layer_state.keys.data() + row * kKvWidth +
-                    static_cast<std::size_t>(kv_head) * kHeadDim;
-                float dot = 0.0F;
-                for (std::uint32_t element = 0U; element < kHeadDim; ++element) {
-                    dot += query_row[element] * key_row[element];
+                if (inkling_attention_visible(token_position, key_position, local,
+                                              window)) {
+                    visible.push_back(row);
                 }
-                float score = dot * kContract.attention_scale;
-                // The bias is zero outside its extent, which is what makes a
-                // global layer content-only beyond 1024 tokens.
-                const auto distance = token_position - key_position;
-                if (distance < extent) score += bias_row[distance];
-                scores[index] = score;
-                maximum = std::max(maximum, score);
             }
-            float total = 0.0F;
-            for (std::size_t index = 0U; index < visible.size(); ++index) {
-                scores[index] = std::exp(scores[index] - maximum);
-                total += scores[index];
+            if (visible.empty()) {
+                result.errors.emplace_back("Inkling attention has no visible keys");
+                return result;
             }
-            auto* context_row =
-                context.data() + static_cast<std::size_t>(head) * kHeadDim;
-            for (std::size_t index = 0U; index < visible.size(); ++index) {
-                const float weight = scores[index] / total;
-                const auto* value_row =
-                    layer_state.values.data() + visible[index] * kKvWidth +
-                    static_cast<std::size_t>(kv_head) * kHeadDim;
-                for (std::uint32_t element = 0U; element < kHeadDim; ++element) {
-                    context_row[element] += weight * value_row[element];
+
+            for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                const auto kv_head = head / heads_per_kv;
+                const auto* query_row =
+                    query.data() + static_cast<std::size_t>(head) * kHeadDim;
+                const auto* bias_row =
+                    bias.data() + static_cast<std::size_t>(head) * extent;
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (std::size_t index = 0U; index < visible.size(); ++index) {
+                    const auto row = visible[index];
+                    const auto key_position = layer_state.base_position + row;
+                    const auto* key_row =
+                        layer_state.keys.data() + row * kKvWidth +
+                        static_cast<std::size_t>(kv_head) * kHeadDim;
+                    float dot = 0.0F;
+                    for (std::uint32_t element = 0U; element < kHeadDim; ++element) {
+                        dot += query_row[element] * key_row[element];
+                    }
+                    float score = dot * kContract.attention_scale;
+                    // The bias is zero outside its extent, which is what makes a
+                    // global layer content-only beyond 1024 tokens.
+                    const auto distance = token_position - key_position;
+                    if (distance < extent) score += bias_row[distance];
+                    scores[index] = score;
+                    maximum = std::max(maximum, score);
+                }
+                float total = 0.0F;
+                for (std::size_t index = 0U; index < visible.size(); ++index) {
+                    scores[index] = std::exp(scores[index] - maximum);
+                    total += scores[index];
+                }
+                auto* context_row =
+                    context.data() + static_cast<std::size_t>(head) * kHeadDim;
+                for (std::size_t index = 0U; index < visible.size(); ++index) {
+                    const float weight = scores[index] / total;
+                    const auto* value_row =
+                        layer_state.values.data() + visible[index] * kKvWidth +
+                        static_cast<std::size_t>(kv_head) * kHeadDim;
+                    for (std::uint32_t element = 0U; element < kHeadDim; ++element) {
+                        context_row[element] += weight * value_row[element];
+                    }
                 }
             }
         }
@@ -1344,6 +1405,7 @@ struct InklingRuntime::Impl {
             layer.values.clear();
             layer.rows = 0U;
             layer.base_position = 0U;
+            layer.device_kv_ready = false;
             reset_conv_history(layer);
         }
         for (auto& depth : mtp_state) {
@@ -1351,6 +1413,7 @@ struct InklingRuntime::Impl {
             depth.values.clear();
             depth.rows = 0U;
             depth.base_position = 0U;
+            depth.device_kv_ready = false;
             reset_conv_history(depth);
         }
         position = 0U;
@@ -1780,6 +1843,17 @@ struct InklingRuntime::Impl {
         result = cuda.initialize(devices, config.vram_cache_fraction);
         if (!result.ok()) return result;
         resident_spine_bytes.assign(devices.size(), 0U);
+        resident_kv_bytes.assign(devices.size(), 0U);
+        const bool configure_device_attention =
+            config.enable_device_kv_attention &&
+            config.maximum_context_tokens >
+                config.minimum_device_attention_rows;
+        if (configure_device_attention) {
+            for (const auto device : devices) {
+                result = cuda.validate_flash_attention_device(device);
+                if (!result.ok()) return result;
+            }
+        }
 
         const auto upload_linear = [&](std::size_t slot, const std::string& name,
                                        std::uint64_t rows, std::uint64_t columns,
@@ -1950,6 +2024,19 @@ struct InklingRuntime::Impl {
             }
             if (!result.ok()) return result;
             device.resident = inkling_sparse_layer(index);
+            if (configure_device_attention) {
+                device.kv_capacity_rows = inkling_global_attention_layer(index)
+                    ? config.maximum_context_tokens
+                    : std::min(config.maximum_context_tokens,
+                               kContract.sliding_window);
+                const auto bytes =
+                    2ULL * device.kv_capacity_rows * kKvWidth *
+                    sizeof(std::uint16_t);
+                result = cuda.allocate_buffer(
+                    devices[device.slot], bytes, device.kv_cache);
+                if (!result.ok()) return result;
+                resident_kv_bytes[device.slot] += bytes;
+            }
         }
 
         // The output head is the single largest spine tensor; it lands on the
@@ -2041,6 +2128,11 @@ ValidationResult InklingRuntime::initialize(const std::string& model_directory,
     ValidationResult result;
     if (impl_->initialized) {
         result.errors.emplace_back("Inkling runtime is already initialized");
+        return result;
+    }
+    if (config.maximum_context_tokens == 0U ||
+        config.maximum_context_tokens > kContract.maximum_context_tokens) {
+        result.errors.emplace_back("Inkling context capacity is invalid");
         return result;
     }
     auto checkpoint = InklingCheckpointReader::open(model_directory);
@@ -2444,6 +2536,7 @@ InklingGenerationResult InklingRuntime::Impl::generate(
     result.metrics.cuda = impl.cuda.stats();
     result.metrics.device.enabled = impl.cuda_enabled;
     result.metrics.device.resident_spine_bytes = impl.resident_spine_bytes;
+    result.metrics.device.resident_kv_bytes = impl.resident_kv_bytes;
     if (impl.expert_cache != nullptr) {
         const auto cache = impl.expert_cache->stats();
         result.metrics.device.expert_hits = cache.hits;

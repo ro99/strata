@@ -34,6 +34,9 @@ int main(int argc, char** argv) {
     bool chat = false;
     bool warm_experts = true;
     bool direct_stage = true;
+    bool device_attention = true;
+    std::uint32_t device_attention_minimum_rows = 512U;
+    std::uint32_t context_tokens = 512U;
     std::vector<int> devices;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -53,6 +56,15 @@ int main(int argc, char** argv) {
             direct_stage = true;
         } else if (argument == "--pinned-stage") {
             direct_stage = false;
+        } else if (argument == "--host-attention") {
+            device_attention = false;
+        } else if (argument == "--device-attention-min-rows" &&
+                   index + 1 < argc) {
+            device_attention_minimum_rows =
+                static_cast<std::uint32_t>(std::stoul(argv[++index]));
+        } else if (argument == "--context" && index + 1 < argc) {
+            context_tokens =
+                static_cast<std::uint32_t>(std::stoul(argv[++index]));
         } else if (argument == "--devices" && index + 1 < argc) {
             std::string list = argv[++index];
             std::size_t begin = 0U;
@@ -68,7 +80,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-inkling-probe [--model DIR] "
                          "[--prompt TEXT] [--tokens N] [--devices LIST] "
-                         "[--no-warm] [--direct-stage|--pinned-stage]\n");
+                         "[--no-warm] [--direct-stage|--pinned-stage] "
+                         "[--host-attention] [--device-attention-min-rows N] "
+                         "[--context N]\n");
             return 2;
         }
     }
@@ -83,7 +97,9 @@ int main(int argc, char** argv) {
     config.devices = devices;
     config.warm_expert_pages = warm_experts;
     config.direct_mapped_mxfp4_staging = direct_stage;
-    config.maximum_context_tokens = 512U;
+    config.enable_device_kv_attention = device_attention;
+    config.minimum_device_attention_rows = device_attention_minimum_rows;
+    config.maximum_context_tokens = context_tokens;
     config.load_progress = true;
     strata::InklingRuntime runtime;
     strata::reset_cuda_matmul_route_census();
@@ -219,6 +235,11 @@ int main(int argc, char** argv) {
                     : 0.0;
             std::printf("\n  device %zu: spine %.2f GiB, cache budget %.2f GiB",
                         slot, spine, capacity);
+            if (slot < device.resident_kv_bytes.size()) {
+                std::printf(", KV %.2f GiB",
+                            static_cast<double>(device.resident_kv_bytes[slot]) /
+                                (1024.0 * 1024.0 * 1024.0));
+            }
         }
     }
     const auto& cuda = result.metrics.cuda;

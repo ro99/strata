@@ -278,6 +278,10 @@ struct CudaBf16KvAttentionRequest {
     std::span<const float> queries;
     std::span<const std::uint16_t> next_keys;
     std::span<const std::uint16_t> next_values;
+    // Optional [query_heads, relative_bias_extent] score bias indexed by
+    // distance from the current row: column zero is the just-appended row.
+    // An empty span with extent zero preserves the Laguna contract.
+    std::span<const float> relative_bias;
     std::uint32_t query_heads{};
     std::uint32_t key_value_heads{};
     std::uint32_t head_dim{};
@@ -285,6 +289,7 @@ struct CudaBf16KvAttentionRequest {
     std::uint32_t cache_start{};
     std::uint32_t cached_rows{};
     std::uint32_t position{};
+    std::uint32_t relative_bias_extent{};
     float scale{};
 };
 

@@ -36,9 +36,11 @@ int main(int argc, char** argv) {
     bool direct_stage = true;
     bool weight_arena = true;
     bool deferred_expert_uploads = true;
+    bool expert_parallel = false;
     bool device_attention = true;
     std::uint32_t device_attention_minimum_rows = 512U;
     std::uint32_t context_tokens = 512U;
+    std::string route_trace;
     std::vector<int> devices;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -62,6 +64,8 @@ int main(int argc, char** argv) {
             weight_arena = false;
         } else if (argument == "--sync-expert-uploads") {
             deferred_expert_uploads = false;
+        } else if (argument == "--expert-parallel") {
+            expert_parallel = true;
         } else if (argument == "--host-attention") {
             device_attention = false;
         } else if (argument == "--device-attention-min-rows" &&
@@ -71,6 +75,8 @@ int main(int argc, char** argv) {
         } else if (argument == "--context" && index + 1 < argc) {
             context_tokens =
                 static_cast<std::uint32_t>(std::stoul(argv[++index]));
+        } else if (argument == "--route-trace" && index + 1 < argc) {
+            route_trace = argv[++index];
         } else if (argument == "--devices" && index + 1 < argc) {
             std::string list = argv[++index];
             std::size_t begin = 0U;
@@ -89,8 +95,9 @@ int main(int argc, char** argv) {
                          "[--no-warm] [--direct-stage|--pinned-stage] "
                          "[--no-weight-arena] "
                          "[--sync-expert-uploads] "
+                         "[--expert-parallel] "
                          "[--host-attention] [--device-attention-min-rows N] "
-                         "[--context N]\n");
+                         "[--context N] [--route-trace PATH]\n");
             return 2;
         }
     }
@@ -107,9 +114,11 @@ int main(int argc, char** argv) {
     config.direct_mapped_mxfp4_staging = direct_stage;
     config.use_weight_arena = weight_arena;
     config.defer_mapped_mxfp4_uploads = deferred_expert_uploads;
+    config.enable_expert_parallel = expert_parallel;
     config.enable_device_kv_attention = device_attention;
     config.minimum_device_attention_rows = device_attention_minimum_rows;
     config.maximum_context_tokens = context_tokens;
+    config.route_trace_path = route_trace;
     config.load_progress = true;
     strata::InklingRuntime runtime;
     strata::reset_cuda_matmul_route_census();
@@ -243,8 +252,11 @@ int main(int argc, char** argv) {
                     ? static_cast<double>(device.resident_spine_bytes[slot]) /
                           (1024.0 * 1024.0 * 1024.0)
                     : 0.0;
-            std::printf("\n  device %zu: spine %.2f GiB, cache budget %.2f GiB",
-                        slot, spine, capacity);
+            std::printf("\n  device %zu: spine %.2f GiB, cache budget %.2f GiB "
+                        "(%llu bytes)",
+                        slot, spine, capacity,
+                        static_cast<unsigned long long>(
+                            device.cache_capacity_bytes[slot]));
             if (slot < device.resident_kv_bytes.size()) {
                 std::printf(", KV %.2f GiB",
                             static_cast<double>(device.resident_kv_bytes[slot]) /

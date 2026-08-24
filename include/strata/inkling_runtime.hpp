@@ -44,6 +44,10 @@ struct InklingRuntimeConfig {
     // may run on the copy stream and be ordered once before the MoE batch.
     // False retains three host-blocking upload synchronizations per expert.
     bool defer_mapped_mxfp4_uploads{true};
+    // Give each (layer, expert) one stable owner across the admitted devices
+    // and execute a decode route concurrently by owner. False retains the
+    // layer-local single-device scheduler as an exact A/B control.
+    bool enable_expert_parallel{};
     // Keep the exact BF16 K/V ring on each layer's assigned device and run
     // Inkling's relative-bias attention there. False retains the scalar host
     // oracle for controlled comparisons.
@@ -79,6 +83,9 @@ struct InklingRuntimeConfig {
     // an unmeasured draft adds compute to every step.
     bool enable_mtp_speculation{};
     std::uint32_t speculation_depth{};
+    // Optional exact sequential routing trace used by cache and placement
+    // simulations. Recording is observational and never changes selection.
+    std::string route_trace_path;
     std::uint64_t request_id{};
 };
 

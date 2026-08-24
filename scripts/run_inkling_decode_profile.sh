@@ -27,6 +27,9 @@ fi
 if [[ ${DEFER_EXPERT_UPLOADS:-1} == 0 ]]; then
     stage_args+=(--sync-expert-uploads)
 fi
+if [[ ${EXPERT_PARALLEL:-0} == 1 ]]; then
+    stage_args+=(--expert-parallel)
+fi
 
 mkdir -p "${result_dir}"
 export CUDA_DEVICE_ORDER=FASTEST_FIRST

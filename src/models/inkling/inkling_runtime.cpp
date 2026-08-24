@@ -9,6 +9,7 @@
 #include "strata/numerics.hpp"
 #include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
+#include "strata/trace.hpp"
 #include "strata/worker_pool.hpp"
 
 #include <algorithm>
@@ -188,6 +189,8 @@ struct InklingRuntime::Impl {
     std::unique_ptr<InklingCheckpointReader> checkpoint;
     ModelTokenizer tokenizer;
     std::unique_ptr<HostWorkerPool> workers;
+    std::unique_ptr<HostWorkerPool> device_workers;
+    RouteTraceWriter route_trace;
     std::vector<LayerWeights> layers{kLayers};
     std::vector<MtpWeights> mtp;
     MappedMatrix embedding;
@@ -199,6 +202,7 @@ struct InklingRuntime::Impl {
     RouterSpec router;
     CudaBackend cuda;
     std::vector<int> devices;
+    std::vector<std::size_t> device_schedule;
     std::vector<DeviceLayer> device_layers;
     std::unique_ptr<InklingExpertCache> expert_cache;
     CudaWeight device_unembed;
@@ -211,6 +215,33 @@ struct InklingRuntime::Impl {
     SamplingOptions active_sampling;
     TokenLogprob last_sample;
     bool initialized{};
+
+    [[nodiscard]] std::size_t expert_device(std::uint32_t layer,
+                                            std::uint32_t expert,
+                                            std::size_t layer_slot) const {
+        if (!config.enable_expert_parallel || device_schedule.size() <= 1U) {
+            return layer_slot;
+        }
+        const auto index =
+            (static_cast<std::size_t>(layer) * kExperts + expert) %
+            device_schedule.size();
+        return device_schedule[index];
+    }
+
+    bool write_route(std::uint64_t token_position, std::uint32_t layer,
+                     const InklingRoute& route, bool prefill) {
+        if (!route_trace.is_open()) return true;
+        RouteEvent event;
+        event.request = config.request_id;
+        event.token_position = token_position;
+        event.layer = layer;
+        event.experts.assign(route.experts.begin(),
+                             route.experts.begin() + kTopK);
+        event.coefficients.assign(route.weights.begin(),
+                                  route.weights.begin() + kTopK);
+        event.phase = prefill ? RoutePhase::Prefill : RoutePhase::Decode;
+        return route_trace.write(event).ok();
+    }
 
     // ---- primitive kernels -------------------------------------------------
 
@@ -687,7 +718,8 @@ struct InklingRuntime::Impl {
     }
 
     ValidationResult moe(const LayerWeights& layer, const DeviceLayer& device,
-                         std::uint32_t index, std::span<const float> input,
+                         std::uint32_t index, std::uint64_t token_position,
+                         bool prefill, std::span<const float> input,
                          std::span<float> output) {
         auto started = std::chrono::steady_clock::now();
         std::vector<float> logits(layer.gate.rows);
@@ -698,6 +730,10 @@ struct InklingRuntime::Impl {
                                                 layer.gate_global_scale);
         if (!route.ok()) {
             result.errors = std::move(route.errors);
+            return result;
+        }
+        if (!write_route(token_position, index, route.value, prefill)) {
+            result.errors.emplace_back("cannot write Inkling route trace");
             return result;
         }
         graph.moe_router_nanoseconds += elapsed_since(started);
@@ -792,50 +828,125 @@ struct InklingRuntime::Impl {
         };
 
         const auto started = std::chrono::steady_clock::now();
-        std::vector<CudaMoeExpert> routed;
-        routed.reserve(kTopK);
-        std::vector<std::uint32_t> leased;
-        leased.reserve(kTopK);
-        const auto release_all = [&]() {
-            for (const auto expert : leased) {
-                expert_cache->release(device.slot, index, expert);
+        if (!config.enable_expert_parallel || devices.size() <= 1U) {
+            std::vector<CudaMoeExpert> routed;
+            routed.reserve(kTopK);
+            std::vector<std::uint32_t> leased;
+            leased.reserve(kTopK);
+            const auto release_all = [&]() {
+                for (const auto expert : leased) {
+                    expert_cache->release(device.slot, index, expert);
+                }
+            };
+            for (std::uint32_t choice = 0U; choice < kTopK; ++choice) {
+                const auto expert = route.experts[choice];
+                auto staged = expert_cache->acquire(
+                    device.slot, index, expert, layer.expert_gate,
+                    layer.expert_up, layer.expert_down);
+                if (!staged.ok()) {
+                    release_all();
+                    result.errors = std::move(staged.errors);
+                    return result;
+                }
+                leased.push_back(expert);
+                routed.push_back(CudaMoeExpert{&staged.value->gate,
+                                               &staged.value->up,
+                                               &staged.value->down, 1.0F});
+                graph.routed_expert_bytes += staged.value->device_bytes();
             }
-            leased.clear();
-        };
+            result = cuda.synchronize_uploads(devices[device.slot]);
+            if (result.ok()) {
+                result = cuda.enqueue_moe(devices[device.slot], input, 1U,
+                                          routed, nullptr);
+            }
+            std::vector<float> collected(routed.size() * kHidden);
+            if (result.ok()) {
+                result = cuda.collect_moe(devices[device.slot], collected, {});
+            }
+            release_all();
+            if (!result.ok()) return result;
+            accumulate(collected, routed.size(), 0U);
+            graph.moe_routed_nanoseconds += elapsed_since(started);
+        } else {
+        std::array<std::size_t, kTopK> owners{};
         for (std::uint32_t choice = 0U; choice < kTopK; ++choice) {
-            const auto expert = route.experts[choice];
-            auto staged = expert_cache->acquire(device.slot, index, expert,
-                                                layer.expert_gate,
-                                                layer.expert_up,
-                                                layer.expert_down);
-            if (!staged.ok()) {
+            owners[choice] = expert_device(index, route.experts[choice],
+                                           device.slot);
+        }
+        std::vector<float> routed_collected(
+            static_cast<std::size_t>(kTopK) * kHidden);
+        std::vector<std::vector<std::string>> device_errors(devices.size());
+        std::vector<std::uint64_t> device_bytes(devices.size());
+        auto dispatched = device_workers->parallel_for(
+            devices.size(), [&](std::size_t slot) {
+                std::vector<std::uint32_t> choices;
+                for (std::uint32_t choice = 0U; choice < kTopK; ++choice) {
+                    if (owners[choice] == slot) choices.push_back(choice);
+                }
+                if (choices.empty()) return;
+
+                ValidationResult status;
+                std::vector<CudaMoeExpert> batch;
+                std::vector<std::uint32_t> leased;
+                batch.reserve(choices.size());
+                leased.reserve(choices.size());
+                const auto release_all = [&]() {
+                    for (const auto expert : leased) {
+                        expert_cache->release(slot, index, expert);
+                    }
+                };
+                for (const auto choice : choices) {
+                    const auto expert = route.experts[choice];
+                    auto staged = expert_cache->acquire(
+                        slot, index, expert, layer.expert_gate, layer.expert_up,
+                        layer.expert_down);
+                    if (!staged.ok()) {
+                        release_all();
+                        device_errors[slot] = std::move(staged.errors);
+                        return;
+                    }
+                    leased.push_back(expert);
+                    batch.push_back(CudaMoeExpert{&staged.value->gate,
+                                                  &staged.value->up,
+                                                  &staged.value->down, 1.0F});
+                    device_bytes[slot] += staged.value->device_bytes();
+                }
+                status = cuda.synchronize_uploads(devices[slot]);
+                if (status.ok()) {
+                    status = cuda.enqueue_moe(devices[slot], input, 1U, batch,
+                                              nullptr);
+                }
+                std::vector<float> local(choices.size() * kHidden);
+                if (status.ok()) {
+                    status = cuda.collect_moe(devices[slot], local, {});
+                }
                 release_all();
-                result.errors = std::move(staged.errors);
-                return result;
-            }
-            leased.push_back(expert);
-            routed.push_back(CudaMoeExpert{&staged.value->gate,
-                                           &staged.value->up,
-                                           &staged.value->down, 1.0F});
-            graph.routed_expert_bytes += staged.value->device_bytes();
+                if (!status.ok()) {
+                    device_errors[slot] = std::move(status.errors);
+                    return;
+                }
+                for (std::size_t choice_index = 0U;
+                     choice_index < choices.size(); ++choice_index) {
+                    std::copy_n(
+                        local.begin() + static_cast<std::ptrdiff_t>(
+                                            choice_index * kHidden),
+                        kHidden,
+                        routed_collected.begin() + static_cast<std::ptrdiff_t>(
+                                                       choices[choice_index] *
+                                                       kHidden));
+                }
+            });
+        if (!dispatched.ok()) return dispatched;
+        for (auto& errors : device_errors) {
+            result.errors.insert(result.errors.end(),
+                                 std::make_move_iterator(errors.begin()),
+                                 std::make_move_iterator(errors.end()));
         }
-        result = cuda.synchronize_uploads(devices[device.slot]);
-        if (!result.ok()) {
-            release_all();
-            return result;
-        }
-        result = cuda.enqueue_moe(devices[device.slot], input, 1U, routed,
-                                  nullptr);
-        if (!result.ok()) {
-            release_all();
-            return result;
-        }
-        std::vector<float> collected(routed.size() * kHidden);
-        result = cuda.collect_moe(devices[device.slot], collected, {});
-        release_all();
         if (!result.ok()) return result;
-        accumulate(collected, routed.size(), 0U);
+        for (const auto bytes : device_bytes) graph.routed_expert_bytes += bytes;
+        accumulate(routed_collected, kTopK, 0U);
         graph.moe_routed_nanoseconds += elapsed_since(started);
+        }
 
         const auto shared_started = std::chrono::steady_clock::now();
         std::vector<CudaMoeExpert> sinks;
@@ -1242,6 +1353,12 @@ struct InklingRuntime::Impl {
                         return result;
                     }
                     routes[row] = std::move(route.value);
+                    if (!write_route(base_position + row, index, routes[row],
+                                     true)) {
+                        result.errors.emplace_back(
+                            "cannot write Inkling route trace");
+                        return result;
+                    }
                 }
                 graph.moe_router_nanoseconds += elapsed_since(started);
                 started = std::chrono::steady_clock::now();
@@ -1258,7 +1375,8 @@ struct InklingRuntime::Impl {
                                    .subspan(static_cast<std::size_t>(row) * kHidden,
                                             kHidden);
                     if (layer.sparse) {
-                        result = moe(layer, device, index, norm, out);
+                        result = moe(layer, device, index, base_position + row,
+                                     true, norm, out);
                     } else {
                         const auto dense_started =
                             std::chrono::steady_clock::now();
@@ -1295,7 +1413,7 @@ struct InklingRuntime::Impl {
     }
 
     ValidationResult forward(std::uint32_t token, std::uint64_t token_position,
-                             std::vector<float>& hidden) {
+                             bool prefill, std::vector<float>& hidden) {
         hidden.assign(kHidden, 0.0F);
         auto started = std::chrono::steady_clock::now();
         auto result = embed(token, hidden);
@@ -1320,8 +1438,8 @@ struct InklingRuntime::Impl {
                             elapsed_since(dense_started);
                         return status;
                     }
-                    return moe(layer, device_layers[index], index, input,
-                               output);
+                    return moe(layer, device_layers[index], index,
+                               token_position, prefill, input, output);
                 });
             if (!result.ok()) return result;
         }
@@ -1852,15 +1970,17 @@ struct InklingRuntime::Impl {
         if (devices.empty()) return result;
         result = cuda.initialize(devices, true);
         if (!result.ok()) return result;
+        auto plan = plan_runtime_devices(
+            devices, config.vram_cache_fraction, 0U, 2ULL << 30U,
+            "Inkling");
+        if (!plan.ok()) {
+            result.errors = std::move(plan.errors);
+            return result;
+        }
+        device_schedule = plan.value.weighted_schedule;
+        device_workers = std::make_unique<HostWorkerPool>(devices.size());
         std::vector<std::uint64_t> arena_capacities;
         if (config.use_weight_arena) {
-            auto plan = plan_runtime_devices(
-                devices, config.vram_cache_fraction, 0U, 2ULL << 30U,
-                "Inkling");
-            if (!plan.ok()) {
-                result.errors = std::move(plan.errors);
-                return result;
-            }
             arena_capacities = std::move(plan.value.weight_capacities);
             for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
                 result = cuda.reserve_weight_arena(
@@ -2219,6 +2339,10 @@ ValidationResult InklingRuntime::initialize(const std::string& model_directory,
     const auto hardware = std::thread::hardware_concurrency();
     impl_->workers = std::make_unique<HostWorkerPool>(
         hardware == 0U ? 1U : static_cast<std::size_t>(hardware));
+    if (!config.route_trace_path.empty()) {
+        result = impl_->route_trace.open(config.route_trace_path);
+        if (!result.ok()) return result;
+    }
 
     auto& reader = *impl_->checkpoint;
     auto embedding = impl_->map_matrix(
@@ -2330,7 +2454,7 @@ ValidationResult InklingRuntime::forward_logits(
         return result;
     }
     for (std::size_t index = 0U; index < tokens.size(); ++index) {
-        result = impl_->forward(tokens[index], index, hidden);
+        result = impl_->forward(tokens[index], index, true, hidden);
         if (!result.ok()) return result;
         std::vector<float> row;
         result = impl_->logits_from_hidden(hidden, row);
@@ -2466,7 +2590,7 @@ InklingGenerationResult InklingRuntime::Impl::generate(
                       rows_hidden.end());
     } else {
         for (std::size_t index = 0U; index < prompt.size(); ++index) {
-            auto status = impl.forward(prompt[index], index, hidden);
+            auto status = impl.forward(prompt[index], index, true, hidden);
             if (!status.ok()) {
                 result.errors = std::move(status.errors);
                 return result;
@@ -2558,7 +2682,7 @@ InklingGenerationResult InklingRuntime::Impl::generate(
             }
         }
 
-        status = impl.forward(token, next_position++, hidden);
+        status = impl.forward(token, next_position++, false, hidden);
         if (!status.ok()) {
             result.errors = std::move(status.errors);
             return result;

@@ -1,4 +1,4 @@
-# Experiment 0181 — Gemma 4 vLLM prefill reference
+# Experiment 0181 — Gemma 4 vLLM prefill and decode reference
 
 **Date:** 2026-08-24  
 **Runtime:** `/home/rodrigo/Developer/Lvllmds4-x` (`vllm 2.3.8`)  
@@ -72,3 +72,31 @@ integration.
 Raw server and GPU telemetry remained outside Git under `/tmp`:
 `gemma4-vllm-tp1-server.log`, `gemma4-vllm-tp1-gpu.csv`,
 `gemma4-vllm-tp2-server.log`, and `gemma4-vllm-tp2-gpu.csv`.
+
+## Decode addendum requested by the owner
+
+The prefill matrix intentionally generated one token and therefore carried no
+valid steady decode result. After the owner made matching decode an equal goal,
+TP=1 was relaunched at the same 1605 MHz / 250 W point with prefix caching off,
+one sequence, and the same exact checkpoint. A short prompt was warmed once;
+three subsequent requests forced 128 completion tokens with EOS ignored.
+
+The primary metric was `(completion_tokens - 1)` divided by the server-side
+delta of `vllm:request_decode_time_seconds_sum`; this excludes the first token,
+whose forward is charged to prefill. Each arm therefore contains 127 timed
+decode forwards:
+
+| Repetition | Decode seconds | Server decode tok/s | Client completion tok/s |
+|---:|---:|---:|---:|
+| 1 | 3.509532 | 36.1872 | 35.6221 |
+| 2 | 3.503529 | 36.2492 | 35.6882 |
+| 3 | 3.506909 | 36.2142 | 35.6657 |
+
+Median server-side decode is **36.2142 tok/s**. The maximum run spread is only
+0.0620 tok/s. Strata experiment 0165's accepted register-fed baseline is
+18.03 tok/s, so Strata is **2.01x slower** on decode as well as about 44x slower
+on the comparable prefill page. The external target is consequently two-part:
+about 900--1000 prefill tok/s and about 36 decode tok/s at TP=1.
+
+Raw decode logs remain outside Git at `/tmp/gemma4-vllm-decode-server.log` and
+`/tmp/gemma4-vllm-decode-results.jsonl`.

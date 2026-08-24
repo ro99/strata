@@ -20,6 +20,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <array>
@@ -268,6 +269,7 @@ std::uint32_t g_batch = 1U;
 std::uint32_t g_m = 1U;
 bool g_gemma_page = false;
 bool g_page_shared = false;
+bool g_page_wmma = false;
 std::uint32_t g_page_warps = kPageWarps;
 
 constexpr Shape kShapes[] = {
@@ -698,6 +700,150 @@ __global__ __launch_bounds__(kPageWarps * kWarp) void page_matmul_kernel(
     }
 }
 
+// Conventional page GEMM control. A 64x128 CTA widens one compact K32 scale
+// tile into BF16 shared memory, then reuses it across 64 activation rows and
+// feeds BF16 tensor cores. At M=128 every compact weight is read twice rather
+// than the decode-oriented route's eight times. The checkpoint remains in its
+// canonical compact representation; widened weights are transient only.
+constexpr std::uint32_t kWmmaBlockM = 64U;
+constexpr std::uint32_t kWmmaBlockN = 128U;
+constexpr std::uint32_t kWmmaBlockK = 32U;
+
+__device__ __forceinline__ float page_fp4_value(unsigned int code) {
+    const unsigned int magnitude = code & 7U;
+    float value = 0.0F;
+    if (magnitude <= 3U) value = 0.5F * static_cast<float>(magnitude);
+    else if (magnitude == 4U) value = 2.0F;
+    else if (magnitude == 5U) value = 3.0F;
+    else if (magnitude == 6U) value = 4.0F;
+    else value = 6.0F;
+    return (code & 8U) != 0U ? -value : value;
+}
+
+__global__ __launch_bounds__(8U * kWarp) void page_wmma_matmul_kernel(
+    const unsigned char* __restrict__ packed_codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ activations, std::uint32_t m_extent,
+    std::uint32_t n_extent, std::uint32_t k_extent,
+    float* __restrict__ output) {
+    namespace wmma = nvcuda::wmma;
+    __shared__ __nv_bfloat16 shared_a[kWmmaBlockM * kWmmaBlockK];
+    __shared__ __nv_bfloat16 shared_b[kWmmaBlockK * kWmmaBlockN];
+    __shared__ float shared_output[8U * 16U * 16U];
+
+    const std::uint32_t tile_m = blockIdx.y * kWmmaBlockM;
+    const std::uint32_t tile_n = blockIdx.x * kWmmaBlockN;
+    const std::uint32_t warp = threadIdx.x / kWarp;
+    const std::uint32_t warp_m = warp & 3U;
+    const std::uint32_t warp_n_group = warp >> 2U;
+    constexpr std::uint32_t kFragmentsPerWarp = 4U;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+        accumulators[kFragmentsPerWarp];
+#pragma unroll
+    for (std::uint32_t fragment = 0U; fragment < kFragmentsPerWarp;
+         ++fragment) {
+        wmma::fill_fragment(accumulators[fragment], 0.0F);
+    }
+
+    const std::uint32_t packed_columns = k_extent / 2U;
+    const std::uint32_t scale_columns = k_extent / kGroup;
+    for (std::uint32_t tile_k = 0U; tile_k < k_extent;
+         tile_k += kWmmaBlockK) {
+        for (std::uint32_t index = threadIdx.x;
+             index < kWmmaBlockM * kWmmaBlockK; index += blockDim.x) {
+            const std::uint32_t local_k = index / kWmmaBlockM;
+            const std::uint32_t local_m = index % kWmmaBlockM;
+            const std::uint32_t global_m = tile_m + local_m;
+            const float value = global_m < m_extent
+                ? activations[static_cast<std::size_t>(tile_k + local_k) *
+                                  m_extent + global_m]
+                : 0.0F;
+            shared_a[local_m * kWmmaBlockK + local_k] =
+                __float2bfloat16_rn(value);
+        }
+        constexpr std::uint32_t kPackedTileBytes =
+            kWmmaBlockN * kWmmaBlockK / 2U;
+        for (std::uint32_t index = threadIdx.x; index < kPackedTileBytes;
+             index += blockDim.x) {
+            const std::uint32_t local_n = index / (kWmmaBlockK / 2U);
+            const std::uint32_t local_pair = index % (kWmmaBlockK / 2U);
+            const std::uint32_t global_n = tile_n + local_n;
+            unsigned char packed = 0U;
+            unsigned char encoded_scale = 127U;
+            if (global_n < n_extent) {
+                packed = packed_codes[
+                    static_cast<std::size_t>(global_n) * packed_columns +
+                    tile_k / 2U + local_pair];
+                encoded_scale = scales[
+                    static_cast<std::size_t>(global_n) * scale_columns +
+                    tile_k / kGroup];
+            }
+            const float scale = ldexpf(1.0F,
+                                       static_cast<int>(encoded_scale) - 127);
+            const std::uint32_t local_k = local_pair * 2U;
+            shared_b[local_k * kWmmaBlockN + local_n] =
+                __float2bfloat16_rn(
+                    page_fp4_value(static_cast<unsigned int>(packed & 0x0FU)) *
+                    scale);
+            shared_b[(local_k + 1U) * kWmmaBlockN + local_n] =
+                __float2bfloat16_rn(
+                    page_fp4_value(static_cast<unsigned int>(packed >> 4U)) *
+                    scale);
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> a_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> b_fragment;
+#pragma unroll
+        for (std::uint32_t local_k = 0U; local_k < kWmmaBlockK;
+             local_k += 16U) {
+            wmma::load_matrix_sync(
+                a_fragment,
+                shared_a + warp_m * 16U * kWmmaBlockK + local_k,
+                kWmmaBlockK);
+#pragma unroll
+            for (std::uint32_t fragment = 0U;
+                 fragment < kFragmentsPerWarp; ++fragment) {
+                const std::uint32_t fragment_n =
+                    warp_n_group * kFragmentsPerWarp + fragment;
+                wmma::load_matrix_sync(
+                    b_fragment,
+                    shared_b + local_k * kWmmaBlockN + fragment_n * 16U,
+                    kWmmaBlockN);
+                wmma::mma_sync(accumulators[fragment], a_fragment, b_fragment,
+                               accumulators[fragment]);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (std::uint32_t fragment = 0U; fragment < kFragmentsPerWarp;
+         ++fragment) {
+        float* warp_output = shared_output + warp * 16U * 16U;
+        wmma::store_matrix_sync(warp_output, accumulators[fragment], 16U,
+                                wmma::mem_row_major);
+        __syncwarp();
+        const std::uint32_t fragment_n =
+            warp_n_group * kFragmentsPerWarp + fragment;
+        for (std::uint32_t element = threadIdx.x & 31U; element < 256U;
+             element += kWarp) {
+            const std::uint32_t local_m = element / 16U;
+            const std::uint32_t local_n = element % 16U;
+            const std::uint32_t global_m = tile_m + warp_m * 16U + local_m;
+            const std::uint32_t global_n =
+                tile_n + fragment_n * 16U + local_n;
+            if (global_m < m_extent && global_n < n_extent) {
+                output[static_cast<std::size_t>(global_m) * n_extent +
+                       global_n] = warp_output[element];
+            }
+        }
+        __syncwarp();
+    }
+}
+
 // Ownership sweep prompted by the profile of page_matmul_kernel<false>:
 // DRAM was only 11% busy while duplicate cache hits saturated L2 at 89.8% and
 // duplicate FP4 decode drove ALU to 68.4%. Fewer warps per tile give each warp
@@ -875,6 +1021,12 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                 static_cast<float>(static_cast<int>(xorshift(state) % 9U) - 4));
     }
 
+    std::vector<std::uint8_t> canonical_packed_codes(r.code_bytes);
+    for (std::size_t byte = 0U; byte < canonical_packed_codes.size(); ++byte) {
+        canonical_packed_codes[byte] = static_cast<std::uint8_t>(
+            canon_codes[byte * 2U] | (canon_codes[byte * 2U + 1U] << 4U));
+    }
+
     // ---- prepack: pure permutation into fragment order ----
     const std::uint32_t n_tiles = n / kTileN;
     const std::uint32_t k_tiles = k / kTileK;
@@ -962,6 +1114,9 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     DeviceBuffer d_codes(r.prepacked_code_bytes * g_batch);
     DeviceBuffer d_scales(r.prepacked_scale_bytes * g_batch);
     DeviceBuffer d_act(activation_frag.size() * sizeof(std::uint32_t));
+    DeviceBuffer d_canonical_codes(canonical_packed_codes.size());
+    DeviceBuffer d_canonical_scales(canon_scales.size());
+    DeviceBuffer d_canonical_act(activation.size() * sizeof(float));
     DeviceBuffer d_partials(static_cast<std::size_t>(n_tiles) * g_batch *
                             g_split_k * kTileN * g_m * sizeof(float));
     DeviceBuffer d_out(static_cast<std::size_t>(n) * g_batch * g_m *
@@ -972,7 +1127,9 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
           "zero split-K counters");
     DeviceBuffer d_scrub(kScrubBytes);
     r.device_bytes = d_codes.bytes() + d_scales.bytes() + d_act.bytes() +
-                     d_partials.bytes() + d_out.bytes();
+                     d_partials.bytes() + d_out.bytes() +
+                     d_canonical_codes.bytes() + d_canonical_scales.bytes() +
+                     d_canonical_act.bytes();
 
     for (std::uint32_t b = 0U; b < g_batch; ++b) {
         check(cudaMemcpyAsync(
@@ -989,6 +1146,15 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     check(cudaMemcpyAsync(d_act.get(), activation_frag.data(),
                           d_act.bytes(), cudaMemcpyHostToDevice, stream),
           "upload B-fragment activations");
+    check(cudaMemcpyAsync(d_canonical_codes.get(), canonical_packed_codes.data(),
+                          d_canonical_codes.bytes(), cudaMemcpyHostToDevice,
+                          stream), "upload canonical packed codes");
+    check(cudaMemcpyAsync(d_canonical_scales.get(), canon_scales.data(),
+                          d_canonical_scales.bytes(), cudaMemcpyHostToDevice,
+                          stream), "upload canonical scales");
+    check(cudaMemcpyAsync(d_canonical_act.get(), activation.data(),
+                          d_canonical_act.bytes(), cudaMemcpyHostToDevice,
+                          stream), "upload canonical activations");
     check(cudaStreamSynchronize(stream), "finish uploads");
 
     const std::uint32_t k_blocks_total = k_tiles / kKPerLoad;
@@ -1011,7 +1177,15 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
     };
     const auto launch_matmul = [&] {
         if (g_gemma_page) {
-            if (g_page_shared) {
+            if (g_page_wmma) {
+                const dim3 grid((n + kWmmaBlockN - 1U) / kWmmaBlockN,
+                                (g_m + kWmmaBlockM - 1U) / kWmmaBlockM, 1U);
+                page_wmma_matmul_kernel<<<grid, 8U * kWarp, 0U, stream>>>(
+                    static_cast<const unsigned char*>(d_canonical_codes.get()),
+                    static_cast<const unsigned char*>(d_canonical_scales.get()),
+                    static_cast<const float*>(d_canonical_act.get()), g_m, n, k,
+                    static_cast<float*>(d_out.get()));
+            } else if (g_page_shared) {
                 page_matmul_kernel<true><<<
                     std::min<std::uint32_t>(n_tiles, 65535U),
                     kPageWarps * kWarp, 0U, stream>>>(
@@ -1127,7 +1301,9 @@ Result run_shape(const Shape& shape, cudaStream_t stream) {
                                activation[static_cast<std::size_t>(col) * g_m +
                                           mcol]);
             }
-            const float got = out[static_cast<std::size_t>(row) * g_m + mcol];
+            const float got = g_page_wmma
+                ? out[static_cast<std::size_t>(mcol) * n + row]
+                : out[static_cast<std::size_t>(row) * g_m + mcol];
             r.oracle_max_abs = std::max(r.oracle_max_abs, std::abs(sum));
             r.output_max_abs =
                 std::max(r.output_max_abs, std::abs(static_cast<double>(got)));
@@ -1275,6 +1451,10 @@ int main(int argc, char** argv) {
                 g_gemma_page = true;
                 g_page_shared = true;
             }
+            else if (f == "--page-wmma") {
+                g_gemma_page = true;
+                g_page_wmma = true;
+            }
             else if (f == "--page-warps" && i + 1 < argc) {
                 g_gemma_page = true;
                 g_page_warps =
@@ -1329,8 +1509,11 @@ int main(int argc, char** argv) {
              << "  \"device_capability\": \"" << p.major << "." << p.minor
              << "\",\n"
              << "  \"milestone\": \""
-             << (g_gemma_page ? "Gemma MXFP4 M128 page-kernel falsifier"
-                              : "F4-1 step 2 fragment prepack")
+             << (g_page_wmma
+                     ? "Gemma MXFP4 M128 conventional WMMA control"
+                     : g_gemma_page
+                         ? "Gemma MXFP4 M128 page-kernel falsifier"
+                         : "F4-1 step 2 fragment prepack")
              << "\",\n"
              << "  \"operating_point\": \""
              << (g_gemma_page
@@ -1339,6 +1522,8 @@ int main(int argc, char** argv) {
              << "\",\n"
              << "  \"page_shared_broadcast\": "
              << (g_page_shared ? "true" : "false") << ",\n"
+             << "  \"page_wmma\": " << (g_page_wmma ? "true" : "false")
+             << ",\n"
              << "  \"page_warps_per_weight_tile\": " << g_page_warps
              << ",\n"
              << "  \"split_k\": " << g_split_k << ",\n"

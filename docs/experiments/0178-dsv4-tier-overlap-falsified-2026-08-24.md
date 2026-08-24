@@ -1,8 +1,10 @@
-# Experiment 0178 — the overlapped tier split is a regression, and the serial tier is the win
+# Experiment 0178 — the overlapped tier split is a regression, the serial tier is the win, and the tier bricked the server until it was fixed
 
 Status: **the ordering "fix" of experiment 0126 is falsified end to end. It is
 slower than the ordering it replaced and it is not exact. The serial tier it
-replaced is worth 1.119x on decode, deterministic, and is now the default.**
+replaced is worth 1.070x on short-prompt decode and 1.106x at long context,
+costs 0.917x on prefill, and needed a weight-arena defect fixed before it was
+safe to run at all.**
 
 ## What 0126 handed over, and what it turned out to be
 
@@ -14,28 +16,23 @@ split (`483d563`), measured a standalone probe at 1.00x of the achievable
 
 It also said, plainly, what had not been done: *"The tier's exactness under the
 split is not gated... this is an implementation with a projection, not a
-result."* This experiment runs that gate. Both stages fail.
+result."* This experiment runs that gate, and the two it also deferred.
 
-## The operating point, and a defect found before any of it
+## A defect found before any arm was valid
 
-Two RTX 3090s, rank-local TP2, 16k context, `--vram-fraction 0.95`,
-`--prefill-page-tokens 8192`. Greedy (`temperature: 0`), `max_tokens=256`,
-27-token prompt. Medians of 3-7 reps.
-
-**Before any arm was valid, the device binding had to be repaired.** This box's
-login shell exports `CUDA_DEVICE_ORDER=FASTEST_FIRST`, and
+This box's login shell exports `CUDA_DEVICE_ORDER=FASTEST_FIRST`, and
 `apps/strata_server.cpp:863` pins `PCI_BUS_ID` only when the variable is unset.
 So `--devices 1,2` selected the **RTX 5060 Ti plus one 3090**, capped both
 ranks' symmetric admission at the 16 GiB card (13.4 GiB per rank instead of
 20.3), and left a 3090 at 4 MiB. That is verbatim the failure the comment above
-that line warns about; the guard simply loses to an exported value. The tell is
-in the placement report — asymmetric `admitted budget` columns, 22.14 GiB
-against 14.57 GiB. `scripts/dsv4_decode15_server.sh` now exports `PCI_BUS_ID`
-itself.
+that line warns about; the guard loses to an exported value. The tell is the
+asymmetric `admitted budget` columns in the placement report, 22.14 GiB against
+14.57 GiB. `scripts/dsv4_decode15_server.sh` now exports `PCI_BUS_ID` itself.
 
-Every number below was taken after that repair, on the two 3090s.
+## Stage 1 and 2, on the pre-merge tree
 
-## Both gates fail
+Two RTX 3090s, rank-local TP2, 16k context, `--vram-fraction 0.95`,
+`--prefill-page-tokens 8192`, greedy, `max_tokens=256`, 27-token prompt.
 
 | arm | tier | ordering | ms/tok | tok/s | vs no tier | distinct outputs |
 | --- | ---: | --- | ---: | ---: | ---: | --- |
@@ -43,113 +40,138 @@ Every number below was taken after that repair, on the two 3090s.
 | B | 10 GB | overlapped split | 115.2 | 8.680 | 1.030x | **2 of 7** |
 | C | 10 GB | serial (pre-`483d563`) | **106.1** | **9.425** | **1.119x** | 1 of 5 |
 | E | 12 GB | serial | 106.4 | 9.398 | 1.115x | 1 of 5 |
-| D | 14 GB | serial | — | — | — | **admission failure** |
+| D | 14 GB | serial | — | — | — | **VRAM failure** |
 
 **Stage 1, exactness: failed.** Seven greedy reps of arm B produced exactly two
 completions, 4 and 3, one of which opens on a garbage token (`וניב`) before
-recovering into fluent text. Arm A is 3/3 identical and arms C and E are 5/5
-identical, so the harness is sound and the tier itself is deterministic — the
+recovering into fluent text. Arm A is 3/3 identical and arms C and E are 5/5,
+so the harness is sound and the tier itself is deterministic — the
 nondeterminism belongs to the split alone.
 
 A bimodal distribution is the signature of a race with two outcomes, not of
 float reassociation, which smears rather than clusters. 0126 argued exactness
 from the code, on the grounds that the tier's `atomicAdd` was "the same
-reassociation class" the down kernel already had. The data falsifies that
-argument: the class that already existed is deterministic in practice, and the
-new one is not. `483d563` fixed one race — the rank-partial upload against the
-tier's accumulation — and left at least one more.
+reassociation class" the down kernel already had. The data falsifies that: the
+class that already existed is deterministic in practice and the new one is not.
+`483d563` fixed one race — the rank-partial upload against the tier's
+accumulation — and left at least one more.
 
-**Stage 2, overlap: failed, and worse than not moving.** The split was supposed
-to beat the serial ordering. It loses to it by 9.1 ms/tok, giving back 72% of
-the serial tier's 12.6 ms gain. 0126's kill criterion was *"if it does not
-move, the split is not doing what this probe says it does and the 5060 Ti work
-stops here."* It moved backwards.
+**Stage 2, overlap: failed, and worse than not moving.** The split loses to the
+serial ordering by 9.1 ms/tok, giving back 72% of the serial tier's 12.6 ms
+gain. 0126's kill criterion was *"if it does not move, the split is not doing
+what this probe says it does and the 5060 Ti work stops here."* It moved
+backwards.
 
-The `strata-dsv4-tier-overlap-probe` result — 1.00x of the achievable `max`,
-cross-device and same-device — is not wrong about CUDA. It is wrong about this
-system: a spin kernel with no model stage does not reproduce the production
-dispatch, which is the charter's rule 2 on making measurements cheap
-("reproduce the production access pattern, or the probe lies") applied to a
-mechanism probe rather than to a bandwidth probe.
-
-## What the serial tier is worth, and where it stops
-
-The serial ordering hits its own prediction almost exactly. 0126 predicted
-60.70 ms for the MoE term at a 10 GB tier; arm C measures a 106.1 ms step
-against arm A's 118.7, which at 43.09 ms of non-MoE puts the MoE term at
-63.0 ms — the same row, 2.4% off, matching the 2.4% by which this baseline runs
-slower than the inherited one.
+The `strata-dsv4-tier-overlap-probe` result is not wrong about CUDA. It is
+wrong about this system: a spin kernel with no model stage does not reproduce
+the production dispatch. That is the charter's "reproduce the production access
+pattern, or the probe lies" applied to a mechanism probe.
 
 **The tier saturates at about 10 GB.** Arm E holds 962 pairs against arm C's
-802, 20% more residency, and measures 106.4 against 106.1 — no gain. That is
-consistent with 0126's marginal decay (1.63 ms/GB at 4 GB, 0.93 at 10 GB)
-reaching zero, and it means the remaining headroom in this design is not in the
-rank tier's size.
+802, 20% more residency, and measures 106.4 against 106.1. That matches 0126's
+marginal decay (1.63 ms/GB at 4 GB, 0.93 at 10 GB) reaching zero.
 
-**Above 12 GB it does not merely stop paying, it breaks.** Arm D at 7.0 GiB per
-rank boots, builds both tiers, and then fails every request with `DeepSeek
-atomic in-flight expert set exceeds a device VRAM budget` (the mHC
-out-of-order error after it is the sticky follow-on, not the cause). Admission
-passed and the runtime allocation did not: `deepseek_runtime.cpp:6803`
-subtracts the tier reservation from the prefill cache sizing but nothing
-subtracts it from what the in-flight expert set checks. That is a separate
-defect and it is recorded here rather than fixed.
+## Re-measured after merging main
 
-## The tier size is now observable, which it was not
+Main had advanced 57 commits, including `7ca3298`, which wires the register-fed
+FP8 route into the DeepSeek shared expert by default. The pre-merge numbers
+therefore describe a different binary and were re-taken.
 
-The tier build was silent. This experiment could compute 802 pairs from the
-plan and the truncation math but could not observe them, so a partial build and
-a full one looked identical, and "the gain is small because the tier is small"
-could not be ruled out. `dsv4_static_expert_tier.cpp` now prints one line per
-rank at build:
+| arm | tier | short decode | long-context decode | prefill (~2,000 words) |
+| --- | ---: | ---: | ---: | ---: |
+| G | none | 116.7 ms/tok, 8.571 tok/s | 7.302 tok/s | 18.147 tok/s |
+| L | 10 GB | **108.9 ms/tok, 9.171 tok/s** | **8.077 tok/s** | 16.649 tok/s |
+| | | **1.070x** | **1.106x** | **0.917x** |
+
+Main's fast kernels are worth 118.7 -> 116.7 ms/tok on DeepSeek V4 by
+themselves, about 1.7%. That is the size the campaign contract predicts:
+*"DeepSeek V4 remains negative because host MoE is `argmax_r` there."* The two
+lines of work are complementary — the kernels make the one per-token CUDA
+dispatch faster, and the tier removes host-DRAM bytes from the term that
+dominates.
+
+**Stage 3, the prefill cost, is now measured rather than assumed: 0.917x.**
+0126 recorded the handover's prefill constraint as "stale" because 0125 had
+falsified its attribution. The attribution was indeed wrong; the cost is real.
+It is the tier and the new reserve below taking their VRAM from the prefill
+cache.
+
+## The tier bricked the server, and why
+
+Before the fix below, a tier of any size killed the server after a handful of
+requests. Every later request returned a sticky `DeepSeek device mHC slot
+reservation is out of order`, so the first failure was the real one:
 
 ```
-[deepseek-tier] device=1 rank=0/2 pairs=401 bytes=5361106944 (4.99 GiB)
-[deepseek-tier] device=2 rank=1/2 pairs=401 bytes=5361106944 (4.99 GiB)
+layers.19.ffn.shared_experts.w2: CUDA weight arena is exhausted
+(device 1, wanted 8.0 MiB, free 20.0 MiB of 20504.2 MiB in 3 blocks,
+ largest 6.8 MiB)
 ```
 
-That confirmed every arm's residency before its timing was read.
+20 MiB free of 20.5 GiB: **exhaustion, not fragmentation.** The occupancy
+report in that message is new; the old one could not tell the two apart, and
+they need opposite fixes.
 
-**`--static-expert-bytes` is per rank, not total.**
-`dsv4_static_expert_tier.cpp:42` truncates to `vram_budget_bytes / kTripletBytes`
-*after* slicing the ranking by rank, so the "10 GB (total)" row of 0124 and
-0126 is `5G`, not `10G`. Passing `10G` builds a 20 GB tier and compares it
-against a 10 GB row.
+The rank-local sizing set the routed cache to
+`min(arena_expert_bytes, cache_expert_bytes)`, where `arena_expert_bytes` was
+every byte left after the store, the pinned bytes and the tier. **Without a
+tier, `cache_expert_bytes` is the smaller term**, so the cache stops early and
+the leftover slack silently absorbs everything else the arena must hold. A tier
+makes the arena term binding, the slack goes to zero, and the next
+shared-expert re-stage has nowhere to go.
 
-## The 5060 Ti is still blocked, and not by a small thing
+The shared expert is acquired from that same cache once per layer on every
+forward pass, so its whole 43-layer set must stay stageable no matter how many
+routed experts have been admitted. It is now reserved out of what the routed
+cache may claim: **1.016 GiB per rank**, derived from the declared shapes.
 
-The branch's goal was the idle card. It cannot be reached from here:
-`static_expert_tiers` is `std::array<Dsv4StaticExpertTier*, 2U>`, one slot per
-rank, and the backend enqueues the MoE only on rank devices, so nothing would
-dispatch a third device's kernels. The card needs a third slot *and* genuine
-cross-device dispatch — the choreography 0126 gated behind a working overlap.
+Cliff before the fix, by tier size: 14 GB failed on the first request, 10 GB on
+request 6, 6 GB on request 5. A smaller tier did not fix it, it moved the
+cliff — which is what identified this as an accounting defect rather than a
+budget one. After the fix, 12 consecutive requests mixing 27-token and
+~2,000-word prompts complete with zero errors.
 
-That gate now reads negative, so building the cross-device path on top of it
-would be building stage N+1 on a falsified stage N. The card stays idle until
-the split's race is found, or until the overlap is rebuilt from something other
-than the probe that mispredicted it.
+This also explains arm D. Its `atomic in-flight expert set exceeds a device
+VRAM budget` at 7.0 GiB per rank is the same zero-slack arena, reported by a
+different consumer.
 
 ## What landed
 
 - The device-order repair in `scripts/dsv4_decode15_server.sh`.
-- `[deepseek-tier]` build logging.
-- **The serial ordering is the default.** `483d563`'s split is now opt-in
-  behind `STRATA_DSV4_TIER_OVERLAP=1`, kept only so the defect can be worked.
-  Arm F re-runs arm C's configuration with no environment variable set, to
-  confirm the default is the measured-good path.
+- `[deepseek-tier]` build logging. The tier build was silent, so a partial
+  build and a full one looked identical and "the gain is small because the tier
+  is small" could not be ruled out from a log.
+- **`--static-expert-bytes` is per rank, not total.** It truncates to
+  `vram_budget_bytes / kTripletBytes` *after* slicing the ranking by rank, so
+  0124's and 0126's "10 GB (total)" row is `5G`. Passing `10G` builds twice the
+  intended residency.
+- The shared-expert arena reserve, and arena occupancy on exhaustion.
+- **The serial ordering is the default.** `483d563`'s split is opt-in behind
+  `STRATA_DSV4_TIER_OVERLAP=1`, kept only so the defect can be worked.
+
+## The 5060 Ti stays blocked
+
+`static_expert_tiers` is `std::array<Dsv4StaticExpertTier*, 2U>`, one slot per
+rank, and the backend enqueues the MoE only on rank devices, so nothing would
+dispatch a third device's kernels. The card needs a third slot *and* genuine
+cross-device dispatch — the choreography 0126 gated behind a working overlap.
+That gate reads negative, so building it would be stacking stage N+1 on a
+falsified stage N.
 
 ## Gates
 
-`make check` — recorded with the commit.
+`make check` 3/3. Generated tokens are unchanged across the merge and the
+fix: the no-tier arm reproduces its pre-merge hash and the tier arm reproduces
+its own, exactly.
 
 ## Risks and limits
 
-- One prompt, one machine, one model. The tier's coverage is 0124's, held out
-  across prompts but not across traffic.
+- One prompt pair, one machine, one model. The tier's coverage is 0124's, held
+  out across prompts but not across traffic.
+- The tier is **opt-in and should stay that way** until the prefill cost is
+  acceptable for the deployment: it is a decode-for-prefill trade, not a free
+  win.
 - 43.09 ms of non-MoE is still unattributed, and 0125's open defect — every
   `cudaEventRecord` in the rank-local executor gated on `!chain_mode`, so
-  production decode records nothing — is why. Even a free MoE leaves 23.2 tok/s,
-  and at 9.4 tok/s the MoE term is still the larger one, so this remains the
-  place to work.
-- Arm D's admission defect means the tier's VRAM ceiling is currently found by
-  bisection at run time rather than reported at admission.
+  production decode records nothing — is why. At 9.17 tok/s the MoE term is
+  still the larger one, so that remains the place to work.

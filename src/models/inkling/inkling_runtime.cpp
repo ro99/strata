@@ -819,6 +819,11 @@ struct InklingRuntime::Impl {
                                            &staged.value->down, 1.0F});
             graph.routed_expert_bytes += staged.value->device_bytes();
         }
+        result = cuda.synchronize_uploads(devices[device.slot]);
+        if (!result.ok()) {
+            release_all();
+            return result;
+        }
         result = cuda.enqueue_moe(devices[device.slot], input, 1U, routed,
                                   nullptr);
         if (!result.ok()) {
@@ -1062,6 +1067,11 @@ struct InklingRuntime::Impl {
             }
 
             const std::array<CudaMoeExpert, 1U> one{descriptor};
+            result = cuda.synchronize_uploads(devices[device.slot]);
+            if (!result.ok()) {
+                expert_cache->release(device.slot, index, expert);
+                return result;
+            }
             result = cuda.enqueue_moe(devices[device.slot], gathered,
                                       member_rows, one, nullptr);
             if (!result.ok()) {
@@ -2113,7 +2123,12 @@ struct InklingRuntime::Impl {
         }
         expert_cache = std::make_unique<InklingExpertCache>(
             *checkpoint, cuda, devices, capacities,
-            config.direct_mapped_mxfp4_staging);
+            config.direct_mapped_mxfp4_staging,
+            config.defer_mapped_mxfp4_uploads);
+        for (const auto device : devices) {
+            result = cuda.synchronize_uploads(device);
+            if (!result.ok()) return result;
+        }
         cuda_enabled = true;
         return result;
     }

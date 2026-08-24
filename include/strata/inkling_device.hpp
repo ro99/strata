@@ -46,7 +46,8 @@ public:
     InklingExpertCache(const InklingCheckpointReader& checkpoint,
                        CudaBackend& backend, std::vector<int> devices,
                        std::vector<std::uint64_t> capacities,
-                       bool direct_mapped_mxfp4);
+                       bool direct_mapped_mxfp4,
+                       bool defer_mapped_mxfp4_uploads);
     ~InklingExpertCache();
     InklingExpertCache(InklingExpertCache&&) = delete;
     InklingExpertCache& operator=(InklingExpertCache&&) = delete;
@@ -108,6 +109,7 @@ private:
     std::vector<int> devices_;
     std::vector<std::unique_ptr<State>> states_;
     bool direct_mapped_mxfp4_{};
+    bool defer_mapped_mxfp4_uploads_{};
 };
 
 // Uploads one BF16 linear straight to a device.

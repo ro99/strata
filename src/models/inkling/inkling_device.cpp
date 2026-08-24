@@ -111,9 +111,10 @@ ValidationResult load_inkling_cuda_interleaved_half(
 InklingExpertCache::InklingExpertCache(
     const InklingCheckpointReader& checkpoint, CudaBackend& backend,
     std::vector<int> devices, std::vector<std::uint64_t> capacities,
-    bool direct_mapped_mxfp4)
+    bool direct_mapped_mxfp4, bool defer_mapped_mxfp4_uploads)
     : checkpoint_(checkpoint), backend_(backend), devices_(std::move(devices)),
-      direct_mapped_mxfp4_(direct_mapped_mxfp4) {
+      direct_mapped_mxfp4_(direct_mapped_mxfp4),
+      defer_mapped_mxfp4_uploads_(defer_mapped_mxfp4_uploads) {
     // The largest staged block is a plain BF16 half of layer 2's interleaved
     // w13 (2048 x 4096 x 2 bytes); the NVFP4 blocks are a quarter of that.
     constexpr std::size_t kWeightScratch = 2048U * 4096U * sizeof(std::uint16_t);
@@ -230,10 +231,12 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
             descriptor.packed_columns = matrix.value.packed_columns;
             descriptor.scale_columns = matrix.value.scale_columns;
             descriptor.group_size = 32U;
+            const auto completion =
+                direct_mapped_mxfp4_ && defer_mapped_mxfp4_uploads_
+                    ? CudaBackend::UploadCompletion::Deferred
+                    : CudaBackend::UploadCompletion::Synchronous;
             auto status = backend_.upload(
-                device, descriptor,
-                packed, scales,
-                target, CudaBackend::UploadCompletion::Synchronous,
+                device, descriptor, packed, scales, target, completion,
                 CudaBackend::FragmentLayout::Prepack);
             if (!status.ok()) result.errors = std::move(status.errors);
         };

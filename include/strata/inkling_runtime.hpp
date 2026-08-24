@@ -40,6 +40,10 @@ struct InklingRuntimeConfig {
     // per device. False retains the per-projection cudaMalloc/cudaFree control
     // for the allocator-stall experiment.
     bool use_weight_arena{true};
+    // MXFP4 miss sources are persistent checkpoint mappings, so their uploads
+    // may run on the copy stream and be ordered once before the MoE batch.
+    // False retains three host-blocking upload synchronizations per expert.
+    bool defer_mapped_mxfp4_uploads{true};
     // Keep the exact BF16 K/V ring on each layer's assigned device and run
     // Inkling's relative-bias attention there. False retains the scalar host
     // oracle for controlled comparisons.

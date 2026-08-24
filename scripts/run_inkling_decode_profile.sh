@@ -24,6 +24,9 @@ fi
 if [[ ${WEIGHT_ARENA:-1} == 0 ]]; then
     stage_args+=(--no-weight-arena)
 fi
+if [[ ${DEFER_EXPERT_UPLOADS:-1} == 0 ]]; then
+    stage_args+=(--sync-expert-uploads)
+fi
 
 mkdir -p "${result_dir}"
 export CUDA_DEVICE_ORDER=FASTEST_FIRST

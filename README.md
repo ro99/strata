@@ -133,6 +133,7 @@ record those as negatives with their measurements; 0165 records the positive.
 | [`docs/cli.md`](docs/cli.md) | every flag and the dry-run planner |
 | [`docs/sampling.md`](docs/sampling.md) | sampler semantics and reproducibility |
 | [`docs/server.md`](docs/server.md) | the OpenAI-compatible HTTP API |
+| [`docs/models/`](docs/models/) | copy-paste build, chat, server, and measured-speed runbooks by model |
 | [`docs/tui.md`](docs/tui.md) | the terminal UI |
 | [`docs/current-architecture.md`](docs/current-architecture.md) | how the code is organised and what is enforced |
 | [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding a seventh model |

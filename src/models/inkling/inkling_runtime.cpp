@@ -1983,7 +1983,8 @@ struct InklingRuntime::Impl {
             capacities.push_back(budget);
         }
         expert_cache = std::make_unique<InklingExpertCache>(
-            *checkpoint, cuda, devices, capacities);
+            *checkpoint, cuda, devices, capacities,
+            config.direct_mapped_mxfp4_staging);
         cuda_enabled = true;
         return result;
     }

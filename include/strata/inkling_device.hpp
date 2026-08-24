@@ -45,7 +45,8 @@ class InklingExpertCache {
 public:
     InklingExpertCache(const InklingCheckpointReader& checkpoint,
                        CudaBackend& backend, std::vector<int> devices,
-                       std::vector<std::uint64_t> capacities);
+                       std::vector<std::uint64_t> capacities,
+                       bool direct_mapped_mxfp4);
     ~InklingExpertCache();
     InklingExpertCache(InklingExpertCache&&) = delete;
     InklingExpertCache& operator=(InklingExpertCache&&) = delete;
@@ -71,10 +72,10 @@ private:
         std::uint64_t leases{};
         std::uint64_t bytes{};
     };
-    // Per-device page-locked staging. Every miss is a different cold slice of
-    // a checkpoint mapping, so a pageable source makes the driver stage through
-    // its own buffer and H2D collapses to a few GiB/s. De-interleaving into a
-    // registered scratch buffer and uploading from there restores DMA.
+    // Per-device page-locked staging. NVFP4 needs it to de-interleave gate/up.
+    // MXFP4 is already split into canonical stacks and uploads directly from
+    // its resident mapping: an interleaved real-model A/B found that the extra
+    // memcpy into this scratch slowed miss service by 1.38x.
     struct Scratch {
         std::vector<std::byte> weights;
         std::vector<std::byte> scales;
@@ -106,6 +107,7 @@ private:
     CudaBackend& backend_;
     std::vector<int> devices_;
     std::vector<std::unique_ptr<State>> states_;
+    bool direct_mapped_mxfp4_{};
 };
 
 // Uploads one BF16 linear straight to a device.

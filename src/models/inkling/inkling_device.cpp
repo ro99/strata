@@ -110,8 +110,10 @@ ValidationResult load_inkling_cuda_interleaved_half(
 
 InklingExpertCache::InklingExpertCache(
     const InklingCheckpointReader& checkpoint, CudaBackend& backend,
-    std::vector<int> devices, std::vector<std::uint64_t> capacities)
-    : checkpoint_(checkpoint), backend_(backend), devices_(std::move(devices)) {
+    std::vector<int> devices, std::vector<std::uint64_t> capacities,
+    bool direct_mapped_mxfp4)
+    : checkpoint_(checkpoint), backend_(backend), devices_(std::move(devices)),
+      direct_mapped_mxfp4_(direct_mapped_mxfp4) {
     // The largest staged block is a plain BF16 half of layer 2's interleaved
     // w13 (2048 x 4096 x 2 bytes); the NVFP4 blocks are a quarter of that.
     constexpr std::size_t kWeightScratch = 2048U * 4096U * sizeof(std::uint16_t);
@@ -197,16 +199,29 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
                 result.errors = std::move(matrix.errors);
                 return;
             }
-            if (state.scratch.weights.size() < matrix.value.packed.size() ||
-                state.scratch.scales.size() < matrix.value.scales.size()) {
+            if (!direct_mapped_mxfp4_ &&
+                (state.scratch.weights.size() < matrix.value.packed.size() ||
+                 state.scratch.scales.size() < matrix.value.scales.size())) {
                 result.errors.emplace_back(
                     "Inkling MXFP4 staging scratch is too small");
                 return;
             }
-            std::memcpy(state.scratch.weights.data(), matrix.value.packed.data(),
-                        matrix.value.packed.size());
-            std::memcpy(state.scratch.scales.data(), matrix.value.scales.data(),
-                        matrix.value.scales.size());
+            const auto packed = direct_mapped_mxfp4_
+                ? matrix.value.packed
+                : std::span<const std::byte>(state.scratch.weights)
+                      .first(matrix.value.packed.size());
+            const auto scales = direct_mapped_mxfp4_
+                ? matrix.value.scales
+                : std::span<const std::byte>(state.scratch.scales)
+                      .first(matrix.value.scales.size());
+            if (!direct_mapped_mxfp4_) {
+                std::memcpy(state.scratch.weights.data(),
+                            matrix.value.packed.data(),
+                            matrix.value.packed.size());
+                std::memcpy(state.scratch.scales.data(),
+                            matrix.value.scales.data(),
+                            matrix.value.scales.size());
+            }
             CudaWeightDescriptor descriptor;
             descriptor.encoding = CudaWeightEncoding::Fp4E2m1Group32;
             descriptor.dtype = SafetensorsDtype::I8;
@@ -217,10 +232,7 @@ ParseResult<const InklingDeviceExpert*> InklingExpertCache::acquire(
             descriptor.group_size = 32U;
             auto status = backend_.upload(
                 device, descriptor,
-                std::span<const std::byte>(state.scratch.weights)
-                    .first(matrix.value.packed.size()),
-                std::span<const std::byte>(state.scratch.scales)
-                    .first(matrix.value.scales.size()),
+                packed, scales,
                 target, CudaBackend::UploadCompletion::Synchronous,
                 CudaBackend::FragmentLayout::Prepack);
             if (!status.ok()) result.errors = std::move(status.errors);

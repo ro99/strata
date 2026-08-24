@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     bool host_only = false;
     bool chat = false;
     bool warm_experts = true;
+    bool direct_stage = true;
     std::vector<int> devices;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
@@ -48,6 +49,10 @@ int main(int argc, char** argv) {
             host_only = true;
         } else if (argument == "--no-warm") {
             warm_experts = false;
+        } else if (argument == "--direct-stage") {
+            direct_stage = true;
+        } else if (argument == "--pinned-stage") {
+            direct_stage = false;
         } else if (argument == "--devices" && index + 1 < argc) {
             std::string list = argv[++index];
             std::size_t begin = 0U;
@@ -63,7 +68,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-inkling-probe [--model DIR] "
                          "[--prompt TEXT] [--tokens N] [--devices LIST] "
-                         "[--no-warm]\n");
+                         "[--no-warm] [--direct-stage|--pinned-stage]\n");
             return 2;
         }
     }
@@ -77,6 +82,7 @@ int main(int argc, char** argv) {
     config.enable_cuda = !host_only;
     config.devices = devices;
     config.warm_expert_pages = warm_experts;
+    config.direct_mapped_mxfp4_staging = direct_stage;
     config.maximum_context_tokens = 512U;
     config.load_progress = true;
     strata::InklingRuntime runtime;

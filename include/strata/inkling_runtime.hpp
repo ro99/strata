@@ -31,6 +31,11 @@ struct InklingRuntimeConfig {
     // never touch NVMe; without this the VRAM cache misses fault cold pages and
     // the device waits on storage instead of on PCIe.
     bool warm_expert_pages{true};
+    // MXFP4 experts already have the canonical three-stack layout, so upload
+    // from the resident mapping without an extra host memcpy into pinned
+    // scratch. False retains the measured control path for profiling. NVFP4
+    // still needs scratch to de-interleave gate/up and is unaffected.
+    bool direct_mapped_mxfp4_staging{true};
     std::uint32_t maximum_context_tokens{2048U};
     // Rows per prefill page. Zero or one keeps the token-at-a-time path.
     // Above one, a page runs attention and the short convolutions row by row

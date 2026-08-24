@@ -16,10 +16,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <sstream>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
@@ -6430,9 +6432,35 @@ public:
     };
 
     WeightArena(int device, void* base, std::uint64_t capacity)
-        : device_(device), base_(static_cast<std::byte*>(base)) {
+        : device_(device), base_(static_cast<std::byte*>(base)),
+          capacity_(capacity) {
         free_.reserve(16'384U);
         free_.push_back({0U, capacity});
+    }
+
+    // Exhaustion and fragmentation both surface as a failed allocate() and
+    // need opposite fixes: one is a budget that is too small, the other is a
+    // budget that is big enough but cut into pieces none of which fit. The
+    // error path reports both so the next reader does not have to guess.
+    struct Occupancy {
+        std::uint64_t capacity{};
+        std::uint64_t free_bytes{};
+        std::uint64_t largest_free{};
+        std::size_t free_blocks{};
+    };
+
+    [[nodiscard]] Occupancy occupancy() {
+        std::scoped_lock lock(mutex_);
+        Occupancy report;
+        report.capacity = capacity_;
+        report.free_blocks = free_.size();
+        for (const auto& block : free_) {
+            report.free_bytes += block.bytes;
+            if (block.bytes > report.largest_free) {
+                report.largest_free = block.bytes;
+            }
+        }
+        return report;
     }
 
     ~WeightArena() {
@@ -6501,6 +6529,7 @@ private:
 
     int device_{-1};
     std::byte* base_{};
+    std::uint64_t capacity_{};
     std::vector<Block> free_;
     std::mutex mutex_;
     bool metadata_failed_{};
@@ -7647,8 +7676,20 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         WeightArena::Allocation allocation;
         if (target->bytes == 0U ||
             !state.weight_arena->allocate(target->bytes, allocation)) {
-            result.errors.emplace_back(
-                "CUDA weight arena is exhausted; refusing per-weight allocation fallback");
+            const auto report = state.weight_arena->occupancy();
+            const auto mib = [](std::uint64_t bytes) {
+                return static_cast<double>(bytes) / (1024.0 * 1024.0);
+            };
+            std::ostringstream detail;
+            detail.setf(std::ios::fixed);
+            detail.precision(1);
+            detail << "CUDA weight arena is exhausted; refusing per-weight "
+                      "allocation fallback (device " << device << ", wanted "
+                   << mib(target->bytes) << " MiB, free " << mib(report.free_bytes)
+                   << " MiB of " << mib(report.capacity) << " MiB in "
+                   << report.free_blocks << " blocks, largest "
+                   << mib(report.largest_free) << " MiB)";
+            result.errors.emplace_back(detail.str());
             return result;
         }
         target->arena = state.weight_arena;

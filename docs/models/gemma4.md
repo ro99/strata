@@ -56,7 +56,8 @@ For a one-shot prompt:
 ```
 
 Gemma's MXFP4 Marlin layout, device-resident decode, persistent device KV, and
-bounded first-page executor are automatic. Do not add DeepSeek's
+bounded text-page executor are automatic. Partial prompts and every later
+128-token chunk retain the same device-owned path. Do not add DeepSeek's
 `--device-resident-runtime` or `--decode-topology` flags; they are different
 runtime contracts.
 
@@ -85,11 +86,12 @@ At the measured 16,384-token bound, preflight admits 20.93 GiB on the one
 768 MiB workspace. The placement has zero host/storage weight traffic and zero
 cross-device hops.
 
-The headline prefill fast path is currently narrower than the context window:
-it applies only to a text-only first rendered prompt of at most 128 tokens on
-one GPU. Longer prompts remain correct but use the older page path and must not
-be expected to reproduce the 128-token headline. Decode remains on the Marlin
-device path after either prefill path.
+The text fast path applies to every page at every cache position on the
+one-device MXFP4 placement. Global attention retains the admitted context;
+local attention uses its exact 1,024-token ring. Pages that would exceed the
+grouped-attention shared-memory bound retain the exact scalar page-attention
+kernel, not a precision or cache-layout fallback. Decode stays on the Marlin
+device path after prefill.
 
 ## Copy-paste: OpenAI-compatible server
 
@@ -124,38 +126,45 @@ JSON overrides it within the configured context ceiling.
 
 These are single-stream rates, not aggregate serving throughput:
 
-| Engine/path | 128-token prefill | Batch-one decode |
+| Engine/path and shape | Prefill | Batch-one decode |
 |---|---:|---:|
-| Original Strata defect | **20.14 tok/s** | **18.03 tok/s** |
-| Current Strata fast path | **668.99 tok/s** | **29.747 tok/s** |
-| vLLM 2.3.8 TP=1 reference | **881.67 tok/s** | **36.214 tok/s** |
+| Old serialized Strata, 348 tokens | **15.98 tok/s** | — |
+| Current Strata, 348 tokens / three pages | **555.43 tok/s** | **29.747 tok/s** |
+| Current Strata, exact 28-token chat prompt | **509.50 tok/s** | — |
+| Current Strata, exact 128-token page | **689.47 tok/s** | — |
+| vLLM 2.3.8 TP=1, exact 28-token chat prompt | **356.46 tok/s** | — |
+| vLLM 2.3.8 TP=1, 127-token ruler | **881.67 tok/s** | **36.214 tok/s** |
 
 Operating point: the exact 19,531,513,296-byte MXFP4 checkpoint, one RTX 3090
 at PCI bus `82:00.0`, SM clock locked to 1,605 MHz, 250 W, VRAM fraction 0.95,
-context bound 512, temperature zero, and no cross-device hops. Final accepted
-medians and every run are recorded in experiment 0186.
+context bound 512, temperature zero, and no cross-device hops. Final production
+medians and every run are recorded in experiment 0187; the decode ruler is
+from experiment 0186.
 
-The page executor removes the defect opened by experiment 0165: a 128-token
-page now costs 1.495 ms/token, versus 33.617 ms for steady batch-one
-decode. Prefill is therefore over 20 times cheaper per token, as the
-architecture predicts. Strata has not reached vLLM parity: the remaining gap
-is tracked in [issue #36](https://github.com/ro99/strata/issues/36), and the
-first-page executor still needs a wider prompt admission contract.
+Throughput is a batch-shape curve, not a model constant. The old 668.99 tok/s
+number described exactly M=128 and could not honestly be applied to the user's
+28-token prompt; equal-shape vLLM reaches 356.46 tok/s there, versus Strata's
+509.50 tok/s median. The
+production requirement is that partial and later pages stay batched instead of
+collapsing to decode-like execution. At 348 tokens Strata now costs 1.800
+ms/token versus 33.617 ms for steady batch-one decode, so prefill is 18.67
+times cheaper per token. Remaining vLLM parity work stays tracked in
+[issue #36](https://github.com/ro99/strata/issues/36).
 
-## Reproduce the controlled page A/B
+## Reproduce the controlled production A/B
 
-The script runs three counterbalanced fresh processes per arm and verifies the
-Release build before loading weights:
+The production script renders 348 tokens, exercises three pages, runs three
+counterbalanced fresh processes per arm, and verifies the Release build before
+loading weights:
 
 ```bash
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-scripts/gemma4_device_page_ab.sh results/gemma4-device-page-ab
+scripts/gemma4_production_prefill_ab.sh results/gemma4-production-prefill-ab
 ```
 
 The candidate is the default. `STRATA_GEMMA4_DEVICE_PAGE=0` exists only as the
-experiment control; do not set it for normal chat or serving. The script's
-prompt renders to exactly 128 tokens and requests one output token so decode
-does not contaminate the page measurement.
+experiment control; do not set it for normal chat or serving. To reproduce the
+exact 128-token ruler instead, use `scripts/gemma4_device_page_ab.sh`.
 
 Reproduce the controlled 126-step steady decode window with:
 
@@ -173,8 +182,8 @@ scripts/gemma4_decode_bench.sh results/gemma4-decode
   runs; do not mix clock states.
 - Keep the process alive to avoid paying the roughly 19-second checkpoint load
   for every request.
-- Do not quote the 128-token rate for a longer prompt. Measure the live prompt
-  and context shape that matters to the deployment.
+- Do not quote one prompt length's rate for another. Partial pages and growing
+  causal attention have different costs; measure the live shape that matters.
 - Avoid future-entropy sampling when measuring raw decode: `N` candidates cost
   `N+1` forward passes per emitted token by design.
 
@@ -185,6 +194,7 @@ scripts/gemma4_decode_bench.sh results/gemma4-decode
 - [Accepted FP32 Marlin primitive](../experiments/0184-gemma4-marlin-fp32-epilogue-accepted-2026-08-24.md)
 - [Unified M=1 layout](../experiments/0185-gemma4-marlin-unified-m1-layout-accepted-2026-08-24.md)
 - [Device-page integration and KV fix](../experiments/0186-gemma4-device-page-runtime-accepted-2026-08-24.md)
+- [Production multi-page and KV-ring fix](../experiments/0187-gemma4-production-page-prefill-accepted-2026-08-24.md)
 - [Remaining vLLM parity work](https://github.com/ro99/strata/issues/36)
 - [CLI and placement flags](../cli.md)
 - [OpenAI-compatible server](../server.md)

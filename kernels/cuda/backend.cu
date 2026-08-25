@@ -1044,40 +1044,57 @@ __global__ void gemma4_store_kv_rows_kernel(
     cache[plane + destination] = __float2bfloat16_rn(values[source]);
 }
 
-// First-page text attention. A warp owns each key-row dot so its reads are
-// coalesced; thread zero preserves the reference softmax order, and each value
-// column preserves the scalar row accumulation order. The 128-row bound
-// matches the runtime's page contract and keeps scores in shared memory.
+// Text-page attention over the persistent history plus the current page. A
+// warp owns each key-row dot so its reads are coalesced; thread zero preserves
+// the reference softmax order, and each value column preserves the scalar row
+// accumulation order. Current-page K/V is consumed directly and rounded at
+// the cache boundary. Committing it only after attention avoids overwriting
+// history that early rows still need when a sliding-window ring wraps.
 __global__ void gemma4_prefill_attention_kernel(
-    float* output, const float* queries, const __nv_bfloat16* cache,
+    float* output, const float* queries, const float* current_keys,
+    const float* current_values, const __nv_bfloat16* cache,
     std::uint32_t rows, std::uint32_t position_base,
     std::uint32_t capacity_rows, std::uint32_t query_heads,
     std::uint32_t key_value_heads, std::uint32_t head_dim,
     unsigned int* error_flag) {
-    __shared__ float scores[128];
-    __shared__ float denominator;
+    extern __shared__ float scores[];
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
     const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
     if (head >= query_heads || query_row >= rows) return;
-    const auto visible = query_row + 1U;
+    const auto query_position = position_base + query_row;
+    const auto visible = min(query_position + 1U, capacity_rows);
+    const auto first_position = query_position + 1U - visible;
     const auto kv_head = head / (query_heads / key_value_heads);
+    const auto safe_query_row = min(query_row, rows - 1U);
     const auto* query = queries +
-        (static_cast<std::uint64_t>(query_row) * query_heads + head) * head_dim;
+        (static_cast<std::uint64_t>(safe_query_row) * query_heads + head) *
+            head_dim;
     const auto plane = static_cast<std::uint64_t>(capacity_rows) *
                        key_value_heads * head_dim;
     const auto lane = static_cast<std::uint32_t>(threadIdx.x) & 31U;
     const auto warp = static_cast<std::uint32_t>(threadIdx.x) >> 5U;
     const auto warps = static_cast<std::uint32_t>(blockDim.x) >> 5U;
     for (std::uint32_t key_row = warp; key_row < visible; key_row += warps) {
-        const auto absolute = position_base + key_row;
-        const auto physical = absolute % capacity_rows;
-        const auto* key = cache +
-            (static_cast<std::uint64_t>(physical) * key_value_heads + kv_head) *
-                head_dim;
+        const auto absolute = first_position + key_row;
         float score = 0.0F;
         for (std::uint32_t column = lane; column < head_dim; column += 32U) {
+            float key_value = 0.0F;
+            if (absolute < position_base) {
+                const auto physical = absolute % capacity_rows;
+                const auto offset =
+                    (static_cast<std::uint64_t>(physical) * key_value_heads +
+                     kv_head) * head_dim + column;
+                key_value = __bfloat162float(cache[offset]);
+            } else {
+                const auto current_row = absolute - position_base;
+                const auto offset =
+                    (static_cast<std::uint64_t>(current_row) * key_value_heads +
+                     kv_head) * head_dim + column;
+                key_value = __bfloat162float(
+                    __float2bfloat16_rn(current_keys[offset]));
+            }
             score = __fadd_rn(
-                score, __fmul_rn(query[column], __bfloat162float(key[column])));
+                score, __fmul_rn(query[column], key_value));
         }
         for (int offset = 16; offset > 0; offset /= 2) {
             score = __fadd_rn(
@@ -1094,16 +1111,16 @@ __global__ void gemma4_prefill_attention_kernel(
         for (std::uint32_t row = 0U; row < visible; ++row) {
             maximum = fmaxf(maximum, scores[row]);
         }
-        denominator = 0.0F;
+        scores[visible] = 0.0F;
         for (std::uint32_t row = 0U; row < visible; ++row) {
             scores[row] = expf(__fsub_rn(scores[row], maximum));
-            denominator = __fadd_rn(denominator, scores[row]);
+            scores[visible] = __fadd_rn(scores[visible], scores[row]);
         }
-        if (!isfinite(denominator) || denominator <= 0.0F) {
+        if (!isfinite(scores[visible]) || scores[visible] <= 0.0F) {
             atomicExch(error_flag, 3U);
         }
         for (std::uint32_t row = 0U; row < visible; ++row) {
-            scores[row] = __fdiv_rn(scores[row], denominator);
+            scores[row] = __fdiv_rn(scores[row], scores[visible]);
         }
     }
     __syncthreads();
@@ -1113,15 +1130,221 @@ __global__ void gemma4_prefill_attention_kernel(
          column += blockDim.x) {
         float sum = 0.0F;
         for (std::uint32_t row = 0U; row < visible; ++row) {
-            const auto physical = (position_base + row) % capacity_rows;
-            const auto offset =
-                (static_cast<std::uint64_t>(physical) * key_value_heads +
-                 kv_head) * head_dim + column;
-            sum = __fadd_rn(sum, __fmul_rn(
-                scores[row], __bfloat162float(cache[plane + offset])));
+            const auto absolute = first_position + row;
+            float value = 0.0F;
+            if (absolute < position_base) {
+                const auto physical = absolute % capacity_rows;
+                const auto offset =
+                    (static_cast<std::uint64_t>(physical) * key_value_heads +
+                     kv_head) * head_dim + column;
+                value = __bfloat162float(cache[plane + offset]);
+            } else {
+                const auto current_row = absolute - position_base;
+                const auto offset =
+                    (static_cast<std::uint64_t>(current_row) * key_value_heads +
+                     kv_head) * head_dim + column;
+                value = __bfloat162float(
+                    __float2bfloat16_rn(current_values[offset]));
+            }
+            sum = __fadd_rn(sum, __fmul_rn(scores[row], value));
         }
         destination[column] = bf16_round(sum);
         if (!isfinite(sum)) atomicExch(error_flag, 4U);
+    }
+}
+
+// Grouped-query page attention. One CTA shares each BF16 K/V tile across all
+// query heads that own it. Local attention also shares the tile across four
+// adjacent query rows, filling the eight warps of the CTA. Every individual
+// dot, softmax, and value sum retains the scalar order used above; only the
+// redundant cache reads are removed.
+__global__ void gemma4_grouped_prefill_attention_kernel(
+    float* output, const float* queries, const float* current_keys,
+    const float* current_values, const __nv_bfloat16* cache,
+    std::uint32_t rows, std::uint32_t position_base,
+    std::uint32_t capacity_rows, std::uint32_t query_heads,
+    std::uint32_t key_value_heads, std::uint32_t head_dim,
+    std::uint32_t queries_per_block, unsigned int* error_flag) {
+    constexpr std::uint32_t tile_rows = 8U;
+    extern __shared__ unsigned char shared_bytes[];
+    const auto group_size = query_heads / key_value_heads;
+    const auto combined = queries_per_block * group_size;
+    const auto maximum_visible = min(position_base + rows, capacity_rows);
+    const auto score_stride = maximum_visible + 1U;
+    auto* scores = reinterpret_cast<float*>(shared_bytes);
+    auto* tile = reinterpret_cast<__nv_bfloat16*>(
+        scores + static_cast<std::uint64_t>(combined) * score_stride);
+
+    const auto kv_head = static_cast<std::uint32_t>(blockIdx.x);
+    const auto query_begin = static_cast<std::uint32_t>(blockIdx.y) *
+                             queries_per_block;
+    const auto query_end = min(query_begin + queries_per_block, rows);
+    const auto warp = static_cast<std::uint32_t>(threadIdx.x) >> 5U;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) & 31U;
+    const auto local_query = warp / group_size;
+    const auto group_head = warp % group_size;
+    const auto query_row = query_begin + local_query;
+    const bool active = warp < combined && query_row < query_end;
+    const auto head = kv_head * group_size + group_head;
+    const auto query_position = position_base + query_row;
+    const auto visible = active
+        ? min(query_position + 1U, capacity_rows) : 0U;
+    const auto first_position = active
+        ? query_position + 1U - visible : 0U;
+    const auto first_query_position = position_base + query_begin;
+    const auto common_visible = min(first_query_position + 1U, capacity_rows);
+    const auto common_first = first_query_position + 1U - common_visible;
+    const auto common_last = position_base + query_end;
+    const auto plane = static_cast<std::uint64_t>(capacity_rows) *
+                       key_value_heads * head_dim;
+    const auto safe_query_row = min(query_row, rows - 1U);
+    const auto* query = queries +
+        (static_cast<std::uint64_t>(safe_query_row) * query_heads + head) *
+            head_dim;
+
+    for (std::uint32_t base = common_first; base < common_last;
+         base += tile_rows) {
+        for (std::uint32_t element = threadIdx.x;
+             element < tile_rows * head_dim; element += blockDim.x) {
+            const auto tile_row = element / head_dim;
+            const auto column = element % head_dim;
+            const auto absolute = base + tile_row;
+            float value = 0.0F;
+            if (absolute < common_last) {
+                if (absolute < position_base) {
+                    const auto physical = absolute % capacity_rows;
+                    const auto offset =
+                        (static_cast<std::uint64_t>(physical) *
+                             key_value_heads + kv_head) * head_dim + column;
+                    value = __bfloat162float(cache[offset]);
+                } else {
+                    const auto current_row = absolute - position_base;
+                    const auto offset =
+                        (static_cast<std::uint64_t>(current_row) *
+                             key_value_heads + kv_head) * head_dim + column;
+                    value = current_keys[offset];
+                }
+            }
+            tile[element] = __float2bfloat16_rn(value);
+        }
+        __syncthreads();
+        if (active) {
+            for (std::uint32_t tile_row = 0U; tile_row < tile_rows;
+                 ++tile_row) {
+                const auto absolute = base + tile_row;
+                if (absolute < first_position || absolute > query_position) {
+                    continue;
+                }
+                float score = 0.0F;
+                for (std::uint32_t column = lane; column < head_dim;
+                     column += 32U) {
+                    score = __fadd_rn(
+                        score, __fmul_rn(
+                            query[column],
+                            __bfloat162float(tile[tile_row * head_dim +
+                                                  column])));
+                }
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    score = __fadd_rn(
+                        score,
+                        __shfl_down_sync(0xffff'ffffU, score, offset));
+                }
+                if (lane == 0U) {
+                    scores[static_cast<std::uint64_t>(warp) * score_stride +
+                           absolute - first_position] = score;
+                    if (!isfinite(score)) atomicExch(error_flag, 2U);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (active && lane == 0U) {
+        auto* own_scores = scores +
+            static_cast<std::uint64_t>(warp) * score_stride;
+        float maximum = -INFINITY;
+        for (std::uint32_t row = 0U; row < visible; ++row) {
+            maximum = fmaxf(maximum, own_scores[row]);
+        }
+        own_scores[visible] = 0.0F;
+        for (std::uint32_t row = 0U; row < visible; ++row) {
+            own_scores[row] = expf(__fsub_rn(own_scores[row], maximum));
+            own_scores[visible] =
+                __fadd_rn(own_scores[visible], own_scores[row]);
+        }
+        if (!isfinite(own_scores[visible]) || own_scores[visible] <= 0.0F) {
+            atomicExch(error_flag, 3U);
+        }
+        for (std::uint32_t row = 0U; row < visible; ++row) {
+            own_scores[row] = __fdiv_rn(own_scores[row], own_scores[visible]);
+        }
+    }
+    __syncthreads();
+
+    float sums[16]{};
+    for (std::uint32_t base = common_first; base < common_last;
+         base += tile_rows) {
+        for (std::uint32_t element = threadIdx.x;
+             element < tile_rows * head_dim; element += blockDim.x) {
+            const auto tile_row = element / head_dim;
+            const auto column = element % head_dim;
+            const auto absolute = base + tile_row;
+            float value = 0.0F;
+            if (absolute < common_last) {
+                if (absolute < position_base) {
+                    const auto physical = absolute % capacity_rows;
+                    const auto offset =
+                        (static_cast<std::uint64_t>(physical) *
+                             key_value_heads + kv_head) * head_dim + column;
+                    value = __bfloat162float(cache[plane + offset]);
+                } else {
+                    const auto current_row = absolute - position_base;
+                    const auto offset =
+                        (static_cast<std::uint64_t>(current_row) *
+                             key_value_heads + kv_head) * head_dim + column;
+                    value = current_values[offset];
+                }
+            }
+            tile[element] = __float2bfloat16_rn(value);
+        }
+        __syncthreads();
+        if (active) {
+            const auto* own_scores = scores +
+                static_cast<std::uint64_t>(warp) * score_stride;
+            for (std::uint32_t tile_row = 0U; tile_row < tile_rows;
+                 ++tile_row) {
+                const auto absolute = base + tile_row;
+                if (absolute < first_position || absolute > query_position) {
+                    continue;
+                }
+                const auto coefficient = own_scores[absolute - first_position];
+#pragma unroll
+                for (std::uint32_t item = 0U; item < 16U; ++item) {
+                    const auto column = lane + item * 32U;
+                    if (column < head_dim) {
+                        sums[item] = __fadd_rn(
+                            sums[item], __fmul_rn(
+                                coefficient,
+                                __bfloat162float(
+                                    tile[tile_row * head_dim + column])));
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        auto* destination = output +
+            (static_cast<std::uint64_t>(query_row) * query_heads + head) *
+                head_dim;
+#pragma unroll
+        for (std::uint32_t item = 0U; item < 16U; ++item) {
+            const auto column = lane + item * 32U;
+            if (column < head_dim) {
+                destination[column] = bf16_round(sums[item]);
+                if (!isfinite(sums[item])) atomicExch(error_flag, 4U);
+            }
+        }
     }
 }
 
@@ -4317,7 +4540,10 @@ cudaError_t launch_gemma_marlin(
         descriptor.rows % 64U != 0U || descriptor.columns % 256U != 0U) {
         return cudaErrorInvalidValue;
     }
-    const std::uint32_t kernel_rows = rows == 1U ? 1U : 128U;
+    // The old integration padded every multi-row call to M=128.  Marlin has
+    // exact partial-M kernels; keep the useful row count so ordinary chat
+    // prompts do not pay a full-page schedule.
+    const std::uint32_t kernel_rows = rows;
     if (!workspace.configured) {
         int device = 0;
         if (auto status = cudaGetDevice(&device); status != cudaSuccess) {
@@ -4340,6 +4566,36 @@ cudaError_t launch_gemma_marlin(
                     vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                     vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
                     256, 1, 8, 8, true, 4, 2, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                workspace.maximum_shared);
+            status != cudaSuccess) {
+            return status;
+        }
+        if (auto status = cudaFuncSetAttribute(
+                ::marlin::Marlin<
+                    vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                    vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                    256, 1, 8, 8, false, 4, 2, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                workspace.maximum_shared);
+            status != cudaSuccess) {
+            return status;
+        }
+        if (auto status = cudaFuncSetAttribute(
+                ::marlin::Marlin<
+                    vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                    vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                    256, 2, 16, 4, false, 4, 2, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                workspace.maximum_shared);
+            status != cudaSuccess) {
+            return status;
+        }
+        if (auto status = cudaFuncSetAttribute(
+                ::marlin::Marlin<
+                    vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                    vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+                    256, 3, 16, 4, false, 4, 2, false>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 workspace.maximum_shared);
             status != cudaSuccess) {
@@ -4401,44 +4657,56 @@ cudaError_t launch_gemma_marlin(
             return status;
         }
     }
-    if (rows == 1U) {
-        ::marlin::Marlin<
-            vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-            vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
-            256, 1, 8, 8, true, 4, 2, false>
-            <<<workspace.multiprocessors, 256U, workspace.maximum_shared,
-               stream>>>(
-                static_cast<const int4*>(workspace.activation),
-                static_cast<const int4*>(weights),
-                reinterpret_cast<int4*>(output),
-                static_cast<int4*>(workspace.reduce), nullptr, nullptr,
-                static_cast<const int4*>(scales),
-                static_cast<const float*>(workspace.reorder), nullptr, nullptr,
-                static_cast<int>(descriptor.scale_columns), 1,
-                static_cast<int>(descriptor.rows),
-                static_cast<int>(descriptor.columns),
-                static_cast<int>(descriptor.columns),
-                static_cast<int*>(workspace.locks), false, false, true,
-                workspace.maximum_shared);
+    const auto launch_segment = [&](std::uint32_t row_offset,
+                                    std::uint32_t segment_rows) {
+        const auto activation_offset = static_cast<std::uint64_t>(row_offset) *
+                                       descriptor.columns / 8U;
+        const auto output_offset = static_cast<std::uint64_t>(row_offset) *
+                                   descriptor.rows / 4U;
+        const auto* activation =
+            static_cast<const int4*>(workspace.activation) + activation_offset;
+        auto* destination = reinterpret_cast<int4*>(output) + output_offset;
+
+#define STRATA_LAUNCH_GEMMA_MARLIN(TM, TN, TK, M8)                         \
+        ::marlin::Marlin<                                                   \
+            vllm::kBFloat16.id(), vllm::kFE2M1f.id(),                       \
+            vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),                     \
+            256, TM, TN, TK, M8, 4, 2, false>                               \
+            <<<workspace.multiprocessors, 256U, workspace.maximum_shared,   \
+               stream>>>(                                                   \
+                activation, static_cast<const int4*>(weights), destination, \
+                static_cast<int4*>(workspace.reduce), nullptr, nullptr,      \
+                static_cast<const int4*>(scales),                            \
+                static_cast<const float*>(workspace.reorder), nullptr,       \
+                nullptr, static_cast<int>(descriptor.scale_columns),         \
+                static_cast<int>(segment_rows),                              \
+                static_cast<int>(descriptor.rows),                           \
+                static_cast<int>(descriptor.columns),                        \
+                static_cast<int>(descriptor.columns),                        \
+                static_cast<int*>(workspace.locks), false, false, true,      \
+                workspace.maximum_shared)
+
+        if (segment_rows <= 8U) {
+            STRATA_LAUNCH_GEMMA_MARLIN(1, 8, 8, true);
+        } else if (segment_rows <= 16U) {
+            STRATA_LAUNCH_GEMMA_MARLIN(1, 8, 8, false);
+        } else if (segment_rows <= 32U) {
+            STRATA_LAUNCH_GEMMA_MARLIN(2, 16, 4, false);
+        } else if (segment_rows <= 48U) {
+            STRATA_LAUNCH_GEMMA_MARLIN(3, 16, 4, false);
+        } else {
+            STRATA_LAUNCH_GEMMA_MARLIN(4, 16, 4, false);
+        }
+#undef STRATA_LAUNCH_GEMMA_MARLIN
+    };
+    // Marlin's internal parallel count is integer division by the M tile.  A
+    // single 65..127-row launch would therefore drop the remainder; mirror the
+    // upstream dispatcher with a 64-row body and an exact partial tail.
+    if (rows > 64U && rows < 128U) {
+        launch_segment(0U, 64U);
+        launch_segment(64U, rows - 64U);
     } else {
-        ::marlin::Marlin<
-            vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-            vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
-            256, 4, 16, 4, false, 4, 2, false>
-            <<<workspace.multiprocessors, 256U, workspace.maximum_shared,
-               stream>>>(
-                static_cast<const int4*>(workspace.activation),
-                static_cast<const int4*>(weights),
-                reinterpret_cast<int4*>(output),
-                static_cast<int4*>(workspace.reduce), nullptr, nullptr,
-                static_cast<const int4*>(scales),
-                static_cast<const float*>(workspace.reorder), nullptr, nullptr,
-                static_cast<int>(descriptor.scale_columns), 128,
-                static_cast<int>(descriptor.rows),
-                static_cast<int>(descriptor.columns),
-                static_cast<int>(descriptor.columns),
-                static_cast<int*>(workspace.locks), false, false, true,
-                workspace.maximum_shared);
+        launch_segment(0U, rows);
     }
     return cudaGetLastError();
 }
@@ -9075,6 +9343,27 @@ ValidationResult CudaBackend::reserve_gemma4_workspace(
         status != cudaSuccess) {
         return cuda_error(status, "query Gemma 4 Marlin SM count");
     }
+    int maximum_shared = 0;
+    if (auto status = cudaDeviceGetAttribute(
+            &maximum_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        status != cudaSuccess) {
+        return cuda_error(status,
+                          "query Gemma 4 page attention shared memory");
+    }
+    if (auto status = cudaFuncSetAttribute(
+            gemma4_prefill_attention_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, maximum_shared);
+        status != cudaSuccess) {
+        return cuda_error(status,
+                          "configure Gemma 4 page attention shared memory");
+    }
+    if (auto status = cudaFuncSetAttribute(
+            gemma4_grouped_prefill_attention_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, maximum_shared);
+        status != cudaSuccess) {
+        return cuda_error(
+            status, "configure grouped Gemma 4 page attention shared memory");
+    }
     const auto activation_columns = std::max({
         hidden_columns, maximum_query_columns, maximum_kv_columns,
         maximum_intermediate_columns});
@@ -9117,10 +9406,10 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end() || layers.empty() || rows < 2U ||
-        rows > 128U || position_base != 0U || input.empty() ||
+        rows > 128U || input.empty() ||
         input.size() % rows != 0U || output.size() != input.size()) {
         result.errors.emplace_back(
-            "Gemma 4 CUDA first-page prefill request is invalid");
+            "Gemma 4 CUDA page prefill request is invalid");
         return result;
     }
     auto& state = found->second;
@@ -9150,10 +9439,12 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
             (layer.value != nullptr && !valid_weight(layer.value)) ||
             !valid_weight(layer.output) || !valid_weight(layer.gate) ||
             !valid_weight(layer.up) || !valid_weight(layer.down) ||
-            layer.cached_rows != 0U || layer.cache_start != 0U ||
-            layer.cache_capacity_rows < rows || !std::isfinite(layer.scalar)) {
+            layer.cached_rows > layer.cache_capacity_rows ||
+            static_cast<std::uint64_t>(layer.cache_start) +
+                    layer.cached_rows != position_base ||
+            layer.cache_capacity_rows == 0U || !std::isfinite(layer.scalar)) {
             result.errors.emplace_back(
-                "Gemma 4 CUDA first-page layer contract is invalid");
+                "Gemma 4 CUDA page layer contract is invalid");
             return result;
         }
         const auto& query = layer.query->impl_->descriptor;
@@ -9171,7 +9462,7 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
              (layer.value->impl_->descriptor.columns != hidden_columns ||
               layer.value->impl_->descriptor.rows != key.rows))) {
             result.errors.emplace_back(
-                "Gemma 4 CUDA first-page weight shapes are invalid");
+                "Gemma 4 CUDA page weight shapes are invalid");
             return result;
         }
         if (layer.query_norm == nullptr || layer.key_norm == nullptr ||
@@ -9179,7 +9470,7 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
             layer.query_norm->device_bytes() == 0U ||
             layer.query_norm->device_bytes() % sizeof(float) != 0U) {
             result.errors.emplace_back(
-                "Gemma 4 CUDA first-page attention norm shape is invalid");
+                "Gemma 4 CUDA page attention norm shape is invalid");
             return result;
         }
         const auto head_dim = static_cast<std::uint32_t>(
@@ -9190,7 +9481,7 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
             query.rows / head_dim == 0U || key.rows / head_dim == 0U ||
             (query.rows / head_dim) % (key.rows / head_dim) != 0U) {
             result.errors.emplace_back(
-                "Gemma 4 CUDA first-page attention heads are invalid");
+                "Gemma 4 CUDA page attention heads are invalid");
             return result;
         }
         const auto norm_bytes =
@@ -9200,7 +9491,7 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
             !valid_buffer(layer.pre_feedforward_norm, norm_bytes) ||
             !valid_buffer(layer.post_feedforward_norm, norm_bytes)) {
             result.errors.emplace_back(
-                "Gemma 4 CUDA first-page norm buffers are invalid");
+                "Gemma 4 CUDA page norm buffers are invalid");
             return result;
         }
         std::uint64_t plane_bytes = 0U;
@@ -9209,7 +9500,7 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
             plane_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
             !valid_buffer(layer.kv_cache, plane_bytes * 2U)) {
             result.errors.emplace_back(
-                "Gemma 4 CUDA first-page KV buffer is invalid");
+                "Gemma 4 CUDA page KV buffer is invalid");
             return result;
         }
         maximum_query_columns = std::max(maximum_query_columns, query.rows);
@@ -9372,16 +9663,41 @@ ValidationResult CudaBackend::gemma4_prefill_layers(
             query_heads, kv_heads, head_dim, position_base, theta, proportion,
             state.gemma_error);
         auto* cache = static_cast<__nv_bfloat16*>(layer.kv_cache->impl_->data);
+        const auto maximum_visible = std::min(
+            position_base + rows, layer.cache_capacity_rows);
+        const auto scalar_attention_shared = static_cast<std::size_t>(
+            maximum_visible + 1U) * sizeof(float);
+        const auto group_size = query_heads / kv_heads;
+        const std::uint32_t queries_per_block = group_size == 2U ? 4U : 1U;
+        const auto combined = group_size * queries_per_block;
+        const auto grouped_attention_shared =
+            static_cast<std::size_t>(combined) *
+                (maximum_visible + 1U) * sizeof(float) +
+            8U * head_dim * sizeof(__nv_bfloat16);
+        if (maximum_visible >= 64U && combined <= 8U &&
+            grouped_attention_shared <=
+                static_cast<std::size_t>(
+                    state.gemma_marlin.maximum_shared)) {
+            const dim3 grouped_grid(
+                kv_heads, (rows + queries_per_block - 1U) / queries_per_block,
+                1U);
+            gemma4_grouped_prefill_attention_kernel<<<
+                grouped_grid, 256U, grouped_attention_shared, state.stream>>>(
+                context, queries, keys, values, cache, rows, position_base,
+                layer.cache_capacity_rows, query_heads, kv_heads, head_dim,
+                queries_per_block, state.gemma_error);
+        } else {
+            gemma4_prefill_attention_kernel<<<
+                query_grid, 128U, scalar_attention_shared, state.stream>>>(
+                context, queries, keys, values, cache, rows, position_base,
+                layer.cache_capacity_rows, query_heads, kv_heads, head_dim,
+                state.gemma_error);
+        }
         const dim3 store_grid(
             static_cast<unsigned int>((key.rows + 255U) / 256U), rows, 1U);
         gemma4_store_kv_rows_kernel<<<store_grid, 256U, 0U, state.stream>>>(
             cache, keys, values, position_base, rows,
             layer.cache_capacity_rows, static_cast<std::uint32_t>(key.rows));
-        gemma4_prefill_attention_kernel<<<
-            query_grid, 128U, 0U, state.stream>>>(
-            context, queries, cache, rows, position_base,
-            layer.cache_capacity_rows, query_heads, kv_heads, head_dim,
-            state.gemma_error);
         if (auto status = launch_matrix(layer.output, context, branch);
             status != cudaSuccess) {
             return cuda_error(status, "launch Gemma 4 page output projection");

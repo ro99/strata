@@ -3352,6 +3352,8 @@ TEST_CASE("Gemma 4 Marlin layout matches scalar at decode and page widths") {
     };
 
     compare(21'504U, 5'376U, 1U, 0x31U);
+    compare(21'504U, 5'376U, 28U, 0x41U);
+    compare(5'376U, 21'504U, 65U, 0x47U);
     compare(5'376U, 21'504U, 128U, 0x53U);
 }
 

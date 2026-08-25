@@ -215,7 +215,7 @@ struct Gemma4Runtime::Impl {
     bool reusable_sequence{};
     bool device_kv_ready{};
     bool host_kv_ready{true};
-    bool device_first_page_allowed{};
+    bool device_page_allowed{};
     DiagnosticTrace diagnostics;
     Gemma4PrefillPhaseMetrics prefill_phases;
     std::unique_ptr<HostWorkerPool> prefill_workers;
@@ -1080,24 +1080,11 @@ struct Gemma4Runtime::Impl {
         if (rows == 1U && device_kv_ready && multimodal_groups.empty()) {
             return forward_decode_layers(hidden, position_base);
         }
-        if (rows > 1U && device_kv_ready && multimodal_groups.empty() &&
-            !config.enable_layer_hash_trace) {
-            ValidationResult result;
-            for (std::uint32_t row = 0U; row < rows; ++row) {
-                result = forward_decode_layers(
-                    hidden.subspan(
-                        static_cast<std::size_t>(row) * c.hidden_size,
-                        c.hidden_size),
-                    position_base + row);
-                if (!result.ok()) return result;
-            }
-            return result;
-        }
         const bool one_device = std::all_of(
             layers.begin(), layers.end(), [this](const TextLayer& layer) {
                 return layer.device == layers.front().device;
             });
-        if (rows > 1U && device_first_page_allowed && position_base == 0U &&
+        if (rows > 1U && device_page_allowed &&
             multimodal_groups.empty() && !config.enable_layer_hash_trace &&
             one_device && !layers.empty() &&
             CudaBackend::marlin_prepacked(layers.front().query.weight)) {
@@ -1125,7 +1112,7 @@ struct Gemma4Runtime::Impl {
                     {},
                     cache.capacity_rows,
                     cache.start,
-                    0U,
+                    cache.cached_rows,
                     weights.scalar,
                 });
             }
@@ -1133,10 +1120,29 @@ struct Gemma4Runtime::Impl {
                 devices[layers.front().device], request, hidden, rows,
                 position_base, hidden);
             if (!page.ok()) return page;
-            for (auto& cache : kv) cache.cached_rows = rows;
+            for (auto& cache : kv) {
+                const auto total = cache.cached_rows + rows;
+                if (total > cache.capacity_rows) {
+                    cache.start += total - cache.capacity_rows;
+                }
+                cache.cached_rows = std::min(total, cache.capacity_rows);
+            }
             device_kv_ready = true;
             host_kv_ready = false;
             return page;
+        }
+        if (rows > 1U && device_kv_ready && multimodal_groups.empty() &&
+            !config.enable_layer_hash_trace) {
+            ValidationResult result;
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = forward_decode_layers(
+                    hidden.subspan(
+                        static_cast<std::size_t>(row) * c.hidden_size,
+                        c.hidden_size),
+                    position_base + row);
+                if (!result.ok()) return result;
+            }
+            return result;
         }
         ValidationResult result;
         std::vector<float> normalized(hidden.size());
@@ -1259,7 +1265,8 @@ struct Gemma4Runtime::Impl {
                                     std::span<const float> replacements,
                                     std::span<const std::uint8_t> replacement_mask,
                                     std::span<const std::int32_t> multimodal_groups,
-                                    std::vector<float>& logits) {
+                                    std::vector<float>& logits,
+                                    bool produce_logits = true) {
         ValidationResult result;
         if (token_ids.empty() ||
             position_base + token_ids.size() > config.maximum_context_tokens) {
@@ -1279,6 +1286,7 @@ struct Gemma4Runtime::Impl {
         result = forward_layers(hidden, static_cast<std::uint32_t>(token_ids.size()),
                                 position_base, multimodal_groups, token_ids);
         if (!result.ok()) return result;
+        if (!produce_logits) return result;
         std::vector<float> normalized(c.hidden_size);
         if (profile) phase_started = std::chrono::steady_clock::now();
         result = gemma4_rms_norm_bf16(
@@ -1305,9 +1313,8 @@ struct Gemma4Runtime::Impl {
                                        std::span<const std::int32_t> multimodal_groups = {}) {
         ParseResult<std::uint32_t> result;
         std::vector<float> logits;
-        device_first_page_allowed = gemma4_device_page_enabled() &&
-            token_ids.size() <= kPrefillChunk &&
-            position_base == 0U && multimodal_groups.empty();
+        device_page_allowed = gemma4_device_page_enabled() &&
+            multimodal_groups.empty();
         std::size_t offset = 0U;
         while (offset < token_ids.size()) {
             auto count = std::min<std::size_t>(
@@ -1338,14 +1345,14 @@ struct Gemma4Runtime::Impl {
                                            count * c.hidden_size),
                 replacement_mask.empty() ? std::span<const std::uint8_t>{}
                     : replacement_mask.subspan(offset, count),
-                multimodal_groups, logits);
+                multimodal_groups, logits, offset + count == token_ids.size());
             if (!status.ok()) {
                 result.errors = std::move(status.errors);
                 return result;
             }
             offset += count;
         }
-        device_first_page_allowed = false;
+        device_page_allowed = false;
         const auto cached_tokens = position_base + token_ids.size();
         FutureEntropyEvaluator lookahead;
         if (active_sampling.future_entropy_candidates != 0U) {
@@ -1441,7 +1448,7 @@ struct Gemma4Runtime::Impl {
         reusable_sequence = false;
         device_kv_ready = false;
         host_kv_ready = true;
-        device_first_page_allowed = false;
+        device_page_allowed = false;
         cached_token_ids.clear();
         for (auto& cache : kv) {
             cache.keys.clear();

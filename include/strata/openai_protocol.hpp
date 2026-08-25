@@ -17,6 +17,8 @@ struct OpenAiChatRequest {
     bool json_object{};
     bool has_tools{};
     bool has_max_tokens{};
+    bool has_temperature{};
+    bool has_top_p{};
     bool has_seed{};
     std::string user;
 };
@@ -28,6 +30,10 @@ struct OpenAiChatRequest {
 [[nodiscard]] bool parse_openai_tokenize_request(
     std::string_view json, std::string& model, std::string& text,
     std::string& error);
+// Extract only the required top-level model string while preserving the
+// original request body for a router to proxy byte-for-byte.
+[[nodiscard]] bool parse_openai_model_field(
+    std::string_view json, std::string& model, std::string& error);
 [[nodiscard]] bool is_json_object(std::string_view json) noexcept;
 
 // Serialize the completion-metadata fragments llama-swap and other proxies

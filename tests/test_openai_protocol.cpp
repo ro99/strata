@@ -19,6 +19,8 @@ TEST_CASE("OpenAI chat requests preserve messages and generation controls") {
     REQUIRE(request.generation.maximum_new_tokens == 42U);
     REQUIRE(request.generation.sampling.temperature == 0.7);
     REQUIRE(request.generation.sampling.top_p == 0.8);
+    REQUIRE(request.has_temperature);
+    REQUIRE(request.has_top_p);
     REQUIRE(request.generation.sampling.seed == 9U);
     REQUIRE(request.generation.sampling.logit_bias[0].first == 7U);
     REQUIRE(request.generation.sampling.top_logprobs == 3U);
@@ -26,6 +28,18 @@ TEST_CASE("OpenAI chat requests preserve messages and generation controls") {
     REQUIRE(request.n == 2U);
     REQUIRE(request.stream);
     REQUIRE(request.logprobs);
+}
+
+TEST_CASE("OpenAI router extraction preserves the original body contract") {
+    std::string model;
+    std::string error;
+    REQUIRE(strata::parse_openai_model_field(
+        R"({"messages":[],"model":"creative-large","vendor":{"x":1}})",
+        model, error));
+    REQUIRE(model == "creative-large");
+    REQUIRE(!strata::parse_openai_model_field(
+        R"({"model":"a","model":"b"})", model, error));
+    REQUIRE(error.find("exactly once") != std::string::npos);
 }
 
 TEST_CASE("sampler extensions reach both OpenAI endpoints") {

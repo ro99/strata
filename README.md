@@ -39,7 +39,8 @@ make check                       # build and run the test suite
 `kimi-k3`. Add `--devices 0,1` to pin GPUs, `--admission-only --json` to print
 the placement plan without loading anything.
 
-There is also an OpenAI-compatible server (`strata-server`) and a terminal UI.
+There is also an OpenAI-compatible server (`strata-server`), a terminal UI, and
+a provider-neutral [Svelte writing application](web/README.md) for authors.
 **Full flag reference: [`docs/cli.md`](docs/cli.md).**
 
 ## Supported models

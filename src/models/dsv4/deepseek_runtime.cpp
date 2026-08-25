@@ -4030,7 +4030,7 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
         rows64 < 2U || rows64 > std::numeric_limits<std::uint32_t>::max() ||
         input.size() != rows64 * kHidden ||
         query_rank.size() != rows64 * kQueryRank ||
-        queries.size() != rows64 * query_stride ||
+        (!queries.empty() && queries.size() != rows64 * query_stride) ||
         sinks.size() != kHeads || row_slots.size() != rows64 ||
         diagnostic_branches.size() != rows64 * kHidden) {
         result.errors.emplace_back(
@@ -4195,6 +4195,12 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
     const auto weight_started = std::chrono::steady_clock::now();
     Dsv4WeightCache::Lease output_a;
     Dsv4WeightCache::Lease output_b;
+    Dsv4WeightCache::Lease query_b;
+    if (queries.empty()) {
+        result = weights->acquire(
+            slot, prefix + "wq_b", query_stride, kQueryRank, query_b);
+        if (!result.ok()) return result;
+    }
     result = weights->acquire(
         slot, prefix + "wo_a", kOutputGroups * kOutputRank,
         kHeads * kHeadDim / kOutputGroups, output_a);
@@ -4226,7 +4232,8 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
     // slice, matching the reference stack's budgeted prefill chunks.
     constexpr std::uint64_t maximum_workspace_bytes = 384ULL << 20U;
     auto admitted = cuda.dsv4_paged_attention_to_mhc_page_maximum_rows(
-        pages, rows, candidate_width, maximum_workspace_bytes);
+        pages, rows, candidate_width, maximum_workspace_bytes,
+        queries.empty());
     if (!admitted.ok()) return {std::move(admitted.errors)};
     const auto maximum_rows = admitted.value;
     if (const char* trace = std::getenv("STRATA_TRACE_ATTENTION_LAYOUT");
@@ -4236,7 +4243,7 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
             auto at = [&](std::uint32_t probe) -> std::uint64_t {
                 auto bytes = cuda
                     .dsv4_paged_attention_to_mhc_page_workspace_bytes(
-                        pages, probe, candidate_width);
+                        pages, probe, candidate_width, queries.empty());
                 return bytes.ok() ? bytes.value : 0U;
             };
             std::fprintf(stderr,
@@ -4266,8 +4273,11 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
 
         CudaDsv4PagedAttentionMhcRequest request;
         request.attention.queries = queries.subspan(
-            static_cast<std::size_t>(begin) * query_stride,
-            static_cast<std::size_t>(chunk_rows) * query_stride);
+            queries.empty() ? 0U
+                            : static_cast<std::size_t>(begin) * query_stride,
+            queries.empty() ? 0U
+                            : static_cast<std::size_t>(chunk_rows) *
+                                  query_stride);
         request.attention.head_sinks = sinks;
         request.attention.pages = pages;
         request.attention.candidates = std::span<const CudaDsv4AttentionCandidate>(
@@ -4279,6 +4289,12 @@ ValidationResult DeepSeekV4Runtime::Impl::physical_paged_attention_page(
         request.attention.scale = kAttentionScale;
         request.attention.maximum_workspace_bytes = maximum_workspace_bytes;
         request.mhc_slots = row_slots.subspan(begin, chunk_rows);
+        if (queries.empty()) {
+            request.page_query_projection = &query_b.weight();
+            request.page_query_rank = query_rank.subspan(
+                static_cast<std::size_t>(begin) * kQueryRank,
+                static_cast<std::size_t>(chunk_rows) * kQueryRank);
+        }
         request.inverse_rope_cosines = std::span<const float>(cosines).subspan(
             static_cast<std::size_t>(begin) * rope_stride,
             static_cast<std::size_t>(chunk_rows) * rope_stride);
@@ -4673,6 +4689,10 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
 
     const auto slot = layer_device(layer);
     const auto prefix = layer_prefix(layer) + "attn.";
+    const bool device_page_query =
+        config.kv_cache_mode == Dsv4KvCacheMode::PhysicalDevice &&
+        config.enable_dsv4_batched_page_attention && rows > 1U &&
+        !row_slots.empty();
     const auto add_matmul_profile = [](const CudaMatmulProfile& profile,
                                        std::uint64_t& weight_acquisition,
                                        std::uint64_t& issue,
@@ -4719,76 +4739,87 @@ ValidationResult DeepSeekV4Runtime::Impl::attention_page(
         elapsed_nanoseconds(query_rank_norm_started);
 
     const auto query_stride = static_cast<std::size_t>(kHeads) * kHeadDim;
-    allocation_started = std::chrono::steady_clock::now();
-    auto queries = attention_page_query_scratch.acquire(
-        row_count * query_stride);
-    graph_stats.attention_query_allocation_nanoseconds +=
-        elapsed_nanoseconds(allocation_started);
-    ++graph_stats.attention_projection_matmul_calls;
-    graph_stats.attention_projection_matmul_rows += rows;
-    CudaMatmulProfile query_b_profile;
-    result = linear_rows(slot, prefix + "wq_b", query_stride, kQueryRank,
-                         query_rank, rows, queries, true, &query_b_profile,
-                         config.enable_dsv4_fp8_tensor_page);
-    if (!result.ok()) return result;
-    add_matmul_profile(
-        query_b_profile,
-        graph_stats.attention_query_weight_acquisition_nanoseconds,
-        graph_stats.attention_query_matmul_issue_nanoseconds,
-        graph_stats.attention_query_matmul_finish_nanoseconds,
-        graph_stats.attention_query_matmul_sync_nanoseconds,
-        graph_stats.attention_query_matmul_h2d_nanoseconds,
-        graph_stats.attention_query_matmul_kernel_nanoseconds,
-        graph_stats.attention_query_matmul_d2h_nanoseconds);
-    // One task per row rather than per (row, head). A head is about 1,500
-    // flops, so at 64 heads a page of 677 rows dispatched 1.86 million tasks
-    // across 43 layers and spent 11.2 s in pool overhead for work that is
-    // nowhere near that size.
-    std::atomic<std::uint64_t> query_rms_cpu_nanoseconds{0U};
-    std::atomic<std::uint64_t> query_rope_cpu_nanoseconds{0U};
-    const auto normalize_query_row = [&](std::size_t row) {
-        auto cpu_started = std::chrono::steady_clock::now();
-        for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            auto query = queries.subspan(
-                row * query_stride + head * kHeadDim, kHeadDim);
-            double square_sum = 0.0;
-            for (const float value : query) {
-                square_sum += static_cast<double>(value) * value;
-            }
-            const float reciprocal = 1.0F / std::sqrt(
-                static_cast<float>(square_sum / kHeadDim) + kRmsEpsilon);
-            for (auto& value : query) value = round_bf16(value * reciprocal);
-        }
-        query_rms_cpu_nanoseconds.fetch_add(
-            elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
-        cpu_started = std::chrono::steady_clock::now();
-        for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            auto query = queries.subspan(
-                row * query_stride + head * kHeadDim, kHeadDim);
-            apply_rope(query.last(kRopeDim),
-                       position_base + static_cast<std::uint32_t>(row),
-                       attention_state[layer].frequencies);
-            round_bf16(query.last(kRopeDim));
-        }
-        query_rope_cpu_nanoseconds.fetch_add(
-            elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
-    };
-    const auto query_finish_started = std::chrono::steady_clock::now();
-    if (attention_workers != nullptr && row_count > 1U) {
-        result = attention_workers->parallel_for(row_count,
-                                                 normalize_query_row);
+    std::span<float> queries;
+    if (!device_page_query) {
+        allocation_started = std::chrono::steady_clock::now();
+        queries = attention_page_query_scratch.acquire(
+            row_count * query_stride);
+        graph_stats.attention_query_allocation_nanoseconds +=
+            elapsed_nanoseconds(allocation_started);
+        ++graph_stats.attention_projection_matmul_calls;
+        graph_stats.attention_projection_matmul_rows += rows;
+        CudaMatmulProfile query_b_profile;
+        result = linear_rows(slot, prefix + "wq_b", query_stride, kQueryRank,
+                             query_rank, rows, queries, true, &query_b_profile,
+                             config.enable_dsv4_fp8_tensor_page);
         if (!result.ok()) return result;
-    } else {
-        for (std::size_t row = 0U; row < row_count; ++row) {
-            normalize_query_row(row);
+        add_matmul_profile(
+            query_b_profile,
+            graph_stats.attention_query_weight_acquisition_nanoseconds,
+            graph_stats.attention_query_matmul_issue_nanoseconds,
+            graph_stats.attention_query_matmul_finish_nanoseconds,
+            graph_stats.attention_query_matmul_sync_nanoseconds,
+            graph_stats.attention_query_matmul_h2d_nanoseconds,
+            graph_stats.attention_query_matmul_kernel_nanoseconds,
+            graph_stats.attention_query_matmul_d2h_nanoseconds);
+        // One task per row rather than per (row, head). A head is about 1,500
+        // flops, so at 64 heads a page of 677 rows dispatched 1.86 million
+        // tasks across 43 layers and spent 11.2 s in pool overhead for work
+        // that is nowhere near that size.
+        std::atomic<std::uint64_t> query_rms_cpu_nanoseconds{0U};
+        std::atomic<std::uint64_t> query_rope_cpu_nanoseconds{0U};
+        const auto normalize_query_row = [&](std::size_t row) {
+            auto cpu_started = std::chrono::steady_clock::now();
+            for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                auto query = queries.subspan(
+                    row * query_stride + head * kHeadDim, kHeadDim);
+                double square_sum = 0.0;
+                for (const float value : query) {
+                    square_sum += static_cast<double>(value) * value;
+                }
+                const float reciprocal = 1.0F / std::sqrt(
+                    static_cast<float>(square_sum / kHeadDim) + kRmsEpsilon);
+                for (auto& value : query) {
+                    value = round_bf16(value * reciprocal);
+                }
+            }
+            query_rms_cpu_nanoseconds.fetch_add(
+                elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
+            cpu_started = std::chrono::steady_clock::now();
+            for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                auto query = queries.subspan(
+                    row * query_stride + head * kHeadDim, kHeadDim);
+                apply_rope(query.last(kRopeDim),
+                           position_base + static_cast<std::uint32_t>(row),
+                           attention_state[layer].frequencies);
+                round_bf16(query.last(kRopeDim));
+            }
+            query_rope_cpu_nanoseconds.fetch_add(
+                elapsed_nanoseconds(cpu_started), std::memory_order_relaxed);
+        };
+        const auto query_finish_started = std::chrono::steady_clock::now();
+        if (attention_workers != nullptr && row_count > 1U) {
+            result = attention_workers->parallel_for(row_count,
+                                                     normalize_query_row);
+            if (!result.ok()) return result;
+        } else {
+            for (std::size_t row = 0U; row < row_count; ++row) {
+                normalize_query_row(row);
+            }
         }
+        graph_stats.attention_query_finish_nanoseconds +=
+            elapsed_nanoseconds(query_finish_started);
+        graph_stats.attention_query_rms_cpu_nanoseconds +=
+            query_rms_cpu_nanoseconds.load(std::memory_order_relaxed);
+        graph_stats.attention_query_rope_cpu_nanoseconds +=
+            query_rope_cpu_nanoseconds.load(std::memory_order_relaxed);
+    } else {
+        // The projection still executes once for this semantic page, but it is
+        // now part of the bounded attention command and never materializes a
+        // full host query tensor.
+        ++graph_stats.attention_projection_matmul_calls;
+        graph_stats.attention_projection_matmul_rows += rows;
     }
-    graph_stats.attention_query_finish_nanoseconds +=
-        elapsed_nanoseconds(query_finish_started);
-    graph_stats.attention_query_rms_cpu_nanoseconds +=
-        query_rms_cpu_nanoseconds.load(std::memory_order_relaxed);
-    graph_stats.attention_query_rope_cpu_nanoseconds +=
-        query_rope_cpu_nanoseconds.load(std::memory_order_relaxed);
     graph_stats.attention_query_nanoseconds += elapsed_nanoseconds(subphase_started);
 
     subphase_started = std::chrono::steady_clock::now();

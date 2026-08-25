@@ -72,6 +72,7 @@ struct Options {
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
+    std::uint32_t prefill_page_tokens{};
     strata::SamplingOptions sampling{strata::greedy_sampling()};
     double vram_fraction{0.85};
     bool devices_explicit{};
@@ -147,6 +148,7 @@ bool takes_value(std::string_view argument) {
     static constexpr std::string_view names[] = {
         "--model", "--model-type", "--prompt", "--system", "--plan-cache",
         "--decode-topology", "--context-size", "--max-context", "--max-new",
+        "--prefill-page-tokens",
         "--temperature", "--vram-fraction", "--seed", "--preset", "--top-k",
         "--top-p", "--min-p", "--typical-p", "--xtc-probability",
         "--xtc-threshold", "--presence-penalty", "--frequency-penalty",
@@ -189,6 +191,7 @@ execution:
   --block-kv-cache            DeepSeek physical KV pages
   --device-resident-runtime   the whole DeepSeek device-resident decode contract
   --decode-topology T         centralized (default) | rank-local-tp2
+  --prefill-page-tokens N     DeepSeek prompt rows per layer-major page
   --pin-resident-arena        pin the resident weight arena
   --no-prepack-mhc            keep mHC projections in their stored layout
 
@@ -346,6 +349,14 @@ bool parse_options(int argc, char** argv, Options& options) {
             {
                 const auto value = next();
                 if (!strata::cli::parse_positive_u32(value, options.max_new_tokens)) return reject(value);
+            }
+        } else if (argument == "--prefill-page-tokens") {
+            {
+                const auto value = next();
+                if (!strata::cli::parse_positive_u32(
+                        value, options.prefill_page_tokens)) {
+                    return reject(value);
+                }
             }
         } else if (argument == "--temperature") {
             {
@@ -913,6 +924,10 @@ void print_banner(const Options& options,
                                   ? "device-resident, rank-local TP2"
                                   : "device-resident, centralized");
     }
+    if (options.prefill_page_tokens != 0U) {
+        print_field("prefill", std::to_string(options.prefill_page_tokens) +
+                                   " tokens/page");
+    }
     print_field("sampler", sampler_summary(options.sampling) +
                                (deterministic(options.sampling)
                                     ? "   exact greedy, no hidden fallback"
@@ -1158,6 +1173,8 @@ int main(int argc, char** argv) {
                << strata::cli::devices_text(options.devices)
                << "\",\"context_size\":" << options.context_size
                << ",\"max_new_tokens\":" << options.max_new_tokens
+               << ",\"prefill_page_tokens\":"
+               << options.prefill_page_tokens
                << ",\"temperature\":" << options.sampling.temperature
                << ",\"exact\":" << (deterministic(options.sampling) ? "true" : "false")
                << ",\"sampler\":\""
@@ -1197,6 +1214,7 @@ int main(int argc, char** argv) {
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
     config.deepseek_rank_local_decode = options.rank_local_decode;
+    config.deepseek_prefill_page_tokens = options.prefill_page_tokens;
     config.pin_resident_arena = options.pin_resident_arena;
     config.prepack_mhc_projection = options.prepack_mhc;
     config.placement_cache_directory = options.plan_cache;

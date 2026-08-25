@@ -12,13 +12,17 @@ GPU kernel — is what sets the rate. Every instruction below follows from that.
 ## Build once
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_NCCL=ON
 cmake --build build-release --parallel \
   --target strata-chat strata-server strata-deepseek-run
 ```
 
-Rebuild after pulling runtime changes. `make check` is the correctness suite;
-it is not the optimized binary used for the rates below.
+Rank-local TP2 requires NCCL and fails closed when support is absent, so do not
+omit `-DSTRATA_ENABLE_NCCL=ON`. CMake searches the active Python environment,
+`NCCL_HOME`, standard system paths, and the CUDA toolkit. Rebuild after pulling
+runtime changes. `make check` is the correctness suite; it is not the optimized
+binary used for the rates below.
 
 ## Pin the device order first
 
@@ -52,6 +56,64 @@ admitted budget                         22.14 GiB   22.14 GiB
 
 If they read `22.14 GiB   14.57 GiB`, the order is wrong.
 
+## Copy-paste: chat
+
+First run the placement preflight. It reads no checkpoint weights, and catches
+the wrong device order, missing NCCL support, unsupported GPUs, and insufficient
+host or device memory before the roughly 100--115-second warm-cache model load:
+
+```bash
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+./build-release/strata-chat \
+  --model models/dsv4f --model-type deepseek \
+  --devices 1,2 --vram-fraction 0.95 \
+  --context-size 16384 --max-new 2048 \
+  --decode-topology rank-local-tp2 \
+  --prefill-page-tokens 8192 --dry-run
+```
+
+Verify that the placement reports the two RTX 3090s, equal per-rank admitted
+budgets, and a `fits` verdict. Then start interactive chat with the same
+settings:
+
+```bash
+./build-release/strata-chat \
+  --model models/dsv4f --model-type deepseek \
+  --devices 1,2 --vram-fraction 0.95 \
+  --context-size 16384 --max-new 2048 \
+  --decode-topology rank-local-tp2 \
+  --prefill-page-tokens 8192
+```
+
+For a one-shot prompt:
+
+```bash
+./build-release/strata-chat \
+  --model models/dsv4f --model-type deepseek \
+  --devices 1,2 --vram-fraction 0.95 \
+  --context-size 16384 --max-new 2048 \
+  --decode-topology rank-local-tp2 --prefill-page-tokens 8192 \
+  --prompt "Explain how tensor parallel inference works."
+```
+
+`--context-size` covers the rendered prompt, retained chat history, and output.
+With `--context-size 16384 --max-new 2048`, at most 14,336 rendered input
+tokens remain when the full output allowance is reserved. Chat-template tokens
+count toward that input budget. Incremental KV continuation is automatic, so
+later turns prefill only the uncached suffix unless `--full-reprefill` is set.
+
+`--decode-topology rank-local-tp2` automatically enables DeepSeek's complete
+device-resident runtime contract, including physical KV pages, CUDA attention,
+device mHC, and NUMA-local routed experts. Do not redundantly add
+`--device-resident-runtime`.
+
+`--prefill-page-tokens 8192` is the accepted high-throughput prompt shape for
+both chat and server. It does not allocate an 8,192-row page for a shorter
+prompt; it is an upper bound, so keep it in the command for short and long
+conversations alike. Omitting it restores the conservative 64-token DeepSeek
+default and can make long prompt ingestion substantially slower.
+
 ## Copy-paste: OpenAI-compatible server
 
 ```bash
@@ -66,9 +128,9 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 ```
 
 Loading is not instant: the checkpoint's 156.9 GB host tier is faulted into RAM
-before the server is ready. Wait for `[ready] http://127.0.0.1:8133` — roughly
-three minutes cold on the reference machine, less when the pages are already
-resident.
+before the server is ready. Wait for `[ready] http://127.0.0.1:8133`. Recent
+reference runs loaded in roughly 100--115 seconds with filesystem pages warm;
+a genuinely cold load can take several minutes.
 
 From another terminal:
 
@@ -122,19 +184,45 @@ measures the same as a 10 GB one — and 14 GB exhausts the weight arena.
 
 ## What has actually been measured
 
-Greedy, batch-one, `temperature: 0`, medians of three to seven interleaved
-reps. Reference hardware: two RTX 3090 24 GiB cards, 251 GiB RAM,
-`CUDA_DEVICE_ORDER=PCI_BUS_ID`, devices `1,2`, VRAM fraction 0.95, rank-local
-TP2, 16K context.
+Reference hardware is two RTX 3090 24 GiB cards at 1,605 MHz / 250 W, 251 GiB
+RAM, `CUDA_DEVICE_ORDER=PCI_BUS_ID`, devices `1,2`, VRAM fraction 0.95,
+rank-local TP2, 16K context, and no static expert tier unless stated otherwise.
 
-| Configuration | Decode, 27-token prompt | Decode, ~2,000-word prompt | Prefill, ~2,000 words |
-|---|---:|---:|---:|
-| No tier | 8.571 tok/s (116.7 ms/tok) | 7.302 tok/s | 18.147 tok/s |
-| **10 GB tier** | **9.171 tok/s (108.9 ms/tok)** | **8.077 tok/s** | 16.649 tok/s |
-| Relative | **1.070x** | **1.106x** | **0.917x** |
+The current accepted production result is **26.231 prefill tok/s** at exactly
+1,925 prompt tokens: 21.592, 27.828, and 26.231 tok/s, median of three
+interleaved candidate arms. The disabled-path control ran 21.581, 20.882, and
+19.142 tok/s, median 20.882, so keeping query projection through attention on
+the GPU improved the median by 25.6%. A 619-token screen reached 17.10 tok/s
+and a 133-token smoke reached 7.84 tok/s; these two are single screens, not
+median claims.
 
-So the tier buys 7% of decode on a short prompt and 11% at long context, and
-costs 8% of prefill. Both are real and both were measured on the same binary.
+Fresh batch-one server baselines, taken before the page-query change whose
+dispatch excludes single-row decode, measured **8.627 decode tok/s** median for
+a 128-token response after a 19-token prompt. Decode becomes slower as retained
+context grows because attention has more KV to scan. For example, the earlier
+long-context no-tier experiment measured 7.302 tok/s around 2,000 words.
+
+Prefill throughput is strongly shape-dependent. More rows amortize each weight
+read, so do not expect the 1,925-token rate from a 30-token prompt and do not
+average both into one "session speed." The fresh like-for-like baseline matrix
+that motivated the current fix was:
+
+| Engine | ~36-token prefill | ~500-token prefill | ~1,950-token prefill | short-context decode |
+|---|---:|---:|---:|---:|
+| vLLM | 8.439 tok/s | 41.901 tok/s | 127.490 tok/s | 10.346 tok/s |
+| Strata before device query | 4.332 tok/s | 17.431 tok/s | 22.757 tok/s | 8.627 tok/s |
+| Strata current | not re-run | 17.10 tok/s screen at 619 | **26.231 tok/s at 1,925** | unchanged path |
+
+The short vLLM prefill result itself ranged from 7.896 to 19.027 tok/s because
+fixed request cost dominates such a small prompt. The 26.231 tok/s Strata
+result is good enough to land, but it is not vLLM-equivalent; the remaining
+long-page gap is recorded, not hidden.
+
+The optional 10 GB routed-expert tier was measured before the device-query
+change. It bought 7% decode on a short prompt (8.571 to 9.171 tok/s) and 11% at
+long context (7.302 to 8.077 tok/s), while reducing then-current long prefill by
+8% (18.147 to 16.649 tok/s). Use it only when that decode trade is preferable;
+the current prefill-plus-tier combination has not been re-benchmarked.
 
 Two numbers that are **not** claims about this configuration:
 
@@ -146,6 +234,14 @@ Two numbers that are **not** claims about this configuration:
   is recorded as a rejection; see the evidence list.
 
 ## Reproduce the rates
+
+For an immediate user-facing check, use either copy-paste command above. Chat
+prints per-turn prefill and decode rates after each answer. The server returns
+the same measurements in its timing fields. Keep `--context-size 16384`,
+`--max-new 2048` in chat, and `--prefill-page-tokens 8192`; the page value is
+the important prefill setting and remains only an upper bound.
+
+For a controlled decode matrix:
 
 ```bash
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -182,6 +278,9 @@ prefill is the question.
 
 ## Evidence
 
+- [Device page-query ownership accepted](../experiments/0195-dsv4-device-page-query-accepted-2026-08-25.md)
+- [Fast prefill page exposed in chat](../experiments/0192-dsv4-chat-fast-page-accepted-2026-08-25.md)
+- [Production prefill cost model](../experiments/0190-dsv4-page-attention-screen-rejected-2026-08-24.md)
 - [The tier split falsified; the serial tier measured](../experiments/0178-dsv4-tier-overlap-falsified-2026-08-24.md)
 - [Where DeepSeek V4 decode actually dispatches](../experiments/0163-dsv4-sm86-mix1-decode-route-map-2026-08-23.md)
 - [The static hot-expert tier and its held-out coverage](../experiments/0124-dsv4-static-hot-expert-tier-2026-08-18.md)

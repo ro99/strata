@@ -152,14 +152,14 @@ ValidationResult CudaBackend::dsv4_paged_attention_to_mhc(
 ParseResult<std::uint64_t>
 CudaBackend::dsv4_paged_attention_to_mhc_page_workspace_bytes(
     std::span<const CudaDsv4PhysicalPage>, std::uint32_t,
-    std::uint32_t) const {
+    std::uint32_t, bool) const {
     return {0U, {"DeepSeek paged attention requires a CUDA-enabled build"}};
 }
 
 ParseResult<std::uint32_t>
 CudaBackend::dsv4_paged_attention_to_mhc_page_maximum_rows(
     std::span<const CudaDsv4PhysicalPage>, std::uint32_t, std::uint32_t,
-    std::uint64_t) const {
+    std::uint64_t, bool) const {
     return {0U, {"DeepSeek paged attention requires a CUDA-enabled build"}};
 }
 

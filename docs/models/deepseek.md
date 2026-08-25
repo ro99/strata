@@ -12,13 +12,17 @@ GPU kernel — is what sets the rate. Every instruction below follows from that.
 ## Build once
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_NCCL=ON
 cmake --build build-release --parallel \
   --target strata-chat strata-server strata-deepseek-run
 ```
 
-Rebuild after pulling runtime changes. `make check` is the correctness suite;
-it is not the optimized binary used for the rates below.
+Rank-local TP2 requires NCCL and fails closed when support is absent, so do not
+omit `-DSTRATA_ENABLE_NCCL=ON`. CMake searches the active Python environment,
+`NCCL_HOME`, standard system paths, and the CUDA toolkit. Rebuild after pulling
+runtime changes. `make check` is the correctness suite; it is not the optimized
+binary used for the rates below.
 
 ## Pin the device order first
 
@@ -51,6 +55,64 @@ admitted budget                         22.14 GiB   22.14 GiB
 ```
 
 If they read `22.14 GiB   14.57 GiB`, the order is wrong.
+
+## Copy-paste: chat
+
+First run the placement preflight. It reads no checkpoint weights, and catches
+the wrong device order, missing NCCL support, unsupported GPUs, and insufficient
+host or device memory before the roughly three-minute model load:
+
+```bash
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+./build-release/strata-chat \
+  --model models/dsv4f --model-type deepseek \
+  --devices 1,2 --vram-fraction 0.95 \
+  --context-size 16384 --max-new 2048 \
+  --decode-topology rank-local-tp2 \
+  --prefill-page-tokens 8192 --dry-run
+```
+
+Verify that the placement reports the two RTX 3090s, equal per-rank admitted
+budgets, and a `fits` verdict. Then start interactive chat with the same
+settings:
+
+```bash
+./build-release/strata-chat \
+  --model models/dsv4f --model-type deepseek \
+  --devices 1,2 --vram-fraction 0.95 \
+  --context-size 16384 --max-new 2048 \
+  --decode-topology rank-local-tp2 \
+  --prefill-page-tokens 8192
+```
+
+For a one-shot prompt:
+
+```bash
+./build-release/strata-chat \
+  --model models/dsv4f --model-type deepseek \
+  --devices 1,2 --vram-fraction 0.95 \
+  --context-size 16384 --max-new 2048 \
+  --decode-topology rank-local-tp2 --prefill-page-tokens 8192 \
+  --prompt "Explain how tensor parallel inference works."
+```
+
+`--context-size` covers the rendered prompt, retained chat history, and output.
+With `--context-size 16384 --max-new 2048`, at most 14,336 rendered input
+tokens remain when the full output allowance is reserved. Chat-template tokens
+count toward that input budget. Incremental KV continuation is automatic, so
+later turns prefill only the uncached suffix unless `--full-reprefill` is set.
+
+`--decode-topology rank-local-tp2` automatically enables DeepSeek's complete
+device-resident runtime contract, including physical KV pages, CUDA attention,
+device mHC, and NUMA-local routed experts. Do not redundantly add
+`--device-resident-runtime`.
+
+`--prefill-page-tokens 8192` is the accepted high-throughput prompt shape for
+both chat and server. It does not allocate an 8,192-row page for a shorter
+prompt; it is an upper bound, so keep it in the command for short and long
+conversations alike. Omitting it restores the conservative 64-token DeepSeek
+default and can make long prompt ingestion substantially slower.
 
 ## Copy-paste: OpenAI-compatible server
 

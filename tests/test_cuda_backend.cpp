@@ -2651,6 +2651,189 @@ TEST_CASE("native CUDA DeepSeek paged attention batches rows bit exactly") {
     }
 }
 
+TEST_CASE("native CUDA DeepSeek page query projection matches its host boundary bit exactly") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const auto device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_devices{device};
+    REQUIRE(backend.initialize(selected_devices, true).ok());
+    if (!backend.dsv4_fp8_tensor_page_supported(device) ||
+        !backend.validate_dsv4_mhc_device(device).ok()) {
+        return;
+    }
+
+    constexpr std::uint32_t rows = 2U;
+    constexpr std::uint32_t query_rank_columns = 1024U;
+    constexpr std::uint32_t heads = 64U;
+    constexpr std::uint32_t heads_per_group = 32U;
+    constexpr std::uint32_t head_columns = 512U;
+    constexpr std::uint32_t query_columns = heads * head_columns;
+    constexpr std::uint32_t candidate_width = 128U;
+
+    auto query_projection = upload_fp8(
+        backend, device, query_columns, query_rank_columns, 29U);
+    std::vector<float> query_rank(
+        static_cast<std::size_t>(rows) * query_rank_columns);
+    for (std::size_t index = 0U; index < query_rank.size(); ++index) {
+        const auto code = static_cast<int>((index * 13U + 5U) % 31U) - 15;
+        query_rank[index] = round_bf16(static_cast<float>(code) / 128.0F);
+    }
+
+    // This is the accepted host-visible boundary that the production path
+    // replaced: the same tensor-page matmul, then the exact sequential FP64
+    // square sum and BF16 normalization. The chosen RoPE coefficients are
+    // exactly representable and alternate identity with a quarter turn, so
+    // the fixture catches both sign and row/group layout without a libm/FMA
+    // ambiguity.
+    std::vector<float> expected(
+        static_cast<std::size_t>(rows) * query_columns);
+    REQUIRE(backend.matmul(query_projection, query_rank, rows, expected,
+                           true, nullptr, true).ok());
+    std::vector<float> inverse_cosines(static_cast<std::size_t>(rows) * 32U);
+    std::vector<float> inverse_sines(inverse_cosines.size());
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        for (std::uint32_t pair = 0U; pair < 32U; ++pair) {
+            const bool rotate = ((row + pair) & 1U) != 0U;
+            inverse_cosines[static_cast<std::size_t>(row) * 32U + pair] =
+                rotate ? 0.0F : 1.0F;
+            inverse_sines[static_cast<std::size_t>(row) * 32U + pair] =
+                rotate ? -1.0F : 0.0F;
+        }
+    }
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        for (std::uint32_t head = 0U; head < heads; ++head) {
+            auto query = std::span(expected).subspan(
+                (static_cast<std::size_t>(row) * heads + head) *
+                    head_columns,
+                head_columns);
+            double square_sum = 0.0;
+            for (const float value : query) {
+                square_sum += static_cast<double>(value) * value;
+            }
+            const float reciprocal = 1.0F / std::sqrt(
+                static_cast<float>(square_sum / head_columns) + 1.0e-6F);
+            for (auto& value : query) {
+                value = round_bf16(value * reciprocal);
+            }
+            auto rope = query.last(64U);
+            for (std::uint32_t pair = 0U; pair < 32U; ++pair) {
+                if (inverse_cosines[static_cast<std::size_t>(row) * 32U +
+                                    pair] == 1.0F) {
+                    continue;
+                }
+                const float first = rope[pair * 2U];
+                const float second = rope[pair * 2U + 1U];
+                rope[pair * 2U] = round_bf16(-second);
+                rope[pair * 2U + 1U] = round_bf16(first);
+            }
+        }
+    }
+    std::vector<float> expected_group_major(expected.size());
+    for (std::uint32_t group = 0U; group < 2U; ++group) {
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            for (std::uint32_t local_head = 0U;
+                 local_head < heads_per_group; ++local_head) {
+                const auto head = group * heads_per_group + local_head;
+                const auto source =
+                    (static_cast<std::size_t>(row) * heads + head) *
+                    head_columns;
+                const auto destination =
+                    ((static_cast<std::size_t>(group) * rows + row) *
+                         heads_per_group +
+                     local_head) *
+                    head_columns;
+                std::copy_n(expected.begin() +
+                                static_cast<std::ptrdiff_t>(source),
+                            head_columns,
+                            expected_group_major.begin() +
+                                static_cast<std::ptrdiff_t>(destination));
+            }
+        }
+    }
+
+    // Attention/output values are deliberately zero: this operation fixture
+    // observes the query immediately after the new projection boundary, while
+    // still executing the real fused page-attention-to-mHC command and all of
+    // its production validation.
+    const auto upload_zero_bf16 = [&](std::uint64_t weight_rows,
+                                      std::uint64_t columns) {
+        strata::CudaWeightDescriptor descriptor;
+        descriptor.encoding = strata::CudaWeightEncoding::Plain;
+        descriptor.dtype = strata::SafetensorsDtype::Bf16;
+        descriptor.rows = weight_rows;
+        descriptor.columns = columns;
+        std::vector<std::byte> payload(
+            static_cast<std::size_t>(weight_rows * columns * 2U));
+        strata::CudaWeight weight;
+        REQUIRE(backend.upload(device, descriptor, payload, {}, weight).ok());
+        return weight;
+    };
+    auto output_a = upload_zero_bf16(8192U, 4096U);
+    auto output_b = upload_fp8(backend, device, 4096U, 8192U, 0U);
+
+    std::vector<std::byte> physical_page(2U * 584U);
+    strata::CudaBuffer page_buffer;
+    REQUIRE(backend.upload_buffer(device, physical_page, page_buffer).ok());
+    const std::array<strata::CudaDsv4PhysicalPage, 1> pages{{
+        {&page_buffer, 2U},
+    }};
+    std::vector<strata::CudaDsv4AttentionCandidate> candidates(
+        static_cast<std::size_t>(rows) * candidate_width);
+    std::array<float, heads> sinks{};
+    sinks.fill(0.0F);
+
+    constexpr std::size_t hidden = 4096U;
+    constexpr std::size_t multiplier = 4U;
+    constexpr std::size_t mixes = 24U;
+    std::vector<float> mhc_projection(mixes * multiplier * hidden);
+    std::array<float, 3> mhc_scale{};
+    std::array<float, mixes> mhc_base{};
+    std::vector<float> mhc_norm(hidden, 1.0F);
+    strata::CudaDsv4MhcWeights mhc_weights;
+    REQUIRE(backend.upload_dsv4_mhc_weights(
+        device, mhc_projection, mhc_scale, mhc_base, mhc_norm,
+        mhc_weights).ok());
+    REQUIRE(backend.dsv4_mhc_reserve_slots(device, rows).ok());
+    const std::vector<float> residual(multiplier * hidden);
+    std::vector<float> layer_input(hidden);
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+        REQUIRE(backend.dsv4_mhc_select_slot(device, row).ok());
+        REQUIRE(backend.dsv4_mhc_begin(
+            device, mhc_weights, residual, {}, layer_input).ok());
+    }
+
+    const std::array<std::uint32_t, rows> slots{0U, 1U};
+    std::vector<float> actual(expected.size());
+    std::vector<float> diagnostic_branch(
+        static_cast<std::size_t>(rows) * hidden);
+    strata::CudaDsv4PagedAttentionMhcRequest request;
+    request.attention.head_sinks = sinks;
+    request.attention.pages = pages;
+    request.attention.candidates = candidates;
+    request.attention.rows = rows;
+    request.attention.candidate_width = candidate_width;
+    request.attention.maximum_workspace_bytes = 384ULL << 20U;
+    request.attention.scale = 1.0F / std::sqrt(512.0F);
+    request.page_query_projection = &query_projection;
+    request.page_query_rank = query_rank;
+    request.page_query_diagnostic = actual;
+    request.mhc_slots = slots;
+    request.inverse_rope_cosines = inverse_cosines;
+    request.inverse_rope_sines = inverse_sines;
+    request.output_a = &output_a;
+    request.output_b = &output_b;
+    request.mhc_device = device;
+    REQUIRE(backend.dsv4_paged_attention_to_mhc(
+        device, request, diagnostic_branch).ok());
+
+    REQUIRE(actual.size() == expected_group_major.size());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) ==
+                std::bit_cast<std::uint32_t>(expected_group_major[index]));
+    }
+}
+
 TEST_CASE("native CUDA DeepSeek transformed expert shards match the canonical ones") {
     // Prefill uploads the routed experts in the host expert's decode layout,
     // because that is the only copy of them host memory holds. The kernels

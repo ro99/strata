@@ -482,6 +482,18 @@ using CudaDsv4AttentionPrepareHostCallback = bool (*)(
 // may be requested by the caller without changing the device computation.
 struct CudaDsv4PagedAttentionMhcRequest {
     CudaDsv4PagedAttentionRequest attention;
+    // Optional multi-row page projection. `query_rank` is the accepted
+    // host-visible BF16 output of wq_a + q_norm; CUDA applies the same E4M3
+    // activation boundary, wq_b tensor-page projection, per-head RMS norm,
+    // BF16 boundary, and forward RoPE before attention consumes the result.
+    // In this mode attention.queries is empty and no full query page crosses
+    // D2H or H2D.
+    const CudaWeight* page_query_projection{};
+    std::span<const float> page_query_rank;
+    // Test-only capture of the projected BF16 queries in the exact
+    // [group, row, local-head, column] layout consumed by attention. Empty in
+    // production, so the optimized command has no diagnostic download.
+    std::span<float> page_query_diagnostic;
     // Optional per-row mHC arena slots for a page request. Empty selects the
     // active single-row workspace; otherwise its extent equals attention.rows.
     std::span<const std::uint32_t> mhc_slots;
@@ -1075,12 +1087,14 @@ public:
     [[nodiscard]] ParseResult<std::uint64_t>
     dsv4_paged_attention_to_mhc_page_workspace_bytes(
         std::span<const CudaDsv4PhysicalPage> pages, std::uint32_t rows,
-        std::uint32_t candidate_width) const;
+        std::uint32_t candidate_width,
+        bool project_page_query = false) const;
     [[nodiscard]] ParseResult<std::uint32_t>
     dsv4_paged_attention_to_mhc_page_maximum_rows(
         std::span<const CudaDsv4PhysicalPage> pages,
         std::uint32_t requested_rows, std::uint32_t candidate_width,
-        std::uint64_t maximum_workspace_bytes) const;
+        std::uint64_t maximum_workspace_bytes,
+        bool project_page_query = false) const;
     [[nodiscard]] ValidationResult dsv4_prepare_attention(
         int device, const CudaDsv4AttentionPrepareRequest& request,
         std::span<float> query_rank, std::span<float> key_value,

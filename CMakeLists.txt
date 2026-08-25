@@ -640,6 +640,7 @@ if(BUILD_TESTING)
         tests/test_deepseek_diagnostics.cpp
         tests/test_deepseek_runtime.cpp
         tests/test_model.cpp
+        tests/test_model_catalog.cpp
         tests/test_openai_protocol.cpp
         tests/test_placement.cpp
         tests/test_q4.cpp
@@ -657,6 +658,13 @@ if(BUILD_TESTING)
         STRATA_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     add_test(NAME strata-tests COMMAND strata-tests)
+    add_executable(strata-router-test-child tests/router_test_child.cpp)
+    add_test(
+        NAME strata-router-smoke
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_model_router.sh
+            $<TARGET_FILE:strata-server>
+            $<TARGET_FILE:strata-router-test-child>
+    )
     add_test(
         NAME strata-sim-smoke
         COMMAND strata-sim

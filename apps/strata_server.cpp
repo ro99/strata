@@ -1,4 +1,5 @@
 #include "strata/openai_protocol.hpp"
+#include "strata/model_catalog.hpp"
 #include "strata/runtime.hpp"
 #include "strata/runtime_support.hpp"
 #include "strata/tokenizer.hpp"
@@ -8,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -22,10 +24,13 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -34,13 +39,19 @@ struct Options {
     std::string model;
     std::string model_type;
     std::string model_id;
+    std::string models_preset;
     std::string host{"127.0.0.1"};
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
     std::uint16_t port{8080U};
+    std::uint32_t models_max{1U};
     double vram_fraction{0.85};
+    double temperature{1.0};
+    double top_p{1.0};
+    std::optional<std::uint64_t> seed;
     bool devices_explicit{};
+    bool models_autoload{true};
     bool flash_attention{};
     bool block_kv_cache{};
     bool device_resident_runtime{};
@@ -87,7 +98,10 @@ void usage() {
         << "                     [--static-expert-plan PATH]\n"
         << "                     [--static-expert-bytes BYTES]\n"
         << "                     [--dry-run] [--replan]\n"
-        << "                     [--plan-cache DIR] [--no-plan-cache]\n\n"
+        << "                     [--plan-cache DIR] [--no-plan-cache]\n"
+        << "                     [--temperature F] [--top-p F] [--seed N]\n"
+        << "   or: strata-server --models-preset FILE [--models-max N]\n"
+        << "                     [--no-models-autoload] [--host ADDRESS] [--port N]\n\n"
         << "--device-resident-runtime is the DeepSeek device-resident decode\n"
         << "contract as a whole: physical KV pages, device-resident mHC, CUDA\n"
         << "attention, the scalar lightning indexer, and routed experts in the\n"
@@ -145,9 +159,18 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.replan = true;
             continue;
         }
+        if (argument == "--no-models-autoload") {
+            options.models_autoload = false;
+            continue;
+        }
+        if (argument == "--models-autoload") {
+            options.models_autoload = true;
+            continue;
+        }
         if (index + 1 >= argc) return false;
         const auto next = [&]() { return std::string_view(argv[++index]); };
         if (argument == "--model") options.model = next();
+        else if (argument == "--models-preset") options.models_preset = next();
         else if (argument == "--plan-cache") options.plan_cache = next();
         else if (argument == "--model-type") options.model_type = next();
         else if (argument == "--model-id") options.model_id = next();
@@ -195,10 +218,22 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.port = static_cast<std::uint16_t>(port);
         } else if (argument == "--context-size") {
             if (!strata::cli::parse_positive_u32(next(), options.context_size)) return false;
+        } else if (argument == "--models-max") {
+            if (!strata::cli::parse_positive_u32(next(), options.models_max) ||
+                options.models_max > 64U) return false;
         } else if (argument == "--max-new") {
             if (!strata::cli::parse_positive_u32(next(), options.max_new_tokens)) return false;
         } else if (argument == "--vram-fraction") {
             if (!strata::cli::parse_double(next(), options.vram_fraction, 0.0, 0.95)) return false;
+        } else if (argument == "--temperature") {
+            if (!strata::cli::parse_double(next(), options.temperature, 0.0, 2.0)) return false;
+        } else if (argument == "--top-p") {
+            if (!strata::cli::parse_double(next(), options.top_p, 0.0, 1.0) ||
+                options.top_p == 0.0) return false;
+        } else if (argument == "--seed") {
+            std::uint64_t value = 0U;
+            if (!strata::cli::parse_u64(next(), value)) return false;
+            options.seed = value;
         } else if (argument == "--devices") {
             if (!strata::cli::parse_devices(next(), options.devices)) return false;
             options.devices_explicit = true;
@@ -206,6 +241,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             std::cerr << "unknown argument: " << argument << '\n';
             return false;
         }
+    }
+    if (!options.models_preset.empty()) {
+        return options.model.empty() && options.model_type.empty() &&
+               !options.dry_run;
     }
     if (!options.devices_explicit) options.devices = {0, 1, 2};
     if (options.model_id.empty() && !options.model.empty()) {
@@ -531,6 +570,16 @@ private:
         if (!request.has_max_tokens) {
             request.generation.maximum_new_tokens = options_.max_new_tokens;
         }
+        if (!request.has_temperature) {
+            request.generation.sampling.temperature = options_.temperature;
+        }
+        if (!request.has_top_p) {
+            request.generation.sampling.top_p = options_.top_p;
+        }
+        if (!request.has_seed && options_.seed.has_value()) {
+            request.generation.sampling.seed = *options_.seed;
+            request.has_seed = true;
+        }
         std::cerr << "[request] id=" << id << " phase=accepted stream="
                   << (request.stream ? "true" : "false")
                   << " messages=" << request.messages.size()
@@ -817,8 +866,482 @@ private:
     std::uint64_t request_id_{};
 };
 
+enum class RouterModelStatus : std::uint8_t {
+    Unloaded,
+    Loading,
+    Loaded,
+    Failed,
+};
+
+std::string_view router_status_name(RouterModelStatus status) {
+    switch (status) {
+        case RouterModelStatus::Unloaded: return "unloaded";
+        case RouterModelStatus::Loading: return "loading";
+        case RouterModelStatus::Loaded: return "loaded";
+        case RouterModelStatus::Failed: return "failed";
+    }
+    return "failed";
+}
+
+struct RouterModelInstance {
+    strata::ModelCatalogEntry catalog;
+    RouterModelStatus status{RouterModelStatus::Unloaded};
+    pid_t process{-1};
+    std::uint16_t port{};
+    std::uint64_t last_used{};
+    std::uint32_t active_requests{};
+    int exit_code{};
+};
+
+std::uint64_t monotonic_milliseconds() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+int connect_loopback(std::uint16_t port) {
+    // Close-on-exec everywhere: the router forks and execs model children
+    // while holding listening, client, and upstream sockets. An inherited
+    // duplicate keeps peer connections open after the router closes its own
+    // copy, so streaming clients would never observe end-of-stream.
+    const int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        close(socket_fd);
+        return -1;
+    }
+    return socket_fd;
+}
+
+std::optional<std::uint16_t> unused_loopback_port() {
+    const int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) return std::nullopt;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = 0;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        close(socket_fd);
+        return std::nullopt;
+    }
+    socklen_t length = sizeof(address);
+    if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+        close(socket_fd);
+        return std::nullopt;
+    }
+    const auto port = ntohs(address.sin_port);
+    close(socket_fd);
+    return port;
+}
+
+std::string current_executable(std::string_view argv0) {
+    std::array<char, 4096U> path{};
+    const auto length = readlink("/proc/self/exe", path.data(), path.size() - 1U);
+    if (length > 0) return std::string(path.data(), static_cast<std::size_t>(length));
+    return std::filesystem::absolute(std::filesystem::path(argv0)).string();
+}
+
+int process_exit_code(int status) {
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
+}
+
+class RouterServer {
+public:
+    RouterServer(const Options& options, strata::ModelCatalog catalog,
+                 std::string executable)
+        : options_(options), executable_(std::move(executable)) {
+        if (const char* override_path = std::getenv("STRATA_ROUTER_CHILD_EXECUTABLE")) {
+            if (*override_path != '\0') executable_ = override_path;
+        }
+        models_.reserve(catalog.models.size());
+        for (auto& entry : catalog.models) {
+            RouterModelInstance instance;
+            instance.catalog = std::move(entry);
+            models_.push_back(std::move(instance));
+        }
+    }
+
+    ~RouterServer() { shutdown(); }
+
+    void load_startup_models() {
+        for (auto& model : models_) {
+            if (!model.catalog.load_on_startup) continue;
+            std::string error;
+            if (!ensure_loaded(model, error)) {
+                std::cerr << "error: startup load for " << model.catalog.id
+                          << " failed: " << error << '\n';
+            }
+        }
+    }
+
+    void shutdown() {
+        if (shutdown_) return;
+        shutdown_ = true;
+        for (auto& model : models_) {
+            if (model.process > 0) stop_child(model, false);
+        }
+    }
+
+    void handle(int socket_fd, const HttpRequest& request) {
+        refresh_children();
+        const auto query = request.target.find('?');
+        const auto target = std::string_view(request.target).substr(0U, query);
+        if (request.method == "OPTIONS") {
+            send_response(socket_fd, 204, "No Content", "text/plain", "");
+        } else if (request.method == "GET" &&
+                   (target == "/v1/health" || target == "/health")) {
+            send_response(socket_fd, 200, "OK", "application/json",
+                          "{\"status\":\"ok\",\"role\":\"router\"}");
+        } else if (request.method == "GET" && target == "/props") {
+            props(socket_fd);
+        } else if (request.method == "GET" &&
+                   (target == "/v1/models" || target == "/models")) {
+            models(socket_fd);
+        } else if (request.method == "POST" && target == "/models/load") {
+            load(socket_fd, request.body);
+        } else if (request.method == "POST" && target == "/models/unload") {
+            unload(socket_fd, request.body);
+        } else if (request.method == "POST") {
+            route_post(socket_fd, request);
+        } else {
+            send_error(socket_fd, 404, "Not Found", "unknown router endpoint",
+                       "invalid_request_error", "not_found");
+        }
+    }
+
+private:
+    RouterModelInstance* find(std::string_view id) {
+        const auto found = std::find_if(models_.begin(), models_.end(),
+            [&](const RouterModelInstance& model) { return model.catalog.id == id; });
+        return found == models_.end() ? nullptr : &*found;
+    }
+
+    void refresh_children() {
+        for (auto& model : models_) {
+            if (model.process <= 0) continue;
+            int status = 0;
+            const auto waited = waitpid(model.process, &status, WNOHANG);
+            if (waited != model.process) continue;
+            model.exit_code = process_exit_code(status);
+            model.process = -1;
+            model.port = 0;
+            if (model.status == RouterModelStatus::Loaded ||
+                model.status == RouterModelStatus::Loading) {
+                model.status = RouterModelStatus::Failed;
+                std::cerr << "[router] model=" << model.catalog.id
+                          << " child exited code=" << model.exit_code << '\n';
+            }
+        }
+    }
+
+    std::size_t running_count() const {
+        return static_cast<std::size_t>(std::count_if(
+            models_.begin(), models_.end(), [](const RouterModelInstance& model) {
+                return model.status == RouterModelStatus::Loaded ||
+                       model.status == RouterModelStatus::Loading;
+            }));
+    }
+
+    bool make_capacity(RouterModelInstance& requested, std::string& error) {
+        while (running_count() >= options_.models_max) {
+            RouterModelInstance* victim = nullptr;
+            for (auto& candidate : models_) {
+                if (&candidate == &requested ||
+                    candidate.status != RouterModelStatus::Loaded ||
+                    candidate.active_requests != 0U) continue;
+                if (victim == nullptr || candidate.last_used < victim->last_used) {
+                    victim = &candidate;
+                }
+            }
+            if (victim == nullptr) {
+                error = "all model slots are busy";
+                return false;
+            }
+            std::cerr << "[router] evicting model=" << victim->catalog.id
+                      << " for model=" << requested.catalog.id << '\n';
+            stop_child(*victim, true);
+        }
+        return true;
+    }
+
+    bool ensure_loaded(RouterModelInstance& model, std::string& error) {
+        refresh_children();
+        if (model.status == RouterModelStatus::Loaded) return true;
+        if (!make_capacity(model, error)) return false;
+        const auto port = unused_loopback_port();
+        if (!port.has_value()) {
+            error = "cannot allocate a loopback port";
+            return false;
+        }
+
+        std::vector<std::string> arguments{
+            executable_, "--model", model.catalog.model_directory,
+            "--model-type", model.catalog.model_type,
+            "--model-id", model.catalog.id,
+            "--host", "127.0.0.1", "--port", std::to_string(*port)
+        };
+        arguments.insert(arguments.end(), model.catalog.launch_arguments.begin(),
+                         model.catalog.launch_arguments.end());
+        std::vector<char*> argv;
+        argv.reserve(arguments.size() + 1U);
+        for (auto& argument : arguments) argv.push_back(argument.data());
+        argv.push_back(nullptr);
+
+        std::cerr << "[router] spawning model=" << model.catalog.id
+                  << " port=" << *port << '\n';
+        const auto child = fork();
+        if (child < 0) {
+            error = std::string("fork failed: ") + std::strerror(errno);
+            return false;
+        }
+        if (child == 0) {
+            execv(executable_.c_str(), argv.data());
+            std::cerr << "error: cannot exec router child " << executable_
+                      << ": " << std::strerror(errno) << '\n';
+            _exit(127);
+        }
+        model.process = child;
+        model.port = *port;
+        model.status = RouterModelStatus::Loading;
+        model.exit_code = 0;
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        while (stop_requested == 0 && std::chrono::steady_clock::now() < deadline) {
+            int status = 0;
+            const auto waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) {
+                model.exit_code = process_exit_code(status);
+                model.process = -1;
+                model.port = 0;
+                model.status = RouterModelStatus::Failed;
+                error = "model child exited with code " + std::to_string(model.exit_code);
+                return false;
+            }
+            const int probe = connect_loopback(*port);
+            if (probe >= 0) {
+                close(probe);
+                model.status = RouterModelStatus::Loaded;
+                model.last_used = monotonic_milliseconds();
+                std::cerr << "[router] model=" << model.catalog.id << " loaded\n";
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        error = stop_requested == 0 ? "model load timed out after one hour"
+                                    : "router is shutting down";
+        stop_child(model, false);
+        model.status = RouterModelStatus::Failed;
+        return false;
+    }
+
+    void stop_child(RouterModelInstance& model, bool clear_failure) {
+        if (model.process <= 0) {
+            model.status = RouterModelStatus::Unloaded;
+            if (clear_failure) model.exit_code = 0;
+            return;
+        }
+        const auto process = model.process;
+        std::cerr << "[router] stopping model=" << model.catalog.id << '\n';
+        static_cast<void>(kill(process, SIGTERM));
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(model.catalog.stop_timeout_seconds);
+        int status = 0;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto waited = waitpid(process, &status, WNOHANG);
+            if (waited == process || (waited < 0 && errno == ECHILD)) {
+                model.process = -1;
+                model.port = 0;
+                model.status = RouterModelStatus::Unloaded;
+                if (clear_failure) model.exit_code = 0;
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::cerr << "warning: force-killing model=" << model.catalog.id << '\n';
+        static_cast<void>(kill(process, SIGKILL));
+        while (waitpid(process, &status, 0) < 0 && errno == EINTR) {}
+        model.process = -1;
+        model.port = 0;
+        model.status = RouterModelStatus::Unloaded;
+        if (clear_failure) model.exit_code = 0;
+    }
+
+    void props(int socket_fd) const {
+        std::ostringstream body;
+        body << "{\"role\":\"router\",\"max_instances\":"
+             << options_.models_max << ",\"models_autoload\":"
+             << (options_.models_autoload ? "true" : "false") << '}';
+        send_response(socket_fd, 200, "OK", "application/json", body.str());
+    }
+
+    void models(int socket_fd) const {
+        const auto created = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::ostringstream body;
+        body << "{\"object\":\"list\",\"data\":[";
+        for (std::size_t index = 0U; index < models_.size(); ++index) {
+            if (index != 0U) body << ',';
+            const auto& model = models_[index];
+            body << "{\"id\":\"" << strata::cli::json_escape(model.catalog.id)
+                 << "\",\"object\":\"model\",\"created\":" << created
+                 << ",\"owned_by\":\"strata\",\"name\":\""
+                 << strata::cli::json_escape(model.catalog.name)
+                 << "\",\"model_type\":\""
+                 << strata::cli::json_escape(model.catalog.model_type)
+                 << "\",\"status\":{\"value\":\""
+                 << router_status_name(model.status) << '"';
+            if (model.status == RouterModelStatus::Failed) {
+                body << ",\"failed\":true,\"exit_code\":" << model.exit_code;
+            }
+            body << "},\"defaults\":{";
+            bool wrote_default = false;
+            const auto write_default = [&](std::string_view key, const auto& value) {
+                if (wrote_default) body << ',';
+                body << '"' << key << "\":" << value;
+                wrote_default = true;
+            };
+            if (model.catalog.maximum_new_tokens) {
+                write_default("max_tokens", *model.catalog.maximum_new_tokens);
+            }
+            if (model.catalog.temperature) {
+                write_default("temperature", *model.catalog.temperature);
+            }
+            if (model.catalog.top_p) write_default("top_p", *model.catalog.top_p);
+            if (model.catalog.seed) write_default("seed", *model.catalog.seed);
+            body << "}}";
+        }
+        body << "]}";
+        send_response(socket_fd, 200, "OK", "application/json", body.str());
+    }
+
+    void load(int socket_fd, std::string_view body) {
+        std::string id;
+        std::string error;
+        if (!strata::parse_openai_model_field(body, id, error)) {
+            send_error(socket_fd, 400, "Bad Request", error, "invalid_request_error");
+            return;
+        }
+        auto* model = find(id);
+        if (model == nullptr) {
+            send_error(socket_fd, 404, "Not Found", "model is not in the catalog",
+                       "invalid_request_error", "model_not_found");
+            return;
+        }
+        if (!ensure_loaded(*model, error)) {
+            send_error(socket_fd, 503, "Service Unavailable", error, "server_error",
+                       "model_load_failed");
+            return;
+        }
+        send_response(socket_fd, 200, "OK", "application/json", "{\"success\":true}");
+    }
+
+    void unload(int socket_fd, std::string_view body) {
+        std::string id;
+        std::string error;
+        if (!strata::parse_openai_model_field(body, id, error)) {
+            send_error(socket_fd, 400, "Bad Request", error, "invalid_request_error");
+            return;
+        }
+        auto* model = find(id);
+        if (model == nullptr) {
+            send_error(socket_fd, 404, "Not Found", "model is not in the catalog",
+                       "invalid_request_error", "model_not_found");
+            return;
+        }
+        if (model->active_requests != 0U) {
+            send_error(socket_fd, 409, "Conflict", "model is serving a request",
+                       "invalid_request_error", "model_busy");
+            return;
+        }
+        stop_child(*model, true);
+        send_response(socket_fd, 200, "OK", "application/json", "{\"success\":true}");
+    }
+
+    void route_post(int socket_fd, const HttpRequest& request) {
+        std::string id;
+        std::string error;
+        if (!strata::parse_openai_model_field(request.body, id, error)) {
+            send_error(socket_fd, 400, "Bad Request", error, "invalid_request_error");
+            return;
+        }
+        auto* model = find(id);
+        if (model == nullptr) {
+            send_error(socket_fd, 404, "Not Found", "requested model is not in the catalog",
+                       "invalid_request_error", "model_not_found");
+            return;
+        }
+        if (model->status != RouterModelStatus::Loaded) {
+            if (!options_.models_autoload) {
+                send_error(socket_fd, 409, "Conflict", "requested model is not loaded",
+                           "invalid_request_error", "model_not_loaded");
+                return;
+            }
+            if (!ensure_loaded(*model, error)) {
+                send_error(socket_fd, 503, "Service Unavailable", error, "server_error",
+                           "model_load_failed");
+                return;
+            }
+        }
+        proxy(socket_fd, request, *model);
+    }
+
+    void proxy(int socket_fd, const HttpRequest& request, RouterModelInstance& model) {
+        const int upstream = connect_loopback(model.port);
+        if (upstream < 0) {
+            refresh_children();
+            send_error(socket_fd, 502, "Bad Gateway", "cannot connect to model child",
+                       "server_error", "upstream_unavailable");
+            return;
+        }
+        std::ostringstream head;
+        head << request.method << ' ' << request.target << " HTTP/1.1\r\n"
+             << "Host: 127.0.0.1:" << model.port << "\r\n"
+             << "Content-Type: application/json\r\n"
+             << "Accept: */*\r\n"
+             << "Content-Length: " << request.body.size() << "\r\n"
+             << "Connection: close\r\n\r\n";
+        if (!send_all(upstream, head.str()) || !send_all(upstream, request.body)) {
+            close(upstream);
+            send_error(socket_fd, 502, "Bad Gateway", "cannot write to model child",
+                       "server_error", "upstream_unavailable");
+            return;
+        }
+        ++model.active_requests;
+        model.last_used = monotonic_milliseconds();
+        std::array<char, 64U * 1024U> buffer{};
+        bool received_any = false;
+        for (;;) {
+            const auto received = recv(upstream, buffer.data(), buffer.size(), 0);
+            if (received == 0) break;
+            if (received < 0) {
+                if (errno == EINTR) continue;
+                if (!received_any) {
+                    send_error(socket_fd, 502, "Bad Gateway", "cannot read from model child",
+                               "server_error", "upstream_unavailable");
+                }
+                break;
+            }
+            received_any = true;
+            if (!send_all(socket_fd, std::string_view(
+                    buffer.data(), static_cast<std::size_t>(received)))) break;
+        }
+        close(upstream);
+        --model.active_requests;
+    }
+
+    const Options& options_;
+    std::string executable_;
+    std::vector<RouterModelInstance> models_;
+    bool shutdown_{};
+};
+
 int bind_server(const Options& options) {
-    const int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (socket_fd < 0) return -1;
     int enabled = 1;
     setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
@@ -867,6 +1390,50 @@ int main(int argc, char** argv) {
     if (!parse_options(argc, argv, options)) {
         usage();
         return 2;
+    }
+    if (!options.models_preset.empty()) {
+        auto catalog = strata::load_model_catalog(options.models_preset);
+        if (!catalog.ok()) {
+            for (const auto& error : catalog.errors) {
+                std::cerr << "error: " << error << '\n';
+            }
+            return 1;
+        }
+        const auto catalog_size = catalog.value.models.size();
+        RouterServer router(options, std::move(catalog.value),
+                            current_executable(argv[0]));
+        listening_socket = bind_server(options);
+        if (listening_socket < 0) {
+            std::cerr << "error: cannot listen on " << options.host << ':' << options.port
+                      << ": " << std::strerror(errno) << '\n';
+            return 1;
+        }
+        std::signal(SIGINT, stop_server);
+        std::signal(SIGTERM, stop_server);
+        std::signal(SIGPIPE, SIG_IGN);
+        std::cerr << "[ready] http://" << options.host << ':' << options.port
+                  << " role=router models=" << catalog_size << "\n";
+        router.load_startup_models();
+        while (stop_requested == 0) {
+            const int client = accept4(listening_socket, nullptr, nullptr, SOCK_CLOEXEC);
+            if (client < 0) {
+                if (errno == EINTR || stop_requested != 0) continue;
+                std::cerr << "warning: accept failed: " << std::strerror(errno) << '\n';
+                continue;
+            }
+            HttpRequest request;
+            std::string error;
+            if (!read_request(client, request, error)) {
+                send_error(client, 400, "Bad Request", error, "invalid_request_error");
+            } else {
+                router.handle(client, request);
+            }
+            close(client);
+        }
+        listening_socket = -1;
+        router.shutdown();
+        std::cerr << "[shutdown] router stopped cleanly\n";
+        return 0;
     }
     // parse_options already rejected an unregistered --model-type.
     const auto* registration =
@@ -932,7 +1499,7 @@ int main(int argc, char** argv) {
     std::cerr << "[ready] http://" << options.host << ':' << options.port << "\n";
     ApiServer server(options, runtime, std::move(tokenizer.value));
     while (stop_requested == 0) {
-        const int client = accept(listening_socket, nullptr, nullptr);
+        const int client = accept4(listening_socket, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) {
             if (errno == EINTR || stop_requested != 0) continue;
             std::cerr << "warning: accept failed: " << std::strerror(errno) << '\n';

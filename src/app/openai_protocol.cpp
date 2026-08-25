@@ -346,8 +346,10 @@ bool parse_openai_chat_request(
                 has_messages = true;
             } else if (key == "temperature") {
                 request.generation.sampling.temperature = cursor.parse_number();
+                request.has_temperature = true;
             } else if (key == "top_p") {
                 request.generation.sampling.top_p = cursor.parse_number();
+                request.has_top_p = true;
             } else if (key == "n") {
                 const auto value = cursor.parse_uint64();
                 if (value > 16U) {
@@ -470,8 +472,10 @@ bool parse_openai_completion_request(
                 has_prompt = true;
             } else if (key == "temperature") {
                 request.generation.sampling.temperature = cursor.parse_number();
+                request.has_temperature = true;
             } else if (key == "top_p") {
                 request.generation.sampling.top_p = cursor.parse_number();
+                request.has_top_p = true;
             } else if (key == "n") {
                 const auto value = cursor.parse_uint64();
                 if (value > 16U) {
@@ -575,6 +579,49 @@ bool parse_openai_tokenize_request(
     }
     if (model.empty() || text.empty()) {
         error = "model and non-empty text are required";
+        return false;
+    }
+    return true;
+}
+
+bool parse_openai_model_field(
+    std::string_view json, std::string& model, std::string& error) {
+    model.clear();
+    error.clear();
+    if (json.size() > maximum_chat_request_bytes) {
+        error = "request exceeds the 16 MiB limit";
+        return false;
+    }
+    bool found = false;
+    try {
+        detail::JsonCursor cursor(json);
+        cursor.expect('{');
+        while (!cursor.consume('}')) {
+            const auto key = cursor.parse_string();
+            cursor.expect(':');
+            if (key == "model") {
+                if (found) {
+                    error = "model must appear exactly once";
+                    return false;
+                }
+                model = cursor.parse_string();
+                found = true;
+            } else {
+                cursor.skip_value();
+            }
+            if (cursor.consume('}')) break;
+            cursor.expect(',');
+        }
+        if (!cursor.finished()) {
+            error = "request has trailing JSON data";
+            return false;
+        }
+    } catch (const std::exception& exception) {
+        error = exception.what();
+        return false;
+    }
+    if (!found || model.empty()) {
+        error = "model is required";
         return false;
     }
     return true;

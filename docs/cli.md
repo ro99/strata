@@ -314,6 +314,12 @@ Flags worth knowing:
 | `--replan` | Recompute and overwrite a cached placement plan |
 | `--plan-cache DIR` | Directory for cached plans (default `~/.cache/strata/plans`) |
 | `--no-plan-cache` | Neither read nor write a cached plan |
+| `--temperature F` | Default sampling temperature when a request does not set one (default `1.0`) |
+| `--top-p F` | Default nucleus cutoff when a request does not set one (default `1.0`) |
+| `--seed N` | Default seed when a request does not set one |
+| `--models-preset FILE` | Run as a model router over a catalog instead of loading one model — see [`server.md`](server.md) |
+| `--models-max N` | Router: maximum concurrently loaded children (default `1`) |
+| `--no-models-autoload` | Router: reject requests for unloaded models instead of autoloading |
 
 
 ## Elsewhere

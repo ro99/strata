@@ -165,6 +165,7 @@ target_link_libraries(strata_models PUBLIC strata_engine)
 add_library(strata_app STATIC
     src/app/runtime.cpp
     src/app/openai_protocol.cpp
+    src/app/model_catalog.cpp
 )
 target_include_directories(strata_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_app PUBLIC strata_models)

@@ -309,7 +309,9 @@ bool send_response(int socket, int status, std::string_view reason,
            << "Content-Type: " << content_type << "\r\n"
            << "Content-Length: " << body.size() << "\r\n"
            << "Connection: close\r\n"
-           << "Access-Control-Allow-Origin: *\r\n\r\n";
+           << "Access-Control-Allow-Origin: *\r\n"
+           << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+           << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n";
     return send_all(socket, header.str()) && send_all(socket, body);
 }
 
@@ -604,7 +606,9 @@ private:
         const std::string header =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\nConnection: close\r\n"
-            "Access-Control-Allow-Origin: *\r\n\r\n";
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n";
         if (!send_all(socket, header)) {
             std::cerr << "[request] id=" << id
                       << " phase=cancelled stage=response_headers elapsed_ms="

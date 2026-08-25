@@ -1006,15 +1006,15 @@ public:
         int device, std::span<const CudaGemma4DecodeLayer> layers,
         std::span<const float> input, std::uint32_t position,
         std::span<float> output);
-    // Allocates the fixed first-page executor and Marlin scratch during model
-    // initialization so allocator setup is not charged to the first prompt.
+    // Allocates the fixed text-page executor and Marlin scratch during model
+    // initialization so allocator setup is not charged to a prompt page.
     [[nodiscard]] ValidationResult reserve_gemma4_workspace(
         int device, std::uint32_t hidden_columns,
         std::uint32_t maximum_query_columns,
         std::uint32_t maximum_kv_columns,
         std::uint32_t maximum_intermediate_columns);
-    // First-page text prefill. The complete layer chain stays device-resident;
-    // all MXFP4 weights must carry the single Marlin layout.
+    // Text-page prefill at any cache position. The complete layer chain stays
+    // device-resident; all MXFP4 weights must carry the single Marlin layout.
     [[nodiscard]] ValidationResult gemma4_prefill_layers(
         int device, std::span<const CudaGemma4DecodeLayer> layers,
         std::span<const float> input, std::uint32_t rows,

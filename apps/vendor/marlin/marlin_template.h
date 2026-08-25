@@ -1663,13 +1663,12 @@ __global__ void Marlin(
     int c_gl_wr_end = c_gl_stride * prob_m;
     // We first reorder to guarantee efficient final global write patterns.
     // Upstream Marlin uses shared BF16 storage. Strata's MXFP4 contract keeps
-    // the FP32 accumulator boundary, so the standalone acceptance probe uses
-    // one padded FP32 reorder tile per CTA instead.
+    // the FP32 accumulator boundary, so reuse the dynamic shared allocation
+    // after the MMA pipeline has finished. The original FP32 integration put
+    // this tile in a per-SM global buffer, then immediately read it back; that
+    // unnecessary L2 round-trip dominates ordinary short-prompt shapes.
 #ifdef STRATA_MARLIN_FP32_OUTPUT
-    constexpr int fp32_reorder_stride = 2 * thread_n_blocks * 8 + 8;
-    float* fp32_reorder = const_cast<float*>(global_scale_ptr) +
-                          blockIdx.x * 16 * thread_m_blocks *
-                              fp32_reorder_stride;
+    float* fp32_reorder = reinterpret_cast<float*>(sh);
 #endif
     auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {
       if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {

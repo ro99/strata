@@ -4,6 +4,47 @@
 
 namespace strata {
 
+namespace {
+
+ValidationResult cuda_unavailable() {
+    return {{"CUDA support was not compiled into this build"}};
+}
+
+}  // namespace
+
+bool register_fed_matmul_enabled() noexcept { return false; }
+void set_register_fed_matmul(bool) noexcept {}
+CudaMatmulRouteCensus cuda_matmul_route_census() noexcept { return {}; }
+void reset_cuda_matmul_route_census() noexcept {}
+void record_cuda_matmul_route(CudaMatmulRoute) noexcept {}
+const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
+    switch (route) {
+        case CudaMatmulRoute::PlainBf16Matvec: return "plain_bf16_matvec";
+        case CudaMatmulRoute::PlainGeneric: return "plain_generic";
+        case CudaMatmulRoute::PackedInt8Group32: return "packed_int8_group32";
+        case CudaMatmulRoute::PackedOffsetInt: return "packed_offset_int";
+        case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
+        case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
+        case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
+        case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
+        case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
+        case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
+        case CudaMatmulRoute::GemmaMarlin: return "gemma_marlin";
+        case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
+        case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
+        case CudaMatmulRoute::MoeFp4E2m1Group32: return "moe_fp4_e2m1_group32";
+        case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
+        case CudaMatmulRoute::MoeFp4RegisterFed: return "moe_fp4_register_fed";
+        case CudaMatmulRoute::Dsv4MoeRoutedFp4: return "dsv4_moe_routed_fp4";
+        case CudaMatmulRoute::Dsv4MoeSharedFp8: return "dsv4_moe_shared_fp8";
+        case CudaMatmulRoute::Dsv4MoeSharedFp8RegisterFed:
+            return "dsv4_moe_shared_fp8_register_fed";
+        case CudaMatmulRoute::Dsv4MoeTierFp4: return "dsv4_moe_tier_fp4";
+        case CudaMatmulRoute::Unsupported: return "unsupported";
+        default: return "invalid";
+    }
+}
+
 struct CudaWeight::Impl {};
 struct CudaBuffer::Impl {};
 struct CudaDsv4MhcWeights::Impl {};
@@ -38,6 +79,18 @@ CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {}
 CudaBackend::~CudaBackend() = default;
 CudaBackend::CudaBackend(CudaBackend&&) noexcept = default;
 CudaBackend& CudaBackend::operator=(CudaBackend&&) noexcept = default;
+ValidationResult CudaBackend::prepack_fragment(int, const CudaWeight&) {
+    return cuda_unavailable();
+}
+bool CudaBackend::fragment_prepacked(const CudaWeight&) noexcept { return false; }
+ValidationResult CudaBackend::prepack_marlin(int, const CudaWeight&) {
+    return cuda_unavailable();
+}
+bool CudaBackend::marlin_prepacked(const CudaWeight&) noexcept { return false; }
+CudaMatmulRouteCensus CudaBackend::matmul_route_census() const noexcept {
+    return {};
+}
+void CudaBackend::reset_matmul_route_census() noexcept {}
 bool CudaBackend::compiled() noexcept { return false; }
 std::vector<int> CudaBackend::available_devices() { return {}; }
 ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int) {
@@ -72,7 +125,7 @@ void CudaBackend::unregister_host_memory(const void*) noexcept {}
 ValidationResult CudaBackend::upload(int, const CudaWeightDescriptor&,
                                      std::span<const std::byte>,
                                      std::span<const std::byte>, CudaWeight&,
-                                     UploadCompletion) {
+                                     UploadCompletion, FragmentLayout) {
     return {{"CUDA support was not compiled into this build"}};
 }
 
@@ -93,6 +146,39 @@ ValidationResult CudaBackend::update_buffer(
 ValidationResult CudaBackend::download_buffer(
     const CudaBuffer&, std::uint64_t, std::span<std::byte>) {
     return {{"CUDA support was not compiled into this build"}};
+}
+
+ValidationResult CudaBackend::allocate_buffer(int, std::uint64_t, CudaBuffer&) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::upload_gemma4_kv(
+    const CudaBuffer&, std::span<const std::uint16_t>,
+    std::span<const std::uint16_t>, std::uint32_t, std::uint32_t,
+    std::uint32_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::bf16_kv_attention(
+    int, const CudaBf16KvAttentionRequest&, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::gemma4_decode_layers(
+    int, std::span<const CudaGemma4DecodeLayer>, std::span<const float>,
+    std::uint32_t, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::reserve_gemma4_workspace(
+    int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::gemma4_prefill_layers(
+    int, std::span<const CudaGemma4DecodeLayer>, std::span<const float>,
+    std::uint32_t, std::uint32_t, std::span<float>) {
+    return cuda_unavailable();
 }
 
 ValidationResult CudaBackend::matmul(const CudaWeight&, std::span<const float>,
@@ -195,6 +281,11 @@ ValidationResult CudaBackend::dsv4_mhc_begin(
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_mhc_begin_device(
+    int, const CudaDsv4MhcWeights&, std::span<const float>) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::dsv4_mhc_transition(
     int, const CudaDsv4MhcWeights&, std::span<const float>,
     std::span<float>, std::span<float>, std::span<float>) {
@@ -243,6 +334,21 @@ ValidationResult CudaBackend::dsv4_mhc_transition_router_device(
 ValidationResult CudaBackend::dsv4_mhc_transition_next_device(
     int, const CudaDsv4MhcWeights&) {
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
+ValidationResult CudaBackend::reserve_dsv4_mhc_head(int, std::uint64_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
+    int, const CudaWeight&, CudaDsv4MhcHeadCallback, void*,
+    CudaDsv4MhcHeadDeviceView*) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::complete_dsv4_mhc_head_device(
+    int, std::span<float>) {
+    return cuda_unavailable();
 }
 
 ValidationResult CudaBackend::glm_absorbed_attention(
@@ -339,6 +445,26 @@ ValidationResult CudaBackend::enqueue_moe(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::dsv4_tier_reserve(
+    int, std::uint32_t, std::uint32_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::dsv4_tier_add(
+    int, std::uint32_t, std::uint32_t, const CudaWeight&,
+    const CudaWeight&, const CudaWeight&) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::dsv4_tier_commit(int) {
+    return cuda_unavailable();
+}
+
+bool CudaBackend::dsv4_tier_active(int) const noexcept { return false; }
+CudaDsv4TierSelection* CudaBackend::dsv4_tier_selection(int) noexcept {
+    return nullptr;
+}
+
 ValidationResult CudaBackend::collect_moe(
     int, std::span<float>, std::span<float>) {
     return {{"CUDA support was not compiled into this build"}};
@@ -347,7 +473,7 @@ ValidationResult CudaBackend::collect_moe(
 ValidationResult CudaBackend::matmul_impl(
     const CudaWeight&, std::span<const float>, std::uint32_t,
     std::uint32_t, std::uint64_t, std::span<float>, float, bool,
-    CudaMatmulProfile*) {
+    CudaMatmulProfile*, bool) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

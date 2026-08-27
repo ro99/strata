@@ -1,4 +1,4 @@
-#include "strata/models/deepseek/dsv4_expert_residency.hpp"
+#include "strata/models/deepseek/deepseek_expert_residency.hpp"
 
 #include <charconv>
 #include <fstream>

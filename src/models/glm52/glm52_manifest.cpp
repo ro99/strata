@@ -1,4 +1,4 @@
-#include "strata/models/glm52/glm_manifest.hpp"
+#include "strata/models/glm52/glm52_manifest.hpp"
 
 #include "strata/platform/compressed_tensors.hpp"
 

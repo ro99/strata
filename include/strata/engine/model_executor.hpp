@@ -77,7 +77,7 @@ struct RuntimeConfig {
     // row and groups the page's rows by expert; 1 restores row-at-a-time
     // prompt processing.
     std::uint32_t deepseek_prefill_page_tokens{};
-    // Routed-expert tier: a plan from strata-dsv4-expert-residency, and the
+    // Routed-expert tier: a plan produced by the offline experiment planner,
     // VRAM each rank device spends holding its slice of it. The bytes come out
     // of the centralized prefill expert cache, which decode never reads.
     // An empty path disables the tier, which is the default.

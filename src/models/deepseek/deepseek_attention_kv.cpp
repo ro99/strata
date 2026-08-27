@@ -1,4 +1,4 @@
-#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/models/deepseek/deepseek_attention_kv.hpp"
 
 #include "strata/models/deepseek/deepseek_ops.hpp"
 #include "strata/models/common/model_adapter.hpp"

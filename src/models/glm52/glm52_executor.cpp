@@ -1,6 +1,6 @@
 #include "../common/executor_support.hpp"
 #include "strata/engine/runtime_support.hpp"
-#include "strata/models/glm52/glm_runtime.hpp"
+#include "strata/models/glm52/glm52_runtime.hpp"
 
 namespace strata {
 namespace {

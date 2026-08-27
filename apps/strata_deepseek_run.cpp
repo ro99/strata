@@ -1,6 +1,6 @@
 #include "strata/models/deepseek/deepseek_runtime.hpp"
 #include "strata/platform/diagnostics_json.hpp"
-#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/models/deepseek/deepseek_attention_kv.hpp"
 #include "strata/engine/runtime_support.hpp"
 
 #include "strata/app/cli.hpp"

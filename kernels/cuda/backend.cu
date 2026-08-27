@@ -30,17 +30,18 @@
 
 namespace strata {
 
-// Keep the CUDA backend in one translation unit for now: several device
-// helpers and the private PImpl state intentionally have internal linkage.
-// The fragments below are ownership boundaries, not separately linked CUDA
-// objects, so this reorganization cannot change dispatch or device linking.
+// Core backend helpers and the private PImpl intentionally share this owning
+// translation unit. Vendored Marlin code has its own narrow adapter TU.
 #include "detail/backend_kernels.cuh"
+#include "detail/backend_model_kernels.cuh"
 #include "detail/backend_state.cuh"
 #include "detail/backend_core.inc.cuh"
-#include "detail/backend_gemma.inc.cuh"
-#include "detail/backend_attention.inc.cuh"
+#include "detail/backend_dense_page.inc.cuh"
+#include "detail/backend_indexing.inc.cuh"
+#include "detail/backend_flash_attention.inc.cuh"
+#include "detail/backend_prepared_attention.inc.cuh"
 #include "detail/backend_mhc.inc.cuh"
-#include "detail/backend_glm.inc.cuh"
+#include "detail/backend_absorbed_attention.inc.cuh"
 #include "detail/backend_matmul.inc.cuh"
 #include "detail/backend_moe.inc.cuh"
 

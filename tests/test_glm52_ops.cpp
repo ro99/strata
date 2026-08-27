@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/models/glm52/glm_ops.hpp"
+#include "strata/models/glm52/glm52_ops.hpp"
 
 #include <array>
 #include <cmath>

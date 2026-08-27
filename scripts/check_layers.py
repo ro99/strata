@@ -109,7 +109,7 @@ HEADER_OVERRIDES = {
     "glm_int4.hpp": "strata_kernels",
     "model_adapter.hpp": "strata_models",
     "deepseek_host_expert.hpp": "strata_models",
-    "dsv4_rank_local_layer_executor.hpp": "strata_models",
+    "deepseek_rank_local_layer_executor.hpp": "strata_models",
     # The Phase 4 seam and its two companions. Without these three the
     # ownership map cannot classify them, and an unowned header is not
     # scanned at all -- see the unowned-header check below, which now makes
@@ -134,6 +134,8 @@ LOCAL_HEADER_OVERRIDES = {
 
 INCLUDE_RE = re.compile(
     r'#include\s*[<"](?:strata/)?([A-Za-z0-9_./]+\.(?:hpp|h))[>"]')
+IMPLEMENTATION_INCLUDE_RE = re.compile(
+    r'#include\s*"([A-Za-z0-9_./]+\.(?:inc\.(?:cpp|cuh)|cuh))"')
 ADD_LIBRARY_RE = re.compile(
     r'add_library\(\s*(strata_\w+)\s+STATIC(.*?)\n\)', re.DOTALL)
 SET_VAR_RE = re.compile(r'set\(\s*(\w+)\s+([\w./-]+\.(?:cpp|cu))\s*\)')
@@ -161,7 +163,7 @@ def resolve_variable_sources(cmake_text: str) -> dict[str, list[str]]:
 def resolve_target_sources(cmake_text: str) -> dict[str, list[str]]:
     """target -> files added via target_sources(target PRIVATE ...) calls,
     which add_library's own body never sees (the NCCL-conditional
-    dsv4_rank_local_layer_executor.cu, added to strata_models)."""
+    deepseek_rank_local_layer_executor.cu, added to strata_models)."""
     extra: dict[str, list[str]] = {}
     for match in TARGET_SOURCES_RE.finditer(cmake_text):
         extra.setdefault(match.group(1), []).append(match.group(2))
@@ -281,6 +283,36 @@ def check_expiry(current_phase: int = CURRENT_PHASE) -> list[str]:
     ]
 
 
+def implementation_fragments(files: list[str]) -> list[str]:
+    """Recursively include private implementation fragments in a target scan.
+
+    A fragment is compiled as part of its including translation unit but does
+    not appear in CMake's source list. Ignoring it would let an upward include
+    hide in exactly the files introduced to make large owning TUs reviewable.
+    """
+    found: list[str] = []
+    pending = list(files)
+    seen = set(files)
+    while pending:
+        rel = pending.pop()
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in IMPLEMENTATION_INCLUDE_RE.finditer(text):
+            child = (path.parent / match.group(1)).resolve()
+            try:
+                child_rel = str(child.relative_to(ROOT))
+            except ValueError:
+                continue
+            if child_rel in seen:
+                continue
+            seen.add(child_rel)
+            found.append(child_rel)
+            pending.append(child_rel)
+    return found
+
+
 def main() -> int:
     cmake_text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
     targets = parse_targets(cmake_text)
@@ -301,7 +333,7 @@ def main() -> int:
             # a header can carry an upward include the .cpp itself never
             # repeats (that is exactly how checkpoint.hpp's violation used to
             # hide: checkpoint.cpp only includes its own header, which is
-            # where glm_manifest.hpp and cuda_backend.hpp actually were).
+            # where glm52_manifest.hpp and cuda_backend.hpp actually were).
             header = public_headers.get(f"{stem}.hpp")
             if header is not None:
                 header_files[target].append(str(header.relative_to(ROOT)))
@@ -324,6 +356,7 @@ def main() -> int:
     for target, files in targets.items():
         rank = LAYER_ORDER.index(target)
         all_files = files + header_files.get(target, [])
+        all_files += implementation_fragments(all_files)
 
         if target in NO_MODEL_TARGETS:
             for rel in all_files:

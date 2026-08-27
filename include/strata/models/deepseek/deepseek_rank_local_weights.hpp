@@ -2,8 +2,8 @@
 
 #include "strata/device/cuda_backend.hpp"
 #include "strata/models/deepseek/deepseek_checkpoint.hpp"
-#include "strata/models/deepseek/dsv4_rank_local_layer_executor.hpp"
-#include "strata/models/deepseek/dsv4_rank_local_topology.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_layer_executor.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_topology.hpp"
 
 #include <array>
 #include <cstdint>

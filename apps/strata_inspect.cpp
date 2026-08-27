@@ -1,4 +1,4 @@
-#include "strata/models/glm52/glm_manifest.hpp"
+#include "strata/models/glm52/glm52_manifest.hpp"
 #include "strata/platform/compressed_tensors.hpp"
 #include "strata/device/cuda_backend.hpp"
 #include "strata/models/deepseek/deepseek_manifest.hpp"

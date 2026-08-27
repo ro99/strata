@@ -12,7 +12,7 @@ namespace strata {
 // The static routed-expert residency tier: which (layer, expert) triplets live
 // permanently in one device's VRAM instead of host DRAM.
 //
-// Chosen offline by `strata-dsv4-expert-residency` from decode route traces,
+// Chosen offline by the local experiment planner from decode route traces,
 // because decode routing is concentrated in a way that belongs to the model
 // rather than to one conversation -- the hottest 10% of triplets chosen from
 // one prompt cover 38.6% of a different prompt's decode activations against a
@@ -32,7 +32,7 @@ class Dsv4ExpertResidencyPlan {
 public:
     Dsv4ExpertResidencyPlan() = default;
 
-    // Parses the format `strata-dsv4-expert-residency` emits. Fails rather
+    // Parses the local experiment planner's format. Fails rather
     // than admitting a partial plan: a residency map that silently disagrees
     // with the device's contents would produce experts computed twice or not
     // at all.

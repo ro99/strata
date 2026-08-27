@@ -39,11 +39,14 @@ else()
     set(STRATA_HAS_CUDA OFF)
 endif()
 
+# Strata is an application, not a C++ SDK. The headers under include/strata
+# are build-internal interfaces shared by the application's layered targets;
+# they are intentionally not installed and carry no source or ABI guarantee.
 # Phase 1 architecture review: strata_core split into six layered
 # targets, dependencies pointing strictly downward:
 #   platform -> device -> kernels -> engine -> models -> app
 # Phase 3 subsequently moved the sources into per-tier directories, which is
-# why the paths below read src/platform/..., src/models/dsv4/... and so on.
+# why the paths below read src/platform/..., src/models/deepseek/... and so on.
 # There is still no per-target include directory, so the compiler alone cannot
 # catch a boundary violation: scripts/check_layers.py enforces the include
 # graph and scripts/check_symbols.py the link graph, and both run in
@@ -78,6 +81,7 @@ target_include_directories(strata_device PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(strata_device PUBLIC strata_platform)
 
 if(STRATA_HAS_CUDA)
+    target_sources(strata_device PRIVATE kernels/cuda/marlin_adapter.cu)
     set_property(TARGET strata_device PROPERTY CUDA_ARCHITECTURES 86 120)
     set_property(TARGET strata_device PROPERTY CUDA_STANDARD 20)
     set_property(TARGET strata_device PROPERTY CUDA_STANDARD_REQUIRED ON)
@@ -112,19 +116,19 @@ target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(strata_engine PUBLIC strata_kernels)
 
 add_library(strata_models STATIC
-    src/models/dsv4/dsv4_executor.cpp
+    src/models/deepseek/deepseek_executor.cpp
     src/models/glm52/glm52_executor.cpp
     src/models/gemma4/gemma4_executor.cpp
     src/models/kimi_k3/kimi_k3_executor.cpp
     src/models/laguna/laguna_executor.cpp
     src/models/inkling/inkling_executor.cpp
-    src/models/glm52/glm_ops.cpp
+    src/models/glm52/glm52_ops.cpp
     src/models/gemma4/gemma4_ops.cpp
     src/models/gemma4/gemma4_checkpoint.cpp
     src/models/gemma4/gemma4_image.cpp
     src/models/gemma4/gemma4_runtime.cpp
-    src/models/glm52/glm_runtime.cpp
-    src/models/glm52/glm_manifest.cpp
+    src/models/glm52/glm52_runtime.cpp
+    src/models/glm52/glm52_manifest.cpp
     src/models/kimi_k3/kimi_k3_ops.cpp
     src/models/kimi_k3/kimi_k3_manifest.cpp
     src/models/kimi_k3/kimi_k3_checkpoint.cpp
@@ -139,25 +143,25 @@ add_library(strata_models STATIC
     src/models/inkling/inkling_checkpoint.cpp
     src/models/inkling/inkling_device.cpp
     src/models/inkling/inkling_runtime.cpp
-    src/models/dsv4/deepseek_manifest.cpp
-    src/models/dsv4/deepseek_kv_cache.cpp
-    src/models/dsv4/dsv4_attention_kv.cpp
-    src/models/dsv4/dsv4_expert_residency.cpp
-    src/models/dsv4/dsv4_static_expert_tier.cpp
-    src/models/dsv4/deepseek_ops.cpp
-    src/models/dsv4/deepseek_checkpoint.cpp
-    src/models/dsv4/deepseek_rank_shard.cpp
-    src/models/dsv4/dsv4_host_moe_executor.cpp
-    src/models/dsv4/dsv4_rank_local_topology.cpp
-    src/models/dsv4/dsv4_rank_local_kv.cpp
-    src/models/dsv4/dsv4_rank_local_weights.cpp
-    src/models/dsv4/deepseek_admission.cpp
-    src/models/dsv4/deepseek_runtime.cpp
+    src/models/deepseek/deepseek_manifest.cpp
+    src/models/deepseek/deepseek_kv_cache.cpp
+    src/models/deepseek/deepseek_attention_kv.cpp
+    src/models/deepseek/deepseek_expert_residency.cpp
+    src/models/deepseek/deepseek_static_expert_tier.cpp
+    src/models/deepseek/deepseek_ops.cpp
+    src/models/deepseek/deepseek_checkpoint.cpp
+    src/models/deepseek/deepseek_rank_shard.cpp
+    src/models/deepseek/deepseek_host_moe_executor.cpp
+    src/models/deepseek/deepseek_rank_local_topology.cpp
+    src/models/deepseek/deepseek_rank_local_kv.cpp
+    src/models/deepseek/deepseek_rank_local_weights.cpp
+    src/models/deepseek/deepseek_admission.cpp
+    src/models/deepseek/deepseek_runtime.cpp
     src/models/common/model.cpp
     src/models/common/placement_model.cpp
     src/models/common/tokenizer.cpp
     src/models/glm52/checkpoint.cpp
-    kernels/cpu/dsv4_fp4_expert.cpp
+    kernels/cpu/deepseek_fp4_expert.cpp
 )
 target_include_directories(strata_models PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_models PUBLIC strata_engine)
@@ -223,12 +227,6 @@ target_link_libraries(strata-chat PRIVATE strata_core)
 
 add_executable(strata-server apps/strata_server.cpp)
 target_link_libraries(strata-server PRIVATE strata_core)
-
-add_executable(strata-dsv4-expert-residency apps/strata_dsv4_expert_residency.cpp)
-target_link_libraries(strata-dsv4-expert-residency PRIVATE strata_core)
-
-add_executable(strata-laguna-profile apps/strata_laguna_profile.cpp)
-target_link_libraries(strata-laguna-profile PRIVATE strata_core)
 
 if(STRATA_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -339,7 +337,7 @@ if(STRATA_HAS_CUDA)
         # only a models-tier consumer uses is exactly the shape that makes a
         # clean device/models split hard, and it's already here today.
         target_sources(strata_models PRIVATE
-            kernels/cuda/dsv4_rank_local_layer_executor.cu)
+            kernels/cuda/deepseek_rank_local_layer_executor.cu)
         target_include_directories(strata_models PRIVATE "${STRATA_NCCL_INCLUDE_DIR}")
         target_link_libraries(strata_models PUBLIC "${STRATA_NCCL_LIBRARY}" ${CMAKE_DL_LIBS} ${NUMA_LIBRARY})
         set_target_properties(strata_models PROPERTIES BUILD_RPATH "${STRATA_NCCL_LIBRARY_DIR}")
@@ -366,9 +364,9 @@ if(BUILD_TESTING)
         tests/test_attention.cpp
         tests/test_compressed_tensors.cpp
         tests/test_cuda_backend.cpp
-        tests/test_dsv4_expert_residency.cpp
+        tests/test_deepseek_expert_residency.cpp
         tests/test_fp4_decode.cpp
-        tests/test_glm_ops.cpp
+        tests/test_glm52_ops.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp
         tests/test_gemma4_image.cpp
@@ -388,8 +386,8 @@ if(BUILD_TESTING)
         tests/test_inkling_runtime.cpp
         tests/test_deepseek_manifest.cpp
         tests/test_deepseek_rank_shard.cpp
-        tests/test_dsv4_rank_local_topology.cpp
-        tests/test_dsv4_rank_local_kv.cpp
+        tests/test_deepseek_rank_local_topology.cpp
+        tests/test_deepseek_rank_local_kv.cpp
         tests/test_deepseek_kv_cache.cpp
         tests/test_deepseek_ops.cpp
         tests/test_deepseek_host_expert.cpp

@@ -2,7 +2,7 @@
 
 #include "strata/device/cuda_backend.hpp"
 #include "strata/models/deepseek/deepseek_checkpoint.hpp"
-#include "strata/models/deepseek/dsv4_expert_residency.hpp"
+#include "strata/models/deepseek/deepseek_expert_residency.hpp"
 #include "strata/platform/result.hpp"
 
 #include <cstdint>

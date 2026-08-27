@@ -8,9 +8,9 @@ namespace {
 constexpr std::uint64_t kTestVramCeiling = 22'548'578'304ULL;
 }  // namespace
 
-#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/models/deepseek/deepseek_attention_kv.hpp"
 #include "strata/models/deepseek/deepseek_runtime.hpp"
-#include "strata/models/deepseek/dsv4_rank_local_topology.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_topology.hpp"
 
 #include <algorithm>
 #include <array>

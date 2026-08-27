@@ -6,8 +6,8 @@
 #include "strata/models/deepseek/deepseek_checkpoint.hpp"
 #include "strata/models/deepseek/deepseek_kv_cache.hpp"
 #include "strata/platform/diagnostics.hpp"
-#include "strata/models/deepseek/dsv4_rank_local_topology.hpp"
-#include "strata/models/deepseek/dsv4_static_expert_tier.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_topology.hpp"
+#include "strata/models/deepseek/deepseek_static_expert_tier.hpp"
 #include "strata/engine/sampling.hpp"
 #include "strata/platform/types.hpp"
 
@@ -123,7 +123,7 @@ struct Dsv4RuntimeConfig {
     // translation-bound. The selector is retained so the rejection stays
     // reproducible from one binary.
     bool hugepage_expert_arena{false};
-    // Static routed-expert tier: a plan from strata-dsv4-expert-residency, the
+    // Static routed-expert tier: a plan from the offline experiment planner,
     // device to hold it (outside the rank pair), and the VRAM to spend there.
     // An empty path or a negative device disables it, which is the default and
     // is exactly today's decode.

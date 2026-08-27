@@ -1,4 +1,4 @@
-#include "strata/models/deepseek/dsv4_rank_local_kv.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_kv.hpp"
 
 #include <algorithm>
 #include <string>

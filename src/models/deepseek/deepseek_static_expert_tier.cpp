@@ -1,4 +1,4 @@
-#include "strata/models/deepseek/dsv4_static_expert_tier.hpp"
+#include "strata/models/deepseek/deepseek_static_expert_tier.hpp"
 
 #include "strata/models/common/model_adapter.hpp"
 

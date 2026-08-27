@@ -1,4 +1,4 @@
-#include "strata/models/glm52/glm_runtime.hpp"
+#include "strata/models/glm52/glm52_runtime.hpp"
 
 #include "strata/app/cli.hpp"
 

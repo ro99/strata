@@ -2,8 +2,8 @@
 #include "strata/engine/runtime_support.hpp"
 #include "strata/models/deepseek/deepseek_kv_cache.hpp"
 #include "strata/models/deepseek/deepseek_runtime.hpp"
-#include "strata/models/deepseek/dsv4_attention_kv.hpp"
-#include "strata/models/deepseek/dsv4_rank_local_topology.hpp"
+#include "strata/models/deepseek/deepseek_attention_kv.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_topology.hpp"
 
 namespace strata {
 namespace {

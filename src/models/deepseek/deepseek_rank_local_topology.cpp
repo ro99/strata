@@ -1,4 +1,4 @@
-#include "strata/models/deepseek/dsv4_rank_local_topology.hpp"
+#include "strata/models/deepseek/deepseek_rank_local_topology.hpp"
 
 #include "strata/platform/hardware_profile.hpp"
 

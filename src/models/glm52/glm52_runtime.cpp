@@ -1,11 +1,11 @@
-#include "strata/models/glm52/glm_runtime.hpp"
+#include "strata/models/glm52/glm52_runtime.hpp"
 
 #include "strata/platform/hardware_profile.hpp"
 
 #include "../common/cuda_stats_delta.hpp"
 
 #include "strata/kernels/attention_reference.hpp"
-#include "strata/models/glm52/glm_ops.hpp"
+#include "strata/models/glm52/glm52_ops.hpp"
 #include "strata/kernels/glm_int4.hpp"
 #include "strata/models/common/model_adapter.hpp"
 #include "strata/engine/sampling.hpp"

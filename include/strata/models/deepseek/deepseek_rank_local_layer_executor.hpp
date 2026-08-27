@@ -2,8 +2,8 @@
 
 #include "strata/device/cuda_backend.hpp"
 #include "strata/models/deepseek/deepseek_checkpoint.hpp"
-#include "strata/models/deepseek/dsv4_host_moe_executor.hpp"
-#include "strata/models/deepseek/dsv4_static_expert_tier.hpp"
+#include "strata/models/deepseek/deepseek_host_moe_executor.hpp"
+#include "strata/models/deepseek/deepseek_static_expert_tier.hpp"
 
 #include <array>
 #include <cstddef>

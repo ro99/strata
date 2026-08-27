@@ -21,7 +21,7 @@ correctness"), still present one tier up, undetected until now because
 nothing tested any *single* target's link closure in isolation.
 
 This script does: for each of the six `strata_*` static archives (already
-built -- this check needs `build/`, unlike `check_layers.py`, which is
+built -- this check needs a build directory, unlike `check_layers.py`, which is
 purely static), extract the defined and undefined global symbols with `nm`.
 For every ordered pair (lower tier, higher tier), any symbol undefined in the
 lower archive but defined in the higher one is an upward link dependency --
@@ -105,7 +105,10 @@ def build_exception_index() -> dict[str, list[dict]]:
 
 
 def main() -> int:
-    build_dir = ROOT / "build"
+    if len(sys.argv) > 2:
+        print("usage: check_symbols.py [BUILD_DIRECTORY]", file=sys.stderr)
+        return 2
+    build_dir = ROOT / (sys.argv[1] if len(sys.argv) == 2 else "build")
     cmake_text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
     targets = parse_targets(cmake_text)
     if not targets:

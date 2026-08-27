@@ -2,7 +2,7 @@
 
 #include "strata/device/cuda_backend.hpp"
 #include "strata/platform/checkpoint_io.hpp"
-#include "strata/models/glm52/glm_manifest.hpp"
+#include "strata/models/glm52/glm52_manifest.hpp"
 
 #include <atomic>
 #include <chrono>

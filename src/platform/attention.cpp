@@ -1,5 +1,6 @@
 #include "strata/platform/attention.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iterator>
 #include <limits>

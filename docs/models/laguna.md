@@ -14,7 +14,7 @@ measurement.
 ```bash
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --parallel \
-  --target strata-chat strata-server strata-laguna-profile
+  --target strata-chat strata-server
 ```
 
 Reproduce the measured GPU order, check that all three cards are free, then
@@ -153,31 +153,23 @@ tok/s, so the measured improvement is 1.971x. Relative to the originally
 reported 3.75 tok/s, the current warm point is 4.97x; it is not yet the requested
 10x or 30 tok/s.
 
-## Reproduce the 18.6 tok/s measurement
+## Measure the operator path
 
-The profiling binary repeats generation without reloading the checkpoint, which
-makes the cold-versus-warm distinction visible:
+Use the shipped chat application for an operator-facing measurement. It prints
+prefill and decode rates after the response:
 
 ```bash
 export CUDA_DEVICE_ORDER=FASTEST_FIRST
 
-./build-release/strata-laguna-profile \
-  --model models/laguna --devices 0,1,2 \
-  --context 256 --max-new 80 --repetitions 2 \
-  --vram-fraction 0.85 --no-detailed-cuda-timing
+./build-release/strata-chat \
+  --model models/laguna --model-type laguna --devices 0,1,2 \
+  --context-size 256 --max-new 80 --vram-fraction 0.85 \
+  --prompt "Explain why a hash map has constant expected lookup time."
 ```
 
-Look for `decode_tok_s` under repetition 2. Use the normal serving setting
-`--no-detailed-cuda-timing`; CUDA event instrumentation changes the operating
-point. For the full three-pair old/new experiment, run:
-
-```bash
-scripts/laguna_device_kv_ab.sh models/laguna results/laguna-device-kv-ab
-```
-
-That matrix intentionally includes `--host-kv` control arms and takes under
-five minutes on the reference workstation. `--host-kv` exists only in the
-profiler to reproduce the rejected old path; do not use it for chat or serving.
+The detailed phase profiler and controlled old-path switches are research
+tools. Their sources live only in the local Git-ignored `experiments/probes/`
+workspace and are intentionally absent from production CMake.
 
 ## Rules for keeping the fast path fast
 

@@ -26,19 +26,20 @@ strata_app        RuntimeSession and the OpenAI protocol
 `strata_models` under `--whole-archive`; see "Model registration" below.
 
 `src/` mirrors this: `src/platform/`, `src/engine/`, `src/app/`, and
-`src/models/{dsv4,glm52,gemma4,kimi_k3,laguna,inkling,common}/`. Headers mirror
+`src/models/{deepseek,glm52,gemma4,kimi_k3,laguna,inkling,common}/`. Headers mirror
 the same ownership under `include/strata/{platform,device,kernels,engine,app}`
-and `include/strata/models/<model>/`. They are the internal cross-target API;
-the project does not currently install a C++ SDK. The two lints still derive
+and `include/strata/models/<model>/`. They are private application interfaces:
+their headers and libraries are not installed, and no source or ABI
+compatibility is promised. The two lints still derive
 and verify ownership rather than trusting directory names alone.
 
-The native CUDA backend has one owning translation unit,
-`kernels/cuda/backend.cu`, because its private PImpl and device helpers rely on
-internal linkage. Its implementation is split into private responsibility
-fragments under `kernels/cuda/detail/`: lifecycle/core, Gemma, attention,
-DeepSeek mHC, GLM, matmul/layout, and MoE/statistics. The sole Marlin import is
-the Strata adapter in that private directory; vendored paths do not leak into
-the rest of production code.
+The native CUDA backend uses small owning translation units. `backend.cu`
+owns the core backend/PImpl and `marlin_adapter.cu` owns the sole vendored
+kernel import. The core implementation is split into private responsibility
+fragments under `kernels/cuda/detail/`: lifecycle/core, dense pages, indexing,
+flash/prepared attention, mHC, absorbed attention, matmul/layout, and
+MoE/statistics. The sole Marlin import is `kernels/cuda/marlin_adapter.cu`;
+vendored paths do not leak into the rest of production code.
 
 ### The layering is enforced, not asserted
 

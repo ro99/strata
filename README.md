@@ -4,8 +4,8 @@
 
 Strata splits one checkpoint across GPU VRAM, host RAM, and read-only NVMe, and
 runs it at the precision, router semantics, expert count and top-k the
-checkpoint actually declares. No Python, no ML framework in the runtime: a
-static library and a few CLI binaries.
+checkpoint actually declares. No Python and no ML framework in the runtime:
+Strata is a C++ application with command-line and HTTP entry points.
 
 ## The problem it solves
 
@@ -138,7 +138,6 @@ record those as negatives with their measurements; 0165 records the positive.
 | [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding a seventh model |
 | [`docs/architecture.md`](docs/architecture.md) | the target scheduler design, not yet built |
 | [`docs/README.md`](docs/README.md) | product documentation index |
-| [`CLAUDE.md`](CLAUDE.md) | research charter: how changes are proposed and measured |
 
 ## Contributing
 
@@ -146,7 +145,9 @@ Start from a measured bottleneck using `τ = max_r W_r/B_r + Σ_serial`, not fro
 a guess about what's slow. State a hypothesis and a kill criterion before
 building, run `make check` before claiming a result, and don't call something a
 win if it's inside run-to-run variance. Keep accepted and rejected research
-records in the local Git-ignored experimentation workspace.
+records in the local Git-ignored experimentation workspace. The headers under
+`include/strata/` are internal application interfaces, not an installed SDK or
+a stable C++ ABI.
 
 ## License
 

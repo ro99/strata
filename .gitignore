@@ -1,5 +1,5 @@
 /build/
-/models
+/models/
 /results/
 /build-*/
 /target/
@@ -14,7 +14,6 @@
 plan.md
 last-answer.md
 docs/issues/
-hardware/
 # Agent working directory
 .claude/
 .codex/
@@ -27,4 +26,3 @@ __pycache__/
 
 # Operator-specific hardware notes, not part of the project.
 hardware/
-AGENTS.md

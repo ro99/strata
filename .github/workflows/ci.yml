@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without CUDA
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
+      - name: Check architectural layers
+        run: python3 scripts/check_layers.py
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Check archive dependencies
+        run: python3 scripts/check_symbols.py
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

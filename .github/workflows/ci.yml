@@ -13,6 +13,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Install runtime test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes imagemagick
       - name: Configure without CUDA
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
       - name: Check architectural layers

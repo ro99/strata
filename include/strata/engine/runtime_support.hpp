@@ -90,7 +90,7 @@ using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
 
 // Render a chat template, encode it, and make it fit the context.
 //
-// Five of the six runtimes wrote this loop themselves, identically apart from
+// Six of the seven runtimes wrote this loop themselves, identically apart from
 // which template function they called and whether an over-long prompt trims or
 // reports. The shape is: render, encode, check that the prompt plus the
 // requested generation fits, and if it does not, drop the oldest turn and

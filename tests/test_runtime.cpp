@@ -127,14 +127,15 @@ TEST_CASE("runtime session cannot generate before initialization") {
 }
 
 // Free test 1 (Phase 2 survey, brief 04 task 2): the only two conformance
-// properties assertable across all six RuntimeModel values without a real
+// properties assertable across all seven RuntimeModel values without a real
 // checkpoint. A failed initialize() must never leave impl_ holding a runtime
 // -- the facade falls through to std::monostate, so generation afterward
 // must report the same "not initialized" error every model gets from a
 // session that was never touched, not silently produce output or crash.
-TEST_CASE("initialization failure leaves generation disabled, all six models") {
-    constexpr std::array<strata::RuntimeModel, 6> models{
-        strata::RuntimeModel::Glm52,     strata::RuntimeModel::DeepSeekV4,
+TEST_CASE("initialization failure leaves generation disabled, all seven models") {
+    constexpr std::array<strata::RuntimeModel, 7> models{
+        strata::RuntimeModel::Glm52,     strata::RuntimeModel::Glm53,
+        strata::RuntimeModel::DeepSeekV4,
         strata::RuntimeModel::Gemma4,    strata::RuntimeModel::Laguna,
         strata::RuntimeModel::Inkling,   strata::RuntimeModel::KimiK3,
     };
@@ -197,14 +198,14 @@ TEST_CASE("generation metrics can express reuse fields as not applicable") {
 
 // Without -Wl,--whole-archive on strata_models, every ModelRegistrar is
 // dropped by the linker -- nothing references those objects by name -- and
-// find_model returns null for all six models. Every binary then rejects every
+// find_model returns null for all seven models. Every binary then rejects every
 // --model-type. Nothing else in the suite catches that: the initialization
 // and rejection tests below pass just as happily against an empty registry,
 // because "unhandled runtime model: 0" is still a failure and an
 // uninitialized session still says "not initialized".
 TEST_CASE("every model is registered, which is what --whole-archive buys") {
-    REQUIRE(strata::registered_models().size() == 6U);
-    for (const auto* cli_name : {"glm", "deepseek", "gemma4", "kimi-k3",
+    REQUIRE(strata::registered_models().size() == 7U);
+    for (const auto* cli_name : {"glm", "glm53", "deepseek", "gemma4", "kimi-k3",
                                  "laguna", "inkling"}) {
         const auto* found = strata::find_model_by_cli_name(cli_name);
         REQUIRE(found != nullptr);

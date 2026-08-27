@@ -245,6 +245,36 @@ __global__ void quantize_activation_e4m3_kernel(float* values,
     value = quantize_e4m3_value(value / scale) * scale;
 }
 
+// GLM-5.3's compressed-tensors dynamic activation contract stores ordinary
+// F32 inverse scales, not E8M0 powers of two. Simulate its per-token K128
+// quantization in place so the scalar matmul consumes the same values as the
+// fused FP8 kernel while retaining the existing F32 activation workspace.
+__global__ void quantize_activation_e4m3_f32_scale_kernel(
+    float* values, std::uint64_t columns, std::uint32_t rows) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint64_t group_begin =
+        static_cast<std::uint64_t>(blockIdx.x) * 128U;
+    if (row >= rows || group_begin >= columns) return;
+    const std::uint64_t index = group_begin + threadIdx.x;
+    const float magnitude = index < columns
+        ? fabsf(values[static_cast<std::uint64_t>(row) * columns + index])
+        : 0.0F;
+    __shared__ float maximum[128];
+    maximum[threadIdx.x] = magnitude;
+    __syncthreads();
+    for (unsigned int stride = 64U; stride != 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) {
+            maximum[threadIdx.x] = fmaxf(maximum[threadIdx.x],
+                                         maximum[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (index >= columns) return;
+    const float scale = maximum[0] > 0.0F ? maximum[0] / 448.0F : 1.0F;
+    auto& value = values[static_cast<std::uint64_t>(row) * columns + index];
+    value = quantize_e4m3_value(value / scale) * scale;
+}
+
 __global__ void round_bf16_rows_kernel(float* values, std::uint64_t elements) {
     for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
          index < elements; index += gridDim.x * blockDim.x) {
@@ -1470,6 +1500,34 @@ __global__ void native_fp8_matmul_kernel(
         const std::uint64_t output_index =
             static_cast<std::uint64_t>(batch_row) * rows + output_row;
         output[output_index] = sum;
+    }
+}
+
+__global__ void native_fp8_f32_scale_matmul_kernel(
+    float* output, const float* input, const unsigned char* weights,
+    const float* scales, std::uint64_t scale_columns,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    if (output_row >= rows || batch_row >= batch) return;
+    const std::uint64_t input_row = groups == 0U
+        ? batch_row
+        : static_cast<std::uint64_t>(batch_row) * groups +
+              output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
+    const std::uint64_t weight_base = output_row * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float weight = fp8_e4m3_value(weights[weight_base + column]);
+        const float scale = scales[(output_row / 128U) * scale_columns +
+                                   column / 128U];
+        sum += input[input_base + column] * weight * scale;
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] = sum;
     }
 }
 

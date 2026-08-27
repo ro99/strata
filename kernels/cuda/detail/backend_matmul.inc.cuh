@@ -135,6 +135,8 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
         case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
         case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
+        case CudaMatmulRoute::Fp8E4m3Block128F32:
+            return "fp8_e4m3_block128_f32";
         case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
         case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
         case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
@@ -354,6 +356,7 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     const bool native = descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+                        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 ||
                         descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
     const bool w8_group32 =
         descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
@@ -368,6 +371,16 @@ ValidationResult CudaBackend::matmul_impl(
             quantize_grid, 128U, 0U, state.stream>>>(
             compact_values, compact_scales, state.output,
             descriptor.columns, rows);
+    } else if (descriptor.encoding ==
+                   CudaWeightEncoding::Fp8E4m3Block128F32 &&
+               !marlin) {
+        const auto input_rows = groups == 0U ? rows : rows * groups;
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
+            input_rows, 1U);
+        quantize_activation_e4m3_f32_scale_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            state.input, descriptor.columns, input_rows);
     } else if (native && !marlin) {
         const auto input_rows = groups == 0U ? rows : rows * groups;
         const dim3 quantize_grid(
@@ -633,6 +646,15 @@ ValidationResult CudaBackend::matmul_impl(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
             static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
+            groups, rows_per_group);
+    } else if (descriptor.encoding ==
+               CudaWeightEncoding::Fp8E4m3Block128F32) {
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8E4m3Block128F32);
+        native_fp8_f32_scale_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+            state.output, state.input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const float*>(weight.impl_->scales),
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {

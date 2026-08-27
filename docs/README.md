@@ -23,6 +23,8 @@ live in [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
 - `kimi-k3-runtime.md` — Kimi-K3's pinned contract, cost model, NVMe write
   constraint, chat format, and a per-gate status table that says which gates
   have been measured and which have not.
+- `models/glm53.md` — GLM-5.3-Flash's text-only contract, exact context bound,
+  and chat/server commands.
 - Gemma 4's pinned checkpoint, tokenizer, text/vision graph, and public runtime
   contract are described in the root README and `current-architecture.md`.
 - `../kernels/cuda/README.md` — native CUDA and non-CUDA stub behavior.
@@ -39,7 +41,7 @@ a previous “not implemented” statement false.
 - `cli.md` — every command-line flag and the dry-run placement planner.
 - `sampling.md` — sampler options, their exact semantics, reproducibility.
 - `server.md` — `strata-server` and the OpenAI-compatible API.
-- `model-bringup-guide.md` — **how to add a seventh model.** The procedure, the
+- `model-bringup-guide.md` — **how to add another model.** The procedure, the
   five shared files, and the rules that are not obvious. Start here for a new
   architecture.
 

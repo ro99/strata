@@ -1,9 +1,9 @@
 #pragma once
 
-// Shared result mapping for the six ModelExecutor implementations.
+// Shared result mapping for the seven ModelExecutor implementations.
 //
 // Every concrete runtime returns its own *GenerationResult type. The fields
-// below exist on all six with identical meaning, so the copy is written once
+// below exist on all seven with identical meaning, so the copy is written once
 // here instead of once per model -- which is what it was before Phase 4, and
 // where two models quietly lost fields nobody noticed for a month.
 //

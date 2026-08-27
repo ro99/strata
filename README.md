@@ -35,8 +35,8 @@ make check                       # build and run the test suite
 ./build/strata-chat --model /path/to/checkpoint --model-type gemma4
 ```
 
-`--model-type` is one of `gemma4`, `deepseek`, `glm`, `laguna`, `inkling`,
-`kimi-k3`. Add `--devices 0,1` to pin GPUs, `--admission-only --json` to print
+`--model-type` is one of `gemma4`, `deepseek`, `glm`, `glm53`, `laguna`,
+`inkling`, `kimi-k3`. Add `--devices 0,1` to pin GPUs, `--admission-only --json` to print
 the placement plan without loading anything.
 
 There is also an OpenAI-compatible server (`strata-server`).
@@ -51,6 +51,7 @@ There is also an OpenAI-compatible server (`strata-server`).
 | **Laguna S 2.1** | 48 layers 1:3 global/sliding, 256 experts + 1 shared, top-10 | NVFP4 or MXFP4 experts, BF16 elsewhere | Spine in VRAM; experts stream from RAM |
 | **Inkling Small** | 42 layers, 256 experts + 2 sinks, top-6, no rotary | NVFP4 or MXFP4 experts, BF16 elsewhere | Experts stream from RAM |
 | **GLM-5.2** | 78 layers, 256 experts, top-8 | INT4 group-128, W4A16 | Exceeds combined memory; I/O-dependent |
+| **GLM-5.3-Flash** | 45 layers, 3 KDA : 1 sparse MLA, 288 experts + 1 shared, top-8 | FP8 E4M3 block-128 with F32 inverse scales | Text-only; streams checkpoint modules, exact through 2,048 tokens |
 | **Kimi-K3** | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16 | MXFP4 experts, BF16 elsewhere | 1.45 TB; I/O-dependent, 38.6 s/step. Vision not implemented |
 
 Each runs its declared semantics as-is — hybrid compressed attention and
@@ -135,7 +136,7 @@ record those as negatives with their measurements; 0165 records the positive.
 | [`docs/server.md`](docs/server.md) | the OpenAI-compatible HTTP API |
 | [`docs/models/`](docs/models/) | copy-paste build, chat, server, and measured-speed runbooks by model |
 | [`docs/current-architecture.md`](docs/current-architecture.md) | how the code is organised and what is enforced |
-| [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding a seventh model |
+| [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding another model |
 | [`docs/architecture.md`](docs/architecture.md) | the target scheduler design, not yet built |
 | [`docs/README.md`](docs/README.md) | product documentation index |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | repository layout, architecture, and change hygiene rules |

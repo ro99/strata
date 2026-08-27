@@ -21,6 +21,7 @@ inline constexpr std::uint32_t kPlacementPlanVersion = 2U;
 
 enum class PlacementModel : std::uint8_t {
     Glm52,
+    Glm53,
     DeepSeekV4,
     Gemma4,
     KimiK3,
@@ -238,8 +239,8 @@ using PlacementPlanResult = ParseResult<PlacementPlan>;
 // Opens the checkpoint index and shard headers, sizes every component, and
 // solves. Reads no tensor payload and uploads nothing.
 // The planner seam. plan_model_placement below is a thin dispatcher in
-// strata_engine; the implementation that knows how to open six different
-// checkpoints and size six different inventories lives in strata_models and
+// strata_engine; the implementation that knows how to open seven different
+// checkpoints and size seven different inventories lives in strata_models and
 // installs itself here at static-init time.
 //
 // This exists to invert one specific dependency. Before it, placement_cache.cpp

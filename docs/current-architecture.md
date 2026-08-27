@@ -16,7 +16,7 @@ strata_device     the CUDA backend, or its error-returning stub
 strata_kernels    CPU reference kernels (Q4, INT4 group-128, attention)
 strata_engine     placement solver and cache, residency, sampling, chat and
                   session support, the model registry
-strata_models     six models, one directory each, plus the shared checkpoint
+strata_models     seven models, one directory each, plus the shared checkpoint
                   reader, tokenizer and placement inventories
 strata_app        RuntimeSession and the OpenAI protocol
 ```
@@ -26,7 +26,7 @@ strata_app        RuntimeSession and the OpenAI protocol
 `strata_models` under `--whole-archive`; see "Model registration" below.
 
 `src/` mirrors this: `src/platform/`, `src/engine/`, `src/app/`, and
-`src/models/{deepseek,glm52,gemma4,kimi_k3,laguna,inkling,common}/`. Headers mirror
+`src/models/{deepseek,glm52,glm53,gemma4,kimi_k3,laguna,inkling,common}/`. Headers mirror
 the same ownership under `include/strata/{platform,device,kernels,engine,app}`
 and `include/strata/models/<model>/`. They are private application interfaces:
 their headers and libraries are not installed, and no source or ABI
@@ -80,7 +80,7 @@ string-to-enum chain.
 `--whole-archive` on `strata_models` is load-bearing: a static library drops
 any member nothing references, and nothing references a self-registering
 translation unit by definition. `strata_app` links ahead of it because `ld`
-resolves in one pass. A test asserts all six models are registered, because
+resolves in one pass. A test asserts all seven models are registered, because
 without the flag `find_model` returns null for every model and the rest of the
 suite still passes.
 
@@ -106,7 +106,9 @@ prefill then token-at-a-time decode. Gemma 4 performs bounded prefill with
 whole vision blocks, hybrid local/global attention, and a BF16
 local-ring/global-full KV cache. DeepSeek performs bounded layer-major prefill
 pages with a multi-row router projection and exact row-ordered causal
-transitions. Kimi-K3 batches over a token span throughout. Inkling has an
+transitions. GLM-5.3 runs token-at-a-time hybrid KDA and sparse MLA, with its
+exact text context capped at the sparse top-k of 2,048. Kimi-K3 batches over a
+token span throughout. Inkling has an
 opt-in paged prefill (`prefill_page_tokens`) that runs attention and its four
 short convolutions row-serial — both carry row-ordered state — and batches the
 routed MoE expert-major between them; it is bit-identical to its
@@ -148,7 +150,7 @@ not.
 present) runs Gemma 4 against `tests/fixtures/gemma4/layer-hash-trace.json` —
 a per-layer hidden-state hash plus per-operation hashes over a fixed prompt.
 The types are model-neutral (`include/strata/platform/diagnostics.hpp`); DeepSeek emits
-the same records, and the remaining four models do not yet.
+the same records, and the remaining five models do not yet.
 
 Its limits, stated because a gate nobody understands is worse than none: it
 covers **prefill only** — once the device KV path engages, a whole device's
@@ -168,7 +170,7 @@ hardware probe), and a **plan cache** keyed by checkpoint identity, GPU
 identity, context size, device list, VRAM fraction and flags.
 
 `plan_model_placement` in `strata_engine` is a thin dispatcher through a
-registered `PlacementPlanner`; the implementation that opens six different
+registered `PlacementPlanner`; the implementation that opens seven different
 checkpoints lives in `strata_models` and installs itself at static-init. That
 inversion is why `strata_engine` names no model symbol.
 

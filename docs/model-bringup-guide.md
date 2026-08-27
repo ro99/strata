@@ -1,6 +1,6 @@
 # Adding a model
 
-A procedure derived from the six existing adapters. Follow it in order; the
+A procedure derived from the seven existing adapters. Follow it in order; the
 ordering is part of the correctness contract.
 
 ## What it actually costs

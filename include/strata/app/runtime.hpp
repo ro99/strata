@@ -5,7 +5,7 @@
 // RuntimeModel, RuntimeConfig, GenerationResult and friends moved to
 // model_executor.hpp in Phase 4 and are re-exported here, so every existing
 // `#include "strata/app/runtime.hpp"` keeps working unchanged. They live a tier
-// lower because the six models implement ModelExecutor against them: had they
+// lower because the seven models implement ModelExecutor against them: had they
 // stayed here, every model would depend upward on the application tier, which
 // is exactly the inversion check-symbols exists to catch.
 

@@ -424,6 +424,22 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid native FP8 CUDA weight descriptor");
             return result;
         }
+    } else if (descriptor.encoding ==
+               CudaWeightEncoding::Fp8E4m3Block128F32) {
+        const auto expected_scale_columns = (descriptor.columns + 127U) / 128U;
+        const auto expected_scale_rows = (descriptor.rows + 127U) / 128U;
+        if (descriptor.dtype != SafetensorsDtype::F8E4M3 ||
+            descriptor.packed_columns != descriptor.columns ||
+            descriptor.scale_columns != expected_scale_columns ||
+            descriptor.group_size != 128U ||
+            !checked_bytes(descriptor.rows, descriptor.columns, 1U,
+                           expected_weights) ||
+            !checked_bytes(expected_scale_rows, descriptor.scale_columns, 4U,
+                           expected_scales)) {
+            result.errors.emplace_back(
+                "invalid F32-scaled native FP8 CUDA weight descriptor");
+            return result;
+        }
     } else {
         result.errors.emplace_back("unsupported CUDA weight encoding");
         return result;

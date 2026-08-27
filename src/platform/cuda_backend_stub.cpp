@@ -26,6 +26,8 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
         case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
         case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
+        case CudaMatmulRoute::Fp8E4m3Block128F32:
+            return "fp8_e4m3_block128_f32";
         case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
         case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
         case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";

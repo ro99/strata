@@ -118,6 +118,7 @@ target_link_libraries(strata_engine PUBLIC strata_kernels)
 add_library(strata_models STATIC
     src/models/deepseek/deepseek_executor.cpp
     src/models/glm52/glm52_executor.cpp
+    src/models/glm53/glm53_executor.cpp
     src/models/gemma4/gemma4_executor.cpp
     src/models/kimi_k3/kimi_k3_executor.cpp
     src/models/laguna/laguna_executor.cpp
@@ -129,6 +130,9 @@ add_library(strata_models STATIC
     src/models/gemma4/gemma4_runtime.cpp
     src/models/glm52/glm52_runtime.cpp
     src/models/glm52/glm52_manifest.cpp
+    src/models/glm53/glm53_manifest.cpp
+    src/models/glm53/glm53_checkpoint.cpp
+    src/models/glm53/glm53_runtime.cpp
     src/models/kimi_k3/kimi_k3_ops.cpp
     src/models/kimi_k3/kimi_k3_manifest.cpp
     src/models/kimi_k3/kimi_k3_checkpoint.cpp
@@ -367,6 +371,7 @@ if(BUILD_TESTING)
         tests/test_deepseek_expert_residency.cpp
         tests/test_fp4_decode.cpp
         tests/test_glm52_ops.cpp
+        tests/test_glm53_manifest.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp
         tests/test_gemma4_image.cpp

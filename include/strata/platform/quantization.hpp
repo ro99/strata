@@ -6,7 +6,7 @@
 // so they belong below the model tier. They lived in model.hpp only because
 // that is where the first consumer needed them, which forced
 // compressed_tensors.hpp -- a strata_platform header with no model dependency
-// of its own -- to include the header that declares all six models' Spec
+// of its own -- to include the header that declared every model's Spec
 // types. That was the last recorded layering exception.
 
 #include "strata/platform/types.hpp"

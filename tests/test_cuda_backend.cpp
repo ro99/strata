@@ -1915,6 +1915,44 @@ TEST_CASE("SM86 DeepSeek FP8 page projections match at the BF16 boundary") {
     }
 }
 
+TEST_CASE("GLM-5.3 F32-scaled FP8 uses continuous dynamic activation scales") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{devices.front()};
+    REQUIRE(backend.initialize(selected).ok());
+
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding =
+        strata::CudaWeightEncoding::Fp8E4m3Block128F32;
+    descriptor.dtype = strata::SafetensorsDtype::F8E4M3;
+    descriptor.rows = 1U;
+    descriptor.columns = 128U;
+    descriptor.packed_columns = 128U;
+    descriptor.scale_columns = 1U;
+    descriptor.group_size = 128U;
+    std::array<std::byte, 128> weights{};
+    weights.front() = std::byte{0x38U};  // E4M3 1.0
+    std::array<std::byte, sizeof(float)> scales{};
+    const float unit_scale = 1.0F;
+    std::memcpy(scales.data(), &unit_scale, sizeof(unit_scale));
+    strata::CudaWeight weight;
+    REQUIRE(backend.upload(devices.front(), descriptor, weights, scales,
+                           weight).ok());
+
+    std::array<float, 128> input{};
+    // A power-of-two activation scale would round this to an E4M3 grid point.
+    // Continuous max/448 scaling maps the maximum to 448 exactly and therefore
+    // reconstructs 300 exactly before accumulation.
+    input.front() = 300.0F;
+    std::array<float, 1> output{};
+    REQUIRE(backend.matmul(weight, input, 1U, output).ok());
+    REQUIRE_NEAR(output.front(), 300.0F, 1.0e-4F);
+    REQUIRE(strata::cuda_matmul_route_census()
+                .counts[static_cast<std::size_t>(
+                    strata::CudaMatmulRoute::Fp8E4m3Block128F32)] > 0U);
+}
+
 TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE commands") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

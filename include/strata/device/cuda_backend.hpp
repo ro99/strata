@@ -22,6 +22,10 @@ enum class CudaWeightEncoding : std::uint8_t {
     OffsetPackedInt4,
     OffsetPackedInt8,
     Fp8E4m3Block128,
+    // E4M3 payload with one F32 inverse scale per 128x128 weight block. This
+    // is the standard dynamic-FP8 layout used by GLM-5.3-Flash; it is not the
+    // E8M0 scale byte used by DeepSeek and the two must never alias.
+    Fp8E4m3Block128F32,
     Fp4E2m1Group32,
     // compressed-tensors "nvfp4-pack-quantized": E2M1 nibble pairs with FP8
     // E4M3 group scales and one FP32 per-tensor global scale. Weights
@@ -845,6 +849,7 @@ enum class CudaMatmulRoute : std::uint8_t {
     Nvfp4Group16,
     Fp8TensorPage,
     Fp8E4m3Block128,
+    Fp8E4m3Block128F32,
     Fp4E2m1Group32,
     // MIX-2 register-fed skinny kernels. These are the accepted QPN shapes made
     // model agnostic: any weight whose encoding and extents admit the m16n8k16

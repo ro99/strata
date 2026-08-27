@@ -79,6 +79,16 @@ private:
     std::span<const ChatMessage> messages,
     std::string_view reasoning_effort = "medium-high",
     bool enable_thinking = true);
+// GLM-5.3 ships a distinct template: no newline after <sop>, three reasoning
+// budgets with Max as the fallback, and cleared reasoning on prior assistant
+// turns in chat mode.
+[[nodiscard]] std::string render_glm53_user_prompt(
+    std::string_view user_text, std::string_view reasoning_effort = "max",
+    bool clear_thinking = true);
+[[nodiscard]] std::string render_glm53_chat_prompt(
+    std::span<const ChatMessage> messages,
+    std::string_view reasoning_effort = "max",
+    bool clear_thinking = true);
 [[nodiscard]] std::string render_deepseek_v4_user_prompt(
     std::string_view user_text, bool enable_thinking = false);
 [[nodiscard]] std::string render_deepseek_v4_chat_prompt(

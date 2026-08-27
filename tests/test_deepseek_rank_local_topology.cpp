@@ -1,5 +1,7 @@
 #include "test.hpp"
 
+#include <cstdint>
+
 // The production ceiling is now a fraction of the card this process actually
 // sees (dsv4_rank_local_vram_ceiling), so these tests pin the byte count they
 // were written against. They exercise admission arithmetic, not the hardware

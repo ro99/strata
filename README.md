@@ -138,9 +138,11 @@ record those as negatives with their measurements; 0165 records the positive.
 | [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding a seventh model |
 | [`docs/architecture.md`](docs/architecture.md) | the target scheduler design, not yet built |
 | [`docs/README.md`](docs/README.md) | product documentation index |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | repository layout, architecture, and change hygiene rules |
 
 ## Contributing
 
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before changing the repository.
 Start from a measured bottleneck using `τ = max_r W_r/B_r + Σ_serial`, not from
 a guess about what's slow. State a hypothesis and a kill criterion before
 building, run `make check` before claiming a result, and don't call something a

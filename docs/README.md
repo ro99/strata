@@ -5,6 +5,9 @@ architecture, formats, interfaces, and operator runbooks. Research records,
 handovers, campaign trackers, and issue notes belong in the Git-ignored
 `experiments/docs/` workspace.
 
+Repository structure, dependency, vendoring, experimentation, and review rules
+live in [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+
 ## Current state
 
 - `../README.md` — current capabilities, validation limits, commands, and promoted

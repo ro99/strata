@@ -1,6 +1,6 @@
 #include "../common/executor_support.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/laguna_runtime.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/laguna/laguna_runtime.hpp"
 
 namespace strata {
 namespace {

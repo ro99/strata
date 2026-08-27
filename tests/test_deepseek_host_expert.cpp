@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "strata/cuda_backend.hpp"
-#include "strata/deepseek_host_expert.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/deepseek/deepseek_host_expert.hpp"
 #include "test.hpp"
 
 namespace {

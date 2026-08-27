@@ -1,10 +1,10 @@
 #include "test.hpp"
 
-#include "strata/cuda_backend.hpp"
-#include "strata/deepseek_kv_cache.hpp"
-#include "strata/dsv4_attention_kv.hpp"
-#include "strata/dsv4_rank_local_kv.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/deepseek/deepseek_kv_cache.hpp"
+#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_kv.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <array>

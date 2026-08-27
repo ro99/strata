@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/deepseek_runtime.hpp"
+#include "strata/models/deepseek/deepseek_runtime.hpp"
 
 #include <algorithm>
 #include <string>

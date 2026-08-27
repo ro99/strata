@@ -1,5 +1,5 @@
 #include "../common/executor_support.hpp"
-#include "strata/kimi_k3_runtime.hpp"
+#include "strata/models/kimi_k3/kimi_k3_runtime.hpp"
 
 namespace strata {
 namespace {

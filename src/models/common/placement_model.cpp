@@ -1,16 +1,16 @@
-#include "strata/placement.hpp"
+#include "strata/engine/placement.hpp"
 
-#include "strata/hardware_profile.hpp"
+#include "strata/platform/hardware_profile.hpp"
 
-#include "strata/checkpoint.hpp"
-#include "strata/cuda_backend.hpp"
-#include "strata/deepseek_admission.hpp"
-#include "strata/deepseek_checkpoint.hpp"
-#include "strata/gemma4_checkpoint.hpp"
-#include "strata/kimi_k3_checkpoint.hpp"
-#include "strata/inkling_checkpoint.hpp"
-#include "strata/laguna_checkpoint.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/common/checkpoint.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/deepseek/deepseek_admission.hpp"
+#include "strata/models/deepseek/deepseek_checkpoint.hpp"
+#include "strata/models/gemma4/gemma4_checkpoint.hpp"
+#include "strata/models/kimi_k3/kimi_k3_checkpoint.hpp"
+#include "strata/models/inkling/inkling_checkpoint.hpp"
+#include "strata/models/laguna/laguna_checkpoint.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <array>

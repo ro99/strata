@@ -1,16 +1,16 @@
-#include "strata/laguna_runtime.hpp"
+#include "strata/models/laguna/laguna_runtime.hpp"
 
 #include "../common/cuda_stats_delta.hpp"
 
-#include "strata/attention_reference.hpp"
-#include "strata/laguna_checkpoint.hpp"
-#include "strata/laguna_ops.hpp"
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/tokenizer.hpp"
-#include "strata/trace.hpp"
-#include "strata/worker_pool.hpp"
+#include "strata/kernels/attention_reference.hpp"
+#include "strata/models/laguna/laguna_checkpoint.hpp"
+#include "strata/models/laguna/laguna_ops.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/common/tokenizer.hpp"
+#include "strata/platform/trace.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,7 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
-#include "strata/lru_residency.hpp"
+#include "strata/engine/lru_residency.hpp"
 #include <iostream>
 #include <iterator>
 #include <mutex>

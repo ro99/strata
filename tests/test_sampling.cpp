@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/sampling.hpp"
-#include "strata/runtime_support.hpp"
+#include "strata/engine/sampling.hpp"
+#include "strata/engine/runtime_support.hpp"
 
 #include <array>
 #include <cmath>

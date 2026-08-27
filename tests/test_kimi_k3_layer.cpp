@@ -1,11 +1,11 @@
 #include "kimi_fixture.hpp"
 #include "test.hpp"
 
-#include "strata/compressed_tensors.hpp"
-#include "strata/kimi_k3_checkpoint.hpp"
-#include "strata/kimi_k3_expert_arena.hpp"
-#include "strata/kimi_k3_layer.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/platform/compressed_tensors.hpp"
+#include "strata/models/kimi_k3/kimi_k3_checkpoint.hpp"
+#include "strata/models/kimi_k3/kimi_k3_expert_arena.hpp"
+#include "strata/models/kimi_k3/kimi_k3_layer.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <array>

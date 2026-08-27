@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/compressed_tensors.hpp"
-#include "strata/model.hpp"
+#include "strata/platform/compressed_tensors.hpp"
+#include "strata/models/common/model.hpp"
 
 #include <array>
 #include <cstddef>

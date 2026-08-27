@@ -4,11 +4,11 @@
 // not expose architecture-specific diagnostics (see runtime.hpp). This binary
 // talks to Gemma4Runtime directly so --layer-hash-trace has somewhere to go.
 
-#include "strata/diagnostics_json.hpp"
-#include "strata/cuda_backend.hpp"
-#include "strata/gemma4_runtime.hpp"
+#include "strata/platform/diagnostics_json.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/gemma4/gemma4_runtime.hpp"
 
-#include "cli_common.hpp"
+#include "strata/app/cli.hpp"
 
 #include <cstdint>
 #include <cstdlib>

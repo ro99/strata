@@ -12,9 +12,10 @@ admission contract says it should be.
 ## Active campaign contracts
 
 - Before any work on the RTX 3090 mixed FP4/FP8 skinny-kernel/QPN campaign, read
-  `docs/qpn-sm86-kernel-campaign-contract.md` in full, then read its last log
-  line. That contract is authoritative for the campaign goal, target hardware,
-  evidence interpretation, milestone order, current position, and next step.
+  the local `experiments/docs/qpn-sm86-kernel-campaign-contract.md` in full,
+  then read its last log line. That contract is authoritative for the campaign
+  goal, target hardware, evidence interpretation, milestone order, current
+  position, and next step.
   Update its mutable status and append-only log as required by the contract
   before handing the campaign to another agent. Older QPN handovers and
   experiments remain evidence, but do not override the contract's corrected
@@ -53,9 +54,9 @@ other resource. See "Measure the bottleneck before choosing a mechanism".
 
 ## Measure the bottleneck before choosing a mechanism
 
-`research/moe-tiered-memory-decode-optimization.md` is the governing cost model:
-`τ = max_r W_r/B_r + Σ_serial`. It is a **decision procedure**, not background
-reading, and its first step is mandatory.
+The local `experiments/docs/research/moe-tiered-memory-decode-optimization.md`
+is the governing cost model: `τ = max_r W_r/B_r + Σ_serial`. It is a **decision
+procedure**, not background reading, and its first step is mandatory.
 
 Before designing, planning, or building any optimization:
 
@@ -191,8 +192,9 @@ paths. Hand back the session, log, expected summary, and current stage.
 
 ## Worked example of the failure these rules prevent
 
-`docs/experiments/0025` rejected shadow-speculative MoE offload after roughly
-2,900 lines of runtime code. Every rule above is derived from one of its errors.
+The local experiment record `0025` rejected shadow-speculative MoE offload after
+roughly 2,900 lines of runtime code. Every rule above is derived from one of its
+errors.
 
 The governing cost model was written, adversarially reviewed, and available. Its
 parameters were never instantiated on the target hardware, so the bottleneck was

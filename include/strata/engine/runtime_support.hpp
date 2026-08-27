@@ -1,0 +1,126 @@
+#pragma once
+
+#include "strata/platform/result.hpp"
+#include "strata/engine/chat_protocol.hpp"
+#include "strata/platform/types.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace strata {
+
+class StopSequenceBuffer {
+public:
+    explicit StopSequenceBuffer(std::span<const std::string> stops)
+        : stops_(stops) {}
+
+    void append(std::uint32_t token, std::string_view piece,
+                const TokenStreamCallback& callback);
+    void finish(const TokenStreamCallback& callback);
+
+    [[nodiscard]] bool stopped() const noexcept { return stopped_; }
+    [[nodiscard]] bool cancelled() const noexcept { return cancelled_; }
+    [[nodiscard]] const std::string& text() const noexcept { return text_; }
+
+private:
+    void emit(std::size_t end, std::uint32_t token,
+              const TokenStreamCallback& callback);
+
+    std::span<const std::string> stops_;
+    std::string text_;
+    std::size_t emitted_{};
+    bool stopped_{};
+    bool cancelled_{};
+};
+
+struct RuntimeDeviceBudget {
+    std::uint64_t fractional_budget_bytes{};
+    std::uint64_t explicit_budget_bytes{};
+    std::uint64_t applied_budget_bytes{};
+};
+
+struct RuntimeDevicePlan {
+    std::vector<int> devices;
+    std::vector<std::uint64_t> budgets;
+    std::vector<std::uint64_t> fractional_budgets;
+    std::vector<std::uint64_t> explicit_budgets;
+    std::vector<std::uint64_t> weight_capacities;
+    std::vector<std::size_t> weighted_schedule;
+};
+
+using RuntimeDevicePlanResult = ParseResult<RuntimeDevicePlan>;
+
+// An empty device list means "every visible device". Call this before
+// validation so a config default does not have to name a GPU count.
+[[nodiscard]] std::vector<int> resolve_runtime_devices(std::vector<int> requested);
+
+[[nodiscard]] ValidationResult validate_common_runtime_config(
+    std::span<const int> devices, double vram_fraction,
+    double sampling_temperature, std::string_view model_label);
+
+[[nodiscard]] RuntimeDeviceBudget compute_runtime_device_budget(
+    std::uint64_t free_bytes, double vram_fraction,
+    std::uint64_t explicit_budget_bytes) noexcept;
+
+[[nodiscard]] std::string_view runtime_budget_bound_name(
+    std::uint64_t fractional_budget_bytes,
+    std::uint64_t explicit_budget_bytes) noexcept;
+
+[[nodiscard]] RuntimeDevicePlanResult plan_runtime_devices(
+    std::span<const int> devices, double vram_fraction,
+    std::uint64_t per_device_workspace_reserve,
+    std::uint64_t minimum_device_budget,
+    std::string_view model_label,
+    std::uint64_t explicit_device_budget_bytes = 0U);
+
+[[nodiscard]] std::uint64_t process_resident_set_bytes() noexcept;
+[[nodiscard]] std::vector<std::uint64_t> device_vram_used_bytes(
+    std::span<const int> devices);
+
+[[nodiscard]] std::size_t incremental_kv_prefix_tokens(
+    std::span<const std::uint32_t> cached_tokens,
+    std::span<const std::uint32_t> prompt_tokens) noexcept;
+
+[[nodiscard]] bool trim_oldest_chat_turn(
+    std::vector<ChatMessage>& messages);
+
+// Render a chat template, encode it, and make it fit the context.
+//
+// Five of the six runtimes wrote this loop themselves, identically apart from
+// which template function they called and whether an over-long prompt trims or
+// reports. The shape is: render, encode, check that the prompt plus the
+// requested generation fits, and if it does not, drop the oldest turn and
+// render again -- because trimming changes the rendered text, so the encode
+// has to be redone rather than the token vector truncated.
+struct ChatPromptRequest {
+    std::span<const ChatMessage> messages;
+    std::uint32_t maximum_new_tokens{};
+    std::uint32_t maximum_context_tokens{};
+    // This model's chat template.
+    std::function<std::string(std::span<const ChatMessage>)> render;
+    // This model's tokenizer.
+    std::function<ParseResult<std::vector<std::uint32_t>>(const std::string&)>
+        encode;
+    // Drop the oldest turn and retry when the prompt does not fit. False
+    // reports the overflow instead, which is what a runtime with no sliding
+    // cache has to do rather than silently answer a different conversation.
+    bool trim_oldest_turn_to_fit{true};
+};
+
+struct ChatPrompt {
+    std::vector<std::uint32_t> token_ids;
+    std::vector<std::string> errors;
+
+    [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
+};
+
+[[nodiscard]] ChatPrompt prepare_chat_prompt(const ChatPromptRequest& request);
+
+// Returns the complete valid UTF-8 prefix, or string_view::npos for invalid input.
+[[nodiscard]] std::size_t complete_utf8_prefix(std::string_view text) noexcept;
+
+}  // namespace strata

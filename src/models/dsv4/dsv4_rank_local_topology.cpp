@@ -1,6 +1,6 @@
-#include "strata/dsv4_rank_local_topology.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_topology.hpp"
 
-#include "strata/hardware_profile.hpp"
+#include "strata/platform/hardware_profile.hpp"
 
 #include <algorithm>
 #include <iterator>

@@ -1,9 +1,9 @@
-#include "strata/runtime_support.hpp"
+#include "strata/engine/runtime_support.hpp"
 
-#include "strata/cuda_backend.hpp"
-#include "strata/hardware_profile.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/platform/hardware_profile.hpp"
 
-#include "strata/cuda_backend.hpp"
+#include "strata/device/cuda_backend.hpp"
 
 #include <algorithm>
 #include <cmath>

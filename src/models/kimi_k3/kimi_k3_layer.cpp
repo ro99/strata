@@ -1,7 +1,7 @@
-#include "strata/kimi_k3_layer.hpp"
+#include "strata/models/kimi_k3/kimi_k3_layer.hpp"
 
-#include "strata/compressed_tensors.hpp"
-#include "strata/numerics.hpp"
+#include "strata/platform/compressed_tensors.hpp"
+#include "strata/platform/numerics.hpp"
 
 #include <algorithm>
 #include <cmath>

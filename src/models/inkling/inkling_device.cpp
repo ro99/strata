@@ -1,6 +1,6 @@
-#include "strata/inkling_device.hpp"
+#include "strata/models/inkling/inkling_device.hpp"
 
-#include "strata/model_adapter.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <chrono>

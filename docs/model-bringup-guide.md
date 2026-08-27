@@ -1,11 +1,7 @@
 # Adding a model
 
-A procedure, derived from the six that exist. Follow it in order; the ordering
-is the part that was learned expensively.
-
-[`model-bringup.md`](model-bringup.md) is a different document: it is the
-historical GLM-5.2 / DeepSeek-V4 bring-up *contract*, kept for its pinned
-revisions and stage gates. Read this one to add a seventh model.
+A procedure derived from the six existing adapters. Follow it in order; the
+ordering is part of the correctness contract.
 
 ## What it actually costs
 
@@ -23,8 +19,8 @@ cross-cutting cost:
 
 | File | Edit |
 |---|---|
-| `include/strata/model_executor.hpp` | one `RuntimeModel` enumerator |
-| `include/strata/placement.hpp` | one `PlacementModel` enumerator |
+| `include/strata/engine/model_executor.hpp` | one `RuntimeModel` enumerator |
+| `include/strata/engine/placement.hpp` | one `PlacementModel` enumerator |
 | `CMakeLists.txt` | your sources in the `strata_models` list |
 | `src/models/common/placement_model.cpp` | three `switch (PlacementModel)` arms |
 | `src/models/common/tokenizer.cpp` | a pretokenizer arm, if your tokenizer differs |
@@ -51,7 +47,7 @@ overlapping or semantically invalid tensors. Do not guess tensor names in
 runtime code — the offline importer may, the runtime consumes stable roles.
 
 Do not write a new mmap/read-slicing engine. `GlmCheckpointReader` in
-`include/strata/checkpoint.hpp` is shared by GLM, Laguna and Inkling despite
+`include/strata/models/common/checkpoint.hpp` is shared by GLM, Laguna and Inkling despite
 its name; check whether it fits before adding a sixth reader.
 
 ### 3. Write ops with fixtures from real target bytes
@@ -72,13 +68,12 @@ Not after. This is the single highest-leverage step and the one most often
 skipped.
 
 - Emit `LayerHashTraceRecord` / `OperationHashTraceRecord` from
-  `include/strata/diagnostics.hpp` behind a default-off config flag.
+  `include/strata/platform/diagnostics.hpp` behind a default-off config flag.
 - Capture a fixture over a short fixed prompt; commit it under
   `tests/fixtures/<model>/`.
 - Add a ctest entry guarded on the checkpoint being present.
 
-Every later change is then gated on bit-identity rather than on judgement. The
-cost of not having it is the whole reason `docs/experiments/0120` exists.
+Every later change is then gated on bit-identity rather than on judgement.
 
 ### 6. Write the executor and register
 
@@ -125,8 +120,8 @@ degenerate caller: `enqueue_moe` takes a `rows` argument that three models
 passed as `1U`; `upload` takes an `UploadCompletion` that one caller ever set
 to `Deferred`; `numa_bind_range` and the CPU-pinned `HostWorkerPool` had one
 caller between them. Follow the call graph, not the file name — reasoning from
-model-named *files* to model-private *capability* is the error that cost the
-most time in this repository. `docs/experiments/0120` records the A/B/C map.
+model-named *files* to model-private *capability* is an expensive category
+error.
 
 **Do not set a performance default you have not screened.** Inkling's paged
 prefill shipped defaulting on, and an arithmetic screen afterwards showed it
@@ -149,5 +144,5 @@ It is opt-in now. Ten minutes of arithmetic before the default, not after.
       discarded it for months.
 - [ ] `--model-type <yours>` is rejected before the checkpoint is opened if the
       registration is missing, rather than loading a different model.
-- [ ] An experiment record under `docs/experiments/` stating what was verified
-      and, explicitly, what was not measured.
+- [ ] A local record under the Git-ignored `experiments/docs/` workspace stating
+      what was verified and, explicitly, what was not measured.

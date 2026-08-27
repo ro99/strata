@@ -1,8 +1,8 @@
 #include "kimi_fixture.hpp"
 #include "test.hpp"
 
-#include "strata/chat_protocol.hpp"
-#include "strata/tokenizer.hpp"
+#include "strata/engine/chat_protocol.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
 #include <cstdint>
 #include <fstream>

@@ -1,6 +1,6 @@
-#include "strata/glm_runtime.hpp"
+#include "strata/models/glm52/glm_runtime.hpp"
 
-#include "cli_common.hpp"
+#include "strata/app/cli.hpp"
 
 #include <chrono>
 #include <cstdint>

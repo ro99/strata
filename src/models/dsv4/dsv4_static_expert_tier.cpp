@@ -1,6 +1,6 @@
-#include "strata/dsv4_static_expert_tier.hpp"
+#include "strata/models/deepseek/dsv4_static_expert_tier.hpp"
 
-#include "strata/model_adapter.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <cstdio>
 #include <string>

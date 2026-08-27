@@ -276,14 +276,7 @@ prefill is the question.
 - Measure decode on decode. The tier's coverage was validated on held-out
   decode traces; a prefill-heavy trace flatters every locality claim.
 
-## Evidence
+## Related documentation
 
-- [Device page-query ownership accepted](../experiments/0195-dsv4-device-page-query-accepted-2026-08-25.md)
-- [Fast prefill page exposed in chat](../experiments/0192-dsv4-chat-fast-page-accepted-2026-08-25.md)
-- [Production prefill cost model](../experiments/0190-dsv4-page-attention-screen-rejected-2026-08-24.md)
-- [The tier split falsified; the serial tier measured](../experiments/0178-dsv4-tier-overlap-falsified-2026-08-24.md)
-- [Where DeepSeek V4 decode actually dispatches](../experiments/0163-dsv4-sm86-mix1-decode-route-map-2026-08-23.md)
-- [The static hot-expert tier and its held-out coverage](../experiments/0124-dsv4-static-hot-expert-tier-2026-08-18.md)
-- [The rank-pool width regression](../experiments/0123-dsv4-rank-pool-width-regression-2026-08-18.md)
 - [CLI and placement flags](../cli.md)
 - [OpenAI-compatible server](../server.md)

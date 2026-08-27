@@ -1,6 +1,6 @@
-#include "strata/dsv4_host_moe_executor.hpp"
+#include "strata/models/deepseek/dsv4_host_moe_executor.hpp"
 
-#include "strata/numa_topology.hpp"
+#include "strata/platform/numa_topology.hpp"
 
 #include <algorithm>
 #include <cmath>

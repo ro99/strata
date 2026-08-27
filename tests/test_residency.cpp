@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/residency.hpp"
-#include "strata/simulator.hpp"
+#include "strata/engine/residency.hpp"
+#include "strata/engine/simulator.hpp"
 
 TEST_CASE("residency promotes RAM hits into VRAM") {
     strata::ResidencyConfig config;

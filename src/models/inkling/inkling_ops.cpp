@@ -1,6 +1,6 @@
-#include "strata/inkling_ops.hpp"
+#include "strata/models/inkling/inkling_ops.hpp"
 
-#include "strata/compressed_tensors.hpp"
+#include "strata/platform/compressed_tensors.hpp"
 
 #include <algorithm>
 #include <cmath>

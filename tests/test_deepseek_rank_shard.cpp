@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/deepseek_checkpoint.hpp"
-#include "strata/deepseek_rank_shard.hpp"
+#include "strata/models/deepseek/deepseek_checkpoint.hpp"
+#include "strata/models/deepseek/deepseek_rank_shard.hpp"
 
 #include <algorithm>
 #include <cstdlib>

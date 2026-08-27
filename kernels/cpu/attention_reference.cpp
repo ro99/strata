@@ -1,4 +1,4 @@
-#include "strata/attention_reference.hpp"
+#include "strata/kernels/attention_reference.hpp"
 
 #include <algorithm>
 #include <array>

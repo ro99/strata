@@ -103,6 +103,8 @@ HEADER_OVERRIDES = {
     "result.hpp": "strata_platform",
     "types.hpp": "strata_platform",
     "kernel_abi.h": "strata_platform",
+    "cli.hpp": "strata_app",
+    "cli_console.hpp": "strata_app",
     "cuda_backend.hpp": "strata_device",
     "glm_int4.hpp": "strata_kernels",
     "model_adapter.hpp": "strata_models",
@@ -255,7 +257,7 @@ def unowned_headers(cpp_to_target: dict[str, str]) -> list[str]:
     for header in sorted(ROOT.glob("include/strata/**/*.hpp")):
         if owning_target(header.name, cpp_to_target) is None:
             problems.append(
-                f"include/strata/{header.name} is owned by no target -- add it "
+                f"{header.relative_to(ROOT)} is owned by no target -- add it "
                 f"to HEADER_OVERRIDES; until then its includes are unscanned")
     for header in sorted(ROOT.glob("src/**/*.hpp")):
         if owning_target(header.name, cpp_to_target) is None:
@@ -285,22 +287,30 @@ def main() -> int:
 
     cpp_to_target: dict[str, str] = {}
     header_files: dict[str, list[str]] = {t: [] for t in targets}
+    public_headers = {
+        header.name: header
+        for header in ROOT.glob("include/strata/**/*")
+        if header.suffix in {".hpp", ".h"}
+    }
     for target, files in targets.items():
         for rel in files:
             stem = Path(rel).stem
             cpp_to_target[stem] = target
-            # Each .cpp's paired public header (include/strata/<stem>.hpp) is
-            # part of the same target's surface and must be scanned too --
+            # Each .cpp's paired public header is part of the same target's
+            # surface and must be scanned too --
             # a header can carry an upward include the .cpp itself never
             # repeats (that is exactly how checkpoint.hpp's violation used to
             # hide: checkpoint.cpp only includes its own header, which is
             # where glm_manifest.hpp and cuda_backend.hpp actually were).
-            header = ROOT / "include" / "strata" / f"{stem}.hpp"
-            if header.exists():
+            header = public_headers.get(f"{stem}.hpp")
+            if header is not None:
                 header_files[target].append(str(header.relative_to(ROOT)))
     for header_name, target in HEADER_OVERRIDES.items():
-        rel = f"include/strata/{header_name}"
-        if (ROOT / rel).exists() and rel not in header_files.get(target, []):
+        header = public_headers.get(header_name)
+        if header is None:
+            continue
+        rel = str(header.relative_to(ROOT))
+        if rel not in header_files.get(target, []):
             header_files.setdefault(target, []).append(rel)
 
     exception_index = build_exception_index()

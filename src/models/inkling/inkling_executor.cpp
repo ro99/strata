@@ -1,6 +1,6 @@
 #include "../common/executor_support.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/inkling_runtime.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/inkling/inkling_runtime.hpp"
 
 namespace strata {
 namespace {

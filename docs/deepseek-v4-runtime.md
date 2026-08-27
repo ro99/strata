@@ -132,9 +132,8 @@ caches are host-resident and lazily committed.
 
 This section preserves the first successful resident smoke from 2026-07-15 on
 the now-unsupported preview checkpoint. It is historical evidence, not the
-current performance baseline. See the repository
-`README.md` and later records under `docs/experiments/` for promoted loading,
-execution, and long-context results.
+current performance baseline. See the repository `README.md` and model runbook
+for promoted behavior.
 
 The routed expert coefficient is applied once before the down projection, as in
 the bundled target inference code. The host executor, CUDA MoE kernel, and CUDA

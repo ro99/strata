@@ -1,4 +1,4 @@
-#include "strata/checkpoint_io.hpp"
+#include "strata/platform/checkpoint_io.hpp"
 
 #include <algorithm>
 #include <cerrno>

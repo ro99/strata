@@ -2,8 +2,8 @@
 // measures W_r and B_r for every resource at a chosen operating point and
 // prints the per-phase breakdown of one step in milliseconds, so argmax_r is
 // named from measurement rather than assumed.
-#include "strata/cuda_backend.hpp"
-#include "strata/laguna_runtime.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/laguna/laguna_runtime.hpp"
 
 #include <charconv>
 #include <chrono>

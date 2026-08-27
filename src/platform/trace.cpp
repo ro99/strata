@@ -1,4 +1,4 @@
-#include "strata/trace.hpp"
+#include "strata/platform/trace.hpp"
 
 #include "json_cursor.hpp"
 

@@ -1,6 +1,6 @@
-#include "strata/placement.hpp"
+#include "strata/engine/placement.hpp"
 
-#include "strata/cuda_backend.hpp"
+#include "strata/device/cuda_backend.hpp"
 
 #include <algorithm>
 #include <array>

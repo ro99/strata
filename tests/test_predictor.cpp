@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/route_predictor.hpp"
+#include "strata/engine/route_predictor.hpp"
 
 TEST_CASE("predictor learns cross-layer transitions without future input") {
     strata::RoutePredictor predictor;

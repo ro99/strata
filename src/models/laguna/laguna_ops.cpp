@@ -1,4 +1,4 @@
-#include "strata/laguna_ops.hpp"
+#include "strata/models/laguna/laguna_ops.hpp"
 
 #include <algorithm>
 #include <array>

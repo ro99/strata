@@ -1,4 +1,4 @@
-#include "strata/compressed_tensors.hpp"
+#include "strata/platform/compressed_tensors.hpp"
 
 #include "../models/common/checkpoint_common.hpp"
 

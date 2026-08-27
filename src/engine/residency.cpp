@@ -1,4 +1,4 @@
-#include "strata/residency.hpp"
+#include "strata/engine/residency.hpp"
 
 #include <algorithm>
 #include <cmath>

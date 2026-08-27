@@ -11,7 +11,7 @@ Use a Release build for chat, serving, and measurements:
 ```bash
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --parallel \
-  --target strata-chat strata-server strata-inkling-probe
+  --target strata-chat strata-server
 ```
 
 Rebuild after pulling runtime changes. `make check` is the correctness suite;
@@ -163,30 +163,6 @@ splitting Inkling's existing six-expert fused batch added command/barrier cost,
 slowed the zero-miss path to 18.142 tok/s, and heterogeneous GPU numerics changed
 later routing. That failed runtime remains isolated on its experiment branch.
 
-## Reproduce the rates
-
-First fault the checkpoint into RAM and show the same-route cache ceiling:
-
-```bash
-export CUDA_DEVICE_ORDER=FASTEST_FIRST
-
-./build-release/strata-inkling-probe \
-  --model models/inkling --devices 0,1,2 \
-  --context 512 --tokens 16 --repeat 3
-```
-
-Look at repetitions 2 and 3. The first repetition admits its selected experts;
-later repetitions reuse that exact route. To reproduce the fresh 128-token
-point after the host mapping is resident:
-
-```bash
-RESULT_DIR=results/inkling-deferred-upload-128 TOKENS=128 \
-  scripts/inkling_deferred_upload_ab.sh
-```
-
-The accepted arm is `deferred-*`. The script runs three interleaved controls
-and candidates and takes only a few minutes on the reference machine.
-
 ## Keep the fast path fast
 
 - Use a Release build and keep `CUDA_DEVICE_ORDER=FASTEST_FIRST` when comparing
@@ -204,11 +180,7 @@ and candidates and takes only a few minutes on the reference machine.
 - Measure the live context you care about. The 9.072 and 28.010 tok/s points
   use short histories and are not 16K-live-context claims.
 
-## Evidence
+## Related documentation
 
-- [Direct mapped MXFP4 staging](../experiments/0173-inkling-direct-mapped-mxfp4-staging.md)
-- [Persistent long-context KV attention](../experiments/0174-inkling-device-resident-kv-attention.md)
-- [Bounded CUDA weight arena](../experiments/0175-inkling-bounded-weight-arena.md)
-- [Deferred mapped expert uploads](../experiments/0176-inkling-deferred-mapped-expert-upload.md)
 - [CLI and placement flags](../cli.md)
 - [OpenAI-compatible server](../server.md)

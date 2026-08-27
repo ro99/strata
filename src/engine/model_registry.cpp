@@ -1,4 +1,4 @@
-#include "strata/model_executor.hpp"
+#include "strata/engine/model_executor.hpp"
 
 #include <algorithm>
 #include <string>

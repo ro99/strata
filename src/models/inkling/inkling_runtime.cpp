@@ -1,15 +1,15 @@
-#include "strata/inkling_runtime.hpp"
+#include "strata/models/inkling/inkling_runtime.hpp"
 
-#include "strata/compressed_tensors.hpp"
-#include "strata/inkling_checkpoint.hpp"
-#include "strata/inkling_device.hpp"
-#include "strata/inkling_ops.hpp"
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/numerics.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/tokenizer.hpp"
-#include "strata/worker_pool.hpp"
+#include "strata/platform/compressed_tensors.hpp"
+#include "strata/models/inkling/inkling_checkpoint.hpp"
+#include "strata/models/inkling/inkling_device.hpp"
+#include "strata/models/inkling/inkling_ops.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/platform/numerics.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/common/tokenizer.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>

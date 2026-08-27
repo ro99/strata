@@ -1,4 +1,4 @@
-#include "strata/numa_topology.hpp"
+#include "strata/platform/numa_topology.hpp"
 
 #include <algorithm>
 #include <charconv>

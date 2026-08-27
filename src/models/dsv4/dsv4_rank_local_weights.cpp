@@ -1,8 +1,8 @@
-#include "strata/dsv4_rank_local_weights.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_weights.hpp"
 
-#include "strata/deepseek_ops.hpp"
-#include "strata/deepseek_rank_shard.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/models/deepseek/deepseek_rank_shard.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <chrono>
 #include <cstring>

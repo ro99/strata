@@ -1,6 +1,6 @@
-#include "strata/simulator.hpp"
-#include "strata/trace.hpp"
-#include "strata/types.hpp"
+#include "strata/engine/simulator.hpp"
+#include "strata/platform/trace.hpp"
+#include "strata/platform/types.hpp"
 
 #include <algorithm>
 #include <cctype>

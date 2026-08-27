@@ -1,8 +1,8 @@
-#include "strata/deepseek_kv_cache.hpp"
+#include "strata/models/deepseek/deepseek_kv_cache.hpp"
 
-#include "strata/deepseek_ops.hpp"
-#include "strata/dsv4_attention_kv.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <execinfo.h>
 

@@ -8,7 +8,7 @@ marked as such, not described as passing.
 Kimi-K3 is a 93-layer hybrid backbone with attention residuals and a latent MoE.
 Everything in this section is read out of `/data/kimi-k3` — its `config.json`,
 its shard headers, and `modeling_kimi_linear.py` — and pinned in
-`kKimiK3ExecutionContract` (`include/strata/model_adapter.hpp`), which a mutated
+`kKimiK3ExecutionContract` (`include/strata/models/common/model_adapter.hpp`), which a mutated
 config is rejected against field by field.
 
 | | |
@@ -39,9 +39,7 @@ below it. Everything else, all 106.55 GiB of it, is BF16.
 
 ## What it costs on this machine
 
-The governing model is `τ = max_r W_r/B_r + Σ_serial`
-(`research/moe-tiered-memory-decode-optimization.md`), instantiated in
-`docs/experiments/0048`. The short version:
+The governing model is `τ = max_r W_r/B_r + Σ_serial`. At this operating point:
 
 **SATA is `argmax_r` by six to eight times.** A batch-1 decode step moves
 15.6–20.7 GiB of expert misses across a ≈400 MB/s link, which is 42–56 s, while
@@ -55,7 +53,7 @@ Two things follow, and they are binding:
 
 - A mechanism that does not reduce SATA bytes cannot improve `τ`. No
   speculation, no drafting, no recompute — they add compute and PCIe load to
-  shrink nothing. `docs/experiments/0025` is the worked example of that error.
+  shrink nothing.
 - Caching cannot manufacture sparsity. 185 GiB of host arena against 1347 GiB of
   experts is the whole story, and the arena reports its hit rate rather than
   implying one.
@@ -119,8 +117,8 @@ LatentMoE block      relative L2 0.0045   cosine 0.99999
 Gate 7, measured: 33/33 tokenizer cases encode *and* decode exactly, 4/4 XTML
 conversations render and tokenize exactly. No tolerance — ids are exact or wrong.
 
-Gates 5 and 6 first read negative, and the discriminating experiment showed the
-**gates** were unsound rather than the runtime. See `docs/experiments/0049`.
+Gates 5 and 6 first read negative, and a discriminating control showed the
+**gates** were unsound rather than the runtime.
 
 Gate 5 compared per-layer hidden states against a reference computed at BF16
 activation precision, while the runtime carries F32. A control run — the same
@@ -226,8 +224,8 @@ CJK alike splits Japanese differently from the reference.
 - **CUDA kernels.** Deliberate, and measured: SATA is `argmax_r` by 6–8× at
   batch-1 decode, so device kernels cannot move `τ` for decode. Which kernels
   matter for prefill is a question for a phase breakdown from the runtime. That
-  breakdown now exists — `docs/experiments/0049` — and says the decode step is
-  83% storage, so this stays deliberate.
+  measured breakdown says the decode step is 83% storage, so this stays
+  deliberate.
 - **Prescriptive placement.** The inventory is descriptive; the runtime does not
   yet consume `layer_device` or `device_budget_bytes`. That waits on a plan
   validated against a real load.

@@ -1,8 +1,8 @@
 #include "test.hpp"
 
-#include "strata/deepseek_manifest.hpp"
-#include "strata/deepseek_checkpoint.hpp"
-#include "strata/deepseek_admission.hpp"
+#include "strata/models/deepseek/deepseek_manifest.hpp"
+#include "strata/models/deepseek/deepseek_checkpoint.hpp"
+#include "strata/models/deepseek/deepseek_admission.hpp"
 
 #include <algorithm>
 #include <array>

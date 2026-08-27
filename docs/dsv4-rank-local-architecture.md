@@ -5,9 +5,8 @@ DeepSeek V4 on two GPUs. This is the contract document: it states what each
 rank owns, when asynchronous host memory may be reused, how state is committed
 or rolled back, and what admission must prove before the topology runs.
 
-It describes the **production** topology on `feat/dsv4-rank-local-decode`.
-Where a contract was established by an experiment, that experiment is cited.
-File-level provenance is in `docs/dsv4-rank-local-extraction-manifest.md`.
+It describes the **production** topology promoted from
+`feat/dsv4-rank-local-decode`.
 
 ## Scope boundary: M3 versus Stage 10
 
@@ -388,7 +387,7 @@ final completion.
 
 ## Cost model at this operating point
 
-The governing model is `research/moe-tiered-memory-decode-optimization.md`:
+The governing cost model is:
 
 ```text
 tau = max_r (W_r / B_r) + Sigma_serial
@@ -671,8 +670,8 @@ ratio-4 and ratio-0 layers are already at their 1M widths â€” `640` and `128` â€
 every short-context arm, and the 20 ratio-128 layers are the entire
 context-dependent attention term.
 
-`strata-dsv4-attention-probe` measures that term at the production page geometry
-across every width the kernel accepts, and is rejected at every width above it.
+Experiment 0093 measures that term at the production page geometry across every
+width the kernel accepts, and is rejected at every width above it.
 Medians of three interleaved runs of nine repetitions on an idle 3090:
 
 ```text
@@ -712,7 +711,8 @@ the declared accumulation order through the rescaling.
 
 **Indexer scoring, measured.** It must score all `L/ratio` compressed
 candidates to select its top `512`: at 1M, `262,144` candidates per layer over
-the 21 ratio-4 layers. `strata-dsv4-index-probe` on one 3090:
+the 21 ratio-4 layers. The Step 4 measurement recorded in the main-landing
+tracker on one 3090:
 
 ```text
                           baseline                  corrected
@@ -949,9 +949,7 @@ outside this landing's gate. Nothing here claims a 1M prefill budget.
 
 ## Capability index
 
-The thirteen program capabilities, and where each is specified here. Full
-disposition, provenance, evidence, and reuse guidance for every one is in
-`docs/dsv4-rank-local-extraction-manifest.md`.
+The thirteen program capabilities and where each is specified here:
 
 | id | capability | specified in this document |
 |---|---|---|

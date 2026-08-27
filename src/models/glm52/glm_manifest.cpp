@@ -1,6 +1,6 @@
-#include "strata/glm_manifest.hpp"
+#include "strata/models/glm52/glm_manifest.hpp"
 
-#include "strata/compressed_tensors.hpp"
+#include "strata/platform/compressed_tensors.hpp"
 
 #include <algorithm>
 #include <array>

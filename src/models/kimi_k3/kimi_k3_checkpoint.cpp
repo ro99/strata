@@ -1,8 +1,8 @@
-#include "strata/kimi_k3_checkpoint.hpp"
+#include "strata/models/kimi_k3/kimi_k3_checkpoint.hpp"
 
 #include "../common/checkpoint_common.hpp"
 
-#include "strata/model_adapter.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <array>
 #include <cstdio>

@@ -1,10 +1,10 @@
 #include "test.hpp"
 
-#include "strata/inkling_checkpoint.hpp"
-#include "strata/inkling_ops.hpp"
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/tokenizer.hpp"
+#include "strata/models/inkling/inkling_checkpoint.hpp"
+#include "strata/models/inkling/inkling_ops.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
 #include <cmath>
 #include <cstdint>

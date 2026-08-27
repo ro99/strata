@@ -1,9 +1,9 @@
 #include "test.hpp"
 
-#include "strata/inkling_ops.hpp"
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/numerics.hpp"
+#include "strata/models/inkling/inkling_ops.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/platform/numerics.hpp"
 
 #include <algorithm>
 #include <cmath>

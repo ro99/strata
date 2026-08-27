@@ -1,4 +1,4 @@
-#include "strata/numerics.hpp"
+#include "strata/platform/numerics.hpp"
 
 #include <array>
 #include <cmath>

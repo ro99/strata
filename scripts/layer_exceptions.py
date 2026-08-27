@@ -1,4 +1,4 @@
-"""Recorded exceptions to Phase 1's layering enforcement (docs/experiments/0121).
+"""Recorded exceptions to Phase 1's layering enforcement.
 
 Every entry here is a *deferred* violation, not an accepted one: the checks
 that consume this file (`check_layers.py` for includes, `check_symbols.py`

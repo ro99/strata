@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/model.hpp"
+#include "strata/models/common/model.hpp"
 
 TEST_CASE("precision below int4 is rejected") {
     strata::ModelSpec model;

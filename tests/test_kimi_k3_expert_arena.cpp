@@ -1,8 +1,8 @@
 #include "test.hpp"
 
-#include "strata/kimi_k3_expert_arena.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/placement.hpp"
+#include "strata/models/kimi_k3/kimi_k3_expert_arena.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/engine/placement.hpp"
 
 #include <filesystem>
 #include <string>

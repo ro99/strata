@@ -1,6 +1,6 @@
-#include "strata/model.hpp"
+#include "strata/models/common/model.hpp"
 
-#include "strata/model_adapter.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <cmath>

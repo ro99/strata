@@ -1,6 +1,6 @@
 #include "../common/executor_support.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/gemma4_runtime.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/gemma4/gemma4_runtime.hpp"
 
 namespace strata {
 namespace {

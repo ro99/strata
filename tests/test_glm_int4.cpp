@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/glm_int4.hpp"
+#include "strata/kernels/glm_int4.hpp"
 
 #include <algorithm>
 #include <bit>

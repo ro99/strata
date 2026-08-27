@@ -1,4 +1,4 @@
-#include "strata/sampling.hpp"
+#include "strata/engine/sampling.hpp"
 
 #include <algorithm>
 #include <cmath>

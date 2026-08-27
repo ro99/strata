@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/gemma4_image.hpp"
+#include "strata/models/gemma4/gemma4_image.hpp"
 
 #include <string_view>
 

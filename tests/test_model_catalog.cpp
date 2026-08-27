@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/model_catalog.hpp"
+#include "strata/app/model_catalog.hpp"
 
 #include <algorithm>
 #include <filesystem>

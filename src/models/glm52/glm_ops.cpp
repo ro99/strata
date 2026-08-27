@@ -1,4 +1,4 @@
-#include "strata/glm_ops.hpp"
+#include "strata/models/glm52/glm_ops.hpp"
 
 #include <algorithm>
 #include <cmath>

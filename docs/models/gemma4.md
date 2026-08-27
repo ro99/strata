@@ -138,8 +138,8 @@ These are single-stream rates, not aggregate serving throughput:
 Operating point: the exact 19,531,513,296-byte MXFP4 checkpoint, one RTX 3090
 at PCI bus `82:00.0`, SM clock locked to 1,605 MHz, 250 W, VRAM fraction 0.95,
 context bound 512, temperature zero, and no cross-device hops. Final production
-medians and every run are recorded in experiment 0187; the decode ruler is
-from experiment 0186.
+medians and every run are reported with their operating point below; the decode
+ruler uses the same production device-page path.
 
 Throughput is a batch-shape curve, not a model constant. The old 668.99 tok/s
 number described exactly M=128 and could not honestly be applied to the user's
@@ -187,14 +187,8 @@ scripts/gemma4_decode_bench.sh results/gemma4-decode
 - Avoid future-entropy sampling when measuring raw decode: `N` candidates cost
   `N+1` forward passes per emitted token by design.
 
-## Evidence
+## Related documentation
 
-- [Origin of the prefill defect](../experiments/0165-gemma4-mxfp4-register-fed.md)
-- [Direct vLLM reference](../experiments/0181-gemma4-vllm-prefill-reference-2026-08-24.md)
-- [Accepted FP32 Marlin primitive](../experiments/0184-gemma4-marlin-fp32-epilogue-accepted-2026-08-24.md)
-- [Unified M=1 layout](../experiments/0185-gemma4-marlin-unified-m1-layout-accepted-2026-08-24.md)
-- [Device-page integration and KV fix](../experiments/0186-gemma4-device-page-runtime-accepted-2026-08-24.md)
-- [Production multi-page and KV-ring fix](../experiments/0187-gemma4-production-page-prefill-accepted-2026-08-24.md)
 - [Remaining vLLM parity work](https://github.com/ro99/strata/issues/36)
 - [CLI and placement flags](../cli.md)
 - [OpenAI-compatible server](../server.md)

@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/tokenizer.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
 #include <array>
 #include <filesystem>
@@ -193,7 +193,7 @@ TEST_CASE("non-ASCII letters are not pretokenized as digit runs") {
     // ASCII digit test, so every codepoint whose low byte landed in 0x30-0x39
     // classified as a number. Cyrillic а-й is U+0430-U+0439, so `Привет мир`
     // split into six pretokens instead of two, and every contract sharing the
-    // classifier carried it. See docs/experiments/0048.
+    // classifier carried it.
     const auto cyrillic = strata::pretokenize(strata::TokenizerContract::Glm52,
                                               "Привет мир");
     REQUIRE(cyrillic.ok());

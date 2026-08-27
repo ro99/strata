@@ -1,4 +1,4 @@
-#include "strata/safetensors.hpp"
+#include "strata/platform/safetensors.hpp"
 
 #include "json_cursor.hpp"
 

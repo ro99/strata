@@ -1,4 +1,4 @@
-#include "strata/hardware_profile.hpp"
+#include "strata/platform/hardware_profile.hpp"
 
 #include <algorithm>
 #include <charconv>

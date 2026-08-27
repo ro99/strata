@@ -1,22 +1,19 @@
 // strata-chat: the interactive front end.
 //
-// Three modes share one option surface:
+// Two modes share one option surface:
 //   * a tty gets the line editor, slash commands and a per-turn timing line;
 //   * a pipe gets one prompt per line and plain output;
-//   * --protocol jsonl gets the machine framing strata-tui speaks, unchanged.
 //
 // Throughput is reported where it can be believed: once per turn, and as a
 // session aggregate on exit. A live counter would only ever show the last few
 // tokens, and none of it belongs in the terminal title.
 
-#include "strata/chat_protocol.hpp"
-#include "strata/runtime.hpp"
+#include "strata/app/runtime.hpp"
 
-#include "cli_common.hpp"
-#include "cli_console.hpp"
+#include "strata/app/cli.hpp"
+#include "strata/app/cli_console.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -26,7 +23,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -83,7 +79,6 @@ struct Options {
     bool rank_local_decode{};
     bool pin_resident_arena{};
     bool prepack_mhc{true};
-    bool jsonl_protocol{};
     bool no_colour{};
     std::string plan_cache;
     bool dry_run{};
@@ -156,7 +151,7 @@ bool takes_value(std::string_view argument) {
         "--dry-base", "--dry-allowed-length", "--dry-window",
         "--no-repeat-ngram", "--future-entropy", "--future-entropy-top-n",
         "--alpha", "--future-entropy-curve", "--alpha-wave-amplitude",
-        "--alpha-wave-period", "--devices", "--protocol",
+        "--alpha-wave-period", "--devices",
     };
     return std::find(std::begin(names), std::end(names), argument) !=
            std::end(names);
@@ -183,7 +178,6 @@ session:
   --devices 0,1,2             CUDA devices to use
   --vram-fraction F           share of each device given to caches (default 0.85)
   --no-color                  plain output even on a terminal
-  --protocol jsonl            machine framing for a frontend, not for humans
 
 execution:
   --flash-attention           CUDA FlashAttention instead of the scalar path
@@ -494,13 +488,6 @@ bool parse_options(int argc, char** argv, Options& options) {
                 if (!strata::cli::parse_devices(value, options.devices)) return reject(value);
             }
             options.devices_explicit = true;
-        } else if (argument == "--protocol") {
-            const auto protocol = next();
-            if (protocol != "jsonl") {
-                std::cerr << "error: unknown --protocol: " << protocol << '\n';
-                return false;
-            }
-            options.jsonl_protocol = true;
         } else {
             // Unreachable while takes_value() and this chain agree; kept so a
             // flag added to one and not the other is rejected instead of
@@ -578,24 +565,6 @@ std::string sampler_summary(const strata::SamplingOptions& sampling) {
         }
     }
     return text.str();
-}
-
-// ---------------------------------------------------------- jsonl framing ---
-
-void protocol_event(std::string_view event, std::string_view fields = {}) {
-    std::cout << "{\"protocol\":\"strata-chat\",\"version\":"
-              << strata::chat_protocol_version << ",\"event\":\""
-              << event << '"';
-    if (!fields.empty()) std::cout << ',' << fields;
-    std::cout << "}\n" << std::flush;
-}
-
-void protocol_message(std::string_view event, std::string_view message,
-                      bool fatal = false) {
-    std::ostringstream fields;
-    fields << "\"message\":\"" << strata::cli::json_escape(message) << '"';
-    if (fatal) fields << ",\"fatal\":true";
-    protocol_event(event, fields.str());
 }
 
 // ------------------------------------------------------------ statistics ---
@@ -692,80 +661,32 @@ void print_session_stats(const SessionStats& session) {
 
 // --------------------------------------------------------------- display ---
 
-// Streams one answer. In protocol mode it emits a token event per complete
-// UTF-8 run; on a terminal it writes the text and nothing else, so the answer
-// can be selected, piped, or copied without stripping decoration out of it.
+// Streams one answer as complete UTF-8 runs so it can be selected, piped, or
+// copied without stripping decoration out of it.
 class AnswerStream {
 public:
-    explicit AnswerStream(bool protocol) : protocol_(protocol) {}
-
-    void token(std::uint32_t token_id, std::string_view piece) {
-        last_token_id_ = token_id;
-        ++emitted_;
-        const auto now = std::chrono::steady_clock::now();
-        if (last_token_time_) {
-            const double interval =
-                std::chrono::duration<double>(now - *last_token_time_).count();
-            if (interval_count_ == intervals_.size()) {
-                interval_total_ -= intervals_[interval_cursor_];
-            } else {
-                ++interval_count_;
-            }
-            intervals_[interval_cursor_] = interval;
-            interval_total_ += interval;
-            interval_cursor_ = (interval_cursor_ + 1U) % intervals_.size();
-        }
-        last_token_time_ = now;
+    void token(std::string_view piece) {
         assembler_.push(piece, [this](std::string_view text) { write(text); });
     }
 
     void finish() {
         assembler_.finish([this](std::string_view text) { write(text); });
-        if (!protocol_ && wrote_any_ && !ends_with_newline_) std::cout << '\n';
+        if (wrote_any_ && !ends_with_newline_) std::cout << '\n';
         std::cout << std::flush;
     }
-
-    [[nodiscard]] std::uint64_t emitted() const noexcept { return emitted_; }
 
 private:
     void write(std::string_view text) {
         if (text.empty()) return;
-        if (!protocol_) {
-            wrote_any_ = true;
-            ends_with_newline_ = text.back() == '\n';
-            std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
-            std::cout << std::flush;
-            return;
-        }
-        std::ostringstream fields;
-        fields << "\"token_id\":" << last_token_id_
-               << ",\"tokens\":" << emitted_
-               << ",\"tok_s\":" << std::fixed << std::setprecision(4)
-               << windowed_rate()
-               << ",\"text\":\"" << strata::cli::json_escape(text) << '"';
-        protocol_event("token", fields.str());
+        wrote_any_ = true;
+        ends_with_newline_ = text.back() == '\n';
+        std::cout.write(text.data(), static_cast<std::streamsize>(text.size()));
+        std::cout << std::flush;
     }
 
-    // A short trailing window, reported only in the protocol stream where a
-    // frontend wants something live to draw. The turn and session figures come
-    // from the runtime's own measurement instead.
-    [[nodiscard]] double windowed_rate() const {
-        return interval_total_ > 0.0
-                   ? static_cast<double>(interval_count_) / interval_total_
-                   : 0.0;
-    }
-
-    bool protocol_{};
     bool wrote_any_{};
     bool ends_with_newline_{};
-    std::uint32_t last_token_id_{};
-    std::uint64_t emitted_{};
     term::Utf8Assembler assembler_;
-    std::optional<std::chrono::steady_clock::time_point> last_token_time_;
-    std::array<double, 16> intervals_{};
-    std::size_t interval_cursor_{};
-    std::size_t interval_count_{};
-    double interval_total_{};
 };
 
 // ------------------------------------------------------------------ turn ---
@@ -779,38 +700,28 @@ struct TurnOutcome {
 TurnOutcome run_turn(strata::RuntimeSession& runtime, const Options& options,
                      std::span<const strata::ChatMessage> messages) {
     TurnOutcome outcome;
-    if (options.jsonl_protocol) {
-        std::ostringstream fields;
-        fields << "\"prompt_bytes\":" << messages.back().content.size();
-        protocol_event("turn_start", fields.str());
-    }
 
     // Echo off for the whole turn, so a keystroke during generation cannot
     // land in the middle of the answer.
-    const std::optional<term::QuietInput> quiet =
-        options.jsonl_protocol ? std::nullopt
-                               : std::optional<term::QuietInput>(std::in_place);
+    const term::QuietInput quiet;
 
     term::Spinner spinner;
-    bool spinning = false;
-    if (!options.jsonl_protocol) {
-        // The separator goes out before the spinner starts, or the spinner
-        // thread races it and draws its first frame on the wrong line.
-        std::cerr << '\n' << std::flush;
-        // Prefill prints nothing and can run for minutes on a long prompt.
-        spinner.start("thinking");
-        spinning = true;
-    }
+    // The separator goes out before the spinner starts, or the spinner thread
+    // races it and draws its first frame on the wrong line.
+    std::cerr << '\n' << std::flush;
+    // Prefill prints nothing and can run for minutes on a long prompt.
+    spinner.start("thinking");
+    bool spinning = true;
 
     g_interrupts.store(0);
-    AnswerStream stream(options.jsonl_protocol);
+    AnswerStream stream;
     const strata::TokenStreamCallback on_token =
-        [&](std::uint32_t token, std::string_view piece) {
+        [&](std::uint32_t, std::string_view piece) {
             if (spinning) {
                 spinner.stop();
                 spinning = false;
             }
-            stream.token(token, piece);
+            stream.token(piece);
             return g_interrupts.load() == 0;
         };
 
@@ -821,12 +732,8 @@ TurnOutcome run_turn(strata::RuntimeSession& runtime, const Options& options,
 
     if (!result.ok()) {
         for (const auto& error : result.errors) {
-            if (options.jsonl_protocol) {
-                protocol_message("error", error);
-            } else {
-                std::cerr << term::red() << "  error: " << term::reset()
-                          << error << '\n';
-            }
+            std::cerr << term::red() << "  error: " << term::reset()
+                      << error << '\n';
         }
         return outcome;
     }
@@ -840,33 +747,6 @@ TurnOutcome run_turn(strata::RuntimeSession& runtime, const Options& options,
     outcome.stats.decode_seconds = result.metrics.decode_seconds;
     outcome.stats.interrupted = g_interrupts.load() != 0;
     g_interrupts.store(0);
-
-    if (options.jsonl_protocol) {
-        std::ostringstream fields;
-        fields << std::fixed << std::setprecision(6)
-               << "\"prompt_tokens\":" << result.metrics.prompt_tokens
-               << ",\"prefill_tokens\":" << result.metrics.prefill_tokens
-               << ",\"reused_prompt_tokens\":"
-               << result.metrics.reused_prompt_tokens.value_or(0U)
-               << ",\"incremental_kv_continuation\":"
-               << (result.metrics.incremental_kv_continuation.value_or(false)
-                       ? "true" : "false")
-               << ",\"decode_tokens\":" << result.metrics.decode_tokens
-               << ",\"prefill_seconds\":" << result.metrics.prefill_seconds
-               << ",\"prefill_tok_s\":" << rate(result.metrics.prefill_tokens,
-                                                result.metrics.prefill_seconds)
-               << ",\"decode_seconds\":" << result.metrics.decode_seconds
-               << ",\"decode_tok_s\":" << rate(result.metrics.decode_tokens,
-                                               result.metrics.decode_seconds)
-               << ",\"generated_token_ids\":[";
-        for (std::size_t index = 0U;
-             index < result.generated_token_ids.size(); ++index) {
-            if (index != 0U) fields << ',';
-            fields << result.generated_token_ids[index];
-        }
-        fields << ']';
-        protocol_event("turn_done", fields.str());
-    }
     return outcome;
 }
 
@@ -875,29 +755,6 @@ TurnOutcome run_turn(strata::RuntimeSession& runtime, const Options& options,
 void print_field(std::string_view label, std::string_view value) {
     std::cerr << term::grey() << "  " << std::left << std::setw(12)
               << std::string(label) << term::reset() << value << '\n';
-}
-
-// Protocol mode has no banner, but a frontend still shows the child's stderr
-// in a log pane -- strata-tui colours the [ready] line green there. These are
-// diagnostics, not framing; everything a client acts on goes over JSON.
-void print_protocol_log(const Options& options,
-                        const strata::ModelRegistration& registration) {
-    std::cerr << "[startup] model_type=" << options.model_type
-              << " devices=" << strata::cli::devices_text(options.devices)
-              << " context=" << options.context_size
-              << " max_new=" << options.max_new_tokens
-              << " vram_fraction=" << options.vram_fraction
-              << " seed=" << options.sampling.seed << '\n'
-              << "[sampler] " << sampler_summary(options.sampling) << '\n'
-              << "[attention] "
-              << ((options.flash_attention ||
-                   registration.flash_attention_by_default)
-                      ? "CUDA FlashAttention" : "scalar reference")
-              << '\n'
-              << "[contract] "
-              << (deterministic(options.sampling) ? "exact greedy"
-                                                  : "seeded Gumbel-max sampled")
-              << " base-model decode; no hidden fallback\n";
 }
 
 void print_banner(const Options& options,
@@ -1029,15 +886,10 @@ int run_dry_run(const Options& options, const strata::RuntimeConfig& config) {
     if (!resolved.ok()) {
         for (const auto& error : resolved.errors) {
             std::cerr << "error: " << error << '\n';
-            if (options.jsonl_protocol) protocol_message("error", error, true);
         }
         return 1;
     }
-    if (options.jsonl_protocol) {
-        std::cout << strata::encode_placement_plan(resolved.value.plan) << std::flush;
-    } else {
-        std::cout << strata::render_placement_report(resolved.value.plan);
-    }
+    std::cout << strata::render_placement_report(resolved.value.plan);
     if (resolved.value.from_cache) {
         std::cerr << "  reused cached plan " << resolved.value.cache_path << '\n';
     } else if (resolved.value.stored) {
@@ -1130,30 +982,6 @@ int run_piped(strata::RuntimeSession& runtime, const Options& options,
     return 0;
 }
 
-int run_protocol(strata::RuntimeSession& runtime, const Options& options,
-                 std::vector<strata::ChatMessage>& conversation) {
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        strata::ChatRequest request;
-        std::string error;
-        if (!strata::parse_chat_request(line, request, error)) {
-            protocol_message("error", error);
-            continue;
-        }
-        auto messages = request.includes_history ? std::move(request.messages)
-                                                 : conversation;
-        if (!request.includes_history) {
-            messages.push_back({strata::ChatRole::User, std::move(request.prompt)});
-        }
-        auto outcome = run_turn(runtime, options, messages);
-        if (!outcome.ok) return 1;
-        messages.push_back(
-            {strata::ChatRole::Assistant, std::move(outcome.text)});
-        conversation = std::move(messages);
-    }
-    return 0;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1163,40 +991,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    const bool human = !options.jsonl_protocol;
-    term::detect_colour(human && !options.no_colour && term::stderr_is_tty());
-
-    if (options.jsonl_protocol) {
-        std::ostringstream fields;
-        fields << "\"model_type\":\"" << options.model_type
-               << "\",\"devices\":\""
-               << strata::cli::devices_text(options.devices)
-               << "\",\"context_size\":" << options.context_size
-               << ",\"max_new_tokens\":" << options.max_new_tokens
-               << ",\"prefill_page_tokens\":"
-               << options.prefill_page_tokens
-               << ",\"temperature\":" << options.sampling.temperature
-               << ",\"exact\":" << (deterministic(options.sampling) ? "true" : "false")
-               << ",\"sampler\":\""
-               << strata::cli::json_escape(sampler_summary(options.sampling)) << '"'
-               << ",\"flash_attention\":"
-               << (options.flash_attention ? "true" : "false")
-               << ",\"incremental_kv_continuation\":"
-               << (options.incremental_kv_continuation ? "true" : "false")
-               << ",\"block_kv_cache\":"
-               << (options.block_kv_cache ? "true" : "false")
-               << ",\"device_resident_runtime\":"
-               << (options.device_resident_runtime ? "true" : "false")
-               << ",\"decode_topology\":\""
-               << (options.rank_local_decode ? "rank-local-tp2" : "centralized")
-               << '"'
-               << ",\"pin_resident_arena\":"
-               << (options.pin_resident_arena ? "true" : "false")
-               << ",\"prepack_mhc\":"
-               << (options.prepack_mhc ? "true" : "false");
-        protocol_event("hello", fields.str());
-        protocol_message("status", "Loading model");
-    }
+    term::detect_colour(!options.no_colour && term::stderr_is_tty());
 
     // parse_options already rejected an unregistered --model-type.
     const auto* registration = strata::find_model_by_cli_name(options.model_type);
@@ -1224,28 +1019,18 @@ int main(int argc, char** argv) {
 
     if (options.dry_run) return run_dry_run(options, config);
 
-    if (human) {
-        print_banner(options, *registration);
-    } else {
-        print_protocol_log(options, *registration);
-    }
+    print_banner(options, *registration);
 
     strata::RuntimeSession runtime;
-    if (human) {
-        std::cerr << '\n' << term::grey()
-                  << "  loading; a large checkpoint can take several minutes\n"
-                  << term::reset() << std::flush;
-    }
+    std::cerr << '\n' << term::grey()
+              << "  loading; a large checkpoint can take several minutes\n"
+              << term::reset() << std::flush;
     const auto load_started = std::chrono::steady_clock::now();
     const auto initialized = runtime.initialize(options.model, config);
     if (!initialized.ok()) {
         for (const auto& error : initialized.errors) {
-            if (options.jsonl_protocol) {
-                protocol_message("error", error, true);
-            } else {
-                std::cerr << term::red() << "  error: " << term::reset()
-                          << error << '\n';
-            }
+            std::cerr << term::red() << "  error: " << term::reset()
+                      << error << '\n';
         }
         return 1;
     }
@@ -1254,19 +1039,10 @@ int main(int argc, char** argv) {
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - load_started).count();
 
-    if (options.jsonl_protocol) {
-        std::ostringstream fields;
-        fields << std::fixed << std::setprecision(6)
-               << "\"load_seconds\":" << session.load_seconds;
-        protocol_event("ready", fields.str());
-        std::cerr << "[ready] model loaded in " << std::fixed
-                  << std::setprecision(2) << session.load_seconds << " s\n";
-    } else {
-        std::cerr << term::green() << "  ready" << term::reset() << term::grey()
-                  << " in " << std::fixed << std::setprecision(2)
-                  << session.load_seconds << " s\n"
-                  << term::reset() << std::flush;
-    }
+    std::cerr << term::green() << "  ready" << term::reset() << term::grey()
+              << " in " << std::fixed << std::setprecision(2)
+              << session.load_seconds << " s\n"
+              << term::reset() << std::flush;
 
     std::vector<strata::ChatMessage> conversation;
     if (!options.system_prompt.empty()) {
@@ -1283,14 +1059,12 @@ int main(int argc, char** argv) {
         if (!outcome.ok) return 1;
         session.add(outcome.stats);
         print_turn_stats(outcome.stats);
-    } else if (options.jsonl_protocol) {
-        status = run_protocol(runtime, options, conversation);
     } else if (term::stdin_is_tty()) {
         status = run_interactive(runtime, options, conversation, session);
     } else {
         status = run_piped(runtime, options, conversation, session);
     }
 
-    if (human) print_session_stats(session);
+    print_session_stats(session);
     return status;
 }

@@ -30,7 +30,7 @@ inline bool kimi_present() {
 
 // `results/` in the working tree is on the NVMe, and reference activations are
 // derived from model weights, so the default lives on the SATA disk beside the
-// checkpoint. See `docs/experiments/0048`.
+// checkpoint.
 inline std::string fixture_path(const char* name) {
     const auto* directory = std::getenv("STRATA_KIMI_FIXTURE_DIR");
     const std::filesystem::path base =

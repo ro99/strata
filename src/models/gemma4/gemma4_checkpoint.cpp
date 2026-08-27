@@ -1,10 +1,10 @@
-#include "strata/gemma4_checkpoint.hpp"
+#include "strata/models/gemma4/gemma4_checkpoint.hpp"
 
 #include "../common/checkpoint_common.hpp"
 
-#include "strata/compressed_tensors.hpp"
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/platform/compressed_tensors.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <array>
 #include <cstdio>

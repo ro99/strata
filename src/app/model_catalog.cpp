@@ -1,6 +1,6 @@
-#include "strata/model_catalog.hpp"
+#include "strata/app/model_catalog.hpp"
 
-#include "strata/model_executor.hpp"
+#include "strata/engine/model_executor.hpp"
 
 #include <algorithm>
 #include <charconv>

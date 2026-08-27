@@ -1,8 +1,8 @@
 #include "kimi_fixture.hpp"
 #include "test.hpp"
 
-#include "strata/kimi_k3_runtime.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/kimi_k3/kimi_k3_runtime.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -347,7 +347,7 @@ TEST_CASE("Kimi-K3 backbone matches the reference at every layer") {
     REQUIRE(prompt.errors.empty());
     REQUIRE(decode.errors.empty());
 
-    // Gate 5 reports; it does not assert. See docs/experiments/0049.
+    // Gate 5 reports; it does not assert.
     //
     // The per-layer band below compares against a reference computed at BF16
     // activation precision while this runtime carries F32, and the control run

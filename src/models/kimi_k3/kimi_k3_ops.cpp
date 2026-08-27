@@ -1,4 +1,4 @@
-#include "strata/kimi_k3_ops.hpp"
+#include "strata/models/kimi_k3/kimi_k3_ops.hpp"
 
 #include <algorithm>
 #include <cmath>

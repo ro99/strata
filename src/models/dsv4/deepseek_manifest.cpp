@@ -1,4 +1,4 @@
-#include "strata/deepseek_manifest.hpp"
+#include "strata/models/deepseek/deepseek_manifest.hpp"
 
 #include <algorithm>
 #include <array>

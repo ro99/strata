@@ -1,7 +1,7 @@
 # Command-line usage
 
-Every CLI flag, the dry-run planner, samplers, the terminal UI and the HTTP
-server. Extracted from the README, which is now a landing page.
+Every CLI flag, the dry-run planner, samplers, and the HTTP server. Extracted
+from the README, which is now a landing page.
 
 For what Strata is and which models it runs, see the [README](../README.md).
 For how the code is organised, see
@@ -114,14 +114,7 @@ Prefill and decode therefore use different expert kernels, as they do in every
 CPU-GPU hybrid stack. The prefill kernel is held to the scalar oracle within
 one BF16 mantissa step per output rather than to bit equality with the CPU
 one; page-major execution itself remains bit-exact, and routes, precision,
-top-k, expert count and mHC semantics are unchanged. See experiments
-[0095](experiments/0095-dsv4-page-major-tp2-prefill-2026-08-15.md) and
-[0096](experiments/0096-dsv4-gpu-prefill-experts-2026-08-15.md) for the
-page-major and GPU-expert foundation,
-[0105](experiments/0105-dsv4-sm86-fp8-tensor-page-projections-2026-08-16.md)
-for the FP8 projection contract, and
-[0107](experiments/0107-dsv4-promotion-campaign-2026-08-16.md) for the
-promotion campaign.
+top-k, expert count and mHC semantics are unchanged.
 
 Measured on 2× RTX 3090, an 18-token prompt and 31 decode steps including
 warm-up:
@@ -268,11 +261,10 @@ and it is recomputed automatically. `--replan` forces a fresh one,
 `--no-plan-cache` neither reads nor writes one, and `--plan-cache DIR` (or
 `$STRATA_PLAN_CACHE`) moves the directory.
 
-Read the table as an instance of the cost model in
-`research/moe-tiered-memory-decode-optimization.md`: the `per step` column is the
-`W_r` volume each component contributes to one batch-1 decode step, split by the
-resource that serves it. It is a byte count, not a duration — the planner
-measures no bandwidth and converts nothing to milliseconds.
+Read the table as an instance of `τ = max_r W_r/B_r + Σ_serial`: the `per step`
+column is the `W_r` volume each component contributes to one batch-1 decode
+step, split by the resource that serves it. It is a byte count, not a duration
+— the planner measures no bandwidth and converts nothing to milliseconds.
 
 What each verdict means:
 
@@ -330,4 +322,3 @@ Three subjects that used to live here have their own documents:
 |---|---|
 | [`sampling.md`](sampling.md) | sampler options, their exact semantics, reproducibility, future-entropy lookahead |
 | [`server.md`](server.md) | `strata-server` and the OpenAI-compatible API |
-| [`tui.md`](tui.md) | `strata-tui`, the Ratatui operator frontend |

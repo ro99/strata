@@ -1,12 +1,12 @@
-#include "strata/deepseek_admission.hpp"
-#include "strata/deepseek_checkpoint.hpp"
+#include "strata/models/deepseek/deepseek_admission.hpp"
+#include "strata/models/deepseek/deepseek_checkpoint.hpp"
 
 #include "../common/checkpoint_common.hpp"
 
-#include "strata/deepseek_host_expert.hpp"
-#include "strata/deepseek_ops.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/numa_topology.hpp"
+#include "strata/models/deepseek/deepseek_host_expert.hpp"
+#include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/platform/numa_topology.hpp"
 
 #include <algorithm>
 #include <array>

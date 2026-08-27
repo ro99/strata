@@ -1,4 +1,4 @@
-#include "strata/openai_protocol.hpp"
+#include "strata/app/openai_protocol.hpp"
 
 #include "../platform/json_cursor.hpp"
 

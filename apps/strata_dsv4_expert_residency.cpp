@@ -28,7 +28,7 @@
 // This is placement, not prediction: it changes which device holds a weight,
 // never which experts the router selects.
 
-#include "cli_common.hpp"
+#include "strata/app/cli.hpp"
 
 #include <algorithm>
 #include <array>
@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
                 static_cast<double>(decode_activations));
         std::printf(
             "note: that coverage is self-measured on these traces. The held-out "
-            "figure is the one that matters; see docs/experiments/0124.\n");
+            "decode-trace figure is the one that matters.\n");
     }
     return 0;
 }

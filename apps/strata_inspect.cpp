@@ -1,12 +1,12 @@
-#include "strata/glm_manifest.hpp"
-#include "strata/compressed_tensors.hpp"
-#include "strata/cuda_backend.hpp"
-#include "strata/deepseek_manifest.hpp"
-#include "strata/gemma4_checkpoint.hpp"
-#include "strata/inkling_checkpoint.hpp"
-#include "strata/laguna_checkpoint.hpp"
-#include "strata/model.hpp"
-#include "strata/safetensors.hpp"
+#include "strata/models/glm52/glm_manifest.hpp"
+#include "strata/platform/compressed_tensors.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/deepseek/deepseek_manifest.hpp"
+#include "strata/models/gemma4/gemma4_checkpoint.hpp"
+#include "strata/models/inkling/inkling_checkpoint.hpp"
+#include "strata/models/laguna/laguna_checkpoint.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/platform/safetensors.hpp"
 
 #include <array>
 #include <algorithm>

@@ -1,7 +1,7 @@
-#include "strata/deepseek_admission.hpp"
+#include "strata/models/deepseek/deepseek_admission.hpp"
 
-#include "strata/deepseek_kv_cache.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/deepseek/deepseek_kv_cache.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <limits>

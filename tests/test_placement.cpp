@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/placement.hpp"
+#include "strata/engine/placement.hpp"
 
 #include <algorithm>
 #include <cstdlib>

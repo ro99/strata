@@ -1,4 +1,4 @@
-#include "strata/dsv4_rank_local_layer_executor.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_layer_executor.hpp"
 
 #include <cuda_runtime.h>
 #include <nccl.h>

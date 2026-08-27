@@ -1,4 +1,4 @@
-#include "strata/checkpoint.hpp"
+#include "strata/models/common/checkpoint.hpp"
 
 #include "../common/checkpoint_common.hpp"
 

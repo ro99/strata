@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/trace.hpp"
+#include "strata/platform/trace.hpp"
 
 #include <filesystem>
 #include <cstdio>

@@ -39,8 +39,7 @@ make check                       # build and run the test suite
 `kimi-k3`. Add `--devices 0,1` to pin GPUs, `--admission-only --json` to print
 the placement plan without loading anything.
 
-There is also an OpenAI-compatible server (`strata-server`), a terminal UI, and
-a provider-neutral [Svelte writing application](web/README.md) for authors.
+There is also an OpenAI-compatible server (`strata-server`).
 **Full flag reference: [`docs/cli.md`](docs/cli.md).**
 
 ## Supported models
@@ -59,9 +58,8 @@ manifold-constrained hyper-connections for DeepSeek, Kimi Delta Attention and
 latent-space MoE for Kimi-K3, per-head softplus output gating and YaRN-on-global
 rotary for Laguna, and so on.
 
-Measured figures, with their operating points, live in
-[`docs/experiments/`](docs/experiments/). A number from one context length does
-not transfer to another, and none is quoted here without its record.
+Each model runbook states the hardware and operating point for its measured
+figures. A number from one context length does not transfer to another.
 
 ## Precision, as declared
 
@@ -136,21 +134,19 @@ record those as negatives with their measurements; 0165 records the positive.
 | [`docs/sampling.md`](docs/sampling.md) | sampler semantics and reproducibility |
 | [`docs/server.md`](docs/server.md) | the OpenAI-compatible HTTP API |
 | [`docs/models/`](docs/models/) | copy-paste build, chat, server, and measured-speed runbooks by model |
-| [`docs/tui.md`](docs/tui.md) | the terminal UI |
 | [`docs/current-architecture.md`](docs/current-architecture.md) | how the code is organised and what is enforced |
 | [`docs/model-bringup-guide.md`](docs/model-bringup-guide.md) | adding a seventh model |
 | [`docs/architecture.md`](docs/architecture.md) | the target scheduler design, not yet built |
-| [`docs/README.md`](docs/README.md) | full index — current behaviour vs target vs evidence |
+| [`docs/README.md`](docs/README.md) | product documentation index |
 | [`CLAUDE.md`](CLAUDE.md) | research charter: how changes are proposed and measured |
 
 ## Contributing
 
-Start from a measured bottleneck against the cost model in
-[`research/moe-tiered-memory-decode-optimization.md`](research/moe-tiered-memory-decode-optimization.md),
-not from a guess about what's slow. State a hypothesis and a kill criterion
-before building, run `make check` before claiming a result, and don't call
-something a win if it's inside run-to-run variance. Rejected experiments are
-recorded with the same care as accepted ones.
+Start from a measured bottleneck using `τ = max_r W_r/B_r + Σ_serial`, not from
+a guess about what's slow. State a hypothesis and a kill criterion before
+building, run `make check` before claiming a result, and don't call something a
+win if it's inside run-to-run variance. Keep accepted and rejected research
+records in the local Git-ignored experimentation workspace.
 
 ## License
 

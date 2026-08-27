@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/diagnostics.hpp"
+#include "strata/platform/diagnostics.hpp"
 
 #include <array>
 #include <limits>

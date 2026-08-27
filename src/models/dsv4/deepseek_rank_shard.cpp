@@ -1,6 +1,6 @@
-#include "strata/deepseek_rank_shard.hpp"
+#include "strata/models/deepseek/deepseek_rank_shard.hpp"
 
-#include "strata/deepseek_checkpoint.hpp"
+#include "strata/models/deepseek/deepseek_checkpoint.hpp"
 
 #include <algorithm>
 #include <limits>

@@ -1,18 +1,18 @@
-#include "strata/glm_runtime.hpp"
+#include "strata/models/glm52/glm_runtime.hpp"
 
-#include "strata/hardware_profile.hpp"
+#include "strata/platform/hardware_profile.hpp"
 
 #include "../common/cuda_stats_delta.hpp"
 
-#include "strata/attention_reference.hpp"
-#include "strata/glm_ops.hpp"
-#include "strata/glm_int4.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/sampling.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/tokenizer.hpp"
-#include "strata/trace.hpp"
-#include "strata/worker_pool.hpp"
+#include "strata/kernels/attention_reference.hpp"
+#include "strata/models/glm52/glm_ops.hpp"
+#include "strata/kernels/glm_int4.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/engine/sampling.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/common/tokenizer.hpp"
+#include "strata/platform/trace.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>
@@ -26,7 +26,7 @@
 #include <iterator>
 #include <limits>
 #include <iostream>
-#include "strata/lru_residency.hpp"
+#include "strata/engine/lru_residency.hpp"
 #include <mutex>
 #include <numeric>
 #include <optional>

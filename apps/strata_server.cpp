@@ -1,10 +1,10 @@
-#include "strata/openai_protocol.hpp"
-#include "strata/model_catalog.hpp"
-#include "strata/runtime.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/tokenizer.hpp"
+#include "strata/app/openai_protocol.hpp"
+#include "strata/app/model_catalog.hpp"
+#include "strata/app/runtime.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
-#include "cli_common.hpp"
+#include "strata/app/cli.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

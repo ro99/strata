@@ -1,29 +1,29 @@
-#include "strata/deepseek_runtime.hpp"
+#include "strata/models/deepseek/deepseek_runtime.hpp"
 
 #include "../common/cuda_stats_delta.hpp"
 
-#include "strata/deepseek_ops.hpp"
-#include "strata/deepseek_host_expert.hpp"
-#include "strata/dsv4_attention_kv.hpp"
-#include "strata/dsv4_rank_local_kv.hpp"
-#include "strata/dsv4_rank_local_weights.hpp"
+#include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/models/deepseek/deepseek_host_expert.hpp"
+#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_kv.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_weights.hpp"
 // The two-rank executor is a CUDA translation unit compiled only when NCCL is
 // available. Rank-local decode already requires NCCL at config validation, so
 // the session it owns is guarded on the same condition rather than declared
 // and left unlinkable.
 #if defined(STRATA_HAS_NCCL)
-#include "strata/dsv4_rank_local_layer_executor.hpp"
+#include "strata/models/deepseek/dsv4_rank_local_layer_executor.hpp"
 #endif
-#include "strata/model_adapter.hpp"
-#include "strata/hardware_profile.hpp"
-#include "strata/numa_topology.hpp"
-#include "strata/numerics.hpp"
-#include "strata/route_predictor.hpp"
-#include "strata/sampling.hpp"
-#include "strata/runtime_support.hpp"
-#include "strata/tokenizer.hpp"
-#include "strata/trace.hpp"
-#include "strata/worker_pool.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/platform/hardware_profile.hpp"
+#include "strata/platform/numa_topology.hpp"
+#include "strata/platform/numerics.hpp"
+#include "strata/engine/route_predictor.hpp"
+#include "strata/engine/sampling.hpp"
+#include "strata/engine/runtime_support.hpp"
+#include "strata/models/common/tokenizer.hpp"
+#include "strata/platform/trace.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>

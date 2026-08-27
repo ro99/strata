@@ -1,7 +1,7 @@
 # Generic FlashAttention forward backend
 
 Strata provides a ground-up, dependency-free CUDA forward-attention primitive
-behind the model-neutral contract in `include/strata/attention.hpp`. It is
+behind the model-neutral contract in `include/strata/platform/attention.hpp`. It is
 opt-in while the pinned full-model correctness and replicated performance gates
 remain under evaluation.
 
@@ -96,10 +96,8 @@ diagnostics. JSON graph metrics report `attention_cuda_dispatches` and
 `attention_scalar_dispatches` independently.
 
 The original unconditional implementation failed promotion at `0.520x`
-median short-context decode throughput. The production decode redesign and its
-replacement gates are recorded in
-[`docs/experiments/0015-production-flash-decode-2026-07-19.md`](experiments/0015-production-flash-decode-2026-07-19.md); the replicated gate shows
-attention/prefill improvement but no end-to-end decode win within observed
+median short-context decode throughput. Replicated replacement gates showed
+attention/prefill improvement but no end-to-end decode win outside observed
 variance, so the scalar backend remains the global default. Use
 `--flash-attention` for the shape-aware hybrid policy.
 

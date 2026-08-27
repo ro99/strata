@@ -1,4 +1,4 @@
-#include "strata/attention.hpp"
+#include "strata/platform/attention.hpp"
 
 #include <cmath>
 #include <iterator>

@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/gemma4_checkpoint.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/gemma4/gemma4_checkpoint.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <filesystem>
 

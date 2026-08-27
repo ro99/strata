@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/attention.hpp"
-#include "strata/attention_reference.hpp"
+#include "strata/platform/attention.hpp"
+#include "strata/kernels/attention_reference.hpp"
 
 #include <array>
 #include <cmath>

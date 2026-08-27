@@ -1,6 +1,6 @@
-#include "strata/gemma4_ops.hpp"
+#include "strata/models/gemma4/gemma4_ops.hpp"
 
-#include "strata/numerics.hpp"
+#include "strata/platform/numerics.hpp"
 
 #include <algorithm>
 #include <cmath>

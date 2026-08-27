@@ -1,10 +1,10 @@
 #include "test.hpp"
 
-#include "strata/chat_protocol.hpp"
-#include "strata/inkling_runtime.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/cuda_backend.hpp"
-#include "strata/tokenizer.hpp"
+#include "strata/engine/chat_protocol.hpp"
+#include "strata/models/inkling/inkling_runtime.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/device/cuda_backend.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
 #include <algorithm>
 #include <array>

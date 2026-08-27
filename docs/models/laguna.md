@@ -195,10 +195,8 @@ profiler to reproduce the rejected old path; do not use it for chat or serving.
   projection probe produced only 1.115x on Q, 1.011x on O, and a 0.597x
   regression on the shared projection, so no TP runtime was promoted.
 
-## Evidence and deeper reference
+## Related documentation
 
-- [Device-resident KV decode experiment](../experiments/0171-laguna-device-resident-kv-decode.md)
-- [Rejected Laguna TP=2 gate](../experiments/0172-laguna-spine-tp2-gate.md)
 - [All CLI and placement flags](../cli.md)
 - [OpenAI-compatible server](../server.md)
 - [Sampling semantics](../sampling.md)

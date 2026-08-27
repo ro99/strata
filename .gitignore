@@ -3,6 +3,7 @@
 /results/
 /build-*/
 /target/
+/experiments/
 /.cache/
 /compile_commands.json
 *.log

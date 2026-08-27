@@ -1,7 +1,7 @@
-#include "strata/gemma4_image.hpp"
+#include "strata/models/gemma4/gemma4_image.hpp"
 
-#include "strata/model_adapter.hpp"
-#include "strata/numerics.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/platform/numerics.hpp"
 
 #include <array>
 #include <cerrno>

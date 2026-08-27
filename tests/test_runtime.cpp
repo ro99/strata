@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/runtime.hpp"
-#include "strata/runtime_support.hpp"
+#include "strata/app/runtime.hpp"
+#include "strata/engine/runtime_support.hpp"
 
 #include <algorithm>
 

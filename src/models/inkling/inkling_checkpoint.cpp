@@ -1,9 +1,9 @@
-#include "strata/inkling_checkpoint.hpp"
+#include "strata/models/inkling/inkling_checkpoint.hpp"
 
 #include "../common/checkpoint_common.hpp"
 
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <sys/mman.h>
 #include <sys/stat.h>

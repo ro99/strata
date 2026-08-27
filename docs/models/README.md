@@ -2,8 +2,8 @@
 
 These are operator-facing, copy-paste guides for running each model on its
 fastest measured Strata path. Every speed is tied to an operating point and an
-experiment record; it is not a promise that the same number transfers to a
-different context length or machine.
+explicit measurement description; it is not a promise that the same number
+transfers to a different context length or machine.
 
 | Model | Runbook | Fastest accepted single-stream decode |
 |---|---|---:|

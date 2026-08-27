@@ -1,4 +1,4 @@
-#include "strata/kernel_abi.h"
+#include "strata/platform/kernel_abi.h"
 
 #include <algorithm>
 #include <cmath>

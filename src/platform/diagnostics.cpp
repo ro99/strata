@@ -1,4 +1,4 @@
-#include "strata/diagnostics.hpp"
+#include "strata/platform/diagnostics.hpp"
 
 #include <algorithm>
 #include <bit>

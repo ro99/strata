@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/deepseek_ops.hpp"
-#include "strata/numerics.hpp"
+#include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/platform/numerics.hpp"
 
 #include <algorithm>
 #include <array>

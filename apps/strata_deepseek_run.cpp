@@ -1,9 +1,9 @@
-#include "strata/deepseek_runtime.hpp"
-#include "strata/diagnostics_json.hpp"
-#include "strata/dsv4_attention_kv.hpp"
-#include "strata/runtime_support.hpp"
+#include "strata/models/deepseek/deepseek_runtime.hpp"
+#include "strata/platform/diagnostics_json.hpp"
+#include "strata/models/deepseek/dsv4_attention_kv.hpp"
+#include "strata/engine/runtime_support.hpp"
 
-#include "cli_common.hpp"
+#include "strata/app/cli.hpp"
 
 #include <charconv>
 #include <cmath>

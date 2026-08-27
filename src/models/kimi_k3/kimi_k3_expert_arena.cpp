@@ -1,8 +1,8 @@
-#include "strata/kimi_k3_expert_arena.hpp"
+#include "strata/models/kimi_k3/kimi_k3_expert_arena.hpp"
 
-#include "strata/numa_topology.hpp"
+#include "strata/platform/numa_topology.hpp"
 
-#include "strata/placement.hpp"
+#include "strata/engine/placement.hpp"
 
 #include <algorithm>
 #include <array>

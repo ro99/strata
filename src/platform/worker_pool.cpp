@@ -1,4 +1,4 @@
-#include "strata/worker_pool.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <atomic>
 #include <algorithm>

@@ -1,14 +1,14 @@
-#include "strata/kimi_k3_runtime.hpp"
+#include "strata/models/kimi_k3/kimi_k3_runtime.hpp"
 
 #include "../../platform/json_cursor.hpp"
 
-#include "strata/kimi_k3_checkpoint.hpp"
-#include "strata/kimi_k3_kv_cache.hpp"
-#include "strata/kimi_k3_layer.hpp"
-#include "strata/kimi_k3_ops.hpp"
-#include "strata/model_adapter.hpp"
-#include "strata/tokenizer.hpp"
-#include "strata/worker_pool.hpp"
+#include "strata/models/kimi_k3/kimi_k3_checkpoint.hpp"
+#include "strata/models/kimi_k3/kimi_k3_kv_cache.hpp"
+#include "strata/models/kimi_k3/kimi_k3_layer.hpp"
+#include "strata/models/kimi_k3/kimi_k3_ops.hpp"
+#include "strata/models/common/model_adapter.hpp"
+#include "strata/models/common/tokenizer.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <algorithm>
 #include <chrono>

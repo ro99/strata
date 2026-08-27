@@ -1,4 +1,4 @@
-#include "strata/tokenizer.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
 #include "../../platform/json_cursor.hpp"
 #include "../inkling/inkling_unicode.hpp"

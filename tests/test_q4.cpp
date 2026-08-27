@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/kernel_abi.h"
+#include "strata/platform/kernel_abi.h"
 
 #include <array>
 #include <cstdint>

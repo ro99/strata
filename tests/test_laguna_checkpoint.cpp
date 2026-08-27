@@ -1,9 +1,9 @@
 #include "test.hpp"
 
-#include "strata/laguna_checkpoint.hpp"
-#include "strata/laguna_ops.hpp"
-#include "strata/model.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/laguna/laguna_checkpoint.hpp"
+#include "strata/models/laguna/laguna_ops.hpp"
+#include "strata/models/common/model.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <array>
 #include <cmath>

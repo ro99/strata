@@ -26,9 +26,19 @@ strata_app        RuntimeSession and the OpenAI protocol
 `strata_models` under `--whole-archive`; see "Model registration" below.
 
 `src/` mirrors this: `src/platform/`, `src/engine/`, `src/app/`, and
-`src/models/{dsv4,glm52,gemma4,kimi_k3,laguna,inkling,common}/`. Public headers
-stay flat under `include/strata/` — the tier is expressed by the build target
-and checked by the two lints, not by header path.
+`src/models/{dsv4,glm52,gemma4,kimi_k3,laguna,inkling,common}/`. Headers mirror
+the same ownership under `include/strata/{platform,device,kernels,engine,app}`
+and `include/strata/models/<model>/`. They are the internal cross-target API;
+the project does not currently install a C++ SDK. The two lints still derive
+and verify ownership rather than trusting directory names alone.
+
+The native CUDA backend has one owning translation unit,
+`kernels/cuda/backend.cu`, because its private PImpl and device helpers rely on
+internal linkage. Its implementation is split into private responsibility
+fragments under `kernels/cuda/detail/`: lifecycle/core, Gemma, attention,
+DeepSeek mHC, GLM, matmul/layout, and MoE/statistics. The sole Marlin import is
+the Strata adapter in that private directory; vendored paths do not leak into
+the rest of production code.
 
 ### The layering is enforced, not asserted
 
@@ -54,7 +64,7 @@ says so at the point it prints the number.
 
 ## Model registration
 
-`include/strata/model_executor.hpp` is the seam. `ModelExecutor` has three
+`include/strata/engine/model_executor.hpp` is the seam. `ModelExecutor` has three
 virtual members — `initialize`, `generate_chat_stream`, `accepts_images` — and
 each model registers itself with a file-scope `ModelRegistrar` in its own
 translation unit. `RuntimeSession` is a registry lookup and two virtual calls;
@@ -77,8 +87,8 @@ suite still passes.
 
 Its own directory under `src/models/`, and **five shared files**:
 
-1. `include/strata/model_executor.hpp` — the `RuntimeModel` enumerator.
-2. `include/strata/placement.hpp` — the `PlacementModel` enumerator.
+1. `include/strata/engine/model_executor.hpp` — the `RuntimeModel` enumerator.
+2. `include/strata/engine/placement.hpp` — the `PlacementModel` enumerator.
 3. `CMakeLists.txt` — the `strata_models` source list.
 4. `src/models/common/placement_model.cpp` — three `switch (PlacementModel)`.
 5. `src/models/common/tokenizer.cpp` — the pretokenizer dispatch.
@@ -112,7 +122,7 @@ current benchmarks.
 
 ## Hardware
 
-`include/strata/hardware_profile.hpp` probes the machine once and caches it:
+`include/strata/platform/hardware_profile.hpp` probes the machine once and caches it:
 `MemTotal`, the process's CPU affinity mask (not the machine's core count — a
 cgroup or taskset makes those differ), NUMA topology, and the smallest node's
 CPU count. `resolve_runtime_devices` turns an empty device list into every
@@ -136,7 +146,7 @@ not.
 `make check-equivalence` (also a ctest entry, guarded on the checkpoint being
 present) runs Gemma 4 against `tests/fixtures/gemma4/layer-hash-trace.json` —
 a per-layer hidden-state hash plus per-operation hashes over a fixed prompt.
-The types are model-neutral (`include/strata/diagnostics.hpp`); DeepSeek emits
+The types are model-neutral (`include/strata/platform/diagnostics.hpp`); DeepSeek emits
 the same records, and the remaining four models do not yet.
 
 Its limits, stated because a gate nobody understands is worse than none: it
@@ -150,7 +160,7 @@ renames-not-rewrites rather than on this.
 
 ## Placement planning
 
-`strata/placement.hpp` sizes a checkpoint against measured hardware before any
+`strata/engine/placement.hpp` sizes a checkpoint against measured hardware before any
 weight is read: an **inventory** (model-specific, from checkpoint headers only,
 hardware-independent), a **solver** (a pure function of inventory plus a
 hardware probe), and a **plan cache** keyed by checkpoint identity, GPU

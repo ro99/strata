@@ -1,4 +1,4 @@
-#include "strata/diagnostics_json.hpp"
+#include "strata/platform/diagnostics_json.hpp"
 
 #include <iomanip>
 #include <sstream>

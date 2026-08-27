@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/glm_manifest.hpp"
-#include "strata/safetensors.hpp"
+#include "strata/models/glm52/glm_manifest.hpp"
+#include "strata/platform/safetensors.hpp"
 
 #include <array>
 #include <cstdio>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strata/cuda_backend.hpp"
+#include "strata/device/cuda_backend.hpp"
 
 #include <algorithm>
 

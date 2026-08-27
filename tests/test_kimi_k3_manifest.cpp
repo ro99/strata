@@ -1,7 +1,7 @@
 #include "test.hpp"
 
-#include "strata/kimi_k3_manifest.hpp"
-#include "strata/model_adapter.hpp"
+#include "strata/models/kimi_k3/kimi_k3_manifest.hpp"
+#include "strata/models/common/model_adapter.hpp"
 
 #include <algorithm>
 #include <filesystem>

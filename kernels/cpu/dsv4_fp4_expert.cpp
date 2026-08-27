@@ -1,8 +1,8 @@
 // Host FP4 routed expert, bit-identical to deepseek_fp4_gate_up_kernel and
-// deepseek_fp4_down_kernel. See include/strata/deepseek_host_expert.hpp for the
+// deepseek_fp4_down_kernel. See include/strata/models/deepseek/deepseek_host_expert.hpp for the
 // contract this file is obliged to reproduce.
 
-#include "strata/deepseek_host_expert.hpp"
+#include "strata/models/deepseek/deepseek_host_expert.hpp"
 
 #include <array>
 #include <bit>
@@ -11,7 +11,7 @@
 #include <cstring>
 #include <vector>
 
-#include "strata/numerics.hpp"
+#include "strata/platform/numerics.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define STRATA_DSV4_EXPERT_AVX2 1

@@ -1,6 +1,6 @@
 #include "test.hpp"
 
-#include "strata/worker_pool.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <array>
 #include <atomic>

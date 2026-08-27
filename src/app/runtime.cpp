@@ -1,4 +1,4 @@
-#include "strata/runtime.hpp"
+#include "strata/app/runtime.hpp"
 
 #include <algorithm>
 #include <array>

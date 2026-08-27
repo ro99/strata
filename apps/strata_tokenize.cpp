@@ -1,4 +1,4 @@
-#include "strata/tokenizer.hpp"
+#include "strata/models/common/tokenizer.hpp"
 
 #include <iostream>
 #include <string>

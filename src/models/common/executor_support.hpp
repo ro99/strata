@@ -12,7 +12,7 @@
 // say "not applicable" rather than report a zero indistinguishable from a
 // measurement. Each executor sets them, or leaves them unset, explicitly.
 
-#include "strata/model_executor.hpp"
+#include "strata/engine/model_executor.hpp"
 
 #include <utility>
 

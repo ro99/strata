@@ -27,3 +27,4 @@ __pycache__/
 
 # Operator-specific hardware notes, not part of the project.
 hardware/
+AGENTS.md

@@ -18,6 +18,8 @@ hardware/
 # Agent working directory
 .claude/
 .codex/
+AGENTS.md
+CLAUDE.md
 
 # Generated Python bytecode from the test oracles under scripts/.
 __pycache__/

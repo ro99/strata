@@ -129,6 +129,59 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return devices.size() > 1U;
 }
 
+[[nodiscard]] bool tensor_parallel_head_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_TENSOR_PARALLEL_HEAD");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+struct Glm53RowRange {
+    std::uint64_t begin{};
+    std::uint64_t count{};
+};
+
+[[nodiscard]] std::vector<Glm53RowRange> weighted_row_ranges(
+    std::uint64_t rows, std::span<const std::uint64_t> capacities,
+    std::uint64_t alignment) {
+    if (rows == 0U || capacities.empty() || alignment == 0U ||
+        std::any_of(capacities.begin(), capacities.end(),
+                    [](std::uint64_t value) { return value == 0U; })) {
+        return {};
+    }
+    if (rows < capacities.size() * alignment || rows % alignment != 0U) {
+        alignment = 1U;
+    }
+    long double total_capacity = 0.0L;
+    for (const auto capacity : capacities) {
+        total_capacity += static_cast<long double>(capacity);
+    }
+    std::vector<Glm53RowRange> ranges;
+    ranges.reserve(capacities.size());
+    std::uint64_t begin = 0U;
+    long double cumulative = 0.0L;
+    for (std::size_t slot = 0U; slot < capacities.size(); ++slot) {
+        std::uint64_t end = rows;
+        if (slot + 1U != capacities.size()) {
+            cumulative += static_cast<long double>(capacities[slot]);
+            const auto target = static_cast<std::uint64_t>(
+                static_cast<long double>(rows) * cumulative / total_capacity);
+            end = target - target % alignment;
+            const auto minimum = begin + alignment;
+            const auto remaining = static_cast<std::uint64_t>(
+                capacities.size() - slot - 1U) * alignment;
+            end = std::clamp(end, minimum, rows - remaining);
+        }
+        ranges.push_back({begin, end - begin});
+        begin = end;
+    }
+    return ranges;
+}
+
 [[nodiscard]] std::vector<int> projection_worker_cpus(
     std::span<const int> devices) {
     const auto& hardware = host_hardware_profile();
@@ -250,6 +303,8 @@ public:
         std::uint32_t rows{};
         std::span<float> output;
         bool bf16_output{};
+        std::uint64_t weight_rows{};
+        std::uint64_t weight_row_begin{};
     };
 
     struct Stats {
@@ -316,12 +371,50 @@ public:
         return {};
     }
 
+    [[nodiscard]] ValidationResult preload_slice(
+        std::size_t slot, std::string_view base, std::uint64_t total_rows,
+        std::uint64_t columns, std::uint64_t row_begin,
+        std::uint64_t row_count, bool& admitted) {
+        admitted = false;
+        const auto key = slice_key(base, row_begin, row_count);
+        const auto bytes = checkpoint_.cuda_linear_slice_storage_bytes(
+            base, row_begin, row_count);
+        if (slot >= states_.size() || bytes == 0U) {
+            return {{"GLM-5.3 preload references an invalid CUDA slice"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        auto found = state.entries.find(key);
+        if (found != state.entries.end()) {
+            admitted = true;
+            ++state.hits;
+            return {};
+        }
+        if (bytes > state.capacity - state.used) return {};
+        Entry entry;
+        auto loaded = checkpoint_.load_cuda_linear_slice(
+            base, total_rows, columns, row_begin, row_count, devices_[slot],
+            backend_, entry.weight);
+        if (!loaded.ok()) return loaded;
+        entry.pinned = true;
+        const auto actual = entry.weight.device_bytes();
+        if (actual > state.capacity - state.used) {
+            return {{"GLM-5.3 resident slice exceeded its admitted CUDA cache"}};
+        }
+        state.used += actual;
+        state.pinned += actual;
+        state.entries.emplace(key, std::move(entry));
+        admitted = true;
+        ++state.misses;
+        return {};
+    }
+
     [[nodiscard]] ValidationResult matmul(
         std::size_t slot, std::string_view base, std::uint64_t output_columns,
         std::uint64_t input_columns, std::span<const float> input,
         std::uint32_t rows, std::span<float> output, bool bf16_output) {
         const LinearRequest request{base, output_columns, input_columns, input,
-                                    rows, output, bf16_output};
+                                    rows, output, bf16_output, 0U, 0U};
         return matmul_batch(slot, std::span<const LinearRequest>(&request, 1U));
     }
 
@@ -352,11 +445,18 @@ public:
         std::vector<CudaMatmulBatchItem> batch;
         batch.reserve(requests.size());
         for (const auto& request : requests) {
-            const std::string key(request.base);
+            const bool sliced = request.weight_rows != 0U;
+            const std::string key = sliced
+                ? slice_key(request.base, request.weight_row_begin,
+                            request.output_columns)
+                : std::string(request.base);
             auto found = state.entries.find(key);
             if (found == state.entries.end()) {
-                const auto bytes =
-                    checkpoint_.cuda_linear_storage_bytes(request.base);
+                const auto bytes = sliced
+                    ? checkpoint_.cuda_linear_slice_storage_bytes(
+                          request.base, request.weight_row_begin,
+                          request.output_columns)
+                    : checkpoint_.cuda_linear_storage_bytes(request.base);
                 if (bytes == 0U || bytes > state.capacity) {
                     return {{"GLM-5.3 linear is absent or exceeds its CUDA cache: " +
                              key}};
@@ -387,9 +487,16 @@ public:
                     ++state.evictions;
                 }
                 Entry entry;
-                auto loaded = checkpoint_.load_cuda_linear(
-                    request.base, request.output_columns, request.input_columns,
-                    devices_[slot], backend_, entry.weight);
+                auto loaded = sliced
+                    ? checkpoint_.load_cuda_linear_slice(
+                          request.base, request.weight_rows,
+                          request.input_columns, request.weight_row_begin,
+                          request.output_columns, devices_[slot], backend_,
+                          entry.weight)
+                    : checkpoint_.load_cuda_linear(
+                          request.base, request.output_columns,
+                          request.input_columns, devices_[slot], backend_,
+                          entry.weight);
                 if (!loaded.ok()) return loaded;
                 const auto actual = entry.weight.device_bytes();
                 if (actual > state.capacity - state.used) {
@@ -674,6 +781,13 @@ public:
     }
 
 private:
+    [[nodiscard]] static std::string slice_key(
+        std::string_view base, std::uint64_t row_begin,
+        std::uint64_t row_count) {
+        return std::string(base) + "#rows=" + std::to_string(row_begin) + "+" +
+               std::to_string(row_count);
+    }
+
     Glm53CheckpointReader& checkpoint_;
     CudaBackend& backend_;
     std::vector<int> devices_;
@@ -690,10 +804,12 @@ struct Glm53Runtime::Impl {
     std::vector<int> devices;
     std::vector<std::size_t> device_schedule;
     std::vector<std::uint64_t> weight_capacities;
+    std::vector<Glm53RowRange> lm_head_ranges;
     std::unique_ptr<Glm53WeightCache> weights;
     std::unique_ptr<HostWorkerPool> projection_workers;
     std::atomic<std::uint64_t> parallel_projection_batches{};
     std::atomic<std::uint64_t> parallel_projection_requests{};
+    std::atomic<std::uint64_t> tensor_parallel_head_batches{};
     std::mutex host_tensor_mutex;
     std::unordered_map<std::string,
                        std::shared_ptr<const std::vector<float>>> host_tensors;
@@ -760,6 +876,8 @@ struct Glm53Runtime::Impl {
             std::uint64_t rows{};
             std::uint64_t columns{};
             std::uint32_t layer{};
+            std::uint64_t weight_rows{};
+            std::uint64_t weight_row_begin{};
         };
         struct HostTask {
             std::string name;
@@ -786,6 +904,16 @@ struct Glm53Runtime::Impl {
                     : kLayers - 1U;
                 const auto base = tensor.name.substr(
                     0U, tensor.name.size() - 7U);
+                if (base == "lm_head" && lm_head_ranges.size() > 1U) {
+                    for (std::size_t slot = 0U;
+                         slot < lm_head_ranges.size(); ++slot) {
+                        const auto range = lm_head_ranges[slot];
+                        device_tasks[slot].push_back({
+                            base, base, range.count, tensor.source_shape[1],
+                            layer, tensor.source_shape[0], range.begin});
+                    }
+                    continue;
+                }
                 linear_tasks.push_back({
                     base, projection_group_key(base, tensor.role),
                     tensor.source_shape[0], tensor.source_shape[1], layer});
@@ -855,8 +983,12 @@ struct Glm53Runtime::Impl {
                 if (slot >= devices.size()) return;
                 for (const auto& task : device_tasks[slot]) {
                     bool kept = false;
-                    auto loaded = weights->preload(
-                        slot, task.base, task.rows, task.columns, kept);
+                    auto loaded = task.weight_rows == 0U
+                        ? weights->preload(slot, task.base, task.rows,
+                                           task.columns, kept)
+                        : weights->preload_slice(
+                              slot, task.base, task.weight_rows, task.columns,
+                              task.weight_row_begin, task.rows, kept);
                     if (!loaded.ok()) {
                         append(device_results[slot].errors,
                                std::move(loaded.errors));
@@ -1737,6 +1869,32 @@ struct Glm53Runtime::Impl {
         round_bf16(collapsed);
         result = norm(normalized, collapsed, "model.language_model.norm.weight");
         if (!result.ok()) return result;
+        if (lm_head_ranges.size() > 1U && projection_workers != nullptr &&
+            lm_head_ranges.size() == devices.size() &&
+            logits.size() == kVocabulary) {
+            std::vector<ValidationResult> shard_results(devices.size());
+            auto dispatched = projection_workers->parallel_for_addressed(
+                devices.size(), [&](std::size_t slot) {
+                    const auto range = lm_head_ranges[slot];
+                    const Glm53WeightCache::LinearRequest request{
+                        "lm_head", range.count, kHidden, normalized, 1U,
+                        logits.subspan(static_cast<std::size_t>(range.begin),
+                                       static_cast<std::size_t>(range.count)),
+                        true, kVocabulary, range.begin};
+                    shard_results[slot] = weights->matmul_batch(
+                        slot, std::span<const Glm53WeightCache::LinearRequest>(
+                                  &request, 1U));
+                });
+            if (!dispatched.ok()) return dispatched;
+            for (auto& shard_result : shard_results) {
+                append(result.errors, std::move(shard_result.errors));
+            }
+            if (result.ok()) {
+                tensor_parallel_head_batches.fetch_add(
+                    1U, std::memory_order_relaxed);
+            }
+            return result;
+        }
         return linear("lm_head", normalized, 1U, kHidden, logits, kLayers - 1U);
     }
 
@@ -1858,6 +2016,11 @@ ValidationResult Glm53Runtime::initialize(
             impl_->projection_workers = std::make_unique<HostWorkerPool>(
                 std::move(worker_cpus));
         }
+    }
+    if (tensor_parallel_head_enabled() &&
+        impl_->projection_workers != nullptr) {
+        impl_->lm_head_ranges = weighted_row_ranges(
+            kVocabulary, impl_->weight_capacities, 128U);
     }
     impl_->ready = true;
     try {
@@ -1983,6 +2146,9 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                          std::memory_order_relaxed)
                   << " parallel_requests="
                   << impl_->parallel_projection_requests.load(
+                         std::memory_order_relaxed)
+                  << " tensor_parallel_head_batches="
+                  << impl_->tensor_parallel_head_batches.load(
                          std::memory_order_relaxed)
                   << '\n';
     }

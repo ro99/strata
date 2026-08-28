@@ -260,6 +260,23 @@ std::uint64_t Glm53CheckpointReader::cuda_linear_storage_bytes(
                                               scale_bytes);
 }
 
+std::uint64_t Glm53CheckpointReader::cuda_linear_slice_storage_bytes(
+    std::string_view base_name, std::uint64_t row_begin,
+    std::uint64_t row_count) const {
+    const auto* weight = find(std::string(base_name) + ".weight");
+    if (weight == nullptr || weight->source_shape.size() != 2U ||
+        row_count == 0U || row_begin > weight->source_shape[0] ||
+        row_count > weight->source_shape[0] - row_begin ||
+        (weight->source_dtype != SafetensorsDtype::Bf16 &&
+         weight->source_dtype != SafetensorsDtype::F16 &&
+         weight->source_dtype != SafetensorsDtype::F32)) {
+        return 0U;
+    }
+    const auto width = safetensors_dtype_bytes(weight->source_dtype);
+    return CudaBackend::weight_storage_bytes(
+        row_count * weight->source_shape[1] * width, 0U);
+}
+
 ValidationResult Glm53CheckpointReader::load_cuda_linear(
     std::string_view base_name, std::uint64_t rows, std::uint64_t columns,
     int device, CudaBackend& backend, CudaWeight& output) const {
@@ -338,6 +355,51 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
     return backend.upload(device, descriptor, weights.value, scales, output,
                           CudaBackend::UploadCompletion::Synchronous,
                           fragment_layout);
+}
+
+ValidationResult Glm53CheckpointReader::load_cuda_linear_slice(
+    std::string_view base_name, std::uint64_t total_rows,
+    std::uint64_t columns, std::uint64_t row_begin,
+    std::uint64_t row_count, int device, CudaBackend& backend,
+    CudaWeight& output) const {
+    ValidationResult result;
+    const auto weight_name = std::string(base_name) + ".weight";
+    const auto* weight = find(weight_name);
+    if (weight == nullptr ||
+        weight->source_shape != std::vector<std::uint64_t>{total_rows, columns} ||
+        row_count == 0U || row_begin > total_rows ||
+        row_count > total_rows - row_begin ||
+        (weight->source_dtype != SafetensorsDtype::Bf16 &&
+         weight->source_dtype != SafetensorsDtype::F16 &&
+         weight->source_dtype != SafetensorsDtype::F32)) {
+        return {{"GLM-5.3 sliced linear has an invalid weight or row range: " +
+                 weight_name}};
+    }
+    const auto width = safetensors_dtype_bytes(weight->source_dtype);
+    const auto row_bytes = columns * width;
+    const auto offset = row_begin * row_bytes;
+    const auto bytes = row_count * row_bytes;
+    CudaWeightDescriptor descriptor;
+    descriptor.dtype = weight->source_dtype;
+    descriptor.encoding = CudaWeightEncoding::Plain;
+    descriptor.rows = row_count;
+    descriptor.columns = columns;
+    if (deferred_weights_enabled()) {
+        auto mapped = view(weight_name);
+        if (!mapped.ok()) return {std::move(mapped.errors)};
+        if (offset > mapped.value.size_bytes() ||
+            bytes > mapped.value.size_bytes() - offset) {
+            return {{"GLM-5.3 sliced linear exceeds its mapped weight"}};
+        }
+        return backend.upload(
+            device, descriptor,
+            mapped.value.subspan(static_cast<std::size_t>(offset),
+                                 static_cast<std::size_t>(bytes)),
+            {}, output, CudaBackend::UploadCompletion::Deferred);
+    }
+    auto loaded = read_slice(*weight, offset, bytes);
+    if (!loaded.ok()) return {std::move(loaded.errors)};
+    return backend.upload(device, descriptor, loaded.value, {}, output);
 }
 
 }  // namespace strata

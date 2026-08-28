@@ -48,9 +48,17 @@ public:
         std::string_view name, std::uint64_t row) const;
     [[nodiscard]] std::uint64_t cuda_linear_storage_bytes(
         std::string_view base_name) const;
+    [[nodiscard]] std::uint64_t cuda_linear_slice_storage_bytes(
+        std::string_view base_name, std::uint64_t row_begin,
+        std::uint64_t row_count) const;
     [[nodiscard]] ValidationResult load_cuda_linear(
         std::string_view base_name, std::uint64_t rows,
         std::uint64_t columns, int device, CudaBackend& backend,
+        CudaWeight& output) const;
+    [[nodiscard]] ValidationResult load_cuda_linear_slice(
+        std::string_view base_name, std::uint64_t total_rows,
+        std::uint64_t columns, std::uint64_t row_begin,
+        std::uint64_t row_count, int device, CudaBackend& backend,
         CudaWeight& output) const;
 
     [[nodiscard]] const Glm53TextConfig& config() const noexcept {

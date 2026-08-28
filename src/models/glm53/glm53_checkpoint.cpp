@@ -3,6 +3,11 @@
 #include "../common/checkpoint_common.hpp"
 
 #include <filesystem>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 namespace strata {
 namespace {
@@ -10,7 +15,26 @@ namespace {
 constexpr std::uint64_t kMaximumConfigBytes = 4ULL << 20U;
 constexpr std::uint64_t kMaximumIndexBytes = 64ULL << 20U;
 
+[[nodiscard]] bool deferred_weights_enabled() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_DEFERRED_WEIGHTS");
+    return value == nullptr ||
+           (std::string_view(value) != "0" &&
+            std::string_view(value) != "false" &&
+            std::string_view(value) != "off");
+}
+
 }  // namespace
+
+Glm53CheckpointReader::~Glm53CheckpointReader() {
+    std::scoped_lock lock(mapping_mutex_);
+    for (const auto& [name, mapping] : mappings_) {
+        static_cast<void>(name);
+        if (mapping.address != nullptr && mapping.bytes != 0U) {
+            static_cast<void>(munmap(mapping.address,
+                                     static_cast<std::size_t>(mapping.bytes)));
+        }
+    }
+}
 
 Glm53CheckpointOpenResult Glm53CheckpointReader::open(
     std::string model_directory) {
@@ -112,6 +136,51 @@ ParseResult<std::vector<std::byte>> Glm53CheckpointReader::read(
     return read_slice(*tensor, 0U, tensor->source_bytes);
 }
 
+ParseResult<std::span<const std::byte>> Glm53CheckpointReader::view(
+    std::string_view name) const {
+    ParseResult<std::span<const std::byte>> result;
+    const auto* tensor = find(name);
+    if (tensor == nullptr) {
+        result.errors.push_back("unknown GLM-5.3 tensor " + std::string(name));
+        return result;
+    }
+    std::scoped_lock lock(mapping_mutex_);
+    auto mapping = mappings_.find(tensor->shard);
+    if (mapping == mappings_.end()) {
+        const int descriptor = shards_.descriptor(tensor->shard);
+        struct stat status {};
+        if (descriptor < 0 || fstat(descriptor, &status) != 0 ||
+            status.st_size <= 0) {
+            result.errors.push_back("cannot size GLM-5.3 checkpoint shard " +
+                                    tensor->shard + ": " +
+                                    std::strerror(errno));
+            return result;
+        }
+        const auto bytes = static_cast<std::uint64_t>(status.st_size);
+        void* address = mmap(nullptr, static_cast<std::size_t>(bytes), PROT_READ,
+                             MAP_SHARED, descriptor, 0);
+        if (address == MAP_FAILED) {
+            result.errors.push_back("cannot map GLM-5.3 checkpoint shard " +
+                                    tensor->shard + ": " +
+                                    std::strerror(errno));
+            return result;
+        }
+        mapping = mappings_.emplace(
+            tensor->shard,
+            ShardMapping{static_cast<std::byte*>(address), bytes}).first;
+    }
+    if (tensor->source_offset > mapping->second.bytes ||
+        tensor->source_bytes > mapping->second.bytes - tensor->source_offset) {
+        result.errors.push_back("mapped GLM-5.3 tensor exceeds its shard: " +
+                                tensor->name);
+        return result;
+    }
+    result.value = std::span<const std::byte>(
+        mapping->second.address + tensor->source_offset,
+        static_cast<std::size_t>(tensor->source_bytes));
+    return result;
+}
+
 ParseResult<std::vector<float>> Glm53CheckpointReader::read_f32(
     std::string_view name, std::uint64_t maximum_elements) const {
     ParseResult<std::vector<float>> result;
@@ -203,18 +272,13 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
                                 weight_name);
         return result;
     }
-    auto weights = read(weight_name, rows * columns * 4U);
-    if (!weights.ok()) {
-        result.errors = std::move(weights.errors);
-        return result;
-    }
     CudaWeightDescriptor descriptor;
     descriptor.dtype = weight->source_dtype;
     descriptor.rows = rows;
     descriptor.columns = columns;
-    std::vector<std::byte> scale_bytes;
+    std::string scale_name;
     if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
-        const auto scale_name = std::string(base_name) + ".weight_scale_inv";
+        scale_name = std::string(base_name) + ".weight_scale_inv";
         const auto* scale = find(scale_name);
         const auto scale_rows = (rows + 127U) / 128U;
         const auto scale_columns = (columns + 127U) / 128U;
@@ -225,12 +289,6 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
                                     scale_name);
             return result;
         }
-        auto scales = read(scale_name, scale_rows * scale_columns * 4U);
-        if (!scales.ok()) {
-            result.errors = std::move(scales.errors);
-            return result;
-        }
-        scale_bytes = std::move(scales.value);
         descriptor.encoding = CudaWeightEncoding::Fp8E4m3Block128F32;
         descriptor.packed_columns = columns;
         descriptor.scale_columns = scale_columns;
@@ -249,8 +307,36 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
                 backend.fp8_f32_register_fed_supported(device)
             ? CudaBackend::FragmentLayout::Prepack
             : CudaBackend::FragmentLayout::Canonical;
-    return backend.upload(device, descriptor, weights.value, scale_bytes,
-                          output, CudaBackend::UploadCompletion::Synchronous,
+    if (deferred_weights_enabled()) {
+        auto weights = view(weight_name);
+        if (!weights.ok()) return {std::move(weights.errors)};
+        std::span<const std::byte> scales;
+        if (!scale_name.empty()) {
+            auto mapped_scales = view(scale_name);
+            if (!mapped_scales.ok()) return {std::move(mapped_scales.errors)};
+            scales = mapped_scales.value;
+        }
+        // Both mapped views outlive every upload, so the copy stream may retain
+        // them until its device-side completion event without a heap copy.
+        return backend.upload(device, descriptor, weights.value, scales, output,
+                              CudaBackend::UploadCompletion::Deferred,
+                              fragment_layout);
+    }
+
+    // Same-binary control route for performance campaigns. This is the former
+    // production contract: heap-copy each tensor and block each upload.
+    auto weights = read(weight_name, rows * columns * 4U);
+    if (!weights.ok()) return {std::move(weights.errors)};
+    std::vector<std::byte> scales;
+    if (!scale_name.empty()) {
+        auto loaded_scales = read(scale_name,
+                                  descriptor.scale_columns *
+                                      ((rows + 127U) / 128U) * sizeof(float));
+        if (!loaded_scales.ok()) return {std::move(loaded_scales.errors)};
+        scales = std::move(loaded_scales.value);
+    }
+    return backend.upload(device, descriptor, weights.value, scales, output,
+                          CudaBackend::UploadCompletion::Synchronous,
                           fragment_layout);
 }
 

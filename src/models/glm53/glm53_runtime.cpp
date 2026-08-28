@@ -200,8 +200,13 @@ public:
                                      found->second.recency);
             }
         }
-        // The backend's canonical matmul is a completion boundary, so the LRU
-        // entry cannot be in flight when this lock is released.
+        // One device-side event orders all deferred cache-miss uploads before
+        // the consumer. This never blocks the host and is a no-op on a hit-only
+        // path; matmul's output completion still protects the LRU entry.
+        if (auto ordered = backend_.synchronize_uploads(devices_[slot]);
+            !ordered.ok()) {
+            return ordered;
+        }
         return backend_.matmul(found->second.weight, input, rows, output,
                                bf16_output, nullptr, rows > 1U);
     }
@@ -376,6 +381,14 @@ public:
                     &state.entries.at(shared_modules[1].key).weight,
                     &state.entries.at(shared_modules[2].key).weight, 1.0F};
                 group.shared_output.resize(kHidden);
+            }
+            // The whole routed-plus-shared set was admitted with deferred
+            // copies. Order it once instead of synchronizing all 27 projection
+            // uploads independently.
+            auto ordered = backend_.synchronize_uploads(devices_[group_slot]);
+            if (!ordered.ok()) {
+                append(result.errors, std::move(ordered.errors));
+                break;
             }
             group.routed_output.resize(group.routes.size() * kHidden);
             auto enqueued = backend_.enqueue_moe(
@@ -595,6 +608,13 @@ struct Glm53Runtime::Impl {
                         break;
                     }
                     kept ? ++admitted[slot] : ++skipped[slot];
+                }
+                if (device_results[slot].ok()) {
+                    auto ordered = cuda.synchronize_uploads(devices[slot]);
+                    if (!ordered.ok()) {
+                        append(device_results[slot].errors,
+                               std::move(ordered.errors));
+                    }
                 }
             }
         };

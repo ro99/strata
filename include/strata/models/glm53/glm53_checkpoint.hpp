@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,7 +32,7 @@ public:
     Glm53CheckpointReader& operator=(const Glm53CheckpointReader&) = delete;
     Glm53CheckpointReader(Glm53CheckpointReader&&) = delete;
     Glm53CheckpointReader& operator=(Glm53CheckpointReader&&) = delete;
-    ~Glm53CheckpointReader() = default;
+    ~Glm53CheckpointReader();
 
     [[nodiscard]] static Glm53CheckpointOpenResult open(
         std::string model_directory);
@@ -39,6 +40,8 @@ public:
         std::string_view name) const noexcept;
     [[nodiscard]] ParseResult<std::vector<std::byte>> read(
         std::string_view name, std::uint64_t maximum_bytes) const;
+    [[nodiscard]] ParseResult<std::span<const std::byte>> view(
+        std::string_view name) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32(
         std::string_view name, std::uint64_t maximum_elements) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32_row(
@@ -68,6 +71,12 @@ private:
     Glm53IndexManifest manifest_;
     std::unordered_map<std::string_view, std::size_t> by_name_;
     CheckpointShardSet shards_;
+    struct ShardMapping {
+        std::byte* address{};
+        std::uint64_t bytes{};
+    };
+    mutable std::mutex mapping_mutex_;
+    mutable std::unordered_map<std::string, ShardMapping> mappings_;
 };
 
 }  // namespace strata

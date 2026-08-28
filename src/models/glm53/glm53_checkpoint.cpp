@@ -297,10 +297,26 @@ std::uint64_t Glm53CheckpointReader::cuda_linear_slice_storage_bytes(
     const auto* weight = find(std::string(base_name) + ".weight");
     if (weight == nullptr || weight->source_shape.size() != 2U ||
         row_count == 0U || row_begin > weight->source_shape[0] ||
-        row_count > weight->source_shape[0] - row_begin ||
-        (weight->source_dtype != SafetensorsDtype::Bf16 &&
+        row_count > weight->source_shape[0] - row_begin) {
+        return 0U;
+    }
+    if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
+        if (row_begin % 128U != 0U) return 0U;
+        const auto* scale = find(
+            std::string(base_name) + ".weight_scale_inv");
+        if (scale == nullptr || scale->source_dtype != SafetensorsDtype::F32) {
+            return 0U;
+        }
+        const auto scale_columns =
+            (weight->source_shape[1] + 127U) / 128U;
+        const auto scale_rows = (row_count + 127U) / 128U;
+        return CudaBackend::weight_storage_bytes(
+            row_count * weight->source_shape[1],
+            scale_rows * scale_columns * sizeof(float));
+    }
+    if (weight->source_dtype != SafetensorsDtype::Bf16 &&
          weight->source_dtype != SafetensorsDtype::F16 &&
-         weight->source_dtype != SafetensorsDtype::F32)) {
+         weight->source_dtype != SafetensorsDtype::F32) {
         return 0U;
     }
     const auto width = safetensors_dtype_bytes(weight->source_dtype);
@@ -403,7 +419,8 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear_slice(
         weight->source_shape != std::vector<std::uint64_t>{total_rows, columns} ||
         row_count == 0U || row_begin > total_rows ||
         row_count > total_rows - row_begin ||
-        (weight->source_dtype != SafetensorsDtype::Bf16 &&
+        (weight->source_dtype != SafetensorsDtype::F8E4M3 &&
+         weight->source_dtype != SafetensorsDtype::Bf16 &&
          weight->source_dtype != SafetensorsDtype::F16 &&
          weight->source_dtype != SafetensorsDtype::F32)) {
         return {{"GLM-5.3 sliced linear has an invalid weight or row range: " +
@@ -415,9 +432,38 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear_slice(
     const auto bytes = row_count * row_bytes;
     CudaWeightDescriptor descriptor;
     descriptor.dtype = weight->source_dtype;
-    descriptor.encoding = CudaWeightEncoding::Plain;
     descriptor.rows = row_count;
     descriptor.columns = columns;
+    std::span<const std::byte> scales;
+    if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
+        if (row_begin % 128U != 0U) {
+            return {{"GLM-5.3 FP8 slice must begin on a scale-block row"}};
+        }
+        const auto scale_name = std::string(base_name) + ".weight_scale_inv";
+        auto mapped_scales = view(scale_name);
+        const auto* scale = find(scale_name);
+        const auto scale_columns = (columns + 127U) / 128U;
+        const auto scale_row_begin = row_begin / 128U;
+        const auto scale_rows = (row_count + 127U) / 128U;
+        const auto scale_offset =
+            scale_row_begin * scale_columns * sizeof(float);
+        const auto scale_bytes = scale_rows * scale_columns * sizeof(float);
+        if (!mapped_scales.ok()) return {std::move(mapped_scales.errors)};
+        if (scale == nullptr || scale->source_dtype != SafetensorsDtype::F32 ||
+            scale_offset > mapped_scales.value.size_bytes() ||
+            scale_bytes > mapped_scales.value.size_bytes() - scale_offset) {
+            return {{"GLM-5.3 FP8 slice has an invalid scale extent"}};
+        }
+        scales = mapped_scales.value.subspan(
+            static_cast<std::size_t>(scale_offset),
+            static_cast<std::size_t>(scale_bytes));
+        descriptor.encoding = CudaWeightEncoding::Fp8E4m3Block128F32;
+        descriptor.packed_columns = columns;
+        descriptor.scale_columns = scale_columns;
+        descriptor.group_size = 128U;
+    } else {
+        descriptor.encoding = CudaWeightEncoding::Plain;
+    }
     if (deferred_weights_enabled()) {
         auto mapped = view(weight_name);
         if (!mapped.ok()) return {std::move(mapped.errors)};
@@ -429,7 +475,14 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear_slice(
             device, descriptor,
             mapped.value.subspan(static_cast<std::size_t>(offset),
                                  static_cast<std::size_t>(bytes)),
-            {}, output, CudaBackend::UploadCompletion::Deferred);
+            scales, output, CudaBackend::UploadCompletion::Deferred,
+            descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
+                    backend.fp8_f32_register_fed_supported(device)
+                ? CudaBackend::FragmentLayout::Prepack
+                : CudaBackend::FragmentLayout::Canonical);
+    }
+    if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
+        return {{"GLM-5.3 FP8 slices require stable deferred mappings"}};
     }
     auto loaded = read_slice(*weight, offset, bytes);
     if (!loaded.ok()) return {std::move(loaded.errors)};

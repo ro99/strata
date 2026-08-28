@@ -162,6 +162,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool full_tensor_parallel_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_FULL_TP");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool replay_ssm_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_REPLAY_SSM");
@@ -222,7 +233,7 @@ struct Glm53RowRange {
                     [](std::uint64_t value) { return value == 0U; })) {
         return {};
     }
-    if (rows < capacities.size() * alignment || rows % alignment != 0U) {
+    if (rows < capacities.size() * alignment) {
         alignment = 1U;
     }
     long double total_capacity = 0.0L;
@@ -429,10 +440,28 @@ public:
                      std::vector<std::uint64_t> capacities)
         : checkpoint_(checkpoint), backend_(backend),
           devices_(std::move(devices)) {
+        std::uint64_t largest_linear = 0U;
+        for (const auto& tensor : checkpoint_.manifest().tensors) {
+            if ((tensor.role != Glm53TensorRole::RoutedExpert &&
+                 tensor.role != Glm53TensorRole::SharedExpert) ||
+                !tensor.name.ends_with(".weight") ||
+                tensor.source_shape.size() != 2U) {
+                continue;
+            }
+            largest_linear = std::max(
+                largest_linear,
+                checkpoint_.cuda_linear_storage_bytes(
+                    tensor.name.substr(0U, tensor.name.size() - 7U)));
+        }
+        const auto fragmentation_reserve =
+            largest_linear <= std::numeric_limits<std::uint64_t>::max() / 2U
+                ? 2U * largest_linear
+                : largest_linear;
         states_.reserve(capacities.size());
         for (const auto capacity : capacities) {
             auto state = std::make_unique<State>();
-            state->capacity = capacity;
+            state->capacity = capacity > fragmentation_reserve
+                ? capacity - fragmentation_reserve : capacity;
             states_.push_back(std::move(state));
         }
     }
@@ -595,16 +624,24 @@ public:
                     ++state.evictions;
                 }
                 Entry entry;
-                auto loaded = sliced
-                    ? checkpoint_.load_cuda_linear_slice(
-                          request.base, request.weight_rows,
-                          request.input_columns, request.weight_row_begin,
-                          request.output_columns, devices_[slot], backend_,
-                          entry.weight)
-                    : checkpoint_.load_cuda_linear(
-                          request.base, request.output_columns,
-                          request.input_columns, devices_[slot], backend_,
-                          entry.weight);
+                const auto load = [&] {
+                    return sliced
+                        ? checkpoint_.load_cuda_linear_slice(
+                              request.base, request.weight_rows,
+                              request.input_columns, request.weight_row_begin,
+                              request.output_columns, devices_[slot], backend_,
+                              entry.weight)
+                        : checkpoint_.load_cuda_linear(
+                              request.base, request.output_columns,
+                              request.input_columns, devices_[slot], backend_,
+                              entry.weight);
+                };
+                auto loaded = load();
+                while (!loaded.ok() && arena_exhausted(loaded) &&
+                       evict_one(state)) {
+                    entry.weight = CudaWeight{};
+                    loaded = load();
+                }
                 if (!loaded.ok()) return loaded;
                 const auto actual = entry.weight.device_bytes();
                 if (actual > state.capacity - state.used) {
@@ -698,9 +735,17 @@ public:
                 ++state.evictions;
             }
             Entry entry;
-            auto loaded = checkpoint_.load_cuda_linear(
-                projection.key, projection.rows, projection.columns,
-                devices_[slot], backend_, entry.weight, true);
+            const auto load = [&] {
+                return checkpoint_.load_cuda_linear(
+                    projection.key, projection.rows, projection.columns,
+                    devices_[slot], backend_, entry.weight, true);
+            };
+            auto loaded = load();
+            while (!loaded.ok() && arena_exhausted(loaded) &&
+                   evict_one(state)) {
+                entry.weight = CudaWeight{};
+                loaded = load();
+            }
             if (!loaded.ok()) {
                 ++state.failed_prefetches;
                 return loaded;
@@ -797,14 +842,37 @@ public:
         std::vector<DeviceGroup> groups(states_.size());
         groups[slot].has_shared = true;
 
-        // Routed and shared weights stay with the layer owner. A measured
-        // expert-parallel variant issued these groups across every visible GPU,
-        // but the extra cache duplication and PCIe/storage traffic regressed
-        // both prefill and decode on a non-NVLink topology. Preserve locality;
-        // layer splitting still distributes successive layers dynamically.
-        for (std::size_t route_index = 0U; route_index < routed.size();
-             ++route_index) {
-            groups[slot].routes.push_back(route_index);
+        // A best-rank peer fabric makes expert parallelism profitable: split
+        // the eight independent routes capacity-proportionally and join their
+        // exact host-visible outputs in original router order. PHB/PCIe keeps
+        // every route with the layer owner, avoiding duplicate cache traffic.
+        if (devices_.size() == 2U && full_tensor_parallel_enabled() &&
+            cross_gpu_projections_enabled(devices_)) {
+            std::vector<std::uint64_t> capacities;
+            capacities.reserve(states_.size());
+            for (const auto& state : states_) {
+                capacities.push_back(state->capacity);
+            }
+            const auto ranges = weighted_row_ranges(
+                routed.size(), capacities, 1U);
+            if (ranges.size() != groups.size()) {
+                return {{"GLM-5.3 expert-parallel assignment is invalid"}};
+            }
+            for (std::size_t group_slot = 0U; group_slot < ranges.size();
+                 ++group_slot) {
+                for (std::uint64_t route = ranges[group_slot].begin;
+                     route < ranges[group_slot].begin +
+                                 ranges[group_slot].count;
+                     ++route) {
+                    groups[group_slot].routes.push_back(
+                        static_cast<std::size_t>(route));
+                }
+            }
+        } else {
+            for (std::size_t route_index = 0U; route_index < routed.size();
+                 ++route_index) {
+                groups[slot].routes.push_back(route_index);
+            }
         }
 
         const auto release = [&](std::size_t group_slot) {
@@ -851,9 +919,17 @@ public:
                     ++state.evictions;
                 }
                 Entry entry;
-                auto loaded = checkpoint_.load_cuda_linear(
-                    projection.key, projection.rows, projection.columns,
-                    devices_[target_slot], backend_, entry.weight);
+                const auto load = [&] {
+                    return checkpoint_.load_cuda_linear(
+                        projection.key, projection.rows, projection.columns,
+                        devices_[target_slot], backend_, entry.weight);
+                };
+                auto loaded = load();
+                while (!loaded.ok() && arena_exhausted(loaded) &&
+                       evict_one(state)) {
+                    entry.weight = CudaWeight{};
+                    loaded = load();
+                }
                 if (!loaded.ok()) return loaded;
                 const auto actual = entry.weight.device_bytes();
                 if (actual > state.capacity - state.used) {
@@ -1021,6 +1097,32 @@ public:
     }
 
 private:
+    [[nodiscard]] static bool arena_exhausted(
+        const ValidationResult& result) noexcept {
+        return std::any_of(
+            result.errors.begin(), result.errors.end(),
+            [](const std::string& error) {
+                return error.starts_with("CUDA weight arena is exhausted");
+            });
+    }
+
+    [[nodiscard]] static bool evict_one(State& state) {
+        for (auto candidate = state.recency.begin();
+             candidate != state.recency.end(); ++candidate) {
+            auto found = state.entries.find(*candidate);
+            if (found == state.entries.end() || found->second.pinned ||
+                found->second.leases != 0U) {
+                continue;
+            }
+            state.used -= found->second.weight.device_bytes();
+            state.entries.erase(found);
+            state.recency.erase(candidate);
+            ++state.evictions;
+            return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] static std::string slice_key(
         std::string_view base, std::uint64_t row_begin,
         std::uint64_t row_count) {
@@ -1108,6 +1210,7 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> prefetch_dropped{};
     std::atomic<std::uint64_t> prefetch_errors{};
     std::unique_ptr<HostWorkerPool> projection_workers;
+    bool full_tensor_parallel_active{};
     std::unique_ptr<HostWorkerPool> kda_workers;
     std::atomic<std::uint64_t> parallel_projection_batches{};
     std::atomic<std::uint64_t> parallel_projection_requests{};
@@ -1407,6 +1510,25 @@ struct Glm53Runtime::Impl {
                     }
                     continue;
                 }
+                if (full_tensor_parallel_active) {
+                    const auto ranges = weighted_row_ranges(
+                        tensor.source_shape[0], weight_capacities, 128U);
+                    if (ranges.size() == devices.size() &&
+                        std::all_of(ranges.begin(), ranges.end(),
+                                    [](const auto& range) {
+                                        return range.count != 0U &&
+                                               range.begin % 128U == 0U;
+                                    })) {
+                        for (std::size_t slot = 0U; slot < ranges.size();
+                             ++slot) {
+                            device_tasks[slot].push_back({
+                                base, base, ranges[slot].count,
+                                tensor.source_shape[1], layer,
+                                tensor.source_shape[0], ranges[slot].begin});
+                        }
+                        continue;
+                    }
+                }
                 linear_tasks.push_back({
                     base, projection_group_key(base, tensor.role),
                     tensor.source_shape[0], tensor.source_shape[1], layer});
@@ -1559,8 +1681,11 @@ struct Glm53Runtime::Impl {
         // PyTorch returns every published BF16/FP8 linear at the model's BF16
         // activation dtype. Keep that boundary even though the host-facing
         // CUDA API transports activations as float.
-        return weights->matmul(slot_for(layer), base, output_columns, columns,
-                               input, rows, output, bf16_output);
+        const Glm53WeightCache::LinearRequest request{
+            base, output_columns, columns, input, rows, output, bf16_output};
+        return linear_batch(
+            std::span<const Glm53WeightCache::LinearRequest>(&request, 1U),
+            layer);
     }
 
     [[nodiscard]] ValidationResult linear_batch(
@@ -1578,6 +1703,84 @@ struct Glm53Runtime::Impl {
                     static_cast<std::size_t>(request.output_columns) *
                         request.rows) {
                 return {{"GLM-5.3 linear projection batch has an invalid shape"}};
+            }
+        }
+        if (full_tensor_parallel_active) {
+            std::vector<std::vector<Glm53RowRange>> ranges(requests.size());
+            bool eligible = true;
+            for (std::size_t index = 0U; index < requests.size(); ++index) {
+                const auto& request = requests[index];
+                ranges[index] = weighted_row_ranges(
+                    request.output_columns, weight_capacities, 128U);
+                if (request.weight_rows != 0U ||
+                    ranges[index].size() != devices.size()) {
+                    eligible = false;
+                    break;
+                }
+                for (const auto range : ranges[index]) {
+                    if (range.count == 0U || range.begin % 128U != 0U ||
+                        checkpoint->cuda_linear_slice_storage_bytes(
+                            request.base, range.begin, range.count) == 0U) {
+                        eligible = false;
+                        break;
+                    }
+                }
+                if (!eligible) break;
+            }
+            if (eligible) {
+                std::vector<std::vector<std::vector<float>>> shards(
+                    requests.size(),
+                    std::vector<std::vector<float>>(devices.size()));
+                std::vector<std::vector<Glm53WeightCache::LinearRequest>>
+                    groups(devices.size());
+                for (std::size_t index = 0U; index < requests.size(); ++index) {
+                    for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                        const auto range = ranges[index][slot];
+                        shards[index][slot].resize(
+                            static_cast<std::size_t>(requests[index].rows) *
+                            range.count);
+                        groups[slot].push_back({
+                            requests[index].base, range.count,
+                            requests[index].input_columns,
+                            requests[index].input, requests[index].rows,
+                            shards[index][slot], requests[index].bf16_output,
+                            requests[index].output_columns, range.begin});
+                    }
+                }
+                std::vector<ValidationResult> device_results(devices.size());
+                auto dispatched = projection_workers->parallel_for_addressed(
+                    devices.size(), [&](std::size_t slot) {
+                        device_results[slot] =
+                            weights->matmul_batch(slot, groups[slot]);
+                    });
+                if (!dispatched.ok()) return dispatched;
+                for (auto& device_result : device_results) {
+                    if (!device_result.ok()) return device_result;
+                }
+                for (std::size_t index = 0U; index < requests.size(); ++index) {
+                    for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                        const auto range = ranges[index][slot];
+                        for (std::uint32_t row = 0U;
+                             row < requests[index].rows; ++row) {
+                            std::copy_n(
+                                shards[index][slot].begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        static_cast<std::size_t>(row) *
+                                        range.count),
+                                range.count,
+                                requests[index].output.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        static_cast<std::size_t>(row) *
+                                            requests[index].output_columns +
+                                        range.begin));
+                        }
+                    }
+                }
+                parallel_projection_batches.fetch_add(
+                    1U, std::memory_order_relaxed);
+                parallel_projection_requests.fetch_add(
+                    requests.size(), std::memory_order_relaxed);
+                return {};
             }
         }
         if (!batched_projections_enabled()) {
@@ -3531,17 +3734,6 @@ ValidationResult Glm53Runtime::initialize(
     if (impl_->device_schedule.empty()) {
         return {{"GLM-5.3 could not derive a topology-aware layer schedule"}};
     }
-    if (impl_->devices.size() > 1U || config.verbose) {
-        std::uint32_t hops = 0U;
-        for (std::uint32_t layer = 1U; layer < kLayers; ++layer) {
-            if (impl_->slot_for(layer) != impl_->slot_for(layer - 1U)) ++hops;
-        }
-        std::cerr << "[glm53-topology] mode="
-                  << (cross_gpu_projections_enabled(impl_->devices)
-                          ? "high-speed-peer" : "contiguous-pipeline")
-                  << " activation_hops=" << hops << " layers=" << kLayers
-                  << '\n';
-    }
     impl_->weights = std::make_unique<Glm53WeightCache>(
         *impl_->checkpoint, impl_->cuda, impl_->devices,
         impl_->weight_capacities);
@@ -3581,10 +3773,29 @@ ValidationResult Glm53Runtime::initialize(
                 std::move(worker_cpus));
         }
     }
-    if (tensor_parallel_head_enabled() &&
+    impl_->full_tensor_parallel_active =
+        full_tensor_parallel_enabled() && impl_->devices.size() == 2U &&
+        impl_->projection_workers != nullptr &&
+        cross_gpu_projections_enabled(impl_->devices);
+    if ((tensor_parallel_head_enabled() ||
+         impl_->full_tensor_parallel_active) &&
         impl_->projection_workers != nullptr) {
         impl_->lm_head_ranges = weighted_row_ranges(
             kVocabulary, impl_->weight_capacities, 128U);
+    }
+    if (impl_->devices.size() > 1U || config.verbose) {
+        std::uint32_t hops = 0U;
+        for (std::uint32_t layer = 1U; layer < kLayers; ++layer) {
+            if (impl_->slot_for(layer) != impl_->slot_for(layer - 1U)) ++hops;
+        }
+        std::cerr << "[glm53-topology] mode="
+                  << (impl_->full_tensor_parallel_active
+                          ? "high-speed-peer-tp2"
+                          : (cross_gpu_projections_enabled(impl_->devices)
+                                 ? "high-speed-peer"
+                                 : "contiguous-pipeline"))
+                  << " activation_hops=" << hops << " layers=" << kLayers
+                  << '\n';
     }
     if (replay_ssm_enabled() || phase_scheduler_enabled()) {
         auto worker_cpus = compute_worker_cpus();

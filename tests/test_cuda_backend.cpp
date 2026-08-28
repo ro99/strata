@@ -1986,6 +1986,41 @@ TEST_CASE("GLM-5.3 F32-scaled FP8 uses continuous dynamic activation scales") {
                     strata::CudaMatmulRoute::Fp8E4m3Block128F32)] > 0U);
 }
 
+TEST_CASE("CUDA matmul batches preserve exact outputs with one completion") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{devices.front()};
+    REQUIRE(backend.initialize(selected).ok());
+
+    auto first_weight = upload_glm_fp8(backend, devices.front(), 128U, 128U, 3U);
+    auto second_weight = upload_glm_fp8(backend, devices.front(), 128U, 128U, 7U);
+    std::array<float, 128> first_input{};
+    std::array<float, 128> second_input{};
+    for (std::size_t index = 0U; index < first_input.size(); ++index) {
+        first_input[index] = static_cast<float>(index % 11U) * 0.03125F - 0.125F;
+        second_input[index] = static_cast<float>(index % 7U) * -0.046875F + 0.25F;
+    }
+    std::array<float, 128> first_reference{}, second_reference{};
+    std::array<float, 128> first_batched{}, second_batched{};
+    const auto before = backend.stats().synchronization_calls;
+    REQUIRE(backend.matmul(first_weight, first_input, 1U, first_reference,
+                           true).ok());
+    REQUIRE(backend.matmul(second_weight, second_input, 1U, second_reference,
+                           true).ok());
+    const auto after_sequential = backend.stats().synchronization_calls;
+    const std::array<strata::CudaMatmulBatchItem, 2U> batch{
+        {{&first_weight, first_input, 1U, first_batched, true, false},
+         {&second_weight, second_input, 1U, second_batched, true, false}}};
+    REQUIRE(backend.matmul_batch(batch).ok());
+    const auto after_batch = backend.stats().synchronization_calls;
+
+    REQUIRE(first_batched == first_reference);
+    REQUIRE(second_batched == second_reference);
+    REQUIRE(after_sequential - before == 2U);
+    REQUIRE(after_batch - after_sequential == 1U);
+}
+
 TEST_CASE("GLM-5.3 F32-scaled FP8 page tensor route preserves its BF16 contract") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

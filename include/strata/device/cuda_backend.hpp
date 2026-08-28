@@ -16,6 +16,7 @@
 namespace strata {
 
 class CudaBuffer;
+class CudaWeight;
 
 enum class CudaWeightEncoding : std::uint8_t {
     Plain,
@@ -67,6 +68,20 @@ struct CudaMatmulProfile {
     std::uint64_t h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
     std::uint64_t d2h_nanoseconds{};
+};
+
+// Independent same-device projections issued as one host-completion group.
+// Inputs and outputs remain ordinary F32 host spans; the backend stages every
+// source and destination in disjoint pinned regions, reuses its device
+// workspace in stream order, and crosses back to the host once after the last
+// projection. This changes scheduling only, never a matmul's numerical route.
+struct CudaMatmulBatchItem {
+    const CudaWeight* weight{};
+    std::span<const float> input;
+    std::uint32_t rows{};
+    std::span<float> output;
+    bool round_bf16_output{};
+    bool fp8_tensor_page{};
 };
 
 struct CudaSynchronizationStats {
@@ -1049,6 +1064,8 @@ public:
         bool round_bf16_output = false,
         CudaMatmulProfile* profile = nullptr,
         bool dsv4_fp8_tensor_page = false);
+    [[nodiscard]] ValidationResult matmul_batch(
+        std::span<const CudaMatmulBatchItem> items);
     [[nodiscard]] ValidationResult matmul_softcap(
         const CudaWeight& weight, std::span<const float> input,
         float softcap, std::span<float> output);
@@ -1396,7 +1413,10 @@ private:
         std::uint64_t rows_per_group, std::span<float> output,
         float softcap, bool round_output = false,
         CudaMatmulProfile* profile = nullptr,
-        bool dsv4_fp8_tensor_page = false);
+        bool dsv4_fp8_tensor_page = false,
+        const std::byte* batch_input = nullptr,
+        std::byte* batch_output = nullptr,
+        bool defer_completion = false);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

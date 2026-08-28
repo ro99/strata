@@ -10,6 +10,113 @@ ValidationResult CudaBackend::matmul(const CudaWeight& weight,
                        dsv4_fp8_tensor_page);
 }
 
+ValidationResult CudaBackend::matmul_batch(
+    std::span<const CudaMatmulBatchItem> items) {
+    ValidationResult result;
+    if (items.empty() || items.front().weight == nullptr ||
+        !items.front().weight->valid()) {
+        result.errors.emplace_back("CUDA matmul batch is empty or invalid");
+        return result;
+    }
+    const int device = items.front().weight->device();
+    if (impl_->detailed_timing) {
+        for (const auto& item : items) {
+            if (item.weight == nullptr || item.weight->device() != device) {
+                return {{"CUDA matmul batch spans invalid or different devices"}};
+            }
+            auto completed = matmul(*item.weight, item.input, item.rows,
+                                    item.output, item.round_bf16_output, nullptr,
+                                    item.fp8_tensor_page);
+            if (!completed.ok()) return completed;
+        }
+        return result;
+    }
+
+    std::vector<std::uint64_t> input_offsets(items.size());
+    std::vector<std::uint64_t> output_offsets(items.size());
+    std::uint64_t input_bytes = 0U;
+    std::uint64_t output_bytes = 0U;
+    for (std::size_t index = 0U; index < items.size(); ++index) {
+        const auto& item = items[index];
+        if (item.weight == nullptr || !item.weight->valid() ||
+            item.weight->device() != device || item.input.empty() ||
+            item.output.empty() || item.rows == 0U ||
+            item.input.size_bytes() >
+                std::numeric_limits<std::uint64_t>::max() - input_bytes ||
+            item.output.size_bytes() >
+                std::numeric_limits<std::uint64_t>::max() - output_bytes) {
+            result.errors.emplace_back(
+                "CUDA matmul batch spans invalid or different devices");
+            return result;
+        }
+        input_offsets[index] = input_bytes;
+        output_offsets[index] = output_bytes;
+        input_bytes += item.input.size_bytes();
+        output_bytes += item.output.size_bytes();
+    }
+    auto& state = impl_->devices.at(device);
+    const auto grow_pinned = [](std::byte*& pointer, std::uint64_t& capacity,
+                                std::uint64_t required) -> cudaError_t {
+        if (required <= capacity) return cudaSuccess;
+        void* replacement = nullptr;
+        if (auto status = cudaMallocHost(&replacement,
+                                         static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            return status;
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFreeHost(pointer));
+        pointer = static_cast<std::byte*>(replacement);
+        capacity = required;
+        return cudaSuccess;
+    };
+    if (auto status = grow_pinned(state.matmul_host_input,
+                                  state.matmul_host_input_bytes, input_bytes);
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate CUDA matmul batch input staging");
+    }
+    if (auto status = grow_pinned(state.matmul_host_output,
+                                  state.matmul_host_output_bytes, output_bytes);
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate CUDA matmul batch output staging");
+    }
+    for (std::size_t index = 0U; index < items.size(); ++index) {
+        std::memcpy(state.matmul_host_input + input_offsets[index],
+                    items[index].input.data(), items[index].input.size_bytes());
+    }
+    for (std::size_t index = 0U; index < items.size(); ++index) {
+        const auto& item = items[index];
+        auto issued = matmul_impl(
+            *item.weight, item.input, item.rows, 0U, 0U, item.output, 0.0F,
+            item.round_bf16_output, nullptr, item.fp8_tensor_page,
+            state.matmul_host_input + input_offsets[index],
+            state.matmul_host_output + output_offsets[index], true);
+        if (!issued.ok()) {
+            static_cast<void>(cudaStreamSynchronize(state.stream));
+            return issued;
+        }
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
+        return cuda_error(status, "synchronize CUDA matmul batch");
+    }
+    for (std::size_t index = 0U; index < items.size(); ++index) {
+        std::memcpy(items[index].output.data(),
+                    state.matmul_host_output + output_offsets[index],
+                    items[index].output.size_bytes());
+    }
+    const auto wait_nanoseconds = elapsed_nanoseconds_since(wait_started);
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        record_synchronization(device_stats,
+                               SynchronizationSubsystem::Projection, 1U,
+                               wait_nanoseconds);
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::matmul_softcap(
     const CudaWeight& weight, std::span<const float> input,
     float softcap, std::span<float> output) {

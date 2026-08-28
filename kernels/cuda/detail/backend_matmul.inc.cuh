@@ -178,7 +178,8 @@ ValidationResult CudaBackend::matmul_impl(
     std::uint32_t rows, std::uint32_t groups,
     std::uint64_t rows_per_group, std::span<float> output, float softcap,
     bool round_output, CudaMatmulProfile* profile,
-    bool dsv4_fp8_tensor_page) {
+    bool dsv4_fp8_tensor_page, const std::byte* batch_input,
+    std::byte* batch_output, bool defer_completion) {
     ValidationResult result;
     if (profile != nullptr) *profile = {};
     if (!weight.valid()) {
@@ -195,7 +196,10 @@ ValidationResult CudaBackend::matmul_impl(
         output.size() == descriptor.rows * rows;
     if (rows == 0U || (!regular_shape && !grouped_shape) ||
         !std::isfinite(softcap) || softcap < 0.0F ||
-        (softcap != 0.0F && (rows != 1U || groups != 0U))) {
+        (softcap != 0.0F && (rows != 1U || groups != 0U)) ||
+        (defer_completion &&
+         (batch_input == nullptr || batch_output == nullptr ||
+          profile != nullptr || impl_->detailed_timing))) {
         result.errors.emplace_back("CUDA matmul activation shapes are incompatible");
         return result;
     }
@@ -372,11 +376,11 @@ ValidationResult CudaBackend::matmul_impl(
         capacity = target;
         return true;
     };
-    const bool stage_input = ensure_host_staging(
+    const bool stage_input = batch_input != nullptr || ensure_host_staging(
         state.matmul_host_input, state.matmul_host_input_bytes, input_bytes);
-    const bool stage_output = ensure_host_staging(
+    const bool stage_output = batch_output != nullptr || ensure_host_staging(
         state.matmul_host_output, state.matmul_host_output_bytes, output_bytes);
-    if (stage_input) {
+    if (stage_input && batch_input == nullptr) {
         std::memcpy(state.matmul_host_input, input.data(), input.size_bytes());
     }
     if (impl_->detailed_timing) {
@@ -388,7 +392,8 @@ ValidationResult CudaBackend::matmul_impl(
     if (auto status = cudaMemcpyAsync(
             (tensor_page || f32_regfed) ? static_cast<void*>(state.output)
                         : static_cast<void*>(state.input),
-            stage_input ? static_cast<const void*>(state.matmul_host_input)
+            batch_input != nullptr ? static_cast<const void*>(batch_input)
+                        : stage_input ? static_cast<const void*>(state.matmul_host_input)
                         : static_cast<const void*>(input.data()),
             input.size_bytes(), cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
@@ -840,7 +845,8 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     if (auto status = cudaMemcpyAsync(
-            stage_output ? static_cast<void*>(state.matmul_host_output)
+            batch_output != nullptr ? static_cast<void*>(batch_output)
+                         : stage_output ? static_cast<void*>(state.matmul_host_output)
                          : static_cast<void*>(output.data()),
             state.output, output.size_bytes(),
             cudaMemcpyDeviceToHost, state.stream);
@@ -857,6 +863,21 @@ ValidationResult CudaBackend::matmul_impl(
     const auto issue_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             wait_started - issue_started).count());
+    if (defer_completion) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [&weight](const auto& value) {
+                return value.device == weight.impl_->device;
+            });
+        device_stats.activation_h2d_bytes += input_bytes;
+        device_stats.activation_d2h_bytes += output_bytes;
+        ++device_stats.matmul_calls;
+        device_stats.workspace_allocation_calls += workspace_allocation_calls;
+        device_stats.workspace_allocation_bytes += workspace_allocation_bytes;
+        device_stats.matmul_issue_nanoseconds += issue_nanoseconds;
+        return result;
+    }
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA matmul");
     }

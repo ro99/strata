@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <list>
 #include <limits>
@@ -42,6 +43,17 @@ constexpr std::uint32_t kVocabulary = 154880U;
 constexpr std::uint32_t kExactSparseContext = 2048U;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 2ULL << 30U;
 constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
+
+[[nodiscard]] bool batched_projections_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_BATCHED_PROJECTIONS");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
 
 double now_seconds() {
     return std::chrono::duration<double>(
@@ -83,6 +95,16 @@ class Glm53WeightCache {
     };
 
 public:
+    struct LinearRequest {
+        std::string_view base;
+        std::uint64_t output_columns{};
+        std::uint64_t input_columns{};
+        std::span<const float> input;
+        std::uint32_t rows{};
+        std::span<float> output;
+        bool bf16_output{};
+    };
+
     struct Stats {
         std::vector<std::uint64_t> capacity;
         std::vector<std::uint64_t> used;
@@ -151,54 +173,98 @@ public:
         std::size_t slot, std::string_view base, std::uint64_t output_columns,
         std::uint64_t input_columns, std::span<const float> input,
         std::uint32_t rows, std::span<float> output, bool bf16_output) {
+        const LinearRequest request{base, output_columns, input_columns, input,
+                                    rows, output, bf16_output};
+        return matmul_batch(slot, std::span<const LinearRequest>(&request, 1U));
+    }
+
+    [[nodiscard]] ValidationResult matmul_batch(
+        std::size_t slot, std::span<const LinearRequest> requests) {
         if (slot >= states_.size()) {
             return {{"GLM-5.3 linear targets an invalid CUDA cache slot"}};
         }
+        if (requests.empty()) {
+            return {{"GLM-5.3 linear batch is empty"}};
+        }
         auto& state = *states_[slot];
         std::scoped_lock lock(state.mutex);
-        const std::string key(base);
-        auto found = state.entries.find(key);
-        if (found == state.entries.end()) {
-            const auto bytes = checkpoint_.cuda_linear_storage_bytes(base);
-            if (bytes == 0U || bytes > state.capacity) {
-                return {{"GLM-5.3 linear is absent or exceeds its CUDA cache: " +
-                         key}};
-            }
-            while (state.used + bytes > state.capacity) {
-                if (state.recency.empty()) {
-                    return {{"GLM-5.3 pinned spine leaves insufficient CUDA "
-                             "cache for an exact demand weight"}};
+        struct BatchLeases {
+            State& state;
+            std::vector<std::string> keys;
+            ~BatchLeases() {
+                for (const auto& key : keys) {
+                    const auto found = state.entries.find(key);
+                    if (found != state.entries.end() &&
+                        found->second.leases != 0U) {
+                        --found->second.leases;
+                    }
                 }
-                const auto victim_key = state.recency.front();
-                state.recency.pop_front();
-                auto victim = state.entries.find(victim_key);
-                if (victim == state.entries.end() || victim->second.pinned) {
-                    return {{"GLM-5.3 CUDA cache recency bookkeeping is invalid"}};
+            }
+        } leases{state, {}};
+        leases.keys.reserve(requests.size());
+        std::vector<CudaMatmulBatchItem> batch;
+        batch.reserve(requests.size());
+        for (const auto& request : requests) {
+            const std::string key(request.base);
+            auto found = state.entries.find(key);
+            if (found == state.entries.end()) {
+                const auto bytes =
+                    checkpoint_.cuda_linear_storage_bytes(request.base);
+                if (bytes == 0U || bytes > state.capacity) {
+                    return {{"GLM-5.3 linear is absent or exceeds its CUDA cache: " +
+                             key}};
                 }
-                state.used -= victim->second.weight.device_bytes();
-                state.entries.erase(victim);
-                ++state.evictions;
+                while (state.used + bytes > state.capacity) {
+                    auto victim_position = state.recency.end();
+                    for (auto candidate = state.recency.begin();
+                         candidate != state.recency.end(); ++candidate) {
+                        const auto entry = state.entries.find(*candidate);
+                        if (entry != state.entries.end() &&
+                            entry->second.leases == 0U) {
+                            victim_position = candidate;
+                            break;
+                        }
+                    }
+                    if (victim_position == state.recency.end()) {
+                        return {{"GLM-5.3 pinned spine leaves insufficient CUDA "
+                                 "cache for an exact demand weight"}};
+                    }
+                    const auto victim_key = *victim_position;
+                    state.recency.erase(victim_position);
+                    auto victim = state.entries.find(victim_key);
+                    if (victim == state.entries.end() || victim->second.pinned) {
+                        return {{"GLM-5.3 CUDA cache recency bookkeeping is invalid"}};
+                    }
+                    state.used -= victim->second.weight.device_bytes();
+                    state.entries.erase(victim);
+                    ++state.evictions;
+                }
+                Entry entry;
+                auto loaded = checkpoint_.load_cuda_linear(
+                    request.base, request.output_columns, request.input_columns,
+                    devices_[slot], backend_, entry.weight);
+                if (!loaded.ok()) return loaded;
+                const auto actual = entry.weight.device_bytes();
+                if (actual > state.capacity - state.used) {
+                    return {{"GLM-5.3 demand linear exceeded its admitted CUDA cache"}};
+                }
+                state.recency.push_back(key);
+                entry.recency = std::prev(state.recency.end());
+                state.used += actual;
+                found = state.entries.emplace(key, std::move(entry)).first;
+                ++state.misses;
+            } else {
+                ++state.hits;
+                if (!found->second.pinned) {
+                    state.recency.splice(state.recency.end(), state.recency,
+                                         found->second.recency);
+                }
             }
-            Entry entry;
-            auto loaded = checkpoint_.load_cuda_linear(
-                base, output_columns, input_columns, devices_[slot], backend_,
-                entry.weight);
-            if (!loaded.ok()) return loaded;
-            const auto actual = entry.weight.device_bytes();
-            if (actual > state.capacity - state.used) {
-                return {{"GLM-5.3 demand linear exceeded its admitted CUDA cache"}};
-            }
-            state.recency.push_back(key);
-            entry.recency = std::prev(state.recency.end());
-            state.used += actual;
-            found = state.entries.emplace(key, std::move(entry)).first;
-            ++state.misses;
-        } else {
-            ++state.hits;
-            if (!found->second.pinned) {
-                state.recency.splice(state.recency.end(), state.recency,
-                                     found->second.recency);
-            }
+            ++found->second.leases;
+            leases.keys.push_back(key);
+            batch.push_back({&found->second.weight, request.input, request.rows,
+                             request.output, request.bf16_output,
+                             request.rows > 1U});
         }
         // One device-side event orders all deferred cache-miss uploads before
         // the consumer. This never blocks the host and is a no-op on a hit-only
@@ -207,8 +273,7 @@ public:
             !ordered.ok()) {
             return ordered;
         }
-        return backend_.matmul(found->second.weight, input, rows, output,
-                               bf16_output, nullptr, rows > 1U);
+        return backend_.matmul_batch(batch);
     }
 
     [[nodiscard]] ValidationResult moe(
@@ -705,6 +770,36 @@ struct Glm53Runtime::Impl {
                                input, rows, output, bf16_output);
     }
 
+    [[nodiscard]] ValidationResult linear_batch(
+        std::span<const Glm53WeightCache::LinearRequest> requests,
+        std::uint32_t layer) {
+        if (requests.empty()) {
+            return {{"GLM-5.3 linear projection batch is empty"}};
+        }
+        for (const auto& request : requests) {
+            if (request.rows == 0U ||
+                request.input.size() !=
+                    static_cast<std::size_t>(request.input_columns) *
+                        request.rows ||
+                request.output.size() !=
+                    static_cast<std::size_t>(request.output_columns) *
+                        request.rows) {
+                return {{"GLM-5.3 linear projection batch has an invalid shape"}};
+            }
+        }
+        if (!batched_projections_enabled()) {
+            for (const auto& request : requests) {
+                auto projected = weights->matmul(
+                    slot_for(layer), request.base, request.output_columns,
+                    request.input_columns, request.input, request.rows,
+                    request.output, request.bf16_output);
+                if (!projected.ok()) return projected;
+            }
+            return {};
+        }
+        return weights->matmul_batch(slot_for(layer), requests);
+    }
+
     [[nodiscard]] ValidationResult norm(
         std::span<float> output, std::span<const float> input,
         std::string_view weight_name) {
@@ -786,12 +881,21 @@ struct Glm53Runtime::Impl {
         std::span<float> output, std::span<const float> input,
         std::uint32_t layer, const std::string& attention) {
         ValidationResult result;
-        std::vector<float> query(kLinearWidth), key(kLinearWidth), value(kLinearWidth);
-        result = linear(attention + "q_proj", input, 1U, kHidden, query, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "k_proj", input, 1U, kHidden, key, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "v_proj", input, 1U, kHidden, value, layer);
+        std::vector<float> query(kLinearWidth), key(kLinearWidth),
+            value(kLinearWidth), low(kLinearHead), beta(kHeads),
+            gate_low(kLinearHead);
+        const std::array<std::string, 6U> first_bases{
+            attention + "q_proj", attention + "k_proj", attention + "v_proj",
+            attention + "f_a_proj", attention + "b_proj",
+            attention + "g_a_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 6U> first{
+            {{first_bases[0], kLinearWidth, kHidden, input, 1U, query, true},
+             {first_bases[1], kLinearWidth, kHidden, input, 1U, key, true},
+             {first_bases[2], kLinearWidth, kHidden, input, 1U, value, true},
+             {first_bases[3], kLinearHead, kHidden, input, 1U, low, true},
+             {first_bases[4], kHeads, kHidden, input, 1U, beta, true},
+             {first_bases[5], kLinearHead, kHidden, input, 1U, gate_low, true}}};
+        result = linear_batch(first, layer);
         if (!result.ok()) return result;
         for (std::uint32_t projection = 0U; projection < 3U; ++projection) {
             auto taps = host_tensor(
@@ -808,12 +912,14 @@ struct Glm53Runtime::Impl {
             values = std::move(convolved);
             round_bf16(values);
         }
-        std::vector<float> low(kLinearHead), forget(kLinearWidth), beta(kHeads);
-        result = linear(attention + "f_a_proj", input, 1U, kHidden, low, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "f_b_proj", low, 1U, kLinearHead, forget, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "b_proj", input, 1U, kHidden, beta, layer);
+        std::vector<float> forget(kLinearWidth), gate(kLinearWidth);
+        const std::array<std::string, 2U> second_bases{
+            attention + "f_b_proj", attention + "g_b_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> second{
+            {{second_bases[0], kLinearWidth, kLinearHead, low, 1U, forget, true},
+             {second_bases[1], kLinearWidth, kLinearHead, gate_low, 1U, gate,
+              true}}};
+        result = linear_batch(second, layer);
         if (!result.ok()) return result;
         for (auto& element : beta) {
             element = bf16_round_f32(sigmoid(element));
@@ -827,11 +933,6 @@ struct Glm53Runtime::Impl {
             append(result.errors, std::move(o_norm.errors));
             return result;
         }
-        std::vector<float> gate_low(kLinearHead), gate(kLinearWidth);
-        result = linear(attention + "g_a_proj", input, 1U, kHidden, gate_low, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "g_b_proj", gate_low, 1U, kLinearHead, gate, layer);
-        if (!result.ok()) return result;
         std::vector<float> heads_out(kLinearWidth);
         const auto query_scale = 1.0F / std::sqrt(static_cast<float>(kLinearHead));
         for (std::uint32_t head = 0U; head < kHeads; ++head) {
@@ -878,12 +979,22 @@ struct Glm53Runtime::Impl {
         ValidationResult result;
         const auto wide_elements = static_cast<std::size_t>(rows) * kLinearWidth;
         std::vector<float> query(wide_elements), key(wide_elements),
-            value(wide_elements);
-        result = linear(attention + "q_proj", input, rows, kHidden, query, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "k_proj", input, rows, kHidden, key, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "v_proj", input, rows, kHidden, value, layer);
+            value(wide_elements),
+            low(static_cast<std::size_t>(rows) * kLinearHead),
+            beta(static_cast<std::size_t>(rows) * kHeads),
+            gate_low(static_cast<std::size_t>(rows) * kLinearHead);
+        const std::array<std::string, 6U> first_bases{
+            attention + "q_proj", attention + "k_proj", attention + "v_proj",
+            attention + "f_a_proj", attention + "b_proj",
+            attention + "g_a_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 6U> first{
+            {{first_bases[0], kLinearWidth, kHidden, input, rows, query, true},
+             {first_bases[1], kLinearWidth, kHidden, input, rows, key, true},
+             {first_bases[2], kLinearWidth, kHidden, input, rows, value, true},
+             {first_bases[3], kLinearHead, kHidden, input, rows, low, true},
+             {first_bases[4], kHeads, kHidden, input, rows, beta, true},
+             {first_bases[5], kLinearHead, kHidden, input, rows, gate_low, true}}};
+        result = linear_batch(first, layer);
         if (!result.ok()) return result;
         for (std::uint32_t projection = 0U; projection < 3U; ++projection) {
             auto taps = host_tensor(
@@ -906,15 +1017,15 @@ struct Glm53Runtime::Impl {
                           values.begin() + static_cast<std::ptrdiff_t>(begin));
             }
         }
-        std::vector<float> low(static_cast<std::size_t>(rows) * kLinearHead);
         std::vector<float> forget(wide_elements);
-        std::vector<float> beta(static_cast<std::size_t>(rows) * kHeads);
-        result = linear(attention + "f_a_proj", input, rows, kHidden, low, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "f_b_proj", low, rows, kLinearHead,
-                        forget, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "b_proj", input, rows, kHidden, beta, layer);
+        std::vector<float> gate(wide_elements);
+        const std::array<std::string, 2U> second_bases{
+            attention + "f_b_proj", attention + "g_b_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> second{
+            {{second_bases[0], kLinearWidth, kLinearHead, low, rows, forget, true},
+             {second_bases[1], kLinearWidth, kLinearHead, gate_low, rows, gate,
+              true}}};
+        result = linear_batch(second, layer);
         if (!result.ok()) return result;
         for (auto& element : beta) element = bf16_round_f32(sigmoid(element));
         auto a_log = host_tensor(attention + "A_log", kHeads);
@@ -926,15 +1037,6 @@ struct Glm53Runtime::Impl {
             append(result.errors, std::move(o_norm.errors));
             return result;
         }
-        std::vector<float> gate_low(
-            static_cast<std::size_t>(rows) * kLinearHead);
-        std::vector<float> gate(wide_elements);
-        result = linear(attention + "g_a_proj", input, rows, kHidden,
-                        gate_low, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "g_b_proj", gate_low, rows, kLinearHead,
-                        gate, layer);
-        if (!result.ok()) return result;
         std::vector<float> heads_out(wide_elements);
         const auto query_scale = 1.0F / std::sqrt(static_cast<float>(kLinearHead));
         for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -989,15 +1091,14 @@ struct Glm53Runtime::Impl {
         const std::string& attention) {
         ValidationResult result;
         std::vector<float> q_rank(kQueryRank), query(kMlaWidth), latent(kKvRank);
-        result = linear(attention + "q_a_proj", input, 1U, kHidden, q_rank, layer);
+        const std::array<std::string, 2U> first_bases{
+            attention + "q_a_proj", attention + "kv_a_proj_with_mqa"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> first{
+            {{first_bases[0], kQueryRank, kHidden, input, 1U, q_rank, true},
+             {first_bases[1], kKvRank, kHidden, input, 1U, latent, true}}};
+        result = linear_batch(first, layer);
         if (!result.ok()) return result;
         result = norm(q_rank, q_rank, attention + "q_a_layernorm.weight");
-        if (!result.ok()) return result;
-        result = linear(attention + "q_b_proj", q_rank, 1U, kQueryRank,
-                        query, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "kv_a_proj_with_mqa", input, 1U, kHidden,
-                        latent, layer);
         if (!result.ok()) return result;
         result = norm(latent, latent, attention + "kv_a_layernorm.weight");
         if (!result.ok()) return result;
@@ -1007,11 +1108,15 @@ struct Glm53Runtime::Impl {
         const auto history = position + 1U;
         std::vector<float> expanded(
             static_cast<std::size_t>(history) * kHeads * 2U * kMlaHead);
-        result = linear(
-            attention + "kv_b_proj",
-            std::span<const float>(latents[layer]).first(
-                static_cast<std::size_t>(history) * kKvRank),
-            history, kKvRank, expanded, layer);
+        const std::array<std::string, 2U> second_bases{
+            attention + "q_b_proj", attention + "kv_b_proj"};
+        const auto latent_history = std::span<const float>(latents[layer]).first(
+            static_cast<std::size_t>(history) * kKvRank);
+        const std::array<Glm53WeightCache::LinearRequest, 2U> second{
+            {{second_bases[0], kMlaWidth, kQueryRank, q_rank, 1U, query, true},
+             {second_bases[1], kHeads * 2U * kMlaHead, kKvRank, latent_history,
+              history, expanded, true}}};
+        result = linear_batch(second, layer);
         if (!result.ok()) return result;
         std::vector<float> attended(kMlaWidth, 0.0F);
         const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
@@ -1060,17 +1165,15 @@ struct Glm53Runtime::Impl {
         std::vector<float> q_rank(static_cast<std::size_t>(rows) * kQueryRank);
         std::vector<float> query(static_cast<std::size_t>(rows) * kMlaWidth);
         std::vector<float> latent(static_cast<std::size_t>(rows) * kKvRank);
-        result = linear(attention + "q_a_proj", input, rows, kHidden,
-                        q_rank, layer);
+        const std::array<std::string, 2U> first_bases{
+            attention + "q_a_proj", attention + "kv_a_proj_with_mqa"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> first{
+            {{first_bases[0], kQueryRank, kHidden, input, rows, q_rank, true},
+             {first_bases[1], kKvRank, kHidden, input, rows, latent, true}}};
+        result = linear_batch(first, layer);
         if (!result.ok()) return result;
         result = norm_rows(q_rank, q_rank, rows, kQueryRank,
                            attention + "q_a_layernorm.weight");
-        if (!result.ok()) return result;
-        result = linear(attention + "q_b_proj", q_rank, rows, kQueryRank,
-                        query, layer);
-        if (!result.ok()) return result;
-        result = linear(attention + "kv_a_proj_with_mqa", input, rows, kHidden,
-                        latent, layer);
         if (!result.ok()) return result;
         result = norm_rows(latent, latent, rows, kKvRank,
                            attention + "kv_a_layernorm.weight");
@@ -1078,8 +1181,13 @@ struct Glm53Runtime::Impl {
         std::copy(latent.begin(), latent.end(), latents[layer].begin());
         std::vector<float> expanded(
             static_cast<std::size_t>(rows) * kHeads * 2U * kMlaHead);
-        result = linear(attention + "kv_b_proj", latent, rows, kKvRank,
-                        expanded, layer);
+        const std::array<std::string, 2U> second_bases{
+            attention + "q_b_proj", attention + "kv_b_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> second{
+            {{second_bases[0], kMlaWidth, kQueryRank, q_rank, rows, query, true},
+             {second_bases[1], kHeads * 2U * kMlaHead, kKvRank, latent, rows,
+              expanded, true}}};
+        result = linear_batch(second, layer);
         if (!result.ok()) return result;
         std::vector<float> attended(
             static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
@@ -1131,9 +1239,12 @@ struct Glm53Runtime::Impl {
         std::uint32_t layer) {
         ValidationResult result;
         std::vector<float> gate(inner), up(inner), activated(inner);
-        result = linear(prefix + "gate_proj", input, 1U, kHidden, gate, layer);
-        if (!result.ok()) return result;
-        result = linear(prefix + "up_proj", input, 1U, kHidden, up, layer);
+        const std::array<std::string, 2U> bases{
+            prefix + "gate_proj", prefix + "up_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> projections{
+            {{bases[0], inner, kHidden, input, 1U, gate, true},
+             {bases[1], inner, kHidden, input, 1U, up, true}}};
+        result = linear_batch(projections, layer);
         if (!result.ok()) return result;
         for (std::size_t index = 0U; index < inner; ++index) {
             const auto g = std::min(gate[index], 10.0F);
@@ -1152,9 +1263,12 @@ struct Glm53Runtime::Impl {
         ValidationResult result;
         std::vector<float> gate(static_cast<std::size_t>(rows) * inner);
         std::vector<float> up(gate.size()), activated(gate.size());
-        result = linear(prefix + "gate_proj", input, rows, kHidden, gate, layer);
-        if (!result.ok()) return result;
-        result = linear(prefix + "up_proj", input, rows, kHidden, up, layer);
+        const std::array<std::string, 2U> bases{
+            prefix + "gate_proj", prefix + "up_proj"};
+        const std::array<Glm53WeightCache::LinearRequest, 2U> projections{
+            {{bases[0], inner, kHidden, input, rows, gate, true},
+             {bases[1], inner, kHidden, input, rows, up, true}}};
+        result = linear_batch(projections, layer);
         if (!result.ok()) return result;
         for (std::size_t index = 0U; index < gate.size(); ++index) {
             const auto g = std::min(gate[index], 10.0F);

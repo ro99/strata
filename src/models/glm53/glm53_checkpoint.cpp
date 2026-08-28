@@ -23,6 +23,14 @@ constexpr std::uint64_t kMaximumIndexBytes = 64ULL << 20U;
             std::string_view(value) != "off");
 }
 
+[[nodiscard]] bool phase_scheduled_reads_enabled() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_PHASE_SCHEDULER");
+    return value == nullptr ||
+           (std::string_view(value) != "0" &&
+            std::string_view(value) != "false" &&
+            std::string_view(value) != "off");
+}
+
 }  // namespace
 
 Glm53CheckpointReader::~Glm53CheckpointReader() {
@@ -232,15 +240,38 @@ ParseResult<std::vector<float>> Glm53CheckpointReader::read_f32_row(
         return result;
     }
     const auto columns = tensor->source_shape[1];
-    auto encoded = read_slice(*tensor, row * columns * width, columns * width);
-    if (!encoded.ok()) {
-        result.errors = std::move(encoded.errors);
-        return result;
+    const auto offset = row * columns * width;
+    const auto bytes = columns * width;
+    std::vector<std::byte> owned;
+    std::span<const std::byte> encoded;
+    if (phase_scheduled_reads_enabled()) {
+        auto mapped = view(name);
+        if (!mapped.ok()) {
+            result.errors = std::move(mapped.errors);
+            return result;
+        }
+        if (offset > mapped.value.size_bytes() ||
+            bytes > mapped.value.size_bytes() - offset) {
+            result.errors.push_back(
+                "GLM-5.3 mapped row exceeds its tensor: " +
+                std::string(name));
+            return result;
+        }
+        encoded = mapped.value.subspan(static_cast<std::size_t>(offset),
+                                       static_cast<std::size_t>(bytes));
+    } else {
+        auto loaded = read_slice(*tensor, offset, bytes);
+        if (!loaded.ok()) {
+            result.errors = std::move(loaded.errors);
+            return result;
+        }
+        owned = std::move(loaded.value);
+        encoded = owned;
     }
     result.value.resize(static_cast<std::size_t>(columns));
     for (std::size_t column = 0U; column < result.value.size(); ++column) {
         result.value[column] = detail::decode_plain_scalar(
-            encoded.value.data() + column * width, tensor->source_dtype);
+            encoded.data() + column * width, tensor->source_dtype);
     }
     return result;
 }

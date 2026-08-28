@@ -151,6 +151,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool phase_scheduler_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_PHASE_SCHEDULER");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 struct Glm53RowRange {
     std::uint64_t begin{};
     std::uint64_t count{};
@@ -839,6 +850,7 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> parallel_projection_batches{};
     std::atomic<std::uint64_t> parallel_projection_requests{};
     std::atomic<std::uint64_t> tensor_parallel_head_batches{};
+    std::atomic<std::uint64_t> parallel_encode_pages{};
     std::mutex host_tensor_mutex;
     std::unordered_map<std::string,
                        std::shared_ptr<const std::vector<float>>> host_tensors;
@@ -2064,12 +2076,26 @@ struct Glm53Runtime::Impl {
         }
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         std::vector<float> streams(tokens.size() * stream_columns);
-        for (std::size_t position = 0U; position < tokens.size(); ++position) {
-            result = initialize_streams(
+        std::vector<ValidationResult> encode_results(tokens.size());
+        const auto encode = [&](std::size_t position) {
+            encode_results[position] = initialize_streams(
                 tokens[position],
                 std::span<float>(streams).subspan(
                     position * stream_columns, stream_columns));
+        };
+        if (phase_scheduler_enabled() && kda_workers != nullptr &&
+            tokens.size() >= kda_workers->size()) {
+            result = kda_workers->parallel_for(tokens.size(), encode);
             if (!result.ok()) return result;
+            parallel_encode_pages.fetch_add(1U, std::memory_order_relaxed);
+        } else {
+            for (std::size_t position = 0U; position < tokens.size();
+                 ++position) {
+                encode(position);
+            }
+        }
+        for (auto& encoded : encode_results) {
+            if (!encoded.ok()) return encoded;
         }
         // Prompt rows are page/layer-major. Recurrent KDA and causal MLA state
         // still advance in token order inside each layer, while the active
@@ -2158,7 +2184,7 @@ ValidationResult Glm53Runtime::initialize(
         impl_->lm_head_ranges = weighted_row_ranges(
             kVocabulary, impl_->weight_capacities, 128U);
     }
-    if (replay_ssm_enabled()) {
+    if (replay_ssm_enabled() || phase_scheduler_enabled()) {
         auto worker_cpus = compute_worker_cpus();
         if (!worker_cpus.empty()) {
             impl_->kda_workers = std::make_unique<HostWorkerPool>(
@@ -2292,6 +2318,9 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                          std::memory_order_relaxed)
                   << " tensor_parallel_head_batches="
                   << impl_->tensor_parallel_head_batches.load(
+                         std::memory_order_relaxed)
+                  << " parallel_encode_pages="
+                  << impl_->parallel_encode_pages.load(
                          std::memory_order_relaxed)
                   << '\n';
     }

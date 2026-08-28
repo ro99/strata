@@ -29,6 +29,9 @@ public:
             messages, options.maximum_new_tokens, options.sampling,
             options.stop, on_token);
         detail::copy_common_generation(result, concrete);
+        result.metrics.reused_prompt_tokens =
+            concrete.metrics.reused_prompt_tokens;
+        result.metrics.incremental_kv_continuation = true;
         return result;
     }
 

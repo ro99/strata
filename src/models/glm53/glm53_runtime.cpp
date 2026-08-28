@@ -1,4 +1,5 @@
 #include "strata/models/glm53/glm53_runtime.hpp"
+#include "strata/models/glm53/glm53_sequence.hpp"
 
 #include "strata/engine/runtime_support.hpp"
 #include "strata/models/common/tokenizer.hpp"
@@ -91,6 +92,22 @@ constexpr std::uint32_t kVocabulary = 154880U;
 constexpr std::uint32_t kExactSparseContext = 2048U;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 2ULL << 30U;
 constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
+
+[[nodiscard]] std::size_t prefix_cache_entries(
+    std::uint32_t maximum_context_tokens) noexcept {
+    const auto kda_state = 34ULL * kHeads * kLinearHead * kLinearHead *
+                           sizeof(float);
+    const auto convolution_state =
+        34ULL * 3ULL * kLinearWidth * 3ULL * sizeof(float);
+    const auto mla_state = 11ULL * maximum_context_tokens * kKvRank *
+                           sizeof(float);
+    const auto state_bytes = std::max<std::uint64_t>(
+        kda_state + convolution_state + mla_state, 1U);
+    const auto budget = host_hardware_profile().host_usable_bytes(0.05);
+    if (budget == 0U) return 1U;
+    return std::clamp<std::size_t>(
+        static_cast<std::size_t>(budget / state_bytes), 1U, 64U);
+}
 
 [[nodiscard]] bool batched_projections_enabled() noexcept {
     static const bool enabled = [] {
@@ -836,6 +853,13 @@ private:
 }  // namespace
 
 struct Glm53Runtime::Impl {
+    struct PrefixEntry {
+        std::vector<std::uint32_t> tokens;
+        Glm53SequenceState state;
+        std::vector<float> logits;
+        std::uint64_t recency{};
+    };
+
     Glm53RuntimeConfig config;
     std::unique_ptr<Glm53CheckpointReader> checkpoint;
     ModelTokenizer tokenizer;
@@ -851,12 +875,15 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> parallel_projection_requests{};
     std::atomic<std::uint64_t> tensor_parallel_head_batches{};
     std::atomic<std::uint64_t> parallel_encode_pages{};
+    std::atomic<std::uint64_t> prefix_cache_hits{};
+    std::atomic<std::uint64_t> prefix_cache_tokens{};
+    std::mutex prefix_mutex;
+    std::vector<PrefixEntry> prefix_cache;
+    std::size_t prefix_cache_limit{1U};
+    std::uint64_t prefix_clock{};
     std::mutex host_tensor_mutex;
     std::unordered_map<std::string,
                        std::shared_ptr<const std::vector<float>>> host_tensors;
-    std::array<std::vector<float>, kLayers> recurrent;
-    std::array<std::array<std::vector<float>, 3U>, kLayers> convolution;
-    std::array<std::vector<float>, kLayers> latents;
     ValidationResult warmup_result;
     bool ready{};
     std::thread warmup_thread;
@@ -908,6 +935,63 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult wait_for_warmup() {
         if (warmup_thread.joinable()) warmup_thread.join();
         return warmup_result;
+    }
+
+    [[nodiscard]] std::size_t restore_prefix(
+        std::span<const std::uint32_t> tokens, Glm53SequenceState& state,
+        std::span<float> logits) {
+        std::scoped_lock lock(prefix_mutex);
+        PrefixEntry* best = nullptr;
+        for (auto& entry : prefix_cache) {
+            if (entry.tokens.size() > tokens.size() ||
+                entry.logits.size() != logits.size() ||
+                (best != nullptr &&
+                 entry.tokens.size() <= best->tokens.size()) ||
+                !std::equal(entry.tokens.begin(), entry.tokens.end(),
+                            tokens.begin())) {
+                continue;
+            }
+            best = &entry;
+        }
+        if (best == nullptr) return 0U;
+        state = best->state;
+        std::copy(best->logits.begin(), best->logits.end(), logits.begin());
+        best->recency = ++prefix_clock;
+        prefix_cache_hits.fetch_add(1U, std::memory_order_relaxed);
+        prefix_cache_tokens.fetch_add(best->tokens.size(),
+                                      std::memory_order_relaxed);
+        return best->tokens.size();
+    }
+
+    void store_prefix(std::span<const std::uint32_t> tokens,
+                      const Glm53SequenceState& state,
+                      std::span<const float> logits) {
+        if (tokens.empty() || state.token_count() != tokens.size()) return;
+        std::scoped_lock lock(prefix_mutex);
+        for (auto& entry : prefix_cache) {
+            if (entry.tokens.size() == tokens.size() &&
+                std::equal(entry.tokens.begin(), entry.tokens.end(),
+                           tokens.begin())) {
+                entry.state = state;
+                entry.logits.assign(logits.begin(), logits.end());
+                entry.recency = ++prefix_clock;
+                return;
+            }
+        }
+        if (prefix_cache.size() >= prefix_cache_limit) {
+            const auto victim = std::min_element(
+                prefix_cache.begin(), prefix_cache.end(),
+                [](const PrefixEntry& left, const PrefixEntry& right) {
+                    return left.recency < right.recency;
+                });
+            if (victim != prefix_cache.end()) prefix_cache.erase(victim);
+        }
+        PrefixEntry entry;
+        entry.tokens.assign(tokens.begin(), tokens.end());
+        entry.state = state;
+        entry.logits.assign(logits.begin(), logits.end());
+        entry.recency = ++prefix_clock;
+        prefix_cache.push_back(std::move(entry));
     }
 
     [[nodiscard]] ValidationResult warmup() {
@@ -1081,31 +1165,9 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
-    [[nodiscard]] ValidationResult reset_sequence() {
-        ValidationResult result;
-        try {
-            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-                if (glm53_kda_layer(layer)) {
-                    recurrent[layer].assign(
-                        static_cast<std::size_t>(kHeads) * kLinearHead *
-                            kLinearHead,
-                        0.0F);
-                    for (auto& history : convolution[layer]) {
-                        history.assign(static_cast<std::size_t>(kLinearWidth) * 3U,
-                                       0.0F);
-                    }
-                } else {
-                    latents[layer].assign(
-                        static_cast<std::size_t>(config.maximum_context_tokens) *
-                            kKvRank,
-                        0.0F);
-                }
-            }
-        } catch (const std::bad_alloc&) {
-            result.errors.emplace_back(
-                "GLM-5.3 could not allocate recurrent and latent text state");
-        }
-        return result;
+    [[nodiscard]] ValidationResult reset_sequence(
+        Glm53SequenceState& sequence) const {
+        return sequence.reset(config.maximum_context_tokens, 64U);
     }
 
     [[nodiscard]] ValidationResult linear(
@@ -1288,7 +1350,8 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] ValidationResult attention_kda(
         std::span<float> output, std::span<const float> input,
-        std::uint32_t layer, const std::string& attention) {
+        std::uint32_t layer, const std::string& attention,
+        Glm53SequenceState& sequence) {
         ValidationResult result;
         std::vector<float> query(kLinearWidth), key(kLinearWidth),
             value(kLinearWidth), low(kLinearHead), beta(kHeads),
@@ -1315,8 +1378,9 @@ struct Glm53Runtime::Impl {
             if (!taps.ok()) return {std::move(taps.errors)};
             auto& values = projection == 0U ? query : projection == 1U ? key : value;
             auto convolved = values;
-            result = kimi_short_conv_step(convolved, values, *taps.value,
-                                          convolution[layer][projection], 4U);
+            result = kimi_short_conv_step(
+                convolved, values, *taps.value,
+                sequence.convolution(layer, projection), 4U);
             if (!result.ok()) return result;
             values = std::move(convolved);
             round_bf16(values);
@@ -1361,7 +1425,7 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
             for (auto& element : decay) element = std::exp(element);
             std::vector<float> raw(kLinearHead);
-            auto state = std::span<float>(recurrent[layer]).subspan(
+            auto state = sequence.recurrent(layer).subspan(
                 static_cast<std::size_t>(head) * kLinearHead * kLinearHead,
                 static_cast<std::size_t>(kLinearHead) * kLinearHead);
             result = kimi_kda_step(
@@ -1384,7 +1448,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult attention_kda_page(
         std::span<float> output, std::span<const float> input,
         std::uint32_t rows, std::uint32_t layer,
-        const std::string& attention) {
+        const std::string& attention, Glm53SequenceState& sequence) {
         ValidationResult result;
         const auto wide_elements = static_cast<std::size_t>(rows) * kLinearWidth;
         std::vector<float> query(wide_elements), key(wide_elements),
@@ -1419,7 +1483,7 @@ struct Glm53Runtime::Impl {
                 result = kimi_short_conv_step(
                     convolved,
                     std::span<const float>(values).subspan(begin, kLinearWidth),
-                    *taps.value, convolution[layer][projection], 4U);
+                    *taps.value, sequence.convolution(layer, projection), 4U);
                 if (!result.ok()) return result;
                 round_bf16(convolved);
                 std::copy(convolved.begin(), convolved.end(),
@@ -1507,7 +1571,7 @@ struct Glm53Runtime::Impl {
                             static_cast<std::size_t>(row) * kHeads + head];
                     }
                     std::vector<float> raw(q.size());
-                    auto state = std::span<float>(recurrent[layer]).subspan(
+                    auto state = sequence.recurrent(layer).subspan(
                         head * kLinearHead * kLinearHead,
                         static_cast<std::size_t>(kLinearHead) * kLinearHead);
                     auto status = kimi_kda_chunk(
@@ -1571,7 +1635,7 @@ struct Glm53Runtime::Impl {
                     if (!result.ok()) return result;
                     for (auto& element : decay) element = std::exp(element);
                     std::vector<float> raw(kLinearHead);
-                    auto state = std::span<float>(recurrent[layer]).subspan(
+                    auto state = sequence.recurrent(layer).subspan(
                         static_cast<std::size_t>(head) * kLinearHead *
                             kLinearHead,
                         static_cast<std::size_t>(kLinearHead) * kLinearHead);
@@ -1604,7 +1668,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult attention_mla(
         std::span<float> output, std::span<const float> input,
         std::uint32_t layer, std::uint32_t position,
-        const std::string& attention) {
+        const std::string& attention, Glm53SequenceState& sequence) {
         ValidationResult result;
         std::vector<float> q_rank(kQueryRank), query(kMlaWidth), latent(kKvRank);
         const std::array<std::string, 2U> first_bases{
@@ -1618,16 +1682,19 @@ struct Glm53Runtime::Impl {
         if (!result.ok()) return result;
         result = norm(latent, latent, attention + "kv_a_layernorm.weight");
         if (!result.ok()) return result;
-        std::copy(latent.begin(), latent.end(),
-                  latents[layer].begin() + static_cast<std::ptrdiff_t>(
-                      static_cast<std::size_t>(position) * kKvRank));
+        auto& cache = sequence.mla(layer);
+        if (cache.rows() != position) {
+            return {{"GLM-5.3 physical MLA position is not contiguous"}};
+        }
+        result = cache.append(latent);
+        if (!result.ok()) return result;
         const auto history = position + 1U;
         std::vector<float> expanded(
             static_cast<std::size_t>(history) * kHeads * 2U * kMlaHead);
         const std::array<std::string, 2U> second_bases{
             attention + "q_b_proj", attention + "kv_b_proj"};
-        const auto latent_history = std::span<const float>(latents[layer]).first(
-            static_cast<std::size_t>(history) * kKvRank);
+        const auto latent_storage = cache.materialize();
+        const auto latent_history = std::span<const float>(latent_storage);
         const std::array<Glm53WeightCache::LinearRequest, 2U> second{
             {{second_bases[0], kMlaWidth, kQueryRank, q_rank, 1U, query, true},
              {second_bases[1], kHeads * 2U * kMlaHead, kKvRank, latent_history,
@@ -1676,7 +1743,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult attention_mla_page(
         std::span<float> output, std::span<const float> input,
         std::uint32_t rows, std::uint32_t layer,
-        const std::string& attention) {
+        const std::string& attention, Glm53SequenceState& sequence) {
         ValidationResult result;
         std::vector<float> q_rank(static_cast<std::size_t>(rows) * kQueryRank);
         std::vector<float> query(static_cast<std::size_t>(rows) * kMlaWidth);
@@ -1694,27 +1761,33 @@ struct Glm53Runtime::Impl {
         result = norm_rows(latent, latent, rows, kKvRank,
                            attention + "kv_a_layernorm.weight");
         if (!result.ok()) return result;
-        std::copy(latent.begin(), latent.end(), latents[layer].begin());
+        auto& cache = sequence.mla(layer);
+        const auto history_begin = cache.rows();
+        result = cache.append_rows(latent, rows);
+        if (!result.ok()) return result;
+        const auto history_rows = cache.rows();
+        const auto latent_history = cache.materialize();
         std::vector<float> expanded(
-            static_cast<std::size_t>(rows) * kHeads * 2U * kMlaHead);
+            static_cast<std::size_t>(history_rows) * kHeads * 2U * kMlaHead);
         const std::array<std::string, 2U> second_bases{
             attention + "q_b_proj", attention + "kv_b_proj"};
         const std::array<Glm53WeightCache::LinearRequest, 2U> second{
             {{second_bases[0], kMlaWidth, kQueryRank, q_rank, rows, query, true},
-             {second_bases[1], kHeads * 2U * kMlaHead, kKvRank, latent, rows,
-              expanded, true}}};
+             {second_bases[1], kHeads * 2U * kMlaHead, kKvRank,
+              latent_history, history_rows, expanded, true}}};
         result = linear_batch(second, layer);
         if (!result.ok()) return result;
         std::vector<float> attended(
             static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
         const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
         for (std::uint32_t row = 0U; row < rows; ++row) {
-            std::vector<float> scores(row + 1U);
+            const auto visible = history_begin + row + 1U;
+            std::vector<float> scores(visible);
             for (std::uint32_t head = 0U; head < kHeads; ++head) {
                 const auto* q = query.data() +
                     (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                 float highest = -std::numeric_limits<float>::infinity();
-                for (std::uint32_t token = 0U; token <= row; ++token) {
+                for (std::uint32_t token = 0U; token < visible; ++token) {
                     const auto* kv = expanded.data() +
                         (static_cast<std::size_t>(token) * kHeads + head) *
                             (2U * kMlaHead);
@@ -1732,7 +1805,7 @@ struct Glm53Runtime::Impl {
                 }
                 auto* destination = attended.data() +
                     (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
-                for (std::uint32_t token = 0U; token <= row; ++token) {
+                for (std::uint32_t token = 0U; token < visible; ++token) {
                     const auto* values = expanded.data() +
                         (static_cast<std::size_t>(token) * kHeads + head) *
                             (2U * kMlaHead) + kMlaHead;
@@ -1871,7 +1944,7 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] ValidationResult forward_layer(
         std::span<float> streams, std::uint32_t layer,
-        std::uint32_t position) {
+        std::uint32_t position, Glm53SequenceState& sequence) {
         ValidationResult result;
         if (streams.size() != static_cast<std::size_t>(kMhc) * kHidden ||
             layer >= kLayers) {
@@ -1889,8 +1962,9 @@ struct Glm53Runtime::Impl {
         if (!result.ok()) return result;
         const auto attention = prefix + "self_attn.";
         result = glm53_kda_layer(layer)
-            ? attention_kda(branch, normalized, layer, attention)
-            : attention_mla(branch, normalized, layer, position, attention);
+            ? attention_kda(branch, normalized, layer, attention, sequence)
+            : attention_mla(branch, normalized, layer, position, attention,
+                            sequence);
         if (!result.ok()) return result;
         std::vector<float> transitioned(streams.size());
         result = dsv4_mhc_post_f32(transitioned, branch, streams, mix, kMhc);
@@ -1914,7 +1988,8 @@ struct Glm53Runtime::Impl {
     }
 
     [[nodiscard]] ValidationResult forward_layer_page(
-        std::span<float> streams, std::uint32_t rows, std::uint32_t layer) {
+        std::span<float> streams, std::uint32_t rows, std::uint32_t layer,
+        Glm53SequenceState& sequence) {
         ValidationResult result;
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         if (rows == 0U || layer >= kLayers ||
@@ -1945,8 +2020,10 @@ struct Glm53Runtime::Impl {
         if (!result.ok()) return result;
         const auto attention = prefix + "self_attn.";
         result = glm53_kda_layer(layer)
-            ? attention_kda_page(branch, normalized, rows, layer, attention)
-            : attention_mla_page(branch, normalized, rows, layer, attention);
+            ? attention_kda_page(branch, normalized, rows, layer, attention,
+                                 sequence)
+            : attention_mla_page(branch, normalized, rows, layer, attention,
+                                 sequence);
         if (!result.ok()) return result;
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
@@ -2048,13 +2125,13 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] ValidationResult forward_token(
         std::uint32_t token, std::uint32_t position,
-        std::span<float> logits) {
+        std::span<float> logits, Glm53SequenceState& sequence) {
         ValidationResult result;
         std::vector<float> streams(static_cast<std::size_t>(kMhc) * kHidden);
         result = initialize_streams(token, streams);
         if (!result.ok()) return result;
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-            result = forward_layer(streams, layer, position);
+            result = forward_layer(streams, layer, position, sequence);
             if (!result.ok()) return result;
             if (config.load_progress) {
                 std::cerr << "\r[glm53] layer " << (layer + 1U) << '/' << kLayers
@@ -2064,16 +2141,20 @@ struct Glm53Runtime::Impl {
         if (config.load_progress) {
             std::cerr << '\r' << std::string(32U, ' ') << '\r';
         }
-        return finish_streams(streams, logits);
+        result = finish_streams(streams, logits);
+        if (result.ok()) sequence.set_token_count(position + 1U);
+        return result;
     }
 
     [[nodiscard]] ValidationResult forward_prompt(
-        std::span<const std::uint32_t> tokens, std::span<float> logits) {
+        std::span<const std::uint32_t> tokens, std::span<float> logits,
+        Glm53SequenceState& sequence) {
         ValidationResult result;
         if (tokens.empty() || logits.empty()) {
             result.errors.emplace_back("GLM-5.3 prefill has an invalid shape");
             return result;
         }
+        const auto position_base = sequence.token_count();
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         std::vector<float> streams(tokens.size() * stream_columns);
         std::vector<ValidationResult> encode_results(tokens.size());
@@ -2102,7 +2183,8 @@ struct Glm53Runtime::Impl {
         // layer's routed experts remain reusable in the bounded CUDA cache.
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
             result = forward_layer_page(
-                streams, static_cast<std::uint32_t>(tokens.size()), layer);
+                streams, static_cast<std::uint32_t>(tokens.size()), layer,
+                sequence);
             if (!result.ok()) return result;
             if (config.load_progress) {
                 std::cerr << "\r[glm53-prefill] layer " << (layer + 1U) << '/'
@@ -2112,8 +2194,13 @@ struct Glm53Runtime::Impl {
         if (config.load_progress) {
             std::cerr << '\r' << std::string(48U, ' ') << '\r';
         }
-        return finish_streams(
+        result = finish_streams(
             std::span<const float>(streams).last(stream_columns), logits);
+        if (result.ok()) {
+            sequence.set_token_count(
+                position_base + static_cast<std::uint32_t>(tokens.size()));
+        }
+        return result;
     }
 };
 
@@ -2137,6 +2224,8 @@ ValidationResult Glm53Runtime::initialize(
         return result;
     }
     impl_->config = config;
+    impl_->prefix_cache_limit =
+        prefix_cache_entries(config.maximum_context_tokens);
     impl_->devices = resolve_runtime_devices(config.devices);
     result = validate_common_runtime_config(
         impl_->devices, config.vram_cache_fraction,
@@ -2252,22 +2341,30 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
         result.errors = std::move(warmup.errors);
         return result;
     }
-    auto reset = impl_->reset_sequence();
+    result.prompt_token_ids = encoded.value;
+    result.metrics.prompt_tokens = encoded.value.size();
+    std::vector<float> logits(kVocabulary);
+    Glm53SequenceState sequence;
+    auto reset = impl_->reset_sequence(sequence);
     if (!reset.ok()) {
         result.errors = std::move(reset.errors);
         return result;
     }
-    result.prompt_token_ids = encoded.value;
-    result.metrics.prompt_tokens = encoded.value.size();
-    std::vector<float> logits(kVocabulary);
+    const auto reused = impl_->restore_prefix(encoded.value, sequence, logits);
+    result.metrics.reused_prompt_tokens = reused;
     const auto prefill_started = now_seconds();
-    auto prefill = impl_->forward_prompt(encoded.value, logits);
-    if (!prefill.ok()) {
-        result.errors = std::move(prefill.errors);
-        return result;
+    if (reused < encoded.value.size()) {
+        auto prefill = impl_->forward_prompt(
+            std::span<const std::uint32_t>(encoded.value).subspan(reused),
+            logits, sequence);
+        if (!prefill.ok()) {
+            result.errors = std::move(prefill.errors);
+            return result;
+        }
     }
-    result.metrics.prefill_tokens = encoded.value.size();
+    result.metrics.prefill_tokens = encoded.value.size() - reused;
     result.metrics.prefill_seconds = now_seconds() - prefill_started;
+    impl_->store_prefix(encoded.value, sequence, logits);
     std::mt19937_64 generator(sampling.seed);
     std::vector<std::uint32_t> counts(kVocabulary, 0U);
     std::vector<std::uint32_t> sampled;
@@ -2298,7 +2395,8 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
         streamed.append(drawn.token, piece.value, on_token);
         if (streamed.stopped() || streamed.cancelled()) break;
         if (index + 1U == maximum_new_tokens) break;
-        auto step = impl_->forward_token(drawn.token, position++, logits);
+        auto step = impl_->forward_token(drawn.token, position++, logits,
+                                         sequence);
         if (!step.ok()) {
             result.errors = std::move(step.errors);
             return result;
@@ -2322,6 +2420,10 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << " parallel_encode_pages="
                   << impl_->parallel_encode_pages.load(
                          std::memory_order_relaxed)
+                  << " prefix_cache_hits="
+                  << impl_->prefix_cache_hits.load(std::memory_order_relaxed)
+                  << " prefix_cache_tokens="
+                  << impl_->prefix_cache_tokens.load(std::memory_order_relaxed)
                   << '\n';
     }
     return result;

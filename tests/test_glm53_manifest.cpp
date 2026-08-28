@@ -4,6 +4,7 @@
 #include "strata/models/common/tokenizer.hpp"
 #include "strata/models/glm53/glm53_manifest.hpp"
 #include "strata/models/glm53/glm53_runtime.hpp"
+#include "strata/models/glm53/glm53_sequence.hpp"
 
 #include <algorithm>
 #include <array>
@@ -82,6 +83,38 @@ TEST_CASE("GLM-5.3 registers as a text-only chat and server model") {
     const auto executor = model->make();
     REQUIRE(executor != nullptr);
     REQUIRE(!executor->accepts_images());
+}
+
+TEST_CASE("GLM-5.3 physical sequence pages fork copy-on-write") {
+    strata::Glm53PagedRows rows(4U, 2U);
+    constexpr std::array<float, 4U> first{1, 2, 3, 4};
+    constexpr std::array<float, 4U> second{5, 6, 7, 8};
+    constexpr std::array<float, 4U> third{9, 10, 11, 12};
+    REQUIRE(rows.append(first).ok());
+    REQUIRE(rows.append(second).ok());
+    auto fork = rows;
+    REQUIRE(rows.private_bytes() == 0U);
+    REQUIRE(fork.private_bytes() == 0U);
+    REQUIRE(fork.append(third).ok());
+    REQUIRE(rows.rows() == 2U);
+    REQUIRE(fork.rows() == 3U);
+    REQUIRE(fork.row(0U)[0] == 1.0F);
+    REQUIRE(fork.row(2U)[3] == 12.0F);
+    REQUIRE(fork.private_bytes() != 0U);
+}
+
+TEST_CASE("GLM-5.3 recurrent state forks lazily and exactly") {
+    strata::Glm53SequenceState state;
+    REQUIRE(state.reset(128U, 16U).ok());
+    auto recurrent = state.recurrent(0U);
+    REQUIRE(!recurrent.empty());
+    recurrent[17U] = 3.25F;
+    auto fork = state;
+    auto forked = fork.recurrent(0U);
+    REQUIRE(forked[17U] == 3.25F);
+    forked[17U] = -2.0F;
+    REQUIRE(state.recurrent(0U)[17U] == 3.25F);
+    REQUIRE(fork.recurrent(0U)[17U] == -2.0F);
 }
 
 TEST_CASE("GLM-5.3 chat rendering matches its text-only Jinja contract") {

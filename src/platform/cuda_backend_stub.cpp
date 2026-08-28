@@ -106,6 +106,10 @@ std::vector<int> CudaBackend::available_devices() { return {}; }
 ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int) {
     return {{}, {"CUDA support was not compiled into this build"}};
 }
+int CudaBackend::device_numa_node(int) noexcept { return -1; }
+bool CudaBackend::high_speed_peer_access_supported(int, int) noexcept {
+    return false;
+}
 
 std::uint64_t CudaBackend::weight_storage_bytes(
     std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept {

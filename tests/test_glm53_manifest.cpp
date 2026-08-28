@@ -3,7 +3,9 @@
 #include "strata/engine/model_executor.hpp"
 #include "strata/models/common/tokenizer.hpp"
 #include "strata/models/glm53/glm53_manifest.hpp"
+#include "strata/models/glm53/glm53_runtime.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string_view>
@@ -49,6 +51,27 @@ TEST_CASE("GLM-5.3 tensor classifier separates text, MTP, and vision") {
             strata::Glm53TensorRole::Mtp);
     REQUIRE(classify("model.visual.blocks.0.attn.qkv.weight") ==
             strata::Glm53TensorRole::Vision);
+}
+
+TEST_CASE("GLM-5.3 projection assignment is deterministic and capacity weighted") {
+    constexpr std::array<std::string_view, 8U> keys{
+        "q", "k", "v", "f", "b", "g", "up", "down"};
+    constexpr std::array<std::uint64_t, 8U> costs{
+        10U, 10U, 10U, 10U, 10U, 10U, 10U, 10U};
+    constexpr std::array<std::uint64_t, 2U> equal{20U, 20U};
+    const auto first = strata::glm53_projection_slots(keys, costs, equal, 1U);
+    const auto second = strata::glm53_projection_slots(keys, costs, equal, 1U);
+    REQUIRE(first == second);
+    REQUIRE(std::count(first.begin(), first.end(), 0U) == 4);
+    REQUIRE(std::count(first.begin(), first.end(), 1U) == 4);
+
+    constexpr std::array<std::uint64_t, 2U> weighted{30U, 10U};
+    const auto asymmetric =
+        strata::glm53_projection_slots(keys, costs, weighted, 0U);
+    REQUIRE(std::count(asymmetric.begin(), asymmetric.end(), 0U) == 6);
+    REQUIRE(std::count(asymmetric.begin(), asymmetric.end(), 1U) == 2);
+    constexpr std::array<std::uint64_t, 2U> invalid{30U, 0U};
+    REQUIRE(strata::glm53_projection_slots(keys, costs, invalid, 0U).empty());
 }
 
 TEST_CASE("GLM-5.3 registers as a text-only chat and server model") {

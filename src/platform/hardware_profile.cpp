@@ -38,21 +38,31 @@ namespace {
 
 // The process's CPU affinity mask, not the machine's CPU count: a cgroup or a
 // taskset makes those differ, and threads beyond the mask only contend.
-[[nodiscard]] std::size_t read_usable_cpus() noexcept {
+[[nodiscard]] std::vector<int> read_usable_cpu_ids() noexcept {
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        const int count = CPU_COUNT(&set);
-        if (count > 0) return static_cast<std::size_t>(count);
+        std::vector<int> cpus;
+        cpus.reserve(static_cast<std::size_t>(CPU_COUNT(&set)));
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &set)) cpus.push_back(cpu);
+        }
+        if (!cpus.empty()) return cpus;
     }
     const auto concurrency = std::thread::hardware_concurrency();
-    return concurrency == 0U ? 1U : static_cast<std::size_t>(concurrency);
+    const auto count = concurrency == 0U ? 1U : concurrency;
+    std::vector<int> cpus(count);
+    for (std::size_t index = 0U; index < cpus.size(); ++index) {
+        cpus[index] = static_cast<int>(index);
+    }
+    return cpus;
 }
 
 [[nodiscard]] HardwareProfile probe() {
     HardwareProfile profile;
     profile.host_memory_bytes = read_host_memory_bytes();
-    profile.usable_cpus = read_usable_cpus();
+    profile.usable_cpu_ids = read_usable_cpu_ids();
+    profile.usable_cpus = profile.usable_cpu_ids.size();
     profile.numa = NumaTopology::detect();
     std::size_t smallest = 0U;
     for (const auto& cpus : profile.numa.node_cpus) {

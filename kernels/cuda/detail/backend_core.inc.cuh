@@ -68,6 +68,38 @@ ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int device) {
     return result;
 }
 
+int CudaBackend::device_numa_node(int device) noexcept {
+    char bus_id[32]{};
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), device) != cudaSuccess) {
+        return -1;
+    }
+    char path[128]{};
+    const int written = std::snprintf(
+        path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus_id);
+    if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(path)) {
+        return -1;
+    }
+    std::ifstream input(path);
+    int node = -1;
+    return input >> node && node >= 0 ? node : -1;
+}
+
+bool CudaBackend::high_speed_peer_access_supported(
+    int source, int destination) noexcept {
+    if (source == destination) return true;
+    int supported = 0;
+    if (cudaDeviceCanAccessPeer(&supported, source, destination) !=
+            cudaSuccess ||
+        supported == 0) {
+        return false;
+    }
+    int rank = -1;
+    return cudaDeviceGetP2PAttribute(
+               &rank, cudaDevP2PAttrPerformanceRank, source, destination) ==
+               cudaSuccess &&
+           rank == 0;
+}
+
 std::uint64_t CudaBackend::weight_storage_bytes(
     std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept {
     if (weight_bytes == 0U) return 0U;

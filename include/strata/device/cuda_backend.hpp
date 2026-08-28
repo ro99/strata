@@ -966,6 +966,14 @@ public:
     [[nodiscard]] static bool compiled() noexcept;
     [[nodiscard]] static std::vector<int> available_devices();
     [[nodiscard]] static ParseResult<CudaDeviceMemory> device_memory(int device);
+    // Host NUMA node nearest this CUDA device, discovered through its PCI
+    // identity. Returns -1 when the platform cannot describe that affinity.
+    [[nodiscard]] static int device_numa_node(int device) noexcept;
+    // True only for the CUDA driver's best peer-performance rank. Mere peer
+    // addressability over a contended PCIe host bridge is not enough to make
+    // fine-grained cross-device projection barriers profitable.
+    [[nodiscard]] static bool high_speed_peer_access_supported(
+        int source, int destination) noexcept;
     [[nodiscard]] static std::uint64_t weight_storage_bytes(
         std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept;
 

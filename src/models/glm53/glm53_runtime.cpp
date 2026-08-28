@@ -7,6 +7,7 @@
 #include "strata/models/kimi_k3/kimi_k3_ops.hpp"
 #include "strata/platform/hardware_profile.hpp"
 #include "strata/platform/numerics.hpp"
+#include "strata/platform/worker_pool.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <list>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <numeric>
@@ -27,6 +29,52 @@
 #include <utility>
 
 namespace strata {
+
+std::vector<std::size_t> glm53_projection_slots(
+    std::span<const std::string_view> keys,
+    std::span<const std::uint64_t> costs,
+    std::span<const std::uint64_t> capacities,
+    std::size_t preferred_slot) {
+    if (keys.empty() || keys.size() != costs.size() || capacities.empty() ||
+        preferred_slot >= capacities.size() ||
+        std::any_of(capacities.begin(), capacities.end(),
+                    [](std::uint64_t value) { return value == 0U; })) {
+        return {};
+    }
+    std::vector<std::size_t> order(keys.size());
+    std::iota(order.begin(), order.end(), 0U);
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t left,
+                                                      std::size_t right) {
+        if (costs[left] != costs[right]) return costs[left] > costs[right];
+        if (keys[left] != keys[right]) return keys[left] < keys[right];
+        return left < right;
+    });
+    std::vector<long double> loads(capacities.size(), 0.0L);
+    std::vector<std::size_t> slots(keys.size());
+    for (const auto index : order) {
+        std::size_t best = 0U;
+        for (std::size_t slot = 1U; slot < capacities.size(); ++slot) {
+            const auto candidate = loads[slot] /
+                static_cast<long double>(capacities[slot]);
+            const auto incumbent = loads[best] /
+                static_cast<long double>(capacities[best]);
+            const auto candidate_distance =
+                (slot + capacities.size() - preferred_slot) % capacities.size();
+            const auto incumbent_distance =
+                (best + capacities.size() - preferred_slot) % capacities.size();
+            if (candidate < incumbent ||
+                (candidate == incumbent &&
+                 candidate_distance < incumbent_distance)) {
+                best = slot;
+            }
+        }
+        slots[index] = best;
+        loads[best] += static_cast<long double>(std::max<std::uint64_t>(
+            costs[index], 1U));
+    }
+    return slots;
+}
+
 namespace {
 
 constexpr std::uint32_t kHidden = 4096U;
@@ -55,6 +103,78 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool cross_gpu_projections_enabled(
+    std::span<const int> devices) noexcept {
+    static const int policy = [] {
+        const char* value = std::getenv("STRATA_GLM53_CROSS_GPU_PROJECTIONS");
+        if (value == nullptr) return -1;
+        return std::string_view(value) != "0" &&
+                       std::string_view(value) != "false" &&
+                       std::string_view(value) != "off"
+                   ? 1
+                   : 0;
+    }();
+    if (policy >= 0) return policy != 0;
+    for (std::size_t source = 0U; source < devices.size(); ++source) {
+        for (std::size_t destination = source + 1U;
+             destination < devices.size(); ++destination) {
+            if (!CudaBackend::high_speed_peer_access_supported(
+                    devices[source], devices[destination]) ||
+                !CudaBackend::high_speed_peer_access_supported(
+                    devices[destination], devices[source])) {
+                return false;
+            }
+        }
+    }
+    return devices.size() > 1U;
+}
+
+[[nodiscard]] std::vector<int> projection_worker_cpus(
+    std::span<const int> devices) {
+    const auto& hardware = host_hardware_profile();
+    std::vector<int> chosen;
+    chosen.reserve(devices.size());
+    const auto usable = [&](int cpu) {
+        return std::find(hardware.usable_cpu_ids.begin(),
+                         hardware.usable_cpu_ids.end(), cpu) !=
+               hardware.usable_cpu_ids.end();
+    };
+    const auto available = [&](int cpu) {
+        return usable(cpu) &&
+               std::find(chosen.begin(), chosen.end(), cpu) == chosen.end();
+    };
+    for (const int device : devices) {
+        const int node = CudaBackend::device_numa_node(device);
+        const std::vector<int>* local = nullptr;
+        if (node >= 0 && static_cast<std::size_t>(node) <
+                             hardware.numa.node_primary_cpus.size() &&
+            !hardware.numa.node_primary_cpus[static_cast<std::size_t>(node)]
+                 .empty()) {
+            local = &hardware.numa.node_primary_cpus[
+                static_cast<std::size_t>(node)];
+        } else if (node >= 0 && static_cast<std::size_t>(node) <
+                                    hardware.numa.node_cpus.size()) {
+            local = &hardware.numa.node_cpus[static_cast<std::size_t>(node)];
+        }
+        auto selected = hardware.usable_cpu_ids.end();
+        if (local != nullptr) {
+            const auto candidate = std::find_if(
+                local->begin(), local->end(), available);
+            if (candidate != local->end()) {
+                selected = std::find(hardware.usable_cpu_ids.begin(),
+                                     hardware.usable_cpu_ids.end(), *candidate);
+            }
+        }
+        if (selected == hardware.usable_cpu_ids.end()) {
+            selected = std::find_if(hardware.usable_cpu_ids.begin(),
+                                    hardware.usable_cpu_ids.end(), available);
+        }
+        if (selected == hardware.usable_cpu_ids.end()) return {};
+        chosen.push_back(*selected);
+    }
+    return chosen;
+}
+
 double now_seconds() {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -72,6 +192,33 @@ void round_bf16(std::span<float> values) noexcept {
 void append(std::vector<std::string>& destination,
             std::vector<std::string> source) {
     for (auto& error : source) destination.push_back(std::move(error));
+}
+
+[[nodiscard]] std::string projection_group_key(
+    std::string_view base, Glm53TensorRole role) {
+    const auto separator = base.find_last_of('.');
+    const auto prefix = base.substr(0U, separator + 1U);
+    const auto leaf = base.substr(separator + 1U);
+    if (role == Glm53TensorRole::KdaAttention) {
+        if (leaf == "q_proj" || leaf == "k_proj" || leaf == "v_proj" ||
+            leaf == "f_a_proj" || leaf == "b_proj" || leaf == "g_a_proj") {
+            return std::string(prefix) + "#kda-input";
+        }
+        if (leaf == "f_b_proj" || leaf == "g_b_proj") {
+            return std::string(prefix) + "#kda-low-rank";
+        }
+    } else if (role == Glm53TensorRole::SparseAttention) {
+        if (leaf == "q_a_proj" || leaf == "kv_a_proj_with_mqa") {
+            return std::string(prefix) + "#mla-input";
+        }
+        if (leaf == "q_b_proj" || leaf == "kv_b_proj") {
+            return std::string(prefix) + "#mla-expanded";
+        }
+    } else if (role == Glm53TensorRole::DenseMlp &&
+               (leaf == "gate_proj" || leaf == "up_proj")) {
+        return std::string(prefix) + "#dense-gate-up";
+    }
+    return std::string(base);
 }
 
 class Glm53WeightCache {
@@ -542,7 +689,11 @@ struct Glm53Runtime::Impl {
     CudaBackend cuda;
     std::vector<int> devices;
     std::vector<std::size_t> device_schedule;
+    std::vector<std::uint64_t> weight_capacities;
     std::unique_ptr<Glm53WeightCache> weights;
+    std::unique_ptr<HostWorkerPool> projection_workers;
+    std::atomic<std::uint64_t> parallel_projection_batches{};
+    std::atomic<std::uint64_t> parallel_projection_requests{};
     std::mutex host_tensor_mutex;
     std::unordered_map<std::string,
                        std::shared_ptr<const std::vector<float>>> host_tensors;
@@ -605,14 +756,17 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult warmup() {
         struct LinearTask {
             std::string base;
+            std::string group;
             std::uint64_t rows{};
             std::uint64_t columns{};
+            std::uint32_t layer{};
         };
         struct HostTask {
             std::string name;
             std::uint64_t elements{};
         };
         ValidationResult result;
+        std::vector<LinearTask> linear_tasks;
         std::vector<std::vector<LinearTask>> device_tasks(devices.size());
         std::vector<HostTask> host_tasks;
         for (const auto& tensor : checkpoint->manifest().tensors) {
@@ -630,9 +784,11 @@ struct Glm53Runtime::Impl {
                 const auto layer = tensor.layer >= 0
                     ? static_cast<std::uint32_t>(tensor.layer)
                     : kLayers - 1U;
-                device_tasks[slot_for(layer)].push_back({
-                    tensor.name.substr(0U, tensor.name.size() - 7U),
-                    tensor.source_shape[0], tensor.source_shape[1]});
+                const auto base = tensor.name.substr(
+                    0U, tensor.name.size() - 7U);
+                linear_tasks.push_back({
+                    base, projection_group_key(base, tensor.role),
+                    tensor.source_shape[0], tensor.source_shape[1], layer});
                 continue;
             }
             if (tensor.source_dtype != SafetensorsDtype::Bf16 &&
@@ -652,6 +808,40 @@ struct Glm53Runtime::Impl {
                 elements *= dimension;
             }
             if (valid) host_tasks.push_back({tensor.name, elements});
+        }
+
+        std::map<std::string, std::vector<LinearTask>> linear_groups;
+        for (auto& task : linear_tasks) {
+            linear_groups[task.group].push_back(std::move(task));
+        }
+        const bool parallel = projection_workers != nullptr &&
+                              batched_projections_enabled() &&
+                              cross_gpu_projections_enabled(devices) &&
+                              devices.size() > 1U;
+        for (auto& [group, tasks] : linear_groups) {
+            static_cast<void>(group);
+            if (!parallel || tasks.size() == 1U) {
+                for (auto& task : tasks) {
+                    device_tasks[slot_for(task.layer)].push_back(std::move(task));
+                }
+                continue;
+            }
+            std::vector<std::string_view> keys;
+            std::vector<std::uint64_t> costs;
+            keys.reserve(tasks.size());
+            costs.reserve(tasks.size());
+            for (const auto& task : tasks) {
+                keys.push_back(task.base);
+                costs.push_back(checkpoint->cuda_linear_storage_bytes(task.base));
+            }
+            const auto slots = glm53_projection_slots(
+                keys, costs, weight_capacities, slot_for(tasks.front().layer));
+            if (slots.size() != tasks.size()) {
+                return {{"GLM-5.3 projection warmup assignment is invalid"}};
+            }
+            for (std::size_t index = 0U; index < tasks.size(); ++index) {
+                device_tasks[slots[index]].push_back(std::move(tasks[index]));
+            }
         }
 
         std::vector<ValidationResult> device_results(devices.size());
@@ -796,6 +986,52 @@ struct Glm53Runtime::Impl {
                 if (!projected.ok()) return projected;
             }
             return {};
+        }
+        if (cross_gpu_projections_enabled(devices) &&
+            projection_workers != nullptr &&
+            devices.size() > 1U && requests.size() > 1U) {
+            std::vector<std::string_view> keys;
+            std::vector<std::uint64_t> costs;
+            keys.reserve(requests.size());
+            costs.reserve(requests.size());
+            for (const auto& request : requests) {
+                keys.push_back(request.base);
+                costs.push_back(
+                    checkpoint->cuda_linear_storage_bytes(request.base));
+            }
+            const auto slots = glm53_projection_slots(
+                keys, costs, weight_capacities, slot_for(layer));
+            if (slots.size() != requests.size()) {
+                return {{"GLM-5.3 parallel projection assignment is invalid"}};
+            }
+            std::vector<std::vector<Glm53WeightCache::LinearRequest>> groups(
+                devices.size());
+            for (std::size_t index = 0U; index < requests.size(); ++index) {
+                groups[slots[index]].push_back(requests[index]);
+            }
+            std::vector<ValidationResult> device_results(devices.size());
+            auto dispatched = projection_workers->parallel_for_addressed(
+                devices.size(), [&](std::size_t slot) {
+                    if (!groups[slot].empty()) {
+                        device_results[slot] =
+                            weights->matmul_batch(slot, groups[slot]);
+                    }
+                });
+            if (!dispatched.ok()) return dispatched;
+            ValidationResult joined;
+            std::uint64_t active_slots = 0U;
+            for (std::size_t slot = 0U; slot < device_results.size(); ++slot) {
+                if (!groups[slot].empty()) ++active_slots;
+                append(joined.errors, std::move(device_results[slot].errors));
+            }
+            if (joined.ok() && active_slots > 1U) {
+                parallel_projection_batches.fetch_add(
+                    1U, std::memory_order_relaxed);
+                parallel_projection_requests.fetch_add(
+                    static_cast<std::uint64_t>(requests.size()),
+                    std::memory_order_relaxed);
+            }
+            return joined;
         }
         return weights->matmul_batch(slot_for(layer), requests);
     }
@@ -1612,9 +1848,17 @@ ValidationResult Glm53Runtime::initialize(
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->device_schedule = std::move(device_plan.value.weighted_schedule);
+    impl_->weight_capacities = device_plan.value.weight_capacities;
     impl_->weights = std::make_unique<Glm53WeightCache>(
         *impl_->checkpoint, impl_->cuda, impl_->devices,
-        std::move(device_plan.value.weight_capacities));
+        impl_->weight_capacities);
+    if (impl_->devices.size() > 1U) {
+        auto worker_cpus = projection_worker_cpus(impl_->devices);
+        if (worker_cpus.size() == impl_->devices.size()) {
+            impl_->projection_workers = std::make_unique<HostWorkerPool>(
+                std::move(worker_cpus));
+        }
+    }
     impl_->ready = true;
     try {
         // Keep API/server startup lazy-fast while warming independent device
@@ -1733,6 +1977,15 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
     streamed.finish(on_token);
     result.text = streamed.text();
     result.stopped = result.stopped || streamed.stopped();
+    if (impl_->config.verbose) {
+        std::cerr << "[glm53-projection] parallel_batches="
+                  << impl_->parallel_projection_batches.load(
+                         std::memory_order_relaxed)
+                  << " parallel_requests="
+                  << impl_->parallel_projection_requests.load(
+                         std::memory_order_relaxed)
+                  << '\n';
+    }
     return result;
 }
 

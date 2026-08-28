@@ -14,6 +14,15 @@
 
 namespace strata {
 
+// Deterministic weighted assignment used by both warmup and execution. The
+// same projection key therefore has exactly one CUDA home, while independent
+// projections spread according to discovered cache capacity.
+[[nodiscard]] std::vector<std::size_t> glm53_projection_slots(
+    std::span<const std::string_view> keys,
+    std::span<const std::uint64_t> costs,
+    std::span<const std::uint64_t> capacities,
+    std::size_t preferred_slot);
+
 struct Glm53RuntimeConfig {
     std::vector<int> devices;
     double vram_cache_fraction{0.85};

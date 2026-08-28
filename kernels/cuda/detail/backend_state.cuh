@@ -97,6 +97,15 @@ struct CudaBackend::Impl {
         // the lock.
         void* upload_prepack_scratch{};
         std::uint64_t upload_prepack_scratch_bytes{};
+        // Capacity-bounded pinned ring for streamed weight uploads.  Mapped
+        // checkpoint pages are pageable, so cudaMemcpyAsync otherwise performs
+        // its own blocking host staging for every cache miss.  The ring makes
+        // that staging explicit, reusable, and large enough for many expert
+        // projections so CPU copies overlap the copy engine.  It is sized from
+        // the device weight arena rather than from a particular GPU model.
+        std::byte* weight_host_staging{};
+        std::uint64_t weight_host_staging_bytes{};
+        std::uint64_t weight_host_staging_cursor{};
         // Register-fed fused MoE workspaces: split-K partials for gate, up and
         // down, plus the two B-fragment activation buffers. Grown geometrically
         // and kept, so a decode step that repeats the same shapes allocates
@@ -182,6 +191,8 @@ struct CudaBackend::Impl {
         int dsv4_deferred_attention_source_device{-1};
         bool dsv4_deferred_attention_cross_transition{};
         Dsv4MhcWorkspace* dsv4_mhc_workspace{};
+        std::byte* glm53_mla_workspace{};
+        std::uint64_t glm53_mla_workspace_bytes{};
         std::byte* dsv4_mhc_host_staging{};
         std::uint64_t dsv4_mhc_workspace_bytes{};
         std::uint64_t dsv4_mhc_host_staging_bytes{};
@@ -347,6 +358,9 @@ struct CudaBackend::Impl {
             } else if (state.dsv4_mhc_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_mhc_workspace));
             }
+            if (state.glm53_mla_workspace != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_mla_workspace));
+            }
             if (state.gemma_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.gemma_workspace));
             }
@@ -371,6 +385,9 @@ struct CudaBackend::Impl {
             }
             if (state.upload_prepack_scratch != nullptr) {
                 static_cast<void>(cudaFree(state.upload_prepack_scratch));
+            }
+            if (state.weight_host_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.weight_host_staging));
             }
             for (void* pointer : {state.moe_regfed.activation,
                                   state.moe_regfed.partials,

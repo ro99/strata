@@ -2038,6 +2038,23 @@ ValidationResult CudaBackend::enqueue_moe(
     int device, std::span<const float> hidden, std::uint32_t rows,
     std::span<const CudaMoeExpert> routed, const CudaMoeExpert* shared,
     float swiglu_limit) {
+    return enqueue_moe_impl(device, hidden, rows, routed, shared,
+                            swiglu_limit, false, {});
+}
+
+ValidationResult CudaBackend::enqueue_glm53_moe_from_mhc(
+    int device, std::span<const CudaMoeExpert> routed,
+    const CudaMoeExpert& shared, std::span<const float> coefficients,
+    float swiglu_limit) {
+    return enqueue_moe_impl(device, {}, 1U, routed, &shared, swiglu_limit,
+                            true, coefficients);
+}
+
+ValidationResult CudaBackend::enqueue_moe_impl(
+    int device, std::span<const float> hidden, std::uint32_t rows,
+    std::span<const CudaMoeExpert> routed, const CudaMoeExpert* shared,
+    float swiglu_limit, bool mhc_source_destination,
+    std::span<const float> routed_coefficients) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -2045,13 +2062,21 @@ ValidationResult CudaBackend::enqueue_moe(
         return result;
     }
     auto& state = found->second;
-    if (state.moe_in_flight) {
+    if (state.moe_in_flight ||
+        (mhc_source_destination &&
+         (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+          state.dsv4_mhc_workspace == nullptr ||
+          state.dsv4_mhc_branch_ready || state.dsv4_mhc_failed))) {
         result.errors.emplace_back("MoE workspace already has an in-flight command");
         return result;
     }
     const auto expert_count = routed.size() + (shared == nullptr ? 0U : 1U);
     if (rows == 0U || expert_count == 0U || expert_count > kMaxMoeExperts ||
-        routed.size() > kMaxRoutedMoeExperts) {
+        routed.size() > kMaxRoutedMoeExperts ||
+        (mhc_source_destination &&
+         (rows != 1U || shared == nullptr ||
+          routed_coefficients.size() != routed.size())) ||
+        (!mhc_source_destination && !routed_coefficients.empty())) {
         result.errors.emplace_back("MoE command has an unsupported row or expert count");
         return result;
     }
@@ -2169,8 +2194,11 @@ ValidationResult CudaBackend::enqueue_moe(
 
     std::uint64_t hidden_elements = 0U;
     if (!checked_bytes(rows, hidden_columns, 1U, hidden_elements) ||
-        hidden.size() != hidden_elements ||
+        (mhc_source_destination ? !hidden.empty()
+                                : hidden.size() != hidden_elements) ||
         std::any_of(hidden.begin(), hidden.end(),
+                    [](float value) { return !std::isfinite(value); }) ||
+        std::any_of(routed_coefficients.begin(), routed_coefficients.end(),
                     [](float value) { return !std::isfinite(value); })) {
         result.errors.emplace_back("MoE hidden rows are incompatible");
         return result;
@@ -2285,6 +2313,9 @@ ValidationResult CudaBackend::enqueue_moe(
                 static_cast<const unsigned char*>(expert.down->impl_->weights);
             fp8_f32_batch_data.down_scales[index] =
                 static_cast<const float*>(expert.down->impl_->scales);
+            fp8_f32_batch_data.coefficients[index] =
+                index < routed_coefficients.size()
+                    ? routed_coefficients[index] : 1.0F;
         } else if (nvfp4_batch) {
             nvfp4_batch_data.gate_weights[index] =
                 static_cast<const unsigned char*>(expert.gate->impl_->weights);
@@ -2401,7 +2432,7 @@ ValidationResult CudaBackend::enqueue_moe(
     state.moe_has_shared = shared != nullptr;
     state.moe_shared_phase_timing_valid = false;
     state.moe_host_join = false;
-    state.moe_output_to_mhc = false;
+    state.moe_output_to_mhc = mhc_source_destination;
     state.moe_host_callback = {};
     state.moe_kernel_launches = 0U;
     state.moe_in_flight = true;
@@ -2450,10 +2481,23 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "reset MoE error flag");
         return result;
     }
-    if (auto status = cudaMemcpyAsync(
-            state.moe_hidden, hidden.data(), static_cast<std::size_t>(hidden_bytes),
-            cudaMemcpyHostToDevice, state.stream);
-        status != cudaSuccess) {
+    if (mhc_source_destination) {
+        constexpr std::uint32_t convert_threads = 256U;
+        constexpr std::uint32_t convert_blocks =
+            (kDsv4MhcHidden + convert_threads - 1U) / convert_threads;
+        dsv4_bf16_to_fp32<<<convert_blocks, convert_threads, 0U,
+                            state.stream>>>(
+            state.dsv4_mhc_workspace->layer_input, state.moe_hidden,
+            kDsv4MhcHidden);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "convert resident GLM-5.3 MoE input");
+            return result;
+        }
+    } else if (auto status = cudaMemcpyAsync(
+                   state.moe_hidden, hidden.data(),
+                   static_cast<std::size_t>(hidden_bytes),
+                   cudaMemcpyHostToDevice, state.stream);
+               status != cudaSuccess) {
         abort_enqueue(status, "upload MoE hidden rows");
         return result;
     }
@@ -2989,6 +3033,23 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "launch MoE down projection");
         return result;
     }
+    if (mhc_source_destination) {
+        constexpr unsigned int join_threads = 256U;
+        const auto join_blocks = static_cast<unsigned int>(
+            (hidden_columns + join_threads - 1U) / join_threads);
+        glm53_moe_join_mhc_kernel<<<join_blocks, join_threads, 0U,
+                                    state.stream>>>(
+            state.moe_output, fp8_f32_batch_data.coefficients,
+            static_cast<std::uint32_t>(routed.size()),
+            state.dsv4_mhc_workspace->branch,
+            static_cast<std::uint32_t>(hidden_columns), state.moe_error);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "join resident GLM-5.3 MoE branch");
+            return result;
+        }
+        state.dsv4_mhc_branch_ready = true;
+    }
     if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
         status != cudaSuccess) {
         abort_enqueue(status, "record MoE kernel completion");
@@ -2999,14 +3060,17 @@ ValidationResult CudaBackend::enqueue_moe(
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        device_stats.activation_h2d_bytes += hidden_bytes;
+        device_stats.activation_h2d_bytes +=
+            mhc_source_destination ? 0U : hidden_bytes;
         device_stats.matmul_calls += 3U * expert_count;
         device_stats.workspace_allocation_calls += allocation_calls;
         device_stats.workspace_allocation_bytes += allocation_bytes;
         ++device_stats.deepseek_moe_calls;
         device_stats.deepseek_moe_kernel_launches += state.moe_kernel_launches;
-        ++device_stats.deepseek_moe_h2d_transfers;
-        device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
+        device_stats.deepseek_moe_h2d_transfers +=
+            mhc_source_destination ? 0U : 1U;
+        device_stats.deepseek_moe_h2d_bytes +=
+            mhc_source_destination ? 0U : hidden_bytes;
     }
     return result;
 }

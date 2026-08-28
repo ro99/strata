@@ -2001,6 +2001,7 @@ struct Fp8F32MoeBatch {
     const float* up_scales[kMaxMoeExperts]{};
     const unsigned char* down_weights[kMaxMoeExperts]{};
     const float* down_scales[kMaxMoeExperts]{};
+    float coefficients[kMaxMoeExperts]{};
     std::uint32_t count{};
     std::uint32_t rows{};
 };

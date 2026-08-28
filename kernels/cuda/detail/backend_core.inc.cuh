@@ -553,8 +553,66 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         return cuda_error(status, operation);
     };
+    // cudaMemcpyAsync from an mmap-backed checkpoint is only superficially
+    // asynchronous: the runtime blocks the submitting thread while it copies
+    // pageable input into an internal pinned buffer.  Nsight on GLM-5.3 showed
+    // 1.98 seconds of host API time and 9.99 GB of H2D traffic in one token.
+    // Keep a reusable pinned ring instead.  Its capacity follows the admitted
+    // device arena (1/64th), which gives larger GPUs a deeper overlap window
+    // without baking this host's VRAM size into the runtime.
+    const bool stage_pageable = deferred && payload_bytes >= (1ULL << 20U) &&
+                                state.weight_arena != nullptr;
+    if (stage_pageable && state.weight_host_staging == nullptr) {
+        const auto arena = state.weight_arena->occupancy();
+        const auto desired = std::max<std::uint64_t>(
+            payload_bytes, arena.capacity / 64U);
+        void* staging = nullptr;
+        if (desired <= std::numeric_limits<std::size_t>::max() &&
+            cudaMallocHost(&staging, static_cast<std::size_t>(desired)) ==
+                cudaSuccess) {
+            state.weight_host_staging = static_cast<std::byte*>(staging);
+            state.weight_host_staging_bytes = desired;
+        } else {
+            // Pinned staging is an optimization.  A host whose lockable-memory
+            // budget is smaller keeps the exact pageable path.
+            static_cast<void>(cudaGetLastError());
+        }
+    }
+    const bool pinned_stage_ready =
+        stage_pageable && state.weight_host_staging != nullptr &&
+        payload_bytes <= state.weight_host_staging_bytes;
+    const auto reserve_staging = [&](std::uint64_t bytes,
+                                     const std::byte*& source,
+                                     const std::byte* original) -> cudaError_t {
+        if (!pinned_stage_ready || bytes == 0U) {
+            source = original;
+            return cudaSuccess;
+        }
+        constexpr std::uint64_t alignment = 256U;
+        auto cursor = (state.weight_host_staging_cursor + alignment - 1U) &
+                      ~(alignment - 1U);
+        if (cursor > state.weight_host_staging_bytes ||
+            bytes > state.weight_host_staging_bytes - cursor) {
+            // Every earlier slice is consumed by this one upload stream.  Wait
+            // only when the ring wraps, then recycle the whole arena at once.
+            const auto drained = cudaStreamSynchronize(upload_stream);
+            if (drained != cudaSuccess) return drained;
+            cursor = 0U;
+        }
+        auto* destination = state.weight_host_staging + cursor;
+        std::memcpy(destination, original, static_cast<std::size_t>(bytes));
+        state.weight_host_staging_cursor = cursor + bytes;
+        source = destination;
+        return cudaSuccess;
+    };
+    const std::byte* weight_source = weights.data();
+    if (auto status = reserve_staging(weights.size(), weight_source,
+                                      weights.data());
+        status != cudaSuccess) {
+        return upload_error(status, "recycle pinned CUDA weight staging");
+    }
     auto copy_started = std::chrono::steady_clock::now();
-    if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
+    if (auto status = cudaMemcpyAsync(target->weights, weight_source, weights.size(),
                                       cudaMemcpyHostToDevice, upload_stream);
         status != cudaSuccess) {
         return upload_error(status, "upload CUDA weights");
@@ -572,8 +630,14 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             allocation_nanoseconds +=
                 elapsed_nanoseconds_since(scale_allocation_started);
         }
+        const std::byte* scale_source = scales.data();
+        if (auto status = reserve_staging(scales.size(), scale_source,
+                                          scales.data());
+            status != cudaSuccess) {
+            return upload_error(status, "recycle pinned CUDA scale staging");
+        }
         copy_started = std::chrono::steady_clock::now();
-        if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
+        if (auto status = cudaMemcpyAsync(target->scales, scale_source, scales.size(),
                                           cudaMemcpyHostToDevice, upload_stream);
             status != cudaSuccess) {
             return upload_error(status, "upload CUDA scales");
@@ -878,4 +942,11 @@ ValidationResult CudaBackend::allocate_buffer(
         stats.workspace_allocation_bytes += bytes;
     }
     return result;
+}
+ValidationResult CudaBackend::profiler_start() {
+    return cuda_error(cudaProfilerStart(), "start CUDA profiler capture");
+}
+
+ValidationResult CudaBackend::profiler_stop() {
+    return cuda_error(cudaProfilerStop(), "stop CUDA profiler capture");
 }

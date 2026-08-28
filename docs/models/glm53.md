@@ -48,8 +48,19 @@ this adapter's current contract.
 
 ## Current operating point
 
-The implementation is correctness-first and storage-dependent. It uploads one
-linear module at a time and retains only recurrent KDA state, convolution
-history, and compressed MLA latents. This bounds persistent memory without
-claiming a measured throughput figure. Run placement preflight on the target
-machine and treat checkpoint I/O as part of every decode step.
+The runtime discovers CPU width, free VRAM, peer topology and storage at
+startup. On hosts where the routed checkpoint is much larger than the usable
+CUDA cache, it maps canonical FP8 experts once and executes them directly from
+host memory while keeping the non-expert spine, fused KDA state and mHC
+transitions on CUDA. Prompt pages group rows by expert so an expert is traversed
+once for every row that selected it; decode does not reread routed experts from
+the checkpoint through Strata's explicit I/O path per token (the OS still owns
+page-cache residency for mapped payloads). Systems with a high-speed two-GPU
+peer fabric additionally admit the full TP2 route; PCIe systems use a
+contiguous pipeline schedule.
+
+MTP drafting and verification are implemented but opt in because acceptance is
+workload-dependent. Set `STRATA_GLM53_MTP=1` for an acceptance campaign. The
+exact production latency path leaves it disabled. Resident absorbed MLA remains
+an explicit experimental route (`STRATA_GLM53_RESIDENT_MLA=1`) until its
+BF16-boundary equivalence gate is closed; it is never selected silently.

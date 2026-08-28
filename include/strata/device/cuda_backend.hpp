@@ -672,10 +672,23 @@ struct CudaBufferPatch {
 // the O(H * D^2) recurrence never crosses PCIe after prompt admission.
 struct CudaGlm53KdaRequest {
     const CudaBuffer* state{};
-    // Optional same-device FP8 output projection. When present, the normalized
+    // When `input` is present these nine same-device weights turn the command
+    // into the complete KDA attention sublayer. All intermediate activations
+    // stay in the persistent state buffer and only the final O projection is
+    // published. Empty input preserves the narrower projected-input oracle.
+    const CudaWeight* query_projection{};
+    const CudaWeight* key_projection{};
+    const CudaWeight* value_projection{};
+    const CudaWeight* forget_a_projection{};
+    const CudaWeight* beta_projection{};
+    const CudaWeight* gate_a_projection{};
+    const CudaWeight* forget_b_projection{};
+    const CudaWeight* gate_b_projection{};
+    // Optional same-device BF16/FP8 output projection. When present, the normalized
     // KDA heads never return to the host; `output` is the projection's BF16
     // row rather than the unprojected head row.
     const CudaWeight* output_projection{};
+    std::span<const float> input;
     std::span<const float> query;
     std::span<const float> key;
     std::span<const float> value;
@@ -685,6 +698,25 @@ struct CudaGlm53KdaRequest {
     std::uint32_t heads{};
     std::uint32_t head_dim{};
     std::uint32_t convolution_kernel{};
+    // Consume the BF16 layer input from, and publish the BF16 branch into,
+    // the active resident mHC workspace. `input` and `output` are empty and
+    // the complete attention command remains stream ordered in this mode.
+    bool mhc_source_destination{};
+};
+
+struct CudaGlm53MlaRequest {
+    const CudaBuffer* state{};
+    const CudaWeight* query_a{};
+    const CudaWeight* key_value_a{};
+    const CudaWeight* query_b{};
+    const CudaWeight* key_value_b{};
+    const CudaWeight* output{};
+    std::uint32_t position{};
+    std::uint32_t maximum_context{};
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t query_rank{};
+    std::uint32_t key_value_rank{};
 };
 
 // Persistent target-format inputs for one DeepSeek mHC pre boundary. The
@@ -1068,6 +1100,13 @@ public:
         int device, std::uint64_t bytes, CudaBuffer& output);
     [[nodiscard]] ValidationResult glm53_kda_decode(
         const CudaGlm53KdaRequest& request, std::span<float> output);
+    [[nodiscard]] ValidationResult glm53_mhc_router(
+        int device, const CudaWeight& router, std::span<float> logits);
+    [[nodiscard]] ValidationResult glm53_mhc_swiglu(
+        int device, const CudaWeight& gate, const CudaWeight& up,
+        const CudaWeight& down, std::uint32_t intermediate);
+    [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
+        const CudaGlm53MlaRequest& request);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
         std::span<const std::uint16_t> values, std::uint32_t start,
@@ -1222,6 +1261,8 @@ public:
         std::span<float> hidden);
     [[nodiscard]] ValidationResult dsv4_mhc_finish_device(
         int device, std::span<float> hidden);
+    [[nodiscard]] ValidationResult dsv4_mhc_download_layer_input(
+        int device, std::span<float> layer_input);
     // Device-only rank-local mHC bridges.  These preserve the existing state
     // machine while keeping the attention/FFN boundary on the CUDA stream.
     [[nodiscard]] ValidationResult dsv4_mhc_device_view(
@@ -1411,10 +1452,16 @@ public:
         std::span<const CudaMoeExpert> routed,
         const CudaMoeExpert* shared = nullptr,
         float swiglu_limit = 0.0F);
+    [[nodiscard]] ValidationResult enqueue_glm53_moe_from_mhc(
+        int device, std::span<const CudaMoeExpert> routed,
+        const CudaMoeExpert& shared, std::span<const float> coefficients,
+        float swiglu_limit);
     [[nodiscard]] ValidationResult collect_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output = {});
     [[nodiscard]] ValidationResult synchronize(int device);
+    [[nodiscard]] ValidationResult profiler_start();
+    [[nodiscard]] ValidationResult profiler_stop();
 
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
@@ -1426,6 +1473,12 @@ private:
         int device, const CudaDsv4MhcWeights& weights,
         std::span<const float> hidden, std::span<float> weighted,
         std::span<float> layer_input, bool device_only);
+    [[nodiscard]] ValidationResult enqueue_moe_impl(
+        int device, std::span<const float> hidden, std::uint32_t rows,
+        std::span<const CudaMoeExpert> routed,
+        const CudaMoeExpert* shared, float swiglu_limit,
+        bool mhc_source_destination,
+        std::span<const float> routed_coefficients);
     [[nodiscard]] ValidationResult dsv4_mhc_transition_impl(
         int device, const CudaDsv4MhcWeights& next_weights,
         std::span<const float> branch_output, std::span<float> weighted,

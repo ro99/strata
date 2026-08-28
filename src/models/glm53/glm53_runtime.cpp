@@ -33,6 +33,13 @@
 #include <unordered_set>
 #include <utility>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define STRATA_GLM53_HOST_AVX2 1
+#else
+#define STRATA_GLM53_HOST_AVX2 0
+#endif
+
 namespace strata {
 
 std::vector<std::size_t> glm53_projection_slots(
@@ -88,6 +95,127 @@ constexpr std::uint32_t kMtpLayer = 45U;
 constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
+
+struct Glm53HostFp8Linear {
+    std::span<const std::byte> weights;
+    std::span<const float> scales;
+    std::uint32_t rows{};
+    std::uint32_t columns{};
+};
+
+[[nodiscard]] float glm53_quantize_e4m3(float value) noexcept {
+    const float magnitude = std::min(std::abs(value), 448.0F);
+    float quantized = 0.0F;
+    if (magnitude < 0.015625F) {
+        quantized = std::rint(std::ldexp(magnitude, 9)) *
+                    std::ldexp(1.0F, -9);
+    } else {
+        int exponent = 0;
+        static_cast<void>(std::frexp(magnitude, &exponent));
+        exponent = std::clamp(exponent - 1, -6, 8);
+        const float step = std::ldexp(1.0F, exponent - 3);
+        quantized = std::min(std::rint(magnitude / step) * step, 448.0F);
+    }
+    return std::copysign(quantized, value);
+}
+
+void glm53_quantize_activation(std::span<float> values) noexcept {
+    constexpr std::size_t block = 128U;
+    for (std::size_t begin = 0U; begin < values.size(); begin += block) {
+        const auto end = std::min(begin + block, values.size());
+        float maximum = 0.0F;
+        for (auto index = begin; index < end; ++index) {
+            maximum = std::max(maximum, std::abs(values[index]));
+        }
+        const float scale = maximum > 0.0F ? maximum / 448.0F : 1.0F;
+        for (auto index = begin; index < end; ++index) {
+            values[index] = glm53_quantize_e4m3(values[index] / scale) * scale;
+        }
+    }
+}
+
+[[nodiscard]] const std::array<float, 256U>& glm53_fp8_values() noexcept {
+    static const auto values = [] {
+        std::array<float, 256U> result{};
+        for (std::size_t index = 0U; index < result.size(); ++index) {
+            result[index] = fp8_e4m3_f32(static_cast<std::uint8_t>(index));
+        }
+        return result;
+    }();
+    return values;
+}
+
+[[nodiscard]] float glm53_host_fp8_dot_scalar(
+    const std::byte* weights, const float* scales,
+    std::span<const float> input) noexcept {
+    const auto& values = glm53_fp8_values();
+    float sum = 0.0F;
+    for (std::size_t column = 0U; column < input.size(); ++column) {
+        const auto code = std::to_integer<std::uint8_t>(weights[column]);
+        sum = std::fma(input[column] * values[code], scales[column / 128U], sum);
+    }
+    return sum;
+}
+
+#if STRATA_GLM53_HOST_AVX2
+__attribute__((target("avx2,fma")))
+[[nodiscard]] float glm53_host_fp8_dot_avx2(
+    const std::byte* weights, const float* scales,
+    std::span<const float> input) noexcept {
+    const auto& values = glm53_fp8_values();
+    __m256 accumulators[8]{
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()};
+    std::size_t column = 0U;
+    for (; column + 64U <= input.size(); column += 64U) {
+        const auto scale = _mm256_set1_ps(scales[column / 128U]);
+        for (std::size_t group = 0U; group < 8U; ++group) {
+            const auto offset = column + group * 8U;
+            const auto bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(
+                weights + offset));
+            const auto indices = _mm256_cvtepu8_epi32(bytes);
+            const auto decoded = _mm256_i32gather_ps(values.data(), indices, 4);
+            const auto activation = _mm256_loadu_ps(input.data() + offset);
+            accumulators[group] = _mm256_fmadd_ps(
+                _mm256_mul_ps(decoded, scale), activation,
+                accumulators[group]);
+        }
+    }
+    // Keep eight independent dependency chains through the matrix and combine
+    // only once at the end.  This is the host analogue of DeepSeek's tiled
+    // executor: the checkpoint byte is decoded in-register and never expanded
+    // into a second resident copy.
+    for (std::size_t width = 4U; width != 0U; width >>= 1U) {
+        for (std::size_t index = 0U; index < width; ++index) {
+            accumulators[index] = _mm256_add_ps(
+                accumulators[index], accumulators[index + width]);
+        }
+    }
+    const __m128 low = _mm256_castps256_ps128(accumulators[0]);
+    const __m128 high = _mm256_extractf128_ps(accumulators[0], 1);
+    __m128 total = _mm_add_ps(low, high);
+    total = _mm_hadd_ps(total, total);
+    total = _mm_hadd_ps(total, total);
+    float sum = _mm_cvtss_f32(total);
+    for (; column < input.size(); ++column) {
+        const auto code = std::to_integer<std::uint8_t>(weights[column]);
+        sum = std::fma(input[column] * values[code], scales[column / 128U], sum);
+    }
+    return sum;
+}
+#endif
+
+[[nodiscard]] float glm53_host_fp8_dot(
+    const std::byte* weights, const float* scales,
+    std::span<const float> input) noexcept {
+#if STRATA_GLM53_HOST_AVX2
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        return glm53_host_fp8_dot_avx2(weights, scales, input);
+    }
+#endif
+    return glm53_host_fp8_dot_scalar(weights, scales, input);
+}
 constexpr std::uint32_t kMlaHead = 256U;
 constexpr std::uint32_t kMlaWidth = kHeads * kMlaHead;
 constexpr std::uint32_t kQueryRank = 1536U;
@@ -95,6 +223,8 @@ constexpr std::uint32_t kKvRank = 512U;
 constexpr std::uint32_t kMhc = 4U;
 constexpr std::uint32_t kVocabulary = 154880U;
 constexpr std::uint32_t kExactSparseContext = 2048U;
+constexpr std::uint64_t kKdaWorkspaceFloats =
+    2ULL * kHidden + 6ULL * kLinearWidth + 2ULL * kLinearHead + kHeads;
 constexpr std::uint64_t kDeviceWorkspaceReserve = 2ULL << 30U;
 constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 
@@ -196,12 +326,22 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 }
 
 [[nodiscard]] bool fused_kda_enabled() noexcept {
-    // The kernel is exact, but until the surrounding mHC/FFN chain is also
-    // device-resident, its per-layer completion boundary loses to ReplaySSM.
-    // Keep the development route explicit rather than making production
-    // slower while the complete fused chain is being assembled.
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_FUSED_KDA");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool resident_mla_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_RESIDENT_MLA");
+        // The absorbed resident MLA route remains a profiling candidate until
+        // its layer-by-layer exactness gate is closed.  Never make an
+        // experimental arithmetic path the production default.
         return value != nullptr && std::string_view(value) != "0" &&
                std::string_view(value) != "false" &&
                std::string_view(value) != "off";
@@ -209,13 +349,35 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool profiler_capture_enabled() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_NSYS_CAPTURE");
+    return value != nullptr && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "off";
+}
+
+// -1 selects from the discovered CPU width and the admitted CUDA residency;
+// 0/1 are explicit campaign overrides.
+[[nodiscard]] int host_moe_override() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_HOST_MOE");
+    if (value == nullptr || std::string_view(value) == "auto") return -1;
+    return std::string_view(value) != "0" &&
+                   std::string_view(value) != "false" &&
+                   std::string_view(value) != "off"
+               ? 1 : 0;
+}
+
 [[nodiscard]] bool mtp_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_MTP");
-        return value == nullptr ||
-               (std::string_view(value) != "0" &&
+        // The checkpoint MTP layer is fully wired, but verification only pays
+        // when its measured acceptance rate amortizes the extra draft pass.
+        // Keep the production latency route deterministic and opt in to an
+        // MTP campaign explicitly until that gate has been established for a
+        // workload.
+        return value != nullptr && std::string_view(value) != "0" &&
                 std::string_view(value) != "false" &&
-                std::string_view(value) != "off");
+                std::string_view(value) != "off";
     }();
     return enabled;
 }
@@ -786,35 +948,177 @@ public:
     }
 
     [[nodiscard]] ValidationResult kda_decode(
-        std::size_t slot, std::string_view output_projection,
+        std::size_t slot, std::string_view attention,
         CudaGlm53KdaRequest request, std::span<float> output) {
         if (slot >= states_.size() || request.state == nullptr) {
             return {{"GLM-5.3 fused KDA targets an invalid CUDA cache slot"}};
         }
         auto& state = *states_[slot];
         std::scoped_lock lock(state.mutex);
-        const auto found = state.entries.find(std::string(output_projection));
-        if (found == state.entries.end() ||
-            found->second.weight.device() != request.state->device()) {
+        const std::array<std::string, 9U> keys{
+            std::string(attention) + "q_proj",
+            std::string(attention) + "k_proj",
+            std::string(attention) + "v_proj",
+            std::string(attention) + "f_a_proj",
+            std::string(attention) + "b_proj",
+            std::string(attention) + "g_a_proj",
+            std::string(attention) + "f_b_proj",
+            std::string(attention) + "g_b_proj",
+            std::string(attention) + "o_proj"};
+        std::array<Entry*, 9U> entries{};
+        const auto first = request.input.empty() &&
+                                   !request.mhc_source_destination
+                               ? keys.size() - 1U
+                               : 0U;
+        for (std::size_t index = first; index < keys.size(); ++index) {
+            const auto found = state.entries.find(keys[index]);
+            if (found == state.entries.end() ||
+                found->second.weight.device() != request.state->device()) {
+                return {{"GLM-5.3 fused KDA projection was not admitted on "
+                         "its layer device: " + keys[index]}};
+            }
+            entries[index] = &found->second;
+        }
+        if (entries.back() == nullptr) {
             return {{"GLM-5.3 fused KDA output projection was not admitted "
                      "on its layer device"}};
+        }
+        struct Lease {
+            std::span<Entry* const> entries;
+            ~Lease() {
+                for (auto* entry : entries) {
+                    if (entry != nullptr) --entry->leases;
+                }
+            }
+        } lease{entries};
+        for (auto* entry : entries) {
+            if (entry != nullptr) ++entry->leases;
+        }
+        request.query_projection = entries[0] == nullptr
+            ? nullptr : &entries[0]->weight;
+        request.key_projection = entries[1] == nullptr
+            ? nullptr : &entries[1]->weight;
+        request.value_projection = entries[2] == nullptr
+            ? nullptr : &entries[2]->weight;
+        request.forget_a_projection = entries[3] == nullptr
+            ? nullptr : &entries[3]->weight;
+        request.beta_projection = entries[4] == nullptr
+            ? nullptr : &entries[4]->weight;
+        request.gate_a_projection = entries[5] == nullptr
+            ? nullptr : &entries[5]->weight;
+        request.forget_b_projection = entries[6] == nullptr
+            ? nullptr : &entries[6]->weight;
+        request.gate_b_projection = entries[7] == nullptr
+            ? nullptr : &entries[7]->weight;
+        request.output_projection = &entries[8]->weight;
+        return backend_.glm53_kda_decode(request, output);
+    }
+
+    [[nodiscard]] ValidationResult router_mhc(
+        std::size_t slot, std::string_view key, std::span<float> logits) {
+        if (slot >= states_.size()) {
+            return {{"GLM-5.3 resident router targets an invalid cache slot"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        const auto found = state.entries.find(std::string(key));
+        if (found == state.entries.end() ||
+            found->second.weight.device() != devices_[slot]) {
+            return {{"GLM-5.3 resident router was not admitted on its layer "
+                     "device: " + std::string(key)}};
         }
         ++found->second.leases;
         struct Lease {
             Entry& entry;
             ~Lease() { --entry.leases; }
         } lease{found->second};
-        request.output_projection = &found->second.weight;
-        return backend_.glm53_kda_decode(request, output);
+        return backend_.glm53_mhc_router(
+            devices_[slot], found->second.weight, logits);
+    }
+
+    [[nodiscard]] ValidationResult mla_decode_mhc(
+        std::size_t slot, std::string_view attention,
+        CudaGlm53MlaRequest request) {
+        if (slot >= states_.size() || request.state == nullptr) {
+            return {{"GLM-5.3 resident MLA targets an invalid cache slot"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        const std::array<std::string, 5U> keys{
+            std::string(attention) + "q_a_proj",
+            std::string(attention) + "kv_a_proj_with_mqa",
+            std::string(attention) + "q_b_proj",
+            std::string(attention) + "kv_b_proj",
+            std::string(attention) + "o_proj"};
+        std::array<Entry*, 5U> entries{};
+        for (std::size_t index = 0U; index < keys.size(); ++index) {
+            const auto found = state.entries.find(keys[index]);
+            if (found == state.entries.end() ||
+                found->second.weight.device() != request.state->device()) {
+                return {{"GLM-5.3 resident MLA projection was not admitted: " +
+                         keys[index]}};
+            }
+            entries[index] = &found->second;
+        }
+        for (auto* entry : entries) ++entry->leases;
+        struct Lease {
+            std::array<Entry*, 5U>& entries;
+            ~Lease() {
+                for (auto* entry : entries) --entry->leases;
+            }
+        } lease{entries};
+        request.query_a = &entries[0]->weight;
+        request.key_value_a = &entries[1]->weight;
+        request.query_b = &entries[2]->weight;
+        request.key_value_b = &entries[3]->weight;
+        request.output = &entries[4]->weight;
+        return backend_.glm53_mla_decode_to_mhc(request);
+    }
+
+    [[nodiscard]] ValidationResult swiglu_mhc(
+        std::size_t slot, std::string_view prefix,
+        std::uint32_t intermediate) {
+        if (slot >= states_.size()) {
+            return {{"GLM-5.3 resident SwiGLU targets an invalid cache slot"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        const std::array<std::string, 3U> keys{
+            std::string(prefix) + "gate_proj",
+            std::string(prefix) + "up_proj",
+            std::string(prefix) + "down_proj"};
+        std::array<Entry*, 3U> entries{};
+        for (std::size_t index = 0U; index < keys.size(); ++index) {
+            const auto found = state.entries.find(keys[index]);
+            if (found == state.entries.end() ||
+                found->second.weight.device() != devices_[slot]) {
+                return {{"GLM-5.3 resident SwiGLU projection was not "
+                         "admitted: " + keys[index]}};
+            }
+            entries[index] = &found->second;
+        }
+        for (auto* entry : entries) ++entry->leases;
+        struct Lease {
+            std::array<Entry*, 3U>& entries;
+            ~Lease() {
+                for (auto* entry : entries) --entry->leases;
+            }
+        } lease{entries};
+        return backend_.glm53_mhc_swiglu(
+            devices_[slot], entries[0]->weight, entries[1]->weight,
+            entries[2]->weight, intermediate);
     }
 
     [[nodiscard]] ValidationResult moe(
         std::size_t slot, std::string_view prefix,
         std::span<const KimiRoutedExpert> routed,
-        std::span<const float> input, std::span<float> output) {
+        std::span<const float> input, std::span<float> output,
+        bool mhc_source_destination = false) {
         ValidationResult result;
         if (slot >= states_.size() || routed.size() != 8U ||
-            input.size() != kHidden || output.size() != kHidden) {
+            (mhc_source_destination
+                 ? (!input.empty() || !output.empty())
+                 : (input.size() != kHidden || output.size() != kHidden))) {
             result.errors.emplace_back("GLM-5.3 MoE command has an invalid shape");
             return result;
         }
@@ -846,7 +1150,8 @@ public:
         // the eight independent routes capacity-proportionally and join their
         // exact host-visible outputs in original router order. PHB/PCIe keeps
         // every route with the layer owner, avoiding duplicate cache traffic.
-        if (devices_.size() == 2U && full_tensor_parallel_enabled() &&
+        if (!mhc_source_destination && devices_.size() == 2U &&
+            full_tensor_parallel_enabled() &&
             cross_gpu_projections_enabled(devices_)) {
             std::vector<std::uint64_t> capacities;
             capacities.reserve(states_.size());
@@ -1023,9 +1328,22 @@ public:
                 break;
             }
             group.routed_output.resize(group.routes.size() * kHidden);
-            auto enqueued = backend_.enqueue_moe(
-                devices_[group_slot], input, 1U, group.descriptors,
-                group.has_shared ? &group.shared_descriptor : nullptr, 10.0F);
+            ValidationResult enqueued;
+            if (mhc_source_destination) {
+                std::vector<float> coefficients;
+                coefficients.reserve(group.routes.size());
+                for (const auto route : group.routes) {
+                    coefficients.push_back(routed[route].weight);
+                }
+                enqueued = backend_.enqueue_glm53_moe_from_mhc(
+                    devices_[group_slot], group.descriptors,
+                    group.shared_descriptor, coefficients, 10.0F);
+            } else {
+                enqueued = backend_.enqueue_moe(
+                    devices_[group_slot], input, 1U, group.descriptors,
+                    group.has_shared ? &group.shared_descriptor : nullptr,
+                    10.0F);
+            }
             if (!enqueued.ok()) {
                 append(result.errors, std::move(enqueued.errors));
                 break;
@@ -1039,13 +1357,16 @@ public:
              ++group_slot) {
             auto& group = groups[group_slot];
             if (group.enqueued) {
-                auto collected = backend_.collect_moe(
-                    devices_[group_slot], group.routed_output,
-                    group.has_shared ? std::span<float>(group.shared_output)
-                                     : std::span<float>{});
+                auto collected = mhc_source_destination
+                    ? backend_.finish_deepseek_moe_chain(devices_[group_slot])
+                    : backend_.collect_moe(
+                          devices_[group_slot], group.routed_output,
+                          group.has_shared
+                              ? std::span<float>(group.shared_output)
+                              : std::span<float>{});
                 if (!collected.ok()) {
                     append(result.errors, std::move(collected.errors));
-                } else {
+                } else if (!mhc_source_destination) {
                     for (std::size_t local = 0U; local < group.routes.size();
                          ++local) {
                         std::copy_n(
@@ -1065,6 +1386,7 @@ public:
             if (!group.leased.empty()) release(group_slot);
         }
         if (!result.ok()) return result;
+        if (mhc_source_destination) return result;
         std::copy(shared_output.begin(), shared_output.end(), output.begin());
         for (std::size_t expert = 0U; expert < routed.size(); ++expert) {
             const auto begin = expert * kHidden;
@@ -1146,7 +1468,13 @@ struct Glm53Runtime::Impl {
 
     struct DeviceSequenceState {
         std::array<CudaBuffer, kLayers> kda;
+        std::array<CudaBuffer, kLayers> mla;
         bool ready{};
+    };
+
+    struct ResidentLayerWeights {
+        CudaDsv4MhcWeights attention;
+        CudaDsv4MhcWeights feedforward;
     };
 
     struct PrefixEntry {
@@ -1195,6 +1523,8 @@ struct Glm53Runtime::Impl {
     std::vector<std::uint64_t> weight_capacities;
     std::vector<Glm53RowRange> lm_head_ranges;
     std::unique_ptr<Glm53WeightCache> weights;
+    std::array<ResidentLayerWeights, kLayers> resident_layers;
+    bool resident_execution_active{};
     RoutePredictor route_predictor;
     std::mutex prefetch_mutex;
     std::condition_variable prefetch_ready;
@@ -1210,6 +1540,10 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> prefetch_dropped{};
     std::atomic<std::uint64_t> prefetch_errors{};
     std::unique_ptr<HostWorkerPool> projection_workers;
+    std::unique_ptr<HostWorkerPool> host_moe_workers;
+    bool host_moe_active{};
+    std::atomic<std::uint64_t> host_moe_calls{};
+    std::atomic<std::uint64_t> host_moe_nanoseconds{};
     bool full_tensor_parallel_active{};
     std::unique_ptr<HostWorkerPool> kda_workers;
     std::atomic<std::uint64_t> parallel_projection_batches{};
@@ -1240,6 +1574,7 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> scheduler_batched_iterations{};
     std::atomic<std::uint64_t> mtp_drafts{};
     std::atomic<std::uint64_t> mtp_accepted{};
+    std::atomic<bool> profiler_captured{};
 
     ~Impl() {
         {
@@ -1288,7 +1623,16 @@ struct Glm53Runtime::Impl {
     }
 
     void request_prefetch(const RoutePrediction& prediction) {
-        if (prefetch_queue_limit == 0U || prediction.key.layer >= kLayers ||
+        // Nsight measured the fused resident chain at 12 useful predictions
+        // out of 90, with speculative uploads adding 2.3 GB/token and holding
+        // the demand cache mutex for 2.55 seconds.  Resident decode already
+        // overlaps a layer's admitted set as one command, so cache pollution
+        // is more expensive than the predictor's occasional hit.  Keep the
+        // predictor available to the host-bound path where it was originally
+        // validated, but never let it contend with the fused demand chain.
+        if (resident_execution_active || host_moe_active ||
+            prefetch_queue_limit == 0U ||
+            prediction.key.layer >= kLayers ||
             !glm53_moe_layer(prediction.key.layer)) {
             return;
         }
@@ -1394,6 +1738,338 @@ struct Glm53Runtime::Impl {
             const auto [found, inserted] = host_tensors.emplace(key, value);
             result.value = inserted ? std::move(value) : found->second;
         }
+        return result;
+    }
+
+    [[nodiscard]] ParseResult<Glm53HostFp8Linear> host_fp8_linear(
+        std::string_view base, std::uint32_t rows,
+        std::uint32_t columns) const {
+        ParseResult<Glm53HostFp8Linear> result;
+        const auto weight_name = std::string(base) + ".weight";
+        const auto scale_name = std::string(base) + ".weight_scale_inv";
+        const auto* descriptor = checkpoint->find(weight_name);
+        const auto* scale_descriptor = checkpoint->find(scale_name);
+        const auto scale_rows = (rows + 127U) / 128U;
+        const auto scale_columns = (columns + 127U) / 128U;
+        if (descriptor == nullptr || scale_descriptor == nullptr ||
+            descriptor->source_dtype != SafetensorsDtype::F8E4M3 ||
+            descriptor->source_shape !=
+                std::vector<std::uint64_t>{rows, columns} ||
+            scale_descriptor->source_dtype != SafetensorsDtype::F32 ||
+            scale_descriptor->source_shape !=
+                std::vector<std::uint64_t>{scale_rows, scale_columns}) {
+            result.errors.push_back(
+                "GLM-5.3 host expert has an invalid FP8 linear: " +
+                std::string(base));
+            return result;
+        }
+        auto weight_payload = checkpoint->view(weight_name);
+        auto scales = checkpoint->view(scale_name);
+        if (!weight_payload.ok()) {
+            result.errors = std::move(weight_payload.errors);
+            return result;
+        }
+        if (!scales.ok()) {
+            result.errors = std::move(scales.errors);
+            return result;
+        }
+        if (weight_payload.value.size_bytes() !=
+                static_cast<std::size_t>(rows) * columns ||
+            scales.value.size_bytes() !=
+                static_cast<std::size_t>(scale_rows) * scale_columns *
+                    sizeof(float) ||
+            reinterpret_cast<std::uintptr_t>(scales.value.data()) %
+                    alignof(float) != 0U) {
+            result.errors.push_back(
+                "GLM-5.3 host expert mapped payload is mis-sized");
+            return result;
+        }
+        result.value = {
+            weight_payload.value,
+            std::span<const float>(
+                reinterpret_cast<const float*>(scales.value.data()),
+                static_cast<std::size_t>(scale_rows) * scale_columns),
+            rows, columns};
+        return result;
+    }
+
+    [[nodiscard]] ValidationResult host_moe(
+        std::string_view prefix, std::span<const KimiRoutedExpert> routed,
+        std::span<const float> input, std::span<float> output) {
+        ValidationResult result;
+        constexpr std::uint32_t intermediate = 2048U;
+        constexpr std::size_t expert_count = 9U;
+        if (!host_moe_active || host_moe_workers == nullptr ||
+            routed.size() != 8U || input.size() != kHidden ||
+            output.size() != kHidden) {
+            return {{"GLM-5.3 host MoE command has an invalid shape"}};
+        }
+        const auto started = std::chrono::steady_clock::now();
+        struct Expert {
+            Glm53HostFp8Linear gate;
+            Glm53HostFp8Linear up;
+            Glm53HostFp8Linear down;
+        };
+        std::array<Expert, expert_count> experts;
+        for (std::size_t index = 0U; index < expert_count; ++index) {
+            const auto module = index < routed.size()
+                ? std::string(prefix) + "experts." +
+                      std::to_string(routed[index].expert) + "."
+                : std::string(prefix) + "shared_experts.";
+            auto gate = host_fp8_linear(module + "gate_proj", intermediate,
+                                        kHidden);
+            auto up = host_fp8_linear(module + "up_proj", intermediate,
+                                      kHidden);
+            auto down = host_fp8_linear(module + "down_proj", kHidden,
+                                        intermediate);
+            if (!gate.ok() || !up.ok() || !down.ok()) {
+                if (!gate.ok()) append(result.errors, std::move(gate.errors));
+                if (!up.ok()) append(result.errors, std::move(up.errors));
+                if (!down.ok()) append(result.errors, std::move(down.errors));
+                return result;
+            }
+            experts[index] = {gate.value, up.value, down.value};
+        }
+        std::vector<float> quantized_input(input.begin(), input.end());
+        glm53_quantize_activation(quantized_input);
+        std::vector<float> activations(expert_count * intermediate);
+        const auto gate_up = host_moe_workers->parallel_for(
+            expert_count * intermediate, [&](std::size_t task) {
+                const auto expert = task / intermediate;
+                const auto row = task % intermediate;
+                const auto& module = experts[expert];
+                const auto scale_columns = kHidden / 128U;
+                const auto* gate_weights = module.gate.weights.data() +
+                    row * kHidden;
+                const auto* up_weights = module.up.weights.data() +
+                    row * kHidden;
+                const auto* gate_scales = module.gate.scales.data() +
+                    (row / 128U) * scale_columns;
+                const auto* up_scales = module.up.scales.data() +
+                    (row / 128U) * scale_columns;
+                auto gate = bf16_round_f32(glm53_host_fp8_dot(
+                    gate_weights, gate_scales, quantized_input));
+                auto up = bf16_round_f32(glm53_host_fp8_dot(
+                    up_weights, up_scales, quantized_input));
+                gate = std::min(gate, 10.0F);
+                up = std::clamp(up, -10.0F, 10.0F);
+                activations[expert * intermediate + row] =
+                    bf16_round_f32(gate * sigmoid(gate) * up);
+            });
+        if (!gate_up.ok()) return gate_up;
+        for (std::size_t expert = 0U; expert < expert_count; ++expert) {
+            glm53_quantize_activation(std::span<float>(activations).subspan(
+                expert * intermediate, intermediate));
+        }
+        std::vector<float> expert_outputs(expert_count * kHidden);
+        const auto down = host_moe_workers->parallel_for(
+            expert_count * kHidden, [&](std::size_t task) {
+                const auto expert = task / kHidden;
+                const auto row = task % kHidden;
+                const auto& module = experts[expert].down;
+                const auto scale_columns = intermediate / 128U;
+                const auto* weight_row = module.weights.data() +
+                    row * intermediate;
+                const auto* scales = module.scales.data() +
+                    (row / 128U) * scale_columns;
+                expert_outputs[expert * kHidden + row] = bf16_round_f32(
+                    glm53_host_fp8_dot(
+                        weight_row, scales,
+                        std::span<const float>(activations).subspan(
+                            expert * intermediate, intermediate)));
+            });
+        if (!down.ok()) return down;
+        std::copy_n(expert_outputs.begin() + 8U * kHidden, kHidden,
+                    output.begin());
+        for (std::size_t expert = 0U; expert < routed.size(); ++expert) {
+            for (std::size_t column = 0U; column < kHidden; ++column) {
+                output[column] = bf16_round_f32(
+                    output[column] + bf16_round_f32(
+                        routed[expert].weight *
+                        expert_outputs[expert * kHidden + column]));
+            }
+        }
+        host_moe_calls.fetch_add(1U, std::memory_order_relaxed);
+        host_moe_nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<
+                std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                          started).count()),
+            std::memory_order_relaxed);
+        return result;
+    }
+
+    [[nodiscard]] ValidationResult host_moe_page(
+        std::string_view prefix,
+        std::span<const std::array<KimiRoutedExpert, 8U>> routes,
+        std::span<const float> input, std::span<float> output) {
+        ValidationResult result;
+        constexpr std::uint32_t intermediate = 2048U;
+        constexpr std::size_t routes_per_row = 8U;
+        constexpr std::size_t outputs_per_row = routes_per_row + 1U;
+        const auto rows = routes.size();
+        if (!host_moe_active || host_moe_workers == nullptr || rows == 0U ||
+            input.size() != rows * kHidden ||
+            output.size() != rows * kHidden) {
+            return {{"GLM-5.3 host page MoE command has an invalid shape"}};
+        }
+        const auto started = std::chrono::steady_clock::now();
+        struct Expert {
+            Glm53HostFp8Linear gate;
+            Glm53HostFp8Linear up;
+            Glm53HostFp8Linear down;
+        };
+        struct Assignment {
+            std::size_t input_row{};
+            std::size_t output_slot{};
+        };
+        struct Group {
+            std::uint32_t expert{};
+            bool shared{};
+            Expert module;
+            std::vector<Assignment> assignments;
+        };
+
+        std::array<std::size_t, 288U> group_for_expert;
+        group_for_expert.fill(std::numeric_limits<std::size_t>::max());
+        std::vector<Group> groups;
+        groups.reserve(std::min<std::size_t>(288U, rows * routes_per_row) + 1U);
+        for (std::size_t row = 0U; row < rows; ++row) {
+            for (std::size_t route = 0U; route < routes_per_row; ++route) {
+                const auto expert = routes[row][route].expert;
+                if (expert >= group_for_expert.size()) {
+                    return {{"GLM-5.3 host page route is out of range"}};
+                }
+                auto& group_index = group_for_expert[expert];
+                if (group_index == std::numeric_limits<std::size_t>::max()) {
+                    group_index = groups.size();
+                    groups.push_back({expert, false, {}, {}});
+                }
+                groups[group_index].assignments.push_back(
+                    {row, row * outputs_per_row + route});
+            }
+        }
+        groups.push_back({0U, true, {}, {}});
+        auto& shared = groups.back();
+        shared.assignments.reserve(rows);
+        for (std::size_t row = 0U; row < rows; ++row) {
+            shared.assignments.push_back(
+                {row, row * outputs_per_row + routes_per_row});
+        }
+
+        for (auto& group : groups) {
+            const auto module = group.shared
+                ? std::string(prefix) + "shared_experts."
+                : std::string(prefix) + "experts." +
+                      std::to_string(group.expert) + ".";
+            auto gate = host_fp8_linear(module + "gate_proj", intermediate,
+                                        kHidden);
+            auto up = host_fp8_linear(module + "up_proj", intermediate,
+                                      kHidden);
+            auto down = host_fp8_linear(module + "down_proj", kHidden,
+                                        intermediate);
+            if (!gate.ok() || !up.ok() || !down.ok()) {
+                if (!gate.ok()) append(result.errors, std::move(gate.errors));
+                if (!up.ok()) append(result.errors, std::move(up.errors));
+                if (!down.ok()) append(result.errors, std::move(down.errors));
+                return result;
+            }
+            group.module = {gate.value, up.value, down.value};
+        }
+
+        std::vector<float> quantized_input(input.begin(), input.end());
+        result = host_moe_workers->parallel_for(rows, [&](std::size_t row) {
+            glm53_quantize_activation(
+                std::span<float>(quantized_input)
+                    .subspan(row * kHidden, kHidden));
+        });
+        if (!result.ok()) return result;
+
+        const auto output_slots = rows * outputs_per_row;
+        std::vector<float> activations(output_slots * intermediate);
+        result = host_moe_workers->parallel_for(
+            groups.size() * intermediate, [&](std::size_t task) {
+                const auto group_index = task / intermediate;
+                const auto projection_row = task % intermediate;
+                const auto& group = groups[group_index];
+                const auto scale_columns = kHidden / 128U;
+                const auto* gate_weights = group.module.gate.weights.data() +
+                    projection_row * kHidden;
+                const auto* up_weights = group.module.up.weights.data() +
+                    projection_row * kHidden;
+                const auto* gate_scales = group.module.gate.scales.data() +
+                    (projection_row / 128U) * scale_columns;
+                const auto* up_scales = group.module.up.scales.data() +
+                    (projection_row / 128U) * scale_columns;
+                for (const auto& assignment : group.assignments) {
+                    const auto source = std::span<const float>(quantized_input)
+                        .subspan(assignment.input_row * kHidden, kHidden);
+                    auto gate = bf16_round_f32(glm53_host_fp8_dot(
+                        gate_weights, gate_scales, source));
+                    auto up = bf16_round_f32(glm53_host_fp8_dot(
+                        up_weights, up_scales, source));
+                    gate = std::min(gate, 10.0F);
+                    up = std::clamp(up, -10.0F, 10.0F);
+                    activations[assignment.output_slot * intermediate +
+                                projection_row] =
+                        bf16_round_f32(gate * sigmoid(gate) * up);
+                }
+            });
+        if (!result.ok()) return result;
+        result = host_moe_workers->parallel_for(
+            output_slots, [&](std::size_t slot) {
+                glm53_quantize_activation(
+                    std::span<float>(activations)
+                        .subspan(slot * intermediate, intermediate));
+            });
+        if (!result.ok()) return result;
+
+        std::vector<float> expert_outputs(output_slots * kHidden);
+        result = host_moe_workers->parallel_for(
+            groups.size() * kHidden, [&](std::size_t task) {
+                const auto group_index = task / kHidden;
+                const auto projection_row = task % kHidden;
+                const auto& group = groups[group_index];
+                const auto& projection = group.module.down;
+                const auto scale_columns = intermediate / 128U;
+                const auto* projection_weights = projection.weights.data() +
+                    projection_row * intermediate;
+                const auto* projection_scales = projection.scales.data() +
+                    (projection_row / 128U) * scale_columns;
+                for (const auto& assignment : group.assignments) {
+                    expert_outputs[assignment.output_slot * kHidden +
+                                   projection_row] = bf16_round_f32(
+                        glm53_host_fp8_dot(
+                            projection_weights, projection_scales,
+                            std::span<const float>(activations).subspan(
+                                assignment.output_slot * intermediate,
+                                intermediate)));
+                }
+            });
+        if (!result.ok()) return result;
+        result = host_moe_workers->parallel_for(
+            rows * kHidden, [&](std::size_t task) {
+                const auto row = task / kHidden;
+                const auto column = task % kHidden;
+                auto value = expert_outputs[
+                    (row * outputs_per_row + routes_per_row) * kHidden +
+                    column];
+                for (std::size_t route = 0U; route < routes_per_row; ++route) {
+                    value = bf16_round_f32(
+                        value + bf16_round_f32(
+                            routes[row][route].weight *
+                            expert_outputs[
+                                (row * outputs_per_row + route) * kHidden +
+                                column]));
+                }
+                output[row * kHidden + column] = value;
+            });
+        if (!result.ok()) return result;
+        host_moe_calls.fetch_add(rows, std::memory_order_relaxed);
+        host_moe_nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<
+                std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                          started).count()),
+            std::memory_order_relaxed);
         return result;
     }
 
@@ -1640,6 +2316,42 @@ struct Glm53Runtime::Impl {
         for (auto& loader : loaders) loader.join();
         for (auto& device_result : device_results) {
             append(result.errors, std::move(device_result.errors));
+        }
+        if (result.ok() && resident_execution_active) {
+            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+                const auto prefix = "model.language_model.layers." +
+                                    std::to_string(layer) + ".";
+                const auto upload_mhc = [&](const std::string& mhc,
+                                            const std::string& norm,
+                                            CudaDsv4MhcWeights& destination)
+                    -> ValidationResult {
+                    auto projection = host_tensor(mhc + "_fn", 24U * 16384U);
+                    auto base = host_tensor(mhc + "_base", 24U);
+                    auto scale = host_tensor(mhc + "_scale", 3U);
+                    auto norm_weight = host_tensor(norm, kHidden);
+                    ValidationResult status;
+                    if (!projection.ok() || !base.ok() || !scale.ok() ||
+                        !norm_weight.ok()) {
+                        append(status.errors, std::move(projection.errors));
+                        append(status.errors, std::move(base.errors));
+                        append(status.errors, std::move(scale.errors));
+                        append(status.errors, std::move(norm_weight.errors));
+                        return status;
+                    }
+                    return cuda.upload_dsv4_mhc_weights(
+                        device_for(layer), *projection.value, *scale.value,
+                        *base.value, *norm_weight.value, destination);
+                };
+                auto status = upload_mhc(
+                    prefix + "hc_attn", prefix + "input_layernorm.weight",
+                    resident_layers[layer].attention);
+                if (!status.ok()) return status;
+                status = upload_mhc(
+                    prefix + "hc_ffn",
+                    prefix + "post_attention_layernorm.weight",
+                    resident_layers[layer].feedforward);
+                if (!status.ok()) return status;
+            }
         }
         if (config.verbose) {
             const auto stats = weights->stats();
@@ -1924,6 +2636,16 @@ struct Glm53Runtime::Impl {
         std::uint32_t layer, const std::string& attention,
         Glm53SequenceState& sequence, CudaBuffer* device_state = nullptr) {
         ValidationResult result;
+        if (device_state != nullptr && fused_kda_enabled()) {
+            CudaGlm53KdaRequest request;
+            request.state = device_state;
+            request.input = input;
+            request.heads = kHeads;
+            request.head_dim = kLinearHead;
+            request.convolution_kernel = 4U;
+            return weights->kda_decode(
+                slot_for(layer), attention, request, output);
+        }
         std::vector<float> query(kLinearWidth), key(kLinearWidth),
             value(kLinearWidth), low(kLinearHead), beta(kHeads),
             gate_low(kLinearHead);
@@ -1991,8 +2713,8 @@ struct Glm53Runtime::Impl {
             request.heads = kHeads;
             request.head_dim = kLinearHead;
             request.convolution_kernel = 4U;
-            return weights->kda_decode(slot_for(layer),
-                                       attention + "o_proj", request, output);
+            return weights->kda_decode(slot_for(layer), attention, request,
+                                       output);
         }
         std::vector<float> heads_out(kLinearWidth);
         const auto query_scale = 1.0F / std::sqrt(static_cast<float>(kLinearHead));
@@ -2480,6 +3202,9 @@ struct Glm53Runtime::Impl {
         if (!result.ok()) return result;
         observe_route(layer, selected, route_request, route_position,
                       schedule_prefetch);
+        if (host_moe_active) {
+            return host_moe(prefix + "mlp.", selected, input, output);
+        }
         return weights->moe(slot_for(layer), prefix + "mlp.", selected,
                             input, output);
     }
@@ -2506,8 +3231,9 @@ struct Glm53Runtime::Impl {
         auto bias = host_tensor(
             prefix + "mlp.gate.e_score_correction_bias", 288U);
         if (!bias.ok()) return {std::move(bias.errors)};
+        std::vector<std::array<KimiRoutedExpert, 8U>> selected_rows(rows);
         for (std::uint32_t row = 0U; row < rows; ++row) {
-            std::array<KimiRoutedExpert, 8U> selected{};
+            auto& selected = selected_rows[row];
             result = kimi_route_topk(
                 selected,
                 std::span<const float>(logits).subspan(
@@ -2518,8 +3244,14 @@ struct Glm53Runtime::Impl {
                 observe_route(layer, selected, route_requests[row],
                               route_positions[row], schedule_prefetch);
             }
+        }
+        if (host_moe_active) {
+            return host_moe_page(prefix + "mlp.", selected_rows, input,
+                                 output);
+        }
+        for (std::uint32_t row = 0U; row < rows; ++row) {
             result = weights->moe(
-                slot_for(layer), prefix + "mlp.", selected,
+                slot_for(layer), prefix + "mlp.", selected_rows[row],
                 input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
                 output.subspan(static_cast<std::size_t>(row) * kHidden, kHidden));
             if (!result.ok()) return result;
@@ -2591,6 +3323,97 @@ struct Glm53Runtime::Impl {
         round_bf16(transitioned);
         std::copy(transitioned.begin(), transitioned.end(), streams.begin());
         return result;
+    }
+
+    [[nodiscard]] ValidationResult forward_layer_resident(
+        std::span<float> streams, std::uint32_t layer,
+        std::uint32_t position, Glm53SequenceState& sequence,
+        DeviceSequenceState& device_sequence) {
+        if (!resident_execution_active || !device_sequence.ready ||
+            streams.size() != static_cast<std::size_t>(kMhc) * kHidden) {
+            return {{"GLM-5.3 resident layer command is not admissible"}};
+        }
+        const auto device = device_for(layer);
+        auto result = cuda.dsv4_mhc_begin_device(
+            device, resident_layers[layer].attention, streams);
+        if (!result.ok()) return result;
+        const auto prefix = "model.language_model.layers." +
+                            std::to_string(layer) + ".";
+        const auto attention = prefix + "self_attn.";
+        if (glm53_kda_layer(layer)) {
+            CudaGlm53KdaRequest request;
+            request.state = &device_sequence.kda[layer];
+            request.heads = kHeads;
+            request.head_dim = kLinearHead;
+            request.convolution_kernel = 4U;
+            request.mhc_source_destination = true;
+            result = weights->kda_decode(
+                slot_for(layer), attention, request, {});
+        } else {
+            CudaGlm53MlaRequest request;
+            request.state = &device_sequence.mla[layer];
+            request.position = position;
+            request.maximum_context = config.maximum_context_tokens;
+            request.heads = kHeads;
+            request.head_dim = kMlaHead;
+            request.query_rank = kQueryRank;
+            request.key_value_rank = kKvRank;
+            result = weights->mla_decode_mhc(
+                slot_for(layer), attention, request);
+        }
+        if (!result.ok()) return result;
+        result = cuda.dsv4_mhc_transition_next_device(
+            device, resident_layers[layer].feedforward);
+        if (!result.ok()) return result;
+        if (host_moe_active) {
+            std::vector<float> normalized(kHidden), branch(kHidden);
+            result = cuda.dsv4_mhc_download_layer_input(device, normalized);
+            if (!result.ok()) return result;
+            if (glm53_moe_layer(layer)) {
+                std::vector<float> logits(288U);
+                result = weights->router_mhc(
+                    slot_for(layer), prefix + "mlp.gate", logits);
+                if (!result.ok()) return result;
+                auto bias = host_tensor(
+                    prefix + "mlp.gate.e_score_correction_bias", 288U);
+                if (!bias.ok()) return {std::move(bias.errors)};
+                std::array<KimiRoutedExpert, 8U> selected{};
+                result = kimi_route_topk(selected, logits, *bias.value, 2.5F);
+                if (!result.ok()) return result;
+                observe_route(
+                    layer, selected, route_request_key(&sequence, position),
+                    position, false);
+                result = host_moe(prefix + "mlp.", selected, normalized,
+                                  branch);
+            } else {
+                result = swiglu_block(branch, normalized, prefix + "mlp.",
+                                      12288U, layer);
+            }
+            if (!result.ok()) return result;
+            return cuda.dsv4_mhc_finish(device, branch, streams);
+        }
+        if (glm53_moe_layer(layer)) {
+            std::vector<float> logits(288U);
+            result = weights->router_mhc(
+                slot_for(layer), prefix + "mlp.gate", logits);
+            if (!result.ok()) return result;
+            auto bias = host_tensor(
+                prefix + "mlp.gate.e_score_correction_bias", 288U);
+            if (!bias.ok()) return {std::move(bias.errors)};
+            std::array<KimiRoutedExpert, 8U> selected{};
+            result = kimi_route_topk(selected, logits, *bias.value, 2.5F);
+            if (!result.ok()) return result;
+            observe_route(
+                layer, selected, route_request_key(&sequence, position),
+                position, true);
+            result = weights->moe(
+                slot_for(layer), prefix + "mlp.", selected, {}, {}, true);
+        } else {
+            result = weights->swiglu_mhc(
+                slot_for(layer), prefix + "mlp.", 12288U);
+        }
+        if (!result.ok()) return result;
+        return cuda.dsv4_mhc_finish_device(device, streams);
     }
 
     [[nodiscard]] ValidationResult forward_layer_page(
@@ -2706,6 +3529,14 @@ struct Glm53Runtime::Impl {
             device_sequences.size() != rows ||
             streams.size() != static_cast<std::size_t>(rows) * stream_columns) {
             return {{"GLM-5.3 independent layer batch has an invalid shape"}};
+        }
+        if (rows == 1U && device_sequences.front() != nullptr &&
+            resident_execution_active &&
+            (glm53_kda_layer(layer) || resident_mla_enabled()) &&
+            (glm53_moe_layer(layer) || host_moe_active)) {
+            return forward_layer_resident(
+                streams, layer, positions.front(), *sequences.front(),
+                *device_sequences.front());
         }
         const auto hidden_elements = static_cast<std::size_t>(rows) * kHidden;
         std::vector<float> collapsed(hidden_elements), normalized(hidden_elements),
@@ -3219,9 +4050,42 @@ struct Glm53Runtime::Impl {
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
         ValidationResult result;
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-            if (!glm53_kda_layer(layer)) continue;
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";
+            if (!glm53_kda_layer(layer)) {
+                const auto cache_floats =
+                    static_cast<std::size_t>(config.maximum_context_tokens) *
+                    kKvRank;
+                std::vector<float> packed(
+                    cache_floats + kQueryRank + kKvRank, 0.0F);
+                const auto latent = sequence.mla(layer).materialize();
+                if (latent.size() > cache_floats) {
+                    return {{"GLM-5.3 resident MLA cache exceeds its admitted "
+                             "context"}};
+                }
+                std::copy(latent.begin(), latent.end(), packed.begin());
+                auto q_norm = host_tensor(
+                    attention + "q_a_layernorm.weight", kQueryRank);
+                auto kv_norm = host_tensor(
+                    attention + "kv_a_layernorm.weight", kKvRank);
+                if (!q_norm.ok() || !kv_norm.ok()) {
+                    append(result.errors, std::move(q_norm.errors));
+                    append(result.errors, std::move(kv_norm.errors));
+                    return result;
+                }
+                std::copy(q_norm.value->begin(), q_norm.value->end(),
+                          packed.begin() +
+                              static_cast<std::ptrdiff_t>(cache_floats));
+                std::copy(kv_norm.value->begin(), kv_norm.value->end(),
+                          packed.begin() + static_cast<std::ptrdiff_t>(
+                                               cache_floats + kQueryRank));
+                result = cuda.upload_buffer(
+                    device_for(layer),
+                    std::as_bytes(std::span<const float>(packed)),
+                    device_sequence.mla[layer]);
+                if (!result.ok()) return result;
+                continue;
+            }
             const std::array<std::string, 3U> tap_names{
                 attention + "q_conv1d.weight",
                 attention + "k_conv1d.weight",
@@ -3251,7 +4115,7 @@ struct Glm53Runtime::Impl {
                 static_cast<std::size_t>(3U) * kLinearWidth * 4U;
             std::vector<float> packed(
                 recurrent.size() + convolution_elements + tap_elements +
-                kHeads + kLinearWidth + kLinearHead);
+                kHeads + kLinearWidth + kLinearHead + kKdaWorkspaceFloats);
             auto destination = packed.begin();
             destination = std::copy(recurrent.begin(), recurrent.end(),
                                     destination);
@@ -3588,9 +4452,26 @@ struct Glm53Runtime::Impl {
                             step_requests.size() * kVocabulary);
                         std::vector<float> step_hidden(
                             step_requests.size() * kHidden);
+                        const bool capture = profiler_capture_enabled() &&
+                            !profiler_captured.exchange(
+                                true, std::memory_order_relaxed);
+                        if (capture) {
+                            const auto started = cuda.profiler_start();
+                            if (!started.ok()) {
+                                std::cerr << "[glm53-profile] "
+                                          << started.errors.front() << '\n';
+                            }
+                        }
                         auto step = forward_token_batch(
                             step_tokens, step_positions, step_sequences,
                             step_device_sequences, step_logits, step_hidden);
+                        if (capture) {
+                            const auto stopped = cuda.profiler_stop();
+                            if (!stopped.ok()) {
+                                std::cerr << "[glm53-profile] "
+                                          << stopped.errors.front() << '\n';
+                            }
+                        }
                         if (!step.ok()) {
                             for (auto& request : step_requests) {
                                 request->result.errors = step.errors;
@@ -3734,6 +4615,39 @@ ValidationResult Glm53Runtime::initialize(
     if (impl_->device_schedule.empty()) {
         return {{"GLM-5.3 could not derive a topology-aware layer schedule"}};
     }
+    impl_->resident_execution_active = fused_kda_enabled();
+    if (impl_->resident_execution_active) {
+        for (const auto device : impl_->devices) {
+            if (!impl_->cuda.validate_dsv4_mhc_device(device).ok()) {
+                impl_->resident_execution_active = false;
+                break;
+            }
+        }
+    }
+    if (impl_->resident_execution_active) {
+        // mHC weights use the same arena as cached linears. Reserve their
+        // exact order of magnitude per discovered layer owner before the
+        // cache fills the arena; no device-count or VRAM-size assumption is
+        // embedded here.
+        constexpr std::uint64_t per_layer_mhc_reserve = 4ULL << 20U;
+        std::vector<std::uint64_t> resident_reserve(impl_->devices.size());
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            resident_reserve[impl_->slot_for(layer)] +=
+                per_layer_mhc_reserve;
+        }
+        for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+            if (impl_->weight_capacities[slot] <= resident_reserve[slot] +
+                                                    kMinimumDeviceBudget) {
+                impl_->resident_execution_active = false;
+                break;
+            }
+        }
+        if (impl_->resident_execution_active) {
+            for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+                impl_->weight_capacities[slot] -= resident_reserve[slot];
+            }
+        }
+    }
     impl_->weights = std::make_unique<Glm53WeightCache>(
         *impl_->checkpoint, impl_->cuda, impl_->devices,
         impl_->weight_capacities);
@@ -3749,6 +4663,38 @@ ValidationResult Glm53Runtime::initialize(
     const auto cache_bytes = std::accumulate(
         impl_->weight_capacities.begin(), impl_->weight_capacities.end(),
         std::uint64_t{0U});
+    const auto routed_bytes = std::accumulate(
+        impl_->checkpoint->manifest().tensors.begin(),
+        impl_->checkpoint->manifest().tensors.end(), std::uint64_t{0U},
+        [](std::uint64_t total, const Glm53ManifestTensor& tensor) {
+            return tensor.role == Glm53TensorRole::RoutedExpert
+                ? total + tensor.source_bytes : total;
+        });
+    const auto& hardware = host_hardware_profile();
+    const auto host_width = std::min<std::size_t>(
+        hardware.worker_threads(0.5), hardware.usable_cpu_ids.size());
+    const auto model_parallel_width = static_cast<std::size_t>(
+        impl_->checkpoint->config().experts_per_token) * 2U;
+    const auto override = host_moe_override();
+    const bool host_instruction_support =
+#if STRATA_GLM53_HOST_AVX2
+        __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+        false;
+#endif
+    const bool host_moe_admitted = override > 0 ||
+        (override < 0 && host_instruction_support &&
+         host_width >= model_parallel_width &&
+         cache_bytes != 0U && routed_bytes > 2U * cache_bytes);
+    if (host_moe_admitted && host_width != 0U) {
+        std::vector<int> cpus(hardware.usable_cpu_ids.begin(),
+                              hardware.usable_cpu_ids.begin() +
+                                  static_cast<std::ptrdiff_t>(host_width));
+        impl_->host_moe_workers = std::make_unique<HostWorkerPool>(
+            std::move(cpus), std::chrono::milliseconds(1));
+        impl_->host_moe_active =
+            impl_->host_moe_workers->size() == host_width;
+    }
     if (expert_bytes != 0U) {
         const auto cache_experts = static_cast<std::size_t>(
             cache_bytes / expert_bytes);
@@ -3795,6 +4741,23 @@ ValidationResult Glm53Runtime::initialize(
                                  ? "high-speed-peer"
                                  : "contiguous-pipeline"))
                   << " activation_hops=" << hops << " layers=" << kLayers
+                  << '\n';
+        std::cerr << "[glm53-resident] mode="
+                  << (impl_->resident_execution_active
+                          ? "fused-layer"
+                          : "host-boundary-fallback")
+                  << '\n';
+        std::cerr << "[glm53-expert-tier] mode="
+                  << (impl_->host_moe_active ? "host-fp8" : "cuda-lru")
+                  << " workers="
+                  << (impl_->host_moe_workers == nullptr
+                          ? 0U : impl_->host_moe_workers->size())
+                  << " routed_gib="
+                  << static_cast<double>(routed_bytes) /
+                         static_cast<double>(1ULL << 30U)
+                  << " cuda_cache_gib="
+                  << static_cast<double>(cache_bytes) /
+                         static_cast<double>(1ULL << 30U)
                   << '\n';
     }
     if (replay_ssm_enabled() || phase_scheduler_enabled()) {
@@ -3948,6 +4911,11 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << impl_->prefetch_errors.load(std::memory_order_relaxed)
                   << " prefetch_queue_limit="
                   << impl_->prefetch_queue_limit
+                  << " host_moe_calls="
+                  << impl_->host_moe_calls.load(std::memory_order_relaxed)
+                  << " host_moe_ms="
+                  << static_cast<double>(impl_->host_moe_nanoseconds.load(
+                         std::memory_order_relaxed)) / 1.0e6
                   << '\n';
         const auto cache = impl_->weights->stats();
         std::cerr << "[glm53-cache] hits=" << cache.hits

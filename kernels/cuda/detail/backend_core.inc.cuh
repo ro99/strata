@@ -117,6 +117,12 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         state.lightning_index_supported = state.flash_attention_supported;
         state.dsv4_fp8_tensor_page_supported =
             properties.major == 8 && properties.minor == 6;
+        // BF16 WMMA is an architectural CUDA capability from Ampere onward.
+        // Keep DeepSeek's experimentally-bound SM86 flag above exact, while
+        // allowing the model-neutral F32-scale route to follow the hardware
+        // discovered at runtime instead of a machine-specific device list.
+        state.fp8_f32_tensor_page_supported = properties.major >= 8;
+        state.fp8_f32_register_fed_supported = properties.major >= 8;
         if (auto status = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
@@ -546,7 +552,9 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     // costs one read and one write of what was staged, measured at 0.509
     // ms/token against Laguna's 65.05 ms staging term (experiment 0168), so it
     // does not need to move off the staging path.
-    if (prepack == FragmentLayout::Prepack && regfed_matmul_enabled()) {
+    if (prepack == FragmentLayout::Prepack && regfed_matmul_enabled() &&
+        (descriptor.encoding != CudaWeightEncoding::Fp8E4m3Block128F32 ||
+         state.fp8_f32_register_fed_supported)) {
         const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
         if (scratch_bytes != 0U) {
             bool ready = true;

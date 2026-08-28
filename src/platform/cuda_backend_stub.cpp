@@ -25,14 +25,22 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::PackedOffsetInt: return "packed_offset_int";
         case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
         case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
+        case CudaMatmulRoute::Fp8F32TensorPage:
+            return "fp8_f32_tensor_page";
         case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
         case CudaMatmulRoute::Fp8E4m3Block128F32:
             return "fp8_e4m3_block128_f32";
         case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
         case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
+        case CudaMatmulRoute::Fp8F32RegisterFed:
+            return "fp8_f32_register_fed";
         case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
         case CudaMatmulRoute::GemmaMarlin: return "gemma_marlin";
         case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
+        case CudaMatmulRoute::MoeFp8E4m3Block128F32:
+            return "moe_fp8_e4m3_block128_f32";
+        case CudaMatmulRoute::MoeFp8F32RegisterFed:
+            return "moe_fp8_f32_register_fed";
         case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
         case CudaMatmulRoute::MoeFp4E2m1Group32: return "moe_fp4_e2m1_group32";
         case CudaMatmulRoute::MoePackedInt4: return "moe_packed_int4";
@@ -215,6 +223,14 @@ ValidationResult CudaBackend::validate_lightning_index_device(int) const {
 }
 
 bool CudaBackend::dsv4_fp8_tensor_page_supported(int) const noexcept {
+    return false;
+}
+
+bool CudaBackend::fp8_f32_tensor_page_supported(int) const noexcept {
+    return false;
+}
+
+bool CudaBackend::fp8_f32_register_fed_supported(int) const noexcept {
     return false;
 }
 
@@ -443,7 +459,7 @@ ValidationResult CudaBackend::collect_deepseek_moe_rows(
 
 ValidationResult CudaBackend::enqueue_moe(
     int, std::span<const float>, std::uint32_t,
-    std::span<const CudaMoeExpert>, const CudaMoeExpert*) {
+    std::span<const CudaMoeExpert>, const CudaMoeExpert*, float) {
     return {{"CUDA support was not compiled into this build"}};
 }
 

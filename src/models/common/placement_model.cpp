@@ -384,8 +384,10 @@ struct Gemma4Linear {
     inventory.per_device_workspace_bytes = 2ULL << 30U;
     inventory.minimum_device_budget_bytes = kMinimumDeviceBudget;
     inventory.contiguous_layer_blocks = false;
-    // The text runtime streams one module at a time from the checkpoint. The
-    // plan reports that contract but does not prescribe a resident layout.
+    // The checkpoint remains the canonical backing store. At runtime the
+    // non-expert spine is pinned opportunistically and experts enter a
+    // free-VRAM-sized demand cache, so this inventory is a cold-cache bound;
+    // it does not prescribe or claim a fixed resident layout.
     inventory.prescriptive = false;
 
     std::map<std::string, ModuleSizes> modules;

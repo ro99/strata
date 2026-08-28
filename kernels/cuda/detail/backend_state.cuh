@@ -106,11 +106,13 @@ struct CudaBackend::Impl {
         void* moe_regfed_down_partials{};
         void* moe_regfed_hidden_fragment{};
         void* moe_regfed_activation_fragment{};
+        void* moe_regfed_compact{};
         std::uint64_t moe_regfed_gate_partial_bytes{};
         std::uint64_t moe_regfed_up_partial_bytes{};
         std::uint64_t moe_regfed_down_partial_bytes{};
         std::uint64_t moe_regfed_hidden_fragment_bytes{};
         std::uint64_t moe_regfed_activation_fragment_bytes{};
+        std::uint64_t moe_regfed_compact_bytes{};
         RegfedWorkspace gemma_regfed{};
         GemmaMarlinWorkspace gemma_marlin{};
         float* moe_regfed_gate{};
@@ -307,6 +309,8 @@ struct CudaBackend::Impl {
         bool dsv4_mhc_supported{};
         bool lightning_index_supported{};
         bool dsv4_fp8_tensor_page_supported{};
+        bool fp8_f32_tensor_page_supported{};
+        bool fp8_f32_register_fed_supported{};
     };
 
     std::unordered_map<int, DeviceState> devices;
@@ -361,7 +365,8 @@ struct CudaBackend::Impl {
                                   state.moe_regfed_up_partials,
                                   state.moe_regfed_down_partials,
                                   state.moe_regfed_hidden_fragment,
-                                  state.moe_regfed_activation_fragment}) {
+                                  state.moe_regfed_activation_fragment,
+                                  state.moe_regfed_compact}) {
                 if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
             }
             if (state.upload_prepack_scratch != nullptr) {

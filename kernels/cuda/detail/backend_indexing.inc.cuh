@@ -64,6 +64,18 @@ bool CudaBackend::dsv4_fp8_tensor_page_supported(int device) const noexcept {
            found->second.dsv4_fp8_tensor_page_supported;
 }
 
+bool CudaBackend::fp8_f32_tensor_page_supported(int device) const noexcept {
+    const auto found = impl_->devices.find(device);
+    return found != impl_->devices.end() &&
+           found->second.fp8_f32_tensor_page_supported;
+}
+
+bool CudaBackend::fp8_f32_register_fed_supported(int device) const noexcept {
+    const auto found = impl_->devices.find(device);
+    return found != impl_->devices.end() &&
+           found->second.fp8_f32_register_fed_supported;
+}
+
 ValidationResult CudaBackend::validate_dsv4_mhc_device(int device) const {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
@@ -1292,4 +1304,3 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     }
     return result;
 }
-

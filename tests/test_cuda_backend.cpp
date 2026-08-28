@@ -154,6 +154,39 @@ strata::CudaWeight upload_fp8(
     return result;
 }
 
+strata::CudaWeight upload_glm_fp8(
+    strata::CudaBackend& backend, int device, std::uint64_t rows,
+    std::uint64_t columns, std::uint8_t seed) {
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Fp8E4m3Block128F32;
+    descriptor.dtype = strata::SafetensorsDtype::F8E4M3;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = columns;
+    descriptor.scale_columns = (columns + 127U) / 128U;
+    descriptor.group_size = 128U;
+    constexpr std::array<std::uint8_t, 8> encodings{
+        0x00U, 0x28U, 0xA8U, 0x30U, 0xB0U, 0x38U, 0xB8U, 0x20U};
+    std::vector<std::byte> weights(static_cast<std::size_t>(rows * columns));
+    for (std::size_t index = 0U; index < weights.size(); ++index) {
+        weights[index] = static_cast<std::byte>(
+            encodings[(index * 5U + seed) % encodings.size()]);
+    }
+    const auto scale_rows = (rows + 127U) / 128U;
+    std::vector<std::byte> scales(
+        static_cast<std::size_t>(scale_rows * descriptor.scale_columns) *
+        sizeof(float));
+    for (std::size_t index = 0U; index < scales.size() / sizeof(float); ++index) {
+        const float scale = 0.125F +
+            static_cast<float>((index + seed) % 3U) * 0.03125F;
+        std::memcpy(scales.data() + index * sizeof(float), &scale,
+                    sizeof(scale));
+    }
+    strata::CudaWeight result;
+    REQUIRE(backend.upload(device, descriptor, weights, scales, result).ok());
+    return result;
+}
+
 strata::CudaWeight upload_int4(
     strata::CudaBackend& backend, int device, std::uint64_t rows,
     std::uint64_t columns, std::uint8_t seed) {
@@ -1953,6 +1986,189 @@ TEST_CASE("GLM-5.3 F32-scaled FP8 uses continuous dynamic activation scales") {
                     strata::CudaMatmulRoute::Fp8E4m3Block128F32)] > 0U);
 }
 
+TEST_CASE("GLM-5.3 F32-scaled FP8 page tensor route preserves its BF16 contract") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+    if (!backend.fp8_f32_tensor_page_supported(device)) return;
+
+    constexpr std::uint32_t batch = 17U;
+    constexpr std::uint32_t columns = 256U;
+    constexpr std::uint32_t rows = 128U;
+    constexpr std::uint32_t scale_columns = columns / 128U;
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding =
+        strata::CudaWeightEncoding::Fp8E4m3Block128F32;
+    descriptor.dtype = strata::SafetensorsDtype::F8E4M3;
+    descriptor.rows = rows;
+    descriptor.columns = columns;
+    descriptor.packed_columns = columns;
+    descriptor.scale_columns = scale_columns;
+    descriptor.group_size = 128U;
+
+    constexpr std::array<std::uint8_t, 10> codes{
+        0x00U, 0x20U, 0xA0U, 0x28U, 0xA8U,
+        0x30U, 0xB0U, 0x38U, 0xB8U, 0x40U};
+    std::vector<std::byte> weight_bytes(
+        static_cast<std::size_t>(rows) * columns);
+    for (std::size_t index = 0U; index < weight_bytes.size(); ++index) {
+        weight_bytes[index] =
+            static_cast<std::byte>(codes[(index * 7U + 3U) % codes.size()]);
+    }
+    std::array<float, scale_columns> weight_scale_values{0.137F, 0.219F};
+    std::vector<std::byte> weight_scales(
+        scale_columns * sizeof(float));
+    std::memcpy(weight_scales.data(), weight_scale_values.data(),
+                weight_scales.size());
+    strata::CudaWeight weight;
+    REQUIRE(backend.upload(device, descriptor, weight_bytes, weight_scales,
+                           weight).ok());
+    strata::CudaWeight prepacked_weight;
+    REQUIRE(backend.upload(device, descriptor, weight_bytes, weight_scales,
+                           prepacked_weight).ok());
+    REQUIRE(backend.prepack_fragment(device, prepacked_weight).ok());
+
+    std::vector<float> input(static_cast<std::size_t>(batch) * columns);
+    std::array<float, batch * scale_columns> activation_scales{};
+    for (std::uint32_t batch_row = 0U; batch_row < batch; ++batch_row) {
+        for (std::uint32_t group = 0U; group < scale_columns; ++group) {
+            const float scale = 0.173F + 0.019F * batch_row + 0.031F * group;
+            activation_scales[batch_row * scale_columns + group] = scale;
+            const auto base = static_cast<std::size_t>(batch_row) * columns +
+                              group * 128U;
+            // Force max/448 to recover the deliberately non-power-of-two
+            // scale. Every other value is also exactly E4M3*scale, so the
+            // independent oracle knows the compact activation codes.
+            input[base] = 448.0F * scale;
+            for (std::uint32_t column = 1U; column < 128U; ++column) {
+                const auto code = codes[(batch_row * 11U + group * 5U +
+                                         column * 3U) % codes.size()];
+                input[base + column] = decode_e4m3(code) * scale;
+            }
+        }
+    }
+
+    std::vector<float> incumbent(static_cast<std::size_t>(batch) * rows);
+    std::vector<float> tensor(incumbent.size());
+    std::vector<float> prepacked_tensor(incumbent.size());
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.matmul(weight, input, batch, incumbent, true, nullptr,
+                           false).ok());
+    REQUIRE(backend.matmul(weight, input, batch, tensor, true, nullptr,
+                           true).ok());
+    REQUIRE(backend.matmul(prepacked_weight, input, batch, prepacked_tensor,
+                           true, nullptr, true).ok());
+    REQUIRE(strata::cuda_matmul_route_census()
+                .counts[static_cast<std::size_t>(
+                    strata::CudaMatmulRoute::Fp8F32TensorPage)] == 2U);
+    for (std::size_t index = 0U; index < tensor.size(); ++index) {
+        REQUIRE(std::bit_cast<std::uint32_t>(prepacked_tensor[index]) ==
+                std::bit_cast<std::uint32_t>(tensor[index]));
+    }
+
+    double incumbent_squared = 0.0;
+    double tensor_squared = 0.0;
+    double incumbent_maximum = 0.0;
+    double tensor_maximum = 0.0;
+    for (std::uint32_t batch_row = 0U; batch_row < batch; ++batch_row) {
+        for (std::uint32_t output_row = 0U; output_row < rows; ++output_row) {
+            double oracle = 0.0;
+            for (std::uint32_t column = 0U; column < columns; ++column) {
+                const auto group = column / 128U;
+                const float activation_code = column % 128U == 0U
+                    ? 448.0F
+                    : decode_e4m3(codes[(batch_row * 11U + group * 5U +
+                                         (column % 128U) * 3U) % codes.size()]);
+                const auto weight_code = std::to_integer<std::uint8_t>(
+                    weight_bytes[static_cast<std::size_t>(output_row) *
+                                     columns + column]);
+                oracle += static_cast<double>(activation_code) *
+                          activation_scales[batch_row * scale_columns + group] *
+                          decode_e4m3(weight_code) *
+                          weight_scale_values[group];
+            }
+            const auto expected = round_bf16(static_cast<float>(oracle));
+            const auto index = static_cast<std::size_t>(batch_row) * rows +
+                               output_row;
+            const double incumbent_error =
+                std::fabs(static_cast<double>(incumbent[index]) - expected);
+            const double tensor_error =
+                std::fabs(static_cast<double>(tensor[index]) - expected);
+            incumbent_squared += incumbent_error * incumbent_error;
+            tensor_squared += tensor_error * tensor_error;
+            incumbent_maximum = std::max(incumbent_maximum, incumbent_error);
+            tensor_maximum = std::max(tensor_maximum, tensor_error);
+        }
+    }
+    // Reassociation is permitted, but the tensor route must not weaken the
+    // carried BF16 result relative to an independent FP64 block-scale oracle.
+    REQUIRE(tensor_maximum <= incumbent_maximum);
+    REQUIRE(tensor_squared <= incumbent_squared);
+}
+
+TEST_CASE("GLM-5.3 F32-scaled FP8 MoE batch matches scalar expert execution") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint64_t hidden_columns = 128U;
+    constexpr std::uint64_t intermediate_columns = 128U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    auto routed_gate = upload_glm_fp8(
+        backend, device, intermediate_columns, hidden_columns, 1U);
+    auto routed_up = upload_glm_fp8(
+        backend, device, intermediate_columns, hidden_columns, 3U);
+    auto routed_down = upload_glm_fp8(
+        backend, device, hidden_columns, intermediate_columns, 5U);
+    auto shared_gate = upload_glm_fp8(
+        backend, device, intermediate_columns, hidden_columns, 7U);
+    auto shared_up = upload_glm_fp8(
+        backend, device, intermediate_columns, hidden_columns, 2U);
+    auto shared_down = upload_glm_fp8(
+        backend, device, hidden_columns, intermediate_columns, 4U);
+    std::array<float, hidden_columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(static_cast<int>(index % 19U) - 9) /
+                        16.0F;
+    }
+    const auto expected_routed = reference_expert(
+        backend, routed_gate, routed_up, routed_down, hidden,
+        intermediate_columns, 1.0F, true);
+    const auto expected_shared = reference_expert(
+        backend, shared_gate, shared_up, shared_down, hidden,
+        intermediate_columns, 1.0F, false);
+
+    REQUIRE(backend.prepack_fragment(device, routed_gate).ok());
+    REQUIRE(backend.prepack_fragment(device, routed_up).ok());
+    REQUIRE(backend.prepack_fragment(device, routed_down).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_gate).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_up).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_down).ok());
+
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&routed_gate, &routed_up, &routed_down, 1.0F},
+    }};
+    const strata::CudaMoeExpert shared{
+        &shared_gate, &shared_up, &shared_down, 1.0F};
+    std::array<float, hidden_columns> routed_output{};
+    std::array<float, hidden_columns> shared_output{};
+    strata::reset_cuda_matmul_route_census();
+    REQUIRE(backend.enqueue_moe(device, hidden, 1U, routed, &shared, 10.0F).ok());
+    REQUIRE(backend.collect_moe(device, routed_output, shared_output).ok());
+    for (std::size_t index = 0U; index < hidden_columns; ++index) {
+        REQUIRE_NEAR(routed_output[index], expected_routed[index], 1.0e-4F);
+        REQUIRE_NEAR(shared_output[index], expected_shared[index], 1.0e-4F);
+    }
+    const auto census = strata::cuda_matmul_route_census();
+    REQUIRE(census.counts[static_cast<std::size_t>(
+                strata::CudaMatmulRoute::MoeFp8F32RegisterFed)] == 1U);
+}
+
 TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE commands") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;
@@ -3457,6 +3673,70 @@ TEST_CASE("MIX-2 register-fed matmul matches the scalar route it replaces") {
     compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 128U, 1U, 0x11U);
     compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 128U, 256U, 5U, 0x27U);
     compare(strata::CudaWeightEncoding::Fp8E4m3Block128, 256U, 256U, 16U, 0x41U);
+    strata::set_register_fed_matmul(true);
+}
+
+TEST_CASE("GLM-5.3 continuous-scale register-fed W8A8 matches scalar execution") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    strata::CudaBackend backend;
+    const int device = devices.front();
+    REQUIRE(backend.initialize(std::vector<int>{device}, true).ok());
+    constexpr std::array<float, 9> palette{
+        1.0F, -1.0F, 0.5F, 2.0F, -0.5F,
+        -2.0F, 0.03125F, -0.0625F, 0.0F};
+
+    const auto compare = [&](std::uint64_t output_rows,
+                             std::uint64_t columns,
+                             std::uint32_t batch,
+                             std::uint8_t seed) {
+        const auto control =
+            upload_glm_fp8(backend, device, output_rows, columns, seed);
+        const auto candidate =
+            upload_glm_fp8(backend, device, output_rows, columns, seed);
+        std::vector<float> activation(
+            static_cast<std::size_t>(columns) * batch);
+        for (std::size_t index = 0U; index < activation.size(); ++index) {
+            activation[index] = palette[(index * 5U + seed) % palette.size()];
+        }
+        std::vector<float> expected(
+            static_cast<std::size_t>(output_rows) * batch);
+        std::vector<float> measured(expected.size());
+
+        strata::set_register_fed_matmul(false);
+        REQUIRE(backend.matmul(control, activation, batch, expected, true).ok());
+        strata::set_register_fed_matmul(true);
+        REQUIRE(backend.prepack_fragment(device, candidate).ok());
+        strata::reset_cuda_matmul_route_census();
+        REQUIRE(backend.matmul(candidate, activation, batch, measured, true).ok());
+        REQUIRE(strata::cuda_matmul_route_census()
+                    .counts[static_cast<std::size_t>(
+                        strata::CudaMatmulRoute::Fp8F32RegisterFed)] > 0U);
+
+        double worst = 0.0;
+        for (std::size_t index = 0U; index < expected.size(); ++index) {
+            const double denominator = std::max(
+                1.0, std::fabs(static_cast<double>(expected[index])));
+            worst = std::max(
+                worst,
+                std::fabs(static_cast<double>(measured[index]) -
+                          static_cast<double>(expected[index])) /
+                    denominator);
+        }
+        if (!(worst < 2.0e-3)) {
+            std::fprintf(stderr,
+                         "GLM register-fed mismatch: N %llu K %llu M %u "
+                         "worst relative residual %g\n",
+                         static_cast<unsigned long long>(output_rows),
+                         static_cast<unsigned long long>(columns), batch,
+                         worst);
+        }
+        REQUIRE(worst < 2.0e-3);
+    };
+
+    compare(128U, 128U, 1U, 0x13U);
+    compare(128U, 256U, 5U, 0x29U);
+    compare(256U, 512U, 16U, 0x47U);
     strata::set_register_fed_matmul(true);
 }
 

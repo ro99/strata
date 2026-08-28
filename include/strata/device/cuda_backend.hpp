@@ -848,6 +848,7 @@ enum class CudaMatmulRoute : std::uint8_t {
     PackedOffsetInt,
     Nvfp4Group16,
     Fp8TensorPage,
+    Fp8F32TensorPage,
     Fp8E4m3Block128,
     Fp8E4m3Block128F32,
     Fp4E2m1Group32,
@@ -857,6 +858,7 @@ enum class CudaMatmulRoute : std::uint8_t {
     // shapes the fragment layout cannot express. The census distinguishes them
     // so a run can show which of the two actually served a dispatch.
     Fp8RegisterFed,
+    Fp8F32RegisterFed,
     Fp4RegisterFed,
     GemmaMarlin,
     // MoE expert batches dispatch through CudaBackend::enqueue_moe, which
@@ -864,6 +866,8 @@ enum class CudaMatmulRoute : std::uint8_t {
     // matmul_impl is load-only. These are counted separately so a census can
     // distinguish a load-time dispatch from a per-token one.
     MoePlainBf16,
+    MoeFp8E4m3Block128F32,
+    MoeFp8F32RegisterFed,
     MoeNvfp4Group16,
     MoeFp4E2m1Group32,
     MoePackedInt4,
@@ -916,8 +920,9 @@ void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
 
 class CudaBackend {
 public:
-    // Permutes an Fp8E4m3Block128 or Fp4E2m1Group32 weight from its canonical
-    // layout into m16n8k16 fragment order, in place. The fragment order
+    // Permutes an Fp8E4m3Block128, Fp8E4m3Block128F32, or Fp4E2m1Group32
+    // weight from its canonical layout into m16n8k16 fragment order, in place.
+    // The fragment order
     // REPLACES the canonical device layout -- one-copy residency, not a second
     // buffer -- so every consumer of that weight must expect fragment order
     // afterwards. matmul_impl and the shared expert call this themselves on
@@ -1066,6 +1071,13 @@ public:
     // projection can use the SM86 BF16-WMMA path. Other capabilities retain
     // the native FP8 CUDA-core kernel as a numerical fallback.
     [[nodiscard]] bool dsv4_fp8_tensor_page_supported(int device) const noexcept;
+    // Model-neutral tensor-core page projection for E4M3 weights with F32
+    // block-128 scales and continuous per-row activation scales. Capability is
+    // discovered from the selected CUDA device; callers still opt in per
+    // projection so a numerical route change is never implicit.
+    [[nodiscard]] bool fp8_f32_tensor_page_supported(int device) const noexcept;
+    [[nodiscard]] bool fp8_f32_register_fed_supported(
+        int device) const noexcept;
     [[nodiscard]] ValidationResult validate_dsv4_mhc_device(
         int device) const;
     // Executes the model-neutral forward attention primitive under the
@@ -1344,7 +1356,8 @@ public:
     [[nodiscard]] ValidationResult enqueue_moe(
         int device, std::span<const float> hidden, std::uint32_t rows,
         std::span<const CudaMoeExpert> routed,
-        const CudaMoeExpert* shared = nullptr);
+        const CudaMoeExpert* shared = nullptr,
+        float swiglu_limit = 0.0F);
     [[nodiscard]] ValidationResult collect_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output = {});

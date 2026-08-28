@@ -708,6 +708,7 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
             "host tier withholds " + format_bytes(inventory.host_reserve_bytes) +
             " for activations, worker stacks, and page cache");
     }
+    const bool glm53_dynamic_cache = inventory.model == PlacementModel::Glm53;
     if (plan.io_dependent) {
         std::string where = "the checkpoint";
         if (hardware.storage.resolved) {
@@ -719,7 +720,8 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
                     ')';
         }
         plan.notes.emplace_back(
-            "steady-state decode reads " +
+            std::string(glm53_dynamic_cache ? "cold-cache decode can read "
+                                            : "steady-state decode reads ") +
             format_bytes(plan.decode_storage_read_bytes) + " per step from " +
             where + ": this configuration is I/O dependent");
     }
@@ -739,7 +741,12 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
                                  " holds no layers at this operating point");
         }
     }
-    if (!inventory.prescriptive) {
+    if (glm53_dynamic_cache) {
+        plan.notes.emplace_back(
+            "GLM dynamically pins its non-expert spine and demand-caches experts "
+            "within live free VRAM; storage residency and reads above are "
+            "checkpoint-backing cold-cache bounds, not steady-state cache misses");
+    } else if (!inventory.prescriptive) {
         plan.notes.emplace_back(
             "descriptive plan: it reports and admits the placement this runtime "
             "already performs and does not change it");

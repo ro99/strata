@@ -176,6 +176,21 @@ ParseResult<std::vector<float>> Glm53CheckpointReader::read_f32_row(
     return result;
 }
 
+std::uint64_t Glm53CheckpointReader::cuda_linear_storage_bytes(
+    std::string_view base_name) const {
+    const auto weight_name = std::string(base_name) + ".weight";
+    const auto* weight = find(weight_name);
+    if (weight == nullptr) return 0U;
+    std::uint64_t scale_bytes = 0U;
+    if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
+        const auto* scale = find(std::string(base_name) + ".weight_scale_inv");
+        if (scale == nullptr) return 0U;
+        scale_bytes = scale->source_bytes;
+    }
+    return CudaBackend::weight_storage_bytes(weight->source_bytes,
+                                              scale_bytes);
+}
+
 ValidationResult Glm53CheckpointReader::load_cuda_linear(
     std::string_view base_name, std::uint64_t rows, std::uint64_t columns,
     int device, CudaBackend& backend, CudaWeight& output) const {
@@ -229,7 +244,14 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
                                 weight_name);
         return result;
     }
-    return backend.upload(device, descriptor, weights.value, scale_bytes, output);
+    const auto fragment_layout =
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
+                backend.fp8_f32_register_fed_supported(device)
+            ? CudaBackend::FragmentLayout::Prepack
+            : CudaBackend::FragmentLayout::Canonical;
+    return backend.upload(device, descriptor, weights.value, scale_bytes,
+                          output, CudaBackend::UploadCompletion::Synchronous,
+                          fragment_layout);
 }
 
 }  // namespace strata

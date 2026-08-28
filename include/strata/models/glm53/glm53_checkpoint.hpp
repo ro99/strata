@@ -43,6 +43,8 @@ public:
         std::string_view name, std::uint64_t maximum_elements) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32_row(
         std::string_view name, std::uint64_t row) const;
+    [[nodiscard]] std::uint64_t cuda_linear_storage_bytes(
+        std::string_view base_name) const;
     [[nodiscard]] ValidationResult load_cuda_linear(
         std::string_view base_name, std::uint64_t rows,
         std::uint64_t columns, int device, CudaBackend& backend,

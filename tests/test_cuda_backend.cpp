@@ -2205,6 +2205,66 @@ TEST_CASE("GLM-5.3 F32-scaled FP8 MoE batch matches scalar expert execution") {
                 strata::CudaMatmulRoute::MoeFp8F32RegisterFed)] == 1U);
 }
 
+TEST_CASE("GLM deferred prefetch overlaps a leased MoE command exactly") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint64_t columns = 128U;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected_device{device};
+    REQUIRE(backend.initialize(selected_device, true).ok());
+
+    auto gate = upload_glm_fp8(backend, device, columns, columns, 1U);
+    auto up = upload_glm_fp8(backend, device, columns, columns, 3U);
+    auto down = upload_glm_fp8(backend, device, columns, columns, 5U);
+    auto shared_gate = upload_glm_fp8(backend, device, columns, columns, 7U);
+    auto shared_up = upload_glm_fp8(backend, device, columns, columns, 9U);
+    auto shared_down = upload_glm_fp8(backend, device, columns, columns, 11U);
+    REQUIRE(backend.prepack_fragment(device, gate).ok());
+    REQUIRE(backend.prepack_fragment(device, up).ok());
+    REQUIRE(backend.prepack_fragment(device, down).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_gate).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_up).ok());
+    REQUIRE(backend.prepack_fragment(device, shared_down).ok());
+    std::array<float, columns> hidden{};
+    for (std::size_t index = 0U; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(index % 13U) / 32.0F;
+    }
+    const std::array<strata::CudaMoeExpert, 1> routed{{
+        {&gate, &up, &down, 1.0F},
+    }};
+    const strata::CudaMoeExpert shared{
+        &shared_gate, &shared_up, &shared_down, 1.0F};
+    REQUIRE(backend.enqueue_moe(
+        device, hidden, 1U, routed, &shared, 10.0F).ok());
+
+    strata::CudaWeightDescriptor descriptor;
+    descriptor.encoding = strata::CudaWeightEncoding::Fp8E4m3Block128F32;
+    descriptor.dtype = strata::SafetensorsDtype::F8E4M3;
+    descriptor.rows = columns;
+    descriptor.columns = columns;
+    descriptor.packed_columns = columns;
+    descriptor.scale_columns = 1U;
+    descriptor.group_size = 128U;
+    std::vector<std::byte> payload(columns * columns, std::byte{0x38});
+    std::vector<float> scale_values(1U, 1.0F);
+    strata::CudaWeight prefetched;
+    REQUIRE(backend.upload(
+        device, descriptor, payload, std::as_bytes(std::span(scale_values)),
+        prefetched,
+        strata::CudaBackend::UploadCompletion::DeferredConcurrent).ok());
+    REQUIRE(backend.synchronize_uploads(device).ok());
+    std::array<float, columns> routed_output{};
+    std::array<float, columns> shared_output{};
+    REQUIRE(backend.collect_moe(
+        device, routed_output, shared_output).ok());
+
+    std::array<float, columns> projected{};
+    REQUIRE(backend.matmul(prefetched, hidden, 1U, projected, true).ok());
+    REQUIRE(std::all_of(projected.begin(), projected.end(),
+                        [](float value) { return std::isfinite(value); }));
+}
+
 TEST_CASE("native CUDA backend batches reusable target-shape GLM INT4 MoE commands") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

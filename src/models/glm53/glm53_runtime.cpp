@@ -2,6 +2,7 @@
 #include "strata/models/glm53/glm53_sequence.hpp"
 
 #include "strata/engine/runtime_support.hpp"
+#include "strata/engine/route_predictor.hpp"
 #include "strata/models/common/tokenizer.hpp"
 #include "strata/models/deepseek/deepseek_ops.hpp"
 #include "strata/models/glm53/glm53_checkpoint.hpp"
@@ -29,6 +30,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace strata {
@@ -377,6 +379,7 @@ class Glm53WeightCache {
     struct Entry {
         CudaWeight weight;
         bool pinned{};
+        bool prefetched{};
         std::uint32_t leases{};
         std::list<std::string>::iterator recency;
     };
@@ -391,6 +394,9 @@ class Glm53WeightCache {
         std::uint64_t hits{};
         std::uint64_t misses{};
         std::uint64_t evictions{};
+        std::uint64_t prefetches{};
+        std::uint64_t useful_prefetches{};
+        std::uint64_t failed_prefetches{};
     };
 
 public:
@@ -413,6 +419,9 @@ public:
         std::uint64_t hits{};
         std::uint64_t misses{};
         std::uint64_t evictions{};
+        std::uint64_t prefetches{};
+        std::uint64_t useful_prefetches{};
+        std::uint64_t failed_prefetches{};
     };
 
     Glm53WeightCache(Glm53CheckpointReader& checkpoint, CudaBackend& backend,
@@ -608,6 +617,10 @@ public:
                 ++state.misses;
             } else {
                 ++state.hits;
+                if (found->second.prefetched) {
+                    found->second.prefetched = false;
+                    ++state.useful_prefetches;
+                }
                 if (!found->second.pinned) {
                     state.recency.splice(state.recency.end(), state.recency,
                                          found->second.recency);
@@ -627,6 +640,104 @@ public:
             return ordered;
         }
         return backend_.matmul_batch(batch);
+    }
+
+    // Admit one routed expert without consuming it. The worker holds the
+    // device cache lock through the copy-stream completion, so a demand can
+    // never observe a half-uploaded entry and an eviction cannot recycle its
+    // arena storage early. Storage faults and H2D copies happen on the worker,
+    // concurrently with the preceding layer's compute stream.
+    [[nodiscard]] ValidationResult prefetch_expert(
+        std::size_t slot, std::uint32_t layer, std::uint32_t expert) {
+        if (slot >= states_.size() || layer >= kLayers || expert >= 288U ||
+            !glm53_moe_layer(layer)) {
+            return { {"GLM-5.3 expert prefetch has an invalid target"} };
+        }
+        const auto prefix = "model.language_model.layers." +
+                            std::to_string(layer) + ".mlp.experts." +
+                            std::to_string(expert) + ".";
+        struct Projection {
+            std::string key;
+            std::uint64_t rows{};
+            std::uint64_t columns{};
+        };
+        const std::array<Projection, 3U> projections{{
+            {prefix + "gate_proj", 2048U, kHidden},
+            {prefix + "up_proj", 2048U, kHidden},
+            {prefix + "down_proj", kHidden, 2048U}}};
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        bool admitted = false;
+        for (const auto& projection : projections) {
+            if (state.entries.contains(projection.key)) continue;
+            const auto bytes = checkpoint_.cuda_linear_storage_bytes(
+                projection.key);
+            if (bytes == 0U || bytes > state.capacity) {
+                ++state.failed_prefetches;
+                return {};
+            }
+            while (state.used + bytes > state.capacity) {
+                auto victim = state.recency.end();
+                for (auto candidate = state.recency.begin();
+                     candidate != state.recency.end(); ++candidate) {
+                    const auto found = state.entries.find(*candidate);
+                    if (found != state.entries.end() &&
+                        !found->second.pinned && found->second.leases == 0U) {
+                        victim = candidate;
+                        break;
+                    }
+                }
+                if (victim == state.recency.end()) {
+                    ++state.failed_prefetches;
+                    return {};
+                }
+                auto found = state.entries.find(*victim);
+                state.used -= found->second.weight.device_bytes();
+                state.entries.erase(found);
+                state.recency.erase(victim);
+                ++state.evictions;
+            }
+            Entry entry;
+            auto loaded = checkpoint_.load_cuda_linear(
+                projection.key, projection.rows, projection.columns,
+                devices_[slot], backend_, entry.weight, true);
+            if (!loaded.ok()) {
+                ++state.failed_prefetches;
+                return loaded;
+            }
+            const auto actual = entry.weight.device_bytes();
+            if (actual > state.capacity - state.used) {
+                ++state.failed_prefetches;
+                return {};
+            }
+            state.recency.push_back(projection.key);
+            entry.recency = std::prev(state.recency.end());
+            entry.prefetched = true;
+            state.used += actual;
+            state.entries.emplace(projection.key, std::move(entry));
+            admitted = true;
+        }
+        if (!admitted) return {};
+        auto ordered = backend_.synchronize_uploads(devices_[slot]);
+        if (!ordered.ok()) {
+            ++state.failed_prefetches;
+            return ordered;
+        }
+        ++state.prefetches;
+        return {};
+    }
+
+    [[nodiscard]] bool contains_expert(
+        std::size_t slot, std::uint32_t layer, std::uint32_t expert) const {
+        if (slot >= states_.size()) return false;
+        const auto prefix = "model.language_model.layers." +
+                            std::to_string(layer) + ".mlp.experts." +
+                            std::to_string(expert) + ".";
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        return state.entries.contains(prefix + "gate_proj") &&
+               state.entries.contains(prefix + "up_proj") &&
+               state.entries.contains(prefix + "down_proj");
     }
 
     [[nodiscard]] ValidationResult kda_decode(
@@ -757,6 +868,10 @@ public:
                 ++state.misses;
             } else {
                 ++state.hits;
+                if (found->second.prefetched) {
+                    found->second.prefetched = false;
+                    ++state.useful_prefetches;
+                }
                 if (!found->second.pinned) {
                     state.recency.splice(state.recency.end(), state.recency,
                                          found->second.recency);
@@ -898,6 +1013,9 @@ public:
             result.hits += state.hits;
             result.misses += state.misses;
             result.evictions += state.evictions;
+            result.prefetches += state.prefetches;
+            result.useful_prefetches += state.useful_prefetches;
+            result.failed_prefetches += state.failed_prefetches;
         }
         return result;
     }
@@ -919,6 +1037,11 @@ private:
 }  // namespace
 
 struct Glm53Runtime::Impl {
+    struct PrefetchJob {
+        ExpertKey key;
+        std::size_t slot{};
+    };
+
     struct DeviceSequenceState {
         std::array<CudaBuffer, kLayers> kda;
         bool ready{};
@@ -945,6 +1068,7 @@ struct Glm53Runtime::Impl {
         std::vector<float> base_hidden;
         std::vector<std::uint32_t> counts;
         std::vector<std::uint32_t> sampled;
+        Glm53WeightCache::Stats decode_cache_start;
         std::mt19937_64 generator;
         std::unique_ptr<StopSequenceBuffer> streamed;
         std::size_t prefill_cursor{};
@@ -969,6 +1093,20 @@ struct Glm53Runtime::Impl {
     std::vector<std::uint64_t> weight_capacities;
     std::vector<Glm53RowRange> lm_head_ranges;
     std::unique_ptr<Glm53WeightCache> weights;
+    RoutePredictor route_predictor;
+    std::mutex prefetch_mutex;
+    std::condition_variable prefetch_ready;
+    std::deque<PrefetchJob> prefetch_queue;
+    std::unordered_set<ExpertKey, ExpertKeyHash> pending_prefetch;
+    std::vector<std::thread> prefetch_threads;
+    std::size_t prefetch_queue_limit{};
+    std::size_t prefetch_prediction_limit{};
+    double prefetch_minimum_confidence{1.0};
+    bool prefetch_stopping{};
+    std::atomic<std::uint64_t> prefetch_requests{};
+    std::atomic<std::uint64_t> prefetch_completed{};
+    std::atomic<std::uint64_t> prefetch_dropped{};
+    std::atomic<std::uint64_t> prefetch_errors{};
     std::unique_ptr<HostWorkerPool> projection_workers;
     std::unique_ptr<HostWorkerPool> kda_workers;
     std::atomic<std::uint64_t> parallel_projection_batches{};
@@ -1008,6 +1146,111 @@ struct Glm53Runtime::Impl {
         scheduler_ready.notify_all();
         if (scheduler_thread.joinable()) scheduler_thread.join();
         if (warmup_thread.joinable()) warmup_thread.join();
+        {
+            std::scoped_lock lock(prefetch_mutex);
+            prefetch_stopping = true;
+        }
+        prefetch_ready.notify_all();
+        for (auto& worker : prefetch_threads) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    void prefetch_loop() {
+        for (;;) {
+            PrefetchJob job;
+            {
+                std::unique_lock lock(prefetch_mutex);
+                prefetch_ready.wait(lock, [&] {
+                    return prefetch_stopping || !prefetch_queue.empty();
+                });
+                if (prefetch_stopping && prefetch_queue.empty()) return;
+                job = prefetch_queue.front();
+                prefetch_queue.pop_front();
+            }
+            auto status = weights->prefetch_expert(
+                job.slot, job.key.layer, job.key.expert);
+            if (status.ok()) {
+                prefetch_completed.fetch_add(1U, std::memory_order_relaxed);
+            } else if (prefetch_errors.fetch_add(
+                           1U, std::memory_order_relaxed) == 0U) {
+                std::cerr << "[glm53-residency] first_prefetch_error="
+                          << status.errors.front() << '\n';
+            }
+            {
+                std::scoped_lock lock(prefetch_mutex);
+                pending_prefetch.erase(job.key);
+            }
+        }
+    }
+
+    void request_prefetch(const RoutePrediction& prediction) {
+        if (prefetch_queue_limit == 0U || prediction.key.layer >= kLayers ||
+            !glm53_moe_layer(prediction.key.layer)) {
+            return;
+        }
+        const auto slot = slot_for(prediction.key.layer);
+        if (weights->contains_expert(slot, prediction.key.layer,
+                                     prediction.key.expert)) {
+            return;
+        }
+        prefetch_requests.fetch_add(1U, std::memory_order_relaxed);
+        std::scoped_lock lock(prefetch_mutex);
+        if (prefetch_stopping || pending_prefetch.contains(prediction.key)) {
+            return;
+        }
+        if (prefetch_queue.size() >= prefetch_queue_limit) {
+            prefetch_dropped.fetch_add(1U, std::memory_order_relaxed);
+            return;
+        }
+        pending_prefetch.insert(prediction.key);
+        prefetch_queue.push_back({prediction.key, slot});
+        prefetch_ready.notify_one();
+    }
+
+    [[nodiscard]] static std::uint64_t route_request_key(
+        const Glm53SequenceState* sequence, std::uint32_t position) noexcept {
+        // Each logical token owns one transition chain. Prompt execution is
+        // layer-major, so using only the sequence address would connect rows
+        // in execution order instead of connecting adjacent layers.
+        auto value = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(sequence));
+        value ^= static_cast<std::uint64_t>(position) +
+                 0x9e3779b97f4a7c15ULL + (value << 6U) + (value >> 2U);
+        return value == 0U ? 1U : value;
+    }
+
+    void observe_route(std::uint32_t layer,
+                       std::span<const KimiRoutedExpert> selected,
+                       std::uint64_t request, std::uint32_t position,
+                       bool schedule_prefetch) {
+        if (prefetch_prediction_limit == 0U || request == 0U ||
+            layer >= kLayers) {
+            return;
+        }
+        RouteEvent event;
+        event.request = request;
+        event.token_position = position;
+        event.layer = layer;
+        event.phase = RoutePhase::Decode;
+        event.experts.reserve(selected.size());
+        event.coefficients.reserve(selected.size());
+        for (const auto& route : selected) {
+            event.experts.push_back(route.expert);
+            event.coefficients.push_back(route.weight);
+        }
+        route_predictor.observe(event);
+        if (!schedule_prefetch) return;
+        for (const auto& prediction : route_predictor.predict(
+                 event, prefetch_prediction_limit,
+                 prefetch_minimum_confidence)) {
+            // One-layer lookahead is the useful overlap window: farther
+            // predictions consume cache before their demand and are more
+            // likely to evict a nearer expert.
+            if (prediction.key.layer == layer + 1U) {
+                request_prefetch(prediction);
+            }
+        }
     }
 
     [[nodiscard]] std::size_t slot_for(std::uint32_t layer) const noexcept {
@@ -2013,7 +2256,10 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] ValidationResult feedforward(
         std::span<float> output, std::span<const float> input,
-        std::uint32_t layer, const std::string& prefix) {
+        std::uint32_t layer, const std::string& prefix,
+        std::uint64_t route_request = 0U,
+        std::uint32_t route_position = 0U,
+        bool schedule_prefetch = false) {
         if (layer != kMtpLayer && !glm53_moe_layer(layer)) {
             return swiglu_block(output, input, prefix + "mlp.", 12288U, layer);
         }
@@ -2029,13 +2275,22 @@ struct Glm53Runtime::Impl {
         std::array<KimiRoutedExpert, 8U> selected{};
         result = kimi_route_topk(selected, logits, *bias.value, 2.5F);
         if (!result.ok()) return result;
+        observe_route(layer, selected, route_request, route_position,
+                      schedule_prefetch);
         return weights->moe(slot_for(layer), prefix + "mlp.", selected,
                             input, output);
     }
 
     [[nodiscard]] ValidationResult feedforward_page(
         std::span<float> output, std::span<const float> input,
-        std::uint32_t rows, std::uint32_t layer, const std::string& prefix) {
+        std::uint32_t rows, std::uint32_t layer, const std::string& prefix,
+        std::span<const std::uint64_t> route_requests = {},
+        std::span<const std::uint32_t> route_positions = {},
+        bool schedule_prefetch = false) {
+        if ((!route_requests.empty() || !route_positions.empty()) &&
+            (route_requests.size() != rows || route_positions.size() != rows)) {
+            return {{"GLM-5.3 route-observation page has an invalid shape"}};
+        }
         if (layer != kMtpLayer && !glm53_moe_layer(layer)) {
             return swiglu_block_page(output, input, prefix + "mlp.", rows,
                                      12288U, layer);
@@ -2056,6 +2311,10 @@ struct Glm53Runtime::Impl {
                     static_cast<std::size_t>(row) * 288U, 288U),
                 *bias.value, 2.5F);
             if (!result.ok()) return result;
+            if (!route_requests.empty()) {
+                observe_route(layer, selected, route_requests[row],
+                              route_positions[row], schedule_prefetch);
+            }
             result = weights->moe(
                 slot_for(layer), prefix + "mlp.", selected,
                 input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
@@ -2119,7 +2378,9 @@ struct Glm53Runtime::Impl {
         result = norm(normalized, collapsed,
                       prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
-        result = feedforward(branch, normalized, layer, prefix);
+        result = feedforward(
+            branch, normalized, layer, prefix,
+            route_request_key(&sequence, position), position, true);
         if (!result.ok()) return result;
         std::fill(transitioned.begin(), transitioned.end(), 0.0F);
         result = dsv4_mhc_post_f32(transitioned, branch, streams, mix, kMhc);
@@ -2197,7 +2458,16 @@ struct Glm53Runtime::Impl {
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
-        result = feedforward_page(branch, normalized, rows, layer, prefix);
+        std::vector<std::uint64_t> route_requests(rows);
+        std::vector<std::uint32_t> route_positions(rows);
+        const auto position_base = sequence.token_count();
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            route_positions[row] = position_base + row;
+            route_requests[row] = route_request_key(
+                &sequence, route_positions[row]);
+        }
+        result = feedforward_page(branch, normalized, rows, layer, prefix,
+                                  route_requests, route_positions);
         if (!result.ok()) return result;
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
@@ -2300,7 +2570,13 @@ struct Glm53Runtime::Impl {
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
-        result = feedforward_page(branch, normalized, rows, layer, prefix);
+        std::vector<std::uint64_t> route_requests(rows);
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            route_requests[row] = route_request_key(sequences[row],
+                                                    positions[row]);
+        }
+        result = feedforward_page(branch, normalized, rows, layer, prefix,
+                                  route_requests, positions, true);
         if (!result.ok()) return result;
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
@@ -2691,6 +2967,16 @@ struct Glm53Runtime::Impl {
                 request->result.stopped = request->result.stopped ||
                                           request->streamed->stopped();
             }
+            const auto cache = weights->stats();
+            std::cerr << "[glm53-decode-cache] misses="
+                      << (cache.misses - request->decode_cache_start.misses)
+                      << " evictions="
+                      << (cache.evictions -
+                          request->decode_cache_start.evictions)
+                      << " useful_prefetches="
+                      << (cache.useful_prefetches -
+                          request->decode_cache_start.useful_prefetches)
+                      << '\n';
         }
         {
             std::scoped_lock lock(request->completion_mutex);
@@ -2825,6 +3111,7 @@ struct Glm53Runtime::Impl {
         request->streamed =
             std::make_unique<StopSequenceBuffer>(request->stop);
         request->position = static_cast<std::uint32_t>(request->prompt.size());
+        request->decode_cache_start = weights->stats();
         request->decode_started = now_seconds();
         request->decoding = true;
         if (request->maximum_new_tokens == 0U) {
@@ -3258,6 +3545,35 @@ ValidationResult Glm53Runtime::initialize(
     impl_->weights = std::make_unique<Glm53WeightCache>(
         *impl_->checkpoint, impl_->cuda, impl_->devices,
         impl_->weight_capacities);
+    const std::string expert_prefix =
+        "model.language_model.layers.3.mlp.experts.0.";
+    const auto expert_bytes =
+        impl_->checkpoint->cuda_linear_storage_bytes(
+            expert_prefix + "gate_proj") +
+        impl_->checkpoint->cuda_linear_storage_bytes(
+            expert_prefix + "up_proj") +
+        impl_->checkpoint->cuda_linear_storage_bytes(
+            expert_prefix + "down_proj");
+    const auto cache_bytes = std::accumulate(
+        impl_->weight_capacities.begin(), impl_->weight_capacities.end(),
+        std::uint64_t{0U});
+    if (expert_bytes != 0U) {
+        const auto cache_experts = static_cast<std::size_t>(
+            cache_bytes / expert_bytes);
+        const auto host_window = static_cast<std::size_t>(
+            host_hardware_profile().worker_threads(0.25)) *
+            impl_->checkpoint->config().experts_per_token;
+        impl_->prefetch_queue_limit = std::max<std::size_t>(
+            1U, std::min(cache_experts, host_window));
+        impl_->prefetch_prediction_limit = std::min<std::size_t>(
+            impl_->checkpoint->config().experts_per_token,
+            impl_->prefetch_queue_limit);
+        impl_->prefetch_minimum_confidence =
+            1.0 - static_cast<double>(
+                      impl_->checkpoint->config().experts_per_token) /
+                      static_cast<double>(
+                          impl_->checkpoint->config().routed_experts);
+    }
     if (impl_->devices.size() > 1U) {
         auto worker_cpus = projection_worker_cpus(impl_->devices);
         if (worker_cpus.size() == impl_->devices.size()) {
@@ -3285,6 +3601,12 @@ ValidationResult Glm53Runtime::initialize(
         impl_->warmup_thread = std::thread([state = impl_.get()] {
             state->warmup_result = state->warmup();
         });
+        impl_->prefetch_threads.reserve(impl_->devices.size());
+        for (std::size_t worker = 0U; worker < impl_->devices.size(); ++worker) {
+            impl_->prefetch_threads.emplace_back([state = impl_.get()] {
+                state->prefetch_loop();
+            });
+        }
         impl_->scheduler_thread = std::thread([state = impl_.get()] {
             state->scheduler_loop();
         });
@@ -3340,6 +3662,9 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
         impl_->mtp_drafts.load(std::memory_order_relaxed);
     const auto mtp_accepted_before =
         impl_->mtp_accepted.load(std::memory_order_relaxed);
+    const auto prefetch_requests_before =
+        impl_->prefetch_requests.load(std::memory_order_relaxed);
+    const auto cache_before = impl_->weights->stats();
     result = impl_->schedule(std::move(encoded.value), maximum_new_tokens,
                              sampling, stop, on_token);
     const auto request_mtp_drafts =
@@ -3354,6 +3679,27 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << (100.0 * static_cast<double>(request_mtp_accepted) /
                       static_cast<double>(request_mtp_drafts))
                   << "%\n";
+    }
+    const auto request_prefetches =
+        impl_->prefetch_requests.load(std::memory_order_relaxed) -
+        prefetch_requests_before;
+    if (request_prefetches != 0U) {
+        const auto cache_after = impl_->weights->stats();
+        std::cerr << "[glm53-residency] predictions=" << request_prefetches
+                  << " completed="
+                  << impl_->prefetch_completed.load(std::memory_order_relaxed)
+                  << " dropped="
+                  << impl_->prefetch_dropped.load(std::memory_order_relaxed)
+                  << " errors="
+                  << impl_->prefetch_errors.load(std::memory_order_relaxed)
+                  << " useful="
+                  << (cache_after.useful_prefetches -
+                      cache_before.useful_prefetches)
+                  << " demand_misses="
+                  << (cache_after.misses - cache_before.misses)
+                  << " evictions="
+                  << (cache_after.evictions - cache_before.evictions)
+                  << '\n';
     }
     if (impl_->config.verbose) {
         std::cerr << "[glm53-projection] parallel_batches="
@@ -3381,6 +3727,24 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << impl_->mtp_drafts.load(std::memory_order_relaxed)
                   << " mtp_accepted="
                   << impl_->mtp_accepted.load(std::memory_order_relaxed)
+                  << " prefetch_requests="
+                  << impl_->prefetch_requests.load(std::memory_order_relaxed)
+                  << " prefetch_completed="
+                  << impl_->prefetch_completed.load(std::memory_order_relaxed)
+                  << " prefetch_dropped="
+                  << impl_->prefetch_dropped.load(std::memory_order_relaxed)
+                  << " prefetch_errors="
+                  << impl_->prefetch_errors.load(std::memory_order_relaxed)
+                  << " prefetch_queue_limit="
+                  << impl_->prefetch_queue_limit
+                  << '\n';
+        const auto cache = impl_->weights->stats();
+        std::cerr << "[glm53-cache] hits=" << cache.hits
+                  << " misses=" << cache.misses
+                  << " evictions=" << cache.evictions
+                  << " prefetches=" << cache.prefetches
+                  << " useful_prefetches=" << cache.useful_prefetches
+                  << " failed_prefetches=" << cache.failed_prefetches
                   << '\n';
     }
     return result;

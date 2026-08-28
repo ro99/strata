@@ -310,7 +310,8 @@ std::uint64_t Glm53CheckpointReader::cuda_linear_slice_storage_bytes(
 
 ValidationResult Glm53CheckpointReader::load_cuda_linear(
     std::string_view base_name, std::uint64_t rows, std::uint64_t columns,
-    int device, CudaBackend& backend, CudaWeight& output) const {
+    int device, CudaBackend& backend, CudaWeight& output,
+    bool concurrent_prefetch) const {
     ValidationResult result;
     const auto weight_name = std::string(base_name) + ".weight";
     const auto* weight = find(weight_name);
@@ -367,7 +368,9 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
         // Both mapped views outlive every upload, so the copy stream may retain
         // them until its device-side completion event without a heap copy.
         return backend.upload(device, descriptor, weights.value, scales, output,
-                              CudaBackend::UploadCompletion::Deferred,
+                              concurrent_prefetch
+                                  ? CudaBackend::UploadCompletion::DeferredConcurrent
+                                  : CudaBackend::UploadCompletion::Deferred,
                               fragment_layout);
     }
 

@@ -1029,6 +1029,11 @@ public:
     enum class UploadCompletion : std::uint8_t {
         Synchronous,
         Deferred,
+        // The caller additionally guarantees that any weight which an
+        // in-flight MoE command references remains leased. Allocation and H2D
+        // may then use the independent upload stream while that command runs;
+        // synchronize_uploads() orders the next execution-stream consumer.
+        DeferredConcurrent,
     };
     // `prepack` asks for the weight to be permuted into m16n8k16 fragment
     // order as part of the upload, stream-ordered behind the copy so the loader

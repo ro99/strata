@@ -358,7 +358,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         result.errors.emplace_back("weight upload targets an uninitialized CUDA device");
         return result;
     }
-    if (found->second.moe_in_flight) {
+    if (found->second.moe_in_flight &&
+        completion != UploadCompletion::DeferredConcurrent) {
         result.errors.emplace_back(
             "weight upload cannot overlap an in-flight DeepSeek MoE command");
         return result;
@@ -543,7 +544,7 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     // upload_ready before anything reads the weight. A synchronous upload keeps
     // the execution stream, because its caller's host payload dies at return
     // and the wait below is what keeps it alive long enough.
-    const bool deferred = completion == UploadCompletion::Deferred;
+    const bool deferred = completion != UploadCompletion::Synchronous;
     auto* const upload_stream = deferred ? state.upload_stream : state.stream;
     const auto upload_error = [&state, &target, upload_stream](
         cudaError_t status, const char* operation) {

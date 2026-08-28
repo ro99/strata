@@ -181,6 +181,20 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool fused_kda_enabled() noexcept {
+    // The kernel is exact, but until the surrounding mHC/FFN chain is also
+    // device-resident, its per-layer completion boundary loses to ReplaySSM.
+    // Keep the development route explicit rather than making production
+    // slower while the complete fused chain is being assembled.
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_FUSED_KDA");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
 struct Glm53RowRange {
     std::uint64_t begin{};
     std::uint64_t count{};
@@ -221,6 +235,21 @@ struct Glm53RowRange {
         begin = end;
     }
     return ranges;
+}
+
+[[nodiscard]] std::vector<std::size_t> contiguous_layer_schedule(
+    std::uint32_t layers, std::span<const std::uint64_t> capacities) {
+    const auto ranges = weighted_row_ranges(layers, capacities, 1U);
+    if (ranges.size() != capacities.size()) return {};
+    std::vector<std::size_t> schedule(layers);
+    for (std::size_t slot = 0U; slot < ranges.size(); ++slot) {
+        const auto range = ranges[slot];
+        for (std::uint64_t layer = range.begin;
+             layer < range.begin + range.count; ++layer) {
+            schedule[static_cast<std::size_t>(layer)] = slot;
+        }
+    }
+    return schedule;
 }
 
 [[nodiscard]] std::vector<int> projection_worker_cpus(
@@ -588,6 +617,29 @@ public:
         return backend_.matmul_batch(batch);
     }
 
+    [[nodiscard]] ValidationResult kda_decode(
+        std::size_t slot, std::string_view output_projection,
+        CudaGlm53KdaRequest request, std::span<float> output) {
+        if (slot >= states_.size() || request.state == nullptr) {
+            return {{"GLM-5.3 fused KDA targets an invalid CUDA cache slot"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        const auto found = state.entries.find(std::string(output_projection));
+        if (found == state.entries.end() ||
+            found->second.weight.device() != request.state->device()) {
+            return {{"GLM-5.3 fused KDA output projection was not admitted "
+                     "on its layer device"}};
+        }
+        ++found->second.leases;
+        struct Lease {
+            Entry& entry;
+            ~Lease() { --entry.leases; }
+        } lease{found->second};
+        request.output_projection = &found->second.weight;
+        return backend_.glm53_kda_decode(request, output);
+    }
+
     [[nodiscard]] ValidationResult moe(
         std::size_t slot, std::string_view prefix,
         std::span<const KimiRoutedExpert> routed,
@@ -855,6 +907,11 @@ private:
 }  // namespace
 
 struct Glm53Runtime::Impl {
+    struct DeviceSequenceState {
+        std::array<CudaBuffer, kLayers> kda;
+        bool ready{};
+    };
+
     struct PrefixEntry {
         std::vector<std::uint32_t> tokens;
         Glm53SequenceState state;
@@ -870,6 +927,7 @@ struct Glm53Runtime::Impl {
         TokenStreamCallback on_token;
         Glm53GenerationResult result;
         Glm53SequenceState sequence;
+        DeviceSequenceState device_sequence;
         std::vector<float> logits;
         std::vector<std::uint32_t> counts;
         std::vector<std::uint32_t> sampled;
@@ -1395,7 +1453,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult attention_kda(
         std::span<float> output, std::span<const float> input,
         std::uint32_t layer, const std::string& attention,
-        Glm53SequenceState& sequence) {
+        Glm53SequenceState& sequence, CudaBuffer* device_state = nullptr) {
         ValidationResult result;
         std::vector<float> query(kLinearWidth), key(kLinearWidth),
             value(kLinearWidth), low(kLinearHead), beta(kHeads),
@@ -1413,7 +1471,8 @@ struct Glm53Runtime::Impl {
              {first_bases[5], kLinearHead, kHidden, input, 1U, gate_low, true}}};
         result = linear_batch(first, layer);
         if (!result.ok()) return result;
-        for (std::uint32_t projection = 0U; projection < 3U; ++projection) {
+        if (device_state == nullptr) {
+          for (std::uint32_t projection = 0U; projection < 3U; ++projection) {
             auto taps = host_tensor(
                 attention + (projection == 0U ? "q_conv1d.weight"
                               : projection == 1U ? "k_conv1d.weight"
@@ -1428,6 +1487,7 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
             values = std::move(convolved);
             round_bf16(values);
+          }
         }
         std::vector<float> forget(kLinearWidth), gate(kLinearWidth);
         const std::array<std::string, 2U> second_bases{
@@ -1449,6 +1509,21 @@ struct Glm53Runtime::Impl {
             append(result.errors, std::move(dt_bias.errors));
             append(result.errors, std::move(o_norm.errors));
             return result;
+        }
+        if (device_state != nullptr) {
+            CudaGlm53KdaRequest request;
+            request.state = device_state;
+            request.query = query;
+            request.key = key;
+            request.value = value;
+            request.forget = forget;
+            request.beta = beta;
+            request.gate = gate;
+            request.heads = kHeads;
+            request.head_dim = kLinearHead;
+            request.convolution_kernel = 4U;
+            return weights->kda_decode(slot_for(layer),
+                                       attention + "o_proj", request, output);
         }
         std::vector<float> heads_out(kLinearWidth);
         const auto query_scale = 1.0F / std::sqrt(static_cast<float>(kLinearHead));
@@ -2126,11 +2201,13 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult forward_layer_sequences(
         std::span<float> streams, std::uint32_t layer,
         std::span<const std::uint32_t> positions,
-        std::span<Glm53SequenceState* const> sequences) {
+        std::span<Glm53SequenceState* const> sequences,
+        std::span<DeviceSequenceState* const> device_sequences) {
         ValidationResult result;
         const auto rows = static_cast<std::uint32_t>(sequences.size());
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         if (rows == 0U || positions.size() != rows ||
+            device_sequences.size() != rows ||
             streams.size() != static_cast<std::size_t>(rows) * stream_columns) {
             return {{"GLM-5.3 independent layer batch has an invalid shape"}};
         }
@@ -2162,7 +2239,10 @@ struct Glm53Runtime::Impl {
                 static_cast<std::size_t>(row) * kHidden, kHidden);
             result = glm53_kda_layer(layer)
                 ? attention_kda(destination, input, layer, attention,
-                                *sequences[row])
+                                *sequences[row],
+                                device_sequences[row] == nullptr
+                                    ? nullptr
+                                    : &device_sequences[row]->kda[layer])
                 : attention_mla(destination, input, layer, positions[row],
                                 attention, *sequences[row]);
             if (!result.ok()) return result;
@@ -2334,10 +2414,11 @@ struct Glm53Runtime::Impl {
         std::span<const std::uint32_t> tokens,
         std::span<const std::uint32_t> positions,
         std::span<Glm53SequenceState* const> sequences,
+        std::span<DeviceSequenceState* const> device_sequences,
         std::span<float> logits) {
         const auto rows = static_cast<std::uint32_t>(tokens.size());
         if (rows == 0U || positions.size() != rows ||
-            sequences.size() != rows ||
+            sequences.size() != rows || device_sequences.size() != rows ||
             logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
             return {{"GLM-5.3 decode batch has an invalid shape"}};
         }
@@ -2353,7 +2434,7 @@ struct Glm53Runtime::Impl {
         }
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
             auto result = forward_layer_sequences(
-                streams, layer, positions, sequences);
+                streams, layer, positions, sequences, device_sequences);
             if (!result.ok()) return result;
         }
         auto result = finish_streams_page(streams, rows, logits);
@@ -2489,6 +2570,70 @@ struct Glm53Runtime::Impl {
         return true;
     }
 
+    [[nodiscard]] ValidationResult prepare_device_sequence(
+        Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
+        ValidationResult result;
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            if (!glm53_kda_layer(layer)) continue;
+            const auto attention = "model.language_model.layers." +
+                std::to_string(layer) + ".self_attn.";
+            const std::array<std::string, 3U> tap_names{
+                attention + "q_conv1d.weight",
+                attention + "k_conv1d.weight",
+                attention + "v_conv1d.weight"};
+            std::array<std::shared_ptr<const std::vector<float>>, 3U> taps;
+            for (std::size_t projection = 0U; projection < taps.size();
+                 ++projection) {
+                auto loaded = host_tensor(
+                    tap_names[projection],
+                    static_cast<std::uint64_t>(kLinearWidth) * 4U);
+                if (!loaded.ok()) return {std::move(loaded.errors)};
+                taps[projection] = std::move(loaded.value);
+            }
+            auto a_log = host_tensor(attention + "A_log", kHeads);
+            auto dt_bias = host_tensor(attention + "dt_bias", kLinearWidth);
+            auto o_norm = host_tensor(attention + "o_norm.weight", kLinearHead);
+            if (!a_log.ok() || !dt_bias.ok() || !o_norm.ok()) {
+                append(result.errors, std::move(a_log.errors));
+                append(result.errors, std::move(dt_bias.errors));
+                append(result.errors, std::move(o_norm.errors));
+                return result;
+            }
+            const auto recurrent = sequence.recurrent(layer);
+            const auto convolution_elements =
+                static_cast<std::size_t>(3U) * kLinearWidth * 3U;
+            const auto tap_elements =
+                static_cast<std::size_t>(3U) * kLinearWidth * 4U;
+            std::vector<float> packed(
+                recurrent.size() + convolution_elements + tap_elements +
+                kHeads + kLinearWidth + kLinearHead);
+            auto destination = packed.begin();
+            destination = std::copy(recurrent.begin(), recurrent.end(),
+                                    destination);
+            for (std::uint32_t projection = 0U; projection < 3U;
+                 ++projection) {
+                const auto history = sequence.convolution(layer, projection);
+                destination = std::copy(history.begin(), history.end(),
+                                        destination);
+            }
+            for (const auto& tap : taps) {
+                destination = std::copy(tap->begin(), tap->end(), destination);
+            }
+            destination = std::copy(a_log.value->begin(), a_log.value->end(),
+                                    destination);
+            destination = std::copy(dt_bias.value->begin(), dt_bias.value->end(),
+                                    destination);
+            static_cast<void>(std::copy(o_norm.value->begin(),
+                                        o_norm.value->end(), destination));
+            result = cuda.upload_buffer(
+                device_for(layer), std::as_bytes(std::span<const float>(packed)),
+                device_sequence.kda[layer]);
+            if (!result.ok()) return result;
+        }
+        device_sequence.ready = true;
+        return result;
+    }
+
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
         request->result.metrics.prefill_tokens =
             request->prompt.size() -
@@ -2496,6 +2641,17 @@ struct Glm53Runtime::Impl {
         request->result.metrics.prefill_seconds =
             now_seconds() - request->prefill_started;
         store_prefix(request->prompt, request->sequence, request->logits);
+        // The prompt cache remains host/COW F32. Decode state is admitted once
+        // after that immutable snapshot, then never read back per token.
+        if (request->maximum_new_tokens > 1U && fused_kda_enabled()) {
+            auto prepared = prepare_device_sequence(
+                request->sequence, request->device_sequence);
+            if (!prepared.ok()) {
+                request->result.errors = std::move(prepared.errors);
+                complete_request(request);
+                return;
+            }
+        }
         request->counts.assign(kVocabulary, 0U);
         request->generator.seed(request->sampling.seed);
         request->streamed =
@@ -2624,6 +2780,7 @@ struct Glm53Runtime::Impl {
                 std::vector<std::uint32_t> step_tokens;
                 std::vector<std::uint32_t> step_positions;
                 std::vector<Glm53SequenceState*> step_sequences;
+                std::vector<DeviceSequenceState*> step_device_sequences;
                 for (auto& request : active_requests) {
                     if (request->done || !request->decoding) continue;
                     std::uint32_t token = 0U;
@@ -2632,6 +2789,9 @@ struct Glm53Runtime::Impl {
                         step_tokens.push_back(token);
                         step_positions.push_back(request->position);
                         step_sequences.push_back(&request->sequence);
+                        step_device_sequences.push_back(
+                            request->device_sequence.ready
+                                ? &request->device_sequence : nullptr);
                     }
                 }
                 if (!step_requests.empty()) {
@@ -2639,6 +2799,7 @@ struct Glm53Runtime::Impl {
                         step_requests.size() * kVocabulary);
                     auto step = forward_token_batch(
                         step_tokens, step_positions, step_sequences,
+                        step_device_sequences,
                         step_logits);
                     if (!step.ok()) {
                         for (auto& request : step_requests) {
@@ -2758,8 +2919,34 @@ ValidationResult Glm53Runtime::initialize(
     }
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->checkpoint = std::move(checkpoint.value);
-    impl_->device_schedule = std::move(device_plan.value.weighted_schedule);
     impl_->weight_capacities = device_plan.value.weight_capacities;
+    if (impl_->devices.size() > 1U &&
+        !cross_gpu_projections_enabled(impl_->devices)) {
+        // PCIe/PHB systems pay a full activation bridge for every owner
+        // change. Use capacity-weighted contiguous pipeline stages so a token
+        // crosses once. Best-rank P2P (NVLink/NVSwitch) keeps the fine-grained
+        // schedule, which the TP executor can consume without redistributing
+        // layer ownership when that topology is available.
+        impl_->device_schedule = contiguous_layer_schedule(
+            kLayers, impl_->weight_capacities);
+    } else {
+        impl_->device_schedule = std::move(
+            device_plan.value.weighted_schedule);
+    }
+    if (impl_->device_schedule.empty()) {
+        return {{"GLM-5.3 could not derive a topology-aware layer schedule"}};
+    }
+    if (impl_->devices.size() > 1U || config.verbose) {
+        std::uint32_t hops = 0U;
+        for (std::uint32_t layer = 1U; layer < kLayers; ++layer) {
+            if (impl_->slot_for(layer) != impl_->slot_for(layer - 1U)) ++hops;
+        }
+        std::cerr << "[glm53-topology] mode="
+                  << (cross_gpu_projections_enabled(impl_->devices)
+                          ? "high-speed-peer" : "contiguous-pipeline")
+                  << " activation_hops=" << hops << " layers=" << kLayers
+                  << '\n';
+    }
     impl_->weights = std::make_unique<Glm53WeightCache>(
         *impl_->checkpoint, impl_->cuda, impl_->devices,
         impl_->weight_capacities);

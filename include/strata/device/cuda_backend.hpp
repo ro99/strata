@@ -666,6 +666,27 @@ struct CudaBufferPatch {
     std::span<const std::byte> bytes;
 };
 
+// One GLM-5.3 KDA decode command. `state` owns the exact F32 recurrent matrix,
+// causal convolution history, and immutable per-layer coefficients packed by
+// the model runtime. Projection boundaries remain host-visible for now, but
+// the O(H * D^2) recurrence never crosses PCIe after prompt admission.
+struct CudaGlm53KdaRequest {
+    const CudaBuffer* state{};
+    // Optional same-device FP8 output projection. When present, the normalized
+    // KDA heads never return to the host; `output` is the projection's BF16
+    // row rather than the unprojected head row.
+    const CudaWeight* output_projection{};
+    std::span<const float> query;
+    std::span<const float> key;
+    std::span<const float> value;
+    std::span<const float> forget;
+    std::span<const float> beta;
+    std::span<const float> gate;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t convolution_kernel{};
+};
+
 // Persistent target-format inputs for one DeepSeek mHC pre boundary. The
 // projection remains F32 as in the accepted SM86 contract; scale/base and the
 // BF16 norm weight are packed into one immutable auxiliary allocation.
@@ -1040,6 +1061,8 @@ public:
         std::span<std::byte> output);
     [[nodiscard]] ValidationResult allocate_buffer(
         int device, std::uint64_t bytes, CudaBuffer& output);
+    [[nodiscard]] ValidationResult glm53_kda_decode(
+        const CudaGlm53KdaRequest& request, std::span<float> output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
         std::span<const std::uint16_t> values, std::uint32_t start,

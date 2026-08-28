@@ -166,6 +166,11 @@ ValidationResult CudaBackend::allocate_buffer(int, std::uint64_t, CudaBuffer&) {
     return cuda_unavailable();
 }
 
+ValidationResult CudaBackend::glm53_kda_decode(
+    const CudaGlm53KdaRequest&, std::span<float>) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::upload_gemma4_kv(
     const CudaBuffer&, std::span<const std::uint16_t>,
     std::span<const std::uint16_t>, std::uint32_t, std::uint32_t,

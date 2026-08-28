@@ -5,6 +5,7 @@
 #include "strata/models/deepseek/deepseek_kv_cache.hpp"
 #include "strata/models/deepseek/deepseek_host_expert.hpp"
 #include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/models/kimi_k3/kimi_k3_ops.hpp"
 #include "strata/models/deepseek/deepseek_attention_kv.hpp"
 #include "strata/platform/numerics.hpp"
 
@@ -4080,4 +4081,164 @@ TEST_CASE("a partially prepacked MXFP4 MoE batch is refused, not half-served") {
     const std::array<strata::CudaMoeExpert, 1> routed{{{&gate, &up, &down, 1.0F}}};
     const auto refused = backend.enqueue_moe(device, hidden, 1U, routed, nullptr);
     REQUIRE(!refused.ok());
+}
+
+TEST_CASE("native CUDA GLM-5.3 KDA keeps exact recurrent state resident") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    constexpr std::uint32_t heads = 2U;
+    constexpr std::uint32_t dim = 8U;
+    constexpr std::uint32_t kernel = 4U;
+    constexpr std::uint32_t width = heads * dim;
+    const auto recurrent_floats = static_cast<std::size_t>(heads) * dim * dim;
+    const auto convolution_floats = 3U * width * (kernel - 1U);
+    const auto tap_floats = 3U * width * kernel;
+    std::vector<float> packed(recurrent_floats + convolution_floats +
+                              tap_floats + heads + width + dim);
+    for (std::size_t index = 0U; index < recurrent_floats; ++index) {
+        packed[index] = static_cast<float>(static_cast<int>(index % 17U) - 8) /
+                        512.0F;
+    }
+    auto* convolution = packed.data() + recurrent_floats;
+    auto* taps = convolution + convolution_floats;
+    for (std::size_t index = 0U; index < convolution_floats; ++index) {
+        convolution[index] = static_cast<float>(static_cast<int>(index % 7U) - 3) /
+                             128.0F;
+    }
+    for (std::size_t index = 0U; index < tap_floats; ++index) {
+        taps[index] = static_cast<float>(static_cast<int>(index % 11U) - 5) /
+                      32.0F;
+    }
+    auto* a_log = taps + tap_floats;
+    auto* dt_bias = a_log + heads;
+    auto* norm = dt_bias + width;
+    for (std::uint32_t head = 0U; head < heads; ++head) a_log[head] = -0.4F;
+    for (std::uint32_t index = 0U; index < width; ++index) {
+        dt_bias[index] = static_cast<float>(index % 5U) / 32.0F;
+    }
+    for (std::uint32_t index = 0U; index < dim; ++index) norm[index] = 0.75F;
+
+    auto expected_state = packed;
+    std::vector<float> query(width), key(width), value(width), forget(width),
+        gate(width), beta(heads);
+    for (std::uint32_t index = 0U; index < width; ++index) {
+        query[index] = static_cast<float>(static_cast<int>(index) - 7) / 32.0F;
+        key[index] = static_cast<float>(static_cast<int>(index % 9U) - 4) / 24.0F;
+        value[index] = static_cast<float>(static_cast<int>(index % 13U) - 6) / 20.0F;
+        forget[index] = static_cast<float>(static_cast<int>(index % 7U) - 3) / 16.0F;
+        gate[index] = static_cast<float>(static_cast<int>(index % 6U) - 2) / 8.0F;
+    }
+    beta[0] = round_bf16(0.45F);
+    beta[1] = round_bf16(0.65F);
+
+    auto expected_q = query;
+    auto expected_k = key;
+    auto expected_v = value;
+    auto* expected_convolution = expected_state.data() + recurrent_floats;
+    for (std::uint32_t projection = 0U; projection < 3U; ++projection) {
+        auto& values = projection == 0U ? expected_q
+                     : projection == 1U ? expected_k : expected_v;
+        auto history = std::span<float>(expected_convolution +
+            static_cast<std::size_t>(projection) * width * (kernel - 1U),
+            width * (kernel - 1U));
+        std::vector<float> convolved(width);
+        REQUIRE(strata::kimi_short_conv_step(
+            convolved, values,
+            std::span<const float>(taps +
+                static_cast<std::size_t>(projection) * width * kernel,
+                width * kernel), history, kernel).ok());
+        for (auto& element : convolved) element = round_bf16(element);
+        values = std::move(convolved);
+    }
+    std::vector<float> expected(width);
+    for (std::uint32_t head = 0U; head < heads; ++head) {
+        const auto begin = static_cast<std::size_t>(head) * dim;
+        auto q = std::span<float>(expected_q).subspan(begin, dim);
+        auto k = std::span<float>(expected_k).subspan(begin, dim);
+        REQUIRE(strata::kimi_l2_normalize(q, 1.0e-6F).ok());
+        REQUIRE(strata::kimi_l2_normalize(k, 1.0e-6F).ok());
+        for (auto& element : q) element /= std::sqrt(static_cast<float>(dim));
+        std::vector<float> decay(dim);
+        REQUIRE(strata::kimi_kda_log_decay(
+            decay, std::span<const float>(forget).subspan(begin, dim),
+            std::span<const float>(dt_bias, width).subspan(begin, dim),
+            a_log[head], -5.0F).ok());
+        for (auto& element : decay) element = std::exp(element);
+        std::vector<float> raw(dim);
+        REQUIRE(strata::kimi_kda_step(
+            raw,
+            std::span<float>(expected_state).subspan(
+                static_cast<std::size_t>(head) * dim * dim, dim * dim),
+            q, k, std::span<const float>(expected_v).subspan(begin, dim),
+            decay, beta[head], dim, dim).ok());
+        for (auto& element : raw) element = round_bf16(element);
+        REQUIRE(strata::kimi_kda_output_norm(
+            std::span<float>(expected).subspan(begin, dim), raw,
+            std::span<const float>(gate).subspan(begin, dim),
+            std::span<const float>(norm, dim), 1.0e-5F).ok());
+        for (auto& element : std::span<float>(expected).subspan(begin, dim)) {
+            element = round_bf16(element);
+        }
+    }
+
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{devices.front()};
+    REQUIRE(backend.initialize(selected, true).ok());
+    strata::CudaBuffer state;
+    REQUIRE(backend.upload_buffer(devices.front(), std::as_bytes(
+                std::span<const float>(packed)), state).ok());
+    std::vector<float> actual(width);
+    strata::CudaGlm53KdaRequest request;
+    request.state = &state;
+    request.query = query;
+    request.key = key;
+    request.value = value;
+    request.forget = forget;
+    request.beta = beta;
+    request.gate = gate;
+    request.heads = heads;
+    request.head_dim = dim;
+    request.convolution_kernel = kernel;
+    REQUIRE(backend.glm53_kda_decode(request, actual).ok());
+    for (std::size_t index = 0U; index < actual.size(); ++index) {
+        REQUIRE_NEAR(actual[index], expected[index], 2.0e-3F);
+    }
+    std::vector<float> measured_state(recurrent_floats + convolution_floats);
+    REQUIRE(backend.download_buffer(
+        state, 0U, std::as_writable_bytes(std::span<float>(measured_state))).ok());
+    for (std::size_t index = 0U; index < measured_state.size(); ++index) {
+        REQUIRE_NEAR(measured_state[index], expected_state[index], 2.0e-3F);
+    }
+
+    // The production checkpoint's KDA o_proj is BF16. Prove the chained
+    // command consumes the resident KDA row directly and publishes the same
+    // rounded projection as the standalone boundary.
+    strata::CudaWeightDescriptor projection_descriptor;
+    projection_descriptor.encoding = strata::CudaWeightEncoding::Plain;
+    projection_descriptor.dtype = strata::SafetensorsDtype::Bf16;
+    projection_descriptor.rows = dim;
+    projection_descriptor.columns = width;
+    std::vector<std::byte> projection_bytes(
+        static_cast<std::size_t>(dim) * width * 2U);
+    for (std::uint32_t row = 0U; row < dim; ++row) {
+        for (std::uint32_t column = 0U; column < width; ++column) {
+            const auto encoded = bf16(column == row ? 1.0F : 0.0F);
+            std::copy(encoded.begin(), encoded.end(),
+                projection_bytes.begin() + static_cast<std::ptrdiff_t>(
+                    (static_cast<std::size_t>(row) * width + column) * 2U));
+        }
+    }
+    strata::CudaWeight projection;
+    REQUIRE(backend.upload(devices.front(), projection_descriptor,
+                           projection_bytes, {}, projection).ok());
+    strata::CudaBuffer chained_state;
+    REQUIRE(backend.upload_buffer(devices.front(), std::as_bytes(
+                std::span<const float>(packed)), chained_state).ok());
+    request.state = &chained_state;
+    request.output_projection = &projection;
+    std::vector<float> projected(dim);
+    REQUIRE(backend.glm53_kda_decode(request, projected).ok());
+    for (std::uint32_t index = 0U; index < dim; ++index) {
+        REQUIRE_NEAR(projected[index], expected[index], 2.0e-3F);
+    }
 }

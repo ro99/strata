@@ -15,7 +15,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <list>
 #include <limits>
@@ -860,6 +862,31 @@ struct Glm53Runtime::Impl {
         std::uint64_t recency{};
     };
 
+    struct ScheduledRequest {
+        std::vector<std::uint32_t> prompt;
+        std::uint32_t maximum_new_tokens{};
+        SamplingOptions sampling;
+        std::vector<std::string> stop;
+        TokenStreamCallback on_token;
+        Glm53GenerationResult result;
+        Glm53SequenceState sequence;
+        std::vector<float> logits;
+        std::vector<std::uint32_t> counts;
+        std::vector<std::uint32_t> sampled;
+        std::mt19937_64 generator;
+        std::unique_ptr<StopSequenceBuffer> streamed;
+        std::size_t prefill_cursor{};
+        double prefill_started{};
+        std::uint32_t position{};
+        std::uint32_t iteration{};
+        double decode_started{};
+        std::mutex completion_mutex;
+        std::condition_variable completion;
+        bool prepared{};
+        bool decoding{};
+        bool done{};
+    };
+
     Glm53RuntimeConfig config;
     std::unique_ptr<Glm53CheckpointReader> checkpoint;
     ModelTokenizer tokenizer;
@@ -887,8 +914,24 @@ struct Glm53Runtime::Impl {
     ValidationResult warmup_result;
     bool ready{};
     std::thread warmup_thread;
+    std::mutex warmup_mutex;
+    std::mutex scheduler_mutex;
+    std::condition_variable scheduler_ready;
+    std::deque<std::shared_ptr<ScheduledRequest>> pending_requests;
+    std::vector<std::shared_ptr<ScheduledRequest>> active_requests;
+    std::thread scheduler_thread;
+    std::size_t scheduler_capacity{1U};
+    bool scheduler_stopping{};
+    std::atomic<std::uint64_t> scheduler_iterations{};
+    std::atomic<std::uint64_t> scheduler_batched_iterations{};
 
     ~Impl() {
+        {
+            std::scoped_lock lock(scheduler_mutex);
+            scheduler_stopping = true;
+        }
+        scheduler_ready.notify_all();
+        if (scheduler_thread.joinable()) scheduler_thread.join();
         if (warmup_thread.joinable()) warmup_thread.join();
     }
 
@@ -933,6 +976,7 @@ struct Glm53Runtime::Impl {
     }
 
     [[nodiscard]] ValidationResult wait_for_warmup() {
+        std::scoped_lock lock(warmup_mutex);
         if (warmup_thread.joinable()) warmup_thread.join();
         return warmup_result;
     }
@@ -2076,6 +2120,104 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
+    // Independent sequence rows share the layer's resident weights while
+    // retaining disjoint recurrent/MLA state. This is the decode batch shape:
+    // unlike prompt pages, rows are not causally related to one another.
+    [[nodiscard]] ValidationResult forward_layer_sequences(
+        std::span<float> streams, std::uint32_t layer,
+        std::span<const std::uint32_t> positions,
+        std::span<Glm53SequenceState* const> sequences) {
+        ValidationResult result;
+        const auto rows = static_cast<std::uint32_t>(sequences.size());
+        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
+        if (rows == 0U || positions.size() != rows ||
+            streams.size() != static_cast<std::size_t>(rows) * stream_columns) {
+            return {{"GLM-5.3 independent layer batch has an invalid shape"}};
+        }
+        const auto hidden_elements = static_cast<std::size_t>(rows) * kHidden;
+        std::vector<float> collapsed(hidden_elements), normalized(hidden_elements),
+            branch(hidden_elements);
+        std::vector<Dsv4MhcMix> mixes(rows);
+        const auto prefix = "model.language_model.layers." +
+                            std::to_string(layer) + ".";
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = mhc_pre(
+                std::span<float>(collapsed).subspan(
+                    static_cast<std::size_t>(row) * kHidden, kHidden),
+                mixes[row],
+                std::span<const float>(streams).subspan(
+                    static_cast<std::size_t>(row) * stream_columns,
+                    stream_columns),
+                prefix + "hc_attn");
+            if (!result.ok()) return result;
+        }
+        result = norm_rows(normalized, collapsed, rows, kHidden,
+                           prefix + "input_layernorm.weight");
+        if (!result.ok()) return result;
+        const auto attention = prefix + "self_attn.";
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            auto destination = std::span<float>(branch).subspan(
+                static_cast<std::size_t>(row) * kHidden, kHidden);
+            const auto input = std::span<const float>(normalized).subspan(
+                static_cast<std::size_t>(row) * kHidden, kHidden);
+            result = glm53_kda_layer(layer)
+                ? attention_kda(destination, input, layer, attention,
+                                *sequences[row])
+                : attention_mla(destination, input, layer, positions[row],
+                                attention, *sequences[row]);
+            if (!result.ok()) return result;
+        }
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto stream_begin =
+                static_cast<std::size_t>(row) * stream_columns;
+            std::vector<float> transitioned(stream_columns);
+            result = dsv4_mhc_post_f32(
+                transitioned,
+                std::span<const float>(branch).subspan(
+                    static_cast<std::size_t>(row) * kHidden, kHidden),
+                std::span<const float>(streams).subspan(
+                    stream_begin, stream_columns),
+                mixes[row], kMhc);
+            if (!result.ok()) return result;
+            round_bf16(transitioned);
+            std::copy(transitioned.begin(), transitioned.end(),
+                      streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
+        }
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = mhc_pre(
+                std::span<float>(collapsed).subspan(
+                    static_cast<std::size_t>(row) * kHidden, kHidden),
+                mixes[row],
+                std::span<const float>(streams).subspan(
+                    static_cast<std::size_t>(row) * stream_columns,
+                    stream_columns),
+                prefix + "hc_ffn");
+            if (!result.ok()) return result;
+        }
+        result = norm_rows(normalized, collapsed, rows, kHidden,
+                           prefix + "post_attention_layernorm.weight");
+        if (!result.ok()) return result;
+        result = feedforward_page(branch, normalized, rows, layer, prefix);
+        if (!result.ok()) return result;
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto stream_begin =
+                static_cast<std::size_t>(row) * stream_columns;
+            std::vector<float> transitioned(stream_columns);
+            result = dsv4_mhc_post_f32(
+                transitioned,
+                std::span<const float>(branch).subspan(
+                    static_cast<std::size_t>(row) * kHidden, kHidden),
+                std::span<const float>(streams).subspan(
+                    stream_begin, stream_columns),
+                mixes[row], kMhc);
+            if (!result.ok()) return result;
+            round_bf16(transitioned);
+            std::copy(transitioned.begin(), transitioned.end(),
+                      streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
+        }
+        return result;
+    }
+
     [[nodiscard]] ValidationResult finish_streams(
         std::span<const float> streams, std::span<float> logits) {
         ValidationResult result;
@@ -2121,6 +2263,106 @@ struct Glm53Runtime::Impl {
             return result;
         }
         return linear("lm_head", normalized, 1U, kHidden, logits, kLayers - 1U);
+    }
+
+    [[nodiscard]] ValidationResult finish_streams_page(
+        std::span<const float> streams, std::uint32_t rows,
+        std::span<float> logits) {
+        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
+        if (rows == 0U ||
+            streams.size() != static_cast<std::size_t>(rows) * stream_columns ||
+            logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
+            return {{"GLM-5.3 final sequence batch has an invalid shape"}};
+        }
+        std::vector<float> collapsed(static_cast<std::size_t>(rows) * kHidden);
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto stream_base =
+                static_cast<std::size_t>(row) * stream_columns;
+            const auto hidden_base = static_cast<std::size_t>(row) * kHidden;
+            for (std::size_t column = 0U; column < kHidden; ++column) {
+                collapsed[hidden_base + column] = 0.25F *
+                    (streams[stream_base + column] +
+                     streams[stream_base + kHidden + column] +
+                     streams[stream_base + 2U * kHidden + column] +
+                     streams[stream_base + 3U * kHidden + column]);
+            }
+        }
+        round_bf16(collapsed);
+        std::vector<float> normalized(collapsed.size());
+        auto result = norm_rows(normalized, collapsed, rows, kHidden,
+                                "model.language_model.norm.weight");
+        if (!result.ok()) return result;
+        if (lm_head_ranges.size() > 1U && projection_workers != nullptr &&
+            lm_head_ranges.size() == devices.size()) {
+            std::vector<std::vector<float>> shards(devices.size());
+            std::vector<ValidationResult> shard_results(devices.size());
+            auto dispatched = projection_workers->parallel_for_addressed(
+                devices.size(), [&](std::size_t slot) {
+                    const auto range = lm_head_ranges[slot];
+                    shards[slot].resize(static_cast<std::size_t>(rows) *
+                                        range.count);
+                    const Glm53WeightCache::LinearRequest request{
+                        "lm_head", range.count, kHidden, normalized, rows,
+                        shards[slot], true, kVocabulary, range.begin};
+                    shard_results[slot] = weights->matmul_batch(
+                        slot, std::span<const Glm53WeightCache::LinearRequest>(
+                                  &request, 1U));
+                });
+            if (!dispatched.ok()) return dispatched;
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                if (!shard_results[slot].ok()) return shard_results[slot];
+                const auto range = lm_head_ranges[slot];
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    std::copy_n(
+                        shards[slot].begin() + static_cast<std::ptrdiff_t>(
+                            static_cast<std::size_t>(row) * range.count),
+                        range.count,
+                        logits.begin() + static_cast<std::ptrdiff_t>(
+                            static_cast<std::size_t>(row) * kVocabulary +
+                            range.begin));
+                }
+            }
+            tensor_parallel_head_batches.fetch_add(1U,
+                                                    std::memory_order_relaxed);
+            return {};
+        }
+        return linear("lm_head", normalized, rows, kHidden, logits,
+                      kLayers - 1U);
+    }
+
+    [[nodiscard]] ValidationResult forward_token_batch(
+        std::span<const std::uint32_t> tokens,
+        std::span<const std::uint32_t> positions,
+        std::span<Glm53SequenceState* const> sequences,
+        std::span<float> logits) {
+        const auto rows = static_cast<std::uint32_t>(tokens.size());
+        if (rows == 0U || positions.size() != rows ||
+            sequences.size() != rows ||
+            logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
+            return {{"GLM-5.3 decode batch has an invalid shape"}};
+        }
+        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
+        std::vector<float> streams(static_cast<std::size_t>(rows) *
+                                   stream_columns);
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            auto result = initialize_streams(
+                tokens[row], std::span<float>(streams).subspan(
+                    static_cast<std::size_t>(row) * stream_columns,
+                    stream_columns));
+            if (!result.ok()) return result;
+        }
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            auto result = forward_layer_sequences(
+                streams, layer, positions, sequences);
+            if (!result.ok()) return result;
+        }
+        auto result = finish_streams_page(streams, rows, logits);
+        if (result.ok()) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                sequences[row]->set_token_count(positions[row] + 1U);
+            }
+        }
+        return result;
     }
 
     [[nodiscard]] ValidationResult forward_token(
@@ -2202,6 +2444,264 @@ struct Glm53Runtime::Impl {
         }
         return result;
     }
+
+    void complete_request(const std::shared_ptr<ScheduledRequest>& request) {
+        if (request->decoding) {
+            request->result.metrics.decode_seconds =
+                now_seconds() - request->decode_started;
+            if (request->streamed != nullptr) {
+                request->streamed->finish(request->on_token);
+                request->result.text = request->streamed->text();
+                request->result.stopped = request->result.stopped ||
+                                          request->streamed->stopped();
+            }
+        }
+        {
+            std::scoped_lock lock(request->completion_mutex);
+            request->done = true;
+        }
+        request->completion.notify_all();
+    }
+
+    [[nodiscard]] bool prepare_request(
+        const std::shared_ptr<ScheduledRequest>& request) {
+        auto warm = wait_for_warmup();
+        if (!warm.ok()) {
+            request->result.errors = std::move(warm.errors);
+            complete_request(request);
+            return false;
+        }
+        auto reset = reset_sequence(request->sequence);
+        if (!reset.ok()) {
+            request->result.errors = std::move(reset.errors);
+            complete_request(request);
+            return false;
+        }
+        request->result.prompt_token_ids = request->prompt;
+        request->result.metrics.prompt_tokens = request->prompt.size();
+        request->logits.resize(kVocabulary);
+        const auto reused = restore_prefix(
+            request->prompt, request->sequence, request->logits);
+        request->result.metrics.reused_prompt_tokens = reused;
+        request->prefill_cursor = reused;
+        request->prefill_started = now_seconds();
+        request->prepared = true;
+        return true;
+    }
+
+    void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
+        request->result.metrics.prefill_tokens =
+            request->prompt.size() -
+            request->result.metrics.reused_prompt_tokens;
+        request->result.metrics.prefill_seconds =
+            now_seconds() - request->prefill_started;
+        store_prefix(request->prompt, request->sequence, request->logits);
+        request->counts.assign(kVocabulary, 0U);
+        request->generator.seed(request->sampling.seed);
+        request->streamed =
+            std::make_unique<StopSequenceBuffer>(request->stop);
+        request->position = static_cast<std::uint32_t>(request->prompt.size());
+        request->decode_started = now_seconds();
+        request->decoding = true;
+        if (request->maximum_new_tokens == 0U) {
+            complete_request(request);
+        }
+    }
+
+    void advance_prefill(const std::shared_ptr<ScheduledRequest>& request,
+                         std::size_t maximum_rows) {
+        if (request->done || request->decoding) return;
+        if (request->prefill_cursor == request->prompt.size()) {
+            finish_prefill(request);
+            return;
+        }
+        const auto count = std::min(
+            maximum_rows, request->prompt.size() - request->prefill_cursor);
+        auto prefill = forward_prompt(
+            std::span<const std::uint32_t>(request->prompt).subspan(
+                request->prefill_cursor, count),
+            request->logits, request->sequence);
+        if (!prefill.ok()) {
+            request->result.errors = std::move(prefill.errors);
+            complete_request(request);
+            return;
+        }
+        request->prefill_cursor += count;
+        if (request->prefill_cursor == request->prompt.size()) {
+            finish_prefill(request);
+        }
+    }
+
+    [[nodiscard]] bool sample_request(
+        const std::shared_ptr<ScheduledRequest>& request,
+        std::uint32_t& forward_token_id) {
+        auto drawn = sample_logits(
+            request->logits, request->sampling,
+            SamplingHistory{request->counts, request->sampled},
+            request->generator);
+        if (!drawn.ok()) {
+            request->result.errors = std::move(drawn.errors);
+            complete_request(request);
+            return false;
+        }
+        if (drawn.token == 154820U || drawn.token == 154827U ||
+            drawn.token == 154829U) {
+            request->result.stopped = true;
+            complete_request(request);
+            return false;
+        }
+        request->result.generated_token_ids.push_back(drawn.token);
+        request->result.logprobs.push_back(drawn);
+        request->sampled.push_back(drawn.token);
+        ++request->counts[drawn.token];
+        auto piece = tokenizer.decode_token(drawn.token);
+        if (!piece.ok()) {
+            request->result.errors = std::move(piece.errors);
+            complete_request(request);
+            return false;
+        }
+        request->streamed->append(drawn.token, piece.value,
+                                  request->on_token);
+        if (request->streamed->stopped() ||
+            request->streamed->cancelled() ||
+            request->iteration + 1U == request->maximum_new_tokens) {
+            complete_request(request);
+            return false;
+        }
+        forward_token_id = drawn.token;
+        return true;
+    }
+
+    void scheduler_loop() {
+        for (;;) {
+            {
+                std::unique_lock lock(scheduler_mutex);
+                scheduler_ready.wait(lock, [&] {
+                    return scheduler_stopping || !pending_requests.empty() ||
+                           !active_requests.empty();
+                });
+                if (scheduler_stopping && pending_requests.empty() &&
+                    active_requests.empty()) {
+                    return;
+                }
+                // A fresh queue gets a tiny admission window so requests that
+                // arrived together become one prefill/decode cohort. Once a
+                // cohort is active there is no delay: iteration admission is
+                // immediate. Two milliseconds is below network jitter while
+                // avoiding a model- or hardware-specific batching timeout.
+                if (active_requests.empty() && pending_requests.size() == 1U &&
+                    !scheduler_stopping) {
+                    static_cast<void>(scheduler_ready.wait_for(
+                        lock, std::chrono::milliseconds(2), [&] {
+                            return scheduler_stopping ||
+                                   pending_requests.size() > 1U;
+                        }));
+                }
+                while (!pending_requests.empty() &&
+                       active_requests.size() < scheduler_capacity) {
+                    active_requests.push_back(pending_requests.front());
+                    pending_requests.pop_front();
+                }
+            }
+            for (auto& request : active_requests) {
+                if (!request->prepared && !request->done) {
+                    static_cast<void>(prepare_request(request));
+                }
+            }
+            std::size_t live = 0U;
+            std::size_t decoding = 0U;
+            for (const auto& request : active_requests) {
+                if (!request->done) ++live;
+                if (!request->done && request->decoding) ++decoding;
+            }
+            if (live > 0U) {
+                scheduler_iterations.fetch_add(1U, std::memory_order_relaxed);
+                if (live > 1U) {
+                    scheduler_batched_iterations.fetch_add(
+                        1U, std::memory_order_relaxed);
+                }
+                std::vector<std::shared_ptr<ScheduledRequest>> step_requests;
+                std::vector<std::uint32_t> step_tokens;
+                std::vector<std::uint32_t> step_positions;
+                std::vector<Glm53SequenceState*> step_sequences;
+                for (auto& request : active_requests) {
+                    if (request->done || !request->decoding) continue;
+                    std::uint32_t token = 0U;
+                    if (sample_request(request, token)) {
+                        step_requests.push_back(request);
+                        step_tokens.push_back(token);
+                        step_positions.push_back(request->position);
+                        step_sequences.push_back(&request->sequence);
+                    }
+                }
+                if (!step_requests.empty()) {
+                    std::vector<float> step_logits(
+                        step_requests.size() * kVocabulary);
+                    auto step = forward_token_batch(
+                        step_tokens, step_positions, step_sequences,
+                        step_logits);
+                    if (!step.ok()) {
+                        for (auto& request : step_requests) {
+                            request->result.errors = step.errors;
+                            complete_request(request);
+                        }
+                    } else {
+                        for (std::size_t row = 0U;
+                             row < step_requests.size(); ++row) {
+                            auto& request = step_requests[row];
+                            std::copy_n(
+                                step_logits.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        row * kVocabulary),
+                                kVocabulary, request->logits.begin());
+                            ++request->position;
+                            ++request->result.metrics.decode_tokens;
+                            ++request->iteration;
+                        }
+                    }
+                }
+                // Decode has latency priority. A newly admitted prompt gets a
+                // single-token chunk while decoders are live; with no decode
+                // work, a page-sized chunk retains the wide prefill route.
+                const std::size_t prefill_rows = decoding == 0U ? 64U : 1U;
+                for (auto& request : active_requests) {
+                    if (!request->done && !request->decoding) {
+                        advance_prefill(request, prefill_rows);
+                    }
+                }
+            }
+            active_requests.erase(
+                std::remove_if(active_requests.begin(), active_requests.end(),
+                    [](const auto& request) { return request->done; }),
+                active_requests.end());
+        }
+    }
+
+    [[nodiscard]] Glm53GenerationResult schedule(
+        std::vector<std::uint32_t> prompt,
+        std::uint32_t maximum_new_tokens, const SamplingOptions& sampling,
+        std::span<const std::string> stop,
+        const TokenStreamCallback& on_token) {
+        auto request = std::make_shared<ScheduledRequest>();
+        request->prompt = std::move(prompt);
+        request->maximum_new_tokens = maximum_new_tokens;
+        request->sampling = sampling;
+        request->stop.assign(stop.begin(), stop.end());
+        request->on_token = on_token;
+        {
+            std::scoped_lock lock(scheduler_mutex);
+            if (scheduler_stopping) {
+                request->result.errors.emplace_back(
+                    "GLM-5.3 iteration scheduler is stopping");
+                return std::move(request->result);
+            }
+            pending_requests.push_back(request);
+        }
+        scheduler_ready.notify_one();
+        std::unique_lock lock(request->completion_mutex);
+        request->completion.wait(lock, [&] { return request->done; });
+        return std::move(request->result);
+    }
 };
 
 Glm53Runtime::Glm53Runtime() : impl_(std::make_unique<Impl>()) {}
@@ -2226,6 +2726,8 @@ ValidationResult Glm53Runtime::initialize(
     impl_->config = config;
     impl_->prefix_cache_limit =
         prefix_cache_entries(config.maximum_context_tokens);
+    impl_->scheduler_capacity = std::max<std::size_t>(
+        1U, std::min<std::size_t>(32U, impl_->prefix_cache_limit));
     impl_->devices = resolve_runtime_devices(config.devices);
     result = validate_common_runtime_config(
         impl_->devices, config.vram_cache_fraction,
@@ -2288,6 +2790,9 @@ ValidationResult Glm53Runtime::initialize(
         impl_->warmup_thread = std::thread([state = impl_.get()] {
             state->warmup_result = state->warmup();
         });
+        impl_->scheduler_thread = std::thread([state = impl_.get()] {
+            state->scheduler_loop();
+        });
     } catch (const std::system_error& error) {
         impl_->ready = false;
         result.errors.push_back(
@@ -2336,77 +2841,8 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
             "GLM-5.3 prompt and requested generation exceed the admitted text context");
         return result;
     }
-    auto warmup = impl_->wait_for_warmup();
-    if (!warmup.ok()) {
-        result.errors = std::move(warmup.errors);
-        return result;
-    }
-    result.prompt_token_ids = encoded.value;
-    result.metrics.prompt_tokens = encoded.value.size();
-    std::vector<float> logits(kVocabulary);
-    Glm53SequenceState sequence;
-    auto reset = impl_->reset_sequence(sequence);
-    if (!reset.ok()) {
-        result.errors = std::move(reset.errors);
-        return result;
-    }
-    const auto reused = impl_->restore_prefix(encoded.value, sequence, logits);
-    result.metrics.reused_prompt_tokens = reused;
-    const auto prefill_started = now_seconds();
-    if (reused < encoded.value.size()) {
-        auto prefill = impl_->forward_prompt(
-            std::span<const std::uint32_t>(encoded.value).subspan(reused),
-            logits, sequence);
-        if (!prefill.ok()) {
-            result.errors = std::move(prefill.errors);
-            return result;
-        }
-    }
-    result.metrics.prefill_tokens = encoded.value.size() - reused;
-    result.metrics.prefill_seconds = now_seconds() - prefill_started;
-    impl_->store_prefix(encoded.value, sequence, logits);
-    std::mt19937_64 generator(sampling.seed);
-    std::vector<std::uint32_t> counts(kVocabulary, 0U);
-    std::vector<std::uint32_t> sampled;
-    StopSequenceBuffer streamed(stop);
-    auto position = static_cast<std::uint32_t>(encoded.value.size());
-    const auto decode_started = now_seconds();
-    for (std::uint32_t index = 0U; index < maximum_new_tokens; ++index) {
-        auto drawn = sample_logits(logits, sampling,
-                                   SamplingHistory{counts, sampled}, generator);
-        if (!drawn.ok()) {
-            result.errors = std::move(drawn.errors);
-            return result;
-        }
-        if (drawn.token == 154820U || drawn.token == 154827U ||
-            drawn.token == 154829U) {
-            result.stopped = true;
-            break;
-        }
-        result.generated_token_ids.push_back(drawn.token);
-        result.logprobs.push_back(drawn);
-        sampled.push_back(drawn.token);
-        ++counts[drawn.token];
-        auto piece = impl_->tokenizer.decode_token(drawn.token);
-        if (!piece.ok()) {
-            result.errors = std::move(piece.errors);
-            return result;
-        }
-        streamed.append(drawn.token, piece.value, on_token);
-        if (streamed.stopped() || streamed.cancelled()) break;
-        if (index + 1U == maximum_new_tokens) break;
-        auto step = impl_->forward_token(drawn.token, position++, logits,
-                                         sequence);
-        if (!step.ok()) {
-            result.errors = std::move(step.errors);
-            return result;
-        }
-        ++result.metrics.decode_tokens;
-    }
-    result.metrics.decode_seconds = now_seconds() - decode_started;
-    streamed.finish(on_token);
-    result.text = streamed.text();
-    result.stopped = result.stopped || streamed.stopped();
+    result = impl_->schedule(std::move(encoded.value), maximum_new_tokens,
+                             sampling, stop, on_token);
     if (impl_->config.verbose) {
         std::cerr << "[glm53-projection] parallel_batches="
                   << impl_->parallel_projection_batches.load(
@@ -2424,6 +2860,11 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << impl_->prefix_cache_hits.load(std::memory_order_relaxed)
                   << " prefix_cache_tokens="
                   << impl_->prefix_cache_tokens.load(std::memory_order_relaxed)
+                  << " scheduler_iterations="
+                  << impl_->scheduler_iterations.load(std::memory_order_relaxed)
+                  << " scheduler_batched_iterations="
+                  << impl_->scheduler_batched_iterations.load(
+                         std::memory_order_relaxed)
                   << '\n';
     }
     return result;

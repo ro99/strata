@@ -769,6 +769,50 @@ ValidationResult CudaBackend::dsv4_mhc_finish_device(
     return dsv4_mhc_finish_impl(device, {}, hidden, true);
 }
 
+ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
+    int device, std::span<float> layer_input) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"mHC layer-input download targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.moe_in_flight || state.dsv4_mhc_failed ||
+        layer_input.size() != kDsv4MhcHidden ||
+        state.dsv4_mhc_host_staging == nullptr ||
+        state.dsv4_mhc_host_staging_bytes <
+            kDsv4MhcHidden * sizeof(std::uint16_t)) {
+        return {{"mHC layer-input download violates command order"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC input download");
+    }
+    const auto bytes = kDsv4MhcHidden * sizeof(std::uint16_t);
+    if (auto status = cudaMemcpyAsync(
+            state.dsv4_mhc_host_staging,
+            state.dsv4_mhc_workspace->layer_input, bytes,
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download mHC normalized layer input");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize mHC layer-input download");
+    }
+    const auto* encoded = reinterpret_cast<const std::uint16_t*>(
+        state.dsv4_mhc_host_staging);
+    for (std::size_t index = 0U; index < layer_input.size(); ++index) {
+        layer_input[index] = std::bit_cast<float>(
+            static_cast<std::uint32_t>(encoded[index]) << 16U);
+        if (!std::isfinite(layer_input[index])) {
+            return {{"mHC normalized layer input is non-finite"}};
+        }
+    }
+    return result;
+}
+
 ValidationResult CudaBackend::dsv4_mhc_device_view(
     int device, CudaDsv4MhcDeviceView& view) {
     view = {};

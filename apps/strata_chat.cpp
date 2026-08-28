@@ -168,7 +168,7 @@ usage:
 
 required:
   --model DIR                 checkpoint directory
-  --model-type TYPE           gemma4 | deepseek | glm | laguna | inkling | kimi-k3
+  --model-type TYPE           gemma4 | deepseek | glm | glm53 | laguna | inkling | kimi-k3
 
 session:
   --prompt TEXT               answer TEXT and exit instead of prompting

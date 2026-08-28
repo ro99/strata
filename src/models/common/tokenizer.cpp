@@ -1623,6 +1623,56 @@ std::string render_glm52_chat_prompt(std::span<const ChatMessage> messages,
     return output;
 }
 
+std::string render_glm53_chat_prompt(std::span<const ChatMessage> messages,
+                                     std::string_view reasoning_effort,
+                                     bool clear_thinking) {
+    const auto effort = reasoning_effort == "low" ? "Low"
+        : reasoning_effort == "high" ? "High" : "Max";
+    std::string output =
+        std::string("[gMASK]<sop><|system|>Reasoning Effort: ") + effort;
+    bool observing = false;
+    for (const auto& message : messages) {
+        switch (message.role) {
+            case ChatRole::System:
+                output += "<|system|>" + message.content;
+                observing = false;
+                break;
+            case ChatRole::User:
+                output += "<|user|>" + message.content;
+                observing = false;
+                break;
+            case ChatRole::Assistant: {
+                output += "<|assistant|>";
+                if (clear_thinking) output += "<think></think>";
+                auto begin = message.content.find_first_not_of(" \t\r\n");
+                if (begin != std::string::npos) {
+                    const auto end = message.content.find_last_not_of(" \t\r\n");
+                    output.append(message.content, begin, end - begin + 1U);
+                }
+                observing = false;
+                break;
+            }
+            case ChatRole::Tool:
+                if (!observing) output += "<|observation|>";
+                output += "<tool_response>" + message.content +
+                          "</tool_response>";
+                observing = true;
+                break;
+        }
+    }
+    output += "<|assistant|><think>";
+    return output;
+}
+
+std::string render_glm53_user_prompt(std::string_view user_text,
+                                     std::string_view reasoning_effort,
+                                     bool clear_thinking) {
+    const std::array messages{ChatMessage{ChatRole::User,
+                                          std::string(user_text)}};
+    return render_glm53_chat_prompt(messages, reasoning_effort,
+                                    clear_thinking);
+}
+
 std::string render_deepseek_v4_user_prompt(std::string_view user_text,
                                            bool enable_thinking) {
     const std::array messages{ChatMessage{ChatRole::User,

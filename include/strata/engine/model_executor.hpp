@@ -3,7 +3,7 @@
 // The model seam.
 //
 // Everything above this header (RuntimeSession, the CLIs, the server) speaks
-// only ModelExecutor and the registry. Everything below it (the six concrete
+// only ModelExecutor and the registry. Everything below it (the seven concrete
 // runtimes) implements ModelExecutor and registers itself from its own
 // translation unit.
 //
@@ -38,6 +38,7 @@ namespace strata {
 
 enum class RuntimeModel : std::uint8_t {
     Glm52,
+    Glm53,
     DeepSeekV4,
     Gemma4,
     KimiK3,

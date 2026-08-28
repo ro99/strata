@@ -2376,6 +2376,7 @@ struct alignas(256) Dsv4MhcWorkspace {
     float post[kDsv4MhcMultiplier];
     float combination[kDsv4MhcMultiplier * kDsv4MhcMultiplier];
     float router_logits[kDsv4MhcRouterLogits];
+    float glm53_router_logits[288U];
     unsigned int failure{};
 };
 

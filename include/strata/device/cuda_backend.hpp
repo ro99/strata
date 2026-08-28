@@ -16,12 +16,17 @@
 namespace strata {
 
 class CudaBuffer;
+class CudaWeight;
 
 enum class CudaWeightEncoding : std::uint8_t {
     Plain,
     OffsetPackedInt4,
     OffsetPackedInt8,
     Fp8E4m3Block128,
+    // E4M3 payload with one F32 inverse scale per 128x128 weight block. This
+    // is the standard dynamic-FP8 layout used by GLM-5.3-Flash; it is not the
+    // E8M0 scale byte used by DeepSeek and the two must never alias.
+    Fp8E4m3Block128F32,
     Fp4E2m1Group32,
     // compressed-tensors "nvfp4-pack-quantized": E2M1 nibble pairs with FP8
     // E4M3 group scales and one FP32 per-tensor global scale. Weights
@@ -63,6 +68,20 @@ struct CudaMatmulProfile {
     std::uint64_t h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
     std::uint64_t d2h_nanoseconds{};
+};
+
+// Independent same-device projections issued as one host-completion group.
+// Inputs and outputs remain ordinary F32 host spans; the backend stages every
+// source and destination in disjoint pinned regions, reuses its device
+// workspace in stream order, and crosses back to the host once after the last
+// projection. This changes scheduling only, never a matmul's numerical route.
+struct CudaMatmulBatchItem {
+    const CudaWeight* weight{};
+    std::span<const float> input;
+    std::uint32_t rows{};
+    std::span<float> output;
+    bool round_bf16_output{};
+    bool fp8_tensor_page{};
 };
 
 struct CudaSynchronizationStats {
@@ -647,6 +666,59 @@ struct CudaBufferPatch {
     std::span<const std::byte> bytes;
 };
 
+// One GLM-5.3 KDA decode command. `state` owns the exact F32 recurrent matrix,
+// causal convolution history, and immutable per-layer coefficients packed by
+// the model runtime. Projection boundaries remain host-visible for now, but
+// the O(H * D^2) recurrence never crosses PCIe after prompt admission.
+struct CudaGlm53KdaRequest {
+    const CudaBuffer* state{};
+    // When `input` is present these nine same-device weights turn the command
+    // into the complete KDA attention sublayer. All intermediate activations
+    // stay in the persistent state buffer and only the final O projection is
+    // published. Empty input preserves the narrower projected-input oracle.
+    const CudaWeight* query_projection{};
+    const CudaWeight* key_projection{};
+    const CudaWeight* value_projection{};
+    const CudaWeight* forget_a_projection{};
+    const CudaWeight* beta_projection{};
+    const CudaWeight* gate_a_projection{};
+    const CudaWeight* forget_b_projection{};
+    const CudaWeight* gate_b_projection{};
+    // Optional same-device BF16/FP8 output projection. When present, the normalized
+    // KDA heads never return to the host; `output` is the projection's BF16
+    // row rather than the unprojected head row.
+    const CudaWeight* output_projection{};
+    std::span<const float> input;
+    std::span<const float> query;
+    std::span<const float> key;
+    std::span<const float> value;
+    std::span<const float> forget;
+    std::span<const float> beta;
+    std::span<const float> gate;
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t convolution_kernel{};
+    // Consume the BF16 layer input from, and publish the BF16 branch into,
+    // the active resident mHC workspace. `input` and `output` are empty and
+    // the complete attention command remains stream ordered in this mode.
+    bool mhc_source_destination{};
+};
+
+struct CudaGlm53MlaRequest {
+    const CudaBuffer* state{};
+    const CudaWeight* query_a{};
+    const CudaWeight* key_value_a{};
+    const CudaWeight* query_b{};
+    const CudaWeight* key_value_b{};
+    const CudaWeight* output{};
+    std::uint32_t position{};
+    std::uint32_t maximum_context{};
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    std::uint32_t query_rank{};
+    std::uint32_t key_value_rank{};
+};
+
 // Persistent target-format inputs for one DeepSeek mHC pre boundary. The
 // projection remains F32 as in the accepted SM86 contract; scale/base and the
 // BF16 norm weight are packed into one immutable auxiliary allocation.
@@ -844,7 +916,9 @@ enum class CudaMatmulRoute : std::uint8_t {
     PackedOffsetInt,
     Nvfp4Group16,
     Fp8TensorPage,
+    Fp8F32TensorPage,
     Fp8E4m3Block128,
+    Fp8E4m3Block128F32,
     Fp4E2m1Group32,
     // MIX-2 register-fed skinny kernels. These are the accepted QPN shapes made
     // model agnostic: any weight whose encoding and extents admit the m16n8k16
@@ -852,6 +926,7 @@ enum class CudaMatmulRoute : std::uint8_t {
     // shapes the fragment layout cannot express. The census distinguishes them
     // so a run can show which of the two actually served a dispatch.
     Fp8RegisterFed,
+    Fp8F32RegisterFed,
     Fp4RegisterFed,
     GemmaMarlin,
     // MoE expert batches dispatch through CudaBackend::enqueue_moe, which
@@ -859,6 +934,8 @@ enum class CudaMatmulRoute : std::uint8_t {
     // matmul_impl is load-only. These are counted separately so a census can
     // distinguish a load-time dispatch from a per-token one.
     MoePlainBf16,
+    MoeFp8E4m3Block128F32,
+    MoeFp8F32RegisterFed,
     MoeNvfp4Group16,
     MoeFp4E2m1Group32,
     MoePackedInt4,
@@ -911,8 +988,9 @@ void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
 
 class CudaBackend {
 public:
-    // Permutes an Fp8E4m3Block128 or Fp4E2m1Group32 weight from its canonical
-    // layout into m16n8k16 fragment order, in place. The fragment order
+    // Permutes an Fp8E4m3Block128, Fp8E4m3Block128F32, or Fp4E2m1Group32
+    // weight from its canonical layout into m16n8k16 fragment order, in place.
+    // The fragment order
     // REPLACES the canonical device layout -- one-copy residency, not a second
     // buffer -- so every consumer of that weight must expect fragment order
     // afterwards. matmul_impl and the shared expert call this themselves on
@@ -941,6 +1019,14 @@ public:
     [[nodiscard]] static bool compiled() noexcept;
     [[nodiscard]] static std::vector<int> available_devices();
     [[nodiscard]] static ParseResult<CudaDeviceMemory> device_memory(int device);
+    // Host NUMA node nearest this CUDA device, discovered through its PCI
+    // identity. Returns -1 when the platform cannot describe that affinity.
+    [[nodiscard]] static int device_numa_node(int device) noexcept;
+    // True only for the CUDA driver's best peer-performance rank. Mere peer
+    // addressability over a contended PCIe host bridge is not enough to make
+    // fine-grained cross-device projection barriers profitable.
+    [[nodiscard]] static bool high_speed_peer_access_supported(
+        int source, int destination) noexcept;
     [[nodiscard]] static std::uint64_t weight_storage_bytes(
         std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept;
 
@@ -975,6 +1061,11 @@ public:
     enum class UploadCompletion : std::uint8_t {
         Synchronous,
         Deferred,
+        // The caller additionally guarantees that any weight which an
+        // in-flight MoE command references remains leased. Allocation and H2D
+        // may then use the independent upload stream while that command runs;
+        // synchronize_uploads() orders the next execution-stream consumer.
+        DeferredConcurrent,
     };
     // `prepack` asks for the weight to be permuted into m16n8k16 fragment
     // order as part of the upload, stream-ordered behind the copy so the loader
@@ -1007,6 +1098,15 @@ public:
         std::span<std::byte> output);
     [[nodiscard]] ValidationResult allocate_buffer(
         int device, std::uint64_t bytes, CudaBuffer& output);
+    [[nodiscard]] ValidationResult glm53_kda_decode(
+        const CudaGlm53KdaRequest& request, std::span<float> output);
+    [[nodiscard]] ValidationResult glm53_mhc_router(
+        int device, const CudaWeight& router, std::span<float> logits);
+    [[nodiscard]] ValidationResult glm53_mhc_swiglu(
+        int device, const CudaWeight& gate, const CudaWeight& up,
+        const CudaWeight& down, std::uint32_t intermediate);
+    [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
+        const CudaGlm53MlaRequest& request);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
         std::span<const std::uint16_t> values, std::uint32_t start,
@@ -1039,6 +1139,8 @@ public:
         bool round_bf16_output = false,
         CudaMatmulProfile* profile = nullptr,
         bool dsv4_fp8_tensor_page = false);
+    [[nodiscard]] ValidationResult matmul_batch(
+        std::span<const CudaMatmulBatchItem> items);
     [[nodiscard]] ValidationResult matmul_softcap(
         const CudaWeight& weight, std::span<const float> input,
         float softcap, std::span<float> output);
@@ -1061,6 +1163,13 @@ public:
     // projection can use the SM86 BF16-WMMA path. Other capabilities retain
     // the native FP8 CUDA-core kernel as a numerical fallback.
     [[nodiscard]] bool dsv4_fp8_tensor_page_supported(int device) const noexcept;
+    // Model-neutral tensor-core page projection for E4M3 weights with F32
+    // block-128 scales and continuous per-row activation scales. Capability is
+    // discovered from the selected CUDA device; callers still opt in per
+    // projection so a numerical route change is never implicit.
+    [[nodiscard]] bool fp8_f32_tensor_page_supported(int device) const noexcept;
+    [[nodiscard]] bool fp8_f32_register_fed_supported(
+        int device) const noexcept;
     [[nodiscard]] ValidationResult validate_dsv4_mhc_device(
         int device) const;
     // Executes the model-neutral forward attention primitive under the
@@ -1152,6 +1261,8 @@ public:
         std::span<float> hidden);
     [[nodiscard]] ValidationResult dsv4_mhc_finish_device(
         int device, std::span<float> hidden);
+    [[nodiscard]] ValidationResult dsv4_mhc_download_layer_input(
+        int device, std::span<float> layer_input);
     // Device-only rank-local mHC bridges.  These preserve the existing state
     // machine while keeping the attention/FFN boundary on the CUDA stream.
     [[nodiscard]] ValidationResult dsv4_mhc_device_view(
@@ -1339,11 +1450,18 @@ public:
     [[nodiscard]] ValidationResult enqueue_moe(
         int device, std::span<const float> hidden, std::uint32_t rows,
         std::span<const CudaMoeExpert> routed,
-        const CudaMoeExpert* shared = nullptr);
+        const CudaMoeExpert* shared = nullptr,
+        float swiglu_limit = 0.0F);
+    [[nodiscard]] ValidationResult enqueue_glm53_moe_from_mhc(
+        int device, std::span<const CudaMoeExpert> routed,
+        const CudaMoeExpert& shared, std::span<const float> coefficients,
+        float swiglu_limit);
     [[nodiscard]] ValidationResult collect_moe(
         int device, std::span<float> routed_output,
         std::span<float> shared_output = {});
     [[nodiscard]] ValidationResult synchronize(int device);
+    [[nodiscard]] ValidationResult profiler_start();
+    [[nodiscard]] ValidationResult profiler_stop();
 
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
@@ -1355,6 +1473,12 @@ private:
         int device, const CudaDsv4MhcWeights& weights,
         std::span<const float> hidden, std::span<float> weighted,
         std::span<float> layer_input, bool device_only);
+    [[nodiscard]] ValidationResult enqueue_moe_impl(
+        int device, std::span<const float> hidden, std::uint32_t rows,
+        std::span<const CudaMoeExpert> routed,
+        const CudaMoeExpert* shared, float swiglu_limit,
+        bool mhc_source_destination,
+        std::span<const float> routed_coefficients);
     [[nodiscard]] ValidationResult dsv4_mhc_transition_impl(
         int device, const CudaDsv4MhcWeights& next_weights,
         std::span<const float> branch_output, std::span<float> weighted,
@@ -1378,7 +1502,10 @@ private:
         std::uint64_t rows_per_group, std::span<float> output,
         float softcap, bool round_output = false,
         CudaMatmulProfile* profile = nullptr,
-        bool dsv4_fp8_tensor_page = false);
+        bool dsv4_fp8_tensor_page = false,
+        const std::byte* batch_input = nullptr,
+        std::byte* batch_output = nullptr,
+        bool defer_completion = false);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

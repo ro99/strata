@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <mma.h>
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -38,6 +40,7 @@ namespace strata {
 #include "detail/backend_core.inc.cuh"
 #include "detail/backend_dense_page.inc.cuh"
 #include "detail/backend_indexing.inc.cuh"
+#include "detail/backend_hybrid_recurrence.inc.cuh"
 #include "detail/backend_flash_attention.inc.cuh"
 #include "detail/backend_prepared_attention.inc.cuh"
 #include "detail/backend_mhc.inc.cuh"

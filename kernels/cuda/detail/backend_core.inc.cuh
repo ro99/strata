@@ -68,6 +68,38 @@ ParseResult<CudaDeviceMemory> CudaBackend::device_memory(int device) {
     return result;
 }
 
+int CudaBackend::device_numa_node(int device) noexcept {
+    char bus_id[32]{};
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), device) != cudaSuccess) {
+        return -1;
+    }
+    char path[128]{};
+    const int written = std::snprintf(
+        path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus_id);
+    if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(path)) {
+        return -1;
+    }
+    std::ifstream input(path);
+    int node = -1;
+    return input >> node && node >= 0 ? node : -1;
+}
+
+bool CudaBackend::high_speed_peer_access_supported(
+    int source, int destination) noexcept {
+    if (source == destination) return true;
+    int supported = 0;
+    if (cudaDeviceCanAccessPeer(&supported, source, destination) !=
+            cudaSuccess ||
+        supported == 0) {
+        return false;
+    }
+    int rank = -1;
+    return cudaDeviceGetP2PAttribute(
+               &rank, cudaDevP2PAttrPerformanceRank, source, destination) ==
+               cudaSuccess &&
+           rank == 0;
+}
+
 std::uint64_t CudaBackend::weight_storage_bytes(
     std::uint64_t weight_bytes, std::uint64_t scale_bytes) noexcept {
     if (weight_bytes == 0U) return 0U;
@@ -117,6 +149,12 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
         state.lightning_index_supported = state.flash_attention_supported;
         state.dsv4_fp8_tensor_page_supported =
             properties.major == 8 && properties.minor == 6;
+        // BF16 WMMA is an architectural CUDA capability from Ampere onward.
+        // Keep DeepSeek's experimentally-bound SM86 flag above exact, while
+        // allowing the model-neutral F32-scale route to follow the hardware
+        // discovered at runtime instead of a machine-specific device list.
+        state.fp8_f32_tensor_page_supported = properties.major >= 8;
+        state.fp8_f32_register_fed_supported = properties.major >= 8;
         if (auto status = cudaStreamCreateWithFlags(&state.stream, cudaStreamNonBlocking);
             status != cudaSuccess) {
             return cuda_error(status, "create CUDA stream");
@@ -320,7 +358,8 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         result.errors.emplace_back("weight upload targets an uninitialized CUDA device");
         return result;
     }
-    if (found->second.moe_in_flight) {
+    if (found->second.moe_in_flight &&
+        completion != UploadCompletion::DeferredConcurrent) {
         result.errors.emplace_back(
             "weight upload cannot overlap an in-flight DeepSeek MoE command");
         return result;
@@ -424,6 +463,22 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             result.errors.emplace_back("invalid native FP8 CUDA weight descriptor");
             return result;
         }
+    } else if (descriptor.encoding ==
+               CudaWeightEncoding::Fp8E4m3Block128F32) {
+        const auto expected_scale_columns = (descriptor.columns + 127U) / 128U;
+        const auto expected_scale_rows = (descriptor.rows + 127U) / 128U;
+        if (descriptor.dtype != SafetensorsDtype::F8E4M3 ||
+            descriptor.packed_columns != descriptor.columns ||
+            descriptor.scale_columns != expected_scale_columns ||
+            descriptor.group_size != 128U ||
+            !checked_bytes(descriptor.rows, descriptor.columns, 1U,
+                           expected_weights) ||
+            !checked_bytes(expected_scale_rows, descriptor.scale_columns, 4U,
+                           expected_scales)) {
+            result.errors.emplace_back(
+                "invalid F32-scaled native FP8 CUDA weight descriptor");
+            return result;
+        }
     } else {
         result.errors.emplace_back("unsupported CUDA weight encoding");
         return result;
@@ -489,7 +544,7 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     // upload_ready before anything reads the weight. A synchronous upload keeps
     // the execution stream, because its caller's host payload dies at return
     // and the wait below is what keeps it alive long enough.
-    const bool deferred = completion == UploadCompletion::Deferred;
+    const bool deferred = completion != UploadCompletion::Synchronous;
     auto* const upload_stream = deferred ? state.upload_stream : state.stream;
     const auto upload_error = [&state, &target, upload_stream](
         cudaError_t status, const char* operation) {
@@ -498,8 +553,66 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         }
         return cuda_error(status, operation);
     };
+    // cudaMemcpyAsync from an mmap-backed checkpoint is only superficially
+    // asynchronous: the runtime blocks the submitting thread while it copies
+    // pageable input into an internal pinned buffer.  Nsight on GLM-5.3 showed
+    // 1.98 seconds of host API time and 9.99 GB of H2D traffic in one token.
+    // Keep a reusable pinned ring instead.  Its capacity follows the admitted
+    // device arena (1/64th), which gives larger GPUs a deeper overlap window
+    // without baking this host's VRAM size into the runtime.
+    const bool stage_pageable = deferred && payload_bytes >= (1ULL << 20U) &&
+                                state.weight_arena != nullptr;
+    if (stage_pageable && state.weight_host_staging == nullptr) {
+        const auto arena = state.weight_arena->occupancy();
+        const auto desired = std::max<std::uint64_t>(
+            payload_bytes, arena.capacity / 64U);
+        void* staging = nullptr;
+        if (desired <= std::numeric_limits<std::size_t>::max() &&
+            cudaMallocHost(&staging, static_cast<std::size_t>(desired)) ==
+                cudaSuccess) {
+            state.weight_host_staging = static_cast<std::byte*>(staging);
+            state.weight_host_staging_bytes = desired;
+        } else {
+            // Pinned staging is an optimization.  A host whose lockable-memory
+            // budget is smaller keeps the exact pageable path.
+            static_cast<void>(cudaGetLastError());
+        }
+    }
+    const bool pinned_stage_ready =
+        stage_pageable && state.weight_host_staging != nullptr &&
+        payload_bytes <= state.weight_host_staging_bytes;
+    const auto reserve_staging = [&](std::uint64_t bytes,
+                                     const std::byte*& source,
+                                     const std::byte* original) -> cudaError_t {
+        if (!pinned_stage_ready || bytes == 0U) {
+            source = original;
+            return cudaSuccess;
+        }
+        constexpr std::uint64_t alignment = 256U;
+        auto cursor = (state.weight_host_staging_cursor + alignment - 1U) &
+                      ~(alignment - 1U);
+        if (cursor > state.weight_host_staging_bytes ||
+            bytes > state.weight_host_staging_bytes - cursor) {
+            // Every earlier slice is consumed by this one upload stream.  Wait
+            // only when the ring wraps, then recycle the whole arena at once.
+            const auto drained = cudaStreamSynchronize(upload_stream);
+            if (drained != cudaSuccess) return drained;
+            cursor = 0U;
+        }
+        auto* destination = state.weight_host_staging + cursor;
+        std::memcpy(destination, original, static_cast<std::size_t>(bytes));
+        state.weight_host_staging_cursor = cursor + bytes;
+        source = destination;
+        return cudaSuccess;
+    };
+    const std::byte* weight_source = weights.data();
+    if (auto status = reserve_staging(weights.size(), weight_source,
+                                      weights.data());
+        status != cudaSuccess) {
+        return upload_error(status, "recycle pinned CUDA weight staging");
+    }
     auto copy_started = std::chrono::steady_clock::now();
-    if (auto status = cudaMemcpyAsync(target->weights, weights.data(), weights.size(),
+    if (auto status = cudaMemcpyAsync(target->weights, weight_source, weights.size(),
                                       cudaMemcpyHostToDevice, upload_stream);
         status != cudaSuccess) {
         return upload_error(status, "upload CUDA weights");
@@ -517,8 +630,14 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
             allocation_nanoseconds +=
                 elapsed_nanoseconds_since(scale_allocation_started);
         }
+        const std::byte* scale_source = scales.data();
+        if (auto status = reserve_staging(scales.size(), scale_source,
+                                          scales.data());
+            status != cudaSuccess) {
+            return upload_error(status, "recycle pinned CUDA scale staging");
+        }
         copy_started = std::chrono::steady_clock::now();
-        if (auto status = cudaMemcpyAsync(target->scales, scales.data(), scales.size(),
+        if (auto status = cudaMemcpyAsync(target->scales, scale_source, scales.size(),
                                           cudaMemcpyHostToDevice, upload_stream);
             status != cudaSuccess) {
             return upload_error(status, "upload CUDA scales");
@@ -530,7 +649,9 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     // costs one read and one write of what was staged, measured at 0.509
     // ms/token against Laguna's 65.05 ms staging term (experiment 0168), so it
     // does not need to move off the staging path.
-    if (prepack == FragmentLayout::Prepack && regfed_matmul_enabled()) {
+    if (prepack == FragmentLayout::Prepack && regfed_matmul_enabled() &&
+        (descriptor.encoding != CudaWeightEncoding::Fp8E4m3Block128F32 ||
+         state.fp8_f32_register_fed_supported)) {
         const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
         if (scratch_bytes != 0U) {
             bool ready = true;
@@ -821,4 +942,11 @@ ValidationResult CudaBackend::allocate_buffer(
         stats.workspace_allocation_bytes += bytes;
     }
     return result;
+}
+ValidationResult CudaBackend::profiler_start() {
+    return cuda_error(cudaProfilerStart(), "start CUDA profiler capture");
+}
+
+ValidationResult CudaBackend::profiler_stop() {
+    return cuda_error(cudaProfilerStop(), "stop CUDA profiler capture");
 }

@@ -2036,7 +2036,25 @@ ValidationResult CudaBackend::collect_deepseek_moe_rows(
 
 ValidationResult CudaBackend::enqueue_moe(
     int device, std::span<const float> hidden, std::uint32_t rows,
-    std::span<const CudaMoeExpert> routed, const CudaMoeExpert* shared) {
+    std::span<const CudaMoeExpert> routed, const CudaMoeExpert* shared,
+    float swiglu_limit) {
+    return enqueue_moe_impl(device, hidden, rows, routed, shared,
+                            swiglu_limit, false, {});
+}
+
+ValidationResult CudaBackend::enqueue_glm53_moe_from_mhc(
+    int device, std::span<const CudaMoeExpert> routed,
+    const CudaMoeExpert& shared, std::span<const float> coefficients,
+    float swiglu_limit) {
+    return enqueue_moe_impl(device, {}, 1U, routed, &shared, swiglu_limit,
+                            true, coefficients);
+}
+
+ValidationResult CudaBackend::enqueue_moe_impl(
+    int device, std::span<const float> hidden, std::uint32_t rows,
+    std::span<const CudaMoeExpert> routed, const CudaMoeExpert* shared,
+    float swiglu_limit, bool mhc_source_destination,
+    std::span<const float> routed_coefficients) {
     ValidationResult result;
     const auto found = impl_->devices.find(device);
     if (found == impl_->devices.end()) {
@@ -2044,13 +2062,21 @@ ValidationResult CudaBackend::enqueue_moe(
         return result;
     }
     auto& state = found->second;
-    if (state.moe_in_flight) {
+    if (state.moe_in_flight ||
+        (mhc_source_destination &&
+         (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+          state.dsv4_mhc_workspace == nullptr ||
+          state.dsv4_mhc_branch_ready || state.dsv4_mhc_failed))) {
         result.errors.emplace_back("MoE workspace already has an in-flight command");
         return result;
     }
     const auto expert_count = routed.size() + (shared == nullptr ? 0U : 1U);
     if (rows == 0U || expert_count == 0U || expert_count > kMaxMoeExperts ||
-        routed.size() > kMaxRoutedMoeExperts) {
+        routed.size() > kMaxRoutedMoeExperts ||
+        (mhc_source_destination &&
+         (rows != 1U || shared == nullptr ||
+          routed_coefficients.size() != routed.size())) ||
+        (!mhc_source_destination && !routed_coefficients.empty())) {
         result.errors.emplace_back("MoE command has an unsupported row or expert count");
         return result;
     }
@@ -2069,10 +2095,18 @@ ValidationResult CudaBackend::enqueue_moe(
     const bool nvfp4_batch = batch_encoding == CudaWeightEncoding::Nvfp4Group16;
     const bool mxfp4_batch =
         batch_encoding == CudaWeightEncoding::Fp4E2m1Group32;
+    const bool fp8_f32_batch =
+        batch_encoding == CudaWeightEncoding::Fp8E4m3Block128F32;
     const bool plain_batch = batch_encoding == CudaWeightEncoding::Plain;
-    if (!nvfp4_batch && !mxfp4_batch && !plain_batch &&
+    if (!nvfp4_batch && !mxfp4_batch && !fp8_f32_batch && !plain_batch &&
         batch_encoding != CudaWeightEncoding::OffsetPackedInt4) {
         result.errors.emplace_back("MoE command has an unsupported weight encoding");
+        return result;
+    }
+    if (fp8_f32_batch &&
+        (!std::isfinite(swiglu_limit) || swiglu_limit <= 0.0F)) {
+        result.errors.emplace_back(
+            "F32-scaled FP8 MoE requires a positive finite SwiGLU limit");
         return result;
     }
 
@@ -2095,6 +2129,10 @@ ValidationResult CudaBackend::enqueue_moe(
                  : mxfp4_batch
                      ? (weight->impl_->descriptor.dtype == SafetensorsDtype::I8 &&
                         weight->impl_->descriptor.group_size == 32U)
+                 : fp8_f32_batch
+                     ? (weight->impl_->descriptor.dtype ==
+                            SafetensorsDtype::F8E4M3 &&
+                        weight->impl_->descriptor.group_size == 128U)
                  : plain_batch
                      ? weight->impl_->descriptor.dtype == SafetensorsDtype::Bf16
                      : (weight->impl_->descriptor.dtype == SafetensorsDtype::I32 &&
@@ -2108,8 +2146,10 @@ ValidationResult CudaBackend::enqueue_moe(
         const auto& gate = expert.gate->impl_->descriptor;
         const auto& up = expert.up->impl_->descriptor;
         const auto& down = expert.down->impl_->descriptor;
-        const auto expected_down_packed = (nvfp4_batch || mxfp4_batch)
-            ? (down.columns + 1U) / 2U : (down.columns + 7U) / 8U;
+        const auto expected_down_packed = fp8_f32_batch
+            ? down.columns
+            : (nvfp4_batch || mxfp4_batch)
+                ? (down.columns + 1U) / 2U : (down.columns + 7U) / 8U;
         const auto expected_down_scales = nvfp4_batch
             ? (down.columns + 15U) / 16U
             : mxfp4_batch ? (down.columns + 31U) / 32U
@@ -2130,7 +2170,8 @@ ValidationResult CudaBackend::enqueue_moe(
         // because scaling before the down projection is not float-equal to
         // scaling after it and Laguna's reference scales after.
         if (!std::isfinite(expert.coefficient) ||
-            ((shared_expert || nvfp4_batch || mxfp4_batch || plain_batch) &&
+            ((shared_expert || nvfp4_batch || mxfp4_batch || fp8_f32_batch ||
+              plain_batch) &&
              expert.coefficient != 1.0F)) {
             result.errors.emplace_back("MoE expert coefficient is invalid");
             return false;
@@ -2153,8 +2194,11 @@ ValidationResult CudaBackend::enqueue_moe(
 
     std::uint64_t hidden_elements = 0U;
     if (!checked_bytes(rows, hidden_columns, 1U, hidden_elements) ||
-        hidden.size() != hidden_elements ||
+        (mhc_source_destination ? !hidden.empty()
+                                : hidden.size() != hidden_elements) ||
         std::any_of(hidden.begin(), hidden.end(),
+                    [](float value) { return !std::isfinite(value); }) ||
+        std::any_of(routed_coefficients.begin(), routed_coefficients.end(),
                     [](float value) { return !std::isfinite(value); })) {
         result.errors.emplace_back("MoE hidden rows are incompatible");
         return result;
@@ -2243,6 +2287,7 @@ ValidationResult CudaBackend::enqueue_moe(
     PackedInt4MoeBatch batch;
     Nvfp4MoeBatch nvfp4_batch_data;
     Mxfp4MoeBatch mxfp4_batch_data;
+    Fp8F32MoeBatch fp8_f32_batch_data;
     PlainBf16MoeBatch plain_batch_data;
     state.moe_weights.clear();
     state.moe_weights.reserve(expert_count * 3U);
@@ -2255,6 +2300,22 @@ ValidationResult CudaBackend::enqueue_moe(
                 static_cast<const __nv_bfloat16*>(expert.up->impl_->weights);
             plain_batch_data.down_weights[index] =
                 static_cast<const __nv_bfloat16*>(expert.down->impl_->weights);
+        } else if (fp8_f32_batch) {
+            fp8_f32_batch_data.gate_weights[index] =
+                static_cast<const unsigned char*>(expert.gate->impl_->weights);
+            fp8_f32_batch_data.gate_scales[index] =
+                static_cast<const float*>(expert.gate->impl_->scales);
+            fp8_f32_batch_data.up_weights[index] =
+                static_cast<const unsigned char*>(expert.up->impl_->weights);
+            fp8_f32_batch_data.up_scales[index] =
+                static_cast<const float*>(expert.up->impl_->scales);
+            fp8_f32_batch_data.down_weights[index] =
+                static_cast<const unsigned char*>(expert.down->impl_->weights);
+            fp8_f32_batch_data.down_scales[index] =
+                static_cast<const float*>(expert.down->impl_->scales);
+            fp8_f32_batch_data.coefficients[index] =
+                index < routed_coefficients.size()
+                    ? routed_coefficients[index] : 1.0F;
         } else if (nvfp4_batch) {
             nvfp4_batch_data.gate_weights[index] =
                 static_cast<const unsigned char*>(expert.gate->impl_->weights);
@@ -2316,8 +2377,50 @@ ValidationResult CudaBackend::enqueue_moe(
     nvfp4_batch_data.rows = rows;
     mxfp4_batch_data.count = batch.count;
     mxfp4_batch_data.rows = rows;
+    fp8_f32_batch_data.count = batch.count;
+    fp8_f32_batch_data.rows = rows;
     plain_batch_data.count = batch.count;
     plain_batch_data.rows = rows;
+
+    bool fp8_f32_prepacked = fp8_f32_batch;
+    bool fp8_f32_any_prepacked = false;
+    if (fp8_f32_batch) {
+        for (std::uint32_t index = 0U; index < batch.count; ++index) {
+            const auto* expert = index < routed.size() ? &routed[index] : shared;
+            const bool ready = expert->gate->impl_->fragment_prepacked &&
+                               expert->up->impl_->fragment_prepacked &&
+                               expert->down->impl_->fragment_prepacked &&
+                regfed_fp8_shape_admissible(
+                    expert->gate->impl_->descriptor.rows,
+                    expert->gate->impl_->descriptor.columns) &&
+                regfed_fp8_shape_admissible(
+                    expert->up->impl_->descriptor.rows,
+                    expert->up->impl_->descriptor.columns) &&
+                regfed_fp8_shape_admissible(
+                    expert->down->impl_->descriptor.rows,
+                    expert->down->impl_->descriptor.columns);
+            fp8_f32_prepacked = fp8_f32_prepacked && ready;
+            fp8_f32_any_prepacked = fp8_f32_any_prepacked ||
+                expert->gate->impl_->fragment_prepacked ||
+                expert->up->impl_->fragment_prepacked ||
+                expert->down->impl_->fragment_prepacked;
+        }
+        if (fp8_f32_any_prepacked && !fp8_f32_prepacked) {
+            result.errors.emplace_back(
+                "F32-scaled FP8 MoE batch mixes fragment-prepacked and "
+                "canonical experts");
+            return result;
+        }
+        if (fp8_f32_prepacked && rows > kRegfedMaxM) {
+            result.errors.emplace_back(
+                "F32-scaled FP8 MoE batch is fragment-prepacked but exceeds "
+                "the register-fed row width");
+            return result;
+        }
+    }
+    const bool fp8_f32_regfed =
+        fp8_f32_prepacked && regfed_matmul_enabled() &&
+        state.fp8_f32_register_fed_supported;
 
     state.moe_hidden_columns = hidden_columns;
     state.moe_intermediate_columns = intermediate_columns;
@@ -2329,7 +2432,7 @@ ValidationResult CudaBackend::enqueue_moe(
     state.moe_has_shared = shared != nullptr;
     state.moe_shared_phase_timing_valid = false;
     state.moe_host_join = false;
-    state.moe_output_to_mhc = false;
+    state.moe_output_to_mhc = mhc_source_destination;
     state.moe_host_callback = {};
     state.moe_kernel_launches = 0U;
     state.moe_in_flight = true;
@@ -2348,6 +2451,25 @@ ValidationResult CudaBackend::enqueue_moe(
         }
     };
 
+    if (fp8_f32_regfed) {
+        const std::uint64_t hidden_compact = hidden_elements +
+            static_cast<std::uint64_t>(rows) *
+                (hidden_columns / 128U) * sizeof(float);
+        const std::uint64_t activation_elements =
+            activation_rows * intermediate_columns;
+        const std::uint64_t activation_compact = activation_elements +
+            activation_rows * (intermediate_columns / 128U) * sizeof(float);
+        const auto compact_bytes = std::max(hidden_compact,
+                                            activation_compact);
+        if (regfed_grow(state.moe_regfed_compact,
+                        state.moe_regfed_compact_bytes, compact_bytes, false,
+                        state.stream) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate F32-scaled FP8 MoE compact workspace");
+            return result;
+        }
+    }
+
     if (auto status = cudaEventRecord(state.moe_start, state.stream);
         status != cudaSuccess) {
         abort_enqueue(status, "record MoE start");
@@ -2359,10 +2481,23 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "reset MoE error flag");
         return result;
     }
-    if (auto status = cudaMemcpyAsync(
-            state.moe_hidden, hidden.data(), static_cast<std::size_t>(hidden_bytes),
-            cudaMemcpyHostToDevice, state.stream);
-        status != cudaSuccess) {
+    if (mhc_source_destination) {
+        constexpr std::uint32_t convert_threads = 256U;
+        constexpr std::uint32_t convert_blocks =
+            (kDsv4MhcHidden + convert_threads - 1U) / convert_threads;
+        dsv4_bf16_to_fp32<<<convert_blocks, convert_threads, 0U,
+                            state.stream>>>(
+            state.dsv4_mhc_workspace->layer_input, state.moe_hidden,
+            kDsv4MhcHidden);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "convert resident GLM-5.3 MoE input");
+            return result;
+        }
+    } else if (auto status = cudaMemcpyAsync(
+                   state.moe_hidden, hidden.data(),
+                   static_cast<std::size_t>(hidden_bytes),
+                   cudaMemcpyHostToDevice, state.stream);
+               status != cudaSuccess) {
         abort_enqueue(status, "upload MoE hidden rows");
         return result;
     }
@@ -2371,7 +2506,36 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "record MoE hidden upload");
         return result;
     }
-    if (mxfp4_batch) {
+    if (fp8_f32_regfed) {
+        auto* compact_values =
+            static_cast<unsigned char*>(state.moe_regfed_compact);
+        auto* compact_scales = reinterpret_cast<float*>(
+            compact_values + hidden_elements);
+        const dim3 quantize_grid(
+            static_cast<unsigned int>(hidden_columns / 128U), rows, 1U);
+        quantize_activation_e4m3_f32_bytes_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            compact_values, compact_scales, state.moe_hidden,
+            hidden_columns, rows);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status,
+                          "compact F32-scaled FP8 MoE hidden activation");
+            return result;
+        }
+    } else if (fp8_f32_batch) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((hidden_columns + 127U) / 128U), rows,
+            1U);
+        quantize_activation_e4m3_f32_scale_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            state.moe_hidden, hidden_columns, rows);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "launch F32-scaled FP8 MoE hidden quantization");
+            return result;
+        }
+    } else if (mxfp4_batch) {
         const dim3 quantize_grid(
             static_cast<unsigned int>((hidden_columns + 127U) / 128U), rows,
             1U);
@@ -2434,6 +2598,8 @@ ValidationResult CudaBackend::enqueue_moe(
     const bool mxfp4_regfed = mxfp4_prepacked && regfed_matmul_enabled();
     record_cuda_matmul_route(
         plain_batch      ? CudaMatmulRoute::MoePlainBf16
+        : fp8_f32_regfed ? CudaMatmulRoute::MoeFp8F32RegisterFed
+        : fp8_f32_batch  ? CudaMatmulRoute::MoeFp8E4m3Block128F32
         : nvfp4_batch    ? CudaMatmulRoute::MoeNvfp4Group16
         : mxfp4_regfed   ? CudaMatmulRoute::MoeFp4RegisterFed
         : mxfp4_batch    ? CudaMatmulRoute::MoeFp4E2m1Group32
@@ -2442,6 +2608,96 @@ ValidationResult CudaBackend::enqueue_moe(
         plain_bf16_moe_gate_up_kernel<<<plain_gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, plain_batch_data,
             hidden_columns, intermediate_columns, state.moe_error);
+    } else if (fp8_f32_regfed) {
+        const auto experts = batch.count;
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (rows + kRegfedTileM - 1U) / kRegfedTileM);
+        const auto groups = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto n_tiles =
+            static_cast<std::uint32_t>(intermediate_columns / kRegfedTileN);
+        const auto pairs =
+            static_cast<std::uint32_t>(hidden_columns / 32U);
+        std::uint32_t split = 1U;
+        while (split < 16U && pairs % ((split * 2U) * 4U) == 0U &&
+               static_cast<std::uint64_t>(experts) * n_tiles * split * 2U <=
+                   4096U) {
+            split *= 2U;
+        }
+        const std::uint64_t partial_bytes =
+            static_cast<std::uint64_t>(experts) * intermediate_columns * rows *
+            split * sizeof(float);
+        const std::uint64_t fragment_total =
+            (hidden_columns / kRegfedTileK) * column_blocks * groups * 4U;
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required) {
+            return regfed_grow(pointer, capacity, required, false,
+                               state.stream);
+        };
+        if (grow(state.moe_regfed_gate_partials,
+                 state.moe_regfed_gate_partial_bytes, partial_bytes) !=
+                cudaSuccess ||
+            grow(state.moe_regfed_up_partials,
+                 state.moe_regfed_up_partial_bytes, partial_bytes) !=
+                cudaSuccess ||
+            grow(state.moe_regfed_hidden_fragment,
+                 state.moe_regfed_hidden_fragment_bytes,
+                 fragment_total * sizeof(uint2)) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate register-fed FP8 MoE gate/up workspaces");
+            return result;
+        }
+        const auto* compact_values =
+            static_cast<const unsigned char*>(state.moe_regfed_compact);
+        const auto* compact_scales = reinterpret_cast<const float*>(
+            compact_values + hidden_elements);
+        regfed_fp8_moe_activation_fragment_kernel<<<
+            static_cast<unsigned int>(std::min<std::uint64_t>(
+                (fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            static_cast<uint2*>(state.moe_regfed_hidden_fragment),
+            compact_values, 1U, rows,
+            static_cast<std::uint32_t>(hidden_columns), column_blocks, groups);
+        const auto blocks = static_cast<unsigned int>(
+            std::min<std::uint64_t>(
+                (static_cast<std::uint64_t>(experts) * n_tiles * split +
+                 kRegfedWarpsPerBlock - 1U) /
+                    kRegfedWarpsPerBlock,
+                65535U));
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_fp8_f32_moe_gate_up_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                static_cast<float*>(state.moe_regfed_gate_partials),
+                static_cast<float*>(state.moe_regfed_up_partials),
+                static_cast<const uint2*>(state.moe_regfed_hidden_fragment),
+                compact_scales, fp8_f32_batch_data,
+                static_cast<std::uint32_t>(hidden_columns),
+                static_cast<std::uint32_t>(intermediate_columns), split, rows,
+                groups);
+        };
+        if (column_blocks == 1U) {
+            launch(std::integral_constant<std::uint32_t, 1U>{});
+        } else {
+            launch(std::integral_constant<std::uint32_t, 2U>{});
+        }
+        const std::uint64_t swiglu_total =
+            static_cast<std::uint64_t>(experts) * intermediate_columns * rows;
+        regfed_fp8_f32_moe_swiglu_kernel<<<
+            static_cast<unsigned int>(std::min<std::uint64_t>(
+                (swiglu_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            state.moe_activations,
+            static_cast<const float*>(state.moe_regfed_gate_partials),
+            static_cast<const float*>(state.moe_regfed_up_partials), experts,
+            static_cast<std::uint32_t>(intermediate_columns), rows, split,
+            swiglu_limit, state.moe_error);
+        state.moe_kernel_launches += 2U;
+    } else if (fp8_f32_batch) {
+        fp8_f32_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
+            state.moe_activations, state.moe_hidden, fp8_f32_batch_data,
+            hidden_columns, intermediate_columns, gate.scale_columns,
+            swiglu_limit, state.moe_error);
     } else if (nvfp4_batch) {
         nvfp4_moe_gate_up_kernel<<<gate_grid, threads, 0U, state.stream>>>(
             state.moe_activations, state.moe_hidden, nvfp4_batch_data,
@@ -2537,7 +2793,41 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "launch MoE gate/up SwiGLU");
         return result;
     }
-    if (mxfp4_batch) {
+    if (fp8_f32_regfed) {
+        const auto activation_elements =
+            activation_rows * intermediate_columns;
+        auto* compact_values =
+            static_cast<unsigned char*>(state.moe_regfed_compact);
+        auto* compact_scales = reinterpret_cast<float*>(
+            compact_values + activation_elements);
+        const dim3 quantize_grid(
+            static_cast<unsigned int>(intermediate_columns / 128U),
+            static_cast<unsigned int>(activation_rows), 1U);
+        quantize_activation_e4m3_f32_bytes_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            compact_values, compact_scales, state.moe_activations,
+            intermediate_columns, static_cast<std::uint32_t>(activation_rows));
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status,
+                          "compact F32-scaled FP8 MoE down activation");
+            return result;
+        }
+    } else if (fp8_f32_batch) {
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((intermediate_columns + 127U) / 128U),
+            static_cast<unsigned int>(activation_rows), 1U);
+        quantize_activation_e4m3_f32_scale_kernel<<<
+            quantize_grid, 128U, 0U, state.stream>>>(
+            state.moe_activations, intermediate_columns,
+            static_cast<std::uint32_t>(activation_rows));
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status,
+                          "launch F32-scaled FP8 MoE activation quantization");
+            return result;
+        }
+    } else if (mxfp4_batch) {
         // Runs for both routes: it is what makes the activation E4M3, and an
         // E4M3 value's BF16 image is exact, which is why the register-fed
         // tensor op multiplies the same numbers the scalar kernel does.
@@ -2564,6 +2854,95 @@ ValidationResult CudaBackend::enqueue_moe(
         plain_bf16_moe_down_kernel<<<plain_down_grid, threads, 0U, state.stream>>>(
             state.moe_output, state.moe_activations, plain_batch_data,
             intermediate_columns, hidden_columns, state.moe_error);
+    } else if (fp8_f32_regfed) {
+        const auto experts = batch.count;
+        const auto column_blocks = static_cast<std::uint32_t>(
+            (rows + kRegfedTileM - 1U) / kRegfedTileM);
+        const auto groups = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(rows, kRegfedTileM));
+        const auto n_tiles =
+            static_cast<std::uint32_t>(hidden_columns / kRegfedTileN);
+        const auto pairs =
+            static_cast<std::uint32_t>(intermediate_columns / 32U);
+        std::uint32_t split = 1U;
+        while (split < 16U && pairs % ((split * 2U) * 4U) == 0U &&
+               static_cast<std::uint64_t>(experts) * n_tiles * split * 2U <=
+                   4096U) {
+            split *= 2U;
+        }
+        const std::uint64_t partial_bytes =
+            static_cast<std::uint64_t>(experts) * hidden_columns * rows * split *
+            sizeof(float);
+        const std::uint64_t fragment_total =
+            static_cast<std::uint64_t>(experts) *
+            (intermediate_columns / kRegfedTileK) * column_blocks * groups * 4U;
+        const auto grow = [&](void*& pointer, std::uint64_t& capacity,
+                              std::uint64_t required) {
+            return regfed_grow(pointer, capacity, required, false,
+                               state.stream);
+        };
+        if (grow(state.moe_regfed_down_partials,
+                 state.moe_regfed_down_partial_bytes, partial_bytes) !=
+                cudaSuccess ||
+            grow(state.moe_regfed_activation_fragment,
+                 state.moe_regfed_activation_fragment_bytes,
+                 fragment_total * sizeof(uint2)) != cudaSuccess) {
+            abort_enqueue(cudaErrorMemoryAllocation,
+                          "allocate register-fed FP8 MoE down workspaces");
+            return result;
+        }
+        const auto activation_elements =
+            activation_rows * intermediate_columns;
+        const auto* compact_values =
+            static_cast<const unsigned char*>(state.moe_regfed_compact);
+        const auto* compact_scales = reinterpret_cast<const float*>(
+            compact_values + activation_elements);
+        regfed_fp8_moe_activation_fragment_kernel<<<
+            static_cast<unsigned int>(std::min<std::uint64_t>(
+                (fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            static_cast<uint2*>(state.moe_regfed_activation_fragment),
+            compact_values, experts, rows,
+            static_cast<std::uint32_t>(intermediate_columns), column_blocks,
+            groups);
+        const auto blocks = static_cast<unsigned int>(
+            std::min<std::uint64_t>(
+                (static_cast<std::uint64_t>(experts) * n_tiles * split +
+                 kRegfedWarpsPerBlock - 1U) /
+                    kRegfedWarpsPerBlock,
+                65535U));
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_fp8_f32_moe_down_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, state.stream>>>(
+                static_cast<float*>(state.moe_regfed_down_partials),
+                static_cast<const uint2*>(state.moe_regfed_activation_fragment),
+                compact_scales, fp8_f32_batch_data,
+                static_cast<std::uint32_t>(intermediate_columns),
+                static_cast<std::uint32_t>(hidden_columns), split, rows,
+                groups);
+        };
+        if (column_blocks == 1U) {
+            launch(std::integral_constant<std::uint32_t, 1U>{});
+        } else {
+            launch(std::integral_constant<std::uint32_t, 2U>{});
+        }
+        const std::uint64_t reduce_total =
+            static_cast<std::uint64_t>(experts) * hidden_columns * rows;
+        regfed_fp8_f32_moe_reduce_kernel<<<
+            static_cast<unsigned int>(std::min<std::uint64_t>(
+                (reduce_total + 255U) / 256U, 65535U)),
+            256U, 0U, state.stream>>>(
+            state.moe_output,
+            static_cast<const float*>(state.moe_regfed_down_partials), experts,
+            static_cast<std::uint32_t>(hidden_columns), rows, split,
+            state.moe_error);
+        state.moe_kernel_launches += 2U;
+    } else if (fp8_f32_batch) {
+        fp8_f32_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
+            state.moe_output, state.moe_activations, fp8_f32_batch_data,
+            intermediate_columns, hidden_columns, down.scale_columns,
+            state.moe_error);
     } else if (nvfp4_batch) {
         nvfp4_moe_down_kernel<<<down_grid, threads, 0U, state.stream>>>(
             state.moe_output, state.moe_activations, nvfp4_batch_data,
@@ -2654,6 +3033,23 @@ ValidationResult CudaBackend::enqueue_moe(
         abort_enqueue(status, "launch MoE down projection");
         return result;
     }
+    if (mhc_source_destination) {
+        constexpr unsigned int join_threads = 256U;
+        const auto join_blocks = static_cast<unsigned int>(
+            (hidden_columns + join_threads - 1U) / join_threads);
+        glm53_moe_join_mhc_kernel<<<join_blocks, join_threads, 0U,
+                                    state.stream>>>(
+            state.moe_output, fp8_f32_batch_data.coefficients,
+            static_cast<std::uint32_t>(routed.size()),
+            state.dsv4_mhc_workspace->branch,
+            static_cast<std::uint32_t>(hidden_columns), state.moe_error);
+        ++state.moe_kernel_launches;
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            abort_enqueue(status, "join resident GLM-5.3 MoE branch");
+            return result;
+        }
+        state.dsv4_mhc_branch_ready = true;
+    }
     if (auto status = cudaEventRecord(state.moe_kernel_finished, state.stream);
         status != cudaSuccess) {
         abort_enqueue(status, "record MoE kernel completion");
@@ -2664,14 +3060,17 @@ ValidationResult CudaBackend::enqueue_moe(
         auto& device_stats = *std::find_if(
             impl_->stats.devices.begin(), impl_->stats.devices.end(),
             [device](const auto& value) { return value.device == device; });
-        device_stats.activation_h2d_bytes += hidden_bytes;
+        device_stats.activation_h2d_bytes +=
+            mhc_source_destination ? 0U : hidden_bytes;
         device_stats.matmul_calls += 3U * expert_count;
         device_stats.workspace_allocation_calls += allocation_calls;
         device_stats.workspace_allocation_bytes += allocation_bytes;
         ++device_stats.deepseek_moe_calls;
         device_stats.deepseek_moe_kernel_launches += state.moe_kernel_launches;
-        ++device_stats.deepseek_moe_h2d_transfers;
-        device_stats.deepseek_moe_h2d_bytes += hidden_bytes;
+        device_stats.deepseek_moe_h2d_transfers +=
+            mhc_source_destination ? 0U : 1U;
+        device_stats.deepseek_moe_h2d_bytes +=
+            mhc_source_destination ? 0U : hidden_bytes;
     }
     return result;
 }

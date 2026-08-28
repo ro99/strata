@@ -245,6 +245,36 @@ __global__ void quantize_activation_e4m3_kernel(float* values,
     value = quantize_e4m3_value(value / scale) * scale;
 }
 
+// GLM-5.3's compressed-tensors dynamic activation contract stores ordinary
+// F32 inverse scales, not E8M0 powers of two. Simulate its per-token K128
+// quantization in place so the scalar matmul consumes the same values as the
+// fused FP8 kernel while retaining the existing F32 activation workspace.
+__global__ void quantize_activation_e4m3_f32_scale_kernel(
+    float* values, std::uint64_t columns, std::uint32_t rows) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint64_t group_begin =
+        static_cast<std::uint64_t>(blockIdx.x) * 128U;
+    if (row >= rows || group_begin >= columns) return;
+    const std::uint64_t index = group_begin + threadIdx.x;
+    const float magnitude = index < columns
+        ? fabsf(values[static_cast<std::uint64_t>(row) * columns + index])
+        : 0.0F;
+    __shared__ float maximum[128];
+    maximum[threadIdx.x] = magnitude;
+    __syncthreads();
+    for (unsigned int stride = 64U; stride != 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) {
+            maximum[threadIdx.x] = fmaxf(maximum[threadIdx.x],
+                                         maximum[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (index >= columns) return;
+    const float scale = maximum[0] > 0.0F ? maximum[0] / 448.0F : 1.0F;
+    auto& value = values[static_cast<std::uint64_t>(row) * columns + index];
+    value = quantize_e4m3_value(value / scale) * scale;
+}
+
 __global__ void round_bf16_rows_kernel(float* values, std::uint64_t elements) {
     for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
          index < elements; index += gridDim.x * blockDim.x) {
@@ -288,6 +318,45 @@ __global__ void quantize_activation_e4m3_bytes_kernel(
     if (threadIdx.x == 0U) {
         scales[static_cast<std::uint64_t>(row) * gridDim.x + blockIdx.x] =
             static_cast<unsigned char>(scale_exponent + 127);
+    }
+    if (index < columns) {
+        values[static_cast<std::uint64_t>(row) * columns + index] =
+            encode_e4m3_value(quantize_e4m3_value(value / scale));
+    }
+}
+
+// Compact continuous-scale activation used by GLM-5.3. This is byte-for-byte
+// the same E4M3 quantization simulated by
+// quantize_activation_e4m3_f32_scale_kernel, but keeps one raw code per value
+// and one F32 scale per row/K128 block. Keeping the scale separate lets tensor
+// cores dot exactly representable raw E4M3 values before the two continuous
+// scales are applied in F32.
+__global__ void quantize_activation_e4m3_f32_bytes_kernel(
+    unsigned char* values, float* scales, const float* source,
+    std::uint64_t columns, std::uint32_t rows) {
+    const std::uint32_t row = blockIdx.y;
+    const std::uint64_t group_begin =
+        static_cast<std::uint64_t>(blockIdx.x) * 128U;
+    if (row >= rows || group_begin >= columns) return;
+    const std::uint64_t index = group_begin + threadIdx.x;
+    const float value = index < columns
+                            ? source[static_cast<std::uint64_t>(row) * columns +
+                                     index]
+                            : 0.0F;
+    __shared__ float maximum[128];
+    maximum[threadIdx.x] = fabsf(value);
+    __syncthreads();
+    for (unsigned int stride = 64U; stride != 0U; stride >>= 1U) {
+        if (threadIdx.x < stride) {
+            maximum[threadIdx.x] = fmaxf(maximum[threadIdx.x],
+                                         maximum[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float scale = maximum[0] > 0.0F ? maximum[0] / 448.0F : 1.0F;
+    if (threadIdx.x == 0U) {
+        scales[static_cast<std::uint64_t>(row) * gridDim.x + blockIdx.x] =
+            scale;
     }
     if (index < columns) {
         values[static_cast<std::uint64_t>(row) * columns + index] =
@@ -1473,9 +1542,38 @@ __global__ void native_fp8_matmul_kernel(
     }
 }
 
+__global__ void native_fp8_f32_scale_matmul_kernel(
+    float* output, const float* input, const unsigned char* weights,
+    const float* scales, std::uint64_t scale_columns,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows,
+    std::uint32_t groups, std::uint64_t rows_per_group) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    if (output_row >= rows || batch_row >= batch) return;
+    const std::uint64_t input_row = groups == 0U
+        ? batch_row
+        : static_cast<std::uint64_t>(batch_row) * groups +
+              output_row / rows_per_group;
+    const std::uint64_t input_base = input_row * columns;
+    const std::uint64_t weight_base = output_row * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float weight = fp8_e4m3_value(weights[weight_base + column]);
+        const float scale = scales[(output_row / 128U) * scale_columns +
+                                   column / 128U];
+        sum += input[input_base + column] * weight * scale;
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        output[static_cast<std::uint64_t>(batch_row) * rows + output_row] = sum;
+    }
+}
+
 constexpr std::uint32_t kDsv4Fp8TensorBlockM = 64U;
 constexpr std::uint32_t kDsv4Fp8TensorBlockN = 128U;
 constexpr std::uint32_t kDsv4Fp8TensorBlockK = 128U;
+constexpr std::uint32_t kFp8F32TensorBlockN = 64U;
 
 // SM86 page-projection path. Both operands remain byte FP8 in global memory;
 // each tile widens them exactly to BF16 in shared memory and uses BF16 WMMA.
@@ -1594,6 +1692,174 @@ __global__ void dsv4_fp8_decode_bf16_tensor_kernel(
             tile_n + fragment_n * 16U;
         wmma::store_matrix_sync(destination, result, rows,
                                 wmma::mem_row_major);
+    }
+}
+
+// QPN-derived continuous-scale page projection. Unlike DeepSeek's E8M0 route,
+// neither GLM scale is a power of two, so widening a scaled activation to BF16
+// would discard part of the checkpoint's declared arithmetic. Instead each
+// K128 tile performs a tensor-core dot over the raw E4M3 values (all exactly
+// representable in BF16), publishes that partial, and applies the activation
+// and weight scales in F32. A 64x64 output tile leaves the raw A/B tiles, the
+// published partial and the accumulated result within the 48 KiB SM86 shared
+// memory budget without assuming a particular installed GPU.
+__device__ __forceinline__ unsigned char fp8_fragment_prepacked_code(
+    const unsigned char* codes, std::uint32_t row, std::uint32_t column,
+    std::uint32_t columns) {
+    const std::uint32_t pair = column / 32U;
+    const std::uint32_t within16 = column & 15U;
+    const std::uint32_t lane = (row & 7U) * 4U +
+                               ((within16 & 7U) / 2U);
+    const auto packed = reinterpret_cast<const uint4*>(codes)[
+        (static_cast<std::size_t>(row / 16U) * (columns / 32U) + pair) * 32U +
+        lane];
+    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+    const bool upper_columns = within16 >= 8U;
+    const std::uint32_t word = (column & 31U) / 16U * 2U +
+                               (upper_columns ? 1U : 0U);
+    const std::uint32_t i = (upper_columns ? 4U : 0U) +
+                            ((row & 15U) >= 8U ? 2U : 0U) +
+                            (within16 & 1U);
+    return static_cast<unsigned char>((words[word] >> ((i & 3U) * 8U)) &
+                                      0xFFU);
+}
+
+template <bool kFragmentPrepacked>
+__global__ void fp8_f32_decode_bf16_tensor_kernel(
+    float* output, const unsigned char* input, const float* input_scales,
+    const unsigned char* weights, const float* weight_scales,
+    std::uint32_t batch, std::uint32_t columns, std::uint32_t rows) {
+    using namespace nvcuda;
+    union SharedAOrPartial {
+        __nv_bfloat16 a[kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockK];
+        float partial[kDsv4Fp8TensorBlockM * kFp8F32TensorBlockN];
+    };
+    __shared__ SharedAOrPartial shared_a_or_partial;
+    __shared__ __nv_bfloat16 shared_b[
+        kDsv4Fp8TensorBlockK * kFp8F32TensorBlockN];
+    __shared__ float totals[
+        kDsv4Fp8TensorBlockM * kFp8F32TensorBlockN];
+
+    const std::uint32_t tile_m = blockIdx.y * kDsv4Fp8TensorBlockM;
+    const std::uint32_t tile_n = blockIdx.x * kFp8F32TensorBlockN;
+    const std::uint32_t warp = threadIdx.x / warpSize;
+    const std::uint32_t warp_m = warp & 3U;
+    const std::uint32_t warp_n_group = warp >> 2U;
+    constexpr std::uint32_t fragments_per_warp = 2U;
+    const std::uint32_t scale_columns = columns / kDsv4Fp8TensorBlockK;
+
+    for (std::uint32_t index = threadIdx.x;
+         index < kDsv4Fp8TensorBlockM * kFp8F32TensorBlockN;
+         index += blockDim.x) {
+        totals[index] = 0.0F;
+    }
+    __syncthreads();
+
+    for (std::uint32_t tile_k = 0U; tile_k < columns;
+         tile_k += kDsv4Fp8TensorBlockK) {
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockM * kDsv4Fp8TensorBlockK;
+             index += blockDim.x) {
+            const std::uint32_t local_m = index / kDsv4Fp8TensorBlockK;
+            const std::uint32_t local_k = index % kDsv4Fp8TensorBlockK;
+            const std::uint32_t global_m = tile_m + local_m;
+            const auto encoded = global_m < batch
+                ? input[static_cast<std::uint64_t>(global_m) * columns +
+                        tile_k + local_k]
+                : 0U;
+            shared_a_or_partial.a[index] =
+                __float2bfloat16_rn(fp8_e4m3_value(encoded));
+        }
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockK * kFp8F32TensorBlockN;
+             index += blockDim.x) {
+            const std::uint32_t local_k = index / kFp8F32TensorBlockN;
+            const std::uint32_t local_n = index % kFp8F32TensorBlockN;
+            const std::uint32_t global_n = tile_n + local_n;
+            const auto encoded = kFragmentPrepacked
+                ? fp8_fragment_prepacked_code(weights, global_n,
+                                              tile_k + local_k, columns)
+                : weights[static_cast<std::uint64_t>(global_n) * columns +
+                          tile_k + local_k];
+            shared_b[index] =
+                __float2bfloat16_rn(fp8_e4m3_value(encoded));
+        }
+        __syncthreads();
+
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> a_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> b_fragment;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+            accumulators[fragments_per_warp];
+        for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+             ++fragment) {
+            wmma::fill_fragment(accumulators[fragment], 0.0F);
+        }
+        for (std::uint32_t local_k = 0U;
+             local_k < kDsv4Fp8TensorBlockK; local_k += 16U) {
+            wmma::load_matrix_sync(
+                a_fragment,
+                shared_a_or_partial.a +
+                    warp_m * 16U * kDsv4Fp8TensorBlockK + local_k,
+                kDsv4Fp8TensorBlockK);
+            for (std::uint32_t fragment = 0U;
+                 fragment < fragments_per_warp; ++fragment) {
+                const std::uint32_t fragment_n =
+                    warp_n_group * fragments_per_warp + fragment;
+                wmma::load_matrix_sync(
+                    b_fragment,
+                    shared_b + local_k * kFp8F32TensorBlockN +
+                        fragment_n * 16U,
+                    kFp8F32TensorBlockN);
+                wmma::mma_sync(accumulators[fragment], a_fragment, b_fragment,
+                               accumulators[fragment]);
+            }
+        }
+        __syncthreads();
+        for (std::uint32_t fragment = 0U; fragment < fragments_per_warp;
+             ++fragment) {
+            const std::uint32_t fragment_n =
+                warp_n_group * fragments_per_warp + fragment;
+            float* destination = shared_a_or_partial.partial +
+                warp_m * 16U * kFp8F32TensorBlockN + fragment_n * 16U;
+            wmma::store_matrix_sync(destination, accumulators[fragment],
+                                    kFp8F32TensorBlockN,
+                                    wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        for (std::uint32_t index = threadIdx.x;
+             index < kDsv4Fp8TensorBlockM * kFp8F32TensorBlockN;
+             index += blockDim.x) {
+            const std::uint32_t local_m = index / kFp8F32TensorBlockN;
+            const std::uint32_t local_n = index % kFp8F32TensorBlockN;
+            const std::uint32_t global_m = tile_m + local_m;
+            const std::uint32_t global_n = tile_n + local_n;
+            if (global_m < batch) {
+                const float activation_scale = input_scales[
+                    static_cast<std::uint64_t>(global_m) * scale_columns +
+                    tile_k / kDsv4Fp8TensorBlockK];
+                const float weight_scale = weight_scales[
+                    static_cast<std::uint64_t>(global_n / 128U) *
+                        scale_columns + tile_k / kDsv4Fp8TensorBlockK];
+                totals[index] += shared_a_or_partial.partial[index] *
+                                 activation_scale * weight_scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (std::uint32_t index = threadIdx.x;
+         index < kDsv4Fp8TensorBlockM * kFp8F32TensorBlockN;
+         index += blockDim.x) {
+        const std::uint32_t local_m = index / kFp8F32TensorBlockN;
+        const std::uint32_t local_n = index % kFp8F32TensorBlockN;
+        const std::uint32_t global_m = tile_m + local_m;
+        if (global_m < batch) {
+            output[static_cast<std::uint64_t>(global_m) * rows + tile_n +
+                   local_n] = totals[index];
+        }
     }
 }
 
@@ -1721,6 +1987,21 @@ struct Mxfp4MoeBatch {
     const unsigned char* up_scales[kMaxMoeExperts]{};
     const unsigned char* down_weights[kMaxMoeExperts]{};
     const unsigned char* down_scales[kMaxMoeExperts]{};
+    std::uint32_t count{};
+    std::uint32_t rows{};
+};
+
+// Standard compressed-tensors FP8: E4M3 payloads with ordinary F32 inverse
+// scales per 128x128 weight block. Kept separate from the E8M0-scaled FP8
+// batches so their scale bytes can never be reinterpreted silently.
+struct Fp8F32MoeBatch {
+    const unsigned char* gate_weights[kMaxMoeExperts]{};
+    const float* gate_scales[kMaxMoeExperts]{};
+    const unsigned char* up_weights[kMaxMoeExperts]{};
+    const float* up_scales[kMaxMoeExperts]{};
+    const unsigned char* down_weights[kMaxMoeExperts]{};
+    const float* down_scales[kMaxMoeExperts]{};
+    float coefficients[kMaxMoeExperts]{};
     std::uint32_t count{};
     std::uint32_t rows{};
 };
@@ -2630,6 +2911,92 @@ __global__ void mxfp4_moe_down_kernel(
         if (!isfinite(sum)) atomicExch(error_flag, 1U);
         output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
                output_row] = sum;
+    }
+}
+
+__global__ void fp8_f32_moe_gate_up_kernel(
+    float* activations, const float* hidden, Fp8F32MoeBatch batch,
+    std::uint64_t columns, std::uint64_t intermediate,
+    std::uint64_t scale_columns, float swiglu_limit,
+    unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= intermediate || expert >= batch.count) return;
+
+    const auto* gate_weights = batch.gate_weights[expert];
+    const auto* gate_scales = batch.gate_scales[expert];
+    const auto* up_weights = batch.up_weights[expert];
+    const auto* up_scales = batch.up_scales[expert];
+    const auto weight_base = output_row * columns;
+    const auto scale_base = (output_row / 128U) * scale_columns;
+    const auto input_base = static_cast<std::uint64_t>(row) * columns;
+    float gate = 0.0F;
+    float up = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float input = hidden[input_base + column];
+        gate += input * fp8_e4m3_value(gate_weights[weight_base + column]) *
+                gate_scales[scale_base + column / 128U];
+        up += input * fp8_e4m3_value(up_weights[weight_base + column]) *
+              up_scales[scale_base + column / 128U];
+    }
+    gate = reduce_block(gate);
+    __syncthreads();
+    up = reduce_block(up);
+    if (threadIdx.x == 0U) {
+        gate = bf16_round(gate);
+        up = bf16_round(up);
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            return;
+        }
+        const float limited_gate = swiglu_limit > 0.0F
+            ? fminf(gate, swiglu_limit) : gate;
+        const float limited_up = swiglu_limit > 0.0F
+            ? fminf(fmaxf(up, -swiglu_limit), swiglu_limit) : up;
+        const float exponential = limited_gate >= 0.0F
+            ? expf(-limited_gate) : expf(limited_gate);
+        const float sigmoid = limited_gate >= 0.0F
+            ? 1.0F / (1.0F + exponential)
+            : exponential / (1.0F + exponential);
+        const auto activation =
+            (static_cast<std::uint64_t>(expert) * batch.rows + row) *
+                intermediate + output_row;
+        activations[activation] = bf16_round(
+            limited_gate * sigmoid * limited_up);
+    }
+}
+
+__global__ void fp8_f32_moe_down_kernel(
+    float* output, const float* activations, Fp8F32MoeBatch batch,
+    std::uint64_t columns, std::uint64_t rows,
+    std::uint64_t scale_columns, unsigned int* error_flag) {
+    const std::uint64_t output_row = blockIdx.x;
+    const std::uint32_t batch_row = blockIdx.y;
+    const auto expert = batch_row / batch.rows;
+    const auto row = batch_row % batch.rows;
+    if (output_row >= rows || expert >= batch.count) return;
+
+    const auto* weights = batch.down_weights[expert];
+    const auto* scales = batch.down_scales[expert];
+    const auto weight_base = output_row * columns;
+    const auto scale_base = (output_row / 128U) * scale_columns;
+    const auto input_base =
+        (static_cast<std::uint64_t>(expert) * batch.rows + row) * columns;
+    float sum = 0.0F;
+    for (std::uint64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        sum += activations[input_base + column] *
+               fp8_e4m3_value(weights[weight_base + column]) *
+               scales[scale_base + column / 128U];
+    }
+    sum = reduce_block(sum);
+    if (threadIdx.x == 0U) {
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::uint64_t>(expert) * batch.rows + row) * rows +
+               output_row] = bf16_round(sum);
     }
 }
 
@@ -3678,6 +4045,47 @@ __global__ void regfed_activation_fragment_kernel(
     }
 }
 
+// Compact E4M3 activation codes to MMA B-fragment order. GLM keeps its
+// continuous activation scale beside these codes; the tensor dot sees only
+// the raw representable values and the scale is applied to each K128 partial
+// in F32 by regfed_fp8_f32_matmul_kernel.
+__global__ void regfed_fp8_activation_fragment_kernel(
+    uint2* __restrict__ destination,
+    const unsigned char* __restrict__ source, std::uint32_t m,
+    std::uint32_t columns, std::uint32_t column_blocks,
+    std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t total =
+        k_tiles * column_blocks * groups_per_block * 4U;
+    constexpr std::uint32_t unit_factor =
+        ((127U + 120U) << 7U) * 0x0001'0001U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t thread = index % 4U;
+        const std::uint32_t group = (index / 4U) % groups_per_block;
+        const std::uint32_t block =
+            (index / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile =
+            index / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        uint2 value = make_uint2(0U, 0U);
+        if (column < m) {
+            const auto* row = source +
+                static_cast<std::size_t>(column) * columns +
+                k_tile * kRegfedTileK;
+            const std::uint32_t first =
+                static_cast<std::uint32_t>(row[thread * 2U]) |
+                (static_cast<std::uint32_t>(row[thread * 2U + 1U]) << 8U);
+            const std::uint32_t second =
+                static_cast<std::uint32_t>(row[thread * 2U + 8U]) |
+                (static_cast<std::uint32_t>(row[thread * 2U + 9U]) << 8U);
+            value = make_uint2(dsv4_fp8_decode_pair(first, unit_factor),
+                               dsv4_fp8_decode_pair(second, unit_factor));
+        }
+        destination[index] = value;
+    }
+}
+
 // ---- the kernels -----------------------------------------------------------
 
 // One warp owns one (N-tile, K-slice). The last slice of a tile folds the
@@ -3917,6 +4325,143 @@ __global__ __launch_bounds__(128) void regfed_fp8_matmul_kernel(
     }
 }
 
+// Register-fed GLM W8A8. Weight and activation codes remain one byte through
+// HBM and are decoded directly into MMA registers. Each K128 dot is completed
+// before its two arbitrary F32 scales are applied, preserving continuous
+// dynamic activation scaling without widening scaled operands to BF16.
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp8_f32_matmul_kernel(
+    float* __restrict__ output, const uint4* __restrict__ codes,
+    const float* __restrict__ weight_scales,
+    const uint2* __restrict__ activations,
+    const float* __restrict__ activation_scales, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t scale_columns, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block,
+    float* __restrict__ partials, std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t pairs_per_slice = pairs / split;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    constexpr std::uint32_t unit_factor =
+        ((127U + 120U) << 7U) * 0x0001'0001U;
+    __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
+
+    bool live[kColBlocks];
+    std::size_t activation_offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block &&
+                  c * kRegfedTileM + group < m;
+        activation_offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U +
+            thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t n_tile = work / split;
+        const std::uint32_t slice = work % split;
+        float totals_for_slice[kColBlocks][4]{};
+        const std::uint32_t begin = slice * pairs_per_slice;
+        const std::uint32_t end = begin + pairs_per_slice;
+        for (std::uint32_t pair_block = begin; pair_block < end;
+             pair_block += 4U) {
+            float block_acc[kColBlocks][4]{};
+#pragma unroll
+            for (std::uint32_t within = 0U; within < 4U; ++within) {
+                const std::uint32_t pair = pair_block + within;
+                const std::uint32_t k_tile = pair * 2U;
+                const uint4 packed = codes[
+                    (static_cast<std::size_t>(n_tile) * pairs + pair) * 32U +
+                    lane];
+                const std::uint32_t word[4] = {packed.x, packed.y, packed.z,
+                                               packed.w};
+#pragma unroll
+                for (std::uint32_t half = 0U; half < 2U; ++half) {
+                    const std::uint32_t low = word[half * 2U];
+                    const std::uint32_t high = word[half * 2U + 1U];
+                    const std::uint32_t a0 =
+                        dsv4_fp8_decode_pair(low & 0xFFFFU, unit_factor);
+                    const std::uint32_t a1 =
+                        dsv4_fp8_decode_pair(low >> 16U, unit_factor);
+                    const std::uint32_t a2 =
+                        dsv4_fp8_decode_pair(high & 0xFFFFU, unit_factor);
+                    const std::uint32_t a3 =
+                        dsv4_fp8_decode_pair(high >> 16U, unit_factor);
+                    const std::size_t tile_base =
+                        (static_cast<std::size_t>(k_tile) + half) *
+                        kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                        const uint2 b = live[c]
+                            ? activations[tile_base + activation_offset[c]]
+                            : make_uint2(0U, 0U);
+                        dsv4_mma_m16n8k16(
+                            block_acc[c][0], block_acc[c][1],
+                            block_acc[c][2], block_acc[c][3], a0, a1, a2, a3,
+                            b.x, b.y);
+                    }
+                }
+            }
+            const std::uint32_t scale_column = pair_block / 4U;
+            const float weight_scale = weight_scales[
+                static_cast<std::size_t>(n_tile / 8U) * scale_columns +
+                scale_column];
+#pragma unroll
+            for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+                for (std::uint32_t i = 0U; i < 4U; ++i) {
+                    const std::uint32_t input_row =
+                        c * kRegfedTileM + thread * 2U + (i & 1U);
+                    if (input_row < m) {
+                        totals_for_slice[c][i] += block_acc[c][i] *
+                            activation_scales[
+                                static_cast<std::size_t>(input_row) *
+                                    scale_columns + scale_column] *
+                            weight_scale;
+                    }
+                }
+            }
+        }
+
+        float* slot = partials + static_cast<std::size_t>(work) *
+                                     kRegfedTileN * kRegfedMaxM;
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column < m) slot[row * m + column] = totals_for_slice[c][i];
+            }
+        }
+
+        __threadfence();
+        __syncwarp();
+        if (lane == 0U) arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        __syncwarp();
+        if (arrived[warp] == split - 1U) {
+            if (lane < kRegfedTileN) {
+                for (std::uint32_t column = 0U; column < m; ++column) {
+                    float sum = 0.0F;
+                    for (std::uint32_t s = 0U; s < split; ++s) {
+                        sum += partials[(static_cast<std::size_t>(n_tile) *
+                                             split + s) * kRegfedTileN *
+                                            kRegfedMaxM + lane * m + column];
+                    }
+                    output[static_cast<std::size_t>(column) * rows +
+                           n_tile * kRegfedTileN + lane] = sum;
+                }
+            }
+            if (lane == 0U) counters[n_tile] = 0U;
+        }
+    }
+}
+
 // Shape admission for the register-fed routes. Stated once, used by both the
 // load-time prepack and the dispatch, so a weight can never be prepacked into a
 // layout the kernel will not read.
@@ -4016,6 +4561,364 @@ __global__ void regfed_moe_activation_fragment_kernel(
             b1 = bits(thread * 2U + 8U) | (bits(thread * 2U + 9U) << 16U);
         }
         destination[index] = make_uint2(b0, b1);
+    }
+}
+
+__global__ void regfed_fp8_moe_activation_fragment_kernel(
+    uint2* __restrict__ destination,
+    const unsigned char* __restrict__ source, std::uint32_t experts,
+    std::uint32_t m, std::uint32_t columns, std::uint32_t column_blocks,
+    std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t per_expert =
+        k_tiles * column_blocks * groups_per_block * 4U;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(experts) * per_expert;
+    constexpr std::uint32_t unit_factor =
+        ((127U + 120U) << 7U) * 0x0001'0001U;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const auto local = static_cast<std::uint32_t>(index % per_expert);
+        const auto expert = static_cast<std::uint32_t>(index / per_expert);
+        const std::uint32_t thread = local % 4U;
+        const std::uint32_t group = (local / 4U) % groups_per_block;
+        const std::uint32_t block =
+            (local / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile =
+            local / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        uint2 value = make_uint2(0U, 0U);
+        if (column < m) {
+            const auto* row = source +
+                (static_cast<std::size_t>(expert) * m + column) * columns +
+                k_tile * kRegfedTileK;
+            const std::uint32_t first =
+                static_cast<std::uint32_t>(row[thread * 2U]) |
+                (static_cast<std::uint32_t>(row[thread * 2U + 1U]) << 8U);
+            const std::uint32_t second =
+                static_cast<std::uint32_t>(row[thread * 2U + 8U]) |
+                (static_cast<std::uint32_t>(row[thread * 2U + 9U]) << 8U);
+            value = make_uint2(dsv4_fp8_decode_pair(first, unit_factor),
+                               dsv4_fp8_decode_pair(second, unit_factor));
+        }
+        destination[index] = value;
+    }
+}
+
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp8_f32_moe_gate_up_kernel(
+    float* __restrict__ gate_partials, float* __restrict__ up_partials,
+    const uint2* __restrict__ activations,
+    const float* __restrict__ activation_scales, Fp8F32MoeBatch batch,
+    std::uint32_t columns, std::uint32_t intermediate, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = intermediate / kRegfedTileN;
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t pairs_per_slice = pairs / split;
+    const std::uint32_t scale_columns = columns / 128U;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t total = batch.count * n_tiles * split;
+    constexpr std::uint32_t unit_factor =
+        ((127U + 120U) << 7U) * 0x0001'0001U;
+    bool live[kColBlocks];
+    std::size_t offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block &&
+                  c * kRegfedTileM + group < m;
+        offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U +
+            thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < total; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t slice = work % split;
+        const std::uint32_t flat = work / split;
+        const std::uint32_t n_tile = flat % n_tiles;
+        const std::uint32_t expert = flat / n_tiles;
+        const auto* gate4 =
+            reinterpret_cast<const uint4*>(batch.gate_weights[expert]);
+        const auto* up4 =
+            reinterpret_cast<const uint4*>(batch.up_weights[expert]);
+        const auto* gate_scales = batch.gate_scales[expert];
+        const auto* up_scales = batch.up_scales[expert];
+        float gate_totals[kColBlocks][4]{};
+        float up_totals[kColBlocks][4]{};
+        const std::uint32_t begin = slice * pairs_per_slice;
+        const std::uint32_t end = begin + pairs_per_slice;
+        for (std::uint32_t pair_block = begin; pair_block < end;
+             pair_block += 4U) {
+            float gate_block[kColBlocks][4]{};
+            float up_block[kColBlocks][4]{};
+#pragma unroll
+            for (std::uint32_t within = 0U; within < 4U; ++within) {
+                const std::uint32_t pair = pair_block + within;
+                const std::size_t code_index =
+                    (static_cast<std::size_t>(n_tile) * pairs + pair) * 32U +
+                    lane;
+                const uint4 gate_packed = gate4[code_index];
+                const uint4 up_packed = up4[code_index];
+                const std::uint32_t gate_words[4] = {
+                    gate_packed.x, gate_packed.y, gate_packed.z, gate_packed.w};
+                const std::uint32_t up_words[4] = {
+                    up_packed.x, up_packed.y, up_packed.z, up_packed.w};
+#pragma unroll
+                for (std::uint32_t half = 0U; half < 2U; ++half) {
+                    const auto decode = [&](const std::uint32_t* words,
+                                            std::uint32_t (&decoded)[4]) {
+                        const auto low = words[half * 2U];
+                        const auto high = words[half * 2U + 1U];
+                        decoded[0] = dsv4_fp8_decode_pair(
+                            low & 0xFFFFU, unit_factor);
+                        decoded[1] = dsv4_fp8_decode_pair(
+                            low >> 16U, unit_factor);
+                        decoded[2] = dsv4_fp8_decode_pair(
+                            high & 0xFFFFU, unit_factor);
+                        decoded[3] = dsv4_fp8_decode_pair(
+                            high >> 16U, unit_factor);
+                    };
+                    std::uint32_t gate_a[4];
+                    std::uint32_t up_a[4];
+                    decode(gate_words, gate_a);
+                    decode(up_words, up_a);
+                    const std::size_t base =
+                        (static_cast<std::size_t>(pair * 2U) + half) *
+                        kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                        const uint2 b = live[c]
+                            ? activations[base + offset[c]]
+                            : make_uint2(0U, 0U);
+                        dsv4_mma_m16n8k16(
+                            gate_block[c][0], gate_block[c][1],
+                            gate_block[c][2], gate_block[c][3], gate_a[0],
+                            gate_a[1], gate_a[2], gate_a[3], b.x, b.y);
+                        dsv4_mma_m16n8k16(
+                            up_block[c][0], up_block[c][1], up_block[c][2],
+                            up_block[c][3], up_a[0], up_a[1], up_a[2], up_a[3],
+                            b.x, b.y);
+                    }
+                }
+            }
+            const std::uint32_t scale_column = pair_block / 4U;
+            const auto weight_scale_index =
+                static_cast<std::size_t>(n_tile / 8U) * scale_columns +
+                scale_column;
+#pragma unroll
+            for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+                for (std::uint32_t i = 0U; i < 4U; ++i) {
+                    const std::uint32_t input_row =
+                        c * kRegfedTileM + thread * 2U + (i & 1U);
+                    if (input_row < m) {
+                        const float activation_scale = activation_scales[
+                            static_cast<std::size_t>(input_row) *
+                                scale_columns + scale_column];
+                        gate_totals[c][i] += gate_block[c][i] *
+                            activation_scale *
+                            gate_scales[weight_scale_index];
+                        up_totals[c][i] += up_block[c][i] * activation_scale *
+                            up_scales[weight_scale_index];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column >= m) continue;
+                const std::size_t slot =
+                    ((static_cast<std::size_t>(expert) * intermediate +
+                      n_tile * kRegfedTileN + row) * m + column) * split +
+                    slice;
+                gate_partials[slot] = gate_totals[c][i];
+                up_partials[slot] = up_totals[c][i];
+            }
+        }
+    }
+}
+
+__global__ void regfed_fp8_f32_moe_swiglu_kernel(
+    float* __restrict__ activations, const float* __restrict__ gate_partials,
+    const float* __restrict__ up_partials, std::uint32_t experts,
+    std::uint32_t intermediate, std::uint32_t m, std::uint32_t split,
+    float swiglu_limit, unsigned int* __restrict__ error_flag) {
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(experts) * intermediate * m;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t column = static_cast<std::uint32_t>(index % m);
+        float gate = 0.0F;
+        float up = 0.0F;
+        for (std::uint32_t slice = 0U; slice < split; ++slice) {
+            gate += gate_partials[index * split + slice];
+            up += up_partials[index * split + slice];
+        }
+        gate = bf16_round(gate);
+        up = bf16_round(up);
+        if (!isfinite(gate) || !isfinite(up)) {
+            atomicExch(error_flag, 1U);
+            continue;
+        }
+        const float limited_gate = fminf(gate, swiglu_limit);
+        const float limited_up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+        const float exponential = limited_gate >= 0.0F
+            ? expf(-limited_gate) : expf(limited_gate);
+        const float sigmoid = limited_gate >= 0.0F
+            ? 1.0F / (1.0F + exponential)
+            : exponential / (1.0F + exponential);
+        const std::uint32_t rest = static_cast<std::uint32_t>(index / m);
+        const std::uint32_t output_row = rest % intermediate;
+        const std::uint32_t expert = rest / intermediate;
+        activations[(static_cast<std::size_t>(expert) * m + column) *
+                        intermediate + output_row] =
+            bf16_round(limited_gate * sigmoid * limited_up);
+    }
+}
+
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_fp8_f32_moe_down_kernel(
+    float* __restrict__ partials, const uint2* __restrict__ activations,
+    const float* __restrict__ activation_scales, Fp8F32MoeBatch batch,
+    std::uint32_t columns, std::uint32_t rows, std::uint32_t split,
+    std::uint32_t m, std::uint32_t groups_per_block) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t pairs = columns / 32U;
+    const std::uint32_t pairs_per_slice = pairs / split;
+    const std::uint32_t scale_columns = columns / 128U;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t total = batch.count * n_tiles * split;
+    const std::size_t per_expert_activation =
+        static_cast<std::size_t>(columns / kRegfedTileK) * kColBlocks *
+        groups_per_block * 4U;
+    constexpr std::uint32_t unit_factor =
+        ((127U + 120U) << 7U) * 0x0001'0001U;
+    bool live[kColBlocks];
+    std::size_t offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block &&
+                  c * kRegfedTileM + group < m;
+        offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U +
+            thread;
+    }
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < total; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t slice = work % split;
+        const std::uint32_t flat = work / split;
+        const std::uint32_t n_tile = flat % n_tiles;
+        const std::uint32_t expert = flat / n_tiles;
+        const auto* codes4 =
+            reinterpret_cast<const uint4*>(batch.down_weights[expert]);
+        const auto* weight_scales = batch.down_scales[expert];
+        float totals_for_slice[kColBlocks][4]{};
+        const std::uint32_t begin = slice * pairs_per_slice;
+        const std::uint32_t end = begin + pairs_per_slice;
+        for (std::uint32_t pair_block = begin; pair_block < end;
+             pair_block += 4U) {
+            float block_acc[kColBlocks][4]{};
+#pragma unroll
+            for (std::uint32_t within = 0U; within < 4U; ++within) {
+                const std::uint32_t pair = pair_block + within;
+                const uint4 packed = codes4[
+                    (static_cast<std::size_t>(n_tile) * pairs + pair) * 32U +
+                    lane];
+                const std::uint32_t words[4] = {
+                    packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+                for (std::uint32_t half = 0U; half < 2U; ++half) {
+                    const auto low = words[half * 2U];
+                    const auto high = words[half * 2U + 1U];
+                    const std::uint32_t a[4] = {
+                        dsv4_fp8_decode_pair(low & 0xFFFFU, unit_factor),
+                        dsv4_fp8_decode_pair(low >> 16U, unit_factor),
+                        dsv4_fp8_decode_pair(high & 0xFFFFU, unit_factor),
+                        dsv4_fp8_decode_pair(high >> 16U, unit_factor)};
+                    const std::size_t base =
+                        static_cast<std::size_t>(expert) *
+                            per_expert_activation +
+                        (static_cast<std::size_t>(pair * 2U) + half) *
+                            kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                        const uint2 b = live[c]
+                            ? activations[base + offset[c]]
+                            : make_uint2(0U, 0U);
+                        dsv4_mma_m16n8k16(
+                            block_acc[c][0], block_acc[c][1],
+                            block_acc[c][2], block_acc[c][3], a[0], a[1], a[2],
+                            a[3], b.x, b.y);
+                    }
+                }
+            }
+            const std::uint32_t scale_column = pair_block / 4U;
+            const float weight_scale = weight_scales[
+                static_cast<std::size_t>(n_tile / 8U) * scale_columns +
+                scale_column];
+#pragma unroll
+            for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+                for (std::uint32_t i = 0U; i < 4U; ++i) {
+                    const std::uint32_t input_row =
+                        c * kRegfedTileM + thread * 2U + (i & 1U);
+                    if (input_row < m) {
+                        totals_for_slice[c][i] += block_acc[c][i] *
+                            activation_scales[
+                                (static_cast<std::size_t>(expert) * m +
+                                 input_row) * scale_columns + scale_column] *
+                            weight_scale;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column >= m) continue;
+                const std::size_t slot =
+                    ((static_cast<std::size_t>(expert) * rows +
+                      n_tile * kRegfedTileN + row) * m + column) * split +
+                    slice;
+                partials[slot] = totals_for_slice[c][i];
+            }
+        }
+    }
+}
+
+__global__ void regfed_fp8_f32_moe_reduce_kernel(
+    float* __restrict__ output, const float* __restrict__ partials,
+    std::uint32_t experts, std::uint32_t rows, std::uint32_t m,
+    std::uint32_t split, unsigned int* __restrict__ error_flag) {
+    const std::uint64_t total = static_cast<std::uint64_t>(experts) * rows * m;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t column = static_cast<std::uint32_t>(index % m);
+        const std::uint32_t rest = static_cast<std::uint32_t>(index / m);
+        const std::uint32_t output_row = rest % rows;
+        const std::uint32_t expert = rest / rows;
+        float sum = 0.0F;
+        for (std::uint32_t slice = 0U; slice < split; ++slice) {
+            sum += partials[index * split + slice];
+        }
+        if (!isfinite(sum)) atomicExch(error_flag, 1U);
+        output[(static_cast<std::size_t>(expert) * m + column) * rows +
+               output_row] = bf16_round(sum);
     }
 }
 
@@ -4267,7 +5170,8 @@ __global__ void regfed_mxfp4_moe_reduce_kernel(
 // device, so no second persistent copy of any weight exists.
 [[nodiscard]] std::uint64_t fragment_prepack_scratch_bytes(
     const CudaWeightDescriptor& descriptor) noexcept {
-    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32) {
         if (!regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)) {
             return 0U;
         }
@@ -4295,7 +5199,8 @@ cudaError_t launch_fragment_prepack(const CudaWeightDescriptor& descriptor,
         return static_cast<unsigned int>(
             std::min<std::uint64_t>((total + threads - 1U) / threads, 65535U));
     };
-    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32) {
         const std::uint64_t bytes = descriptor.rows * descriptor.columns;
         if (auto status = cudaMemcpyAsync(scratch, weights,
                                           static_cast<std::size_t>(bytes),

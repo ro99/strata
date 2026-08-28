@@ -193,6 +193,7 @@ struct ClassAccumulator {
 std::string_view to_string(PlacementModel model) noexcept {
     switch (model) {
         case PlacementModel::Glm52: return "glm";
+        case PlacementModel::Glm53: return "glm53";
         case PlacementModel::DeepSeekV4: return "deepseek";
         case PlacementModel::Gemma4: return "gemma4";
         case PlacementModel::KimiK3: return "kimi-k3";
@@ -231,6 +232,7 @@ std::string_view to_string(PlacementClass component) noexcept {
 
 bool parse_placement_model(std::string_view text, PlacementModel& model) noexcept {
     if (text == "glm") { model = PlacementModel::Glm52; return true; }
+    if (text == "glm53") { model = PlacementModel::Glm53; return true; }
     if (text == "deepseek") { model = PlacementModel::DeepSeekV4; return true; }
     if (text == "gemma4") { model = PlacementModel::Gemma4; return true; }
     if (text == "kimi-k3") { model = PlacementModel::KimiK3; return true; }
@@ -482,8 +484,13 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
     for (const auto& item : inventory.items) {
         if (item.spillable) continue;
         if (item.preferred_tier != PlacementTier::Device) {
-            if (!add(plan.host_resident_bytes, item.host_bytes)) {
-                result.errors.emplace_back("placement host byte total overflows");
+            auto* resident = item.preferred_tier == PlacementTier::Host
+                ? &plan.host_resident_bytes
+                : &plan.storage_resident_bytes;
+            if (!add(*resident, item.host_bytes)) {
+                result.errors.push_back(
+                    std::string(to_string(item.preferred_tier)) +
+                    " placement byte total overflows");
                 return result;
             }
             account(item.component, item.preferred_tier, item.host_bytes,
@@ -701,6 +708,7 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
             "host tier withholds " + format_bytes(inventory.host_reserve_bytes) +
             " for activations, worker stacks, and page cache");
     }
+    const bool glm53_dynamic_cache = inventory.model == PlacementModel::Glm53;
     if (plan.io_dependent) {
         std::string where = "the checkpoint";
         if (hardware.storage.resolved) {
@@ -712,7 +720,8 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
                     ')';
         }
         plan.notes.emplace_back(
-            "steady-state decode reads " +
+            std::string(glm53_dynamic_cache ? "cold-cache decode can read "
+                                            : "steady-state decode reads ") +
             format_bytes(plan.decode_storage_read_bytes) + " per step from " +
             where + ": this configuration is I/O dependent");
     }
@@ -732,7 +741,12 @@ PlacementPlanResult solve_placement(const PlacementInventory& inventory,
                                  " holds no layers at this operating point");
         }
     }
-    if (!inventory.prescriptive) {
+    if (glm53_dynamic_cache) {
+        plan.notes.emplace_back(
+            "GLM dynamically pins its non-expert spine and demand-caches experts "
+            "within live free VRAM; storage residency and reads above are "
+            "checkpoint-backing cold-cache bounds, not steady-state cache misses");
+    } else if (!inventory.prescriptive) {
         plan.notes.emplace_back(
             "descriptive plan: it reports and admits the placement this runtime "
             "already performs and does not change it");

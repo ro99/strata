@@ -438,6 +438,22 @@ TEST_CASE("the storage tier is admitted wherever the checkpoint lives") {
     REQUIRE(solve_placement(inventory, unknown, request).ok());
 }
 
+TEST_CASE("an explicitly streamed component is accounted as storage resident") {
+    auto inventory = make_dense_inventory(1U, 1U);
+    inventory.prescriptive = false;
+    auto& item = inventory.items.front();
+    item.preferred_tier = strata::PlacementTier::Storage;
+    item.host_bytes = item.source_bytes;
+    item.device_bytes = 0U;
+    const auto planned = solve_placement(
+        inventory, make_hardware({8U}), make_request(1U));
+    REQUIRE(planned.ok());
+    REQUIRE(planned.value.host_resident_bytes == 0U);
+    REQUIRE(planned.value.storage_resident_bytes == kGigabyte);
+    REQUIRE(planned.value.decode_storage_read_bytes == kGigabyte);
+    REQUIRE(planned.value.io_dependent);
+}
+
 TEST_CASE("the backing block device of a real path resolves") {
     const auto storage = strata::resolve_backing_storage(STRATA_SOURCE_DIR);
     REQUIRE(storage.resolved);

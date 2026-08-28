@@ -15,9 +15,11 @@
 #include <cerrno>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -86,7 +88,7 @@ void stop_server(int) {
 void usage() {
     std::cerr
         << "usage: strata-server --model DIR --model-type "
-           "gemma4|deepseek|glm|laguna|inkling|kimi-k3\n"
+           "gemma4|deepseek|glm|glm53|laguna|inkling|kimi-k3\n"
         << "                     [--model-id ID] [--host ADDRESS] [--port N]\n"
         << "                     [--context-size N] [--max-new N]\n"
         << "                     [--devices 0,1,2] [--vram-fraction F]\n"
@@ -867,7 +869,7 @@ private:
     const Options& options_;
     strata::RuntimeSession& runtime_;
     strata::ModelTokenizer tokenizer_;
-    std::uint64_t request_id_{};
+    std::atomic<std::uint64_t> request_id_{};
 };
 
 enum class RouterModelStatus : std::uint8_t {
@@ -1502,6 +1504,18 @@ int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);
     std::cerr << "[ready] http://" << options.host << ':' << options.port << "\n";
     ApiServer server(options, runtime, std::move(tokenizer.value));
+    const bool concurrent_requests =
+        registration->model == strata::RuntimeModel::Glm53;
+    // The GLM scheduler multiplexes generation iterations, so its HTTP front
+    // end must not serialize independently arriving streams. Bound detached
+    // connection workers from the CPUs the host actually exposes instead of
+    // accumulating one joinable thread object for the lifetime of the server.
+    const auto discovered_cpus = std::max(1U, std::thread::hardware_concurrency());
+    const auto maximum_clients = std::min<std::uint32_t>(128U,
+        std::max<std::uint32_t>(4U, discovered_cpus * 2U));
+    std::atomic<std::uint32_t> active_clients{};
+    std::mutex clients_mutex;
+    std::condition_variable clients_drained;
     while (stop_requested == 0) {
         const int client = accept4(listening_socket, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) {
@@ -1509,16 +1523,50 @@ int main(int argc, char** argv) {
             std::cerr << "warning: accept failed: " << std::strerror(errno) << '\n';
             continue;
         }
-        HttpRequest request;
-        std::string error;
-        if (!read_request(client, request, error)) {
-            send_error(client, 400, "Bad Request", error, "invalid_request_error");
+        const auto serve = [&server, &active_clients, &clients_drained](
+                               int socket) {
+            HttpRequest request;
+            std::string error;
+            if (!read_request(socket, request, error)) {
+                send_error(socket, 400, "Bad Request", error,
+                           "invalid_request_error");
+            } else {
+                server.handle(socket, request);
+            }
+            close(socket);
+            active_clients.fetch_sub(1U, std::memory_order_acq_rel);
+            clients_drained.notify_all();
+        };
+        if (concurrent_requests) {
+            if (active_clients.load(std::memory_order_acquire) >=
+                maximum_clients) {
+                send_error(client, 503, "Service Unavailable",
+                           "GLM-5.3 request admission is full",
+                           "server_overloaded");
+                close(client);
+                continue;
+            }
+            active_clients.fetch_add(1U, std::memory_order_acq_rel);
+            try {
+                std::thread(serve, client).detach();
+            } catch (const std::system_error& error) {
+                active_clients.fetch_sub(1U, std::memory_order_acq_rel);
+                send_error(client, 503, "Service Unavailable",
+                           std::string("cannot start request worker: ") +
+                               error.what(),
+                           "server_overloaded");
+                close(client);
+            }
         } else {
-            server.handle(client, request);
+            active_clients.fetch_add(1U, std::memory_order_acq_rel);
+            serve(client);
         }
-        close(client);
     }
     listening_socket = -1;
+    std::unique_lock clients_lock(clients_mutex);
+    clients_drained.wait(clients_lock, [&] {
+        return active_clients.load(std::memory_order_acquire) == 0U;
+    });
     std::cerr << "[shutdown] stopped cleanly\n";
     return 0;
 }

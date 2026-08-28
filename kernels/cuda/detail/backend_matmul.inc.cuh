@@ -71,7 +71,7 @@ ValidationResult CudaBackend::prepack_marlin(int device,
 ValidationResult CudaBackend::prepack_fragment(int device,
                                                const CudaWeight& weight) {
     ValidationResult result;
-    if (!weight.valid()) {
+    if (!weight.valid() || weight.device() != device) {
         result.errors.emplace_back("fragment prepack received an invalid weight");
         return result;
     }
@@ -81,6 +81,14 @@ ValidationResult CudaBackend::prepack_fragment(int device,
         return result;
     }
     const auto& descriptor = weight.impl_->descriptor;
+    const auto found = impl_->devices.find(device);
+    if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
+        (found == impl_->devices.end() ||
+         !found->second.fp8_f32_register_fed_supported)) {
+        result.errors.emplace_back(
+            "F32-scaled FP8 fragment prepack requires BF16 tensor cores");
+        return result;
+    }
     const auto scratch_bytes = fragment_prepack_scratch_bytes(descriptor);
     if (scratch_bytes == 0U) {
         result.errors.emplace_back(
@@ -134,12 +142,22 @@ const char* cuda_matmul_route_name(CudaMatmulRoute route) noexcept {
         case CudaMatmulRoute::PackedOffsetInt: return "packed_offset_int";
         case CudaMatmulRoute::Nvfp4Group16: return "nvfp4_group16";
         case CudaMatmulRoute::Fp8TensorPage: return "fp8_tensor_page";
+        case CudaMatmulRoute::Fp8F32TensorPage:
+            return "fp8_f32_tensor_page";
         case CudaMatmulRoute::Fp8E4m3Block128: return "fp8_e4m3_block128";
+        case CudaMatmulRoute::Fp8E4m3Block128F32:
+            return "fp8_e4m3_block128_f32";
         case CudaMatmulRoute::Fp4E2m1Group32: return "fp4_e2m1_group32";
         case CudaMatmulRoute::Fp8RegisterFed: return "fp8_register_fed";
+        case CudaMatmulRoute::Fp8F32RegisterFed:
+            return "fp8_f32_register_fed";
         case CudaMatmulRoute::Fp4RegisterFed: return "fp4_register_fed";
         case CudaMatmulRoute::GemmaMarlin: return "gemma_marlin";
         case CudaMatmulRoute::MoePlainBf16: return "moe_plain_bf16";
+        case CudaMatmulRoute::MoeFp8E4m3Block128F32:
+            return "moe_fp8_e4m3_block128_f32";
+        case CudaMatmulRoute::MoeFp8F32RegisterFed:
+            return "moe_fp8_f32_register_fed";
         case CudaMatmulRoute::MoeNvfp4Group16: return "moe_nvfp4_group16";
         case CudaMatmulRoute::MoeFp4E2m1Group32:
             return "moe_fp4_e2m1_group32";
@@ -160,7 +178,8 @@ ValidationResult CudaBackend::matmul_impl(
     std::uint32_t rows, std::uint32_t groups,
     std::uint64_t rows_per_group, std::span<float> output, float softcap,
     bool round_output, CudaMatmulProfile* profile,
-    bool dsv4_fp8_tensor_page) {
+    bool dsv4_fp8_tensor_page, const std::byte* batch_input,
+    std::byte* batch_output, bool defer_completion) {
     ValidationResult result;
     if (profile != nullptr) *profile = {};
     if (!weight.valid()) {
@@ -177,7 +196,10 @@ ValidationResult CudaBackend::matmul_impl(
         output.size() == descriptor.rows * rows;
     if (rows == 0U || (!regular_shape && !grouped_shape) ||
         !std::isfinite(softcap) || softcap < 0.0F ||
-        (softcap != 0.0F && (rows != 1U || groups != 0U))) {
+        (softcap != 0.0F && (rows != 1U || groups != 0U)) ||
+        (defer_completion &&
+         (batch_input == nullptr || batch_output == nullptr ||
+          profile != nullptr || impl_->detailed_timing))) {
         result.errors.emplace_back("CUDA matmul activation shapes are incompatible");
         return result;
     }
@@ -205,10 +227,12 @@ ValidationResult CudaBackend::matmul_impl(
     // kernel, which is recorded as its own census route rather than hidden.
     const bool regfed_encoding =
         descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 ||
         descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
     const bool regfed_shape =
         regfed_encoding && groups == 0U && softcap == 0.0F &&
-        (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
+        (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+         descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32
              ? regfed_fp8_shape_admissible(descriptor.rows, descriptor.columns)
              : regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns));
     // The register-fed route requires a weight already permuted by an explicit
@@ -217,8 +241,22 @@ ValidationResult CudaBackend::matmul_impl(
     // weight's other consumers. Deciding it here corrupted the DeepSeek V4
     // attention output projection, which matmul_impl touches 129 times a run
     // and the attention path then reads canonically.
+    const bool f32_fragment_page_candidate =
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
+        weight.impl_->fragment_prepacked && dsv4_fp8_tensor_page && rows > 16U &&
+        state.fp8_f32_tensor_page_supported && groups == 0U && softcap == 0.0F &&
+        descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
+        descriptor.rows % 128U == 0U &&
+        descriptor.columns <= std::numeric_limits<std::uint32_t>::max() &&
+        descriptor.rows <= std::numeric_limits<std::uint32_t>::max();
     const bool regfed = regfed_shape && regfed_matmul_enabled() &&
-                        weight.impl_->fragment_prepacked;
+                        weight.impl_->fragment_prepacked &&
+                        (descriptor.encoding !=
+                             CudaWeightEncoding::Fp8E4m3Block128F32 ||
+                         state.fp8_f32_register_fed_supported) &&
+                        !f32_fragment_page_candidate;
+    const bool f32_regfed = regfed && descriptor.encoding ==
+        CudaWeightEncoding::Fp8E4m3Block128F32;
     const bool marlin = weight.impl_->marlin_prepacked && groups == 0U &&
                         rows <= 128U &&
                         descriptor.encoding ==
@@ -228,7 +266,8 @@ ValidationResult CudaBackend::matmul_impl(
     // No hidden fallback. Fragment order replaces the canonical layout, so a
     // permuted weight reaching a canonical kernel does not degrade -- it
     // decodes a permutation as if it were weights. Refuse instead.
-    if (weight.impl_->fragment_prepacked && !regfed) {
+    if (weight.impl_->fragment_prepacked && !regfed &&
+        !f32_fragment_page_candidate) {
         result.errors.emplace_back(
             "CUDA matmul received a fragment-prepacked weight but has no "
             "register-fed route for this call; refusing to read fragment order "
@@ -241,16 +280,28 @@ ValidationResult CudaBackend::matmul_impl(
             "no admissible Marlin route");
         return result;
     }
-    const bool tensor_page =
+    const bool dsv4_tensor_page =
         dsv4_fp8_tensor_page && !regfed &&
         state.dsv4_fp8_tensor_page_supported && rows > 1U && groups == 0U &&
         descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 &&
         descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
         descriptor.rows % kDsv4Fp8TensorBlockN == 0U &&
         descriptor.columns <= std::numeric_limits<std::uint32_t>::max() &&
-        descriptor.rows <= std::numeric_limits<std::uint32_t>::max();
+        descriptor.rows <= std::numeric_limits<std::uint32_t>::max() &&
+        (!weight.impl_->fragment_prepacked || f32_fragment_page_candidate);
+    const bool f32_tensor_page =
+        dsv4_fp8_tensor_page && !regfed &&
+        state.fp8_f32_tensor_page_supported && rows > 1U && groups == 0U &&
+        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
+        descriptor.columns % kDsv4Fp8TensorBlockK == 0U &&
+        descriptor.rows % 128U == 0U &&
+        descriptor.columns <= std::numeric_limits<std::uint32_t>::max() &&
+        descriptor.rows <= std::numeric_limits<std::uint32_t>::max() &&
+        (!weight.impl_->fragment_prepacked || f32_fragment_page_candidate);
+    const bool tensor_page = dsv4_tensor_page || f32_tensor_page;
     const auto input_scale_bytes = tensor_page
-        ? static_cast<std::uint64_t>(rows) * descriptor.scale_columns
+        ? static_cast<std::uint64_t>(rows) * descriptor.scale_columns *
+              (f32_tensor_page ? sizeof(float) : sizeof(unsigned char))
         : 0U;
     const auto compact_input_bytes = tensor_page
         ? static_cast<std::uint64_t>(input.size()) + input_scale_bytes
@@ -263,7 +314,7 @@ ValidationResult CudaBackend::matmul_impl(
         descriptor.rows > std::numeric_limits<std::uint64_t>::max() /
                               padded_rows / sizeof(float)) {
         result.errors.emplace_back(
-            "DeepSeek FP8 tensor page output workspace overflows");
+            "FP8 tensor page output workspace overflows");
         return result;
     }
     const auto tensor_output_bytes = tensor_page
@@ -277,7 +328,7 @@ ValidationResult CudaBackend::matmul_impl(
     const auto marlin_output_bytes = marlin && rows > 1U
         ? 128U * descriptor.rows * sizeof(float)
         : output_bytes;
-    const auto required_output_bytes = tensor_page
+    const auto required_output_bytes = tensor_page || f32_regfed
         ? std::max(input_bytes, tensor_output_bytes)
         : marlin_output_bytes;
     std::uint64_t workspace_allocation_calls = 0U;
@@ -325,11 +376,11 @@ ValidationResult CudaBackend::matmul_impl(
         capacity = target;
         return true;
     };
-    const bool stage_input = ensure_host_staging(
+    const bool stage_input = batch_input != nullptr || ensure_host_staging(
         state.matmul_host_input, state.matmul_host_input_bytes, input_bytes);
-    const bool stage_output = ensure_host_staging(
+    const bool stage_output = batch_output != nullptr || ensure_host_staging(
         state.matmul_host_output, state.matmul_host_output_bytes, output_bytes);
-    if (stage_input) {
+    if (stage_input && batch_input == nullptr) {
         std::memcpy(state.matmul_host_input, input.data(), input.size_bytes());
     }
     if (impl_->detailed_timing) {
@@ -339,9 +390,10 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     if (auto status = cudaMemcpyAsync(
-            tensor_page ? static_cast<void*>(state.output)
+            (tensor_page || f32_regfed) ? static_cast<void*>(state.output)
                         : static_cast<void*>(state.input),
-            stage_input ? static_cast<const void*>(state.matmul_host_input)
+            batch_input != nullptr ? static_cast<const void*>(batch_input)
+                        : stage_input ? static_cast<const void*>(state.matmul_host_input)
                         : static_cast<const void*>(input.data()),
             input.size_bytes(), cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
@@ -354,20 +406,40 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     const bool native = descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+                        descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 ||
                         descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32;
     const bool w8_group32 =
         descriptor.encoding == CudaWeightEncoding::OffsetPackedInt8 &&
         rows == 1U && groups == 0U && descriptor.group_size == 32U &&
         descriptor.columns % 32U == 0U;
-    if (tensor_page) {
+    if (tensor_page || f32_regfed) {
         const dim3 quantize_grid(
             static_cast<unsigned int>(descriptor.scale_columns), rows, 1U);
         auto* compact_values = reinterpret_cast<unsigned char*>(state.input);
-        auto* compact_scales = compact_values + input.size();
-        quantize_activation_e4m3_bytes_kernel<<<
+        if (f32_tensor_page || f32_regfed) {
+            auto* compact_scales = reinterpret_cast<float*>(
+                compact_values + input.size());
+            quantize_activation_e4m3_f32_bytes_kernel<<<
+                quantize_grid, 128U, 0U, state.stream>>>(
+                compact_values, compact_scales, state.output,
+                descriptor.columns, rows);
+        } else {
+            auto* compact_scales = compact_values + input.size();
+            quantize_activation_e4m3_bytes_kernel<<<
+                quantize_grid, 128U, 0U, state.stream>>>(
+                compact_values, compact_scales, state.output,
+                descriptor.columns, rows);
+        }
+    } else if (descriptor.encoding ==
+                   CudaWeightEncoding::Fp8E4m3Block128F32 &&
+               !marlin && !regfed) {
+        const auto input_rows = groups == 0U ? rows : rows * groups;
+        const dim3 quantize_grid(
+            static_cast<unsigned int>((descriptor.columns + 127U) / 128U),
+            input_rows, 1U);
+        quantize_activation_e4m3_f32_scale_kernel<<<
             quantize_grid, 128U, 0U, state.stream>>>(
-            compact_values, compact_scales, state.output,
-            descriptor.columns, rows);
+            state.input, descriptor.columns, input_rows);
     } else if (native && !marlin) {
         const auto input_rows = groups == 0U ? rows : rows * groups;
         const dim3 quantize_grid(
@@ -476,10 +548,20 @@ ValidationResult CudaBackend::matmul_impl(
         const auto n_tiles =
             static_cast<std::uint32_t>(descriptor.rows / kRegfedTileN);
         const std::uint32_t units =
-            descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128
+            (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128 ||
+             descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32)
                 ? static_cast<std::uint32_t>(descriptor.columns / 32U)
                 : k_tiles / kRegfedKPerLoad;
-        const std::uint32_t split = regfed_split_k(units, n_tiles);
+        std::uint32_t split = regfed_split_k(units, n_tiles);
+        if (f32_regfed) {
+            // A continuous scale belongs to a complete K128 block (four
+            // 32-column pairs), so split-K boundaries may never bisect one.
+            split = 1U;
+            while (split < 16U && units % ((split * 2U) * 4U) == 0U &&
+                   n_tiles * split * 2U <= 4096U) {
+                split *= 2U;
+            }
+        }
         const std::uint64_t activation_bytes =
             static_cast<std::uint64_t>(k_tiles) * column_blocks *
             groups_per_block * 4U * sizeof(uint2);
@@ -545,15 +627,29 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<void>(chunk_activation_bytes);
             const auto fragment_total = static_cast<std::uint64_t>(k_tiles) *
                                         chunk_blocks * chunk_groups * 4U;
-            regfed_activation_fragment_kernel<<<
-                static_cast<unsigned int>(std::min<std::uint64_t>(
-                    (fragment_total + 255U) / 256U, 65535U)),
-                256U, 0U, state.stream>>>(
-                static_cast<uint2*>(state.regfed_activation),
-                state.input + static_cast<std::size_t>(start) *
-                                  descriptor.columns,
-                chunk, static_cast<std::uint32_t>(descriptor.columns),
-                chunk_blocks, chunk_groups);
+            if (f32_regfed) {
+                const auto* compact_values =
+                    reinterpret_cast<const unsigned char*>(state.input);
+                regfed_fp8_activation_fragment_kernel<<<
+                    static_cast<unsigned int>(std::min<std::uint64_t>(
+                        (fragment_total + 255U) / 256U, 65535U)),
+                    256U, 0U, state.stream>>>(
+                    static_cast<uint2*>(state.regfed_activation),
+                    compact_values + static_cast<std::size_t>(start) *
+                                         descriptor.columns,
+                    chunk, static_cast<std::uint32_t>(descriptor.columns),
+                    chunk_blocks, chunk_groups);
+            } else {
+                regfed_activation_fragment_kernel<<<
+                    static_cast<unsigned int>(std::min<std::uint64_t>(
+                        (fragment_total + 255U) / 256U, 65535U)),
+                    256U, 0U, state.stream>>>(
+                    static_cast<uint2*>(state.regfed_activation),
+                    state.input + static_cast<std::size_t>(start) *
+                                      descriptor.columns,
+                    chunk, static_cast<std::uint32_t>(descriptor.columns),
+                    chunk_blocks, chunk_groups);
+            }
             float* chunk_output =
                 state.output + static_cast<std::size_t>(start) * descriptor.rows;
             if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
@@ -583,6 +679,35 @@ ValidationResult CudaBackend::matmul_impl(
                         split, chunk, chunk_groups, state.regfed_partials,
                         state.regfed_counters);
                 }
+            } else if (descriptor.encoding ==
+                       CudaWeightEncoding::Fp8E4m3Block128F32) {
+                record_cuda_matmul_route(CudaMatmulRoute::Fp8F32RegisterFed);
+                const auto* compact_values =
+                    reinterpret_cast<const unsigned char*>(state.input);
+                const auto* compact_scales = reinterpret_cast<const float*>(
+                    compact_values + input.size());
+                const auto launch = [&](auto tag) {
+                    constexpr std::uint32_t kBlocks = decltype(tag)::value;
+                    regfed_fp8_f32_matmul_kernel<kBlocks><<<
+                        blocks, kRegfedWarpsPerBlock * 32U, 0U,
+                        state.stream>>>(
+                        chunk_output,
+                        static_cast<const uint4*>(weight.impl_->weights),
+                        static_cast<const float*>(weight.impl_->scales),
+                        static_cast<const uint2*>(state.regfed_activation),
+                        compact_scales + static_cast<std::size_t>(start) *
+                                             descriptor.scale_columns,
+                        static_cast<std::uint32_t>(descriptor.columns),
+                        static_cast<std::uint32_t>(descriptor.rows),
+                        static_cast<std::uint32_t>(descriptor.scale_columns),
+                        split, chunk, chunk_groups, state.regfed_partials,
+                        state.regfed_counters);
+                };
+                if (chunk_blocks == 1U) {
+                    launch(std::integral_constant<std::uint32_t, 1U>{});
+                } else {
+                    launch(std::integral_constant<std::uint32_t, 2U>{});
+                }
             } else {
                 record_cuda_matmul_route(CudaMatmulRoute::Fp4RegisterFed);
                 if (chunk_blocks == 1U) {
@@ -610,7 +735,7 @@ ValidationResult CudaBackend::matmul_impl(
                 }
             }
         }
-    } else if (tensor_page) {
+    } else if (dsv4_tensor_page) {
         record_cuda_matmul_route(CudaMatmulRoute::Fp8TensorPage);
         const dim3 tensor_grid(
             static_cast<unsigned int>(
@@ -627,12 +752,47 @@ ValidationResult CudaBackend::matmul_impl(
             static_cast<const unsigned char*>(weight.impl_->scales), rows,
             static_cast<std::uint32_t>(descriptor.columns),
             static_cast<std::uint32_t>(descriptor.rows));
+    } else if (f32_tensor_page) {
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8F32TensorPage);
+        const dim3 tensor_grid(
+            static_cast<unsigned int>(
+                descriptor.rows / kFp8F32TensorBlockN),
+            static_cast<unsigned int>(
+                padded_rows / kDsv4Fp8TensorBlockM), 1U);
+        const auto* compact_values =
+            reinterpret_cast<const unsigned char*>(state.input);
+        const auto* compact_scales = reinterpret_cast<const float*>(
+            compact_values + input.size());
+        const auto launch = [&](auto tag) {
+            constexpr bool kPrepacked = decltype(tag)::value;
+            fp8_f32_decode_bf16_tensor_kernel<kPrepacked><<<
+                tensor_grid, threads, 0U, state.stream>>>(
+                state.output, compact_values, compact_scales,
+                static_cast<const unsigned char*>(weight.impl_->weights),
+                static_cast<const float*>(weight.impl_->scales), rows,
+                static_cast<std::uint32_t>(descriptor.columns),
+                static_cast<std::uint32_t>(descriptor.rows));
+        };
+        if (weight.impl_->fragment_prepacked) {
+            launch(std::true_type{});
+        } else {
+            launch(std::false_type{});
+        }
     } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128) {
         record_cuda_matmul_route(CudaMatmulRoute::Fp8E4m3Block128);
         native_fp8_matmul_kernel<<<grid, threads, 0, state.stream>>>(
             state.output, state.input,
             static_cast<const unsigned char*>(weight.impl_->weights),
             static_cast<const unsigned char*>(weight.impl_->scales),
+            descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
+            groups, rows_per_group);
+    } else if (descriptor.encoding ==
+               CudaWeightEncoding::Fp8E4m3Block128F32) {
+        record_cuda_matmul_route(CudaMatmulRoute::Fp8E4m3Block128F32);
+        native_fp8_f32_scale_matmul_kernel<<<grid, threads, 0, state.stream>>>(
+            state.output, state.input,
+            static_cast<const unsigned char*>(weight.impl_->weights),
+            static_cast<const float*>(weight.impl_->scales),
             descriptor.scale_columns, rows, descriptor.columns, descriptor.rows,
             groups, rows_per_group);
     } else if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
@@ -685,7 +845,8 @@ ValidationResult CudaBackend::matmul_impl(
         }
     }
     if (auto status = cudaMemcpyAsync(
-            stage_output ? static_cast<void*>(state.matmul_host_output)
+            batch_output != nullptr ? static_cast<void*>(batch_output)
+                         : stage_output ? static_cast<void*>(state.matmul_host_output)
                          : static_cast<void*>(output.data()),
             state.output, output.size_bytes(),
             cudaMemcpyDeviceToHost, state.stream);
@@ -702,6 +863,21 @@ ValidationResult CudaBackend::matmul_impl(
     const auto issue_nanoseconds = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             wait_started - issue_started).count());
+    if (defer_completion) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& device_stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [&weight](const auto& value) {
+                return value.device == weight.impl_->device;
+            });
+        device_stats.activation_h2d_bytes += input_bytes;
+        device_stats.activation_d2h_bytes += output_bytes;
+        ++device_stats.matmul_calls;
+        device_stats.workspace_allocation_calls += workspace_allocation_calls;
+        device_stats.workspace_allocation_bytes += workspace_allocation_bytes;
+        device_stats.matmul_issue_nanoseconds += issue_nanoseconds;
+        return result;
+    }
     if (auto status = cudaStreamSynchronize(state.stream); status != cudaSuccess) {
         return cuda_error(status, "synchronize CUDA matmul");
     }

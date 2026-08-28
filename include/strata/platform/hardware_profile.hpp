@@ -38,6 +38,10 @@ struct HardwareProfile {
     // the machine's total -- a cgroup or a taskset makes those differ, and the
     // affinity mask is the one that governs how many threads are useful.
     std::size_t usable_cpus{};
+    // Exact affinity-filtered logical CPU ids. A device-addressed worker pool
+    // needs identities, not only a count, to stay local without assuming the
+    // host's CPU numbering.
+    std::vector<int> usable_cpu_ids;
     NumaTopology numa;
     // CPUs on the smallest online node. The relevant figure for anything that
     // assigns one worker pool per node, because the smallest node is what

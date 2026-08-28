@@ -12,4 +12,5 @@ transfers to a different context length or machine.
 | Inkling Small | [Build, chat, serve, and benchmark](inkling.md) | 9.072 tok/s fresh / 28.010 tok/s same-route warm |
 | DeepSeek V4 | [Build, serve, and benchmark](deepseek.md) | 9.171 tok/s with the routed-expert tier, 8.571 without |
 | GLM-5.2 | [Build, preflight, and run](glm52.md) | I/O-dependent on the reference workstation |
+| GLM-5.3-Flash | [Build, preflight, chat, and serve](glm53.md) | I/O-dependent; exact text context currently capped at 2,048 tokens |
 | Kimi-K3 | [Build, preflight, and run](kimi-k3.md) | ~0.02 tok/s; SATA-bound on the reference workstation |

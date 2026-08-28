@@ -7,6 +7,7 @@
 #include "strata/models/deepseek/deepseek_admission.hpp"
 #include "strata/models/deepseek/deepseek_checkpoint.hpp"
 #include "strata/models/gemma4/gemma4_checkpoint.hpp"
+#include "strata/models/glm53/glm53_checkpoint.hpp"
 #include "strata/models/kimi_k3/kimi_k3_checkpoint.hpp"
 #include "strata/models/inkling/inkling_checkpoint.hpp"
 #include "strata/models/laguna/laguna_checkpoint.hpp"
@@ -331,6 +332,110 @@ struct Gemma4Linear {
     cache.host_bytes += static_cast<std::uint64_t>(context_tokens) * kIndexDim *
         sizeof(float) * c.layer_count;
     inventory.items.push_back(make_item(PlacementClass::KvCache, cache, 0U,
+                                        PlacementTier::Host, false));
+    return result;
+}
+
+
+// ------------------------------------------------------------- GLM-5.3
+
+[[nodiscard]] PlacementClass glm53_component(
+    Glm53TensorRole role) noexcept {
+    switch (role) {
+        case Glm53TensorRole::Embedding: return PlacementClass::Embedding;
+        case Glm53TensorRole::OutputHead: return PlacementClass::OutputHead;
+        case Glm53TensorRole::Norm:
+        case Glm53TensorRole::Mhc: return PlacementClass::Norm;
+        case Glm53TensorRole::KdaAttention:
+        case Glm53TensorRole::SparseAttention:
+        case Glm53TensorRole::AttentionIndexer:
+            return PlacementClass::Attention;
+        case Glm53TensorRole::DenseMlp: return PlacementClass::FeedForward;
+        case Glm53TensorRole::Router: return PlacementClass::Router;
+        case Glm53TensorRole::SharedExpert: return PlacementClass::SharedExpert;
+        case Glm53TensorRole::RoutedExpert: return PlacementClass::RoutedExpert;
+        case Glm53TensorRole::Vision: return PlacementClass::Vision;
+        case Glm53TensorRole::Mtp:
+        case Glm53TensorRole::Count: break;
+    }
+    return PlacementClass::Norm;
+}
+
+[[nodiscard]] std::string glm53_module_base(std::string_view name) {
+    for (const auto suffix : {std::string_view{".weight_scale_inv"},
+                              std::string_view{".weight"},
+                              std::string_view{".bias"}}) {
+        if (name.size() >= suffix.size() &&
+            name.substr(name.size() - suffix.size()) == suffix) {
+            return std::string(name.substr(0U, name.size() - suffix.size()));
+        }
+    }
+    return std::string(name);
+}
+
+[[nodiscard]] ParseResult<PlacementInventory> build_glm53_inventory(
+    const Glm53IndexManifest& manifest, std::uint32_t context_tokens) {
+    ParseResult<PlacementInventory> result;
+    auto& inventory = result.value;
+    inventory.model = PlacementModel::Glm53;
+    inventory.model_name = "GLM-5.3-Flash";
+    inventory.layer_count = 45U;
+    inventory.maximum_context_tokens = context_tokens;
+    inventory.per_device_workspace_bytes = 2ULL << 30U;
+    inventory.minimum_device_budget_bytes = kMinimumDeviceBudget;
+    inventory.contiguous_layer_blocks = false;
+    // The checkpoint remains the canonical backing store. At runtime the
+    // non-expert spine is pinned opportunistically and experts enter a
+    // free-VRAM-sized demand cache, so this inventory is a cold-cache bound;
+    // it does not prescribe or claim a fixed resident layout.
+    inventory.prescriptive = false;
+
+    std::map<std::string, ModuleSizes> modules;
+    std::map<std::string, PlacementClass> classes;
+    for (const auto& tensor : manifest.tensors) {
+        if (tensor.role == Glm53TensorRole::Vision ||
+            tensor.role == Glm53TensorRole::Mtp) {
+            continue;
+        }
+        const auto base = glm53_module_base(tensor.name);
+        auto& sizes = modules[base];
+        sizes.layer = tensor.layer;
+        classes[base] = glm53_component(tensor.role);
+        if (tensor.component == Glm53TensorComponent::Scale) {
+            sizes.scale_bytes += tensor.source_bytes;
+        } else if (tensor.component == Glm53TensorComponent::Weight) {
+            sizes.weight_bytes += tensor.source_bytes;
+        } else {
+            sizes.host_bytes += tensor.source_bytes;
+        }
+    }
+    for (const auto& [base, sizes] : modules) {
+        auto source = sizes;
+        source.host_bytes = sizes.source_bytes();
+        source.weight_bytes = 0U;
+        source.scale_bytes = 0U;
+        auto reads = source.host_bytes;
+        const auto component = classes.at(base);
+        if (component == PlacementClass::Embedding) {
+            reads = 4096ULL * sizeof(std::uint16_t);
+        } else if (component == PlacementClass::RoutedExpert) {
+            // The manifest has every expert projection as its own module, but
+            // exact decode reads only the eight selected experts in each MoE
+            // layer. Summing this fraction over all 288 experts gives eight
+            // complete gate/up/down triplets per sparse layer.
+            reads = source.host_bytes * 8ULL / 288ULL;
+        }
+        inventory.items.push_back(make_item(
+            component, source, reads, PlacementTier::Storage, false));
+    }
+
+    ModuleSizes state;
+    constexpr std::uint64_t kKdaLayers = 34U;
+    constexpr std::uint64_t kSparseLayers = 11U;
+    state.host_bytes = kKdaLayers * 64ULL * 128ULL * 128ULL * sizeof(float);
+    state.host_bytes += kKdaLayers * 3ULL * 8192ULL * 3ULL * sizeof(float);
+    state.host_bytes += kSparseLayers * context_tokens * 512ULL * sizeof(float);
+    inventory.items.push_back(make_item(PlacementClass::KvCache, state, 0U,
                                         PlacementTier::Host, false));
     return result;
 }
@@ -1002,6 +1107,7 @@ struct Gemma4Linear {
 struct OpenCheckpoints {
     std::unique_ptr<Gemma4CheckpointReader> gemma4;
     std::unique_ptr<GlmCheckpointReader> glm;
+    std::unique_ptr<Glm53CheckpointReader> glm53;
     std::unique_ptr<Dsv4CheckpointReader> deepseek;
     std::unique_ptr<KimiCheckpointReader> kimi;
     std::unique_ptr<LagunaCheckpointReader> laguna;
@@ -1020,6 +1126,9 @@ struct OpenCheckpoints {
         case PlacementModel::Glm52:
             return build_glm_inventory(checkpoints.glm->manifest(), context_tokens,
                                        request.flash_attention);
+        case PlacementModel::Glm53:
+            return build_glm53_inventory(checkpoints.glm53->manifest(),
+                                         context_tokens);
         case PlacementModel::Laguna:
             return build_laguna_inventory(*checkpoints.laguna, context_tokens);
         case PlacementModel::Inkling:
@@ -1046,6 +1155,8 @@ struct OpenCheckpoints {
             return kGemma4ExecutionContract.maximum_context_tokens;
         case PlacementModel::Glm52:
             return kGlm52ExecutionContract.maximum_context_tokens;
+        case PlacementModel::Glm53:
+            return 2048U;
         case PlacementModel::Laguna:
             return kLagunaExecutionContract.maximum_context_tokens;
         case PlacementModel::Inkling:
@@ -1092,6 +1203,15 @@ PlacementPlanResult plan_model_placement_impl(const PlacementRequest& request,
                 return result;
             }
             checkpoints.glm = std::move(opened.value);
+            break;
+        }
+        case PlacementModel::Glm53: {
+            auto opened = Glm53CheckpointReader::open(request.model_directory);
+            if (!opened.ok()) {
+                result.errors = std::move(opened.errors);
+                return result;
+            }
+            checkpoints.glm53 = std::move(opened.value);
             break;
         }
         case PlacementModel::Laguna: {

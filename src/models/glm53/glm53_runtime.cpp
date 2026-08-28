@@ -140,6 +140,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool replay_ssm_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_REPLAY_SSM");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 struct Glm53RowRange {
     std::uint64_t begin{};
     std::uint64_t count{};
@@ -226,6 +237,23 @@ struct Glm53RowRange {
         chosen.push_back(*selected);
     }
     return chosen;
+}
+
+[[nodiscard]] std::vector<int> compute_worker_cpus() {
+    const auto& hardware = host_hardware_profile();
+    std::vector<int> cpus;
+    const auto usable = [&](int cpu) {
+        return std::find(hardware.usable_cpu_ids.begin(),
+                         hardware.usable_cpu_ids.end(), cpu) !=
+               hardware.usable_cpu_ids.end();
+    };
+    for (const auto& node : hardware.numa.node_primary_cpus) {
+        for (const int cpu : node) {
+            if (usable(cpu)) cpus.push_back(cpu);
+        }
+    }
+    if (cpus.empty()) cpus = hardware.usable_cpu_ids;
+    return cpus;
 }
 
 double now_seconds() {
@@ -807,6 +835,7 @@ struct Glm53Runtime::Impl {
     std::vector<Glm53RowRange> lm_head_ranges;
     std::unique_ptr<Glm53WeightCache> weights;
     std::unique_ptr<HostWorkerPool> projection_workers;
+    std::unique_ptr<HostWorkerPool> kda_workers;
     std::atomic<std::uint64_t> parallel_projection_batches{};
     std::atomic<std::uint64_t> parallel_projection_requests{};
     std::atomic<std::uint64_t> tensor_parallel_head_batches{};
@@ -1407,46 +1436,153 @@ struct Glm53Runtime::Impl {
         }
         std::vector<float> heads_out(wide_elements);
         const auto query_scale = 1.0F / std::sqrt(static_cast<float>(kLinearHead));
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            const auto row_begin = static_cast<std::size_t>(row) * kLinearWidth;
-            for (std::uint32_t head = 0U; head < kHeads; ++head) {
-                const auto begin = row_begin +
-                    static_cast<std::size_t>(head) * kLinearHead;
-                auto q = std::span<float>(query).subspan(begin, kLinearHead);
-                auto k = std::span<float>(key).subspan(begin, kLinearHead);
-                result = kimi_l2_normalize(q, 1.0e-6F);
-                if (!result.ok()) return result;
-                result = kimi_l2_normalize(k, 1.0e-6F);
-                if (!result.ok()) return result;
-                for (auto& element : q) element *= query_scale;
-                std::vector<float> decay(kLinearHead);
-                result = kimi_kda_log_decay(
-                    decay,
-                    std::span<const float>(forget).subspan(begin, kLinearHead),
-                    std::span<const float>(*dt_bias.value).subspan(
-                        static_cast<std::size_t>(head) * kLinearHead,
-                        kLinearHead),
-                    (*a_log.value)[head], -5.0F);
-                if (!result.ok()) return result;
-                for (auto& element : decay) element = std::exp(element);
-                std::vector<float> raw(kLinearHead);
-                auto state = std::span<float>(recurrent[layer]).subspan(
-                    static_cast<std::size_t>(head) * kLinearHead * kLinearHead,
-                    static_cast<std::size_t>(kLinearHead) * kLinearHead);
-                result = kimi_kda_step(
-                    raw, state, q, k,
-                    std::span<const float>(value).subspan(begin, kLinearHead),
-                    decay, beta[static_cast<std::size_t>(row) * kHeads + head],
-                    kLinearHead, kLinearHead);
-                if (!result.ok()) return result;
-                round_bf16(raw);
-                result = kimi_kda_output_norm(
-                    std::span<float>(heads_out).subspan(begin, kLinearHead), raw,
-                    std::span<const float>(gate).subspan(begin, kLinearHead),
-                    *o_norm.value, 1.0e-5F);
-                if (!result.ok()) return result;
-                round_bf16(std::span<float>(heads_out).subspan(
-                    begin, kLinearHead));
+        // The chunk form exposes heads to the physical-core pool, but a page
+        // narrower than the runner count cannot amortize waking that pool.
+        // Derive the crossover from the discovered pool width rather than a
+        // token constant measured on one host.
+        if (kda_workers != nullptr &&
+            rows >= std::min<std::size_t>(kHeads, kda_workers->size())) {
+            std::vector<ValidationResult> failures(kHeads);
+            auto replayed = kda_workers->parallel_for(
+                kHeads, [&](std::size_t head) {
+                    std::vector<float> q(static_cast<std::size_t>(rows) *
+                                         kLinearHead);
+                    std::vector<float> k(q.size()), v(q.size()), decay(q.size());
+                    std::vector<float> head_beta(rows);
+                    for (std::uint32_t row = 0U; row < rows; ++row) {
+                        const auto source = static_cast<std::size_t>(row) *
+                                                kLinearWidth +
+                                            head * kLinearHead;
+                        const auto target = static_cast<std::size_t>(row) *
+                                            kLinearHead;
+                        auto q_row = std::span<float>(q).subspan(
+                            target, kLinearHead);
+                        auto k_row = std::span<float>(k).subspan(
+                            target, kLinearHead);
+                        std::copy_n(query.begin() +
+                                        static_cast<std::ptrdiff_t>(source),
+                                    kLinearHead, q_row.begin());
+                        std::copy_n(key.begin() +
+                                        static_cast<std::ptrdiff_t>(source),
+                                    kLinearHead, k_row.begin());
+                        std::copy_n(value.begin() +
+                                        static_cast<std::ptrdiff_t>(source),
+                                    kLinearHead,
+                                    v.begin() + static_cast<std::ptrdiff_t>(target));
+                        auto status = kimi_l2_normalize(q_row, 1.0e-6F);
+                        if (!status.ok()) {
+                            failures[head] = std::move(status);
+                            return;
+                        }
+                        status = kimi_l2_normalize(k_row, 1.0e-6F);
+                        if (!status.ok()) {
+                            failures[head] = std::move(status);
+                            return;
+                        }
+                        for (auto& element : q_row) element *= query_scale;
+                        status = kimi_kda_log_decay(
+                            std::span<float>(decay).subspan(target, kLinearHead),
+                            std::span<const float>(forget).subspan(
+                                source, kLinearHead),
+                            std::span<const float>(*dt_bias.value).subspan(
+                                head * kLinearHead, kLinearHead),
+                            (*a_log.value)[head], -5.0F);
+                        if (!status.ok()) {
+                            failures[head] = std::move(status);
+                            return;
+                        }
+                        head_beta[row] = beta[
+                            static_cast<std::size_t>(row) * kHeads + head];
+                    }
+                    std::vector<float> raw(q.size());
+                    auto state = std::span<float>(recurrent[layer]).subspan(
+                        head * kLinearHead * kLinearHead,
+                        static_cast<std::size_t>(kLinearHead) * kLinearHead);
+                    auto status = kimi_kda_chunk(
+                        raw, state, q, k, v, decay, head_beta, rows,
+                        kLinearHead, kLinearHead);
+                    if (!status.ok()) {
+                        failures[head] = std::move(status);
+                        return;
+                    }
+                    for (std::uint32_t row = 0U; row < rows; ++row) {
+                        const auto source = static_cast<std::size_t>(row) *
+                                            kLinearHead;
+                        const auto target = static_cast<std::size_t>(row) *
+                                                kLinearWidth +
+                                            head * kLinearHead;
+                        auto raw_row = std::span<float>(raw).subspan(
+                            source, kLinearHead);
+                        round_bf16(raw_row);
+                        status = kimi_kda_output_norm(
+                            std::span<float>(heads_out).subspan(
+                                target, kLinearHead),
+                            raw_row,
+                            std::span<const float>(gate).subspan(
+                                target, kLinearHead),
+                            *o_norm.value, 1.0e-5F);
+                        if (!status.ok()) {
+                            failures[head] = std::move(status);
+                            return;
+                        }
+                        round_bf16(std::span<float>(heads_out).subspan(
+                            target, kLinearHead));
+                    }
+                });
+            if (!replayed.ok()) return replayed;
+            for (auto& failure : failures) {
+                if (!failure.ok()) return failure;
+            }
+        } else {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto row_begin = static_cast<std::size_t>(row) *
+                                       kLinearWidth;
+                for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                    const auto begin = row_begin +
+                        static_cast<std::size_t>(head) * kLinearHead;
+                    auto q = std::span<float>(query).subspan(begin, kLinearHead);
+                    auto k = std::span<float>(key).subspan(begin, kLinearHead);
+                    result = kimi_l2_normalize(q, 1.0e-6F);
+                    if (!result.ok()) return result;
+                    result = kimi_l2_normalize(k, 1.0e-6F);
+                    if (!result.ok()) return result;
+                    for (auto& element : q) element *= query_scale;
+                    std::vector<float> decay(kLinearHead);
+                    result = kimi_kda_log_decay(
+                        decay,
+                        std::span<const float>(forget).subspan(
+                            begin, kLinearHead),
+                        std::span<const float>(*dt_bias.value).subspan(
+                            static_cast<std::size_t>(head) * kLinearHead,
+                            kLinearHead),
+                        (*a_log.value)[head], -5.0F);
+                    if (!result.ok()) return result;
+                    for (auto& element : decay) element = std::exp(element);
+                    std::vector<float> raw(kLinearHead);
+                    auto state = std::span<float>(recurrent[layer]).subspan(
+                        static_cast<std::size_t>(head) * kLinearHead *
+                            kLinearHead,
+                        static_cast<std::size_t>(kLinearHead) * kLinearHead);
+                    result = kimi_kda_step(
+                        raw, state, q, k,
+                        std::span<const float>(value).subspan(
+                            begin, kLinearHead),
+                        decay,
+                        beta[static_cast<std::size_t>(row) * kHeads + head],
+                        kLinearHead, kLinearHead);
+                    if (!result.ok()) return result;
+                    round_bf16(raw);
+                    result = kimi_kda_output_norm(
+                        std::span<float>(heads_out).subspan(
+                            begin, kLinearHead),
+                        raw,
+                        std::span<const float>(gate).subspan(
+                            begin, kLinearHead),
+                        *o_norm.value, 1.0e-5F);
+                    if (!result.ok()) return result;
+                    round_bf16(std::span<float>(heads_out).subspan(
+                        begin, kLinearHead));
+                }
             }
         }
         return linear(attention + "o_proj", heads_out, rows, kLinearWidth,
@@ -2021,6 +2157,13 @@ ValidationResult Glm53Runtime::initialize(
         impl_->projection_workers != nullptr) {
         impl_->lm_head_ranges = weighted_row_ranges(
             kVocabulary, impl_->weight_capacities, 128U);
+    }
+    if (replay_ssm_enabled()) {
+        auto worker_cpus = compute_worker_cpus();
+        if (!worker_cpus.empty()) {
+            impl_->kda_workers = std::make_unique<HostWorkerPool>(
+                std::move(worker_cpus), std::chrono::milliseconds(1));
+        }
     }
     impl_->ready = true;
     try {

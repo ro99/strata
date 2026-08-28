@@ -11,7 +11,8 @@
 
 namespace strata {
 
-inline constexpr std::uint32_t kGlm53LayerCount = 45U;
+// 45 target layers plus the checkpoint's exact next-token prediction layer.
+inline constexpr std::uint32_t kGlm53LayerCount = 46U;
 inline constexpr std::uint32_t kGlm53KdaHeads = 64U;
 inline constexpr std::uint32_t kGlm53KdaHeadWidth = 128U;
 inline constexpr std::uint32_t kGlm53KdaWidth =
@@ -73,6 +74,8 @@ public:
         std::uint32_t layer, std::uint32_t projection);
     [[nodiscard]] Glm53PagedRows& mla(std::uint32_t layer);
     [[nodiscard]] const Glm53PagedRows& mla(std::uint32_t layer) const;
+    void copy_mla_from(std::uint32_t layer,
+                       const Glm53SequenceState& source);
 
     [[nodiscard]] std::uint32_t token_count() const noexcept {
         return token_count_;

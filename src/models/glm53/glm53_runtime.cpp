@@ -82,6 +82,7 @@ namespace {
 
 constexpr std::uint32_t kHidden = 4096U;
 constexpr std::uint32_t kLayers = 45U;
+constexpr std::uint32_t kMtpLayer = 45U;
 constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
@@ -191,6 +192,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
         return value != nullptr && std::string_view(value) != "0" &&
                std::string_view(value) != "false" &&
                std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool mtp_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_MTP");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
     }();
     return enabled;
 }
@@ -916,6 +928,7 @@ struct Glm53Runtime::Impl {
         std::vector<std::uint32_t> tokens;
         Glm53SequenceState state;
         std::vector<float> logits;
+        std::vector<float> base_hidden;
         std::uint64_t recency{};
     };
 
@@ -929,6 +942,7 @@ struct Glm53Runtime::Impl {
         Glm53SequenceState sequence;
         DeviceSequenceState device_sequence;
         std::vector<float> logits;
+        std::vector<float> base_hidden;
         std::vector<std::uint32_t> counts;
         std::vector<std::uint32_t> sampled;
         std::mt19937_64 generator;
@@ -942,6 +956,7 @@ struct Glm53Runtime::Impl {
         std::condition_variable completion;
         bool prepared{};
         bool decoding{};
+        bool mtp_ready{};
         bool done{};
     };
 
@@ -982,6 +997,8 @@ struct Glm53Runtime::Impl {
     bool scheduler_stopping{};
     std::atomic<std::uint64_t> scheduler_iterations{};
     std::atomic<std::uint64_t> scheduler_batched_iterations{};
+    std::atomic<std::uint64_t> mtp_drafts{};
+    std::atomic<std::uint64_t> mtp_accepted{};
 
     ~Impl() {
         {
@@ -994,7 +1011,8 @@ struct Glm53Runtime::Impl {
     }
 
     [[nodiscard]] std::size_t slot_for(std::uint32_t layer) const noexcept {
-        return device_schedule[layer % device_schedule.size()];
+        const auto target_layer = std::min(layer, kLayers - 1U);
+        return device_schedule[target_layer % device_schedule.size()];
     }
 
     [[nodiscard]] int device_for(std::uint32_t layer) const noexcept {
@@ -1041,7 +1059,7 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] std::size_t restore_prefix(
         std::span<const std::uint32_t> tokens, Glm53SequenceState& state,
-        std::span<float> logits) {
+        std::span<float> logits, std::vector<float>& base_hidden) {
         std::scoped_lock lock(prefix_mutex);
         PrefixEntry* best = nullptr;
         for (auto& entry : prefix_cache) {
@@ -1058,6 +1076,7 @@ struct Glm53Runtime::Impl {
         if (best == nullptr) return 0U;
         state = best->state;
         std::copy(best->logits.begin(), best->logits.end(), logits.begin());
+        base_hidden = best->base_hidden;
         best->recency = ++prefix_clock;
         prefix_cache_hits.fetch_add(1U, std::memory_order_relaxed);
         prefix_cache_tokens.fetch_add(best->tokens.size(),
@@ -1067,7 +1086,8 @@ struct Glm53Runtime::Impl {
 
     void store_prefix(std::span<const std::uint32_t> tokens,
                       const Glm53SequenceState& state,
-                      std::span<const float> logits) {
+                      std::span<const float> logits,
+                      std::span<const float> base_hidden) {
         if (tokens.empty() || state.token_count() != tokens.size()) return;
         std::scoped_lock lock(prefix_mutex);
         for (auto& entry : prefix_cache) {
@@ -1076,6 +1096,7 @@ struct Glm53Runtime::Impl {
                            tokens.begin())) {
                 entry.state = state;
                 entry.logits.assign(logits.begin(), logits.end());
+                entry.base_hidden.assign(base_hidden.begin(), base_hidden.end());
                 entry.recency = ++prefix_clock;
                 return;
             }
@@ -1092,6 +1113,7 @@ struct Glm53Runtime::Impl {
         entry.tokens.assign(tokens.begin(), tokens.end());
         entry.state = state;
         entry.logits.assign(logits.begin(), logits.end());
+        entry.base_hidden.assign(base_hidden.begin(), base_hidden.end());
         entry.recency = ++prefix_clock;
         prefix_cache.push_back(std::move(entry));
     }
@@ -1116,10 +1138,11 @@ struct Glm53Runtime::Impl {
         std::vector<HostTask> host_tasks;
         for (const auto& tensor : checkpoint->manifest().tensors) {
             if (tensor.role == Glm53TensorRole::Vision ||
-                tensor.role == Glm53TensorRole::Mtp ||
                 tensor.role == Glm53TensorRole::AttentionIndexer ||
                 tensor.role == Glm53TensorRole::RoutedExpert ||
                 tensor.role == Glm53TensorRole::Embedding ||
+                tensor.name.find(".layers.45.mlp.experts.") !=
+                    std::string::npos ||
                 tensor.component == Glm53TensorComponent::Scale) {
                 continue;
             }
@@ -1991,7 +2014,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult feedforward(
         std::span<float> output, std::span<const float> input,
         std::uint32_t layer, const std::string& prefix) {
-        if (!glm53_moe_layer(layer)) {
+        if (layer != kMtpLayer && !glm53_moe_layer(layer)) {
             return swiglu_block(output, input, prefix + "mlp.", 12288U, layer);
         }
         ValidationResult result;
@@ -2013,7 +2036,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult feedforward_page(
         std::span<float> output, std::span<const float> input,
         std::uint32_t rows, std::uint32_t layer, const std::string& prefix) {
-        if (!glm53_moe_layer(layer)) {
+        if (layer != kMtpLayer && !glm53_moe_layer(layer)) {
             return swiglu_block_page(output, input, prefix + "mlp.", rows,
                                      12288U, layer);
         }
@@ -2298,6 +2321,31 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
+    [[nodiscard]] ValidationResult collapse_streams_page(
+        std::span<const float> streams, std::uint32_t rows,
+        std::span<float> collapsed) const {
+        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
+        if (rows == 0U ||
+            streams.size() != static_cast<std::size_t>(rows) * stream_columns ||
+            collapsed.size() != static_cast<std::size_t>(rows) * kHidden) {
+            return {{"GLM-5.3 residual collapse has an invalid shape"}};
+        }
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto stream_base =
+                static_cast<std::size_t>(row) * stream_columns;
+            const auto hidden_base = static_cast<std::size_t>(row) * kHidden;
+            for (std::size_t column = 0U; column < kHidden; ++column) {
+                collapsed[hidden_base + column] = 0.25F *
+                    (streams[stream_base + column] +
+                     streams[stream_base + kHidden + column] +
+                     streams[stream_base + 2U * kHidden + column] +
+                     streams[stream_base + 3U * kHidden + column]);
+            }
+        }
+        round_bf16(collapsed);
+        return {};
+    }
+
     [[nodiscard]] ValidationResult finish_streams(
         std::span<const float> streams, std::span<float> logits) {
         ValidationResult result;
@@ -2308,12 +2356,8 @@ struct Glm53Runtime::Impl {
             return result;
         }
         std::vector<float> collapsed(kHidden), normalized(kHidden);
-        for (std::size_t column = 0U; column < kHidden; ++column) {
-            collapsed[column] = 0.25F *
-                (streams[column] + streams[kHidden + column] +
-                 streams[2U * kHidden + column] + streams[3U * kHidden + column]);
-        }
-        round_bf16(collapsed);
+        result = collapse_streams_page(streams, 1U, collapsed);
+        if (!result.ok()) return result;
         result = norm(normalized, collapsed, "model.language_model.norm.weight");
         if (!result.ok()) return result;
         if (lm_head_ranges.size() > 1U && projection_workers != nullptr &&
@@ -2345,33 +2389,14 @@ struct Glm53Runtime::Impl {
         return linear("lm_head", normalized, 1U, kHidden, logits, kLayers - 1U);
     }
 
-    [[nodiscard]] ValidationResult finish_streams_page(
-        std::span<const float> streams, std::uint32_t rows,
+    [[nodiscard]] ValidationResult project_lm_head_page(
+        std::span<const float> normalized, std::uint32_t rows,
         std::span<float> logits) {
-        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
-        if (rows == 0U ||
-            streams.size() != static_cast<std::size_t>(rows) * stream_columns ||
+        if (rows == 0U || normalized.size() !=
+                static_cast<std::size_t>(rows) * kHidden ||
             logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
-            return {{"GLM-5.3 final sequence batch has an invalid shape"}};
+            return {{"GLM-5.3 LM-head page has an invalid shape"}};
         }
-        std::vector<float> collapsed(static_cast<std::size_t>(rows) * kHidden);
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            const auto stream_base =
-                static_cast<std::size_t>(row) * stream_columns;
-            const auto hidden_base = static_cast<std::size_t>(row) * kHidden;
-            for (std::size_t column = 0U; column < kHidden; ++column) {
-                collapsed[hidden_base + column] = 0.25F *
-                    (streams[stream_base + column] +
-                     streams[stream_base + kHidden + column] +
-                     streams[stream_base + 2U * kHidden + column] +
-                     streams[stream_base + 3U * kHidden + column]);
-            }
-        }
-        round_bf16(collapsed);
-        std::vector<float> normalized(collapsed.size());
-        auto result = norm_rows(normalized, collapsed, rows, kHidden,
-                                "model.language_model.norm.weight");
-        if (!result.ok()) return result;
         if (lm_head_ranges.size() > 1U && projection_workers != nullptr &&
             lm_head_ranges.size() == devices.size()) {
             std::vector<std::vector<float>> shards(devices.size());
@@ -2410,16 +2435,37 @@ struct Glm53Runtime::Impl {
                       kLayers - 1U);
     }
 
+    [[nodiscard]] ValidationResult finish_streams_page(
+        std::span<const float> streams, std::uint32_t rows,
+        std::span<float> logits) {
+        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
+        if (rows == 0U ||
+            streams.size() != static_cast<std::size_t>(rows) * stream_columns ||
+            logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
+            return {{"GLM-5.3 final sequence batch has an invalid shape"}};
+        }
+        std::vector<float> collapsed(static_cast<std::size_t>(rows) * kHidden);
+        auto result = collapse_streams_page(streams, rows, collapsed);
+        if (!result.ok()) return result;
+        std::vector<float> normalized(collapsed.size());
+        result = norm_rows(normalized, collapsed, rows, kHidden,
+                           "model.language_model.norm.weight");
+        if (!result.ok()) return result;
+        return project_lm_head_page(normalized, rows, logits);
+    }
+
     [[nodiscard]] ValidationResult forward_token_batch(
         std::span<const std::uint32_t> tokens,
         std::span<const std::uint32_t> positions,
         std::span<Glm53SequenceState* const> sequences,
         std::span<DeviceSequenceState* const> device_sequences,
-        std::span<float> logits) {
+        std::span<float> logits, std::span<float> base_hidden = {}) {
         const auto rows = static_cast<std::uint32_t>(tokens.size());
         if (rows == 0U || positions.size() != rows ||
             sequences.size() != rows || device_sequences.size() != rows ||
-            logits.size() != static_cast<std::size_t>(rows) * kVocabulary) {
+            logits.size() != static_cast<std::size_t>(rows) * kVocabulary ||
+            (!base_hidden.empty() &&
+             base_hidden.size() != static_cast<std::size_t>(rows) * kHidden)) {
             return {{"GLM-5.3 decode batch has an invalid shape"}};
         }
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
@@ -2437,6 +2483,10 @@ struct Glm53Runtime::Impl {
                 streams, layer, positions, sequences, device_sequences);
             if (!result.ok()) return result;
         }
+        if (!base_hidden.empty()) {
+            auto collapsed = collapse_streams_page(streams, rows, base_hidden);
+            if (!collapsed.ok()) return collapsed;
+        }
         auto result = finish_streams_page(streams, rows, logits);
         if (result.ok()) {
             for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -2444,6 +2494,96 @@ struct Glm53Runtime::Impl {
             }
         }
         return result;
+    }
+
+    [[nodiscard]] ValidationResult forward_mtp(
+        std::uint32_t next_token, std::span<const float> previous_hidden,
+        std::uint32_t position, Glm53SequenceState& sequence,
+        std::span<float> logits, std::span<float> feedback_hidden) {
+        if (previous_hidden.size() != kHidden || logits.size() != kVocabulary ||
+            feedback_hidden.size() != kHidden ||
+            sequence.mla(kMtpLayer).rows() != position) {
+            return {{"GLM-5.3 MTP command has an invalid sequence shape"}};
+        }
+        const std::string prefix = "model.language_model.layers.45.";
+        auto embedding = checkpoint->read_f32_row(
+            "model.language_model.embed_tokens.weight", next_token);
+        if (!embedding.ok()) return {std::move(embedding.errors)};
+        if (position == 0U) {
+            std::fill(embedding.value.begin(), embedding.value.end(), 0.0F);
+        }
+        std::vector<float> normalized_embedding(kHidden);
+        std::vector<float> normalized_hidden(kHidden);
+        auto result = norm(normalized_embedding, embedding.value,
+                           prefix + "enorm.weight");
+        if (!result.ok()) return result;
+        result = norm(normalized_hidden, previous_hidden,
+                      prefix + "hnorm.weight");
+        if (!result.ok()) return result;
+        std::vector<float> fused(static_cast<std::size_t>(2U) * kHidden);
+        std::copy(normalized_embedding.begin(), normalized_embedding.end(),
+                  fused.begin());
+        std::copy(normalized_hidden.begin(), normalized_hidden.end(),
+                  fused.begin() + kHidden);
+        std::vector<float> hidden(kHidden);
+        result = linear(prefix + "eh_proj", fused, 1U, 2U * kHidden,
+                        hidden, kMtpLayer);
+        if (!result.ok()) return result;
+
+        // The standalone MTP block deliberately disables mHC and follows the
+        // ordinary BF16 residual contract: residual <- input, attention,
+        // add+norm, MoE, final add. Its shared head then applies its own norm
+        // before reusing the target LM head.
+        std::vector<float> residual = hidden;
+        std::vector<float> normalized(kHidden), branch(kHidden);
+        result = norm(normalized, hidden, prefix + "input_layernorm.weight");
+        if (!result.ok()) return result;
+        result = attention_mla(branch, normalized, kMtpLayer, position,
+                               prefix + "self_attn.", sequence);
+        if (!result.ok()) return result;
+        for (std::size_t index = 0U; index < kHidden; ++index) {
+            residual[index] = bf16_round_f32(residual[index] + branch[index]);
+        }
+        result = norm(normalized, residual,
+                      prefix + "post_attention_layernorm.weight");
+        if (!result.ok()) return result;
+        result = feedforward(branch, normalized, kMtpLayer, prefix);
+        if (!result.ok()) return result;
+        for (std::size_t index = 0U; index < kHidden; ++index) {
+            feedback_hidden[index] =
+                bf16_round_f32(residual[index] + branch[index]);
+        }
+        result = norm(normalized, feedback_hidden,
+                      prefix + "shared_head.norm.weight");
+        if (!result.ok()) return result;
+        result = project_lm_head_page(normalized, 1U, logits);
+        return result;
+    }
+
+    [[nodiscard]] ValidationResult prepare_mtp_prompt(
+        std::span<const std::uint32_t> prompt,
+        std::span<const float> base_hidden, Glm53SequenceState& sequence) {
+        if (base_hidden.size() != prompt.size() * kHidden) {
+            return {{"GLM-5.3 MTP prefill hidden-state extent is invalid"}};
+        }
+        auto& cache = sequence.mla(kMtpLayer);
+        const auto required_rows = prompt.empty() ? 0U :
+            static_cast<std::uint32_t>(prompt.size() - 1U);
+        if (cache.rows() > required_rows) {
+            return {{"GLM-5.3 MTP prefix state is ahead of the prompt"}};
+        }
+        std::vector<float> ignored_logits(kVocabulary);
+        std::vector<float> feedback(kHidden);
+        for (std::uint32_t position = cache.rows(); position < required_rows;
+             ++position) {
+            auto result = forward_mtp(
+                prompt[position + 1U],
+                base_hidden.subspan(static_cast<std::size_t>(position) * kHidden,
+                                    kHidden),
+                position, sequence, ignored_logits, feedback);
+            if (!result.ok()) return result;
+        }
+        return {};
     }
 
     [[nodiscard]] ValidationResult forward_token(
@@ -2471,9 +2611,13 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] ValidationResult forward_prompt(
         std::span<const std::uint32_t> tokens, std::span<float> logits,
-        Glm53SequenceState& sequence) {
+        Glm53SequenceState& sequence,
+        std::vector<float>* base_hidden_rows = nullptr,
+        bool all_row_logits = false) {
         ValidationResult result;
-        if (tokens.empty() || logits.empty()) {
+        if (tokens.empty() ||
+            logits.size() != (all_row_logits
+                ? tokens.size() * kVocabulary : kVocabulary)) {
             result.errors.emplace_back("GLM-5.3 prefill has an invalid shape");
             return result;
         }
@@ -2517,8 +2661,19 @@ struct Glm53Runtime::Impl {
         if (config.load_progress) {
             std::cerr << '\r' << std::string(48U, ' ') << '\r';
         }
-        result = finish_streams(
-            std::span<const float>(streams).last(stream_columns), logits);
+        if (base_hidden_rows != nullptr) {
+            const auto old_size = base_hidden_rows->size();
+            base_hidden_rows->resize(old_size + tokens.size() * kHidden);
+            result = collapse_streams_page(
+                streams, static_cast<std::uint32_t>(tokens.size()),
+                std::span<float>(*base_hidden_rows).subspan(old_size));
+            if (!result.ok()) return result;
+        }
+        result = all_row_logits
+            ? finish_streams_page(
+                  streams, static_cast<std::uint32_t>(tokens.size()), logits)
+            : finish_streams(
+                  std::span<const float>(streams).last(stream_columns), logits);
         if (result.ok()) {
             sequence.set_token_count(
                 position_base + static_cast<std::uint32_t>(tokens.size()));
@@ -2562,7 +2717,8 @@ struct Glm53Runtime::Impl {
         request->result.metrics.prompt_tokens = request->prompt.size();
         request->logits.resize(kVocabulary);
         const auto reused = restore_prefix(
-            request->prompt, request->sequence, request->logits);
+            request->prompt, request->sequence, request->logits,
+            request->base_hidden);
         request->result.metrics.reused_prompt_tokens = reused;
         request->prefill_cursor = reused;
         request->prefill_started = now_seconds();
@@ -2640,7 +2796,19 @@ struct Glm53Runtime::Impl {
             request->result.metrics.reused_prompt_tokens;
         request->result.metrics.prefill_seconds =
             now_seconds() - request->prefill_started;
-        store_prefix(request->prompt, request->sequence, request->logits);
+        if (mtp_enabled() && request->sampling.temperature == 0.0 &&
+            request->maximum_new_tokens > 1U) {
+            auto mtp = prepare_mtp_prompt(
+                request->prompt, request->base_hidden, request->sequence);
+            if (!mtp.ok()) {
+                request->result.errors = std::move(mtp.errors);
+                complete_request(request);
+                return;
+            }
+            request->mtp_ready = true;
+        }
+        store_prefix(request->prompt, request->sequence, request->logits,
+                     request->base_hidden);
         // The prompt cache remains host/COW F32. Decode state is admitted once
         // after that immutable snapshot, then never read back per token.
         if (request->maximum_new_tokens > 1U && fused_kda_enabled()) {
@@ -2676,7 +2844,7 @@ struct Glm53Runtime::Impl {
         auto prefill = forward_prompt(
             std::span<const std::uint32_t>(request->prompt).subspan(
                 request->prefill_cursor, count),
-            request->logits, request->sequence);
+            request->logits, request->sequence, &request->base_hidden);
         if (!prefill.ok()) {
             request->result.errors = std::move(prefill.errors);
             complete_request(request);
@@ -2688,18 +2856,9 @@ struct Glm53Runtime::Impl {
         }
     }
 
-    [[nodiscard]] bool sample_request(
+    [[nodiscard]] bool publish_draw(
         const std::shared_ptr<ScheduledRequest>& request,
-        std::uint32_t& forward_token_id) {
-        auto drawn = sample_logits(
-            request->logits, request->sampling,
-            SamplingHistory{request->counts, request->sampled},
-            request->generator);
-        if (!drawn.ok()) {
-            request->result.errors = std::move(drawn.errors);
-            complete_request(request);
-            return false;
-        }
+        const TokenLogprob& drawn, std::uint32_t& forward_token_id) {
         if (drawn.token == 154820U || drawn.token == 154827U ||
             drawn.token == 154829U) {
             request->result.stopped = true;
@@ -2720,11 +2879,142 @@ struct Glm53Runtime::Impl {
                                   request->on_token);
         if (request->streamed->stopped() ||
             request->streamed->cancelled() ||
-            request->iteration + 1U == request->maximum_new_tokens) {
+            request->result.generated_token_ids.size() ==
+                request->maximum_new_tokens) {
             complete_request(request);
             return false;
         }
         forward_token_id = drawn.token;
+        return true;
+    }
+
+    [[nodiscard]] bool sample_request(
+        const std::shared_ptr<ScheduledRequest>& request,
+        std::uint32_t& forward_token_id) {
+        auto drawn = sample_logits(
+            request->logits, request->sampling,
+            SamplingHistory{request->counts, request->sampled},
+            request->generator);
+        if (!drawn.ok()) {
+            request->result.errors = std::move(drawn.errors);
+            complete_request(request);
+            return false;
+        }
+        return publish_draw(request, drawn, forward_token_id);
+    }
+
+    [[nodiscard]] bool try_mtp_step(
+        const std::shared_ptr<ScheduledRequest>& request,
+        std::uint32_t first_token) {
+        if (!request->mtp_ready || request->sampling.temperature != 0.0 ||
+            request->sampling.xtc_probability != 0.0 ||
+            request->sampling.future_entropy_candidates != 0U ||
+            request->base_hidden.size() < kHidden || request->done) {
+            return false;
+        }
+        Glm53SequenceState mtp_after_first = request->sequence;
+        std::vector<float> draft_logits(kVocabulary), draft_feedback(kHidden);
+        const auto mtp_position =
+            static_cast<std::uint32_t>(mtp_after_first.mla(kMtpLayer).rows());
+        auto status = forward_mtp(
+            first_token,
+            std::span<const float>(request->base_hidden).last(kHidden),
+            mtp_position, mtp_after_first, draft_logits, draft_feedback);
+        if (!status.ok()) {
+            request->result.errors = std::move(status.errors);
+            complete_request(request);
+            return true;
+        }
+        ++mtp_drafts;
+        auto draft_generator = request->generator;
+        auto draft = sample_logits(
+            draft_logits, request->sampling,
+            SamplingHistory{request->counts, request->sampled},
+            draft_generator);
+        if (!draft.ok()) {
+            request->result.errors = std::move(draft.errors);
+            complete_request(request);
+            return true;
+        }
+
+        Glm53SequenceState verified = request->sequence;
+        const std::array<std::uint32_t, 2U> candidates{
+            first_token, draft.token};
+        std::vector<float> verification_logits(
+            static_cast<std::size_t>(2U) * kVocabulary);
+        std::vector<float> verification_hidden;
+        status = forward_prompt(candidates, verification_logits, verified,
+                                &verification_hidden, true);
+        if (!status.ok()) {
+            request->result.errors = std::move(status.errors);
+            complete_request(request);
+            return true;
+        }
+        auto target_generator = request->generator;
+        auto target = sample_logits(
+            std::span<const float>(verification_logits).first(kVocabulary),
+            request->sampling,
+            SamplingHistory{request->counts, request->sampled},
+            target_generator);
+        if (!target.ok()) {
+            request->result.errors = std::move(target.errors);
+            complete_request(request);
+            return true;
+        }
+        if (target.token == draft.token) {
+            verified.copy_mla_from(kMtpLayer, mtp_after_first);
+            request->sequence = std::move(verified);
+            request->generator = std::move(target_generator);
+            request->base_hidden.insert(
+                request->base_hidden.end(), verification_hidden.begin(),
+                verification_hidden.end());
+            std::copy_n(verification_logits.begin() + kVocabulary,
+                        kVocabulary, request->logits.begin());
+            request->position += 2U;
+            request->result.metrics.decode_tokens += 2U;
+            request->iteration += 2U;
+            ++mtp_accepted;
+            std::uint32_t ignored = 0U;
+            static_cast<void>(publish_draw(request, target, ignored));
+            if (!request->done) {
+                // Keep the draft cache aligned through the accepted token.
+                // Its next proposal is deliberately discarded; the next
+                // target sample remains the sole source of published tokens.
+                std::vector<float> ignored_logits(kVocabulary);
+                std::vector<float> ignored_feedback(kHidden);
+                status = forward_mtp(
+                    target.token,
+                    std::span<const float>(verification_hidden).subspan(
+                        0U, kHidden),
+                    mtp_position + 1U, request->sequence, ignored_logits,
+                    ignored_feedback);
+                if (!status.ok()) {
+                    request->result.errors = std::move(status.errors);
+                    complete_request(request);
+                }
+            }
+            return true;
+        }
+
+        // A rejected second token must leave the target exactly after the
+        // first token. COW makes the retry cheap in state memory; execution is
+        // intentionally repeated rather than trying to extract a mutable
+        // intermediate snapshot from the two-row verification page.
+        std::vector<float> first_hidden;
+        status = forward_prompt(
+            std::span<const std::uint32_t>(&first_token, 1U), request->logits,
+            request->sequence, &first_hidden);
+        if (!status.ok()) {
+            request->result.errors = std::move(status.errors);
+            complete_request(request);
+            return true;
+        }
+        request->sequence.copy_mla_from(kMtpLayer, mtp_after_first);
+        request->base_hidden.insert(request->base_hidden.end(),
+                                    first_hidden.begin(), first_hidden.end());
+        ++request->position;
+        ++request->result.metrics.decode_tokens;
+        ++request->iteration;
         return true;
     }
 
@@ -2795,29 +3085,47 @@ struct Glm53Runtime::Impl {
                     }
                 }
                 if (!step_requests.empty()) {
-                    std::vector<float> step_logits(
-                        step_requests.size() * kVocabulary);
-                    auto step = forward_token_batch(
-                        step_tokens, step_positions, step_sequences,
-                        step_device_sequences,
-                        step_logits);
-                    if (!step.ok()) {
-                        for (auto& request : step_requests) {
-                            request->result.errors = step.errors;
-                            complete_request(request);
+                    const bool mtp_handled = step_requests.size() == 1U &&
+                        try_mtp_step(step_requests.front(),
+                                     step_tokens.front());
+                    if (!mtp_handled) {
+                        if (step_requests.size() > 1U) {
+                            for (auto& request : step_requests) {
+                                request->mtp_ready = false;
+                            }
                         }
-                    } else {
-                        for (std::size_t row = 0U;
-                             row < step_requests.size(); ++row) {
-                            auto& request = step_requests[row];
-                            std::copy_n(
-                                step_logits.begin() +
-                                    static_cast<std::ptrdiff_t>(
-                                        row * kVocabulary),
-                                kVocabulary, request->logits.begin());
-                            ++request->position;
-                            ++request->result.metrics.decode_tokens;
-                            ++request->iteration;
+                        std::vector<float> step_logits(
+                            step_requests.size() * kVocabulary);
+                        std::vector<float> step_hidden(
+                            step_requests.size() * kHidden);
+                        auto step = forward_token_batch(
+                            step_tokens, step_positions, step_sequences,
+                            step_device_sequences, step_logits, step_hidden);
+                        if (!step.ok()) {
+                            for (auto& request : step_requests) {
+                                request->result.errors = step.errors;
+                                complete_request(request);
+                            }
+                        } else {
+                            for (std::size_t row = 0U;
+                                 row < step_requests.size(); ++row) {
+                                auto& request = step_requests[row];
+                                std::copy_n(
+                                    step_logits.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            row * kVocabulary),
+                                    kVocabulary, request->logits.begin());
+                                request->base_hidden.insert(
+                                    request->base_hidden.end(),
+                                    step_hidden.begin() +
+                                        static_cast<std::ptrdiff_t>(row * kHidden),
+                                    step_hidden.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            (row + 1U) * kHidden));
+                                ++request->position;
+                                ++request->result.metrics.decode_tokens;
+                                ++request->iteration;
+                            }
                         }
                     }
                 }
@@ -3028,8 +3336,25 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
             "GLM-5.3 prompt and requested generation exceed the admitted text context");
         return result;
     }
+    const auto mtp_drafts_before =
+        impl_->mtp_drafts.load(std::memory_order_relaxed);
+    const auto mtp_accepted_before =
+        impl_->mtp_accepted.load(std::memory_order_relaxed);
     result = impl_->schedule(std::move(encoded.value), maximum_new_tokens,
                              sampling, stop, on_token);
+    const auto request_mtp_drafts =
+        impl_->mtp_drafts.load(std::memory_order_relaxed) - mtp_drafts_before;
+    const auto request_mtp_accepted =
+        impl_->mtp_accepted.load(std::memory_order_relaxed) -
+        mtp_accepted_before;
+    if (request_mtp_drafts != 0U) {
+        std::cerr << "[glm53-mtp] drafts=" << request_mtp_drafts
+                  << " accepted=" << request_mtp_accepted
+                  << " acceptance="
+                  << (100.0 * static_cast<double>(request_mtp_accepted) /
+                      static_cast<double>(request_mtp_drafts))
+                  << "%\n";
+    }
     if (impl_->config.verbose) {
         std::cerr << "[glm53-projection] parallel_batches="
                   << impl_->parallel_projection_batches.load(
@@ -3052,6 +3377,10 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << " scheduler_batched_iterations="
                   << impl_->scheduler_batched_iterations.load(
                          std::memory_order_relaxed)
+                  << " mtp_drafts="
+                  << impl_->mtp_drafts.load(std::memory_order_relaxed)
+                  << " mtp_accepted="
+                  << impl_->mtp_accepted.load(std::memory_order_relaxed)
                   << '\n';
     }
     return result;

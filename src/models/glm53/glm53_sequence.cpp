@@ -158,6 +158,11 @@ const Glm53PagedRows& Glm53SequenceState::mla(std::uint32_t layer) const {
     return mla_.at(layer);
 }
 
+void Glm53SequenceState::copy_mla_from(
+    std::uint32_t layer, const Glm53SequenceState& source) {
+    mla_.at(layer) = source.mla_.at(layer);
+}
+
 std::uint64_t Glm53SequenceState::private_bytes() const noexcept {
     std::uint64_t result = 0U;
     for (const auto& buffer : recurrent_) {

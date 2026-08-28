@@ -40,7 +40,7 @@ namespace strata {
 #include "detail/backend_core.inc.cuh"
 #include "detail/backend_dense_page.inc.cuh"
 #include "detail/backend_indexing.inc.cuh"
-#include "detail/backend_glm53.inc.cuh"
+#include "detail/backend_hybrid_recurrence.inc.cuh"
 #include "detail/backend_flash_attention.inc.cuh"
 #include "detail/backend_prepared_attention.inc.cuh"
 #include "detail/backend_mhc.inc.cuh"

@@ -209,7 +209,14 @@ ValidationResult HostWorkerPool::parallel_for_addressed(
 
 ValidationResult HostWorkerPool::parallel_for(
     std::size_t tasks, const std::function<void(std::size_t)>& operation) {
+    return parallel_for_blocked(tasks, 1U, operation);
+}
+
+ValidationResult HostWorkerPool::parallel_for_blocked(
+    std::size_t tasks, std::size_t block,
+    const std::function<void(std::size_t)>& operation) {
     ValidationResult result;
+    if (block == 0U) block = 1U;
     if (tasks == 0U) return result;
     if (impl_ == nullptr || impl_->workers.empty() || !operation) {
         result.errors.emplace_back("host worker pool is not available");
@@ -231,13 +238,17 @@ ValidationResult HostWorkerPool::parallel_for(
         const bool addressed = runners < impl_->workers.size();
         for (std::size_t runner = 0; runner < runners; ++runner) {
             auto& target = addressed ? impl_->queues[runner] : impl_->queue;
-            target.emplace_back([completion, &operation] {
+            target.emplace_back([completion, &operation, block] {
                 try {
                     for (;;) {
-                        const auto index = completion->next.fetch_add(
-                            1U, std::memory_order_relaxed);
-                        if (index >= completion->tasks) break;
-                        operation(index);
+                        const auto first = completion->next.fetch_add(
+                            block, std::memory_order_relaxed);
+                        if (first >= completion->tasks) break;
+                        const auto last =
+                            std::min(first + block, completion->tasks);
+                        for (auto index = first; index < last; ++index) {
+                            operation(index);
+                        }
                     }
                 } catch (...) {
                     std::scoped_lock error_lock(completion->mutex);

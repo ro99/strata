@@ -36,6 +36,22 @@ public:
     [[nodiscard]] ValidationResult parallel_for(
         std::size_t tasks, const std::function<void(std::size_t)>& operation);
 
+    // Same dispatch, but each runner claims `block` consecutive indices at a
+    // time instead of one. For work whose index maps to a memory offset, the
+    // difference is not scheduling overhead but access pattern: claiming single
+    // indices from a shared counter interleaves N runners across one array, so
+    // each walks it with an N-element stride and the hardware prefetcher sees N
+    // strided streams instead of N contiguous ones.
+    //
+    // Measured on cold checkpoint reads (experiment 0198): the same 28 workers
+    // over the same bytes moved 0.69 GB/s taking single expert rows and
+    // 1.96 GB/s taking contiguous blocks, with device request size rising from
+    // 41.2 KiB to 73.0 KiB. Reordering independent tasks changes no arithmetic;
+    // callers whose tasks accumulate into shared state must not use this.
+    [[nodiscard]] ValidationResult parallel_for_blocked(
+        std::size_t tasks, std::size_t block,
+        const std::function<void(std::size_t)>& operation);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

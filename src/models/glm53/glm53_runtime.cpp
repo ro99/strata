@@ -247,6 +247,28 @@ void print_phase_metrics(std::ostream& output,
 constexpr std::uint32_t kHidden = 4096U;
 constexpr std::uint32_t kLayers = 45U;
 constexpr std::uint32_t kMtpLayer = 45U;
+// Consecutive projection rows claimed per worker in the host expert loops.
+// 64 rows is 256 KiB of contiguous FP8 weight per claim -- wide enough for the
+// hardware prefetcher and for a coalesced device request, narrow enough that 28
+// workers still balance across a 2048-row expert at 32 claims each. Single-index
+// dispatch instead interleaves 28 workers across one matrix, so each walks it
+// with a 28-row stride; experiment 0198 measured that shape at 0.69 GB/s against
+// 1.96 GB/s blocked on identical cold bytes.
+constexpr std::size_t kExpertDispatchBlock = 64U;
+
+// STRATA_GLM53_EXPERT_DISPATCH_BLOCK overrides it for the M2 A/B. 1 reproduces
+// the previous single-index dispatch exactly, so both arms of the comparison
+// run the same binary and the build cannot be a confound. Production default
+// stays 64.
+[[nodiscard]] std::size_t expert_dispatch_block() noexcept {
+    static const std::size_t block = [] {
+        const char* value = std::getenv("STRATA_GLM53_EXPERT_DISPATCH_BLOCK");
+        if (value == nullptr) return kExpertDispatchBlock;
+        const std::size_t parsed = std::strtoul(value, nullptr, 10);
+        return parsed == 0U ? kExpertDispatchBlock : parsed;
+    }();
+    return block;
+}
 constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
@@ -2101,8 +2123,9 @@ struct Glm53Runtime::Impl {
         }
         std::vector<float> activations(expert_count * intermediate);
         const auto gate_up_started = std::chrono::steady_clock::now();
-        const auto gate_up = host_moe_workers->parallel_for(
-            expert_count * intermediate, [&](std::size_t task) {
+        const auto gate_up = host_moe_workers->parallel_for_blocked(
+            expert_count * intermediate, expert_dispatch_block(),
+            [&](std::size_t task) {
                 const auto expert = task / intermediate;
                 const auto row = task % intermediate;
                 const auto& module = experts[expert];
@@ -2142,8 +2165,9 @@ struct Glm53Runtime::Impl {
         }
         std::vector<float> expert_outputs(expert_count * kHidden);
         const auto down_started = std::chrono::steady_clock::now();
-        const auto down = host_moe_workers->parallel_for(
-            expert_count * kHidden, [&](std::size_t task) {
+        const auto down = host_moe_workers->parallel_for_blocked(
+            expert_count * kHidden, expert_dispatch_block(),
+            [&](std::size_t task) {
                 const auto expert = task / kHidden;
                 const auto row = task % kHidden;
                 const auto& module = experts[expert].down;
@@ -2310,8 +2334,9 @@ struct Glm53Runtime::Impl {
         const auto output_slots = rows * outputs_per_row;
         std::vector<float> activations(output_slots * intermediate);
         const auto gate_up_started = std::chrono::steady_clock::now();
-        result = host_moe_workers->parallel_for(
-            groups.size() * intermediate, [&](std::size_t task) {
+        result = host_moe_workers->parallel_for_blocked(
+            groups.size() * intermediate, expert_dispatch_block(),
+            [&](std::size_t task) {
                 const auto group_index = task / intermediate;
                 const auto projection_row = task % intermediate;
                 const auto& group = groups[group_index];
@@ -2360,8 +2385,9 @@ struct Glm53Runtime::Impl {
 
         std::vector<float> expert_outputs(output_slots * kHidden);
         const auto down_started = std::chrono::steady_clock::now();
-        result = host_moe_workers->parallel_for(
-            groups.size() * kHidden, [&](std::size_t task) {
+        result = host_moe_workers->parallel_for_blocked(
+            groups.size() * kHidden, expert_dispatch_block(),
+            [&](std::size_t task) {
                 const auto group_index = task / kHidden;
                 const auto projection_row = task % kHidden;
                 const auto& group = groups[group_index];

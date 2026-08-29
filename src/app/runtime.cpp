@@ -101,6 +101,10 @@ ValidationResult RuntimeSession::initialize(
     impl_->sampling = config.sampling;
     impl_->report_load = config.report_placement_plan;
     impl_->load_report.begin(resolve_backing_storage(model_directory).disk);
+    // Set before the first mark so `load` and `first-token` both carry a VRAM
+    // sample; the difference between them is the device expert cache filling
+    // during the first forward, which is the figure worth seeing.
+    impl_->load_report.set_devices(config.devices);
 
     // Resolve placement before anything is uploaded. The plan decides where
     // Gemma 4 puts each layer; for GLM and DeepSeek it reports and admits the
@@ -154,8 +158,6 @@ ValidationResult RuntimeSession::initialize(
         impl_->executor = std::move(executor);
         impl_->load_report.mark("load");
         if (impl_->placement_ready) {
-            impl_->load_report.set_device_vram_bytes(
-                impl_->placement.device_resident_bytes);
             impl_->load_report.set_storage_tier_bytes(
                 impl_->placement.storage_resident_bytes);
             impl_->load_report.set_storage_tier_note(

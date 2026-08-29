@@ -25,6 +25,12 @@ struct LoadReportPhase {
     double seconds{};
     StorageInterval storage;
     std::uint64_t resident_bytes_at_end{};
+    // Bytes in use on each admitted device at the end of the phase, measured
+    // from the driver rather than taken from the plan. The two are very
+    // different on a model that demand-fills a device expert cache: the plan's
+    // resident figure is the workspace it reserves up front, while actual usage
+    // grows through the first forward.
+    std::vector<std::uint64_t> device_bytes_in_use;
 };
 
 // Phases are whatever the caller marks; a runtime typically marks `load` when
@@ -38,7 +44,8 @@ public:
     void begin(std::string disk);
     void mark(std::string name);
 
-    void set_device_vram_bytes(std::vector<std::uint64_t> bytes);
+    // Admitted device ids. Given these, each mark samples real VRAM use.
+    void set_devices(std::vector<int> devices);
     // Free-form, e.g. the placement plan's I/O-dependence verdict.
     void set_storage_tier_note(std::string note);
     void set_storage_tier_bytes(std::uint64_t bytes);
@@ -57,7 +64,7 @@ private:
     std::string disk_;
     std::string tier_note_;
     std::uint64_t storage_tier_bytes_{};
-    std::vector<std::uint64_t> device_vram_bytes_;
+    std::vector<int> devices_;
     std::vector<LoadReportPhase> phases_;
     ProcessIoStats last_process_;
     BlockDeviceStats last_device_;

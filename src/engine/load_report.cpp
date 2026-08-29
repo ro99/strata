@@ -1,5 +1,7 @@
 #include "strata/engine/load_report.hpp"
 
+#include "strata/device/cuda_backend.hpp"
+
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -50,6 +52,15 @@ void LoadReport::mark(std::string name) {
     phase.storage = storage_interval(last_process_, process, last_device_,
                                      device, phase.seconds);
     phase.resident_bytes_at_end = process.resident_bytes;
+    for (const int device : devices_) {
+        const auto memory = CudaBackend::device_memory(device);
+        // An unreadable device contributes zero rather than aborting the
+        // report: the storage and fault figures are still worth having.
+        phase.device_bytes_in_use.push_back(
+            memory.ok() && memory.value.total_bytes >= memory.value.free_bytes
+                ? memory.value.total_bytes - memory.value.free_bytes
+                : 0U);
+    }
     phases_.push_back(std::move(phase));
 
     last_process_ = process;
@@ -57,8 +68,8 @@ void LoadReport::mark(std::string name) {
     last_seconds_ = now;
 }
 
-void LoadReport::set_device_vram_bytes(std::vector<std::uint64_t> bytes) {
-    device_vram_bytes_ = std::move(bytes);
+void LoadReport::set_devices(std::vector<int> devices) {
+    devices_ = std::move(devices);
 }
 
 void LoadReport::set_storage_tier_note(std::string note) {
@@ -80,6 +91,14 @@ std::string LoadReport::render() const {
             << fixed(s.process_read_gigabytes_per_second, 2) << " GB/s"
             << "   " << s.major_faults << " major faults"
             << "   rss " << gigabytes(phase.resident_bytes_at_end) << '\n';
+        if (!phase.device_bytes_in_use.empty()) {
+            out << "      vram   ";
+            for (std::size_t i = 0; i < phase.device_bytes_in_use.size(); ++i) {
+                if (i != 0U) out << ", ";
+                out << gigabytes(phase.device_bytes_in_use[i]) << " in use";
+            }
+            out << '\n';
+        }
         if (s.device_valid) {
             // Queue depth is the field that separates a serialized reader from
             // a saturated device: about 1.0 means one request in flight
@@ -93,14 +112,6 @@ std::string LoadReport::render() const {
                 << fixed(s.average_read_latency_milliseconds, 3)
                 << " ms each\n";
         }
-    }
-    if (!device_vram_bytes_.empty()) {
-        out << "    vram   ";
-        for (std::size_t i = 0; i < device_vram_bytes_.size(); ++i) {
-            if (i != 0U) out << ", ";
-            out << gigabytes(device_vram_bytes_[i]);
-        }
-        out << '\n';
     }
     if (storage_tier_bytes_ != 0U) {
         out << "    storage tier " << gigabytes(storage_tier_bytes_)

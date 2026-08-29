@@ -1,5 +1,7 @@
 #include "strata/models/deepseek/deepseek_host_moe_executor.hpp"
 
+#include "strata/platform/hardware_profile.hpp"
+
 #include "strata/platform/numa_topology.hpp"
 
 #include <algorithm>
@@ -19,7 +21,6 @@ constexpr std::size_t kExperts = kDeepSeekV4ExecutionContract.routed_experts;
 constexpr std::size_t kTopK = kDeepSeekV4ExecutionContract.experts_per_token;
 constexpr std::size_t kShards = 2U;
 constexpr std::size_t kBlock = 32U;
-constexpr std::size_t kDefaultWorkers = 48U;
 constexpr std::size_t kLocalIntermediate = kIntermediate / kShards;
 
 [[nodiscard]] std::uint64_t elapsed_nanoseconds(
@@ -36,7 +37,14 @@ Dsv4HostMoeExecutor::Dsv4HostMoeExecutor(
     : shard_index_(shard_index), both_shards_(both_shards),
       cpus_(std::move(cpus)) {
     if (!both_shards_ && shard_index_ >= kShards) shard_index_ = 0U;
-    const auto worker_count = both_shards_ ? kDefaultWorkers : cpus_.size();
+    // Both-shards with no CPU list is the "use the whole host" shape. Its
+    // width was a hard-coded 48, which was this executor's development box's
+    // logical CPU count asserted as a constant -- the same class of fact
+    // HardwareProfile exists to stop living in the type system. The policy
+    // stays here (one worker per usable CPU across every node, because a
+    // both-shards pool spans them); the measurement comes from the profile.
+    const auto worker_count =
+        both_shards_ ? host_hardware_profile().worker_threads() : cpus_.size();
     if (worker_count != 0U) {
         if (cpus_.empty()) {
             workers_ = std::make_unique<HostWorkerPool>(

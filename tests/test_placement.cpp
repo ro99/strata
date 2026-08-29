@@ -494,6 +494,49 @@ TEST_CASE("the plan cache round-trips the storage tier") {
             planned.value.decode_storage_read_bytes);
 }
 
+TEST_CASE("a plan made for a different peer topology is refused") {
+    // Capacity mismatches fail loudly on their own. A peer mismatch would not:
+    // the run would just take a slower path and report it as the fast one.
+    auto hardware = make_hardware({8U, 8U}, 64U);
+    hardware.high_speed_peer = {0U, 1U, 1U, 0U};
+    auto planned = solve_placement(make_tiered_inventory(12U, 400U), hardware,
+                                   make_request(2U));
+    REQUIRE(planned.ok());
+    REQUIRE(strata::verify_placement_plan(planned.value, hardware).ok());
+
+    auto without_link = hardware;
+    without_link.high_speed_peer = {0U, 0U, 0U, 0U};
+    const auto refused =
+        strata::verify_placement_plan(planned.value, without_link);
+    REQUIRE(!refused.ok());
+}
+
+TEST_CASE("identical checkpoint and topology produce an identical plan") {
+    // M1's acceptance gate requires that the same checkpoint and topology
+    // produce deterministic placement and memory accounting. Comparing the
+    // encoded plans byte for byte tests the accounting too, not only the
+    // layer assignment: any field that drifted between two solves of the same
+    // inputs would change the encoding.
+    const auto hardware = make_hardware({8U, 8U}, 64U);
+    const auto request = make_request(2U);
+    const auto inventory = make_tiered_inventory(12U, 400U);
+
+    const auto first = solve_placement(inventory, hardware, request);
+    const auto second = solve_placement(inventory, hardware, request);
+    REQUIRE(first.ok());
+    REQUIRE(second.ok());
+    REQUIRE(strata::encode_placement_plan(first.value) ==
+            strata::encode_placement_plan(second.value));
+
+    // The same must hold across an encode/decode cycle, because a cached plan
+    // is reused in place of a fresh solve and the two must be interchangeable.
+    const auto decoded = strata::decode_placement_plan(
+        strata::encode_placement_plan(first.value));
+    REQUIRE(decoded.ok());
+    REQUIRE(strata::encode_placement_plan(decoded.value) ==
+            strata::encode_placement_plan(first.value));
+}
+
 TEST_CASE("the plan cache round-trips device locality and the peer matrix") {
     // v3 added both. They are recorded rather than only probed because M3
     // admits or refuses rank-local execution on exactly this, and a plan that

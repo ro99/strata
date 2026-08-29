@@ -799,6 +799,15 @@ ValidationResult verify_placement_plan(const PlacementPlan& plan,
                 " is free; free VRAM or re-run with --replan");
         }
     }
+    // Peer topology is part of "the same topology". A plan cached on a
+    // peer-linked machine and replayed on one without the link would admit a
+    // fast path the hardware cannot serve, and unlike a capacity mismatch that
+    // failure is silent: the run would simply be slower and wrongly attributed.
+    if (plan.hardware.high_speed_peer != hardware.high_speed_peer) {
+        result.errors.emplace_back(
+            "placement plan was made for a different peer topology; "
+            "re-run with --replan");
+    }
     if (plan.host_resident_bytes > hardware.host_available_bytes) {
         result.errors.emplace_back(
             "placement plan needs " + format_bytes(plan.host_resident_bytes) +

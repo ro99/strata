@@ -25,16 +25,19 @@ struct Dsv4HostMoePhaseTimings {
     std::uint64_t total_nanoseconds{};
 };
 
-// Exact production tiled CPU-MoE executor. The default constructor shape is
-// the live runtime's 48-worker, one-millisecond hot-worker pool over the two
-// NUMA nodes. A rank-local instance may provide one node's 24 CPU IDs and a
-// shard index; it then runs the same addressed dispatch and same-node stealing
-// policy over that one transformed intermediate shard.
+// Exact production tiled CPU-MoE executor. The default constructor shape is a
+// one-millisecond hot-worker pool spanning every NUMA node, one worker per
+// usable CPU as discovered by HardwareProfile -- 48 on the box this executor
+// was developed on, and whatever the running host actually offers elsewhere. A
+// rank-local instance instead provides one node's CPU IDs and a shard index; it
+// then runs the same addressed dispatch and same-node stealing policy over that
+// one transformed intermediate shard.
 class Dsv4HostMoeExecutor {
 public:
     // `shard_index` is 0 or 1 for a rank-local executor and is ignored when
-    // `both_shards` is true. `cpus` is empty for the production pool's
-    // established host affinity mapping.
+    // `both_shards` is true. An empty `cpus` asks for a pool sized from the
+    // host profile rather than from an explicit affinity list; a non-empty one
+    // is used verbatim and its size becomes the width.
     explicit Dsv4HostMoeExecutor(
         std::size_t shard_index = 0U, bool both_shards = true,
         std::vector<int> cpus = {});

@@ -1,6 +1,8 @@
 #include "strata/models/glm53/glm53_runtime.hpp"
 #include "strata/models/glm53/glm53_sequence.hpp"
 
+#include "../common/cuda_stats_delta.hpp"
+
 #include "strata/engine/runtime_support.hpp"
 #include "strata/engine/route_predictor.hpp"
 #include "strata/models/common/tokenizer.hpp"
@@ -88,6 +90,159 @@ std::vector<std::size_t> glm53_projection_slots(
 }
 
 namespace {
+
+[[nodiscard]] std::uint64_t elapsed_nanoseconds(
+    std::chrono::steady_clock::time_point started) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count());
+}
+
+[[nodiscard]] bool phase_profile_environment_enabled() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_PHASE_PROFILE");
+    return value != nullptr && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "off";
+}
+
+[[nodiscard]] std::uint32_t prefill_page_tokens_from_environment(
+    std::uint32_t fallback) noexcept {
+    const char* value = std::getenv("STRATA_GLM53_PREFILL_PAGE_TOKENS");
+    if (value == nullptr || *value == '\0') return fallback;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0U ||
+        parsed > std::numeric_limits<std::uint32_t>::max()) {
+        return 0U;
+    }
+    return static_cast<std::uint32_t>(parsed);
+}
+
+[[nodiscard]] Glm53CacheMetrics cache_delta(
+    const Glm53CacheMetrics& after,
+    const Glm53CacheMetrics& before) noexcept {
+    return {
+        after.hits - before.hits,
+        after.misses - before.misses,
+        after.evictions - before.evictions,
+        after.prefetches - before.prefetches,
+        after.useful_prefetches - before.useful_prefetches,
+        after.failed_prefetches - before.failed_prefetches};
+}
+
+[[nodiscard]] Glm53HostExpertMetrics host_expert_delta(
+    const Glm53HostExpertMetrics& after,
+    const Glm53HostExpertMetrics& before) noexcept {
+    return {
+        after.calls - before.calls,
+        after.rows - before.rows,
+        after.gate_up_weight_bytes - before.gate_up_weight_bytes,
+        after.down_weight_bytes - before.down_weight_bytes,
+        after.view_resolution_nanoseconds - before.view_resolution_nanoseconds,
+        after.input_quantization_nanoseconds -
+            before.input_quantization_nanoseconds,
+        after.gate_up_nanoseconds - before.gate_up_nanoseconds,
+        after.activation_nanoseconds - before.activation_nanoseconds,
+        after.down_nanoseconds - before.down_nanoseconds,
+        after.reduction_nanoseconds - before.reduction_nanoseconds,
+        after.service_nanoseconds - before.service_nanoseconds,
+        after.temporary_allocation_calls - before.temporary_allocation_calls};
+}
+
+[[nodiscard]] Glm53GraphMetrics graph_delta(
+    const Glm53GraphMetrics& after,
+    const Glm53GraphMetrics& before) noexcept {
+    return {
+        after.forward_calls - before.forward_calls,
+        after.forward_rows - before.forward_rows,
+        after.embedding_nanoseconds - before.embedding_nanoseconds,
+        after.layer_nanoseconds - before.layer_nanoseconds,
+        after.attention_block_nanoseconds -
+            before.attention_block_nanoseconds,
+        after.kda_nanoseconds - before.kda_nanoseconds,
+        after.mla_nanoseconds - before.mla_nanoseconds,
+        after.feedforward_block_nanoseconds -
+            before.feedforward_block_nanoseconds,
+        after.output_head_nanoseconds - before.output_head_nanoseconds,
+        after.sampling_nanoseconds - before.sampling_nanoseconds};
+}
+
+void print_token_ids(std::ostream& output,
+                     std::span<const std::uint32_t> token_ids) {
+    output << '[';
+    for (std::size_t index = 0U; index < token_ids.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << token_ids[index];
+    }
+    output << ']';
+}
+
+void print_phase_metrics(std::ostream& output,
+                         const Glm53PhaseMetrics& phase) {
+    output << "{\"cuda\":{\"weight_h2d_bytes\":"
+           << phase.cuda.weight_upload_bytes
+           << ",\"activation_h2d_bytes\":"
+           << phase.cuda.activation_h2d_bytes
+           << ",\"activation_d2h_bytes\":"
+           << phase.cuda.activation_d2h_bytes
+           << ",\"matmul_calls\":" << phase.cuda.matmul_calls
+           << ",\"weight_allocation_calls\":"
+           << phase.cuda.weight_allocation_calls
+           << ",\"workspace_allocation_calls\":"
+           << phase.cuda.workspace_allocation_calls
+           << ",\"synchronization_calls\":"
+           << phase.cuda.synchronization_calls
+           << ",\"synchronization_nanoseconds\":"
+           << phase.cuda.synchronization_nanoseconds
+           << ",\"kernel_nanoseconds\":"
+           << phase.cuda.kernel_nanoseconds
+           << "},\"cache\":{\"hits\":" << phase.cache.hits
+           << ",\"misses\":" << phase.cache.misses
+           << ",\"evictions\":" << phase.cache.evictions
+           << ",\"prefetches\":" << phase.cache.prefetches
+           << ",\"useful_prefetches\":"
+           << phase.cache.useful_prefetches
+           << ",\"failed_prefetches\":" << phase.cache.failed_prefetches
+           << "},\"host_experts\":{\"calls\":"
+           << phase.host_experts.calls
+           << ",\"rows\":" << phase.host_experts.rows
+           << ",\"gate_up_weight_bytes\":"
+           << phase.host_experts.gate_up_weight_bytes
+           << ",\"down_weight_bytes\":"
+           << phase.host_experts.down_weight_bytes
+           << ",\"view_resolution_nanoseconds\":"
+           << phase.host_experts.view_resolution_nanoseconds
+           << ",\"input_quantization_nanoseconds\":"
+           << phase.host_experts.input_quantization_nanoseconds
+           << ",\"gate_up_nanoseconds\":"
+           << phase.host_experts.gate_up_nanoseconds
+           << ",\"activation_nanoseconds\":"
+           << phase.host_experts.activation_nanoseconds
+           << ",\"down_nanoseconds\":"
+           << phase.host_experts.down_nanoseconds
+           << ",\"reduction_nanoseconds\":"
+           << phase.host_experts.reduction_nanoseconds
+           << ",\"service_nanoseconds\":"
+           << phase.host_experts.service_nanoseconds
+           << ",\"temporary_allocation_calls\":"
+           << phase.host_experts.temporary_allocation_calls
+           << "},\"graph\":{\"forward_calls\":"
+           << phase.graph.forward_calls
+           << ",\"forward_rows\":" << phase.graph.forward_rows
+           << ",\"embedding_nanoseconds\":"
+           << phase.graph.embedding_nanoseconds
+           << ",\"layer_nanoseconds\":" << phase.graph.layer_nanoseconds
+           << ",\"attention_block_nanoseconds\":"
+           << phase.graph.attention_block_nanoseconds
+           << ",\"kda_nanoseconds\":" << phase.graph.kda_nanoseconds
+           << ",\"mla_nanoseconds\":" << phase.graph.mla_nanoseconds
+           << ",\"feedforward_block_nanoseconds\":"
+           << phase.graph.feedforward_block_nanoseconds
+           << ",\"output_head_nanoseconds\":"
+           << phase.graph.output_head_nanoseconds
+           << ",\"sampling_nanoseconds\":"
+           << phase.graph.sampling_nanoseconds << "}}";
+}
 
 constexpr std::uint32_t kHidden = 4096U;
 constexpr std::uint32_t kLayers = 45U;
@@ -1485,6 +1640,13 @@ struct Glm53Runtime::Impl {
         std::uint64_t recency{};
     };
 
+    struct ProfileSnapshot {
+        CudaBackendStats cuda;
+        Glm53CacheMetrics cache;
+        Glm53HostExpertMetrics host_experts;
+        Glm53GraphMetrics graph;
+    };
+
     struct ScheduledRequest {
         std::vector<std::uint32_t> prompt;
         std::uint32_t maximum_new_tokens{};
@@ -1503,6 +1665,9 @@ struct Glm53Runtime::Impl {
         std::unique_ptr<StopSequenceBuffer> streamed;
         std::size_t prefill_cursor{};
         double prefill_started{};
+        ProfileSnapshot profile_started;
+        ProfileSnapshot profile_after_prefill;
+        ProfileSnapshot profile_decode_started;
         std::uint32_t position{};
         std::uint32_t iteration{};
         double decode_started{};
@@ -1543,7 +1708,27 @@ struct Glm53Runtime::Impl {
     std::unique_ptr<HostWorkerPool> host_moe_workers;
     bool host_moe_active{};
     std::atomic<std::uint64_t> host_moe_calls{};
+    std::atomic<std::uint64_t> host_moe_rows{};
     std::atomic<std::uint64_t> host_moe_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_gate_up_weight_bytes{};
+    std::atomic<std::uint64_t> host_moe_down_weight_bytes{};
+    std::atomic<std::uint64_t> host_moe_view_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_input_quantization_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_gate_up_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_activation_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_down_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_reduction_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_temporary_allocation_calls{};
+    std::atomic<std::uint64_t> graph_forward_calls{};
+    std::atomic<std::uint64_t> graph_forward_rows{};
+    std::atomic<std::uint64_t> graph_embedding_nanoseconds{};
+    std::atomic<std::uint64_t> graph_layer_nanoseconds{};
+    std::atomic<std::uint64_t> graph_attention_block_nanoseconds{};
+    std::atomic<std::uint64_t> graph_kda_nanoseconds{};
+    std::atomic<std::uint64_t> graph_mla_nanoseconds{};
+    std::atomic<std::uint64_t> graph_feedforward_block_nanoseconds{};
+    std::atomic<std::uint64_t> graph_output_head_nanoseconds{};
+    std::atomic<std::uint64_t> graph_sampling_nanoseconds{};
     bool full_tensor_parallel_active{};
     std::unique_ptr<HostWorkerPool> kda_workers;
     std::atomic<std::uint64_t> parallel_projection_batches{};
@@ -1575,6 +1760,60 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> mtp_drafts{};
     std::atomic<std::uint64_t> mtp_accepted{};
     std::atomic<bool> profiler_captured{};
+
+    [[nodiscard]] Glm53CacheMetrics cache_metrics() const {
+        if (weights == nullptr) return {};
+        const auto stats = weights->stats();
+        return {stats.hits, stats.misses, stats.evictions, stats.prefetches,
+                stats.useful_prefetches, stats.failed_prefetches};
+    }
+
+    [[nodiscard]] Glm53HostExpertMetrics host_expert_metrics() const noexcept {
+        return {
+            host_moe_calls.load(std::memory_order_relaxed),
+            host_moe_rows.load(std::memory_order_relaxed),
+            host_moe_gate_up_weight_bytes.load(std::memory_order_relaxed),
+            host_moe_down_weight_bytes.load(std::memory_order_relaxed),
+            host_moe_view_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_input_quantization_nanoseconds.load(
+                std::memory_order_relaxed),
+            host_moe_gate_up_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_activation_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_down_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_reduction_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_temporary_allocation_calls.load(
+                std::memory_order_relaxed)};
+    }
+
+    [[nodiscard]] Glm53GraphMetrics graph_metrics() const noexcept {
+        return {
+            graph_forward_calls.load(std::memory_order_relaxed),
+            graph_forward_rows.load(std::memory_order_relaxed),
+            graph_embedding_nanoseconds.load(std::memory_order_relaxed),
+            graph_layer_nanoseconds.load(std::memory_order_relaxed),
+            graph_attention_block_nanoseconds.load(std::memory_order_relaxed),
+            graph_kda_nanoseconds.load(std::memory_order_relaxed),
+            graph_mla_nanoseconds.load(std::memory_order_relaxed),
+            graph_feedforward_block_nanoseconds.load(
+                std::memory_order_relaxed),
+            graph_output_head_nanoseconds.load(std::memory_order_relaxed),
+            graph_sampling_nanoseconds.load(std::memory_order_relaxed)};
+    }
+
+    [[nodiscard]] ProfileSnapshot profile_snapshot() const {
+        if (!config.phase_profile) return {};
+        return {cuda.stats(), cache_metrics(), host_expert_metrics(),
+                graph_metrics()};
+    }
+
+    [[nodiscard]] static Glm53PhaseMetrics phase_delta(
+        const ProfileSnapshot& after, const ProfileSnapshot& before) {
+        return {detail::cuda_delta(after.cuda, before.cuda),
+                cache_delta(after.cache, before.cache),
+                host_expert_delta(after.host_experts, before.host_experts),
+                graph_delta(after.graph, before.graph)};
+    }
 
     ~Impl() {
         {
@@ -1805,6 +2044,7 @@ struct Glm53Runtime::Impl {
             return {{"GLM-5.3 host MoE command has an invalid shape"}};
         }
         const auto started = std::chrono::steady_clock::now();
+        const auto view_started = started;
         struct Expert {
             Glm53HostFp8Linear gate;
             Glm53HostFp8Linear up;
@@ -1830,9 +2070,37 @@ struct Glm53Runtime::Impl {
             }
             experts[index] = {gate.value, up.value, down.value};
         }
+        if (config.phase_profile) {
+            std::uint64_t gate_up_bytes = 0U;
+            std::uint64_t down_bytes = 0U;
+            for (const auto& expert : experts) {
+                gate_up_bytes += expert.gate.weights.size_bytes() +
+                                 expert.gate.scales.size_bytes() +
+                                 expert.up.weights.size_bytes() +
+                                 expert.up.scales.size_bytes();
+                down_bytes += expert.down.weights.size_bytes() +
+                              expert.down.scales.size_bytes();
+            }
+            host_moe_gate_up_weight_bytes.fetch_add(
+                gate_up_bytes, std::memory_order_relaxed);
+            host_moe_down_weight_bytes.fetch_add(
+                down_bytes, std::memory_order_relaxed);
+            host_moe_view_nanoseconds.fetch_add(
+                elapsed_nanoseconds(view_started), std::memory_order_relaxed);
+            host_moe_temporary_allocation_calls.fetch_add(
+                3U, std::memory_order_relaxed);
+        }
+        const auto input_quantization_started =
+            std::chrono::steady_clock::now();
         std::vector<float> quantized_input(input.begin(), input.end());
         glm53_quantize_activation(quantized_input);
+        if (config.phase_profile) {
+            host_moe_input_quantization_nanoseconds.fetch_add(
+                elapsed_nanoseconds(input_quantization_started),
+                std::memory_order_relaxed);
+        }
         std::vector<float> activations(expert_count * intermediate);
+        const auto gate_up_started = std::chrono::steady_clock::now();
         const auto gate_up = host_moe_workers->parallel_for(
             expert_count * intermediate, [&](std::size_t task) {
                 const auto expert = task / intermediate;
@@ -1857,11 +2125,23 @@ struct Glm53Runtime::Impl {
                     bf16_round_f32(gate * sigmoid(gate) * up);
             });
         if (!gate_up.ok()) return gate_up;
+        if (config.phase_profile) {
+            host_moe_gate_up_nanoseconds.fetch_add(
+                elapsed_nanoseconds(gate_up_started),
+                std::memory_order_relaxed);
+        }
+        const auto activation_started = std::chrono::steady_clock::now();
         for (std::size_t expert = 0U; expert < expert_count; ++expert) {
             glm53_quantize_activation(std::span<float>(activations).subspan(
                 expert * intermediate, intermediate));
         }
+        if (config.phase_profile) {
+            host_moe_activation_nanoseconds.fetch_add(
+                elapsed_nanoseconds(activation_started),
+                std::memory_order_relaxed);
+        }
         std::vector<float> expert_outputs(expert_count * kHidden);
+        const auto down_started = std::chrono::steady_clock::now();
         const auto down = host_moe_workers->parallel_for(
             expert_count * kHidden, [&](std::size_t task) {
                 const auto expert = task / kHidden;
@@ -1879,6 +2159,11 @@ struct Glm53Runtime::Impl {
                             expert * intermediate, intermediate)));
             });
         if (!down.ok()) return down;
+        if (config.phase_profile) {
+            host_moe_down_nanoseconds.fetch_add(
+                elapsed_nanoseconds(down_started), std::memory_order_relaxed);
+        }
+        const auto reduction_started = std::chrono::steady_clock::now();
         std::copy_n(expert_outputs.begin() + 8U * kHidden, kHidden,
                     output.begin());
         for (std::size_t expert = 0U; expert < routed.size(); ++expert) {
@@ -1889,7 +2174,13 @@ struct Glm53Runtime::Impl {
                         expert_outputs[expert * kHidden + column]));
             }
         }
+        if (config.phase_profile) {
+            host_moe_reduction_nanoseconds.fetch_add(
+                elapsed_nanoseconds(reduction_started),
+                std::memory_order_relaxed);
+        }
         host_moe_calls.fetch_add(1U, std::memory_order_relaxed);
+        host_moe_rows.fetch_add(1U, std::memory_order_relaxed);
         host_moe_nanoseconds.fetch_add(
             static_cast<std::uint64_t>(std::chrono::duration_cast<
                 std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -1913,6 +2204,7 @@ struct Glm53Runtime::Impl {
             return {{"GLM-5.3 host page MoE command has an invalid shape"}};
         }
         const auto started = std::chrono::steady_clock::now();
+        const auto view_started = started;
         struct Expert {
             Glm53HostFp8Linear gate;
             Glm53HostFp8Linear up;
@@ -1976,6 +2268,32 @@ struct Glm53Runtime::Impl {
             group.module = {gate.value, up.value, down.value};
         }
 
+        if (config.phase_profile) {
+            std::uint64_t gate_up_bytes = 0U;
+            std::uint64_t down_bytes = 0U;
+            for (const auto& group : groups) {
+                // The production page primitive traverses each expert weight
+                // row once and reuses it across every assigned prompt row.
+                gate_up_bytes += group.module.gate.weights.size_bytes() +
+                                 group.module.gate.scales.size_bytes() +
+                                 group.module.up.weights.size_bytes() +
+                                 group.module.up.scales.size_bytes();
+                down_bytes += group.module.down.weights.size_bytes() +
+                              group.module.down.scales.size_bytes();
+            }
+            host_moe_gate_up_weight_bytes.fetch_add(
+                gate_up_bytes, std::memory_order_relaxed);
+            host_moe_down_weight_bytes.fetch_add(
+                down_bytes, std::memory_order_relaxed);
+            host_moe_view_nanoseconds.fetch_add(
+                elapsed_nanoseconds(view_started), std::memory_order_relaxed);
+            host_moe_temporary_allocation_calls.fetch_add(
+                static_cast<std::uint64_t>(4U + groups.size()),
+                std::memory_order_relaxed);
+        }
+
+        const auto input_quantization_started =
+            std::chrono::steady_clock::now();
         std::vector<float> quantized_input(input.begin(), input.end());
         result = host_moe_workers->parallel_for(rows, [&](std::size_t row) {
             glm53_quantize_activation(
@@ -1983,9 +2301,15 @@ struct Glm53Runtime::Impl {
                     .subspan(row * kHidden, kHidden));
         });
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            host_moe_input_quantization_nanoseconds.fetch_add(
+                elapsed_nanoseconds(input_quantization_started),
+                std::memory_order_relaxed);
+        }
 
         const auto output_slots = rows * outputs_per_row;
         std::vector<float> activations(output_slots * intermediate);
+        const auto gate_up_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for(
             groups.size() * intermediate, [&](std::size_t task) {
                 const auto group_index = task / intermediate;
@@ -2015,6 +2339,12 @@ struct Glm53Runtime::Impl {
                 }
             });
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            host_moe_gate_up_nanoseconds.fetch_add(
+                elapsed_nanoseconds(gate_up_started),
+                std::memory_order_relaxed);
+        }
+        const auto activation_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for(
             output_slots, [&](std::size_t slot) {
                 glm53_quantize_activation(
@@ -2022,8 +2352,14 @@ struct Glm53Runtime::Impl {
                         .subspan(slot * intermediate, intermediate));
             });
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            host_moe_activation_nanoseconds.fetch_add(
+                elapsed_nanoseconds(activation_started),
+                std::memory_order_relaxed);
+        }
 
         std::vector<float> expert_outputs(output_slots * kHidden);
+        const auto down_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for(
             groups.size() * kHidden, [&](std::size_t task) {
                 const auto group_index = task / kHidden;
@@ -2046,6 +2382,11 @@ struct Glm53Runtime::Impl {
                 }
             });
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            host_moe_down_nanoseconds.fetch_add(
+                elapsed_nanoseconds(down_started), std::memory_order_relaxed);
+        }
+        const auto reduction_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for(
             rows * kHidden, [&](std::size_t task) {
                 const auto row = task / kHidden;
@@ -2064,7 +2405,13 @@ struct Glm53Runtime::Impl {
                 output[row * kHidden + column] = value;
             });
         if (!result.ok()) return result;
-        host_moe_calls.fetch_add(rows, std::memory_order_relaxed);
+        if (config.phase_profile) {
+            host_moe_reduction_nanoseconds.fetch_add(
+                elapsed_nanoseconds(reduction_started),
+                std::memory_order_relaxed);
+        }
+        host_moe_calls.fetch_add(1U, std::memory_order_relaxed);
+        host_moe_rows.fetch_add(rows, std::memory_order_relaxed);
         host_moe_nanoseconds.fetch_add(
             static_cast<std::uint64_t>(std::chrono::duration_cast<
                 std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -2822,6 +3169,15 @@ struct Glm53Runtime::Impl {
         }
         std::vector<float> heads_out(wide_elements);
         const auto query_scale = 1.0F / std::sqrt(static_cast<float>(kLinearHead));
+        // Resolve the copy-on-write buffer before dispatch. Calling recurrent()
+        // for the first time from every head worker races the shared_ptr's lazy
+        // allocation; workers below own disjoint head matrices once this span
+        // is stable.
+        auto recurrent = sequence.recurrent(layer);
+        if (recurrent.size() != static_cast<std::size_t>(kHeads) *
+                                    kLinearHead * kLinearHead) {
+            return {{"GLM-5.3 KDA recurrent state has an invalid shape"}};
+        }
         // The chunk form exposes heads to the physical-core pool, but a page
         // narrower than the runner count cannot amortize waking that pool.
         // Derive the crossover from the discovered pool width rather than a
@@ -2881,7 +3237,7 @@ struct Glm53Runtime::Impl {
                             static_cast<std::size_t>(row) * kHeads + head];
                     }
                     std::vector<float> raw(q.size());
-                    auto state = sequence.recurrent(layer).subspan(
+                    auto state = recurrent.subspan(
                         head * kLinearHead * kLinearHead,
                         static_cast<std::size_t>(kLinearHead) * kLinearHead);
                     auto status = kimi_kda_chunk(
@@ -2945,7 +3301,7 @@ struct Glm53Runtime::Impl {
                     if (!result.ok()) return result;
                     for (auto& element : decay) element = std::exp(element);
                     std::vector<float> raw(kLinearHead);
-                    auto state = sequence.recurrent(layer).subspan(
+                    auto state = recurrent.subspan(
                         static_cast<std::size_t>(head) * kLinearHead *
                             kLinearHead,
                         static_cast<std::size_t>(kLinearHead) * kLinearHead);
@@ -3297,11 +3653,20 @@ struct Glm53Runtime::Impl {
         result = norm(normalized, collapsed, prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
         const auto attention = prefix + "self_attn.";
+        const auto attention_started = std::chrono::steady_clock::now();
         result = glm53_kda_layer(layer)
             ? attention_kda(branch, normalized, layer, attention, sequence)
             : attention_mla(branch, normalized, layer, position, attention,
                             sequence);
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            const auto elapsed = elapsed_nanoseconds(attention_started);
+            graph_attention_block_nanoseconds.fetch_add(
+                elapsed, std::memory_order_relaxed);
+            (glm53_kda_layer(layer) ? graph_kda_nanoseconds
+                                    : graph_mla_nanoseconds)
+                .fetch_add(elapsed, std::memory_order_relaxed);
+        }
         std::vector<float> transitioned(streams.size());
         result = dsv4_mhc_post_f32(transitioned, branch, streams, mix, kMhc);
         if (!result.ok()) return result;
@@ -3313,10 +3678,16 @@ struct Glm53Runtime::Impl {
         result = norm(normalized, collapsed,
                       prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
+        const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward(
             branch, normalized, layer, prefix,
             route_request_key(&sequence, position), position, true);
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            graph_feedforward_block_nanoseconds.fetch_add(
+                elapsed_nanoseconds(feedforward_started),
+                std::memory_order_relaxed);
+        }
         std::fill(transitioned.begin(), transitioned.end(), 0.0F);
         result = dsv4_mhc_post_f32(transitioned, branch, streams, mix, kMhc);
         if (!result.ok()) return result;
@@ -3340,6 +3711,7 @@ struct Glm53Runtime::Impl {
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
         const auto attention = prefix + "self_attn.";
+        const auto attention_started = std::chrono::steady_clock::now();
         if (glm53_kda_layer(layer)) {
             CudaGlm53KdaRequest request;
             request.state = &device_sequence.kda[layer];
@@ -3362,9 +3734,22 @@ struct Glm53Runtime::Impl {
                 slot_for(layer), attention, request);
         }
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            const auto elapsed = elapsed_nanoseconds(attention_started);
+            graph_attention_block_nanoseconds.fetch_add(
+                elapsed, std::memory_order_relaxed);
+            if (glm53_kda_layer(layer)) {
+                graph_kda_nanoseconds.fetch_add(elapsed,
+                                                std::memory_order_relaxed);
+            } else {
+                graph_mla_nanoseconds.fetch_add(elapsed,
+                                                std::memory_order_relaxed);
+            }
+        }
         result = cuda.dsv4_mhc_transition_next_device(
             device, resident_layers[layer].feedforward);
         if (!result.ok()) return result;
+        const auto feedforward_started = std::chrono::steady_clock::now();
         if (host_moe_active) {
             std::vector<float> normalized(kHidden), branch(kHidden);
             result = cuda.dsv4_mhc_download_layer_input(device, normalized);
@@ -3390,6 +3775,11 @@ struct Glm53Runtime::Impl {
                                       12288U, layer);
             }
             if (!result.ok()) return result;
+            if (config.phase_profile) {
+                graph_feedforward_block_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(feedforward_started),
+                    std::memory_order_relaxed);
+            }
             return cuda.dsv4_mhc_finish(device, branch, streams);
         }
         if (glm53_moe_layer(layer)) {
@@ -3413,6 +3803,11 @@ struct Glm53Runtime::Impl {
                 slot_for(layer), prefix + "mlp.", 12288U);
         }
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            graph_feedforward_block_nanoseconds.fetch_add(
+                elapsed_nanoseconds(feedforward_started),
+                std::memory_order_relaxed);
+        }
         return cuda.dsv4_mhc_finish_device(device, streams);
     }
 
@@ -3448,12 +3843,25 @@ struct Glm53Runtime::Impl {
                            prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
         const auto attention = prefix + "self_attn.";
+        const auto attention_started = std::chrono::steady_clock::now();
         result = glm53_kda_layer(layer)
             ? attention_kda_page(branch, normalized, rows, layer, attention,
                                  sequence)
             : attention_mla_page(branch, normalized, rows, layer, attention,
                                  sequence);
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            const auto elapsed = elapsed_nanoseconds(attention_started);
+            graph_attention_block_nanoseconds.fetch_add(
+                elapsed, std::memory_order_relaxed);
+            if (glm53_kda_layer(layer)) {
+                graph_kda_nanoseconds.fetch_add(elapsed,
+                                                std::memory_order_relaxed);
+            } else {
+                graph_mla_nanoseconds.fetch_add(elapsed,
+                                                std::memory_order_relaxed);
+            }
+        }
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
@@ -3492,9 +3900,15 @@ struct Glm53Runtime::Impl {
             route_requests[row] = route_request_key(
                 &sequence, route_positions[row]);
         }
+        const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward_page(branch, normalized, rows, layer, prefix,
                                   route_requests, route_positions);
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            graph_feedforward_block_nanoseconds.fetch_add(
+                elapsed_nanoseconds(feedforward_started),
+                std::memory_order_relaxed);
+        }
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
@@ -3559,6 +3973,7 @@ struct Glm53Runtime::Impl {
                            prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
         const auto attention = prefix + "self_attn.";
+        const auto attention_started = std::chrono::steady_clock::now();
         for (std::uint32_t row = 0U; row < rows; ++row) {
             auto destination = std::span<float>(branch).subspan(
                 static_cast<std::size_t>(row) * kHidden, kHidden);
@@ -3573,6 +3988,18 @@ struct Glm53Runtime::Impl {
                 : attention_mla(destination, input, layer, positions[row],
                                 attention, *sequences[row]);
             if (!result.ok()) return result;
+        }
+        if (config.phase_profile) {
+            const auto elapsed = elapsed_nanoseconds(attention_started);
+            graph_attention_block_nanoseconds.fetch_add(
+                elapsed, std::memory_order_relaxed);
+            if (glm53_kda_layer(layer)) {
+                graph_kda_nanoseconds.fetch_add(elapsed,
+                                                std::memory_order_relaxed);
+            } else {
+                graph_mla_nanoseconds.fetch_add(elapsed,
+                                                std::memory_order_relaxed);
+            }
         }
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
@@ -3609,9 +4036,15 @@ struct Glm53Runtime::Impl {
             route_requests[row] = route_request_key(sequences[row],
                                                     positions[row]);
         }
+        const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward_page(branch, normalized, rows, layer, prefix,
                                   route_requests, positions, true);
         if (!result.ok()) return result;
+        if (config.phase_profile) {
+            graph_feedforward_block_nanoseconds.fetch_add(
+                elapsed_nanoseconds(feedforward_started),
+                std::memory_order_relaxed);
+        }
         for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
@@ -3781,6 +4214,11 @@ struct Glm53Runtime::Impl {
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         std::vector<float> streams(static_cast<std::size_t>(rows) *
                                    stream_columns);
+        if (config.phase_profile) {
+            graph_forward_calls.fetch_add(1U, std::memory_order_relaxed);
+            graph_forward_rows.fetch_add(rows, std::memory_order_relaxed);
+        }
+        const auto embedding_started = std::chrono::steady_clock::now();
         for (std::uint32_t row = 0U; row < rows; ++row) {
             auto result = initialize_streams(
                 tokens[row], std::span<float>(streams).subspan(
@@ -3788,16 +4226,33 @@ struct Glm53Runtime::Impl {
                     stream_columns));
             if (!result.ok()) return result;
         }
+        if (config.phase_profile) {
+            graph_embedding_nanoseconds.fetch_add(
+                elapsed_nanoseconds(embedding_started),
+                std::memory_order_relaxed);
+        }
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto layer_started = std::chrono::steady_clock::now();
             auto result = forward_layer_sequences(
                 streams, layer, positions, sequences, device_sequences);
             if (!result.ok()) return result;
+            if (config.phase_profile) {
+                graph_layer_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(layer_started),
+                    std::memory_order_relaxed);
+            }
         }
         if (!base_hidden.empty()) {
             auto collapsed = collapse_streams_page(streams, rows, base_hidden);
             if (!collapsed.ok()) return collapsed;
         }
+        const auto output_head_started = std::chrono::steady_clock::now();
         auto result = finish_streams_page(streams, rows, logits);
+        if (config.phase_profile) {
+            graph_output_head_nanoseconds.fetch_add(
+                elapsed_nanoseconds(output_head_started),
+                std::memory_order_relaxed);
+        }
         if (result.ok()) {
             for (std::uint32_t row = 0U; row < rows; ++row) {
                 sequences[row]->set_token_count(positions[row] + 1U);
@@ -3935,6 +4390,12 @@ struct Glm53Runtime::Impl {
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         std::vector<float> streams(tokens.size() * stream_columns);
         std::vector<ValidationResult> encode_results(tokens.size());
+        if (config.phase_profile) {
+            graph_forward_calls.fetch_add(1U, std::memory_order_relaxed);
+            graph_forward_rows.fetch_add(tokens.size(),
+                                         std::memory_order_relaxed);
+        }
+        const auto embedding_started = std::chrono::steady_clock::now();
         const auto encode = [&](std::size_t position) {
             encode_results[position] = initialize_streams(
                 tokens[position],
@@ -3955,14 +4416,25 @@ struct Glm53Runtime::Impl {
         for (auto& encoded : encode_results) {
             if (!encoded.ok()) return encoded;
         }
+        if (config.phase_profile) {
+            graph_embedding_nanoseconds.fetch_add(
+                elapsed_nanoseconds(embedding_started),
+                std::memory_order_relaxed);
+        }
         // Prompt rows are page/layer-major. Recurrent KDA and causal MLA state
         // still advance in token order inside each layer, while the active
         // layer's routed experts remain reusable in the bounded CUDA cache.
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto layer_started = std::chrono::steady_clock::now();
             result = forward_layer_page(
                 streams, static_cast<std::uint32_t>(tokens.size()), layer,
                 sequence);
             if (!result.ok()) return result;
+            if (config.phase_profile) {
+                graph_layer_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(layer_started),
+                    std::memory_order_relaxed);
+            }
             if (config.load_progress) {
                 std::cerr << "\r[glm53-prefill] layer " << (layer + 1U) << '/'
                           << kLayers << " rows " << tokens.size() << std::flush;
@@ -3979,11 +4451,17 @@ struct Glm53Runtime::Impl {
                 std::span<float>(*base_hidden_rows).subspan(old_size));
             if (!result.ok()) return result;
         }
+        const auto output_head_started = std::chrono::steady_clock::now();
         result = all_row_logits
             ? finish_streams_page(
                   streams, static_cast<std::uint32_t>(tokens.size()), logits)
             : finish_streams(
                   std::span<const float>(streams).last(stream_columns), logits);
+        if (config.phase_profile) {
+            graph_output_head_nanoseconds.fetch_add(
+                elapsed_nanoseconds(output_head_started),
+                std::memory_order_relaxed);
+        }
         if (result.ok()) {
             sequence.set_token_count(
                 position_base + static_cast<std::uint32_t>(tokens.size()));
@@ -4012,6 +4490,15 @@ struct Glm53Runtime::Impl {
                           request->decode_cache_start.useful_prefetches)
                       << '\n';
         }
+        if (config.phase_profile && request->prepared) {
+            const auto profile_after_decode = profile_snapshot();
+            request->result.metrics.decode = phase_delta(
+                profile_after_decode, request->profile_decode_started);
+        }
+        request->result.metrics.rss_bytes = process_resident_set_bytes();
+        request->result.metrics.device_vram_used_bytes =
+            device_vram_used_bytes(devices);
+        request->result.metrics.phase_profile = config.phase_profile;
         {
             std::scoped_lock lock(request->completion_mutex);
             request->done = true;
@@ -4042,6 +4529,7 @@ struct Glm53Runtime::Impl {
         request->result.metrics.reused_prompt_tokens = reused;
         request->prefill_cursor = reused;
         request->prefill_started = now_seconds();
+        request->profile_started = profile_snapshot();
         request->prepared = true;
         return true;
     }
@@ -4149,6 +4637,12 @@ struct Glm53Runtime::Impl {
             request->result.metrics.reused_prompt_tokens;
         request->result.metrics.prefill_seconds =
             now_seconds() - request->prefill_started;
+        request->profile_after_prefill = profile_snapshot();
+        if (config.phase_profile) {
+            request->result.metrics.prefill = phase_delta(
+                request->profile_after_prefill, request->profile_started);
+        }
+        const auto decode_prepare_started = std::chrono::steady_clock::now();
         if (mtp_enabled() && request->sampling.temperature == 0.0 &&
             request->maximum_new_tokens > 1U) {
             auto mtp = prepare_mtp_prompt(
@@ -4179,6 +4673,10 @@ struct Glm53Runtime::Impl {
             std::make_unique<StopSequenceBuffer>(request->stop);
         request->position = static_cast<std::uint32_t>(request->prompt.size());
         request->decode_cache_start = weights->stats();
+        request->result.metrics.decode_prepare_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          decode_prepare_started).count();
+        request->profile_decode_started = profile_snapshot();
         request->decode_started = now_seconds();
         request->decoding = true;
         if (request->maximum_new_tokens == 0U) {
@@ -4245,6 +4743,7 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] bool sample_request(
         const std::shared_ptr<ScheduledRequest>& request,
         std::uint32_t& forward_token_id) {
+        const auto sampling_started = std::chrono::steady_clock::now();
         auto drawn = sample_logits(
             request->logits, request->sampling,
             SamplingHistory{request->counts, request->sampled},
@@ -4253,6 +4752,11 @@ struct Glm53Runtime::Impl {
             request->result.errors = std::move(drawn.errors);
             complete_request(request);
             return false;
+        }
+        if (config.phase_profile) {
+            graph_sampling_nanoseconds.fetch_add(
+                elapsed_nanoseconds(sampling_started),
+                std::memory_order_relaxed);
         }
         return publish_draw(request, drawn, forward_token_id);
     }
@@ -4503,7 +5007,8 @@ struct Glm53Runtime::Impl {
                 // Decode has latency priority. A newly admitted prompt gets a
                 // single-token chunk while decoders are live; with no decode
                 // work, a page-sized chunk retains the wide prefill route.
-                const std::size_t prefill_rows = decoding == 0U ? 64U : 1U;
+                const std::size_t prefill_rows =
+                    decoding == 0U ? config.prefill_page_tokens : 1U;
                 for (auto& request : active_requests) {
                     if (!request->done && !request->decoding) {
                         advance_prefill(request, prefill_rows);
@@ -4564,6 +5069,17 @@ ValidationResult Glm53Runtime::initialize(
         return result;
     }
     impl_->config = config;
+    impl_->config.phase_profile =
+        config.phase_profile || phase_profile_environment_enabled();
+    impl_->config.prefill_page_tokens =
+        prefill_page_tokens_from_environment(config.prefill_page_tokens);
+    if (impl_->config.prefill_page_tokens == 0U ||
+        impl_->config.prefill_page_tokens > config.maximum_context_tokens) {
+        result.errors.emplace_back(
+            "GLM-5.3 prefill page tokens must be within the configured "
+            "context window");
+        return result;
+    }
     impl_->prefix_cache_limit =
         prefix_cache_entries(config.maximum_context_tokens);
     impl_->scheduler_capacity = std::max<std::size_t>(
@@ -4589,7 +5105,8 @@ ValidationResult Glm53Runtime::initialize(
     }
     auto checkpoint = Glm53CheckpointReader::open(model_directory);
     if (!checkpoint.ok()) return {std::move(checkpoint.errors)};
-    result = impl_->cuda.initialize(impl_->devices);
+    result = impl_->cuda.initialize(impl_->devices,
+                                    impl_->config.phase_profile);
     if (!result.ok()) return result;
     for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
         result = impl_->cuda.reserve_weight_arena(
@@ -4925,6 +5442,33 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << " useful_prefetches=" << cache.useful_prefetches
                   << " failed_prefetches=" << cache.failed_prefetches
                   << '\n';
+    }
+    if (impl_->config.phase_profile) {
+        std::cerr << "[glm53-phase-profile] {\"prefill_page_tokens\":"
+                  << impl_->config.prefill_page_tokens
+                  << ",\"prompt_token_ids\":";
+        print_token_ids(std::cerr, result.prompt_token_ids);
+        std::cerr << ",\"generated_token_ids\":";
+        print_token_ids(std::cerr, result.generated_token_ids);
+        std::cerr << ",\"prompt_tokens\":" << result.metrics.prompt_tokens
+                  << ",\"prefill_tokens\":" << result.metrics.prefill_tokens
+                  << ",\"decode_tokens\":" << result.metrics.decode_tokens
+                  << ",\"prefill_seconds\":" << result.metrics.prefill_seconds
+                  << ",\"decode_prepare_seconds\":"
+                  << result.metrics.decode_prepare_seconds
+                  << ",\"decode_seconds\":" << result.metrics.decode_seconds
+                  << ",\"rss_bytes\":" << result.metrics.rss_bytes
+                  << ",\"device_vram_used_bytes\":[";
+        for (std::size_t index = 0U;
+             index < result.metrics.device_vram_used_bytes.size(); ++index) {
+            if (index != 0U) std::cerr << ',';
+            std::cerr << result.metrics.device_vram_used_bytes[index];
+        }
+        std::cerr << "],\"prefill\":";
+        print_phase_metrics(std::cerr, result.metrics.prefill);
+        std::cerr << ",\"decode\":";
+        print_phase_metrics(std::cerr, result.metrics.decode);
+        std::cerr << "}\n";
     }
     return result;
 }

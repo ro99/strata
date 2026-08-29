@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/device/cuda_backend.hpp"
 #include "strata/engine/chat_protocol.hpp"
 #include "strata/engine/sampling.hpp"
 #include "strata/platform/result.hpp"
@@ -29,8 +30,58 @@ struct Glm53RuntimeConfig {
     std::uint32_t maximum_context_tokens{2048U};
     double sampling_temperature{};
     std::uint64_t sampling_seed{33'377'335U};
+    // Upper bound for a prefill scheduler page. The default preserves the
+    // production path; experiments may override it to measure weight reuse.
+    std::uint32_t prefill_page_tokens{64U};
     bool verbose{};
     bool load_progress{};
+    // Opt-in request attribution. CUDA event timing is enabled only when this
+    // is true; ordinary production execution retains its existing timing path.
+    bool phase_profile{};
+};
+
+struct Glm53CacheMetrics {
+    std::uint64_t hits{};
+    std::uint64_t misses{};
+    std::uint64_t evictions{};
+    std::uint64_t prefetches{};
+    std::uint64_t useful_prefetches{};
+    std::uint64_t failed_prefetches{};
+};
+
+struct Glm53HostExpertMetrics {
+    std::uint64_t calls{};
+    std::uint64_t rows{};
+    std::uint64_t gate_up_weight_bytes{};
+    std::uint64_t down_weight_bytes{};
+    std::uint64_t view_resolution_nanoseconds{};
+    std::uint64_t input_quantization_nanoseconds{};
+    std::uint64_t gate_up_nanoseconds{};
+    std::uint64_t activation_nanoseconds{};
+    std::uint64_t down_nanoseconds{};
+    std::uint64_t reduction_nanoseconds{};
+    std::uint64_t service_nanoseconds{};
+    std::uint64_t temporary_allocation_calls{};
+};
+
+struct Glm53GraphMetrics {
+    std::uint64_t forward_calls{};
+    std::uint64_t forward_rows{};
+    std::uint64_t embedding_nanoseconds{};
+    std::uint64_t layer_nanoseconds{};
+    std::uint64_t attention_block_nanoseconds{};
+    std::uint64_t kda_nanoseconds{};
+    std::uint64_t mla_nanoseconds{};
+    std::uint64_t feedforward_block_nanoseconds{};
+    std::uint64_t output_head_nanoseconds{};
+    std::uint64_t sampling_nanoseconds{};
+};
+
+struct Glm53PhaseMetrics {
+    CudaBackendStats cuda;
+    Glm53CacheMetrics cache;
+    Glm53HostExpertMetrics host_experts;
+    Glm53GraphMetrics graph;
 };
 
 struct Glm53RunMetrics {
@@ -40,6 +91,12 @@ struct Glm53RunMetrics {
     std::uint64_t decode_tokens{};
     double prefill_seconds{};
     double decode_seconds{};
+    double decode_prepare_seconds{};
+    Glm53PhaseMetrics prefill;
+    Glm53PhaseMetrics decode;
+    std::uint64_t rss_bytes{};
+    std::vector<std::uint64_t> device_vram_used_bytes;
+    bool phase_profile{};
 };
 
 struct Glm53GenerationResult {

@@ -198,7 +198,16 @@ std::string encode_placement_plan(const PlacementPlan& plan) {
         output << "{\"id\": " << device.id << ", \"name\": ";
         escape(output, device.name);
         output << ", \"total_bytes\": " << device.total_bytes
-               << ", \"free_bytes\": " << device.free_bytes << '}';
+               << ", \"free_bytes\": " << device.free_bytes
+               << ", \"numa_node_plus_one\": "
+               << (device.numa_node < 0 ? 0 : device.numa_node + 1) << '}';
+    }
+    output << "], \"high_speed_peer\": [";
+    for (std::size_t index = 0U; index < plan.hardware.high_speed_peer.size();
+         ++index) {
+        if (index != 0U) output << ',';
+        // uint8_t streams as a character; the matrix is written as numbers.
+        output << static_cast<unsigned>(plan.hardware.high_speed_peer[index]);
     }
     output << "]}";
     output << ",\n  \"components\": [";
@@ -287,7 +296,13 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                 });
             } else if (key == "hardware") {
                 read_object(cursor, [&](const std::string& field) {
-                    if (field == "host_total_bytes") {
+                    if (field == "high_speed_peer") {
+                        plan.hardware.high_speed_peer.clear();
+                        for (const auto value : read_uint64_array(cursor)) {
+                            plan.hardware.high_speed_peer.push_back(
+                                static_cast<std::uint8_t>(value));
+                        }
+                    } else if (field == "host_total_bytes") {
                         plan.hardware.host_total_bytes = cursor.parse_uint64();
                     } else if (field == "host_available_bytes") {
                         plan.hardware.host_available_bytes = cursor.parse_uint64();
@@ -328,6 +343,13 @@ PlacementPlanResult decode_placement_plan(std::string_view text) {
                                         device.total_bytes = cursor.parse_uint64();
                                     } else if (entry == "free_bytes") {
                                         device.free_bytes = cursor.parse_uint64();
+                                    } else if (entry == "numa_node_plus_one") {
+                                        const auto encoded =
+                                            cursor.parse_uint64();
+                                        device.numa_node =
+                                            encoded == 0U
+                                                ? -1
+                                                : static_cast<int>(encoded) - 1;
                                     } else {
                                         return false;
                                     }

@@ -483,7 +483,7 @@ TEST_CASE("the plan cache round-trips the storage tier") {
     const auto decoded = strata::decode_placement_plan(
         strata::encode_placement_plan(planned.value));
     REQUIRE(decoded.ok());
-    REQUIRE(decoded.value.version == 2U);
+    REQUIRE(decoded.value.version == strata::kPlacementPlanVersion);
     REQUIRE(decoded.value.request.model == strata::PlacementModel::KimiK3);
     REQUIRE(decoded.value.hardware.storage.disk == "sda");
     REQUIRE(decoded.value.hardware.storage.resolved);
@@ -492,6 +492,43 @@ TEST_CASE("the plan cache round-trips the storage tier") {
             planned.value.storage_resident_bytes);
     REQUIRE(decoded.value.decode_storage_read_bytes ==
             planned.value.decode_storage_read_bytes);
+}
+
+TEST_CASE("the plan cache round-trips device locality and the peer matrix") {
+    // v3 added both. They are recorded rather than only probed because M3
+    // admits or refuses rank-local execution on exactly this, and a plan that
+    // does not carry the topology it was built for cannot be verified against
+    // the machine that later reuses it.
+    auto hardware = make_hardware({8U, 8U}, 64U);
+    hardware.devices[0].numa_node = 1;
+    // -1 is the driver declining to say, and must survive a round trip through
+    // an unsigned-only JSON reader rather than decoding as node 0.
+    hardware.devices[1].numa_node = -1;
+    hardware.high_speed_peer = {0U, 1U, 1U, 0U};
+    auto planned = solve_placement(make_tiered_inventory(12U, 400U), hardware,
+                                   make_request(2U));
+    REQUIRE(planned.ok());
+
+    const auto decoded = strata::decode_placement_plan(
+        strata::encode_placement_plan(planned.value));
+    REQUIRE(decoded.ok());
+    REQUIRE(decoded.value.hardware.devices.size() == 2U);
+    REQUIRE(decoded.value.hardware.devices[0].numa_node == 1);
+    REQUIRE(decoded.value.hardware.devices[1].numa_node == -1);
+    REQUIRE(decoded.value.hardware.high_speed_peer.size() == 4U);
+    REQUIRE(decoded.value.hardware.peer_is_high_speed(0U, 1U));
+    REQUIRE(decoded.value.hardware.peer_is_high_speed(1U, 0U));
+    // The diagonal stays clear: a device is not its own peer, and treating it
+    // as one would let a single-GPU topology look peer-linked.
+    REQUIRE(!decoded.value.hardware.peer_is_high_speed(0U, 0U));
+}
+
+TEST_CASE("an absent peer matrix reports no high-speed link rather than crashing") {
+    strata::PlacementHardware hardware = make_hardware({8U, 8U}, 64U);
+    hardware.high_speed_peer.clear();
+    REQUIRE(!hardware.peer_is_high_speed(0U, 1U));
+    // Out-of-range slots are a caller error, not a reason to read past the end.
+    REQUIRE(!hardware.peer_is_high_speed(0U, 99U));
 }
 
 TEST_CASE("a v1 plan is discarded rather than reinterpreted") {

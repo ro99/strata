@@ -43,12 +43,31 @@ struct HardwareProfile {
     // host's CPU numbering.
     std::vector<int> usable_cpu_ids;
     NumaTopology numa;
+    // Huge-page facts, for callers deciding whether a long-lived arena should
+    // ask for them. M1's discovery list names huge-page availability
+    // explicitly; before this it was the one host property nothing probed.
+    //
+    // `transparent_huge_pages_enabled` reflects
+    // /sys/kernel/mm/transparent_hugepage/enabled being `always` or `madvise`
+    // rather than `never`, which is what decides whether MADV_HUGEPAGE on a
+    // mapped arena can do anything at all. Explicit (hugetlbfs) pages are
+    // reported separately because a host can offer one and not the other.
+    std::uint64_t huge_page_bytes{};
+    std::uint64_t explicit_huge_pages_total{};
+    std::uint64_t explicit_huge_pages_free{};
+    bool transparent_huge_pages_enabled{};
+    bool transparent_huge_pages_always{};
     // CPUs on the smallest online node. The relevant figure for anything that
     // assigns one worker pool per node, because the smallest node is what
     // bounds a symmetric assignment.
     std::size_t minimum_cpus_per_node{};
 
     [[nodiscard]] bool multi_node() const noexcept { return numa.nodes > 1; }
+    // Bytes backed by explicit hugetlbfs pages that are currently free. Zero
+    // on a host that reserved none, which is the common case and not an error.
+    [[nodiscard]] std::uint64_t explicit_huge_page_bytes_free() const noexcept {
+        return explicit_huge_pages_free * huge_page_bytes;
+    }
 
     // Host memory a long-lived resident arena may claim, after leaving room
     // for page cache, the CUDA driver's pinned staging and everything else on

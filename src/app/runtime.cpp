@@ -1,5 +1,8 @@
 #include "strata/app/runtime.hpp"
 
+#include "strata/engine/load_report.hpp"
+#include "strata/engine/placement.hpp"
+
 #include <algorithm>
 #include <array>
 #include <iostream>
@@ -13,6 +16,13 @@ struct RuntimeSession::Impl {
     SamplingOptions sampling;
     PlacementPlan placement;
     bool placement_ready{};
+    // Contract section 8's load report. Started before placement resolution so
+    // it covers header parsing and mapping, and closed at the first published
+    // token, because on a lazily mapped checkpoint the load is nearly free and
+    // the fault-in all lands in the first forward.
+    LoadReport load_report;
+    bool report_load{};
+    bool load_report_emitted{};
 };
 
 namespace {
@@ -89,6 +99,8 @@ ValidationResult RuntimeSession::initialize(
         }
     }
     impl_->sampling = config.sampling;
+    impl_->report_load = config.report_placement_plan;
+    impl_->load_report.begin(resolve_backing_storage(model_directory).disk);
 
     // Resolve placement before anything is uploaded. The plan decides where
     // Gemma 4 puts each layer; for GLM and DeepSeek it reports and admits the
@@ -138,7 +150,20 @@ ValidationResult RuntimeSession::initialize(
     result = executor->initialize(model_directory, config, placement);
     // Commit only on success: a failed attempt leaves generation disabled and
     // a retry starts from a fresh implementation object.
-    if (result.ok()) impl_->executor = std::move(executor);
+    if (result.ok()) {
+        impl_->executor = std::move(executor);
+        impl_->load_report.mark("load");
+        if (impl_->placement_ready) {
+            impl_->load_report.set_device_vram_bytes(
+                impl_->placement.device_resident_bytes);
+            impl_->load_report.set_storage_tier_bytes(
+                impl_->placement.storage_resident_bytes);
+            impl_->load_report.set_storage_tier_note(
+                impl_->placement.io_dependent
+                    ? "I/O dependent: steady-state decode reads the checkpoint"
+                    : "resident: steady-state decode does not read the checkpoint");
+        }
+    }
     return result;
 }
 
@@ -180,6 +205,26 @@ GenerationResult RuntimeSession::generate_chat_stream(
         result.errors.emplace_back(
             "this loaded model does not support image content");
         return result;
+    }
+    // The first published token closes the load report. Wrapping the callback
+    // rather than timing around the whole call is deliberate: a generation runs
+    // to many tokens, and the figure contract section 8 asks for is time to
+    // *first* token.
+    if (!impl_->load_report_emitted && impl_->load_report.started()) {
+        impl_->load_report_emitted = true;
+        bool first = true;
+        const TokenStreamCallback wrapped =
+            [&](std::uint32_t token, std::string_view text) {
+                if (first) {
+                    first = false;
+                    impl_->load_report.mark("first-token");
+                    if (impl_->report_load) {
+                        std::cerr << impl_->load_report.render();
+                    }
+                }
+                return on_token ? on_token(token, text) : true;
+            };
+        return impl_->executor->generate_chat_stream(messages, options, wrapped);
     }
     return impl_->executor->generate_chat_stream(messages, options, on_token);
 }

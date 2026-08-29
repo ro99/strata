@@ -280,6 +280,22 @@ struct Glm53HostFp8Linear {
     std::uint32_t columns{};
 };
 
+// Reusable host-MoE scratch. The three buffers are fully overwritten every
+// call -- gate/up writes every activation slot, down writes every output slot --
+// so reuse without clearing is exact, and the byte-identical output gate is what
+// verifies it rather than the argument. Thread-local so reuse carries no
+// assumption about which thread drives the MoE.
+//
+// `grow` returns true when it actually allocated, so the profiler's allocation
+// counter reports what happened instead of a constant: M0 counted 30,208 timed
+// allocations per 128 decode tokens, and after warm-up this should be zero.
+[[nodiscard]] bool glm53_grow(std::vector<float>& buffer, std::size_t size) {
+    if (buffer.size() >= size) return false;
+    const auto before = buffer.capacity();
+    buffer.resize(size);
+    return buffer.capacity() != before;
+}
+
 [[nodiscard]] float glm53_quantize_e4m3(float value) noexcept {
     const float magnitude = std::min(std::abs(value), 448.0F);
     float quantized = 0.0F;
@@ -1728,6 +1744,48 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> prefetch_errors{};
     std::unique_ptr<HostWorkerPool> projection_workers;
     std::unique_ptr<HostWorkerPool> host_moe_workers;
+    // Host-MoE scratch, reused across calls instead of reallocated per call.
+    //
+    // These are Impl members rather than function-local `thread_local`: the
+    // buffers are filled by the worker pool, and a thread_local resolves to the
+    // *worker's* copy inside the dispatch lambda, not the caller's, so every
+    // worker indexed into an empty vector. They are plain members for the same
+    // reason `host_moe_workers` is: one runtime drives one MoE call at a time.
+    //
+    // Every element is overwritten each call -- gate/up writes every activation
+    // slot and down every output slot -- so reuse without clearing is exact,
+    // and the byte-identical output gate is what verifies that.
+    std::vector<float> host_moe_quantized_input;
+    std::vector<float> host_moe_activations;
+    std::vector<float> host_moe_expert_outputs;
+    // Paged-primitive scratch, same ownership reasoning. `page_groups` keeps
+    // its per-group assignment vectors alive between calls so their capacity is
+    // reused; only `clear()` is called on them, never destruction.
+    std::vector<float> page_quantized_input;
+    std::vector<float> page_activations;
+    std::vector<float> page_expert_outputs;
+    // Process-lifetime cache of resolved expert weight spans, indexed by
+    // (layer, expert slot) with slot 288 the shared expert.
+    //
+    // `Glm53CheckpointReader::view` computes a span into the mapping and
+    // touches no pages -- `read` is the one that moves bytes -- so caching a
+    // view changes nothing about what is read. What it removes is per-call
+    // work that M0 counted every step: three module-name strings built and
+    // three manifest lookups per expert, 27 per MoE call and 5,376 calls per
+    // 128 decode tokens.
+    //
+    // Guarded rather than lock-free: the MoE call site is the scheduler thread
+    // today, but nothing in the type system says so, and the lock is taken once
+    // per call around the whole group rather than once per expert.
+    struct Glm53ExpertViews {
+        Glm53HostFp8Linear gate;
+        Glm53HostFp8Linear up;
+        Glm53HostFp8Linear down;
+    };
+    static constexpr std::uint32_t kExpertSlots = 289U;  // 288 routed + shared
+    mutable std::mutex expert_view_mutex;
+    mutable std::vector<Glm53ExpertViews> expert_view_cache;
+    mutable std::vector<std::uint8_t> expert_view_ready;
     bool host_moe_active{};
     std::atomic<std::uint64_t> host_moe_calls{};
     std::atomic<std::uint64_t> host_moe_rows{};
@@ -2002,6 +2060,46 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
+    // Resolves one expert's three matrices, caching them. `expert_slot` is the
+    // routed expert id, or 288 for the shared expert.
+    [[nodiscard]] ValidationResult expert_views(
+        std::uint32_t layer, std::uint32_t expert_slot, std::string_view prefix,
+        Glm53ExpertViews& out) const {
+        ValidationResult result;
+        if (layer >= kLayers || expert_slot >= kExpertSlots) {
+            result.errors.emplace_back("GLM-5.3 expert view index is invalid");
+            return result;
+        }
+        const std::size_t index =
+            static_cast<std::size_t>(layer) * kExpertSlots + expert_slot;
+        std::scoped_lock guard(expert_view_mutex);
+        if (expert_view_cache.empty()) {
+            expert_view_cache.resize(static_cast<std::size_t>(kLayers) *
+                                     kExpertSlots);
+            expert_view_ready.assign(expert_view_cache.size(), 0U);
+        }
+        if (expert_view_ready[index] == 0U) {
+            const auto module =
+                expert_slot + 1U == kExpertSlots
+                    ? std::string(prefix) + "shared_experts."
+                    : std::string(prefix) + "experts." +
+                          std::to_string(expert_slot) + ".";
+            auto gate = host_fp8_linear(module + "gate_proj", 2048U, kHidden);
+            auto up = host_fp8_linear(module + "up_proj", 2048U, kHidden);
+            auto down = host_fp8_linear(module + "down_proj", kHidden, 2048U);
+            if (!gate.ok() || !up.ok() || !down.ok()) {
+                if (!gate.ok()) append(result.errors, std::move(gate.errors));
+                if (!up.ok()) append(result.errors, std::move(up.errors));
+                if (!down.ok()) append(result.errors, std::move(down.errors));
+                return result;
+            }
+            expert_view_cache[index] = {gate.value, up.value, down.value};
+            expert_view_ready[index] = 1U;
+        }
+        out = expert_view_cache[index];
+        return result;
+    }
+
     [[nodiscard]] ParseResult<Glm53HostFp8Linear> host_fp8_linear(
         std::string_view base, std::uint32_t rows,
         std::uint32_t columns) const {
@@ -2055,7 +2153,8 @@ struct Glm53Runtime::Impl {
     }
 
     [[nodiscard]] ValidationResult host_moe(
-        std::string_view prefix, std::span<const KimiRoutedExpert> routed,
+        std::uint32_t layer, std::string_view prefix,
+        std::span<const KimiRoutedExpert> routed,
         std::span<const float> input, std::span<float> output) {
         ValidationResult result;
         constexpr std::uint32_t intermediate = 2048U;
@@ -2074,24 +2173,15 @@ struct Glm53Runtime::Impl {
         };
         std::array<Expert, expert_count> experts;
         for (std::size_t index = 0U; index < expert_count; ++index) {
-            const auto module = index < routed.size()
-                ? std::string(prefix) + "experts." +
-                      std::to_string(routed[index].expert) + "."
-                : std::string(prefix) + "shared_experts.";
-            auto gate = host_fp8_linear(module + "gate_proj", intermediate,
-                                        kHidden);
-            auto up = host_fp8_linear(module + "up_proj", intermediate,
-                                      kHidden);
-            auto down = host_fp8_linear(module + "down_proj", kHidden,
-                                        intermediate);
-            if (!gate.ok() || !up.ok() || !down.ok()) {
-                if (!gate.ok()) append(result.errors, std::move(gate.errors));
-                if (!up.ok()) append(result.errors, std::move(up.errors));
-                if (!down.ok()) append(result.errors, std::move(down.errors));
-                return result;
-            }
-            experts[index] = {gate.value, up.value, down.value};
+            const auto slot = index < routed.size()
+                ? static_cast<std::uint32_t>(routed[index].expert)
+                : kExpertSlots - 1U;
+            Glm53ExpertViews views;
+            result = expert_views(layer, slot, prefix, views);
+            if (!result.ok()) return result;
+            experts[index] = {views.gate, views.up, views.down};
         }
+        std::uint64_t allocations = 0U;
         if (config.phase_profile) {
             std::uint64_t gate_up_bytes = 0U;
             std::uint64_t down_bytes = 0U;
@@ -2109,19 +2199,21 @@ struct Glm53Runtime::Impl {
                 down_bytes, std::memory_order_relaxed);
             host_moe_view_nanoseconds.fetch_add(
                 elapsed_nanoseconds(view_started), std::memory_order_relaxed);
-            host_moe_temporary_allocation_calls.fetch_add(
-                3U, std::memory_order_relaxed);
         }
         const auto input_quantization_started =
             std::chrono::steady_clock::now();
-        std::vector<float> quantized_input(input.begin(), input.end());
-        glm53_quantize_activation(quantized_input);
+        auto& quantized_input = host_moe_quantized_input;
+        if (glm53_grow(quantized_input, input.size())) ++allocations;
+        std::copy(input.begin(), input.end(), quantized_input.begin());
+        glm53_quantize_activation(
+            std::span<float>(quantized_input).first(input.size()));
         if (config.phase_profile) {
             host_moe_input_quantization_nanoseconds.fetch_add(
                 elapsed_nanoseconds(input_quantization_started),
                 std::memory_order_relaxed);
         }
-        std::vector<float> activations(expert_count * intermediate);
+        auto& activations = host_moe_activations;
+        if (glm53_grow(activations, expert_count * intermediate)) ++allocations;
         const auto gate_up_started = std::chrono::steady_clock::now();
         const auto gate_up = host_moe_workers->parallel_for_blocked(
             expert_count * intermediate, expert_dispatch_block(),
@@ -2163,7 +2255,12 @@ struct Glm53Runtime::Impl {
                 elapsed_nanoseconds(activation_started),
                 std::memory_order_relaxed);
         }
-        std::vector<float> expert_outputs(expert_count * kHidden);
+        auto& expert_outputs = host_moe_expert_outputs;
+        if (glm53_grow(expert_outputs, expert_count * kHidden)) ++allocations;
+        if (config.phase_profile) {
+            host_moe_temporary_allocation_calls.fetch_add(
+                allocations, std::memory_order_relaxed);
+        }
         const auto down_started = std::chrono::steady_clock::now();
         const auto down = host_moe_workers->parallel_for_blocked(
             expert_count * kHidden, expert_dispatch_block(),
@@ -2214,7 +2311,7 @@ struct Glm53Runtime::Impl {
     }
 
     [[nodiscard]] ValidationResult host_moe_page(
-        std::string_view prefix,
+        std::uint32_t layer, std::string_view prefix,
         std::span<const std::array<KimiRoutedExpert, 8U>> routes,
         std::span<const float> input, std::span<float> output) {
         ValidationResult result;
@@ -2264,6 +2361,7 @@ struct Glm53Runtime::Impl {
                     {row, row * outputs_per_row + route});
             }
         }
+        std::uint64_t allocations = 0U;
         groups.push_back({0U, true, {}, {}});
         auto& shared = groups.back();
         shared.assignments.reserve(rows);
@@ -2273,23 +2371,11 @@ struct Glm53Runtime::Impl {
         }
 
         for (auto& group : groups) {
-            const auto module = group.shared
-                ? std::string(prefix) + "shared_experts."
-                : std::string(prefix) + "experts." +
-                      std::to_string(group.expert) + ".";
-            auto gate = host_fp8_linear(module + "gate_proj", intermediate,
-                                        kHidden);
-            auto up = host_fp8_linear(module + "up_proj", intermediate,
-                                      kHidden);
-            auto down = host_fp8_linear(module + "down_proj", kHidden,
-                                        intermediate);
-            if (!gate.ok() || !up.ok() || !down.ok()) {
-                if (!gate.ok()) append(result.errors, std::move(gate.errors));
-                if (!up.ok()) append(result.errors, std::move(up.errors));
-                if (!down.ok()) append(result.errors, std::move(down.errors));
-                return result;
-            }
-            group.module = {gate.value, up.value, down.value};
+            const auto slot = group.shared ? kExpertSlots - 1U : group.expert;
+            Glm53ExpertViews views;
+            result = expert_views(layer, slot, prefix, views);
+            if (!result.ok()) return result;
+            group.module = {views.gate, views.up, views.down};
         }
 
         if (config.phase_profile) {
@@ -2312,13 +2398,14 @@ struct Glm53Runtime::Impl {
             host_moe_view_nanoseconds.fetch_add(
                 elapsed_nanoseconds(view_started), std::memory_order_relaxed);
             host_moe_temporary_allocation_calls.fetch_add(
-                static_cast<std::uint64_t>(4U + groups.size()),
-                std::memory_order_relaxed);
+                allocations, std::memory_order_relaxed);
         }
 
         const auto input_quantization_started =
             std::chrono::steady_clock::now();
-        std::vector<float> quantized_input(input.begin(), input.end());
+        auto& quantized_input = page_quantized_input;
+        if (glm53_grow(quantized_input, input.size())) ++allocations;
+        std::copy(input.begin(), input.end(), quantized_input.begin());
         result = host_moe_workers->parallel_for(rows, [&](std::size_t row) {
             glm53_quantize_activation(
                 std::span<float>(quantized_input)
@@ -2332,7 +2419,8 @@ struct Glm53Runtime::Impl {
         }
 
         const auto output_slots = rows * outputs_per_row;
-        std::vector<float> activations(output_slots * intermediate);
+        auto& activations = page_activations;
+        if (glm53_grow(activations, output_slots * intermediate)) ++allocations;
         const auto gate_up_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for_blocked(
             groups.size() * intermediate, expert_dispatch_block(),
@@ -2383,7 +2471,8 @@ struct Glm53Runtime::Impl {
                 std::memory_order_relaxed);
         }
 
-        std::vector<float> expert_outputs(output_slots * kHidden);
+        auto& expert_outputs = page_expert_outputs;
+        if (glm53_grow(expert_outputs, output_slots * kHidden)) ++allocations;
         const auto down_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for_blocked(
             groups.size() * kHidden, expert_dispatch_block(),
@@ -3585,7 +3674,7 @@ struct Glm53Runtime::Impl {
         observe_route(layer, selected, route_request, route_position,
                       schedule_prefetch);
         if (host_moe_active) {
-            return host_moe(prefix + "mlp.", selected, input, output);
+            return host_moe(layer, prefix + "mlp.", selected, input, output);
         }
         return weights->moe(slot_for(layer), prefix + "mlp.", selected,
                             input, output);
@@ -3628,7 +3717,7 @@ struct Glm53Runtime::Impl {
             }
         }
         if (host_moe_active) {
-            return host_moe_page(prefix + "mlp.", selected_rows, input,
+            return host_moe_page(layer, prefix + "mlp.", selected_rows, input,
                                  output);
         }
         for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -3794,7 +3883,7 @@ struct Glm53Runtime::Impl {
                 observe_route(
                     layer, selected, route_request_key(&sequence, position),
                     position, false);
-                result = host_moe(prefix + "mlp.", selected, normalized,
+                result = host_moe(layer, prefix + "mlp.", selected, normalized,
                                   branch);
             } else {
                 result = swiglu_block(branch, normalized, prefix + "mlp.",

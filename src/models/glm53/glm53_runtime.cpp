@@ -534,12 +534,24 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 [[nodiscard]] bool resident_mla_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_RESIDENT_MLA");
-        // The absorbed resident MLA route remains a profiling candidate until
-        // its layer-by-layer exactness gate is closed.  Never make an
-        // experimental arithmetic path the production default.
-        return value != nullptr && std::string_view(value) != "0" &&
-               std::string_view(value) != "false" &&
-               std::string_view(value) != "off";
+        // On by default since 2026-08-30. Its exactness gate is closed: under a
+        // control that holds the mHC fixed and varies only where the attention
+        // runs, three-and-three alternating arms are byte-identical, and decode
+        // wall falls 24.0% with MLA down 78.9% and activation D2H down 98.3%
+        // (record 0214).
+        //
+        // Landing it also repairs a latent defect the campaign had not noticed:
+        // the model computed mHC two different ways depending on layer type,
+        // device for the 34 KDA layers and host for the 11 MLA fallback layers,
+        // and those two are not the same function -- they disagree on every
+        // layer by up to 0.16 absolute. All 45 layers now use one. The owner
+        // ruled this a repair rather than a regression and authorized the
+        // re-baseline; figures anchored to `b3deffc5d0f0` are superseded by
+        // `fe74dc4ec7ab`.
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
     }();
     return enabled;
 }

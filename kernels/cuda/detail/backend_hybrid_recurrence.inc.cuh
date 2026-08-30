@@ -1150,3 +1150,275 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     state.dsv4_mhc_branch_ready = true;
     return {};
 }
+
+namespace {
+
+// The three GLM-5.3 shared-expert matrices are fixed by the architecture:
+// gate and up are `intermediate x hidden`, down is `hidden x intermediate`,
+// and E4M3 block scales are one per 128x128 tile.
+[[nodiscard]] ValidationResult glm53_shared_expert_shape(
+    const CudaGlm53SharedExpert& expert) {
+    if (expert.hidden == 0U || expert.intermediate == 0U ||
+        expert.hidden % 128U != 0U || expert.intermediate % 128U != 0U) {
+        return {{"CUDA GLM-5.3 shared expert has an invalid shape"}};
+    }
+    const CudaBuffer* buffers[6] = {
+        expert.gate_weights, expert.gate_scales, expert.up_weights,
+        expert.up_scales, expert.down_weights, expert.down_scales};
+    for (const auto* buffer : buffers) {
+        if (buffer == nullptr || !buffer->valid()) {
+            return {{"CUDA GLM-5.3 shared expert is missing a matrix"}};
+        }
+    }
+    const std::uint64_t projection =
+        static_cast<std::uint64_t>(expert.intermediate) * expert.hidden;
+    const std::uint64_t gate_up_scales =
+        static_cast<std::uint64_t>(expert.intermediate / 128U) *
+        (expert.hidden / 128U) * sizeof(float);
+    const std::uint64_t down_scales =
+        static_cast<std::uint64_t>(expert.hidden / 128U) *
+        (expert.intermediate / 128U) * sizeof(float);
+    if (expert.gate_weights->device_bytes() != projection ||
+        expert.up_weights->device_bytes() != projection ||
+        expert.down_weights->device_bytes() != projection ||
+        expert.gate_scales->device_bytes() != gate_up_scales ||
+        expert.up_scales->device_bytes() != gate_up_scales ||
+        expert.down_scales->device_bytes() != down_scales) {
+        return {{"CUDA GLM-5.3 shared expert matrix is mis-sized"}};
+    }
+    return {};
+}
+
+}  // namespace
+
+ValidationResult CudaBackend::enqueue_glm53_shared_gate_up(
+    int device, const CudaGlm53SharedExpert& expert,
+    std::span<const float> quantized_input) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"GLM-5.3 shared expert targets an uninitialized CUDA device"}};
+    }
+    auto& state = found->second;
+    if (state.glm53_shared_gate_up_in_flight ||
+        state.glm53_shared_down_in_flight) {
+        return {{"a GLM-5.3 shared expert command is already in flight"}};
+    }
+    if (auto shape = glm53_shared_expert_shape(expert); !shape.ok()) {
+        return shape;
+    }
+    if (quantized_input.size() != expert.hidden) {
+        return {{"GLM-5.3 shared expert input has an invalid shape"}};
+    }
+    const CudaBuffer* buffers[6] = {
+        expert.gate_weights, expert.gate_scales, expert.up_weights,
+        expert.up_scales, expert.down_weights, expert.down_scales};
+    for (const auto* buffer : buffers) {
+        if (buffer->device() != device) {
+            return {{"GLM-5.3 shared expert matrix is on another device"}};
+        }
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for the shared expert");
+    }
+    if (state.glm53_shared_input == nullptr) {
+        const auto allocate = [](float*& pointer, std::uint32_t floats) {
+            void* memory = nullptr;
+            const auto status = cudaMalloc(&memory, floats * sizeof(float));
+            if (status == cudaSuccess) pointer = static_cast<float*>(memory);
+            return status;
+        };
+        if (auto status = allocate(state.glm53_shared_input, expert.hidden);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate GLM-5.3 shared expert input");
+        }
+        if (auto status =
+                allocate(state.glm53_shared_gate, expert.intermediate);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate GLM-5.3 shared expert gate");
+        }
+        if (auto status = allocate(state.glm53_shared_up, expert.intermediate);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate GLM-5.3 shared expert up");
+        }
+        if (auto status =
+                allocate(state.glm53_shared_activation, expert.intermediate);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "allocate GLM-5.3 shared expert activation");
+        }
+        if (auto status = allocate(state.glm53_shared_output, expert.hidden);
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate GLM-5.3 shared expert output");
+        }
+        const std::uint32_t staging_floats =
+            std::max(expert.hidden, 2U * expert.intermediate);
+        void* staging = nullptr;
+        if (auto status =
+                cudaMallocHost(&staging, staging_floats * sizeof(float));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate GLM-5.3 shared expert staging");
+        }
+        state.glm53_shared_staging = static_cast<float*>(staging);
+        state.glm53_shared_staging_floats = staging_floats;
+        state.glm53_shared_hidden = expert.hidden;
+        state.glm53_shared_intermediate = expert.intermediate;
+    }
+    if (state.glm53_shared_hidden != expert.hidden ||
+        state.glm53_shared_intermediate != expert.intermediate) {
+        return {{"GLM-5.3 shared expert shape changed after admission"}};
+    }
+    std::copy(quantized_input.begin(), quantized_input.end(),
+              state.glm53_shared_staging);
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_shared_input, state.glm53_shared_staging,
+            expert.hidden * sizeof(float), cudaMemcpyHostToDevice,
+            state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload GLM-5.3 shared expert input");
+    }
+    constexpr std::uint32_t threads = 128U;
+    const std::uint32_t blocks =
+        (expert.intermediate + threads - 1U) / threads;
+    const auto scale_columns = expert.hidden / 128U;
+    glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
+        state.glm53_shared_gate,
+        static_cast<const unsigned char*>(expert.gate_weights->impl_->data),
+        static_cast<const float*>(expert.gate_scales->impl_->data),
+        state.glm53_shared_input, expert.intermediate, expert.hidden,
+        scale_columns);
+    glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
+        state.glm53_shared_up,
+        static_cast<const unsigned char*>(expert.up_weights->impl_->data),
+        static_cast<const float*>(expert.up_scales->impl_->data),
+        state.glm53_shared_input, expert.intermediate, expert.hidden,
+        scale_columns);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch GLM-5.3 shared expert gate and up");
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_shared_staging, state.glm53_shared_gate,
+            expert.intermediate * sizeof(float), cudaMemcpyDeviceToHost,
+            state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download GLM-5.3 shared expert gate");
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_shared_staging + expert.intermediate,
+            state.glm53_shared_up, expert.intermediate * sizeof(float),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download GLM-5.3 shared expert up");
+    }
+    state.glm53_shared_gate_up_in_flight = true;
+    return {};
+}
+
+ValidationResult CudaBackend::collect_glm53_shared_gate_up(
+    int device, std::span<float> gate, std::span<float> up) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"GLM-5.3 shared expert targets an uninitialized CUDA device"}};
+    }
+    auto& state = found->second;
+    if (!state.glm53_shared_gate_up_in_flight) {
+        return {{"no GLM-5.3 shared expert gate and up command is in flight"}};
+    }
+    if (gate.size() != state.glm53_shared_intermediate ||
+        up.size() != state.glm53_shared_intermediate) {
+        return {{"GLM-5.3 shared expert gate and up output has an invalid shape"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for the shared expert");
+    }
+    const auto status = cudaStreamSynchronize(state.stream);
+    state.glm53_shared_gate_up_in_flight = false;
+    if (status != cudaSuccess) {
+        return cuda_error(status, "complete GLM-5.3 shared expert gate and up");
+    }
+    std::copy_n(state.glm53_shared_staging, gate.size(), gate.begin());
+    std::copy_n(state.glm53_shared_staging + state.glm53_shared_intermediate,
+                up.size(), up.begin());
+    return {};
+}
+
+ValidationResult CudaBackend::enqueue_glm53_shared_down(
+    int device, const CudaGlm53SharedExpert& expert,
+    std::span<const float> quantized_activations) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"GLM-5.3 shared expert targets an uninitialized CUDA device"}};
+    }
+    auto& state = found->second;
+    if (state.glm53_shared_gate_up_in_flight ||
+        state.glm53_shared_down_in_flight) {
+        return {{"a GLM-5.3 shared expert command is already in flight"}};
+    }
+    if (state.glm53_shared_input == nullptr) {
+        return {{"GLM-5.3 shared expert down ran before its gate and up"}};
+    }
+    if (auto shape = glm53_shared_expert_shape(expert); !shape.ok()) {
+        return shape;
+    }
+    if (quantized_activations.size() != expert.intermediate ||
+        state.glm53_shared_intermediate != expert.intermediate ||
+        state.glm53_shared_hidden != expert.hidden) {
+        return {{"GLM-5.3 shared expert activation has an invalid shape"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for the shared expert");
+    }
+    std::copy(quantized_activations.begin(), quantized_activations.end(),
+              state.glm53_shared_staging);
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_shared_activation, state.glm53_shared_staging,
+            expert.intermediate * sizeof(float), cudaMemcpyHostToDevice,
+            state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload GLM-5.3 shared expert activation");
+    }
+    constexpr std::uint32_t threads = 128U;
+    const std::uint32_t blocks = (expert.hidden + threads - 1U) / threads;
+    glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
+        state.glm53_shared_output,
+        static_cast<const unsigned char*>(expert.down_weights->impl_->data),
+        static_cast<const float*>(expert.down_scales->impl_->data),
+        state.glm53_shared_activation, expert.hidden, expert.intermediate,
+        expert.intermediate / 128U);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch GLM-5.3 shared expert down");
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_shared_staging, state.glm53_shared_output,
+            expert.hidden * sizeof(float), cudaMemcpyDeviceToHost,
+            state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download GLM-5.3 shared expert down");
+    }
+    state.glm53_shared_down_in_flight = true;
+    return {};
+}
+
+ValidationResult CudaBackend::collect_glm53_shared_down(
+    int device, std::span<float> output) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"GLM-5.3 shared expert targets an uninitialized CUDA device"}};
+    }
+    auto& state = found->second;
+    if (!state.glm53_shared_down_in_flight) {
+        return {{"no GLM-5.3 shared expert down command is in flight"}};
+    }
+    if (output.size() != state.glm53_shared_hidden) {
+        return {{"GLM-5.3 shared expert output has an invalid shape"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for the shared expert");
+    }
+    const auto status = cudaStreamSynchronize(state.stream);
+    state.glm53_shared_down_in_flight = false;
+    if (status != cudaSuccess) {
+        return cuda_error(status, "complete GLM-5.3 shared expert down");
+    }
+    std::copy_n(state.glm53_shared_staging, output.size(), output.begin());
+    return {};
+}

@@ -560,6 +560,46 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
                ? 1 : 0;
 }
 
+// The shared expert is the ninth of the nine every MoE layer runs and the only
+// one the router does not choose, so it can be computed on the GPU that owns
+// the layer while the host works through the eight routed ones. The device dot
+// associates its sum exactly as the host AVX2 dot does and every rounding stays
+// on the host, so the tier is bit-exact -- 129-token decode is byte-identical
+// across five alternating arms.
+//
+// It is off by default because it does not pay (record 0211). Removing 8.20% of
+// the expert bytes the host services took 3.7% off the gate/up dispatch and
+// 2.5% off down, and gave 1.0 s of that back waiting on the device collect, for
+// a net -0.84% on host expert service against host arms whose own spread was
+// 0.48%. Extrapolated to full coverage that is about 1.4% of a decode step, for
+// 1.06 GB of the VRAM M4's routed hot tier wants and measurably worse run-to-run
+// variance. The mechanism stays because M4's expert-residency work needs exactly
+// this primitive; only the default is off. `1` opts in.
+[[nodiscard]] int shared_expert_device_override() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_SHARED_EXPERT_DEVICE");
+    if (value == nullptr || std::string_view(value) == "auto") return 0;
+    return std::string_view(value) != "0" &&
+                   std::string_view(value) != "false" &&
+                   std::string_view(value) != "off"
+               ? 1 : 0;
+}
+
+// Measurement-only bound: service at most this many of the nine experts a MoE
+// layer needs. Output is WRONG by construction -- the dropped experts simply do
+// not contribute -- so this is never a candidate configuration. It exists to
+// price the marginal cost of an expert in the host dispatch, which is the
+// number both M3's shared-expert lever and M4's hot-tier plan are betting on.
+// 0 or unset leaves the production path untouched.
+[[nodiscard]] std::size_t host_expert_bound() noexcept {
+    static const std::size_t bound = [] {
+        const char* value = std::getenv("STRATA_GLM53_EXPERT_BOUND");
+        if (value == nullptr) return std::size_t{0U};
+        const auto parsed = std::strtoul(value, nullptr, 10);
+        return static_cast<std::size_t>(parsed);
+    }();
+    return bound;
+}
+
 [[nodiscard]] bool mtp_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_MTP");
@@ -1758,6 +1798,37 @@ struct Glm53Runtime::Impl {
     std::vector<float> host_moe_quantized_input;
     std::vector<float> host_moe_activations;
     std::vector<float> host_moe_expert_outputs;
+    // All 42 shared experts, resident on the GPU that owns their layer.
+    //
+    // Every MoE layer runs nine experts and the router chooses only eight of
+    // them: the ninth, the shared expert, is known before routing and never
+    // competes for the routed cache. It is also exactly one ninth of host
+    // expert service, which M0 attributed at 67.7% of a decode step, while the
+    // GPUs sit idle for 94% of that step. Moving it across costs 25.17 MB of
+    // VRAM per layer -- 1.06 GB for the tier -- and the device dot associates
+    // its sum exactly as the host AVX2 dot does, so the output is unchanged.
+    struct SharedExpertTier {
+        // Six buffers per layer, in checkpoint-native FP8 with F32 block
+        // scales. They own the device memory the descriptors point into.
+        std::vector<CudaBuffer> storage;
+        std::array<CudaGlm53SharedExpert, kLayers + 1U> experts{};
+        // The device holding each layer's tier, or -1 where it was not
+        // admitted. The MTP layer keeps -1: it is opt-in and its expert runs
+        // on the host path.
+        std::array<int, kLayers + 1U> devices{};
+        std::uint64_t bytes{};
+        bool active{};
+    };
+    SharedExpertTier shared_experts;
+    // One bit per layer, set when a MoE layer serviced its shared expert on
+    // the host. With the tier admitted this should stay zero; anything else
+    // names exactly which layers the dispatch missed.
+    std::atomic<std::uint64_t> shared_expert_host_layers{};
+    std::atomic<std::uint64_t> shared_expert_host_calls{};
+    std::atomic<std::uint64_t> shared_expert_device_calls{};
+    std::vector<float> shared_expert_gate;
+    std::vector<float> shared_expert_up;
+    std::vector<float> shared_expert_output;
     // Paged-primitive scratch, same ownership reasoning. `page_groups` keeps
     // its per-group assignment vectors alive between calls so their capacity is
     // reused; only `clear()` is called on them, never destruction.
@@ -2152,13 +2223,132 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
+    // Admits every shared expert to the GPU that owns its layer.
+    //
+    // The tier is admitted whole or not at all. A partly admitted tier would
+    // make host expert service depend on which layer ran, which would make
+    // every subsequent A/B a comparison of two different workloads.
+    [[nodiscard]] ValidationResult admit_shared_experts() {
+        shared_experts.devices.fill(-1);
+        shared_experts.active = false;
+        shared_experts.bytes = 0U;
+        const auto override = shared_expert_device_override();
+        if (override == 0 || !host_moe_active || devices.empty()) return {};
+
+        constexpr std::uint32_t intermediate = 2048U;
+        // gate and up are intermediate x hidden, down is hidden x
+        // intermediate, and each carries one F32 scale per 128x128 tile.
+        const std::uint64_t projection_bytes =
+            static_cast<std::uint64_t>(intermediate) * kHidden;
+        const std::uint64_t scale_bytes =
+            static_cast<std::uint64_t>(intermediate / 128U) *
+            (kHidden / 128U) * sizeof(float);
+        const std::uint64_t layer_bytes = 3U * projection_bytes +
+                                          3U * scale_bytes;
+        std::vector<std::uint64_t> required(devices.size(), 0U);
+        std::vector<std::uint32_t> admitted_layers;
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            if (!glm53_moe_layer(layer)) continue;
+            required[slot_for(layer)] += layer_bytes;
+            admitted_layers.push_back(layer);
+        }
+        if (admitted_layers.empty()) return {};
+        // The tier holds its own device memory rather than living in the
+        // weight cache's arena, so its bytes come out of that arena before the
+        // cache is built with them -- the same reservation the resident mHC
+        // weights make, for the same reason. Reading free VRAM here would
+        // prove nothing: the cache fills lazily during prefill, so at this
+        // point almost all of the capacity it has been promised is still
+        // unclaimed and still free.
+        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+            if (required[slot] == 0U) continue;
+            if (weight_capacities[slot] <=
+                required[slot] + kMinimumDeviceBudget) {
+                return {{"GLM-5.3 shared expert tier does not fit the "
+                         "admitted CUDA capacity on device " +
+                         std::to_string(devices[slot])}};
+            }
+        }
+        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+            weight_capacities[slot] -= required[slot];
+        }
+
+        shared_experts.storage.resize(admitted_layers.size() * 6U);
+        std::size_t cursor = 0U;
+        for (const auto layer : admitted_layers) {
+            const auto slot = slot_for(layer);
+            const auto device = devices[slot];
+            const auto module = "model.language_model.layers." +
+                std::to_string(layer) + ".mlp.shared_experts.";
+            struct Projection {
+                std::string name;
+                std::uint32_t rows;
+                std::uint32_t columns;
+            };
+            const std::array<Projection, 3U> projections{
+                Projection{module + "gate_proj", intermediate, kHidden},
+                Projection{module + "up_proj", intermediate, kHidden},
+                Projection{module + "down_proj", kHidden, intermediate}};
+            std::array<CudaBuffer*, 6U> uploaded{};
+            for (std::size_t index = 0U; index < projections.size(); ++index) {
+                auto linear = host_fp8_linear(projections[index].name,
+                                              projections[index].rows,
+                                              projections[index].columns);
+                if (!linear.ok()) return {std::move(linear.errors)};
+                auto& weight_buffer = shared_experts.storage[cursor++];
+                auto& scale_buffer = shared_experts.storage[cursor++];
+                auto weights = cuda.upload_buffer(
+                    device, linear.value.weights, weight_buffer);
+                if (!weights.ok()) return weights;
+                auto scales = cuda.upload_buffer(
+                    device,
+                    std::as_bytes(linear.value.scales), scale_buffer);
+                if (!scales.ok()) return scales;
+                uploaded[index * 2U] = &weight_buffer;
+                uploaded[index * 2U + 1U] = &scale_buffer;
+                shared_experts.bytes += linear.value.weights.size_bytes() +
+                                        linear.value.scales.size_bytes();
+            }
+            shared_experts.experts[layer] = {
+                uploaded[0], uploaded[1], uploaded[2],
+                uploaded[3], uploaded[4], uploaded[5],
+                kHidden, intermediate};
+            shared_experts.devices[layer] = device;
+        }
+        shared_experts.active = true;
+        return {};
+    }
+
     [[nodiscard]] ValidationResult host_moe(
         std::uint32_t layer, std::string_view prefix,
         std::span<const KimiRoutedExpert> routed,
         std::span<const float> input, std::span<float> output) {
         ValidationResult result;
         constexpr std::uint32_t intermediate = 2048U;
-        constexpr std::size_t expert_count = 9U;
+        // The shared expert is the ninth of the nine this layer runs and the
+        // only one the router does not choose, so it can be computed on the
+        // idle GPU while the host works through the eight routed ones. When
+        // its tier is admitted the host runs eight; otherwise it runs all
+        // nine, exactly as before.
+        const int shared_device = shared_experts.active &&
+                                  layer < shared_experts.devices.size()
+            ? shared_experts.devices[layer] : -1;
+        std::size_t expert_count = shared_device >= 0 ? 8U : 9U;
+        const auto bound = host_expert_bound();
+        if (bound != 0U) expert_count = std::min(expert_count, bound);
+        if (shared_experts.active) {
+            if (shared_device < 0) {
+                shared_expert_host_calls.fetch_add(
+                    1U, std::memory_order_relaxed);
+                if (layer < 64U) {
+                    shared_expert_host_layers.fetch_or(
+                        std::uint64_t{1U} << layer, std::memory_order_relaxed);
+                }
+            } else {
+                shared_expert_device_calls.fetch_add(
+                    1U, std::memory_order_relaxed);
+            }
+        }
         if (!host_moe_active || host_moe_workers == nullptr ||
             routed.size() != 8U || input.size() != kHidden ||
             output.size() != kHidden) {
@@ -2171,7 +2361,7 @@ struct Glm53Runtime::Impl {
             Glm53HostFp8Linear up;
             Glm53HostFp8Linear down;
         };
-        std::array<Expert, expert_count> experts;
+        std::array<Expert, 9U> experts;
         for (std::size_t index = 0U; index < expert_count; ++index) {
             const auto slot = index < routed.size()
                 ? static_cast<std::uint32_t>(routed[index].expert)
@@ -2185,7 +2375,8 @@ struct Glm53Runtime::Impl {
         if (config.phase_profile) {
             std::uint64_t gate_up_bytes = 0U;
             std::uint64_t down_bytes = 0U;
-            for (const auto& expert : experts) {
+            for (std::size_t index = 0U; index < expert_count; ++index) {
+                const auto& expert = experts[index];
                 gate_up_bytes += expert.gate.weights.size_bytes() +
                                  expert.gate.scales.size_bytes() +
                                  expert.up.weights.size_bytes() +
@@ -2211,6 +2402,14 @@ struct Glm53Runtime::Impl {
             host_moe_input_quantization_nanoseconds.fetch_add(
                 elapsed_nanoseconds(input_quantization_started),
                 std::memory_order_relaxed);
+        }
+        // Enqueued before the host dispatch, collected after it: the device
+        // gate and up run in the shadow of the eight routed experts.
+        if (shared_device >= 0) {
+            result = cuda.enqueue_glm53_shared_gate_up(
+                shared_device, shared_experts.experts[layer],
+                std::span<const float>(quantized_input).first(kHidden));
+            if (!result.ok()) return result;
         }
         auto& activations = host_moe_activations;
         if (glm53_grow(activations, expert_count * intermediate)) ++allocations;
@@ -2250,6 +2449,33 @@ struct Glm53Runtime::Impl {
             glm53_quantize_activation(std::span<float>(activations).subspan(
                 expert * intermediate, intermediate));
         }
+        // The device returns the two raw dots. Every rounding, the clamp and
+        // the SwiGLU stay here, on the same code the host path runs for its
+        // own eight experts, so no device libm function -- expf above all --
+        // enters the result.
+        if (shared_device >= 0) {
+            if (glm53_grow(shared_expert_gate, intermediate)) ++allocations;
+            if (glm53_grow(shared_expert_up, intermediate)) ++allocations;
+            result = cuda.collect_glm53_shared_gate_up(
+                shared_device,
+                std::span<float>(shared_expert_gate).first(intermediate),
+                std::span<float>(shared_expert_up).first(intermediate));
+            if (!result.ok()) return result;
+            for (std::size_t row = 0U; row < intermediate; ++row) {
+                auto gate = bf16_round_f32(shared_expert_gate[row]);
+                auto up = bf16_round_f32(shared_expert_up[row]);
+                gate = std::min(gate, 10.0F);
+                up = std::clamp(up, -10.0F, 10.0F);
+                shared_expert_gate[row] =
+                    bf16_round_f32(gate * sigmoid(gate) * up);
+            }
+            glm53_quantize_activation(
+                std::span<float>(shared_expert_gate).first(intermediate));
+            result = cuda.enqueue_glm53_shared_down(
+                shared_device, shared_experts.experts[layer],
+                std::span<const float>(shared_expert_gate).first(intermediate));
+            if (!result.ok()) return result;
+        }
         if (config.phase_profile) {
             host_moe_activation_nanoseconds.fetch_add(
                 elapsed_nanoseconds(activation_started),
@@ -2285,9 +2511,30 @@ struct Glm53Runtime::Impl {
                 elapsed_nanoseconds(down_started), std::memory_order_relaxed);
         }
         const auto reduction_started = std::chrono::steady_clock::now();
-        std::copy_n(expert_outputs.begin() + 8U * kHidden, kHidden,
-                    output.begin());
-        for (std::size_t expert = 0U; expert < routed.size(); ++expert) {
+        if (shared_device >= 0) {
+            if (glm53_grow(shared_expert_output, kHidden)) ++allocations;
+            result = cuda.collect_glm53_shared_down(
+                shared_device,
+                std::span<float>(shared_expert_output).first(kHidden));
+            if (!result.ok()) return result;
+            // The host down dispatch rounds its own dot to BF16; round the
+            // device's the same way and the shared term is bit-identical.
+            for (std::size_t column = 0U; column < kHidden; ++column) {
+                output[column] = bf16_round_f32(shared_expert_output[column]);
+            }
+        } else if (expert_count == 9U) {
+            std::copy_n(expert_outputs.begin() + 8U * kHidden, kHidden,
+                        output.begin());
+        } else {
+            // Only reachable under the measurement bound, where the shared
+            // expert was not computed and `expert_outputs` has no ninth slot.
+            std::fill(output.begin(), output.end(), 0.0F);
+        }
+        // `expert_count` is `routed.size()` in every production configuration;
+        // it is smaller only under the measurement bound, where summing an
+        // expert that was never computed would read stale scratch.
+        const auto reduced = std::min(routed.size(), expert_count);
+        for (std::size_t expert = 0U; expert < reduced; ++expert) {
             for (std::size_t column = 0U; column < kHidden; ++column) {
                 output[column] = bf16_round_f32(
                     output[column] + bf16_round_f32(
@@ -4604,6 +4851,30 @@ struct Glm53Runtime::Impl {
                       << (cache.useful_prefetches -
                           request->decode_cache_start.useful_prefetches)
                       << '\n';
+            if (shared_experts.active) {
+                const auto missed = shared_expert_host_layers.load(
+                    std::memory_order_relaxed);
+                std::cerr << "[glm53-shared-expert] device_layers="
+                          << (shared_experts.storage.size() / 6U)
+                          << " device_calls="
+                          << shared_expert_device_calls.load(
+                                 std::memory_order_relaxed)
+                          << " host_calls="
+                          << shared_expert_host_calls.load(
+                                 std::memory_order_relaxed)
+                          << " host_path_layers=";
+                if (missed == 0U) {
+                    std::cerr << "none";
+                } else {
+                    const char* separator = "";
+                    for (std::uint32_t layer = 0U; layer < 64U; ++layer) {
+                        if ((missed >> layer & 1U) == 0U) continue;
+                        std::cerr << separator << layer;
+                        separator = ",";
+                    }
+                }
+                std::cerr << '\n';
+            }
         }
         if (config.phase_profile && request->prepared) {
             const auto profile_after_decode = profile_snapshot();
@@ -5280,9 +5551,6 @@ ValidationResult Glm53Runtime::initialize(
             }
         }
     }
-    impl_->weights = std::make_unique<Glm53WeightCache>(
-        *impl_->checkpoint, impl_->cuda, impl_->devices,
-        impl_->weight_capacities);
     const std::string expert_prefix =
         "model.language_model.layers.3.mlp.experts.0.";
     const auto expert_bytes =
@@ -5327,6 +5595,15 @@ ValidationResult Glm53Runtime::initialize(
         impl_->host_moe_active =
             impl_->host_moe_workers->size() == host_width;
     }
+    if (impl_->host_moe_active) {
+        auto admitted = impl_->admit_shared_experts();
+        if (!admitted.ok()) return admitted;
+    }
+    // Built last: the shared-expert tier has already taken its bytes out of
+    // the capacities the cache is about to claim.
+    impl_->weights = std::make_unique<Glm53WeightCache>(
+        *impl_->checkpoint, impl_->cuda, impl_->devices,
+        impl_->weight_capacities);
     if (expert_bytes != 0U) {
         const auto cache_experts = static_cast<std::size_t>(
             cache_bytes / expert_bytes);
@@ -5389,6 +5666,11 @@ ValidationResult Glm53Runtime::initialize(
                          static_cast<double>(1ULL << 30U)
                   << " cuda_cache_gib="
                   << static_cast<double>(cache_bytes) /
+                         static_cast<double>(1ULL << 30U)
+                  << " shared_expert="
+                  << (impl_->shared_experts.active ? "device" : "host")
+                  << " shared_expert_gib="
+                  << static_cast<double>(impl_->shared_experts.bytes) /
                          static_cast<double>(1ULL << 30U)
                   << '\n';
     }

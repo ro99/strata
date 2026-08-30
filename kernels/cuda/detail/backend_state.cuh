@@ -80,6 +80,23 @@ struct CudaBackend::Impl {
         // matmul round trips a step. FlashAttention and the MoE command already
         // stage through pinned host memory; this is the same for the generic
         // matmul.
+        // GLM-5.3 shared-expert scratch. The tier is resident for the life
+        // of the runtime and every layer runs the same three shapes, so these
+        // are allocated once on first use and never grow again.
+        float* glm53_shared_input{};
+        float* glm53_shared_gate{};
+        float* glm53_shared_up{};
+        float* glm53_shared_activation{};
+        float* glm53_shared_output{};
+        std::uint32_t glm53_shared_hidden{};
+        std::uint32_t glm53_shared_intermediate{};
+        // Pinned host staging: a pageable cudaMemcpyAsync is not asynchronous,
+        // and the whole point of this path is that the enqueue returns before
+        // the host starts its eight routed experts.
+        float* glm53_shared_staging{};
+        std::uint32_t glm53_shared_staging_floats{};
+        bool glm53_shared_gate_up_in_flight{};
+        bool glm53_shared_down_in_flight{};
         std::byte* matmul_host_input{};
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};
@@ -419,6 +436,24 @@ struct CudaBackend::Impl {
             }
             if (state.regfed_scratch != nullptr) {
                 static_cast<void>(cudaFree(state.regfed_scratch));
+            }
+            if (state.glm53_shared_input != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_input));
+            }
+            if (state.glm53_shared_gate != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_gate));
+            }
+            if (state.glm53_shared_up != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_up));
+            }
+            if (state.glm53_shared_activation != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_activation));
+            }
+            if (state.glm53_shared_output != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_output));
+            }
+            if (state.glm53_shared_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.glm53_shared_staging));
             }
             if (state.matmul_host_input != nullptr) {
                 static_cast<void>(cudaFreeHost(state.matmul_host_input));

@@ -642,14 +642,17 @@ struct CudaDsv4AttentionPrepareRequest {
     bool host_only{};
 };
 
-// One GLM-5.3 shared expert held on a device in checkpoint-native form.
+// One GLM-5.3 expert held on a device in checkpoint-native form.
+//
+// Its three matrices hold the E4M3 codes and F32 block scales verbatim -- not
+// prepacked, not widened -- because the device dot has to associate its sum
+// exactly as the host AVX2 dot does.
 //
 // The shared expert is the ninth of the nine experts every MoE layer runs and
-// the only one the router does not select, so it can be computed while the
-// host works on the eight routed experts. Its three matrices hold the E4M3
-// codes and F32 block scales verbatim -- not prepacked, not widened -- because
-// the device dot has to associate its sum exactly as the host AVX2 dot does.
-struct CudaGlm53SharedExpert {
+// the only one the router does not select, so it can always be computed while
+// the host works on the eight routed ones. A routed expert can be computed the
+// same way whenever it happens to be resident.
+struct CudaGlm53Expert {
     const CudaBuffer* gate_weights{};
     const CudaBuffer* gate_scales{};
     const CudaBuffer* up_weights{};
@@ -1125,19 +1128,24 @@ public:
         const CudaWeight& down, std::uint32_t intermediate);
     [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
         const CudaGlm53MlaRequest& request);
-    // The shared expert in two halves, because the SwiGLU between them stays
-    // on the host. Each enqueue returns as soon as the work is on the stream;
-    // the matching collect completes it. Both dots are returned raw, so the
-    // caller applies exactly the rounding the host path applies.
-    [[nodiscard]] ValidationResult enqueue_glm53_shared_gate_up(
-        int device, const CudaGlm53SharedExpert& expert,
+    // A batch of device-resident experts in two halves, because the SwiGLU
+    // between them stays on the host. Each enqueue returns as soon as the work
+    // is on the stream; the matching collect completes it. Both dots are
+    // returned raw, so the caller applies exactly the rounding the host path
+    // applies. Outputs are laid out expert-major: gate and up hold
+    // `experts.size() * intermediate` floats, down `experts.size() * hidden`.
+    //
+    // The shared expert is the one-element case. A routed hot tier is the same
+    // call with more of them.
+    [[nodiscard]] ValidationResult enqueue_glm53_expert_gate_up(
+        int device, std::span<const CudaGlm53Expert> experts,
         std::span<const float> quantized_input);
-    [[nodiscard]] ValidationResult collect_glm53_shared_gate_up(
+    [[nodiscard]] ValidationResult collect_glm53_expert_gate_up(
         int device, std::span<float> gate, std::span<float> up);
-    [[nodiscard]] ValidationResult enqueue_glm53_shared_down(
-        int device, const CudaGlm53SharedExpert& expert,
+    [[nodiscard]] ValidationResult enqueue_glm53_expert_down(
+        int device, std::span<const CudaGlm53Expert> experts,
         std::span<const float> quantized_activations);
-    [[nodiscard]] ValidationResult collect_glm53_shared_down(
+    [[nodiscard]] ValidationResult collect_glm53_expert_down(
         int device, std::span<float> output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,

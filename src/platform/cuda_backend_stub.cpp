@@ -171,6 +171,42 @@ ValidationResult CudaBackend::glm53_kda_decode(
     return cuda_unavailable();
 }
 
+ValidationResult CudaBackend::glm53_mhc_router(
+    int, const CudaWeight&, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mhc_swiglu(
+    int, const CudaWeight&, const CudaWeight&, const CudaWeight&,
+    std::uint32_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
+    const CudaGlm53MlaRequest&) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
+    int, std::span<const CudaGlm53Expert>, std::span<const float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::collect_glm53_expert_gate_up(
+    int, std::span<float>, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::enqueue_glm53_expert_down(
+    int, std::span<const CudaGlm53Expert>, std::span<const float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::collect_glm53_expert_down(
+    int, std::span<float>) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::upload_gemma4_kv(
     const CudaBuffer&, std::span<const std::uint16_t>,
     std::span<const std::uint16_t>, std::uint32_t, std::uint32_t,
@@ -482,6 +518,12 @@ ValidationResult CudaBackend::enqueue_moe(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::enqueue_glm53_moe_from_mhc(
+    int, std::span<const CudaMoeExpert>, const CudaMoeExpert&,
+    std::span<const float>, float) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::dsv4_tier_reserve(
     int, std::uint32_t, std::uint32_t) {
     return cuda_unavailable();
@@ -517,6 +559,10 @@ ValidationResult CudaBackend::matmul_impl(
 ValidationResult CudaBackend::synchronize(int) {
     return {{"CUDA support was not compiled into this build"}};
 }
+
+ValidationResult CudaBackend::profiler_start() { return cuda_unavailable(); }
+
+ValidationResult CudaBackend::profiler_stop() { return cuda_unavailable(); }
 
 CudaBackendStats CudaBackend::stats() const noexcept { return {}; }
 

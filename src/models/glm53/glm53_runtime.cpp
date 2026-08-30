@@ -568,20 +568,15 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // on the host, so the tier is bit-exact -- 129-token decode is byte-identical
 // across five alternating arms.
 //
-// On by default. It was measured at -0.84% and held off while the device dot
-// ran one thread per output row; coalescing that kernel took an expert from
-// 2.149 ms to 0.229 ms (`2193ee3`) and the lever moved with it. Re-measured,
-// both device arms beat the host arms bracketing them, by 4.49% and 6.33% of
-// host expert service, with gate/up down 7.16% and down down 5.98% -- which is
-// what removing one expert of nine predicts from makespan alone, 288 blocks
-// over 28 workers falling from eleven rounds to ten. Decode wall -2.79%.
-//
-// The tier costs 1.06 GB of the VRAM a routed hot tier wants, which is about
-// one expert per layer of M4's measured K=11 coverage (record 0212). It buys
-// several times that. `0` opts out.
+// Off by default after the protected six-arm rerun. The coalesced kernel is
+// exact and fast, but three device arms measured +1.71% median decode wall and
+// only -0.21% host expert service against three host arms, both inside the
+// observed ranges. Prefill was neutral (+0.22%); initialization consistently
+// paid about 0.24 s and the tier consumes 1.06 GB. The exact primitive remains
+// for an explicitly selected resident policy. `1` opts in.
 [[nodiscard]] int shared_expert_device_override() noexcept {
     const char* value = std::getenv("STRATA_GLM53_SHARED_EXPERT_DEVICE");
-    if (value == nullptr || std::string_view(value) == "auto") return -1;
+    if (value == nullptr || std::string_view(value) == "auto") return 0;
     return std::string_view(value) != "0" &&
                    std::string_view(value) != "false" &&
                    std::string_view(value) != "off"
@@ -1780,7 +1775,9 @@ struct Glm53Runtime::Impl {
     CudaBackend cuda;
     std::vector<int> devices;
     std::vector<std::size_t> device_schedule;
+    std::vector<std::uint64_t> device_budgets;
     std::vector<std::uint64_t> weight_capacities;
+    std::vector<std::uint64_t> resident_reserve_bytes;
     std::vector<Glm53RowRange> lm_head_ranges;
     std::unique_ptr<Glm53WeightCache> weights;
     std::array<ResidentLayerWeights, kLayers> resident_layers;
@@ -1825,14 +1822,15 @@ struct Glm53Runtime::Impl {
     // VRAM per layer -- 1.06 GB for the tier -- and the device dot associates
     // its sum exactly as the host AVX2 dot does, so the output is unchanged.
     struct SharedExpertTier {
-        // Six buffers per layer, in checkpoint-native FP8 with F32 block
-        // scales. They own the device memory the descriptors point into.
+        // Six buffers per admitted expert, in checkpoint-native FP8 with F32
+        // block scales. They own the device memory the descriptors point into.
         std::vector<CudaBuffer> storage;
-        std::array<CudaGlm53SharedExpert, kLayers + 1U> experts{};
+        std::array<CudaGlm53Expert, kLayers + 1U> experts{};
         // The device holding each layer's tier, or -1 where it was not
         // admitted. The MTP layer keeps -1: it is opt-in and its expert runs
         // on the host path.
         std::array<int, kLayers + 1U> devices{};
+        std::vector<std::uint64_t> bytes_by_slot;
         std::uint64_t bytes{};
         bool active{};
     };
@@ -2279,6 +2277,7 @@ struct Glm53Runtime::Impl {
         shared_experts.devices.fill(-1);
         shared_experts.active = false;
         shared_experts.bytes = 0U;
+        shared_experts.bytes_by_slot.assign(devices.size(), 0U);
         const auto override = shared_expert_device_override();
         if (override == 0 || !host_moe_active || devices.empty()) return {};
 
@@ -2349,17 +2348,20 @@ struct Glm53Runtime::Impl {
                 if (!linear.ok()) return {std::move(linear.errors)};
                 auto& weight_buffer = shared_experts.storage[cursor++];
                 auto& scale_buffer = shared_experts.storage[cursor++];
-                auto weights = cuda.upload_buffer(
+                auto weight_upload = cuda.upload_buffer(
                     device, linear.value.weights, weight_buffer);
-                if (!weights.ok()) return weights;
-                auto scales = cuda.upload_buffer(
+                if (!weight_upload.ok()) return weight_upload;
+                auto scale_upload = cuda.upload_buffer(
                     device,
                     std::as_bytes(linear.value.scales), scale_buffer);
-                if (!scales.ok()) return scales;
+                if (!scale_upload.ok()) return scale_upload;
                 uploaded[index * 2U] = &weight_buffer;
                 uploaded[index * 2U + 1U] = &scale_buffer;
                 shared_experts.bytes += linear.value.weights.size_bytes() +
                                         linear.value.scales.size_bytes();
+                shared_experts.bytes_by_slot[slot] +=
+                    linear.value.weights.size_bytes() +
+                    linear.value.scales.size_bytes();
             }
             shared_experts.experts[layer] = {
                 uploaded[0], uploaded[1], uploaded[2],
@@ -2458,8 +2460,10 @@ struct Glm53Runtime::Impl {
         // Enqueued before the host dispatch, collected after it: the device
         // gate and up run in the shadow of the eight routed experts.
         if (shared_device >= 0) {
-            result = cuda.enqueue_glm53_shared_gate_up(
-                shared_device, shared_experts.experts[layer],
+            result = cuda.enqueue_glm53_expert_gate_up(
+                shared_device,
+                std::span<const CudaGlm53Expert>(
+                    &shared_experts.experts[layer], 1U),
                 std::span<const float>(quantized_input).first(kHidden));
             if (!result.ok()) return result;
         }
@@ -2508,7 +2512,7 @@ struct Glm53Runtime::Impl {
         if (shared_device >= 0) {
             if (glm53_grow(shared_expert_gate, intermediate)) ++allocations;
             if (glm53_grow(shared_expert_up, intermediate)) ++allocations;
-            result = cuda.collect_glm53_shared_gate_up(
+            result = cuda.collect_glm53_expert_gate_up(
                 shared_device,
                 std::span<float>(shared_expert_gate).first(intermediate),
                 std::span<float>(shared_expert_up).first(intermediate));
@@ -2523,8 +2527,10 @@ struct Glm53Runtime::Impl {
             }
             glm53_quantize_activation(
                 std::span<float>(shared_expert_gate).first(intermediate));
-            result = cuda.enqueue_glm53_shared_down(
-                shared_device, shared_experts.experts[layer],
+            result = cuda.enqueue_glm53_expert_down(
+                shared_device,
+                std::span<const CudaGlm53Expert>(
+                    &shared_experts.experts[layer], 1U),
                 std::span<const float>(shared_expert_gate).first(intermediate));
             if (!result.ok()) return result;
         }
@@ -2565,7 +2571,7 @@ struct Glm53Runtime::Impl {
         const auto reduction_started = std::chrono::steady_clock::now();
         if (shared_device >= 0) {
             if (glm53_grow(shared_expert_output, kHidden)) ++allocations;
-            result = cuda.collect_glm53_shared_down(
+            result = cuda.collect_glm53_expert_down(
                 shared_device,
                 std::span<float>(shared_expert_output).first(kHidden));
             if (!result.ok()) return result;
@@ -3123,6 +3129,31 @@ struct Glm53Runtime::Impl {
                           << " pinned_bytes=" << stats.pinned[slot]
                           << " cache_capacity_bytes=" << stats.capacity[slot]
                           << '\n';
+            }
+        }
+        if (config.phase_profile) {
+            const auto stats = weights->stats();
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                std::size_t moe_layers = 0U;
+                for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+                    if (glm53_moe_layer(layer) && slot_for(layer) == slot) {
+                        ++moe_layers;
+                    }
+                }
+                std::cerr << "[glm53-capacity] cuda=" << devices[slot]
+                          << " moe_layers=" << moe_layers
+                          << " admitted_budget_bytes=" << device_budgets[slot]
+                          << " workspace_reserve_bytes="
+                          << kDeviceWorkspaceReserve
+                          << " resident_reserve_bytes="
+                          << resident_reserve_bytes[slot]
+                          << " shared_expert_bytes="
+                          << shared_experts.bytes_by_slot[slot]
+                          << " arena_capacity_bytes=" << stats.capacity[slot]
+                          << " arena_used_bytes=" << stats.used[slot]
+                          << " arena_pinned_bytes=" << stats.pinned[slot]
+                          << " arena_free_bytes="
+                          << (stats.capacity[slot] - stats.used[slot]) << '\n';
             }
         }
         return result;
@@ -3984,7 +4015,7 @@ struct Glm53Runtime::Impl {
         std::uint32_t rows, std::uint32_t layer, const std::string& prefix,
         std::span<const std::uint64_t> route_requests = {},
         std::span<const std::uint32_t> route_positions = {},
-        bool schedule_prefetch = false) {
+        bool schedule_prefetch = false, bool route_prefill = false) {
         if ((!route_requests.empty() || !route_positions.empty()) &&
             (route_requests.size() != rows || route_positions.size() != rows)) {
             return {{"GLM-5.3 route-observation page has an invalid shape"}};
@@ -4011,14 +4042,14 @@ struct Glm53Runtime::Impl {
                 *bias.value, 2.5F);
             if (!result.ok()) return result;
             if (!route_requests.empty()) {
-                // `rows > 1` is what makes this a prompt page. Decode drives
-                // the same page path at a single row for the layers that are
-                // not on the resident chain, and those visits are decode
-                // routes -- the census would otherwise file 11 of the 42 MoE
-                // layers under prefill.
+                // Prompt pages and independent decode cohorts both have
+                // `rows > 1`; only the caller knows which one this is. Using
+                // width as phase mislabeled concurrent server decode as
+                // prefill and silently dropped those tokens from M4 policy
+                // analysis.
                 observe_route(layer, selected, route_requests[row],
                               route_positions[row], schedule_prefetch,
-                              rows > 1U);
+                              route_prefill);
             }
         }
         if (host_moe_active) {
@@ -4322,7 +4353,7 @@ struct Glm53Runtime::Impl {
         }
         const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward_page(branch, normalized, rows, layer, prefix,
-                                  route_requests, route_positions);
+                                  route_requests, route_positions, false, true);
         if (!result.ok()) return result;
         if (config.phase_profile) {
             graph_feedforward_block_nanoseconds.fetch_add(
@@ -4458,7 +4489,7 @@ struct Glm53Runtime::Impl {
         }
         const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward_page(branch, normalized, rows, layer, prefix,
-                                  route_requests, positions, true);
+                                  route_requests, positions, true, false);
         if (!result.ok()) return result;
         if (config.phase_profile) {
             graph_feedforward_block_nanoseconds.fetch_add(
@@ -5574,14 +5605,12 @@ ValidationResult Glm53Runtime::initialize(
     result = impl_->cuda.initialize(impl_->devices,
                                     impl_->config.phase_profile);
     if (!result.ok()) return result;
-    for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
-        result = impl_->cuda.reserve_weight_arena(
-            impl_->devices[slot], device_plan.value.weight_capacities[slot]);
-        if (!result.ok()) return result;
-    }
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->checkpoint = std::move(checkpoint.value);
+    impl_->device_budgets = device_plan.value.budgets;
     impl_->weight_capacities = device_plan.value.weight_capacities;
+    impl_->resident_reserve_bytes.assign(impl_->devices.size(), 0U);
+    impl_->shared_experts.bytes_by_slot.assign(impl_->devices.size(), 0U);
     if (impl_->devices.size() > 1U &&
         !cross_gpu_projections_enabled(impl_->devices)) {
         // PCIe/PHB systems pay a full activation bridge for every owner
@@ -5626,6 +5655,7 @@ ValidationResult Glm53Runtime::initialize(
             }
         }
         if (impl_->resident_execution_active) {
+            impl_->resident_reserve_bytes = resident_reserve;
             for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
                 impl_->weight_capacities[slot] -= resident_reserve[slot];
             }
@@ -5640,7 +5670,7 @@ ValidationResult Glm53Runtime::initialize(
             expert_prefix + "up_proj") +
         impl_->checkpoint->cuda_linear_storage_bytes(
             expert_prefix + "down_proj");
-    const auto cache_bytes = std::accumulate(
+    const auto initial_cache_bytes = std::accumulate(
         impl_->weight_capacities.begin(), impl_->weight_capacities.end(),
         std::uint64_t{0U});
     const auto routed_bytes = std::accumulate(
@@ -5665,7 +5695,7 @@ ValidationResult Glm53Runtime::initialize(
     const bool host_moe_admitted = override > 0 ||
         (override < 0 && host_instruction_support &&
          host_width >= model_parallel_width &&
-         cache_bytes != 0U && routed_bytes > 2U * cache_bytes);
+         initial_cache_bytes != 0U && routed_bytes > 2U * initial_cache_bytes);
     if (host_moe_admitted && host_width != 0U) {
         std::vector<int> cpus(hardware.usable_cpu_ids.begin(),
                               hardware.usable_cpu_ids.begin() +
@@ -5679,11 +5709,21 @@ ValidationResult Glm53Runtime::initialize(
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
     }
-    // Built last: the shared-expert tier has already taken its bytes out of
-    // the capacities the cache is about to claim.
+    // Allocate the arena only after every independently allocated resident
+    // tier has reduced its capacity. This makes the physical allocation match
+    // the admission ledger; reducing only the cache's logical capacity after
+    // cudaMalloc would spend the workspace/safety reserve a second time.
+    for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+        result = impl_->cuda.reserve_weight_arena(
+            impl_->devices[slot], impl_->weight_capacities[slot]);
+        if (!result.ok()) return result;
+    }
     impl_->weights = std::make_unique<Glm53WeightCache>(
         *impl_->checkpoint, impl_->cuda, impl_->devices,
         impl_->weight_capacities);
+    const auto cache_bytes = std::accumulate(
+        impl_->weight_capacities.begin(), impl_->weight_capacities.end(),
+        std::uint64_t{0U});
     if (expert_bytes != 0U) {
         const auto cache_experts = static_cast<std::size_t>(
             cache_bytes / expert_bytes);

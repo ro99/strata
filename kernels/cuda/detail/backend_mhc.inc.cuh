@@ -778,7 +778,7 @@ ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
     }
     auto& state = found->second;
     if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
-        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.dsv4_mhc_workspace == nullptr ||
         state.moe_in_flight || state.dsv4_mhc_failed ||
         layer_input.size() != kDsv4MhcHidden ||
         state.dsv4_mhc_host_staging == nullptr ||
@@ -811,6 +811,46 @@ ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
         }
     }
     return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_download_branch(
+    int device, std::span<float> branch) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"mHC branch download targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || !state.dsv4_mhc_branch_ready ||
+        state.moe_in_flight || state.dsv4_mhc_failed ||
+        branch.size() != kDsv4MhcHidden ||
+        state.dsv4_mhc_host_staging == nullptr ||
+        state.dsv4_mhc_host_staging_bytes <
+            kDsv4MhcHidden * sizeof(std::uint16_t)) {
+        return {{"mHC branch download violates command order"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch download");
+    }
+    const auto bytes = kDsv4MhcHidden * sizeof(std::uint16_t);
+    if (auto status = cudaMemcpyAsync(
+            state.dsv4_mhc_host_staging,
+            state.dsv4_mhc_workspace->branch, bytes,
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download mHC branch");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize mHC branch download");
+    }
+    const auto* encoded = reinterpret_cast<const std::uint16_t*>(
+        state.dsv4_mhc_host_staging);
+    for (std::size_t index = 0U; index < branch.size(); ++index) {
+        branch[index] = std::bit_cast<float>(
+            static_cast<std::uint32_t>(encoded[index]) << 16U);
+    }
+    return {};
 }
 
 ValidationResult CudaBackend::dsv4_mhc_device_view(

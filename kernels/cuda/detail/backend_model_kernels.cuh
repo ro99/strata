@@ -80,6 +80,117 @@ cudaError_t launch_regfed_fp8_matvec(RegfedWorkspace& workspace,
     return cudaGetLastError();
 }
 
+// F32-scaled FP8 counterpart for device-resident activations.  GLM-5.3 uses
+// weight_scale_inv tensors, not DeepSeek's E8M0 scale bytes.  Keep the same
+// compact activation quantization and M<=16 chunking as matmul_impl so a row
+// has the accepted projection operands and reduction association.
+cudaError_t launch_regfed_fp8_f32_rows(
+    RegfedWorkspace& workspace, const CudaWeightDescriptor& descriptor,
+    void* weights, void* scales, bool& prepacked, const float* input,
+    float* output, std::uint32_t batch, cudaStream_t stream) {
+    if (descriptor.encoding != CudaWeightEncoding::Fp8E4m3Block128F32 ||
+        batch == 0U) {
+        return cudaErrorInvalidValue;
+    }
+    const auto rows = static_cast<std::uint32_t>(descriptor.rows);
+    const auto columns = static_cast<std::uint32_t>(descriptor.columns);
+    const auto scale_columns =
+        static_cast<std::uint32_t>(descriptor.scale_columns);
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    std::uint32_t split = 1U;
+    const auto column_blocks = columns / 32U;
+    while (split < 16U && column_blocks % ((split * 2U) * 4U) == 0U &&
+           n_tiles * split * 2U <= 4096U) {
+        split *= 2U;
+    }
+    const std::uint64_t activation_bytes =
+        static_cast<std::uint64_t>(k_tiles) * kRegfedMaxColBlocks *
+        kRegfedTileM * 4U * sizeof(uint2);
+    const std::uint64_t partial_bytes = static_cast<std::uint64_t>(n_tiles) *
+        split * kRegfedTileN * kRegfedMaxM * sizeof(float);
+    const std::uint64_t counter_bytes =
+        static_cast<std::uint64_t>(n_tiles) * sizeof(std::uint32_t);
+    const std::uint64_t compact_bytes =
+        static_cast<std::uint64_t>(batch) * columns +
+        static_cast<std::uint64_t>(batch) * scale_columns * sizeof(float);
+    const std::uint64_t scratch_bytes = std::max<std::uint64_t>(
+        compact_bytes, fragment_prepack_scratch_bytes(descriptor));
+    if (auto status = regfed_grow(workspace.activation,
+                                  workspace.activation_bytes,
+                                  activation_bytes, false, stream);
+        status != cudaSuccess) return status;
+    if (auto status = regfed_grow(workspace.partials, workspace.partial_bytes,
+                                  partial_bytes, false, stream);
+        status != cudaSuccess) return status;
+    if (auto status = regfed_grow(workspace.counters, workspace.counter_bytes,
+                                  counter_bytes, true, stream);
+        status != cudaSuccess) return status;
+    if (auto status = regfed_grow(workspace.scratch, workspace.scratch_bytes,
+                                  scratch_bytes, false, stream);
+        status != cudaSuccess) return status;
+    if (!prepacked) {
+        if (auto status = launch_fragment_prepack(
+                descriptor, weights, scales, workspace.scratch, stream);
+            status != cudaSuccess) return status;
+        prepacked = true;
+    }
+    auto* compact_values = static_cast<unsigned char*>(workspace.scratch);
+    auto* compact_scales = reinterpret_cast<float*>(
+        compact_values + static_cast<std::uint64_t>(batch) * columns);
+    quantize_activation_e4m3_f32_bytes_kernel<<<
+        dim3{scale_columns, batch, 1U}, 128U, 0U, stream>>>(
+        compact_values, compact_scales, input, columns, batch);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) return status;
+    const unsigned int blocks = static_cast<unsigned int>(
+        std::min<std::uint64_t>(
+            (static_cast<std::uint64_t>(n_tiles) * split +
+             kRegfedWarpsPerBlock - 1U) / kRegfedWarpsPerBlock,
+            65535U));
+    for (std::uint32_t start = 0U; start < batch; start += kRegfedMaxM) {
+        const auto chunk = std::min<std::uint32_t>(kRegfedMaxM, batch - start);
+        const auto chunk_blocks =
+            (chunk + kRegfedTileM - 1U) / kRegfedTileM;
+        const auto chunk_groups = std::min<std::uint32_t>(chunk, kRegfedTileM);
+        const auto fragment_total = static_cast<std::uint64_t>(k_tiles) *
+            chunk_blocks * chunk_groups * 4U;
+        regfed_fp8_activation_fragment_kernel<<<
+            static_cast<unsigned int>(std::min<std::uint64_t>(
+                (fragment_total + 255U) / 256U, 65535U)),
+            256U, 0U, stream>>>(
+            static_cast<uint2*>(workspace.activation),
+            compact_values + static_cast<std::uint64_t>(start) * columns,
+            chunk, columns, chunk_blocks, chunk_groups);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return status;
+        }
+        auto* chunk_output =
+            output + static_cast<std::uint64_t>(start) * rows;
+        const auto launch = [&](auto tag) {
+            constexpr std::uint32_t kBlocks = decltype(tag)::value;
+            regfed_fp8_f32_matmul_kernel<kBlocks><<<
+                blocks, kRegfedWarpsPerBlock * 32U, 0U, stream>>>(
+                chunk_output, static_cast<const uint4*>(weights),
+                static_cast<const float*>(scales),
+                static_cast<const uint2*>(workspace.activation),
+                compact_scales + static_cast<std::uint64_t>(start) *
+                                     scale_columns,
+                columns, rows, scale_columns, split, chunk, chunk_groups,
+                static_cast<float*>(workspace.partials),
+                static_cast<std::uint32_t*>(workspace.counters));
+        };
+        if (chunk_blocks == 1U) {
+            launch(std::integral_constant<std::uint32_t, 1U>{});
+        } else {
+            launch(std::integral_constant<std::uint32_t, 2U>{});
+        }
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
+}
+
 // One register-fed FP4 matvec against a device-resident activation. Unlike the
 // DeepSeek helper above, Gemma weights have already been explicitly prepacked
 // by their loader after all consumers have been audited.

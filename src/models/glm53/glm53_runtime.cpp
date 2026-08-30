@@ -543,6 +543,13 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool resident_mla_compare_enabled() noexcept {
+    const char* value = std::getenv("STRATA_GLM53_RESIDENT_MLA_COMPARE");
+    return value != nullptr && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "off";
+}
+
 [[nodiscard]] bool profiler_capture_enabled() noexcept {
     const char* value = std::getenv("STRATA_GLM53_NSYS_CAPTURE");
     return value != nullptr && std::string_view(value) != "0" &&
@@ -4185,6 +4192,68 @@ struct Glm53Runtime::Impl {
                 slot_for(layer), attention, request);
         }
         if (!result.ok()) return result;
+        if (!glm53_kda_layer(layer) && resident_mla_compare_enabled()) {
+            std::vector<float> normalized(kHidden), actual(kHidden),
+                expected(kHidden);
+            result = cuda.dsv4_mhc_download_layer_input(device, normalized);
+            if (!result.ok()) return result;
+            result = cuda.dsv4_mhc_download_branch(device, actual);
+            if (!result.ok()) return result;
+            result = attention_mla(expected, normalized, layer, position,
+                                   attention, sequence);
+            if (!result.ok()) return result;
+            // The branch is what the layer publishes, but it is not the only
+            // thing the resident path writes: it also appends this position's
+            // latent to its device cache, and every later step attends over
+            // that history. A branch that matches today and a latent that is
+            // one ULP out is exactly the failure that survives a short oracle
+            // and diverges a long one, so compare the latent first.
+            //
+            // `attention_mla` above has already appended this position's row
+            // to the host cache, so both sides now hold row `position`.
+            auto& host_cache = sequence.mla(layer);
+            if (host_cache.rows() == position + 1U) {
+                const auto host_rows = host_cache.materialize();
+                std::vector<float> device_row(kKvRank);
+                const auto latent_offset =
+                    static_cast<std::uint64_t>(position) * kKvRank *
+                    sizeof(float);
+                auto downloaded = cuda.download_buffer(
+                    device_sequence.mla[layer], latent_offset,
+                    std::as_writable_bytes(std::span<float>(device_row)));
+                if (!downloaded.ok()) return downloaded;
+                const auto* host_row =
+                    host_rows.data() +
+                    static_cast<std::size_t>(position) * kKvRank;
+                for (std::size_t index = 0U; index < device_row.size();
+                     ++index) {
+                    if (host_row[index] == device_row[index]) continue;
+                    return {{"GLM-5.3 resident MLA latent mismatch at layer " +
+                             std::to_string(layer) + ", position " +
+                             std::to_string(position) + ", element " +
+                             std::to_string(index) + ": expected " +
+                             std::to_string(host_row[index]) + ", actual " +
+                             std::to_string(device_row[index])}};
+                }
+            }
+            std::size_t first = expected.size();
+            float maximum = 0.0F;
+            for (std::size_t index = 0U; index < expected.size(); ++index) {
+                maximum = std::max(maximum,
+                                   std::fabs(expected[index] - actual[index]));
+                if (first == expected.size() &&
+                    expected[index] != actual[index]) first = index;
+            }
+            if (first != expected.size()) {
+                return {{"GLM-5.3 resident MLA exactness mismatch at layer " +
+                         std::to_string(layer) + ", position " +
+                         std::to_string(position) + ", element " +
+                         std::to_string(first) + ": expected " +
+                         std::to_string(expected[first]) + ", actual " +
+                         std::to_string(actual[first]) + ", maximum " +
+                         std::to_string(maximum)}};
+            }
+        }
         if (config.phase_profile) {
             const auto elapsed = elapsed_nanoseconds(attention_started);
             graph_attention_block_nanoseconds.fetch_add(

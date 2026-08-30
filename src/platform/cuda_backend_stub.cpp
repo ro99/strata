@@ -381,6 +381,11 @@ ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_mhc_download_branch(
+    int, std::span<float>) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::dsv4_mhc_device_view(
     int, CudaDsv4MhcDeviceView&) {
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};

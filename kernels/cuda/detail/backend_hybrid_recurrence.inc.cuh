@@ -173,11 +173,18 @@ __global__ void glm53_mla_attention_kernel(
                     (2U * head_dim);
             const auto* q = query +
                 static_cast<std::uint64_t>(head) * head_dim;
+            // The host fallback writes `score += q[column] * kv[column]`,
+            // which GCC contracts to an FMA at -O3 on this FMA3 host, so a
+            // separate rounded multiply and add is a different number. Match
+            // the contraction rather than the source text.
             float score = 0.0F;
             for (std::uint32_t column = 0U; column < head_dim; ++column) {
-                score = __fadd_rn(score, __fmul_rn(q[column], key[column]));
+                score = __fmaf_rn(q[column], key[column], score);
             }
-            score *= rsqrtf(static_cast<float>(head_dim));
+            // `rsqrtf` is a ~2 ULP approximation. The host computes
+            // `1.0F / std::sqrt(head_dim)` once and multiplies, so do exactly
+            // that: for head_dim 256 it is 0.0625 and must be that bit pattern.
+            score *= 1.0F / sqrtf(static_cast<float>(head_dim));
             scores[token] = score;
             highest = fmaxf(highest, score);
         }
@@ -517,11 +524,11 @@ ValidationResult CudaBackend::glm53_kda_decode(
                     return cuda_error(status, operation);
                 }
             } else {
-                if (auto status = launch_regfed_fp8_matvec(
+                if (auto status = launch_regfed_fp8_f32_rows(
                         device_state.moe_regfed, projection.descriptor,
                         projection.weights, projection.scales,
                         projection.fragment_prepacked, source, destination,
-                        device_state.stream);
+                        1U, device_state.stream);
                     status != cudaSuccess) {
                     return cuda_error(status, operation);
                 }
@@ -746,11 +753,11 @@ ValidationResult CudaBackend::glm53_kda_decode(
                     status, "launch GLM-5.3 fused BF16 KDA output projection");
             }
         } else {
-            if (auto status = launch_regfed_fp8_matvec(
+            if (auto status = launch_regfed_fp8_f32_rows(
                     device_state.moe_regfed, projection.descriptor,
                     projection.weights, projection.scales,
                     projection.fragment_prepacked, device_state.output,
-                    device_state.input, device_state.stream);
+                    device_state.input, 1U, device_state.stream);
                 status != cudaSuccess) {
                 return cuda_error(
                     status, "launch GLM-5.3 fused FP8 KDA output projection");
@@ -945,10 +952,10 @@ ValidationResult CudaBackend::glm53_mhc_swiglu(
                 descriptor.columns, rows);
             return cudaGetLastError();
         }
-        return launch_regfed_fp8_matvec(
+        return launch_regfed_fp8_f32_rows(
             state.moe_regfed, descriptor, weight.impl_->weights,
             weight.impl_->scales, weight.impl_->fragment_prepacked,
-            source, destination, state.stream);
+            source, destination, 1U, state.stream);
     };
     if (auto status = project(gate, state.moe_hidden, gate_output,
                               intermediate); status != cudaSuccess) {
@@ -1037,10 +1044,27 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
         return {{"CUDA GLM-5.3 resident MLA projection shapes are invalid"}};
     }
     const auto history = static_cast<std::uint64_t>(request.position) + 1U;
-    const auto compressed_width =
-        static_cast<std::uint64_t>(request.heads) * request.key_value_rank;
+    // Keep the accepted host fallback's projection/attention association.
+    // Absorbing the KV-B projection into the query is algebraically equivalent,
+    // but not bit-equivalent after the model's BF16 projection boundaries.
+    // The resident path therefore expands the latent history exactly as the
+    // fallback does before applying attention.
+    //
+    // Size the workspace from the admitted context rather than the current
+    // position. The expanded history grows by `expanded_width` floats every
+    // token, so sizing it from `history` would cudaFree and cudaMalloc inside a
+    // timed decode step -- which M4's gate forbids outright, and which would
+    // also make a step's cost depend on when the buffer last happened to grow.
+    // Reserving once costs `maximum_context * expanded_width` floats, 134 MB at
+    // 2,048 tokens and this model's 64 heads, inside the per-device workspace
+    // reserve the planner already withholds.
+    //
+    // The offsets below use the reserved extent too, so a pointer into the
+    // workspace means the same thing at every position.
+    const auto reserved_history = std::max<std::uint64_t>(
+        history, request.maximum_context);
     const auto workspace_floats = kDsv4MhcHidden + request.query_rank + width +
-        2U * compressed_width + width + kDsv4MhcHidden;
+        reserved_history * expanded_width + width + kDsv4MhcHidden;
     const auto workspace_bytes = workspace_floats * sizeof(float);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status,
@@ -1067,9 +1091,8 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     auto* input = workspace;
     auto* q_rank = input + kDsv4MhcHidden;
     auto* query = q_rank + request.query_rank;
-    auto* compressed_query = query + width;
-    auto* weighted_latent = compressed_query + compressed_width;
-    auto* attended = weighted_latent + compressed_width;
+    auto* expanded = query + width;
+    auto* attended = expanded + reserved_history * expanded_width;
     auto* output = attended + width;
     auto* latent = packed + static_cast<std::uint64_t>(request.position) *
                                 request.key_value_rank;
@@ -1090,11 +1113,11 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
                 destination, source,
                 static_cast<const __nv_bfloat16*>(weight->impl_->weights),
                 descriptor.columns, rows);
-        } else if (auto status = launch_regfed_fp8_matvec(
+        } else if (auto status = launch_regfed_fp8_f32_rows(
                        state.moe_regfed, descriptor, weight->impl_->weights,
                        weight->impl_->scales,
                        weight->impl_->fragment_prepacked, source, destination,
-                       state.stream); status != cudaSuccess) {
+                       1U, state.stream); status != cudaSuccess) {
             return status;
         }
         round_bf16_rows_kernel<<<
@@ -1119,24 +1142,42 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
         status != cudaSuccess) {
         return cuda_error(status, "project resident GLM-5.3 MLA query B");
     }
-    const auto* kv_weights = static_cast<const __nv_bfloat16*>(
-        request.key_value_b->impl_->weights);
-    glm53_mla_absorb_query_kernel<<<
-        static_cast<unsigned int>((compressed_width + threads - 1U) / threads),
-        threads, 0U, state.stream>>>(
-        query, kv_weights, compressed_query, request.heads, request.head_dim,
-        request.key_value_rank);
-    glm53_mla_latent_attention_kernel<<<
+    const auto& kv_descriptor = request.key_value_b->impl_->descriptor;
+    if (kv_descriptor.encoding == CudaWeightEncoding::Plain) {
+        const dim3 kv_grid(
+            static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
+            static_cast<unsigned int>(
+                (history + kBf16MatvecRowTile - 1U) /
+                kBf16MatvecRowTile),
+            1U);
+        bf16_matvec_rows_kernel<kBf16MatvecRowTile><<<
+            kv_grid, threads, 0U, state.stream>>>(
+            expanded, packed,
+            static_cast<const __nv_bfloat16*>(
+                request.key_value_b->impl_->weights),
+            static_cast<std::uint32_t>(history), request.key_value_rank,
+            expanded_width);
+    } else if (auto status = launch_regfed_fp8_f32_rows(
+                   state.moe_regfed, kv_descriptor,
+                   request.key_value_b->impl_->weights,
+                   request.key_value_b->impl_->scales,
+                   request.key_value_b->impl_->fragment_prepacked, packed,
+                   expanded, static_cast<std::uint32_t>(history),
+                   state.stream); status != cudaSuccess) {
+        return cuda_error(status, "project resident GLM-5.3 MLA KV B");
+    }
+    round_bf16_rows_kernel<<<
+        static_cast<unsigned int>(
+            std::min<std::uint64_t>(
+                (history * expanded_width + threads - 1U) / threads,
+                65535U)),
+        threads, 0U, state.stream>>>(expanded, history * expanded_width);
+    glm53_mla_attention_kernel<<<
         request.heads, threads,
         static_cast<std::size_t>(history * sizeof(float)),
-        state.stream>>>(compressed_query, packed, weighted_latent,
+        state.stream>>>(query, expanded, attended,
                         static_cast<std::uint32_t>(history), request.heads,
-                        request.head_dim, request.key_value_rank);
-    glm53_mla_expand_value_kernel<<<
-        static_cast<unsigned int>((width + threads - 1U) / threads), threads,
-        0U, state.stream>>>(weighted_latent, kv_weights, attended,
-                            request.heads, request.head_dim,
-                            request.key_value_rank);
+                        request.head_dim);
     if (auto status = project_one(request.output, attended, output,
                                   kDsv4MhcHidden);
         status != cudaSuccess) {

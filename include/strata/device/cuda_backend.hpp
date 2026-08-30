@@ -1303,6 +1303,8 @@ public:
         int device, std::span<float> hidden);
     [[nodiscard]] ValidationResult dsv4_mhc_download_layer_input(
         int device, std::span<float> layer_input);
+    [[nodiscard]] ValidationResult dsv4_mhc_download_branch(
+        int device, std::span<float> branch);
     // Device-only rank-local mHC bridges.  These preserve the existing state
     // machine while keeping the attention/FFN boundary on the CUDA stream.
     [[nodiscard]] ValidationResult dsv4_mhc_device_view(

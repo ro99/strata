@@ -544,6 +544,33 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+// Runs the MLA attention on the accepted host fallback while the layer keeps
+// the *device* mHC. This is the control the resident MLA candidate actually
+// needs, and it is not the production fallback.
+//
+// Host `mhc_pre` and the device mHC are not the same function: they disagree on
+// every layer, and flipping all 45 layers to the host path changes the
+// generated text (`bf2016cd3e39` against the reference `b3deffc5d0f0`). The
+// reference encodes a mixture -- device mHC on the 34 KDA layers, host mHC on
+// the 11 MLA fallback layers -- so enabling resident MLA moves those 11 layers
+// between two different mHC implementations and its output must change however
+// exact its attention is. Comparing against the reference therefore measures
+// the mHC swap, not the attention.
+//
+// With this flag the control keeps device mHC on all 45 layers and differs
+// from the candidate only in where the MLA attention runs, which is the
+// variable under test.
+[[nodiscard]] bool resident_mla_host_attention() noexcept {
+    static const bool enabled = [] {
+        const char* value =
+            std::getenv("STRATA_GLM53_RESIDENT_MLA_HOST_ATTENTION");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool resident_mla_compare_enabled() noexcept {
     const char* value = std::getenv("STRATA_GLM53_RESIDENT_MLA_COMPARE");
     return value != nullptr && std::string_view(value) != "0" &&
@@ -4200,22 +4227,34 @@ struct Glm53Runtime::Impl {
             result = cuda.dsv4_mhc_download_layer_input(
                 device, device_normalized);
             if (!result.ok()) return result;
+            // `dsv4_mhc_begin_impl` BF16-encodes the incoming streams before
+            // it uploads them, so model that here: any difference that
+            // survives is a difference between the two mHC implementations
+            // rather than between their inputs.
+            std::vector<float> rounded(streams.begin(), streams.end());
+            round_bf16(rounded);
             Dsv4MhcMix host_mix;
-            result = mhc_pre(collapsed, host_mix, streams, prefix + "hc_attn");
+            result = mhc_pre(collapsed, host_mix, rounded,
+                             prefix + "hc_attn");
             if (!result.ok()) return result;
             result = norm(host_normalized, collapsed,
                           prefix + "input_layernorm.weight");
             if (!result.ok()) return result;
+            std::size_t differing = 0U;
+            float worst = 0.0F;
             for (std::size_t index = 0U; index < host_normalized.size();
                  ++index) {
                 if (host_normalized[index] == device_normalized[index]) continue;
-                return {{"GLM-5.3 resident mHC/norm mismatch at layer " +
-                         std::to_string(layer) + " (" +
-                         (glm53_kda_layer(layer) ? "KDA" : "MLA") +
-                         "), position " + std::to_string(position) +
-                         ", element " + std::to_string(index) + ": host " +
-                         std::to_string(host_normalized[index]) + ", device " +
-                         std::to_string(device_normalized[index])}};
+                ++differing;
+                worst = std::max(worst, std::fabs(host_normalized[index] -
+                                                  device_normalized[index]));
+            }
+            if (differing != 0U && position == 36U) {
+                std::cerr << "[glm53-mhc-compare] layer " << layer << " ("
+                          << (glm53_kda_layer(layer) ? "KDA" : "MLA")
+                          << ") differing " << differing << "/"
+                          << host_normalized.size() << " worst " << worst
+                          << '\n';
             }
         }
         const auto attention_started = std::chrono::steady_clock::now();
@@ -4228,6 +4267,16 @@ struct Glm53Runtime::Impl {
             request.mhc_source_destination = true;
             result = weights->kda_decode(
                 slot_for(layer), attention, request, {});
+        } else if (resident_mla_host_attention()) {
+            // The control arm: device mHC produced this layer's input, and the
+            // accepted host fallback consumes it. Only the attention moves.
+            std::vector<float> normalized(kHidden), branch(kHidden);
+            result = cuda.dsv4_mhc_download_layer_input(device, normalized);
+            if (!result.ok()) return result;
+            result = attention_mla(branch, normalized, layer, position,
+                                   attention, sequence);
+            if (!result.ok()) return result;
+            result = cuda.dsv4_mhc_publish_branch(device, branch);
         } else {
             CudaGlm53MlaRequest request;
             request.state = &device_sequence.mla[layer];

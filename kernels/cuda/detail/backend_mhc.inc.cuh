@@ -853,6 +853,54 @@ ValidationResult CudaBackend::dsv4_mhc_download_branch(
     return {};
 }
 
+// Publishes a host-computed branch into the resident chain, so a layer can run
+// its attention on the host while the rest of the layer stays on the device.
+//
+// This exists for the resident MLA control arm: host `mhc_pre` and the device
+// mHC are not the same function, so a control that runs the whole layer on the
+// host also swaps the mHC and measures the wrong variable. Publishing the
+// branch keeps the device mHC on both sides and isolates the attention.
+ValidationResult CudaBackend::dsv4_mhc_publish_branch(
+    int device, std::span<const float> branch) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"mHC branch publish targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.moe_in_flight || state.dsv4_mhc_failed ||
+        branch.size() != kDsv4MhcHidden ||
+        state.dsv4_mhc_host_staging == nullptr ||
+        state.dsv4_mhc_host_staging_bytes <
+            kDsv4MhcHidden * sizeof(std::uint16_t)) {
+        return {{"mHC branch publish violates command order"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch publish");
+    }
+    // The branch is BF16 on the device, and the resident path's own producer
+    // writes it through `dsv4_fp32_to_bf16`, so encode identically here.
+    auto* encoded = reinterpret_cast<std::uint16_t*>(
+        state.dsv4_mhc_host_staging);
+    for (std::size_t index = 0U; index < branch.size(); ++index) {
+        encoded[index] = bf16_encode(branch[index]);
+    }
+    const auto bytes = kDsv4MhcHidden * sizeof(std::uint16_t);
+    if (auto status = cudaMemcpyAsync(
+            state.dsv4_mhc_workspace->branch, encoded, bytes,
+            cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload mHC branch");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize mHC branch publish");
+    }
+    state.dsv4_mhc_branch_ready = true;
+    return {};
+}
+
 ValidationResult CudaBackend::dsv4_mhc_device_view(
     int device, CudaDsv4MhcDeviceView& view) {
     view = {};

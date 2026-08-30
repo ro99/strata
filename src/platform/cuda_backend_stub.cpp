@@ -423,6 +423,11 @@ ValidationResult CudaBackend::reserve_dsv4_mhc_head(int, std::uint64_t) {
     return cuda_unavailable();
 }
 
+ValidationResult CudaBackend::dsv4_mhc_publish_branch(
+    int, std::span<const float>) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::enqueue_dsv4_mhc_finish_head_device(
     int, const CudaWeight&, CudaDsv4MhcHeadCallback, void*,
     CudaDsv4MhcHeadDeviceView*) {

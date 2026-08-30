@@ -5917,6 +5917,13 @@ ValidationResult Glm53Runtime::initialize(
             impl_->host_moe_workers->size() == host_width;
     }
     if (impl_->host_moe_active) {
+        // Decode's batch-1 expert primitive uses separate scratch from the
+        // page-major prefill primitive. Reserve its fixed maximum extents
+        // before profiling begins so the first generated token cannot grow a
+        // vector inside the measured interval.
+        impl_->host_moe_quantized_input.resize(kHidden);
+        impl_->host_moe_activations.resize(9U * 2048U);
+        impl_->host_moe_expert_outputs.resize(9U * kHidden);
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
     }

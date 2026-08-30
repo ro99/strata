@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace strata {
@@ -51,6 +52,18 @@ public:
     [[nodiscard]] ValidationResult parallel_for_blocked(
         std::size_t tasks, std::size_t block,
         const std::function<void(std::size_t)>& operation);
+
+    // Runs each partition only on workers pinned to its owning NUMA node.
+    // Work is divided into one contiguous range per same-node worker and is
+    // never stolen across nodes. Pools without explicit, discoverable CPU
+    // affinity reject non-empty owned dispatches instead of silently losing
+    // locality.
+    [[nodiscard]] ValidationResult parallel_for_owned(
+        std::span<const std::size_t> partition_tasks,
+        std::span<const int> partition_nodes,
+        const std::function<void(std::size_t, std::size_t)>& operation);
+
+    [[nodiscard]] std::span<const int> worker_nodes() const noexcept;
 
 private:
     struct Impl;

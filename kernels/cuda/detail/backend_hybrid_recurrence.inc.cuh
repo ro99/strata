@@ -1298,6 +1298,389 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
     return {};
 }
 
+ValidationResult CudaBackend::reserve_glm53_mla_shard_workspace(
+    int device, std::uint32_t maximum_context, std::uint32_t heads,
+    std::uint32_t head_dim, std::uint32_t query_rank,
+    std::uint32_t key_value_rank) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() || maximum_context == 0U || heads == 0U ||
+        head_dim == 0U || query_rank == 0U || key_value_rank == 0U) {
+        return {{"CUDA GLM-5.3 MLA shard reserve is invalid"}};
+    }
+    auto& state = found->second;
+    const auto width = static_cast<std::uint64_t>(heads) * head_dim;
+    const auto expanded = 2ULL * width;
+    const auto workspace_floats = kDsv4MhcHidden + query_rank + width +
+        static_cast<std::uint64_t>(maximum_context) * expanded + width +
+        static_cast<std::uint64_t>(heads) * maximum_context;
+    const auto workspace_bytes = workspace_floats * sizeof(float);
+    const auto host_bytes = std::max<std::uint64_t>({
+        static_cast<std::uint64_t>(kDsv4MhcHidden) * sizeof(float),
+        static_cast<std::uint64_t>(heads) * maximum_context * sizeof(float),
+        width * sizeof(float)});
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for MLA shard reserve");
+    }
+    if (state.glm53_mla_workspace_bytes < workspace_bytes) {
+        if (state.glm53_mla_workspace != nullptr) {
+            static_cast<void>(cudaFree(state.glm53_mla_workspace));
+        }
+        state.glm53_mla_workspace = nullptr;
+        state.glm53_mla_workspace_bytes = 0U;
+        if (auto status = cudaMalloc(&state.glm53_mla_workspace,
+                                     workspace_bytes);
+            status != cudaSuccess) {
+            return cuda_error(status, "reserve CUDA MLA shard workspace");
+        }
+        state.glm53_mla_workspace_bytes = workspace_bytes;
+    }
+    if (state.glm53_mla_host_staging_bytes < host_bytes) {
+        if (state.glm53_mla_host_staging != nullptr) {
+            static_cast<void>(cudaFreeHost(state.glm53_mla_host_staging));
+        }
+        state.glm53_mla_host_staging = nullptr;
+        state.glm53_mla_host_staging_bytes = 0U;
+        void* staging = nullptr;
+        if (auto status = cudaMallocHost(&staging, host_bytes);
+            status != cudaSuccess) {
+            return cuda_error(status, "reserve pinned MLA shard staging");
+        }
+        state.glm53_mla_host_staging = static_cast<std::byte*>(staging);
+        state.glm53_mla_host_staging_bytes = host_bytes;
+    }
+    return {};
+}
+
+ValidationResult CudaBackend::glm53_mla_shard_scores(
+    const CudaGlm53MlaShardRequest& request, std::span<float> scores) {
+    if (request.state == nullptr || !request.state->valid() ||
+        request.position >= request.maximum_context || request.heads == 0U ||
+        request.head_dim == 0U || request.query_rank == 0U ||
+        request.key_value_rank == 0U ||
+        request.input.size() != kDsv4MhcHidden) {
+        return {{"CUDA GLM-5.3 MLA shard command is invalid"}};
+    }
+    const auto device = request.state->device();
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"CUDA GLM-5.3 MLA shard targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (state.glm53_mla_scores_pending || state.moe_in_flight) {
+        return {{"CUDA GLM-5.3 MLA shard command order is invalid"}};
+    }
+    const auto width = static_cast<std::uint64_t>(request.heads) *
+                       request.head_dim;
+    const auto expanded_width = 2ULL * width;
+    const auto history = static_cast<std::uint64_t>(request.position) + 1U;
+    const auto cache_floats =
+        static_cast<std::uint64_t>(request.maximum_context) *
+        request.key_value_rank;
+    const auto state_floats = cache_floats + request.query_rank +
+                              request.key_value_rank;
+    const auto workspace_floats = kDsv4MhcHidden + request.query_rank + width +
+        static_cast<std::uint64_t>(request.maximum_context) * expanded_width +
+        width + static_cast<std::uint64_t>(request.heads) *
+                    request.maximum_context;
+    if (request.state->device_bytes() < state_floats * sizeof(float) ||
+        state.glm53_mla_workspace_bytes < workspace_floats * sizeof(float) ||
+        state.glm53_mla_host_staging_bytes < scores.size_bytes() ||
+        scores.size() != request.heads * history) {
+        return {{"CUDA GLM-5.3 MLA shard buffers are not reserved"}};
+    }
+    const auto valid = [device](const CudaWeight* weight,
+                                std::uint64_t rows,
+                                std::uint64_t columns) {
+        if (weight == nullptr || !weight->valid() ||
+            weight->device() != device ||
+            weight->impl_->descriptor.rows != rows ||
+            weight->impl_->descriptor.columns != columns) return false;
+        const auto& descriptor = weight->impl_->descriptor;
+        return (descriptor.encoding == CudaWeightEncoding::Plain &&
+                descriptor.dtype == SafetensorsDtype::Bf16) ||
+               (descriptor.encoding ==
+                    CudaWeightEncoding::Fp8E4m3Block128F32 &&
+                weight->impl_->fragment_prepacked);
+    };
+    if (!valid(request.query_a, request.query_rank, kDsv4MhcHidden) ||
+        !valid(request.key_value_a, request.key_value_rank,
+               kDsv4MhcHidden) ||
+        !valid(request.query_b, width, request.query_rank) ||
+        !valid(request.key_value_b, expanded_width,
+               request.key_value_rank)) {
+        return {{"CUDA GLM-5.3 MLA shard projection shapes are invalid"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for MLA shard");
+    }
+    auto* packed = static_cast<float*>(request.state->impl_->data);
+    auto* q_norm = packed + cache_floats;
+    auto* kv_norm = q_norm + request.query_rank;
+    auto* workspace = reinterpret_cast<float*>(state.glm53_mla_workspace);
+    auto* input = workspace;
+    auto* q_rank = input + kDsv4MhcHidden;
+    auto* query = q_rank + request.query_rank;
+    auto* expanded = query + width;
+    auto* attended = expanded +
+        static_cast<std::uint64_t>(request.maximum_context) * expanded_width;
+    auto* coefficients = attended + width;
+    auto* latent = packed + static_cast<std::uint64_t>(request.position) *
+                                request.key_value_rank;
+    std::memcpy(state.glm53_mla_host_staging, request.input.data(),
+                request.input.size_bytes());
+    if (auto status = cudaMemcpyAsync(
+            input, state.glm53_mla_host_staging, request.input.size_bytes(),
+            cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload pinned MLA shard input");
+    }
+    constexpr unsigned int threads = 256U;
+    constexpr unsigned int warps = threads / 32U;
+    const auto project_one = [&](const CudaWeight* weight, float* source,
+                                 float* destination,
+                                 std::uint64_t rows) -> cudaError_t {
+        const auto& descriptor = weight->impl_->descriptor;
+        if (descriptor.encoding == CudaWeightEncoding::Plain) {
+            const auto blocks = static_cast<unsigned int>(
+                (rows + warps - 1U) / warps);
+            bf16_matvec_kernel<<<blocks, threads, 0U, state.stream>>>(
+                destination, source,
+                static_cast<const __nv_bfloat16*>(weight->impl_->weights),
+                descriptor.columns, rows);
+        } else if (auto status = launch_regfed_fp8_f32_rows(
+                       state.moe_regfed, descriptor, weight->impl_->weights,
+                       weight->impl_->scales,
+                       weight->impl_->fragment_prepacked, source, destination,
+                       1U, state.stream); status != cudaSuccess) {
+            return status;
+        }
+        round_bf16_rows_kernel<<<
+            static_cast<unsigned int>((rows + threads - 1U) / threads),
+            threads, 0U, state.stream>>>(destination, rows);
+        return cudaGetLastError();
+    };
+    if (auto status = project_one(request.query_a, input, q_rank,
+                                  request.query_rank); status != cudaSuccess) {
+        return cuda_error(status, "project MLA shard query A");
+    }
+    if (auto status = project_one(request.key_value_a, input, latent,
+                                  request.key_value_rank);
+        status != cudaSuccess) {
+        return cuda_error(status, "project MLA shard KV A");
+    }
+    glm53_rms_norm_bf16_kernel<<<1U, threads, 0U, state.stream>>>(
+        q_rank, q_norm, request.query_rank);
+    glm53_rms_norm_bf16_kernel<<<1U, threads, 0U, state.stream>>>(
+        latent, kv_norm, request.key_value_rank);
+    if (auto status = project_one(request.query_b, q_rank, query, width);
+        status != cudaSuccess) {
+        return cuda_error(status, "project MLA shard query B");
+    }
+    const auto& kv_descriptor = request.key_value_b->impl_->descriptor;
+    if (kv_descriptor.encoding == CudaWeightEncoding::Plain) {
+        const dim3 grid(
+            static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
+            static_cast<unsigned int>(
+                (history + kBf16MatvecRowTile - 1U) /
+                kBf16MatvecRowTile), 1U);
+        bf16_matvec_rows_kernel<kBf16MatvecRowTile><<<
+            grid, threads, 0U, state.stream>>>(
+            expanded, packed,
+            static_cast<const __nv_bfloat16*>(
+                request.key_value_b->impl_->weights),
+            static_cast<std::uint32_t>(history), request.key_value_rank,
+            expanded_width);
+    } else if (auto status = launch_regfed_fp8_f32_rows(
+                   state.moe_regfed, kv_descriptor,
+                   request.key_value_b->impl_->weights,
+                   request.key_value_b->impl_->scales,
+                   request.key_value_b->impl_->fragment_prepacked, packed,
+                   expanded, static_cast<std::uint32_t>(history),
+                   state.stream); status != cudaSuccess) {
+        return cuda_error(status, "project MLA shard KV B");
+    }
+    round_bf16_rows_kernel<<<
+        static_cast<unsigned int>(std::min<std::uint64_t>(
+            (history * expanded_width + threads - 1U) / threads, 65535U)),
+        threads, 0U, state.stream>>>(expanded, history * expanded_width);
+    glm53_mla_scores_kernel<<<request.heads, threads, 0U, state.stream>>>(
+        query, expanded, coefficients, static_cast<std::uint32_t>(history),
+        request.heads, request.head_dim);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch MLA shard scores");
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_mla_host_staging, coefficients, scores.size_bytes(),
+            cudaMemcpyDeviceToHost, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "download pinned MLA shard scores");
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "complete MLA shard scores");
+    }
+    const auto wait_nanoseconds = elapsed_nanoseconds_since(wait_started);
+    std::memcpy(scores.data(), state.glm53_mla_host_staging,
+                scores.size_bytes());
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += request.input.size_bytes();
+        stats.activation_d2h_bytes += scores.size_bytes();
+        record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
+                               wait_nanoseconds);
+    }
+    state.glm53_mla_scores_pending = true;
+    return {};
+}
+
+ValidationResult CudaBackend::glm53_mla_shard_finish(
+    const CudaGlm53MlaShardRequest& request,
+    std::span<const float> normalized_coefficients,
+    std::span<float> attended_output) {
+    const auto device = request.state == nullptr ? -1 : request.state->device();
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"CUDA GLM-5.3 MLA shard targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    const auto history = static_cast<std::uint64_t>(request.position) + 1U;
+    const auto width = static_cast<std::uint64_t>(request.heads) *
+                       request.head_dim;
+    const auto expanded_width = 2ULL * width;
+    if (!state.glm53_mla_scores_pending ||
+        normalized_coefficients.size() != request.heads * history ||
+        attended_output.size() != width ||
+        state.glm53_mla_host_staging_bytes <
+            std::max(normalized_coefficients.size_bytes(),
+                     attended_output.size_bytes())) {
+        return {{"CUDA GLM-5.3 MLA shard finish is invalid"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for MLA shard finish");
+    }
+    auto* workspace = reinterpret_cast<float*>(state.glm53_mla_workspace);
+    auto* query = workspace + kDsv4MhcHidden + request.query_rank;
+    auto* expanded = query + width;
+    auto* attended = expanded +
+        static_cast<std::uint64_t>(request.maximum_context) * expanded_width;
+    auto* coefficients = attended + width;
+    std::memcpy(state.glm53_mla_host_staging,
+                normalized_coefficients.data(),
+                normalized_coefficients.size_bytes());
+    if (auto status = cudaMemcpyAsync(
+            coefficients, state.glm53_mla_host_staging,
+            normalized_coefficients.size_bytes(), cudaMemcpyHostToDevice,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "upload pinned MLA shard coefficients");
+    }
+    constexpr unsigned int threads = 256U;
+    glm53_mla_weighted_kernel<<<request.heads, threads, 0U, state.stream>>>(
+        coefficients, expanded, attended,
+        static_cast<std::uint32_t>(history), request.heads, request.head_dim);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch MLA shard weighted sum");
+    }
+    if (auto status = cudaMemcpyAsync(
+            state.glm53_mla_host_staging, attended,
+            attended_output.size_bytes(), cudaMemcpyDeviceToHost,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "download pinned MLA shard heads");
+    }
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "complete MLA shard weighted sum");
+    }
+    const auto wait_nanoseconds = elapsed_nanoseconds_since(wait_started);
+    std::memcpy(attended_output.data(), state.glm53_mla_host_staging,
+                attended_output.size_bytes());
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += normalized_coefficients.size_bytes();
+        stats.activation_d2h_bytes += attended_output.size_bytes();
+        record_synchronization(stats, SynchronizationSubsystem::Other, 1U,
+                               wait_nanoseconds);
+    }
+    state.glm53_mla_scores_pending = false;
+    return {};
+}
+
+ValidationResult CudaBackend::glm53_mla_publish_attended(
+    int device, const CudaWeight& output_weight,
+    std::span<const float> attended) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"CUDA GLM-5.3 MLA publication targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        !output_weight.valid() || output_weight.device() != device ||
+        output_weight.impl_->descriptor.rows != kDsv4MhcHidden ||
+        output_weight.impl_->descriptor.columns != attended.size() ||
+        state.glm53_mla_host_staging_bytes < attended.size_bytes() ||
+        state.glm53_mla_workspace_bytes <
+            (attended.size() + kDsv4MhcHidden) * sizeof(float)) {
+        return {{"CUDA GLM-5.3 MLA publication is invalid"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for MLA publication");
+    }
+    std::memcpy(state.glm53_mla_host_staging, attended.data(),
+                attended.size_bytes());
+    auto* input = reinterpret_cast<float*>(state.glm53_mla_workspace);
+    auto* output = input + attended.size();
+    if (auto status = cudaMemcpyAsync(
+            input, state.glm53_mla_host_staging, attended.size_bytes(),
+            cudaMemcpyHostToDevice, state.stream); status != cudaSuccess) {
+        return cuda_error(status, "upload exact gathered MLA heads");
+    }
+    {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.activation_h2d_bytes += attended.size_bytes();
+    }
+    constexpr unsigned int threads = 256U;
+    const auto& descriptor = output_weight.impl_->descriptor;
+    if (descriptor.encoding == CudaWeightEncoding::Plain) {
+        bf16_matvec_kernel<<<(kDsv4MhcHidden + 7U) / 8U, threads, 0U,
+                             state.stream>>>(
+            output, input,
+            static_cast<const __nv_bfloat16*>(output_weight.impl_->weights),
+            descriptor.columns, kDsv4MhcHidden);
+    } else if (descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
+               output_weight.impl_->fragment_prepacked) {
+        if (auto status = launch_regfed_fp8_f32_rows(
+                state.moe_regfed, descriptor, output_weight.impl_->weights,
+                output_weight.impl_->scales,
+                output_weight.impl_->fragment_prepacked, input, output, 1U,
+                state.stream); status != cudaSuccess) {
+            return cuda_error(status, "project gathered MLA heads");
+        }
+    } else {
+        return {{"CUDA GLM-5.3 MLA output encoding is unsupported"}};
+    }
+    round_bf16_rows_kernel<<<(kDsv4MhcHidden + threads - 1U) / threads,
+                             threads, 0U, state.stream>>>(
+        output, kDsv4MhcHidden);
+    dsv4_fp32_to_bf16<<<(kDsv4MhcHidden + threads - 1U) / threads,
+                         threads, 0U, state.stream>>>(
+        output, state.dsv4_mhc_workspace->branch, kDsv4MhcHidden);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "publish gathered MLA branch");
+    }
+    state.dsv4_mhc_branch_ready = true;
+    return {};
+}
+
 namespace {
 
 // The three GLM-5.3 expert matrices are fixed by the architecture:

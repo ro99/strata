@@ -1,6 +1,7 @@
 #include "strata/platform/numa_topology.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
 #include <fstream>
@@ -16,8 +17,14 @@ namespace {
 // dependency for two syscalls.
 constexpr int kMpolBind = 2;
 constexpr int kMpolInterleave = 3;
+constexpr int kMpolMfMove = 2;
 
 constexpr std::uint64_t kPageBytes = 4096U;
+
+long move_pages_syscall(unsigned long count, void** pages, const int* nodes,
+                        int* status, int flags) noexcept {
+    return syscall(__NR_move_pages, 0, count, pages, nodes, status, flags);
+}
 
 // "0-13,28-41" -> {0..13, 28..41}
 void parse_cpu_list(std::string_view text, std::vector<int>& cpus) {
@@ -160,6 +167,75 @@ int NumaTopology::node_of_cpu(int cpu) const noexcept {
     if (cpu < 0 || static_cast<std::size_t>(cpu) >= cpu_node.size()) return 0;
     const auto node = cpu_node[static_cast<std::size_t>(cpu)];
     return node < 0 ? 0 : node;
+}
+
+PageMigration numa_move_page_ranges(
+    std::span<const std::pair<const void*, std::uint64_t>> ranges,
+    int node) noexcept {
+    PageMigration result;
+    if (node < 0 || ranges.empty()) return result;
+    constexpr std::size_t chunk_pages = 512U;
+    std::vector<void*> addresses;
+    std::vector<void*> to_move;
+    std::vector<int> targets(chunk_pages, node);
+    std::vector<int> status(chunk_pages, -1);
+    addresses.reserve(chunk_pages);
+    to_move.reserve(chunk_pages);
+
+    const auto flush = [&] {
+        if (addresses.empty()) return;
+        const auto count = addresses.size();
+        std::fill_n(status.begin(), count, -1);
+        static_cast<void>(move_pages_syscall(
+            count, addresses.data(), nullptr, status.data(), 0));
+        to_move.clear();
+        for (std::size_t index = 0U; index < count; ++index) {
+            if (status[index] == node) {
+                ++result.already_local;
+            } else if (status[index] == -ENOENT) {
+                ++result.absent;
+            } else if (status[index] < 0) {
+                ++result.failed;
+            } else {
+                to_move.push_back(addresses[index]);
+            }
+        }
+        if (!to_move.empty()) {
+            const auto moving = to_move.size();
+            std::fill_n(status.begin(), moving, -1);
+            static_cast<void>(move_pages_syscall(
+                moving, to_move.data(), targets.data(), status.data(),
+                kMpolMfMove));
+            std::vector<int> verified(moving, -1);
+            static_cast<void>(move_pages_syscall(
+                moving, to_move.data(), nullptr, verified.data(), 0));
+            for (const auto where : verified) {
+                if (where == node) {
+                    ++result.moved;
+                    result.bytes_moved += kPageBytes;
+                } else {
+                    ++result.failed;
+                }
+            }
+        }
+        addresses.clear();
+    };
+
+    for (const auto& [base, bytes] : ranges) {
+        if (base == nullptr || bytes < kPageBytes) continue;
+        auto address = reinterpret_cast<std::uintptr_t>(base);
+        const auto aligned = (address + kPageBytes - 1U) & ~(kPageBytes - 1U);
+        const auto skipped = aligned - address;
+        if (skipped >= bytes) continue;
+        const auto length = (bytes - skipped) & ~(kPageBytes - 1U);
+        for (std::uint64_t offset = 0U; offset < length;
+             offset += kPageBytes) {
+            addresses.push_back(reinterpret_cast<void*>(aligned + offset));
+            if (addresses.size() == chunk_pages) flush();
+        }
+    }
+    flush();
+    return result;
 }
 
 bool numa_bind_range(void* base, std::uint64_t bytes, int node) noexcept {

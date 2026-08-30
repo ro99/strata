@@ -191,6 +191,24 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
     const CudaGlm53MlaRequest&, std::span<const float>) {
     return cuda_unavailable();
 }
+ValidationResult CudaBackend::reserve_glm53_mla_shard_workspace(
+    int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    std::uint32_t) {
+    return cuda_unavailable();
+}
+ValidationResult CudaBackend::glm53_mla_shard_scores(
+    const CudaGlm53MlaShardRequest&, std::span<float>) {
+    return cuda_unavailable();
+}
+ValidationResult CudaBackend::glm53_mla_shard_finish(
+    const CudaGlm53MlaShardRequest&, std::span<const float>,
+    std::span<float>) {
+    return cuda_unavailable();
+}
+ValidationResult CudaBackend::glm53_mla_publish_attended(
+    int, const CudaWeight&, std::span<const float>) {
+    return cuda_unavailable();
+}
 
 ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     int, std::span<const CudaGlm53Expert>, std::span<const float>) {

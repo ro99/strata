@@ -212,6 +212,8 @@ struct CudaBackend::Impl {
         Dsv4MhcWorkspace* dsv4_mhc_workspace{};
         std::byte* glm53_mla_workspace{};
         std::uint64_t glm53_mla_workspace_bytes{};
+        std::byte* glm53_mla_host_staging{};
+        std::uint64_t glm53_mla_host_staging_bytes{};
         std::byte* dsv4_mhc_host_staging{};
         std::uint64_t dsv4_mhc_workspace_bytes{};
         std::uint64_t dsv4_mhc_host_staging_bytes{};
@@ -499,6 +501,9 @@ struct CudaBackend::Impl {
             }
             if (state.dsv4_mhc_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.dsv4_mhc_host_staging));
+            }
+            if (state.glm53_mla_host_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.glm53_mla_host_staging));
             }
             if (state.dsv4_mhc_head_input != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_mhc_head_input));

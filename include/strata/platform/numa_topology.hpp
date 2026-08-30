@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace strata {
@@ -44,6 +46,25 @@ struct NumaTopology {
     // The node a logical CPU belongs to, or 0 when the topology is unknown.
     [[nodiscard]] int node_of_cpu(int cpu) const noexcept;
 };
+
+struct PageMigration {
+    std::uint64_t already_local{};
+    std::uint64_t moved{};
+    std::uint64_t absent{};
+    std::uint64_t failed{};
+    std::uint64_t bytes_moved{};
+
+    [[nodiscard]] bool complete() const noexcept { return failed == 0U; }
+    [[nodiscard]] std::uint64_t pages() const noexcept {
+        return already_local + moved + absent + failed;
+    }
+};
+
+// Migrates and verifies inward-aligned resident pages without splitting the
+// checkpoint's VMAs. Absent pages remain eligible for owner-local first touch.
+[[nodiscard]] PageMigration numa_move_page_ranges(
+    std::span<const std::pair<const void*, std::uint64_t>> ranges,
+    int node) noexcept;
 
 // Binds [base, base + bytes) to `node` with MPOL_BIND. Must be called before
 // the range is first touched: without MPOL_MF_MOVE the policy only governs

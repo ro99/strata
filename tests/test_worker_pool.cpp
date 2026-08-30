@@ -1,12 +1,15 @@
 #include "test.hpp"
 
 #include "strata/platform/worker_pool.hpp"
+#include "strata/platform/hardware_profile.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <numeric>
+#include <sched.h>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -147,4 +150,38 @@ TEST_CASE("a zero block is treated as one rather than spinning forever") {
         8U, 0U, [&](std::size_t) { ran.fetch_add(1); });
     REQUIRE(status.ok());
     REQUIRE(ran.load() == 8);
+}
+
+TEST_CASE("owned dispatch keeps partitions on their declared NUMA nodes") {
+    const auto& hardware = strata::host_hardware_profile();
+    std::vector<int> cpus;
+    std::vector<int> nodes;
+    for (const auto cpu : hardware.usable_cpu_ids) {
+        const auto node = hardware.numa.node_of_cpu(cpu);
+        if (std::find(nodes.begin(), nodes.end(), node) != nodes.end()) continue;
+        cpus.push_back(cpu);
+        nodes.push_back(node);
+    }
+    REQUIRE(!cpus.empty());
+    strata::HostWorkerPool pool(cpus);
+    REQUIRE(pool.worker_nodes().size() == cpus.size());
+    std::vector<std::atomic<int>> visits(nodes.size() * 17U);
+    for (auto& visit : visits) visit.store(0);
+    std::vector<std::size_t> tasks(nodes.size(), 17U);
+    const auto ran = pool.parallel_for_owned(
+        tasks, nodes, [&](std::size_t partition, std::size_t index) {
+            REQUIRE(hardware.numa.node_of_cpu(sched_getcpu()) ==
+                    nodes[partition]);
+            visits[partition * 17U + index].fetch_add(1);
+        });
+    REQUIRE(ran.ok());
+    for (const auto& visit : visits) REQUIRE(visit.load() == 1);
+}
+
+TEST_CASE("owned dispatch rejects an incomplete partition map") {
+    strata::HostWorkerPool pool(1U);
+    const std::array<std::size_t, 2U> tasks{1U, 1U};
+    const std::array<int, 1U> nodes{0};
+    REQUIRE(!pool.parallel_for_owned(
+        tasks, nodes, [](std::size_t, std::size_t) {}).ok());
 }

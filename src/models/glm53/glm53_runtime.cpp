@@ -4184,6 +4184,40 @@ struct Glm53Runtime::Impl {
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
         const auto attention = prefix + "self_attn.";
+        // The layer input, before attention touches it.
+        //
+        // Record 0214's attention oracle downloads this vector and feeds it to
+        // the host fallback, so it compares attention given identical input and
+        // is blind to whatever produced the input. `dsv4_mhc_begin_device` runs
+        // the mHC pre projection and the input layer norm on the device; the
+        // fallback runs both on the host. Compare them here, on every resident
+        // layer rather than only the MLA ones, because the KDA layers take the
+        // device path in both arms and a difference there would mean the
+        // control arm is itself a mixture.
+        if (resident_mla_compare_enabled()) {
+            std::vector<float> device_normalized(kHidden),
+                collapsed(kHidden), host_normalized(kHidden);
+            result = cuda.dsv4_mhc_download_layer_input(
+                device, device_normalized);
+            if (!result.ok()) return result;
+            Dsv4MhcMix host_mix;
+            result = mhc_pre(collapsed, host_mix, streams, prefix + "hc_attn");
+            if (!result.ok()) return result;
+            result = norm(host_normalized, collapsed,
+                          prefix + "input_layernorm.weight");
+            if (!result.ok()) return result;
+            for (std::size_t index = 0U; index < host_normalized.size();
+                 ++index) {
+                if (host_normalized[index] == device_normalized[index]) continue;
+                return {{"GLM-5.3 resident mHC/norm mismatch at layer " +
+                         std::to_string(layer) + " (" +
+                         (glm53_kda_layer(layer) ? "KDA" : "MLA") +
+                         "), position " + std::to_string(position) +
+                         ", element " + std::to_string(index) + ": host " +
+                         std::to_string(host_normalized[index]) + ", device " +
+                         std::to_string(device_normalized[index])}};
+            }
+        }
         const auto attention_started = std::chrono::steady_clock::now();
         if (glm53_kda_layer(layer)) {
             CudaGlm53KdaRequest request;

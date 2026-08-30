@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <list>
 #include <limits>
@@ -598,6 +599,19 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
         return static_cast<std::size_t>(parsed);
     }();
     return bound;
+}
+
+// Where to write the M4 route census, or empty for no census. Section 11's
+// first gate item needs the sequence, not just frequencies: byte-weighted
+// coverage answers "would a resident tier of size K hold this token's experts"
+// and reuse distance answers "would it still hold them next token", and only
+// the second needs order.
+[[nodiscard]] const std::string& route_census_path() {
+    static const std::string path = [] {
+        const char* value = std::getenv("STRATA_GLM53_ROUTE_CENSUS");
+        return value == nullptr ? std::string{} : std::string(value);
+    }();
+    return path;
 }
 
 [[nodiscard]] bool mtp_enabled() noexcept {
@@ -1823,6 +1837,19 @@ struct Glm53Runtime::Impl {
     // One bit per layer, set when a MoE layer serviced its shared expert on
     // the host. With the tier admitted this should stay zero; anything else
     // names exactly which layers the dispatch missed.
+    // One row per routed MoE layer visit: the eight experts the router chose,
+    // in order, with enough context to separate phases and tokens. 42 layers
+    // times 8 experts is 336 uint16 per decode token, so a 128-token census is
+    // 86 KB -- small enough to hold and write whole rather than stream.
+    struct RouteCensusRow {
+        std::uint32_t layer{};
+        std::uint32_t position{};
+        std::uint64_t request{};
+        bool prefill{};
+        std::array<std::uint16_t, 8U> experts{};
+    };
+    std::mutex route_census_mutex;
+    std::vector<RouteCensusRow> route_census;
     std::atomic<std::uint64_t> shared_expert_host_layers{};
     std::atomic<std::uint64_t> shared_expert_host_calls{};
     std::atomic<std::uint64_t> shared_expert_device_calls{};
@@ -2060,7 +2087,24 @@ struct Glm53Runtime::Impl {
     void observe_route(std::uint32_t layer,
                        std::span<const KimiRoutedExpert> selected,
                        std::uint64_t request, std::uint32_t position,
-                       bool schedule_prefetch) {
+                       bool schedule_prefetch, bool prefill = false) {
+        // Recorded before the prefetch guard: the census has to see every
+        // routed layer visit, and prefetch is a separate opt-in that is off
+        // whenever the host expert path owns the experts.
+        if (!route_census_path().empty() && layer < kLayers &&
+            selected.size() == 8U) {
+            RouteCensusRow row;
+            row.layer = layer;
+            row.position = position;
+            row.request = request;
+            row.prefill = prefill;
+            for (std::size_t index = 0U; index < selected.size(); ++index) {
+                row.experts[index] =
+                    static_cast<std::uint16_t>(selected[index].expert);
+            }
+            std::scoped_lock guard(route_census_mutex);
+            route_census.push_back(row);
+        }
         if (prefetch_prediction_limit == 0U || request == 0U ||
             layer >= kLayers) {
             return;
@@ -3960,7 +4004,7 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
             if (!route_requests.empty()) {
                 observe_route(layer, selected, route_requests[row],
-                              route_positions[row], schedule_prefetch);
+                              route_positions[row], schedule_prefetch, true);
             }
         }
         if (host_moe_active) {
@@ -4851,6 +4895,28 @@ struct Glm53Runtime::Impl {
                       << (cache.useful_prefetches -
                           request->decode_cache_start.useful_prefetches)
                       << '\n';
+            if (!route_census_path().empty()) {
+                std::scoped_lock guard(route_census_mutex);
+                std::ofstream census(route_census_path(), std::ios::trunc);
+                if (census) {
+                    census << "phase\trequest\tposition\tlayer\texperts\n";
+                    for (const auto& row : route_census) {
+                        census << (row.prefill ? "prefill" : "decode") << '\t'
+                               << row.request << '\t' << row.position << '\t'
+                               << row.layer << '\t';
+                        for (std::size_t index = 0U;
+                             index < row.experts.size(); ++index) {
+                            if (index != 0U) census << ',';
+                            census << row.experts[index];
+                        }
+                        census << '\n';
+                    }
+                }
+                std::cerr << "[glm53-route-census] rows="
+                          << route_census.size() << " path="
+                          << route_census_path()
+                          << (census ? " written" : " FAILED") << '\n';
+            }
             if (shared_experts.active) {
                 const auto missed = shared_expert_host_layers.load(
                     std::memory_order_relaxed);

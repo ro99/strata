@@ -568,17 +568,20 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // on the host, so the tier is bit-exact -- 129-token decode is byte-identical
 // across five alternating arms.
 //
-// It is off by default because it does not pay (record 0211). Removing 8.20% of
-// the expert bytes the host services took 3.7% off the gate/up dispatch and
-// 2.5% off down, and gave 1.0 s of that back waiting on the device collect, for
-// a net -0.84% on host expert service against host arms whose own spread was
-// 0.48%. Extrapolated to full coverage that is about 1.4% of a decode step, for
-// 1.06 GB of the VRAM M4's routed hot tier wants and measurably worse run-to-run
-// variance. The mechanism stays because M4's expert-residency work needs exactly
-// this primitive; only the default is off. `1` opts in.
+// On by default. It was measured at -0.84% and held off while the device dot
+// ran one thread per output row; coalescing that kernel took an expert from
+// 2.149 ms to 0.229 ms (`2193ee3`) and the lever moved with it. Re-measured,
+// both device arms beat the host arms bracketing them, by 4.49% and 6.33% of
+// host expert service, with gate/up down 7.16% and down down 5.98% -- which is
+// what removing one expert of nine predicts from makespan alone, 288 blocks
+// over 28 workers falling from eleven rounds to ten. Decode wall -2.79%.
+//
+// The tier costs 1.06 GB of the VRAM a routed hot tier wants, which is about
+// one expert per layer of M4's measured K=11 coverage (record 0212). It buys
+// several times that. `0` opts out.
 [[nodiscard]] int shared_expert_device_override() noexcept {
     const char* value = std::getenv("STRATA_GLM53_SHARED_EXPERT_DEVICE");
-    if (value == nullptr || std::string_view(value) == "auto") return 0;
+    if (value == nullptr || std::string_view(value) == "auto") return -1;
     return std::string_view(value) != "0" &&
                    std::string_view(value) != "false" &&
                    std::string_view(value) != "off"
@@ -2308,9 +2311,14 @@ struct Glm53Runtime::Impl {
             if (required[slot] == 0U) continue;
             if (weight_capacities[slot] <=
                 required[slot] + kMinimumDeviceBudget) {
-                return {{"GLM-5.3 shared expert tier does not fit the "
-                         "admitted CUDA capacity on device " +
-                         std::to_string(devices[slot])}};
+                // An explicit opt-in that cannot fit is an error; the default
+                // admission simply declines and leaves the host path intact.
+                if (override > 0) {
+                    return {{"GLM-5.3 shared expert tier does not fit the "
+                             "admitted CUDA capacity on device " +
+                             std::to_string(devices[slot])}};
+                }
+                return {};
             }
         }
         for (std::size_t slot = 0U; slot < devices.size(); ++slot) {

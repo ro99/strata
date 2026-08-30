@@ -183,7 +183,12 @@ ValidationResult CudaBackend::glm53_mhc_swiglu(
 }
 
 ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
-    const CudaGlm53MlaRequest&) {
+    const CudaGlm53MlaRequest&, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mla_decode_finish(
+    const CudaGlm53MlaRequest&, std::span<const float>) {
     return cuda_unavailable();
 }
 

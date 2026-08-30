@@ -159,53 +159,62 @@ __global__ void glm53_rms_norm_bf16_kernel(
     }
 }
 
-__global__ void glm53_mla_attention_kernel(
-    const float* query, const float* expanded, float* attended,
+// The attention scores, stopping short of the exponential.
+//
+// The softmax is the one place the resident path cannot follow the host: CUDA's
+// `expf` and glibc's disagree in 30.4% of f32 results, and 0.000375% of those
+// survive the BF16 rounding the model applies to the coefficient. At 64 heads
+// times history times 11 MLA layers that is an 11.4% chance per token at
+// history 46, which is exactly the rate at which record 0214 measured the
+// resident chain diverging. So the device computes the scores and the host
+// computes `exp`, the sum and the coefficient, on the accepted fallback's own
+// code.
+//
+// One block per head with a single active thread, because the host accumulates
+// each score sequentially over the columns and the association has to match.
+__global__ void glm53_mla_scores_kernel(
+    const float* query, const float* expanded, float* scores,
     std::uint32_t history, std::uint32_t heads, std::uint32_t head_dim) {
-    extern __shared__ float scores[];
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= heads || threadIdx.x != 0U) return;
+    const auto* q = query + static_cast<std::uint64_t>(head) * head_dim;
+    // The host computes `1.0F / std::sqrt(head_dim)` once and multiplies;
+    // `rsqrtf` is a ~2 ULP approximation and is not the same number.
+    const float score_scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+    for (std::uint32_t token = 0U; token < history; ++token) {
+        const auto* key = expanded +
+            (static_cast<std::uint64_t>(token) * heads + head) *
+                (2U * head_dim);
+        // The host writes `score += q[column] * kv[column]`, which GCC
+        // contracts to an FMA at -O3 on this FMA3 host.
+        float score = 0.0F;
+        for (std::uint32_t column = 0U; column < head_dim; ++column) {
+            score = __fmaf_rn(q[column], key[column], score);
+        }
+        scores[static_cast<std::uint64_t>(head) * history + token] =
+            score * score_scale;
+    }
+}
+
+// The value-weighted sum, from coefficients the host has already exponentiated,
+// normalized and rounded to BF16.
+__global__ void glm53_mla_weighted_kernel(
+    const float* coefficients, const float* expanded, float* attended,
+    std::uint32_t history, std::uint32_t heads, std::uint32_t head_dim) {
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
     if (head >= heads) return;
-    if (threadIdx.x == 0U) {
-        float highest = -INFINITY;
-        for (std::uint32_t token = 0U; token < history; ++token) {
-            const auto* key = expanded +
-                (static_cast<std::uint64_t>(token) * heads + head) *
-                    (2U * head_dim);
-            const auto* q = query +
-                static_cast<std::uint64_t>(head) * head_dim;
-            // The host fallback writes `score += q[column] * kv[column]`,
-            // which GCC contracts to an FMA at -O3 on this FMA3 host, so a
-            // separate rounded multiply and add is a different number. Match
-            // the contraction rather than the source text.
-            float score = 0.0F;
-            for (std::uint32_t column = 0U; column < head_dim; ++column) {
-                score = __fmaf_rn(q[column], key[column], score);
-            }
-            // `rsqrtf` is a ~2 ULP approximation. The host computes
-            // `1.0F / std::sqrt(head_dim)` once and multiplies, so do exactly
-            // that: for head_dim 256 it is 0.0625 and must be that bit pattern.
-            score *= 1.0F / sqrtf(static_cast<float>(head_dim));
-            scores[token] = score;
-            highest = fmaxf(highest, score);
-        }
-        float total = 0.0F;
-        for (std::uint32_t token = 0U; token < history; ++token) {
-            scores[token] = expf(scores[token] - highest);
-            total += scores[token];
-        }
-        for (std::uint32_t token = 0U; token < history; ++token) {
-            scores[token] = glm53_bf16(scores[token] / total);
-        }
-    }
-    __syncthreads();
     for (std::uint32_t column = threadIdx.x; column < head_dim;
          column += blockDim.x) {
+        // Sequential over tokens, contracted, exactly as the host accumulates
+        // `destination[column] += coefficient * values[column]`.
         float value = 0.0F;
         for (std::uint32_t token = 0U; token < history; ++token) {
-            const auto* source = expanded +
+            const auto* values = expanded +
                 (static_cast<std::uint64_t>(token) * heads + head) *
                     (2U * head_dim) + head_dim;
-            value += scores[token] * source[column];
+            value += coefficients[
+                static_cast<std::uint64_t>(head) * history + token] *
+                values[column];
         }
         attended[static_cast<std::uint64_t>(head) * head_dim + column] =
             glm53_bf16(value);
@@ -991,7 +1000,7 @@ ValidationResult CudaBackend::glm53_mhc_swiglu(
 }
 
 ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
-    const CudaGlm53MlaRequest& request) {
+    const CudaGlm53MlaRequest& request, std::span<float> scores) {
     if (request.state == nullptr || !request.state->valid() ||
         request.position >= request.maximum_context || request.heads == 0U ||
         request.head_dim == 0U || request.query_rank == 0U ||
@@ -1055,16 +1064,21 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     // token, so sizing it from `history` would cudaFree and cudaMalloc inside a
     // timed decode step -- which M4's gate forbids outright, and which would
     // also make a step's cost depend on when the buffer last happened to grow.
-    // Reserving once costs `maximum_context * expanded_width` floats, 134 MB at
-    // 2,048 tokens and this model's 64 heads, inside the per-device workspace
-    // reserve the planner already withholds.
+    // Reserving once costs `maximum_context * expanded_width` floats: 268 MB at
+    // 2,048 tokens on this model, whose 64 heads and 256 head dim make
+    // `expanded_width` 32,768 because it holds key and value together. That
+    // sits inside the per-device workspace reserve the planner already
+    // withholds.
     //
     // The offsets below use the reserved extent too, so a pointer into the
     // workspace means the same thing at every position.
     const auto reserved_history = std::max<std::uint64_t>(
         history, request.maximum_context);
+    // The trailing `heads * reserved_history` holds the scores on the way out
+    // and the normalized coefficients on the way back in.
     const auto workspace_floats = kDsv4MhcHidden + request.query_rank + width +
-        reserved_history * expanded_width + width + kDsv4MhcHidden;
+        reserved_history * expanded_width + width + kDsv4MhcHidden +
+        static_cast<std::uint64_t>(request.heads) * reserved_history;
     const auto workspace_bytes = workspace_floats * sizeof(float);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status,
@@ -1094,6 +1108,7 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     auto* expanded = query + width;
     auto* attended = expanded + reserved_history * expanded_width;
     auto* output = attended + width;
+    auto* coefficients = output + kDsv4MhcHidden;
     auto* latent = packed + static_cast<std::uint64_t>(request.position) *
                                 request.key_value_rank;
     constexpr unsigned int threads = 256U;
@@ -1172,12 +1187,102 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
                 (history * expanded_width + threads - 1U) / threads,
                 65535U)),
         threads, 0U, state.stream>>>(expanded, history * expanded_width);
-    glm53_mla_attention_kernel<<<
-        request.heads, threads,
-        static_cast<std::size_t>(history * sizeof(float)),
-        state.stream>>>(query, expanded, attended,
-                        static_cast<std::uint32_t>(history), request.heads,
-                        request.head_dim);
+    // Stop at the scores and hand them back. The caller applies `exp`, the
+    // normalization and the BF16 coefficient rounding on the host, then calls
+    // `glm53_mla_decode_finish` to complete the layer.
+    if (scores.size() != request.heads * history) {
+        return {{"CUDA GLM-5.3 resident MLA score span has an invalid shape"}};
+    }
+    glm53_mla_scores_kernel<<<request.heads, threads, 0U, state.stream>>>(
+        query, expanded, coefficients,
+        static_cast<std::uint32_t>(history), request.heads, request.head_dim);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch resident GLM-5.3 MLA scores");
+    }
+    if (auto status = cudaMemcpyAsync(
+            scores.data(), coefficients, scores.size_bytes(),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download resident GLM-5.3 MLA scores");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "complete resident GLM-5.3 MLA scores");
+    }
+    state.glm53_mla_scores_pending = true;
+    return {};
+}
+
+ValidationResult CudaBackend::glm53_mla_decode_finish(
+    const CudaGlm53MlaRequest& request,
+    std::span<const float> normalized_coefficients) {
+    const auto device = request.state == nullptr ? -1 : request.state->device();
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"CUDA GLM-5.3 resident MLA targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.glm53_mla_scores_pending) {
+        return {{"CUDA GLM-5.3 resident MLA finish has no pending scores"}};
+    }
+    const auto history = static_cast<std::uint64_t>(request.position) + 1U;
+    if (normalized_coefficients.size() != request.heads * history) {
+        return {{"CUDA GLM-5.3 resident MLA coefficient span is invalid"}};
+    }
+    const auto width = static_cast<std::uint64_t>(request.heads) *
+                       request.head_dim;
+    const auto expanded_width = 2ULL * width;
+    const auto reserved_history = std::max<std::uint64_t>(
+        history, request.maximum_context);
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for GLM-5.3 resident MLA");
+    }
+    auto* workspace = reinterpret_cast<float*>(state.glm53_mla_workspace);
+    auto* query = workspace + kDsv4MhcHidden + request.query_rank;
+    auto* expanded = query + width;
+    auto* attended = expanded + reserved_history * expanded_width;
+    auto* output = attended + width;
+    auto* coefficients = output + kDsv4MhcHidden;
+    constexpr unsigned int threads = 256U;
+    const auto hidden_blocks =
+        static_cast<unsigned int>((kDsv4MhcHidden + threads - 1U) / threads);
+    if (auto status = cudaMemcpyAsync(
+            coefficients, normalized_coefficients.data(),
+            normalized_coefficients.size_bytes(), cudaMemcpyHostToDevice,
+            state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload resident GLM-5.3 MLA coefficients");
+    }
+    glm53_mla_weighted_kernel<<<request.heads, threads, 0U, state.stream>>>(
+        coefficients, expanded, attended,
+        static_cast<std::uint32_t>(history), request.heads, request.head_dim);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch resident GLM-5.3 MLA weighted sum");
+    }
+    const auto project_one = [&](const CudaWeight* weight, const float* source,
+                                 float* destination,
+                                 std::uint64_t rows) -> cudaError_t {
+        const auto& descriptor = weight->impl_->descriptor;
+        if (descriptor.encoding == CudaWeightEncoding::Plain) {
+            bf16_matvec_kernel<<<
+                static_cast<unsigned int>((rows + 7U) / 8U), threads, 0U,
+                state.stream>>>(
+                destination, source,
+                static_cast<const __nv_bfloat16*>(weight->impl_->weights),
+                descriptor.columns, rows);
+        } else if (auto status = launch_regfed_fp8_f32_rows(
+                       state.moe_regfed, descriptor, weight->impl_->weights,
+                       weight->impl_->scales,
+                       weight->impl_->fragment_prepacked, source, destination,
+                       1U, state.stream); status != cudaSuccess) {
+            return status;
+        }
+        round_bf16_rows_kernel<<<
+            static_cast<unsigned int>((rows + threads - 1U) / threads),
+            threads, 0U, state.stream>>>(destination, rows);
+        return cudaGetLastError();
+    };
     if (auto status = project_one(request.output, attended, output,
                                   kDsv4MhcHidden);
         status != cudaSuccess) {
@@ -1188,6 +1293,7 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch resident GLM-5.3 MLA");
     }
+    state.glm53_mla_scores_pending = false;
     state.dsv4_mhc_branch_ready = true;
     return {};
 }

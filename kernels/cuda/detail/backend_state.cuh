@@ -95,6 +95,7 @@ struct CudaBackend::Impl {
         // the host starts its eight routed experts.
         float* glm53_shared_staging{};
         std::uint32_t glm53_shared_staging_floats{};
+        bool glm53_mla_scores_pending{};
         std::uint32_t glm53_shared_batch{};
         bool glm53_shared_gate_up_in_flight{};
         bool glm53_shared_down_in_flight{};

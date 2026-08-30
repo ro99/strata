@@ -1126,8 +1126,17 @@ public:
     [[nodiscard]] ValidationResult glm53_mhc_swiglu(
         int device, const CudaWeight& gate, const CudaWeight& up,
         const CudaWeight& down, std::uint32_t intermediate);
+    // Resident MLA in two phases, because the softmax cannot run on the
+    // device and stay bit-exact: CUDA's `expf` and glibc's disagree often
+    // enough to move a BF16 coefficient roughly once every nine tokens at
+    // history 46 (record 0214). Phase one returns `heads * history` raw
+    // scores; the caller applies `exp`, the normalization and the BF16
+    // rounding on the accepted host path, then calls the finish phase.
     [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
-        const CudaGlm53MlaRequest& request);
+        const CudaGlm53MlaRequest& request, std::span<float> scores);
+    [[nodiscard]] ValidationResult glm53_mla_decode_finish(
+        const CudaGlm53MlaRequest& request,
+        std::span<const float> normalized_coefficients);
     // A batch of device-resident experts in two halves, because the SwiGLU
     // between them stays on the host. Each enqueue returns as soon as the work
     // is on the stream; the matching collect completes it. Both dots are

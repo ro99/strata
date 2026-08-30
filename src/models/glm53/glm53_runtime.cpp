@@ -491,10 +491,19 @@ __attribute__((target("avx2,fma")))
     const auto& values = glm53_fp4_values();
     const auto& exponents = glm53_e8m0_values();
     // Eight consecutive columns live in four consecutive bytes, so one 32-bit
-    // load plus a variable right shift places each nibble in its own lane in
-    // column order. There is no shuffle and no second decode table.
+    // load plus a variable right shift places each nibble in its own lane, in
+    // column order and without a shuffle.
     const auto shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
     const auto mask = _mm256_set1_epi32(0x0F);
+    // E2M1's sixteen values are eight magnitudes and a sign bit, so a single
+    // in-register permute plus an XOR decodes them. That matters on this host:
+    // `vgatherdps` is microcoded on Broadwell and the FP8 dot has no choice
+    // but to pay it for a 256-entry table, while FP4 does. The result is bit-
+    // identical to indexing `glm53_fp4_values`, sign of zero included.
+    const auto magnitudes =
+        _mm256_setr_ps(0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F);
+    const auto magnitude_mask = _mm256_set1_epi32(0x07);
+    const auto sign_mask = _mm256_set1_epi32(0x08);
     __m256 accumulators[8]{
         _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
         _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
@@ -513,8 +522,11 @@ __attribute__((target("avx2,fma")))
             const auto nibbles = _mm256_and_si256(
                 _mm256_srlv_epi32(_mm256_set1_epi32(
                                       static_cast<int>(word)), shifts), mask);
-            const auto decoded =
-                _mm256_i32gather_ps(values.data(), nibbles, 4);
+            const auto decoded = _mm256_xor_ps(
+                _mm256_permutevar8x32_ps(
+                    magnitudes, _mm256_and_si256(nibbles, magnitude_mask)),
+                _mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_and_si256(nibbles, sign_mask), 28)));
             const auto activation = _mm256_loadu_ps(input.data() + offset);
             accumulators[group] = _mm256_fmadd_ps(
                 _mm256_mul_ps(decoded, group < 4U ? low_scale : high_scale),
@@ -6550,6 +6562,19 @@ float glm53_host_fp4_group32_row_dot(
     static_cast<void>(use_avx2);
 #endif
     return glm53_host_fp4_dot_scalar(packed.data(), codes, input);
+}
+
+float glm53_host_fp8_block128_row_dot(
+    std::span<const std::byte> weights, std::span<const float> scales,
+    std::span<const float> input, bool use_avx2) noexcept {
+#if STRATA_GLM53_HOST_AVX2
+    if (use_avx2) {
+        return glm53_host_fp8_dot_avx2(weights.data(), scales.data(), input);
+    }
+#else
+    static_cast<void>(use_avx2);
+#endif
+    return glm53_host_fp8_dot_scalar(weights.data(), scales.data(), input);
 }
 
 float glm53_host_bf16_row_dot(

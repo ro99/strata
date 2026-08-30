@@ -34,6 +34,12 @@ namespace strata {
 [[nodiscard]] float glm53_host_fp4_group32_row_dot(
     std::span<const std::byte> packed, std::span<const std::byte> scales,
     std::span<const float> input, bool use_avx2) noexcept;
+// FP8: `weights` holds one row's E4M3 codes and `scales` the F32 inverse
+// scales for that row's 128-column blocks. Exposed alongside the other two so
+// the three formats can be priced against each other on the same input.
+[[nodiscard]] float glm53_host_fp8_block128_row_dot(
+    std::span<const std::byte> weights, std::span<const float> scales,
+    std::span<const float> input, bool use_avx2) noexcept;
 // BF16 rows carry no scale.
 [[nodiscard]] float glm53_host_bf16_row_dot(
     std::span<const std::byte> weights, std::span<const float> input,

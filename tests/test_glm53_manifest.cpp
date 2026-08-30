@@ -136,3 +136,54 @@ TEST_CASE("GLM-5.3 chat rendering matches its text-only Jinja contract") {
             "[gMASK]<sop><|system|>Reasoning Effort: Max"
             "<|user|>x<|assistant|><think>");
 }
+
+TEST_CASE("GLM-5.3 accepts the FP8 and quark MXFP4 releases and nothing else") {
+    strata::Glm53TextConfig config;
+    config.quantization_method = "fp8";
+    config.quantization_format = "e4m3";
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Fp8E4m3Block128);
+    config = {};
+    config.quantization_method = "quark";
+    config.quantization_weight_dtype = "fp4";
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Mxfp4Group32);
+    config.quantization_weight_dtype = "int4";
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Unsupported);
+    config = {};
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Unsupported);
+}
+
+TEST_CASE("GLM-5.3 config parser reads quark's nested weight format") {
+    const auto parsed = strata::parse_glm53_config(
+        R"({"architectures":["Glm5NextForConditionalGeneration"],)"
+        R"("quantization_config":{"quant_method":"quark","exclude":["a","b"],)"
+        R"("global_quant_config":{"input_tensors":{"dtype":"fp4"},)"
+        R"("weight":{"dtype":"fp4","group_size":32,"scale_format":"e8m0",)"
+        R"("observer_cls":"PerBlockMXObserver"}}}})");
+    REQUIRE(parsed.ok());
+    REQUIRE(parsed.value.quantization_method == "quark");
+    REQUIRE(parsed.value.quantization_weight_dtype == "fp4");
+    REQUIRE(parsed.value.quantization_scale_format == "e8m0");
+    REQUIRE(parsed.value.quantization_group_size == 32U);
+    // The FP8 release's flat form must still parse into the same fields.
+    const auto fp8 = strata::parse_glm53_config(
+        R"({"quantization_config":{"quant_method":"fp8","fmt":"e4m3",)"
+        R"("weight_block_size":[128,128]}})");
+    REQUIRE(fp8.ok());
+    REQUIRE(fp8.value.fp8_block_rows == 128U);
+    REQUIRE(fp8.value.fp8_block_columns == 128U);
+}
+
+TEST_CASE("GLM-5.3 classifier places MXFP4 scale tensors with their module") {
+    std::int32_t layer = -1;
+    std::int32_t expert = -1;
+    REQUIRE(strata::classify_glm53_tensor(
+                "model.language_model.layers.20.mlp.experts.7.up_proj"
+                ".weight_scale",
+                layer, expert) == strata::Glm53TensorRole::RoutedExpert);
+    REQUIRE(layer == 20);
+    REQUIRE(expert == 7);
+}

@@ -24,6 +24,21 @@ namespace strata {
     std::span<const std::uint64_t> capacities,
     std::size_t preferred_slot);
 
+// Host decoders for the two expert storage formats the MXFP4 release adds.
+// Exposed so the vectorized and scalar decoders can be compared against each
+// other and against a reference dequantization; the host MoE calls exactly
+// these functions. `use_avx2` false forces the scalar reference.
+//
+// MXFP4: `packed` holds one row's E2M1 nibbles, column 2b in the low nibble of
+// byte b, and `scales` one E8M0 byte per 32 columns of that row.
+[[nodiscard]] float glm53_host_fp4_group32_row_dot(
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    std::span<const float> input, bool use_avx2) noexcept;
+// BF16 rows carry no scale.
+[[nodiscard]] float glm53_host_bf16_row_dot(
+    std::span<const std::byte> weights, std::span<const float> input,
+    bool use_avx2) noexcept;
+
 struct Glm53RuntimeConfig {
     std::vector<int> devices;
     double vram_cache_fraction{0.85};

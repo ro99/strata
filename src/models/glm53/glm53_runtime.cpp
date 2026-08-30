@@ -16,10 +16,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <fstream>
@@ -275,11 +277,34 @@ constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
 
-struct Glm53HostFp8Linear {
+// The three storage formats a GLM-5.3 routed or shared expert can arrive in.
+// The FP8 release uses only the first; the MXFP4 release uses the second for
+// routed experts in the 39 quantized layers and the third everywhere else,
+// including the shared expert and the routed experts of layers 3, 5 and 6 that
+// the publisher's mixed-precision correction left in BF16.
+enum class Glm53ExpertEncoding : std::uint8_t {
+    Fp8E4m3Block128F32,
+    Fp4E2m1Group32E8m0,
+    Bf16,
+};
+
+struct Glm53HostExpertLinear {
     std::span<const std::byte> weights;
-    std::span<const float> scales;
+    // FP8: F32 inverse scales, one per 128x128 block, row-major over blocks.
+    // MXFP4: E8M0 bytes, one per 32 columns of each row. BF16: empty.
+    std::span<const std::byte> scales;
     std::uint32_t rows{};
     std::uint32_t columns{};
+    Glm53ExpertEncoding encoding{Glm53ExpertEncoding::Fp8E4m3Block128F32};
+};
+
+// One output row of one projection, resolved once outside the inner loop --
+// the page path reuses a row across every token routed to that expert, so the
+// row arithmetic must not sit inside the assignment loop.
+struct Glm53HostExpertRow {
+    const std::byte* weights{};
+    const void* scales{};
+    Glm53ExpertEncoding encoding{Glm53ExpertEncoding::Fp8E4m3Block128F32};
 };
 
 // Reusable host-MoE scratch. The three buffers are fully overwritten every
@@ -410,6 +435,235 @@ __attribute__((target("avx2,fma")))
     }
 #endif
     return glm53_host_fp8_dot_scalar(weights, scales, input);
+}
+
+// E8M0 is a bare binary exponent biased by 127, so the whole format is 255
+// powers of two plus one NaN code. Decoding it through a table keeps the inner
+// loop free of ldexp and lets the AVX2 path broadcast a plain float.
+[[nodiscard]] const std::array<float, 256U>& glm53_e8m0_values() noexcept {
+    static const auto values = [] {
+        std::array<float, 256U> result{};
+        for (std::size_t index = 0U; index < 255U; ++index) {
+            result[index] = std::ldexp(1.0F, static_cast<int>(index) - 127);
+        }
+        result[255U] = std::numeric_limits<float>::quiet_NaN();
+        return result;
+    }();
+    return values;
+}
+
+[[nodiscard]] const std::array<float, 16U>& glm53_fp4_values() noexcept {
+    static const auto values = [] {
+        std::array<float, 16U> result{};
+        for (std::size_t index = 0U; index < result.size(); ++index) {
+            result[index] = fp4_e2m1_f32(static_cast<std::uint8_t>(index));
+        }
+        return result;
+    }();
+    return values;
+}
+
+// MXFP4: `packed` holds two E2M1 nibbles per byte, column 2b in the low nibble
+// of byte b and column 2b+1 in the high nibble; `scales` holds one E8M0 byte
+// per 32 columns of this row. The accumulation order mirrors the FP8 dot so
+// the two formats differ only in how a weight is decoded.
+[[nodiscard]] float glm53_host_fp4_dot_scalar(
+    const std::byte* packed, const std::uint8_t* scales,
+    std::span<const float> input) noexcept {
+    const auto& values = glm53_fp4_values();
+    const auto& exponents = glm53_e8m0_values();
+    float sum = 0.0F;
+    for (std::size_t column = 0U; column < input.size(); ++column) {
+        const auto byte = std::to_integer<std::uint8_t>(packed[column / 2U]);
+        const auto nibble = static_cast<std::uint8_t>(
+            (column % 2U == 0U) ? (byte & 0x0FU) : (byte >> 4U));
+        sum = std::fma(input[column] * values[nibble],
+                       exponents[scales[column / 32U]], sum);
+    }
+    return sum;
+}
+
+#if STRATA_GLM53_HOST_AVX2
+__attribute__((target("avx2,fma")))
+[[nodiscard]] float glm53_host_fp4_dot_avx2(
+    const std::byte* packed, const std::uint8_t* scales,
+    std::span<const float> input) noexcept {
+    const auto& values = glm53_fp4_values();
+    const auto& exponents = glm53_e8m0_values();
+    // Eight consecutive columns live in four consecutive bytes, so one 32-bit
+    // load plus a variable right shift places each nibble in its own lane in
+    // column order. There is no shuffle and no second decode table.
+    const auto shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    const auto mask = _mm256_set1_epi32(0x0F);
+    __m256 accumulators[8]{
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()};
+    std::size_t column = 0U;
+    for (; column + 64U <= input.size(); column += 64U) {
+        // Sixty-four columns span exactly two group-32 scales, which keeps the
+        // eight independent accumulator chains of the FP8 dot intact.
+        const auto low_scale = _mm256_set1_ps(exponents[scales[column / 32U]]);
+        const auto high_scale =
+            _mm256_set1_ps(exponents[scales[column / 32U + 1U]]);
+        for (std::size_t group = 0U; group < 8U; ++group) {
+            const auto offset = column + group * 8U;
+            std::uint32_t word = 0U;
+            std::memcpy(&word, packed + offset / 2U, sizeof(word));
+            const auto nibbles = _mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_set1_epi32(
+                                      static_cast<int>(word)), shifts), mask);
+            const auto decoded =
+                _mm256_i32gather_ps(values.data(), nibbles, 4);
+            const auto activation = _mm256_loadu_ps(input.data() + offset);
+            accumulators[group] = _mm256_fmadd_ps(
+                _mm256_mul_ps(decoded, group < 4U ? low_scale : high_scale),
+                activation, accumulators[group]);
+        }
+    }
+    for (std::size_t width = 4U; width != 0U; width >>= 1U) {
+        for (std::size_t index = 0U; index < width; ++index) {
+            accumulators[index] = _mm256_add_ps(
+                accumulators[index], accumulators[index + width]);
+        }
+    }
+    const __m128 low = _mm256_castps256_ps128(accumulators[0]);
+    const __m128 high = _mm256_extractf128_ps(accumulators[0], 1);
+    __m128 total = _mm_add_ps(low, high);
+    total = _mm_hadd_ps(total, total);
+    total = _mm_hadd_ps(total, total);
+    float sum = _mm_cvtss_f32(total);
+    for (; column < input.size(); ++column) {
+        const auto byte = std::to_integer<std::uint8_t>(packed[column / 2U]);
+        const auto nibble = static_cast<std::uint8_t>(
+            (column % 2U == 0U) ? (byte & 0x0FU) : (byte >> 4U));
+        sum = std::fma(input[column] * values[nibble],
+                       exponents[scales[column / 32U]], sum);
+    }
+    return sum;
+}
+#endif
+
+[[nodiscard]] float glm53_host_fp4_dot(
+    const std::byte* packed, const std::uint8_t* scales,
+    std::span<const float> input) noexcept {
+#if STRATA_GLM53_HOST_AVX2
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        return glm53_host_fp4_dot_avx2(packed, scales, input);
+    }
+#endif
+    return glm53_host_fp4_dot_scalar(packed, scales, input);
+}
+
+// BF16 rows carry no scale. The MXFP4 release leaves the shared expert and the
+// routed experts of layers 3, 5 and 6 in this form, so the host MoE meets it on
+// every one of those layers, not as an exceptional case.
+[[nodiscard]] float glm53_host_bf16_dot_scalar(
+    const std::byte* weights, std::span<const float> input) noexcept {
+    float sum = 0.0F;
+    for (std::size_t column = 0U; column < input.size(); ++column) {
+        std::uint16_t encoded = 0U;
+        std::memcpy(&encoded, weights + column * 2U, sizeof(encoded));
+        const auto value = std::bit_cast<float>(
+            static_cast<std::uint32_t>(encoded) << 16U);
+        sum = std::fma(input[column], value, sum);
+    }
+    return sum;
+}
+
+#if STRATA_GLM53_HOST_AVX2
+__attribute__((target("avx2,fma")))
+[[nodiscard]] float glm53_host_bf16_dot_avx2(
+    const std::byte* weights, std::span<const float> input) noexcept {
+    __m256 accumulators[8]{
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()};
+    std::size_t column = 0U;
+    for (; column + 64U <= input.size(); column += 64U) {
+        for (std::size_t group = 0U; group < 8U; ++group) {
+            const auto offset = column + group * 8U;
+            const auto encoded = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(weights + offset * 2U));
+            const auto widened = _mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(encoded), 16);
+            const auto decoded = _mm256_castsi256_ps(widened);
+            const auto activation = _mm256_loadu_ps(input.data() + offset);
+            accumulators[group] = _mm256_fmadd_ps(decoded, activation,
+                                                  accumulators[group]);
+        }
+    }
+    for (std::size_t width = 4U; width != 0U; width >>= 1U) {
+        for (std::size_t index = 0U; index < width; ++index) {
+            accumulators[index] = _mm256_add_ps(
+                accumulators[index], accumulators[index + width]);
+        }
+    }
+    const __m128 low = _mm256_castps256_ps128(accumulators[0]);
+    const __m128 high = _mm256_extractf128_ps(accumulators[0], 1);
+    __m128 total = _mm_add_ps(low, high);
+    total = _mm_hadd_ps(total, total);
+    total = _mm_hadd_ps(total, total);
+    float sum = _mm_cvtss_f32(total);
+    for (; column < input.size(); ++column) {
+        std::uint16_t encoded = 0U;
+        std::memcpy(&encoded, weights + column * 2U, sizeof(encoded));
+        sum = std::fma(input[column],
+                       std::bit_cast<float>(
+                           static_cast<std::uint32_t>(encoded) << 16U),
+                       sum);
+    }
+    return sum;
+}
+#endif
+
+[[nodiscard]] float glm53_host_bf16_dot(
+    const std::byte* weights, std::span<const float> input) noexcept {
+#if STRATA_GLM53_HOST_AVX2
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        return glm53_host_bf16_dot_avx2(weights, input);
+    }
+#endif
+    return glm53_host_bf16_dot_scalar(weights, input);
+}
+
+[[nodiscard]] Glm53HostExpertRow glm53_host_expert_row(
+    const Glm53HostExpertLinear& linear, std::size_t row) noexcept {
+    Glm53HostExpertRow view;
+    view.encoding = linear.encoding;
+    switch (linear.encoding) {
+        case Glm53ExpertEncoding::Fp8E4m3Block128F32:
+            view.weights = linear.weights.data() + row * linear.columns;
+            view.scales = reinterpret_cast<const float*>(linear.scales.data()) +
+                          (row / 128U) * (linear.columns / 128U);
+            break;
+        case Glm53ExpertEncoding::Fp4E2m1Group32E8m0:
+            view.weights = linear.weights.data() + row * (linear.columns / 2U);
+            view.scales =
+                reinterpret_cast<const std::uint8_t*>(linear.scales.data()) +
+                row * (linear.columns / 32U);
+            break;
+        case Glm53ExpertEncoding::Bf16:
+            view.weights = linear.weights.data() + row * linear.columns * 2U;
+            break;
+    }
+    return view;
+}
+
+[[nodiscard]] float glm53_host_expert_dot(
+    const Glm53HostExpertRow& row, std::span<const float> input) noexcept {
+    switch (row.encoding) {
+        case Glm53ExpertEncoding::Fp4E2m1Group32E8m0:
+            return glm53_host_fp4_dot(
+                row.weights, static_cast<const std::uint8_t*>(row.scales),
+                input);
+        case Glm53ExpertEncoding::Bf16:
+            return glm53_host_bf16_dot(row.weights, input);
+        case Glm53ExpertEncoding::Fp8E4m3Block128F32:
+            break;
+    }
+    return glm53_host_fp8_dot(
+        row.weights, static_cast<const float*>(row.scales), input);
 }
 constexpr std::uint32_t kMlaHead = 256U;
 constexpr std::uint32_t kMlaWidth = kHeads * kMlaHead;
@@ -1938,9 +2192,9 @@ struct Glm53Runtime::Impl {
     // today, but nothing in the type system says so, and the lock is taken once
     // per call around the whole group rather than once per expert.
     struct Glm53ExpertViews {
-        Glm53HostFp8Linear gate;
-        Glm53HostFp8Linear up;
-        Glm53HostFp8Linear down;
+        Glm53HostExpertLinear gate;
+        Glm53HostExpertLinear up;
+        Glm53HostExpertLinear down;
     };
     static constexpr std::uint32_t kExpertSlots = 289U;  // 288 routed + shared
     mutable std::mutex expert_view_mutex;
@@ -2239,6 +2493,16 @@ struct Glm53Runtime::Impl {
 
     // Resolves one expert's three matrices, caching them. `expert_slot` is the
     // routed expert id, or 288 for the shared expert.
+    // The FP8 release's host MoE quantizes its own activations to E4M3 so the
+    // host reproduces what `enqueue_glm53_expert_*` does on the device. The
+    // MXFP4 release has no device counterpart and no E4M3 anywhere in its
+    // expert path, so quantizing there would discard precision the format
+    // never asked to lose: it is W4A16, weights only.
+    [[nodiscard]] bool fp8_expert_checkpoint() const noexcept {
+        return checkpoint->manifest().quantization ==
+               Glm53Quantization::Fp8E4m3Block128;
+    }
+
     [[nodiscard]] ValidationResult expert_views(
         std::uint32_t layer, std::uint32_t expert_slot, std::string_view prefix,
         Glm53ExpertViews& out) const {
@@ -2261,9 +2525,9 @@ struct Glm53Runtime::Impl {
                     ? std::string(prefix) + "shared_experts."
                     : std::string(prefix) + "experts." +
                           std::to_string(expert_slot) + ".";
-            auto gate = host_fp8_linear(module + "gate_proj", 2048U, kHidden);
-            auto up = host_fp8_linear(module + "up_proj", 2048U, kHidden);
-            auto down = host_fp8_linear(module + "down_proj", kHidden, 2048U);
+            auto gate = host_expert_linear(module + "gate_proj", 2048U, kHidden);
+            auto up = host_expert_linear(module + "up_proj", 2048U, kHidden);
+            auto down = host_expert_linear(module + "down_proj", kHidden, 2048U);
             if (!gate.ok() || !up.ok() || !down.ok()) {
                 if (!gate.ok()) append(result.errors, std::move(gate.errors));
                 if (!up.ok()) append(result.errors, std::move(up.errors));
@@ -2277,55 +2541,111 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
-    [[nodiscard]] ParseResult<Glm53HostFp8Linear> host_fp8_linear(
+    // Resolves one expert projection into a mapped view, from whichever of the
+    // three storage formats the open checkpoint actually holds. The shapes are
+    // the discriminator, not a configuration flag: an FP8 checkpoint can only
+    // present E4M3 rows and an MXFP4 checkpoint only packed nibbles or BF16, so
+    // a mismatch here is a corrupt or unsupported checkpoint rather than a
+    // wrongly selected path.
+    [[nodiscard]] ParseResult<Glm53HostExpertLinear> host_expert_linear(
         std::string_view base, std::uint32_t rows,
         std::uint32_t columns) const {
-        ParseResult<Glm53HostFp8Linear> result;
+        ParseResult<Glm53HostExpertLinear> result;
         const auto weight_name = std::string(base) + ".weight";
-        const auto scale_name = std::string(base) + ".weight_scale_inv";
         const auto* descriptor = checkpoint->find(weight_name);
-        const auto* scale_descriptor = checkpoint->find(scale_name);
-        const auto scale_rows = (rows + 127U) / 128U;
-        const auto scale_columns = (columns + 127U) / 128U;
-        if (descriptor == nullptr || scale_descriptor == nullptr ||
-            descriptor->source_dtype != SafetensorsDtype::F8E4M3 ||
-            descriptor->source_shape !=
-                std::vector<std::uint64_t>{rows, columns} ||
-            scale_descriptor->source_dtype != SafetensorsDtype::F32 ||
-            scale_descriptor->source_shape !=
-                std::vector<std::uint64_t>{scale_rows, scale_columns}) {
+        if (descriptor == nullptr) {
             result.errors.push_back(
-                "GLM-5.3 host expert has an invalid FP8 linear: " +
-                std::string(base));
+                "GLM-5.3 host expert is missing a weight: " + weight_name);
+            return result;
+        }
+        const auto invalid = [&](std::string_view what) {
+            result.errors.push_back("GLM-5.3 host expert has an invalid " +
+                                    std::string(what) + ": " +
+                                    std::string(base));
+        };
+        std::string scale_name;
+        std::uint64_t expected_weight_bytes = 0U;
+        std::uint64_t expected_scale_bytes = 0U;
+        Glm53ExpertEncoding encoding{};
+        if (descriptor->source_dtype == SafetensorsDtype::F8E4M3) {
+            const auto scale_rows = (rows + 127U) / 128U;
+            const auto scale_columns = (columns + 127U) / 128U;
+            scale_name = std::string(base) + ".weight_scale_inv";
+            const auto* scale = checkpoint->find(scale_name);
+            if (descriptor->source_shape !=
+                    std::vector<std::uint64_t>{rows, columns} ||
+                scale == nullptr ||
+                scale->source_dtype != SafetensorsDtype::F32 ||
+                scale->source_shape !=
+                    std::vector<std::uint64_t>{scale_rows, scale_columns}) {
+                invalid("FP8 linear");
+                return result;
+            }
+            encoding = Glm53ExpertEncoding::Fp8E4m3Block128F32;
+            expected_weight_bytes =
+                static_cast<std::uint64_t>(rows) * columns;
+            expected_scale_bytes = static_cast<std::uint64_t>(scale_rows) *
+                                   scale_columns * sizeof(float);
+        } else if (descriptor->source_dtype == SafetensorsDtype::U8) {
+            scale_name = std::string(base) + ".weight_scale";
+            const auto* scale = checkpoint->find(scale_name);
+            if (columns % 32U != 0U ||
+                descriptor->source_shape !=
+                    std::vector<std::uint64_t>{rows, columns / 2U} ||
+                scale == nullptr ||
+                scale->source_dtype != SafetensorsDtype::U8 ||
+                scale->source_shape !=
+                    std::vector<std::uint64_t>{rows, columns / 32U}) {
+                invalid("MXFP4 linear");
+                return result;
+            }
+            encoding = Glm53ExpertEncoding::Fp4E2m1Group32E8m0;
+            expected_weight_bytes =
+                static_cast<std::uint64_t>(rows) * (columns / 2U);
+            expected_scale_bytes =
+                static_cast<std::uint64_t>(rows) * (columns / 32U);
+        } else if (descriptor->source_dtype == SafetensorsDtype::Bf16) {
+            if (descriptor->source_shape !=
+                    std::vector<std::uint64_t>{rows, columns}) {
+                invalid("BF16 linear");
+                return result;
+            }
+            encoding = Glm53ExpertEncoding::Bf16;
+            expected_weight_bytes =
+                static_cast<std::uint64_t>(rows) * columns * 2U;
+        } else {
+            invalid("expert dtype");
             return result;
         }
         auto weight_payload = checkpoint->view(weight_name);
-        auto scales = checkpoint->view(scale_name);
         if (!weight_payload.ok()) {
             result.errors = std::move(weight_payload.errors);
             return result;
         }
-        if (!scales.ok()) {
-            result.errors = std::move(scales.errors);
-            return result;
+        std::span<const std::byte> scale_payload;
+        if (!scale_name.empty()) {
+            auto scales = checkpoint->view(scale_name);
+            if (!scales.ok()) {
+                result.errors = std::move(scales.errors);
+                return result;
+            }
+            scale_payload = scales.value;
+            if (encoding == Glm53ExpertEncoding::Fp8E4m3Block128F32 &&
+                reinterpret_cast<std::uintptr_t>(scale_payload.data()) %
+                        alignof(float) != 0U) {
+                result.errors.push_back(
+                    "GLM-5.3 host expert mapped payload is mis-aligned");
+                return result;
+            }
         }
-        if (weight_payload.value.size_bytes() !=
-                static_cast<std::size_t>(rows) * columns ||
-            scales.value.size_bytes() !=
-                static_cast<std::size_t>(scale_rows) * scale_columns *
-                    sizeof(float) ||
-            reinterpret_cast<std::uintptr_t>(scales.value.data()) %
-                    alignof(float) != 0U) {
+        if (weight_payload.value.size_bytes() != expected_weight_bytes ||
+            scale_payload.size_bytes() != expected_scale_bytes) {
             result.errors.push_back(
                 "GLM-5.3 host expert mapped payload is mis-sized");
             return result;
         }
-        result.value = {
-            weight_payload.value,
-            std::span<const float>(
-                reinterpret_cast<const float*>(scales.value.data()),
-                static_cast<std::size_t>(scale_rows) * scale_columns),
-            rows, columns};
+        result.value = {weight_payload.value, scale_payload, rows, columns,
+                        encoding};
         return result;
     }
 
@@ -2341,6 +2661,17 @@ struct Glm53Runtime::Impl {
         shared_experts.bytes_by_slot.assign(devices.size(), 0U);
         const auto override = shared_expert_device_override();
         if (override == 0 || !host_moe_active || devices.empty()) return {};
+        // `enqueue_glm53_expert_*` decodes E4M3 rows against F32 block scales.
+        // The MXFP4 release's shared expert is BF16, so the tier has nothing
+        // to upload there; an explicit opt-in says so rather than silently
+        // running the host path it asked to replace.
+        if (!fp8_expert_checkpoint()) {
+            if (override > 0) {
+                return {{"GLM-5.3 shared expert device tier requires the FP8 "
+                         "checkpoint; this release stores it BF16"}};
+            }
+            return {};
+        }
 
         constexpr std::uint32_t intermediate = 2048U;
         // gate and up are intermediate x hidden, down is hidden x
@@ -2403,9 +2734,9 @@ struct Glm53Runtime::Impl {
                 Projection{module + "down_proj", kHidden, intermediate}};
             std::array<CudaBuffer*, 6U> uploaded{};
             for (std::size_t index = 0U; index < projections.size(); ++index) {
-                auto linear = host_fp8_linear(projections[index].name,
-                                              projections[index].rows,
-                                              projections[index].columns);
+                auto linear = host_expert_linear(projections[index].name,
+                                                 projections[index].rows,
+                                                 projections[index].columns);
                 if (!linear.ok()) return {std::move(linear.errors)};
                 auto& weight_buffer = shared_experts.storage[cursor++];
                 auto& scale_buffer = shared_experts.storage[cursor++];
@@ -2472,9 +2803,9 @@ struct Glm53Runtime::Impl {
         const auto started = std::chrono::steady_clock::now();
         const auto view_started = started;
         struct Expert {
-            Glm53HostFp8Linear gate;
-            Glm53HostFp8Linear up;
-            Glm53HostFp8Linear down;
+            Glm53HostExpertLinear gate;
+            Glm53HostExpertLinear up;
+            Glm53HostExpertLinear down;
         };
         std::array<Expert, 9U> experts;
         for (std::size_t index = 0U; index < expert_count; ++index) {
@@ -2511,8 +2842,10 @@ struct Glm53Runtime::Impl {
         auto& quantized_input = host_moe_quantized_input;
         if (glm53_grow(quantized_input, input.size())) ++allocations;
         std::copy(input.begin(), input.end(), quantized_input.begin());
-        glm53_quantize_activation(
-            std::span<float>(quantized_input).first(input.size()));
+        if (fp8_expert_checkpoint()) {
+            glm53_quantize_activation(
+                std::span<float>(quantized_input).first(input.size()));
+        }
         if (config.phase_profile) {
             host_moe_input_quantization_nanoseconds.fetch_add(
                 elapsed_nanoseconds(input_quantization_started),
@@ -2537,19 +2870,12 @@ struct Glm53Runtime::Impl {
                 const auto expert = task / intermediate;
                 const auto row = task % intermediate;
                 const auto& module = experts[expert];
-                const auto scale_columns = kHidden / 128U;
-                const auto* gate_weights = module.gate.weights.data() +
-                    row * kHidden;
-                const auto* up_weights = module.up.weights.data() +
-                    row * kHidden;
-                const auto* gate_scales = module.gate.scales.data() +
-                    (row / 128U) * scale_columns;
-                const auto* up_scales = module.up.scales.data() +
-                    (row / 128U) * scale_columns;
-                auto gate = bf16_round_f32(glm53_host_fp8_dot(
-                    gate_weights, gate_scales, quantized_input));
-                auto up = bf16_round_f32(glm53_host_fp8_dot(
-                    up_weights, up_scales, quantized_input));
+                const auto gate_row = glm53_host_expert_row(module.gate, row);
+                const auto up_row = glm53_host_expert_row(module.up, row);
+                auto gate = bf16_round_f32(glm53_host_expert_dot(
+                    gate_row, quantized_input));
+                auto up = bf16_round_f32(glm53_host_expert_dot(
+                    up_row, quantized_input));
                 gate = std::min(gate, 10.0F);
                 up = std::clamp(up, -10.0F, 10.0F);
                 activations[expert * intermediate + row] =
@@ -2562,9 +2888,11 @@ struct Glm53Runtime::Impl {
                 std::memory_order_relaxed);
         }
         const auto activation_started = std::chrono::steady_clock::now();
-        for (std::size_t expert = 0U; expert < expert_count; ++expert) {
-            glm53_quantize_activation(std::span<float>(activations).subspan(
-                expert * intermediate, intermediate));
+        if (fp8_expert_checkpoint()) {
+            for (std::size_t expert = 0U; expert < expert_count; ++expert) {
+                glm53_quantize_activation(std::span<float>(activations).subspan(
+                    expert * intermediate, intermediate));
+            }
         }
         // The device returns the two raw dots. Every rounding, the clamp and
         // the SwiGLU stay here, on the same code the host path runs for its
@@ -2613,14 +2941,10 @@ struct Glm53Runtime::Impl {
                 const auto expert = task / kHidden;
                 const auto row = task % kHidden;
                 const auto& module = experts[expert].down;
-                const auto scale_columns = intermediate / 128U;
-                const auto* weight_row = module.weights.data() +
-                    row * intermediate;
-                const auto* scales = module.scales.data() +
-                    (row / 128U) * scale_columns;
+                const auto weight_row = glm53_host_expert_row(module, row);
                 expert_outputs[expert * kHidden + row] = bf16_round_f32(
-                    glm53_host_fp8_dot(
-                        weight_row, scales,
+                    glm53_host_expert_dot(
+                        weight_row,
                         std::span<const float>(activations).subspan(
                             expert * intermediate, intermediate)));
             });
@@ -2693,9 +3017,9 @@ struct Glm53Runtime::Impl {
         const auto started = std::chrono::steady_clock::now();
         const auto view_started = started;
         struct Expert {
-            Glm53HostFp8Linear gate;
-            Glm53HostFp8Linear up;
-            Glm53HostFp8Linear down;
+            Glm53HostExpertLinear gate;
+            Glm53HostExpertLinear up;
+            Glm53HostExpertLinear down;
         };
         struct Assignment {
             std::size_t input_row{};
@@ -2772,12 +3096,15 @@ struct Glm53Runtime::Impl {
         auto& quantized_input = page_quantized_input;
         if (glm53_grow(quantized_input, input.size())) ++allocations;
         std::copy(input.begin(), input.end(), quantized_input.begin());
-        result = host_moe_workers->parallel_for(rows, [&](std::size_t row) {
-            glm53_quantize_activation(
-                std::span<float>(quantized_input)
-                    .subspan(row * kHidden, kHidden));
-        });
-        if (!result.ok()) return result;
+        if (fp8_expert_checkpoint()) {
+            result = host_moe_workers->parallel_for(
+                rows, [&](std::size_t row) {
+                    glm53_quantize_activation(
+                        std::span<float>(quantized_input)
+                            .subspan(row * kHidden, kHidden));
+                });
+            if (!result.ok()) return result;
+        }
         if (config.phase_profile) {
             host_moe_input_quantization_nanoseconds.fetch_add(
                 elapsed_nanoseconds(input_quantization_started),
@@ -2794,22 +3121,17 @@ struct Glm53Runtime::Impl {
                 const auto group_index = task / intermediate;
                 const auto projection_row = task % intermediate;
                 const auto& group = groups[group_index];
-                const auto scale_columns = kHidden / 128U;
-                const auto* gate_weights = group.module.gate.weights.data() +
-                    projection_row * kHidden;
-                const auto* up_weights = group.module.up.weights.data() +
-                    projection_row * kHidden;
-                const auto* gate_scales = group.module.gate.scales.data() +
-                    (projection_row / 128U) * scale_columns;
-                const auto* up_scales = group.module.up.scales.data() +
-                    (projection_row / 128U) * scale_columns;
+                const auto gate_row =
+                    glm53_host_expert_row(group.module.gate, projection_row);
+                const auto up_row =
+                    glm53_host_expert_row(group.module.up, projection_row);
                 for (const auto& assignment : group.assignments) {
                     const auto source = std::span<const float>(quantized_input)
                         .subspan(assignment.input_row * kHidden, kHidden);
-                    auto gate = bf16_round_f32(glm53_host_fp8_dot(
-                        gate_weights, gate_scales, source));
-                    auto up = bf16_round_f32(glm53_host_fp8_dot(
-                        up_weights, up_scales, source));
+                    auto gate = bf16_round_f32(
+                        glm53_host_expert_dot(gate_row, source));
+                    auto up = bf16_round_f32(
+                        glm53_host_expert_dot(up_row, source));
                     gate = std::min(gate, 10.0F);
                     up = std::clamp(up, -10.0F, 10.0F);
                     activations[assignment.output_slot * intermediate +
@@ -2824,13 +3146,15 @@ struct Glm53Runtime::Impl {
                 std::memory_order_relaxed);
         }
         const auto activation_started = std::chrono::steady_clock::now();
-        result = host_moe_workers->parallel_for(
-            output_slots, [&](std::size_t slot) {
-                glm53_quantize_activation(
-                    std::span<float>(activations)
-                        .subspan(slot * intermediate, intermediate));
-            });
-        if (!result.ok()) return result;
+        if (fp8_expert_checkpoint()) {
+            result = host_moe_workers->parallel_for(
+                output_slots, [&](std::size_t slot) {
+                    glm53_quantize_activation(
+                        std::span<float>(activations)
+                            .subspan(slot * intermediate, intermediate));
+                });
+            if (!result.ok()) return result;
+        }
         if (config.phase_profile) {
             host_moe_activation_nanoseconds.fetch_add(
                 elapsed_nanoseconds(activation_started),
@@ -2846,17 +3170,13 @@ struct Glm53Runtime::Impl {
                 const auto group_index = task / kHidden;
                 const auto projection_row = task % kHidden;
                 const auto& group = groups[group_index];
-                const auto& projection = group.module.down;
-                const auto scale_columns = intermediate / 128U;
-                const auto* projection_weights = projection.weights.data() +
-                    projection_row * intermediate;
-                const auto* projection_scales = projection.scales.data() +
-                    (projection_row / 128U) * scale_columns;
+                const auto projection_view = glm53_host_expert_row(
+                    group.module.down, projection_row);
                 for (const auto& assignment : group.assignments) {
                     expert_outputs[assignment.output_slot * kHidden +
                                    projection_row] = bf16_round_f32(
-                        glm53_host_fp8_dot(
-                            projection_weights, projection_scales,
+                        glm53_host_expert_dot(
+                            projection_view,
                             std::span<const float>(activations).subspan(
                                 assignment.output_slot * intermediate,
                                 intermediate)));
@@ -5872,8 +6192,15 @@ ValidationResult Glm53Runtime::initialize(
             }
         }
     }
+    // Layer 3 is the first MoE layer, but the MXFP4 release leaves its routed
+    // experts BF16 under the publisher's mixed-precision correction. Sampling
+    // layer 4 there measures the format 39 of the 42 MoE layers actually use.
     const std::string expert_prefix =
-        "model.language_model.layers.3.mlp.experts.0.";
+        "model.language_model.layers." +
+        std::string(impl_->checkpoint->manifest().quantization ==
+                            Glm53Quantization::Mxfp4Group32
+                        ? "4" : "3") +
+        ".mlp.experts.0.";
     const auto expert_bytes =
         impl_->checkpoint->cuda_linear_storage_bytes(
             expert_prefix + "gate_proj") +
@@ -5995,7 +6322,11 @@ ValidationResult Glm53Runtime::initialize(
                           : "host-boundary-fallback")
                   << '\n';
         std::cerr << "[glm53-expert-tier] mode="
-                  << (impl_->host_moe_active ? "host-fp8" : "cuda-lru")
+                  << (impl_->host_moe_active
+                          ? (impl_->checkpoint->manifest().quantization ==
+                                     Glm53Quantization::Mxfp4Group32
+                                 ? "host-mxfp4" : "host-fp8")
+                          : "cuda-lru")
                   << " workers="
                   << (impl_->host_moe_workers == nullptr
                           ? 0U : impl_->host_moe_workers->size())
@@ -6206,6 +6537,30 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
         std::cerr << "}\n";
     }
     return result;
+}
+
+float glm53_host_fp4_group32_row_dot(
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    std::span<const float> input, bool use_avx2) noexcept {
+    const auto* codes =
+        reinterpret_cast<const std::uint8_t*>(scales.data());
+#if STRATA_GLM53_HOST_AVX2
+    if (use_avx2) return glm53_host_fp4_dot_avx2(packed.data(), codes, input);
+#else
+    static_cast<void>(use_avx2);
+#endif
+    return glm53_host_fp4_dot_scalar(packed.data(), codes, input);
+}
+
+float glm53_host_bf16_row_dot(
+    std::span<const std::byte> weights, std::span<const float> input,
+    bool use_avx2) noexcept {
+#if STRATA_GLM53_HOST_AVX2
+    if (use_avx2) return glm53_host_bf16_dot_avx2(weights.data(), input);
+#else
+    static_cast<void>(use_avx2);
+#endif
+    return glm53_host_bf16_dot_scalar(weights.data(), input);
 }
 
 }  // namespace strata

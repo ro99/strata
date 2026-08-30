@@ -282,8 +282,12 @@ std::uint64_t Glm53CheckpointReader::cuda_linear_storage_bytes(
     const auto* weight = find(weight_name);
     if (weight == nullptr) return 0U;
     std::uint64_t scale_bytes = 0U;
-    if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
-        const auto* scale = find(std::string(base_name) + ".weight_scale_inv");
+    if (weight->source_dtype == SafetensorsDtype::F8E4M3 ||
+        weight->source_dtype == SafetensorsDtype::U8) {
+        const auto* scale = find(
+            std::string(base_name) +
+            (weight->source_dtype == SafetensorsDtype::U8 ? ".weight_scale"
+                                                          : ".weight_scale_inv"));
         if (scale == nullptr) return 0U;
         scale_bytes = scale->source_bytes;
     }

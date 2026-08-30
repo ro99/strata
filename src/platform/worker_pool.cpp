@@ -1,7 +1,5 @@
 #include "strata/platform/worker_pool.hpp"
 
-#include "strata/platform/numa_topology.hpp"
-
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -56,9 +54,6 @@ struct HostWorkerPool::Impl {
     std::atomic<std::uint64_t> dispatches{};
     std::chrono::microseconds idle_spin;
     std::vector<int> affinity_cpus;
-    std::vector<int> worker_nodes;
-    std::vector<std::size_t> node_rank;
-    std::vector<std::size_t> node_peers;
     bool stopping{};
 
     explicit Impl(std::size_t count, std::chrono::microseconds spin,
@@ -66,32 +61,6 @@ struct HostWorkerPool::Impl {
         : idle_spin(spin), affinity_cpus(std::move(affinity_cpu_list)) {
         if (!this->affinity_cpus.empty() && this->affinity_cpus.size() != count) {
             this->affinity_cpus.clear();
-        }
-        if (!this->affinity_cpus.empty()) {
-            const auto topology = NumaTopology::detect();
-            bool known = !topology.cpu_node.empty();
-            for (const auto cpu : this->affinity_cpus) {
-                if (cpu < 0 ||
-                    static_cast<std::size_t>(cpu) >= topology.cpu_node.size() ||
-                    topology.cpu_node[static_cast<std::size_t>(cpu)] < 0) {
-                    known = false;
-                    break;
-                }
-                worker_nodes.push_back(
-                    topology.cpu_node[static_cast<std::size_t>(cpu)]);
-            }
-            if (!known) worker_nodes.clear();
-            if (!worker_nodes.empty()) {
-                node_rank.assign(count, 0U);
-                node_peers.assign(count, 0U);
-                for (std::size_t worker = 0U; worker < count; ++worker) {
-                    for (std::size_t other = 0U; other < count; ++other) {
-                        if (worker_nodes[other] != worker_nodes[worker]) continue;
-                        if (other < worker) ++node_rank[worker];
-                        ++node_peers[worker];
-                    }
-                }
-            }
         }
         queues.resize(count);
         workers.reserve(count);
@@ -233,100 +202,6 @@ ValidationResult HostWorkerPool::parallel_for_addressed(
         });
     }
     if (completion->error != nullptr) {
-        result.errors.emplace_back("host worker task raised an exception");
-    }
-    return result;
-}
-
-std::span<const int> HostWorkerPool::worker_nodes() const noexcept {
-    return impl_ == nullptr ? std::span<const int>{}
-                            : std::span<const int>(impl_->worker_nodes);
-}
-
-ValidationResult HostWorkerPool::parallel_for_owned(
-    std::span<const std::size_t> partition_tasks,
-    std::span<const int> partition_nodes,
-    const std::function<void(std::size_t, std::size_t)>& operation) {
-    ValidationResult result;
-    if (partition_tasks.size() != partition_nodes.size()) {
-        return {{"owned dispatch needs one node per partition"}};
-    }
-    std::size_t total = 0U;
-    for (const auto tasks : partition_tasks) total += tasks;
-    if (total == 0U) return result;
-    if (!operation || impl_ == nullptr || impl_->workers.empty() ||
-        impl_->worker_nodes.size() != impl_->workers.size()) {
-        return {{"owned dispatch requires an affinity-aware worker pool"}};
-    }
-    for (std::size_t partition = 0U; partition < partition_tasks.size();
-         ++partition) {
-        if (partition_tasks[partition] == 0U) continue;
-        if (std::find(impl_->worker_nodes.begin(), impl_->worker_nodes.end(),
-                      partition_nodes[partition]) == impl_->worker_nodes.end()) {
-            return {{"owned dispatch has no worker on node " +
-                     std::to_string(partition_nodes[partition])}};
-        }
-    }
-
-    struct Dispatch {
-        std::span<const std::size_t> tasks;
-        std::span<const int> nodes;
-        const std::function<void(std::size_t, std::size_t)>* operation{};
-        const std::vector<int>* worker_nodes{};
-        const std::vector<std::size_t>* rank{};
-        const std::vector<std::size_t>* peers{};
-        std::mutex mutex;
-        std::condition_variable ready;
-        std::size_t remaining{};
-        std::exception_ptr error;
-    } dispatch{partition_tasks, partition_nodes, &operation,
-               &impl_->worker_nodes, &impl_->node_rank, &impl_->node_peers,
-               {}, {}, impl_->workers.size(), {}};
-    {
-        std::scoped_lock queue_lock(impl_->mutex);
-        if (impl_->stopping) return {{"host worker pool is stopping"}};
-        for (std::size_t runner = 0U; runner < impl_->workers.size(); ++runner) {
-            auto* command = &dispatch;
-            impl_->queues[runner].emplace_back([command, runner] {
-                try {
-                    const auto node = (*command->worker_nodes)[runner];
-                    const auto rank = (*command->rank)[runner];
-                    const auto peers = (*command->peers)[runner];
-                    for (std::size_t partition = 0U;
-                         partition < command->tasks.size(); ++partition) {
-                        if (command->nodes[partition] != node) continue;
-                        const auto tasks = command->tasks[partition];
-                        const auto quotient = tasks / peers;
-                        const auto remainder = tasks % peers;
-                        const auto first = rank * quotient +
-                                           std::min(rank, remainder);
-                        const auto count = quotient +
-                                           (rank < remainder ? 1U : 0U);
-                        for (std::size_t offset = 0U; offset < count; ++offset) {
-                            (*command->operation)(partition, first + offset);
-                        }
-                    }
-                } catch (...) {
-                    std::scoped_lock error_lock(command->mutex);
-                    if (command->error == nullptr) {
-                        command->error = std::current_exception();
-                    }
-                }
-                std::scoped_lock done(command->mutex);
-                --command->remaining;
-                command->ready.notify_one();
-            });
-        }
-        impl_->dispatches.fetch_add(1U, std::memory_order_release);
-    }
-    impl_->ready.notify_all();
-    {
-        std::unique_lock lock(dispatch.mutex);
-        dispatch.ready.wait(lock, [&dispatch] {
-            return dispatch.remaining == 0U;
-        });
-    }
-    if (dispatch.error != nullptr) {
         result.errors.emplace_back("host worker task raised an exception");
     }
     return result;

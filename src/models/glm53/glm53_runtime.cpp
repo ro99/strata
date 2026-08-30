@@ -10,7 +10,6 @@
 #include "strata/models/glm53/glm53_checkpoint.hpp"
 #include "strata/models/kimi_k3/kimi_k3_ops.hpp"
 #include "strata/platform/hardware_profile.hpp"
-#include "strata/platform/numa_topology.hpp"
 #include "strata/platform/numerics.hpp"
 #include "strata/platform/worker_pool.hpp"
 
@@ -149,11 +148,7 @@ namespace {
         after.down_nanoseconds - before.down_nanoseconds,
         after.reduction_nanoseconds - before.reduction_nanoseconds,
         after.service_nanoseconds - before.service_nanoseconds,
-        after.temporary_allocation_calls - before.temporary_allocation_calls,
-        after.ep2_calls - before.ep2_calls,
-        after.ep2_owner0_experts - before.ep2_owner0_experts,
-        after.ep2_owner1_experts - before.ep2_owner1_experts,
-        after.ep2_imbalance_experts - before.ep2_imbalance_experts};
+        after.temporary_allocation_calls - before.temporary_allocation_calls};
 }
 
 [[nodiscard]] Glm53GraphMetrics graph_delta(
@@ -233,13 +228,6 @@ void print_phase_metrics(std::ostream& output,
            << phase.host_experts.service_nanoseconds
            << ",\"temporary_allocation_calls\":"
            << phase.host_experts.temporary_allocation_calls
-           << ",\"ep2_calls\":" << phase.host_experts.ep2_calls
-           << ",\"ep2_owner0_experts\":"
-           << phase.host_experts.ep2_owner0_experts
-           << ",\"ep2_owner1_experts\":"
-           << phase.host_experts.ep2_owner1_experts
-           << ",\"ep2_imbalance_experts\":"
-           << phase.host_experts.ep2_imbalance_experts
            << "},\"graph\":{\"forward_calls\":"
            << phase.graph.forward_calls
            << ",\"forward_rows\":" << phase.graph.forward_rows
@@ -618,20 +606,6 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
                    std::string_view(value) != "false" &&
                    std::string_view(value) != "off"
                ? 1 : 0;
-}
-
-[[nodiscard]] bool m31_cpu_ep2_enabled() noexcept {
-    const char* value = std::getenv("STRATA_GLM53_M31_CPU_EP2");
-    return value != nullptr && std::string_view(value) != "0" &&
-           std::string_view(value) != "false" &&
-           std::string_view(value) != "off";
-}
-
-[[nodiscard]] bool m31_gpu_tp2_enabled() noexcept {
-    const char* value = std::getenv("STRATA_GLM53_M31_GPU_TP2");
-    return value != nullptr && std::string_view(value) != "0" &&
-           std::string_view(value) != "false" &&
-           std::string_view(value) != "off";
 }
 
 // The shared expert is the ninth of the nine every MoE layer runs and the only
@@ -1404,69 +1378,6 @@ public:
         return backend_.glm53_mla_decode_finish(request, scores);
     }
 
-    [[nodiscard]] ValidationResult mla_shard_scores(
-        std::size_t slot, std::string_view attention,
-        std::uint32_t rank, CudaGlm53MlaShardRequest request,
-        std::span<float> scores) {
-        if (slot >= states_.size() || request.state == nullptr || rank > 1U) {
-            return {{"GLM-5.3 MLA shard targets an invalid cache slot"}};
-        }
-        const auto local_width = static_cast<std::uint64_t>(request.heads) *
-                                 request.head_dim;
-        const auto full_width = 2ULL * local_width;
-        const std::array<std::string, 4U> keys{
-            std::string(attention) + "q_a_proj",
-            std::string(attention) + "kv_a_proj_with_mqa",
-            slice_key(std::string(attention) + "q_b_proj",
-                      rank * local_width, local_width),
-            slice_key(std::string(attention) + "kv_b_proj",
-                      rank * full_width, full_width)};
-        auto& state = *states_[slot];
-        std::scoped_lock lock(state.mutex);
-        std::array<Entry*, 4U> entries{};
-        for (std::size_t index = 0U; index < keys.size(); ++index) {
-            const auto found = state.entries.find(keys[index]);
-            if (found == state.entries.end() ||
-                found->second.weight.device() != request.state->device()) {
-                return {{"GLM-5.3 MLA shard weight was not admitted: " +
-                         keys[index]}};
-            }
-            entries[index] = &found->second;
-            ++found->second.leases;
-        }
-        struct Lease {
-            std::array<Entry*, 4U>& entries;
-            ~Lease() { for (auto* entry : entries) --entry->leases; }
-        } lease{entries};
-        request.query_a = &entries[0]->weight;
-        request.key_value_a = &entries[1]->weight;
-        request.query_b = &entries[2]->weight;
-        request.key_value_b = &entries[3]->weight;
-        return backend_.glm53_mla_shard_scores(request, scores);
-    }
-
-    [[nodiscard]] ValidationResult mla_publish_attended(
-        std::size_t slot, std::string_view attention,
-        std::span<const float> attended) {
-        if (slot >= states_.size()) {
-            return {{"GLM-5.3 MLA publication targets an invalid cache slot"}};
-        }
-        auto& state = *states_[slot];
-        std::scoped_lock lock(state.mutex);
-        const auto key = std::string(attention) + "o_proj";
-        const auto found = state.entries.find(key);
-        if (found == state.entries.end()) {
-            return {{"GLM-5.3 MLA output was not admitted: " + key}};
-        }
-        ++found->second.leases;
-        struct Lease {
-            Entry& entry;
-            ~Lease() { --entry.leases; }
-        } lease{found->second};
-        return backend_.glm53_mla_publish_attended(
-            devices_[slot], found->second.weight, attended);
-    }
-
     [[nodiscard]] ValidationResult swiglu_mhc(
         std::size_t slot, std::string_view prefix,
         std::uint32_t intermediate) {
@@ -1861,7 +1772,6 @@ struct Glm53Runtime::Impl {
     struct DeviceSequenceState {
         std::array<CudaBuffer, kLayers> kda;
         std::array<CudaBuffer, kLayers> mla;
-        std::array<std::array<CudaBuffer, 2U>, kLayers> mla_tp2;
         bool ready{};
     };
 
@@ -1930,10 +1840,6 @@ struct Glm53Runtime::Impl {
     std::unique_ptr<Glm53WeightCache> weights;
     std::array<ResidentLayerWeights, kLayers> resident_layers;
     bool resident_execution_active{};
-    bool m31_gpu_tp2_active{};
-    std::array<std::vector<float>, 2U> m31_mla_scores;
-    std::array<std::vector<float>, 2U> m31_mla_attended;
-    std::vector<float> m31_mla_gathered;
     RoutePredictor route_predictor;
     std::mutex prefetch_mutex;
     std::condition_variable prefetch_ready;
@@ -2041,10 +1947,6 @@ struct Glm53Runtime::Impl {
     mutable std::vector<Glm53ExpertViews> expert_view_cache;
     mutable std::vector<std::uint8_t> expert_view_ready;
     bool host_moe_active{};
-    bool cpu_ep2_active{};
-    std::array<int, 2U> cpu_ep2_nodes{-1, -1};
-    PageMigration cpu_ep2_migration;
-    std::uint64_t cpu_ep2_residual_bytes{};
     std::atomic<std::uint64_t> host_moe_calls{};
     std::atomic<std::uint64_t> host_moe_rows{};
     std::atomic<std::uint64_t> host_moe_nanoseconds{};
@@ -2057,9 +1959,6 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> host_moe_down_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_reduction_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_temporary_allocation_calls{};
-    std::atomic<std::uint64_t> host_moe_ep2_calls{};
-    std::array<std::atomic<std::uint64_t>, 2U> host_moe_ep2_owner_experts{};
-    std::atomic<std::uint64_t> host_moe_ep2_imbalance_experts{};
     std::atomic<std::uint64_t> graph_forward_calls{};
     std::atomic<std::uint64_t> graph_forward_rows{};
     std::atomic<std::uint64_t> graph_embedding_nanoseconds{};
@@ -2124,11 +2023,6 @@ struct Glm53Runtime::Impl {
             host_moe_reduction_nanoseconds.load(std::memory_order_relaxed),
             host_moe_nanoseconds.load(std::memory_order_relaxed),
             host_moe_temporary_allocation_calls.load(
-                std::memory_order_relaxed),
-            host_moe_ep2_calls.load(std::memory_order_relaxed),
-            host_moe_ep2_owner_experts[0].load(std::memory_order_relaxed),
-            host_moe_ep2_owner_experts[1].load(std::memory_order_relaxed),
-            host_moe_ep2_imbalance_experts.load(
                 std::memory_order_relaxed)};
     }
 
@@ -2435,62 +2329,6 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
-    [[nodiscard]] ValidationResult prepare_cpu_ep2() {
-        ValidationResult result;
-        if (!cpu_ep2_active) return result;
-        std::array<std::vector<std::pair<const void*, std::uint64_t>>, 2U>
-            ranges;
-        constexpr std::uint64_t page_bytes = 4096U;
-        const auto append_linear = [&](std::size_t owner,
-                                       const Glm53HostFp8Linear& linear) {
-            const std::array<std::pair<const void*, std::uint64_t>, 2U> spans{
-                std::pair<const void*, std::uint64_t>{
-                    linear.weights.data(), linear.weights.size_bytes()},
-                std::pair<const void*, std::uint64_t>{
-                    linear.scales.data(), linear.scales.size_bytes()}};
-            for (const auto& span : spans) {
-                ranges[owner].push_back(span);
-                const auto address = reinterpret_cast<std::uintptr_t>(span.first);
-                const auto aligned = (address + page_bytes - 1U) &
-                                     ~(page_bytes - 1U);
-                const auto skipped = aligned - address;
-                const auto interior = skipped < span.second
-                    ? (span.second - skipped) & ~(page_bytes - 1U) : 0U;
-                cpu_ep2_residual_bytes += span.second - interior;
-            }
-        };
-        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-            if (!glm53_moe_layer(layer)) continue;
-            const auto prefix = "model.language_model.layers." +
-                std::to_string(layer) + ".mlp.";
-            for (std::uint32_t expert = 0U; expert < kExpertSlots; ++expert) {
-                Glm53ExpertViews views;
-                result = expert_views(layer, expert, prefix, views);
-                if (!result.ok()) return result;
-                const auto owner = expert + 1U == kExpertSlots
-                    ? 0U : static_cast<std::size_t>(expert & 1U);
-                append_linear(owner, views.gate);
-                append_linear(owner, views.up);
-                append_linear(owner, views.down);
-            }
-        }
-        for (std::size_t owner = 0U; owner < ranges.size(); ++owner) {
-            const auto migration = numa_move_page_ranges(
-                ranges[owner], cpu_ep2_nodes[owner]);
-            cpu_ep2_migration.already_local += migration.already_local;
-            cpu_ep2_migration.moved += migration.moved;
-            cpu_ep2_migration.absent += migration.absent;
-            cpu_ep2_migration.failed += migration.failed;
-            cpu_ep2_migration.bytes_moved += migration.bytes_moved;
-        }
-        if (!cpu_ep2_migration.complete()) {
-            return {{"GLM-5.3 CPU EP2 could not verify " +
-                     std::to_string(cpu_ep2_migration.failed) +
-                     " checkpoint pages on their owners"}};
-        }
-        return result;
-    }
-
     // Admits every shared expert to the GPU that owns its layer.
     //
     // The tier is admitted whole or not at all. A partly admitted tier would
@@ -2648,26 +2486,6 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
             experts[index] = {views.gate, views.up, views.down};
         }
-        std::array<std::array<std::size_t, 9U>, 2U> ep2_experts{};
-        std::array<std::size_t, 2U> ep2_counts{};
-        if (cpu_ep2_active) {
-            for (std::size_t index = 0U; index < expert_count; ++index) {
-                const auto owner = index < routed.size()
-                    ? static_cast<std::size_t>(routed[index].expert & 1U)
-                    : 0U;
-                ep2_experts[owner][ep2_counts[owner]++] = index;
-            }
-            host_moe_ep2_calls.fetch_add(1U, std::memory_order_relaxed);
-            for (std::size_t owner = 0U; owner < ep2_counts.size(); ++owner) {
-                host_moe_ep2_owner_experts[owner].fetch_add(
-                    ep2_counts[owner], std::memory_order_relaxed);
-            }
-            host_moe_ep2_imbalance_experts.fetch_add(
-                ep2_counts[0] > ep2_counts[1]
-                    ? ep2_counts[0] - ep2_counts[1]
-                    : ep2_counts[1] - ep2_counts[0],
-                std::memory_order_relaxed);
-        }
         std::uint64_t allocations = 0U;
         if (config.phase_profile) {
             std::uint64_t gate_up_bytes = 0U;
@@ -2713,8 +2531,11 @@ struct Glm53Runtime::Impl {
         auto& activations = host_moe_activations;
         if (glm53_grow(activations, expert_count * intermediate)) ++allocations;
         const auto gate_up_started = std::chrono::steady_clock::now();
-        const auto gate_up_operation = [&](std::size_t expert,
-                                           std::size_t row) {
+        const auto gate_up = host_moe_workers->parallel_for_blocked(
+            expert_count * intermediate, expert_dispatch_block(),
+            [&](std::size_t task) {
+                const auto expert = task / intermediate;
+                const auto row = task % intermediate;
                 const auto& module = experts[expert];
                 const auto scale_columns = kHidden / 128U;
                 const auto* gate_weights = module.gate.weights.data() +
@@ -2733,27 +2554,7 @@ struct Glm53Runtime::Impl {
                 up = std::clamp(up, -10.0F, 10.0F);
                 activations[expert * intermediate + row] =
                     bf16_round_f32(gate * sigmoid(gate) * up);
-        };
-        ValidationResult gate_up;
-        if (cpu_ep2_active) {
-            const std::array<std::size_t, 2U> tasks{
-                ep2_counts[0] * intermediate,
-                ep2_counts[1] * intermediate};
-            gate_up = host_moe_workers->parallel_for_owned(
-                tasks, cpu_ep2_nodes,
-                [&](std::size_t owner, std::size_t task) {
-                    gate_up_operation(
-                        ep2_experts[owner][task / intermediate],
-                        task % intermediate);
-                });
-        } else {
-            gate_up = host_moe_workers->parallel_for_blocked(
-                expert_count * intermediate, expert_dispatch_block(),
-                [&](std::size_t task) {
-                    gate_up_operation(task / intermediate,
-                                      task % intermediate);
-                });
-        }
+            });
         if (!gate_up.ok()) return gate_up;
         if (config.phase_profile) {
             host_moe_gate_up_nanoseconds.fetch_add(
@@ -2761,24 +2562,9 @@ struct Glm53Runtime::Impl {
                 std::memory_order_relaxed);
         }
         const auto activation_started = std::chrono::steady_clock::now();
-        if (cpu_ep2_active) {
-            const std::array<std::size_t, 2U> tasks{
-                ep2_counts[0], ep2_counts[1]};
-            result = host_moe_workers->parallel_for_owned(
-                tasks, cpu_ep2_nodes,
-                [&](std::size_t owner, std::size_t local) {
-                    const auto expert = ep2_experts[owner][local];
-                    glm53_quantize_activation(
-                        std::span<float>(activations).subspan(
-                            expert * intermediate, intermediate));
-                });
-            if (!result.ok()) return result;
-        } else {
-            for (std::size_t expert = 0U; expert < expert_count; ++expert) {
-                glm53_quantize_activation(
-                    std::span<float>(activations).subspan(
-                        expert * intermediate, intermediate));
-            }
+        for (std::size_t expert = 0U; expert < expert_count; ++expert) {
+            glm53_quantize_activation(std::span<float>(activations).subspan(
+                expert * intermediate, intermediate));
         }
         // The device returns the two raw dots. Every rounding, the clamp and
         // the SwiGLU stay here, on the same code the host path runs for its
@@ -2821,8 +2607,11 @@ struct Glm53Runtime::Impl {
                 allocations, std::memory_order_relaxed);
         }
         const auto down_started = std::chrono::steady_clock::now();
-        const auto down_operation = [&](std::size_t expert,
-                                        std::size_t row) {
+        const auto down = host_moe_workers->parallel_for_blocked(
+            expert_count * kHidden, expert_dispatch_block(),
+            [&](std::size_t task) {
+                const auto expert = task / kHidden;
+                const auto row = task % kHidden;
                 const auto& module = experts[expert].down;
                 const auto scale_columns = intermediate / 128U;
                 const auto* weight_row = module.weights.data() +
@@ -2834,24 +2623,7 @@ struct Glm53Runtime::Impl {
                         weight_row, scales,
                         std::span<const float>(activations).subspan(
                             expert * intermediate, intermediate)));
-        };
-        ValidationResult down;
-        if (cpu_ep2_active) {
-            const std::array<std::size_t, 2U> tasks{
-                ep2_counts[0] * kHidden, ep2_counts[1] * kHidden};
-            down = host_moe_workers->parallel_for_owned(
-                tasks, cpu_ep2_nodes,
-                [&](std::size_t owner, std::size_t task) {
-                    down_operation(ep2_experts[owner][task / kHidden],
-                                   task % kHidden);
-                });
-        } else {
-            down = host_moe_workers->parallel_for_blocked(
-                expert_count * kHidden, expert_dispatch_block(),
-                [&](std::size_t task) {
-                    down_operation(task / kHidden, task % kHidden);
-                });
-        }
+            });
         if (!down.ok()) return down;
         if (config.phase_profile) {
             host_moe_down_nanoseconds.fetch_add(
@@ -2971,24 +2743,6 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
             group.module = {views.gate, views.up, views.down};
         }
-        std::array<std::vector<std::size_t>, 2U> ep2_groups;
-        if (cpu_ep2_active) {
-            for (std::size_t index = 0U; index < groups.size(); ++index) {
-                const auto owner = groups[index].shared
-                    ? 0U : static_cast<std::size_t>(groups[index].expert & 1U);
-                ep2_groups[owner].push_back(index);
-            }
-            host_moe_ep2_calls.fetch_add(1U, std::memory_order_relaxed);
-            for (std::size_t owner = 0U; owner < ep2_groups.size(); ++owner) {
-                host_moe_ep2_owner_experts[owner].fetch_add(
-                    ep2_groups[owner].size(), std::memory_order_relaxed);
-            }
-            const auto left = ep2_groups[0].size();
-            const auto right = ep2_groups[1].size();
-            host_moe_ep2_imbalance_experts.fetch_add(
-                left > right ? left - right : right - left,
-                std::memory_order_relaxed);
-        }
 
         if (config.phase_profile) {
             std::uint64_t gate_up_bytes = 0U;
@@ -3034,8 +2788,11 @@ struct Glm53Runtime::Impl {
         auto& activations = page_activations;
         if (glm53_grow(activations, output_slots * intermediate)) ++allocations;
         const auto gate_up_started = std::chrono::steady_clock::now();
-        const auto gate_up_operation = [&](std::size_t group_index,
-                                           std::size_t projection_row) {
+        result = host_moe_workers->parallel_for_blocked(
+            groups.size() * intermediate, expert_dispatch_block(),
+            [&](std::size_t task) {
+                const auto group_index = task / intermediate;
+                const auto projection_row = task % intermediate;
                 const auto& group = groups[group_index];
                 const auto scale_columns = kHidden / 128U;
                 const auto* gate_weights = group.module.gate.weights.data() +
@@ -3059,26 +2816,7 @@ struct Glm53Runtime::Impl {
                                 projection_row] =
                         bf16_round_f32(gate * sigmoid(gate) * up);
                 }
-        };
-        if (cpu_ep2_active) {
-            const std::array<std::size_t, 2U> tasks{
-                ep2_groups[0].size() * intermediate,
-                ep2_groups[1].size() * intermediate};
-            result = host_moe_workers->parallel_for_owned(
-                tasks, cpu_ep2_nodes,
-                [&](std::size_t owner, std::size_t task) {
-                    gate_up_operation(
-                        ep2_groups[owner][task / intermediate],
-                        task % intermediate);
-                });
-        } else {
-            result = host_moe_workers->parallel_for_blocked(
-                groups.size() * intermediate, expert_dispatch_block(),
-                [&](std::size_t task) {
-                    gate_up_operation(task / intermediate,
-                                      task % intermediate);
-                });
-        }
+            });
         if (!result.ok()) return result;
         if (config.phase_profile) {
             host_moe_gate_up_nanoseconds.fetch_add(
@@ -3102,8 +2840,11 @@ struct Glm53Runtime::Impl {
         auto& expert_outputs = page_expert_outputs;
         if (glm53_grow(expert_outputs, output_slots * kHidden)) ++allocations;
         const auto down_started = std::chrono::steady_clock::now();
-        const auto down_operation = [&](std::size_t group_index,
-                                        std::size_t projection_row) {
+        result = host_moe_workers->parallel_for_blocked(
+            groups.size() * kHidden, expert_dispatch_block(),
+            [&](std::size_t task) {
+                const auto group_index = task / kHidden;
+                const auto projection_row = task % kHidden;
                 const auto& group = groups[group_index];
                 const auto& projection = group.module.down;
                 const auto scale_columns = intermediate / 128U;
@@ -3120,24 +2861,7 @@ struct Glm53Runtime::Impl {
                                 assignment.output_slot * intermediate,
                                 intermediate)));
                 }
-        };
-        if (cpu_ep2_active) {
-            const std::array<std::size_t, 2U> tasks{
-                ep2_groups[0].size() * kHidden,
-                ep2_groups[1].size() * kHidden};
-            result = host_moe_workers->parallel_for_owned(
-                tasks, cpu_ep2_nodes,
-                [&](std::size_t owner, std::size_t task) {
-                    down_operation(ep2_groups[owner][task / kHidden],
-                                   task % kHidden);
-                });
-        } else {
-            result = host_moe_workers->parallel_for_blocked(
-                groups.size() * kHidden, expert_dispatch_block(),
-                [&](std::size_t task) {
-                    down_operation(task / kHidden, task % kHidden);
-                });
-        }
+            });
         if (!result.ok()) return result;
         if (config.phase_profile) {
             host_moe_down_nanoseconds.fetch_add(
@@ -3253,7 +2977,6 @@ struct Glm53Runtime::Impl {
             std::uint32_t layer{};
             std::uint64_t weight_rows{};
             std::uint64_t weight_row_begin{};
-            bool required{};
         };
         struct HostTask {
             std::string name;
@@ -3368,33 +3091,6 @@ struct Glm53Runtime::Impl {
             }
         }
 
-        if (m31_gpu_tp2_active) {
-            constexpr std::uint64_t local_width =
-                static_cast<std::uint64_t>(kHeads / 2U) * kMlaHead;
-            constexpr std::uint64_t full_width = 2U * local_width;
-            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-                if (glm53_kda_layer(layer)) continue;
-                const auto attention = "model.language_model.layers." +
-                    std::to_string(layer) + ".self_attn.";
-                device_tasks[slot_for(layer)].push_back({
-                    attention + "o_proj", {}, kHidden, full_width, layer,
-                    0U, 0U, true});
-                for (std::size_t rank = 0U; rank < 2U; ++rank) {
-                    auto& tasks = device_tasks[rank];
-                    tasks.push_back({attention + "q_a_proj", {}, kQueryRank,
-                                     kHidden, layer, 0U, 0U, true});
-                    tasks.push_back({attention + "kv_a_proj_with_mqa", {},
-                                     kKvRank, kHidden, layer, 0U, 0U, true});
-                    tasks.push_back({attention + "q_b_proj", {}, local_width,
-                                     kQueryRank, layer, full_width,
-                                     rank * local_width, true});
-                    tasks.push_back({attention + "kv_b_proj", {}, full_width,
-                                     kKvRank, layer, 2U * full_width,
-                                     rank * full_width, true});
-                }
-            }
-        }
-
         std::vector<ValidationResult> device_results(devices.size());
         std::vector<std::uint64_t> admitted(devices.size());
         std::vector<std::uint64_t> skipped(devices.size());
@@ -3417,12 +3113,6 @@ struct Glm53Runtime::Impl {
                                std::move(loaded.errors));
                         break;
                     }
-                    if (task.required && !kept) {
-                        device_results[slot].errors.emplace_back(
-                            "GLM-5.3 M3.1 required MLA shard weight exceeds "
-                            "the admitted CUDA cache: " + task.base);
-                        break;
-                    }
                     kept ? ++admitted[slot] : ++skipped[slot];
                 }
                 if (device_results[slot].ok()) {
@@ -3430,15 +3120,6 @@ struct Glm53Runtime::Impl {
                     if (!ordered.ok()) {
                         append(device_results[slot].errors,
                                std::move(ordered.errors));
-                    }
-                }
-                if (device_results[slot].ok() && m31_gpu_tp2_active) {
-                    auto reserved = cuda.reserve_glm53_mla_shard_workspace(
-                        devices[slot], config.maximum_context_tokens,
-                        kHeads / 2U, kMlaHead, kQueryRank, kKvRank);
-                    if (!reserved.ok()) {
-                        append(device_results[slot].errors,
-                               std::move(reserved.errors));
                     }
                 }
             }
@@ -4608,77 +4289,6 @@ struct Glm53Runtime::Impl {
                                    attention, sequence);
             if (!result.ok()) return result;
             result = cuda.dsv4_mhc_publish_branch(device, branch);
-        } else if (m31_gpu_tp2_active) {
-            constexpr std::uint32_t local_heads = kHeads / 2U;
-            constexpr std::size_t local_width =
-                static_cast<std::size_t>(local_heads) * kMlaHead;
-            const auto history = position + 1U;
-            std::vector<float> normalized(kHidden);
-            result = cuda.dsv4_mhc_download_layer_input(device, normalized);
-            if (!result.ok()) return result;
-            std::array<CudaGlm53MlaShardRequest, 2U> requests;
-            std::array<ValidationResult, 2U> rank_results;
-            for (std::size_t rank = 0U; rank < 2U; ++rank) {
-                auto& request = requests[rank];
-                request.state = &device_sequence.mla_tp2[layer][rank];
-                request.input = normalized;
-                request.position = position;
-                request.maximum_context = config.maximum_context_tokens;
-                request.heads = local_heads;
-                request.head_dim = kMlaHead;
-                request.query_rank = kQueryRank;
-                request.key_value_rank = kKvRank;
-            }
-            result = projection_workers->parallel_for(
-                2U, [&](std::size_t rank) {
-                    rank_results[rank] = weights->mla_shard_scores(
-                        rank, attention, static_cast<std::uint32_t>(rank),
-                        requests[rank],
-                        std::span<float>(m31_mla_scores[rank]).first(
-                            static_cast<std::size_t>(local_heads) * history));
-                });
-            if (!result.ok()) return result;
-            for (auto& rank_result : rank_results) {
-                if (!rank_result.ok()) return rank_result;
-            }
-            for (auto& scores : m31_mla_scores) {
-                for (std::uint32_t head = 0U; head < local_heads; ++head) {
-                    auto* row = scores.data() +
-                        static_cast<std::size_t>(head) * history;
-                    float highest = -std::numeric_limits<float>::infinity();
-                    for (std::uint32_t token = 0U; token < history; ++token) {
-                        highest = std::max(highest, row[token]);
-                    }
-                    float total = 0.0F;
-                    for (std::uint32_t token = 0U; token < history; ++token) {
-                        row[token] = std::exp(row[token] - highest);
-                        total += row[token];
-                    }
-                    for (std::uint32_t token = 0U; token < history; ++token) {
-                        row[token] = bf16_round_f32(row[token] / total);
-                    }
-                }
-            }
-            result = projection_workers->parallel_for(
-                2U, [&](std::size_t rank) {
-                    rank_results[rank] = cuda.glm53_mla_shard_finish(
-                        requests[rank],
-                        std::span<const float>(m31_mla_scores[rank]).first(
-                            static_cast<std::size_t>(local_heads) * history),
-                        m31_mla_attended[rank]);
-                });
-            if (!result.ok()) return result;
-            for (auto& rank_result : rank_results) {
-                if (!rank_result.ok()) return rank_result;
-            }
-            std::copy(m31_mla_attended[0].begin(),
-                      m31_mla_attended[0].end(), m31_mla_gathered.begin());
-            std::copy(m31_mla_attended[1].begin(),
-                      m31_mla_attended[1].end(),
-                      m31_mla_gathered.begin() +
-                          static_cast<std::ptrdiff_t>(local_width));
-            result = weights->mla_publish_attended(
-                slot_for(layer), attention, m31_mla_gathered);
         } else {
             CudaGlm53MlaRequest request;
             request.state = &device_sequence.mla[layer];
@@ -4746,33 +4356,26 @@ struct Glm53Runtime::Impl {
             auto& host_cache = sequence.mla(layer);
             if (host_cache.rows() == position + 1U) {
                 const auto host_rows = host_cache.materialize();
+                std::vector<float> device_row(kKvRank);
                 const auto latent_offset =
                     static_cast<std::uint64_t>(position) * kKvRank *
                     sizeof(float);
+                auto downloaded = cuda.download_buffer(
+                    device_sequence.mla[layer], latent_offset,
+                    std::as_writable_bytes(std::span<float>(device_row)));
+                if (!downloaded.ok()) return downloaded;
                 const auto* host_row =
                     host_rows.data() +
                     static_cast<std::size_t>(position) * kKvRank;
-                const auto ranks = m31_gpu_tp2_active ? 2U : 1U;
-                for (std::size_t rank = 0U; rank < ranks; ++rank) {
-                    std::vector<float> device_row(kKvRank);
-                    const auto& state = m31_gpu_tp2_active
-                        ? device_sequence.mla_tp2[layer][rank]
-                        : device_sequence.mla[layer];
-                    auto downloaded = cuda.download_buffer(
-                        state, latent_offset,
-                        std::as_writable_bytes(std::span<float>(device_row)));
-                    if (!downloaded.ok()) return downloaded;
-                    for (std::size_t index = 0U; index < device_row.size();
-                         ++index) {
-                        if (host_row[index] == device_row[index]) continue;
-                        return {{"GLM-5.3 resident MLA latent mismatch at layer " +
-                                 std::to_string(layer) + ", position " +
-                                 std::to_string(position) + ", rank " +
-                                 std::to_string(rank) + ", element " +
-                                 std::to_string(index) + ": expected " +
-                                 std::to_string(host_row[index]) + ", actual " +
-                                 std::to_string(device_row[index])}};
-                    }
+                for (std::size_t index = 0U; index < device_row.size();
+                     ++index) {
+                    if (host_row[index] == device_row[index]) continue;
+                    return {{"GLM-5.3 resident MLA latent mismatch at layer " +
+                             std::to_string(layer) + ", position " +
+                             std::to_string(position) + ", element " +
+                             std::to_string(index) + ": expected " +
+                             std::to_string(host_row[index]) + ", actual " +
+                             std::to_string(device_row[index])}};
                 }
             }
             std::size_t first = expected.size();
@@ -5672,21 +5275,11 @@ struct Glm53Runtime::Impl {
                 std::copy(kv_norm.value->begin(), kv_norm.value->end(),
                           packed.begin() + static_cast<std::ptrdiff_t>(
                                                cache_floats + kQueryRank));
-                if (m31_gpu_tp2_active) {
-                    for (std::size_t rank = 0U; rank < 2U; ++rank) {
-                        result = cuda.upload_buffer(
-                            devices[rank],
-                            std::as_bytes(std::span<const float>(packed)),
-                            device_sequence.mla_tp2[layer][rank]);
-                        if (!result.ok()) return result;
-                    }
-                } else {
-                    result = cuda.upload_buffer(
-                        device_for(layer),
-                        std::as_bytes(std::span<const float>(packed)),
-                        device_sequence.mla[layer]);
-                    if (!result.ok()) return result;
-                }
+                result = cuda.upload_buffer(
+                    device_for(layer),
+                    std::as_bytes(std::span<const float>(packed)),
+                    device_sequence.mla[layer]);
+                if (!result.ok()) return result;
                 continue;
             }
             const std::array<std::string, 3U> tap_names{
@@ -6315,54 +5908,15 @@ ValidationResult Glm53Runtime::initialize(
          host_width >= model_parallel_width &&
          initial_cache_bytes != 0U && routed_bytes > 2U * initial_cache_bytes);
     if (host_moe_admitted && host_width != 0U) {
-        std::vector<int> cpus;
-        if (m31_cpu_ep2_enabled()) {
-            const auto usable = [&](int cpu) {
-                return std::find(hardware.usable_cpu_ids.begin(),
-                                 hardware.usable_cpu_ids.end(), cpu) !=
-                       hardware.usable_cpu_ids.end();
-            };
-            std::size_t owners = 0U;
-            for (std::size_t node = 0U;
-                 node < hardware.numa.node_cpus.size() && owners < 2U;
-                 ++node) {
-                const auto& primary =
-                    node < hardware.numa.node_primary_cpus.size() &&
-                            !hardware.numa.node_primary_cpus[node].empty()
-                        ? hardware.numa.node_primary_cpus[node]
-                        : hardware.numa.node_cpus[node];
-                const auto before = cpus.size();
-                for (const auto cpu : primary) {
-                    if (usable(cpu)) cpus.push_back(cpu);
-                }
-                if (cpus.size() != before) {
-                    impl_->cpu_ep2_nodes[owners++] = static_cast<int>(node);
-                }
-            }
-            if (owners != 2U) {
-                return {{"GLM-5.3 M3.1 CPU EP2 requires two discovered NUMA "
-                         "nodes with usable physical cores"}};
-            }
-            impl_->cpu_ep2_active = true;
-        } else {
-            cpus.assign(hardware.usable_cpu_ids.begin(),
-                        hardware.usable_cpu_ids.begin() +
-                            static_cast<std::ptrdiff_t>(host_width));
-        }
+        std::vector<int> cpus(hardware.usable_cpu_ids.begin(),
+                              hardware.usable_cpu_ids.begin() +
+                                  static_cast<std::ptrdiff_t>(host_width));
         impl_->host_moe_workers = std::make_unique<HostWorkerPool>(
             std::move(cpus), std::chrono::milliseconds(1));
-        impl_->host_moe_active = impl_->host_moe_workers->size() != 0U;
+        impl_->host_moe_active =
+            impl_->host_moe_workers->size() == host_width;
     }
     if (impl_->host_moe_active) {
-        // Decode's batch-1 expert primitive uses separate scratch from the
-        // page-major prefill primitive.  Reserve its maximum fixed extents
-        // before profiling begins so the first generated token cannot grow a
-        // vector inside the protected interval.
-        impl_->host_moe_quantized_input.resize(kHidden);
-        impl_->host_moe_activations.resize(9U * 2048U);
-        impl_->host_moe_expert_outputs.resize(9U * kHidden);
-        auto placed = impl_->prepare_cpu_ep2();
-        if (!placed.ok()) return placed;
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
     }
@@ -6404,24 +5958,6 @@ ValidationResult Glm53Runtime::initialize(
             impl_->projection_workers = std::make_unique<HostWorkerPool>(
                 std::move(worker_cpus));
         }
-    }
-    if (m31_gpu_tp2_enabled()) {
-        if (!impl_->resident_execution_active || impl_->devices.size() != 2U ||
-            impl_->projection_workers == nullptr) {
-            return {{"GLM-5.3 M3.1 GPU TP2 requires the resident runtime, "
-                     "exactly two CUDA devices, and two projection workers"}};
-        }
-        impl_->m31_gpu_tp2_active = true;
-        impl_->scheduler_capacity = 1U;
-        constexpr std::size_t local_heads = kHeads / 2U;
-        constexpr std::size_t local_width = local_heads * kMlaHead;
-        for (auto& scores : impl_->m31_mla_scores) {
-            scores.resize(local_heads * config.maximum_context_tokens);
-        }
-        for (auto& attended : impl_->m31_mla_attended) {
-            attended.resize(local_width);
-        }
-        impl_->m31_mla_gathered.resize(2U * local_width);
     }
     impl_->full_tensor_parallel_active =
         full_tensor_parallel_enabled() && impl_->devices.size() == 2U &&
@@ -6468,27 +6004,6 @@ ValidationResult Glm53Runtime::initialize(
                   << static_cast<double>(impl_->shared_experts.bytes) /
                          static_cast<double>(1ULL << 30U)
                   << '\n';
-        if (impl_->cpu_ep2_active) {
-            std::cerr << "[glm53-m31-ep2] nodes="
-                      << impl_->cpu_ep2_nodes[0] << ','
-                      << impl_->cpu_ep2_nodes[1]
-                      << " pages_local="
-                      << impl_->cpu_ep2_migration.already_local
-                      << " pages_moved=" << impl_->cpu_ep2_migration.moved
-                      << " pages_absent=" << impl_->cpu_ep2_migration.absent
-                      << " pages_failed=" << impl_->cpu_ep2_migration.failed
-                      << " bytes_moved="
-                      << impl_->cpu_ep2_migration.bytes_moved
-                      << " residual_bytes="
-                      << impl_->cpu_ep2_residual_bytes << '\n';
-        }
-        if (impl_->m31_gpu_tp2_active) {
-            std::cerr << "[glm53-m31-gpu] mode=selective-mla-tp2"
-                      << " heads_per_rank=" << (kHeads / 2U)
-                      << " output_projection=unsplit-owner"
-                      << " maximum_context=" << config.maximum_context_tokens
-                      << '\n';
-        }
     }
     if (replay_ssm_enabled() || phase_scheduler_enabled()) {
         auto worker_cpus = compute_worker_cpus();

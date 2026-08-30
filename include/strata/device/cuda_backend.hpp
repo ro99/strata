@@ -740,28 +740,6 @@ struct CudaGlm53MlaRequest {
     std::uint32_t key_value_rank{};
 };
 
-// M3.1's exact selective-TP2 MLA rank.  The low-rank A projections are
-// replicated, while query B and the key/value halves of KV B contain only the
-// rank's contiguous head range.  `input` is the already-normalized layer row;
-// the finish command returns the rank's attended heads without applying an
-// output projection.  The layer owner concatenates rank 0 then rank 1 and
-// applies the original full output projection once, preserving its FP32 dot
-// association exactly.
-struct CudaGlm53MlaShardRequest {
-    const CudaBuffer* state{};
-    const CudaWeight* query_a{};
-    const CudaWeight* key_value_a{};
-    const CudaWeight* query_b{};
-    const CudaWeight* key_value_b{};
-    std::span<const float> input;
-    std::uint32_t position{};
-    std::uint32_t maximum_context{};
-    std::uint32_t heads{};
-    std::uint32_t head_dim{};
-    std::uint32_t query_rank{};
-    std::uint32_t key_value_rank{};
-};
-
 // Persistent target-format inputs for one DeepSeek mHC pre boundary. The
 // projection remains F32 as in the accepted SM86 contract; scale/base and the
 // BF16 norm weight are packed into one immutable auxiliary allocation.
@@ -1159,19 +1137,6 @@ public:
     [[nodiscard]] ValidationResult glm53_mla_decode_finish(
         const CudaGlm53MlaRequest& request,
         std::span<const float> normalized_coefficients);
-    [[nodiscard]] ValidationResult reserve_glm53_mla_shard_workspace(
-        int device, std::uint32_t maximum_context, std::uint32_t heads,
-        std::uint32_t head_dim, std::uint32_t query_rank,
-        std::uint32_t key_value_rank);
-    [[nodiscard]] ValidationResult glm53_mla_shard_scores(
-        const CudaGlm53MlaShardRequest& request, std::span<float> scores);
-    [[nodiscard]] ValidationResult glm53_mla_shard_finish(
-        const CudaGlm53MlaShardRequest& request,
-        std::span<const float> normalized_coefficients,
-        std::span<float> attended);
-    [[nodiscard]] ValidationResult glm53_mla_publish_attended(
-        int device, const CudaWeight& output,
-        std::span<const float> attended);
     // A batch of device-resident experts in two halves, because the SwiGLU
     // between them stays on the host. Each enqueue returns as soon as the work
     // is on the stream; the matching collect completes it. Both dots are

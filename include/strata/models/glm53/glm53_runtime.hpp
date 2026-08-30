@@ -62,10 +62,6 @@ struct Glm53HostExpertMetrics {
     std::uint64_t reduction_nanoseconds{};
     std::uint64_t service_nanoseconds{};
     std::uint64_t temporary_allocation_calls{};
-    std::uint64_t ep2_calls{};
-    std::uint64_t ep2_owner0_experts{};
-    std::uint64_t ep2_owner1_experts{};
-    std::uint64_t ep2_imbalance_experts{};
 };
 
 struct Glm53GraphMetrics {

@@ -4003,8 +4003,14 @@ struct Glm53Runtime::Impl {
                 *bias.value, 2.5F);
             if (!result.ok()) return result;
             if (!route_requests.empty()) {
+                // `rows > 1` is what makes this a prompt page. Decode drives
+                // the same page path at a single row for the layers that are
+                // not on the resident chain, and those visits are decode
+                // routes -- the census would otherwise file 11 of the 42 MoE
+                // layers under prefill.
                 observe_route(layer, selected, route_requests[row],
-                              route_positions[row], schedule_prefetch, true);
+                              route_positions[row], schedule_prefetch,
+                              rows > 1U);
             }
         }
         if (host_moe_active) {

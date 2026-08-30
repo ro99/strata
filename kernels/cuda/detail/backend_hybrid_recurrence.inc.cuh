@@ -1276,9 +1276,10 @@ ValidationResult CudaBackend::enqueue_glm53_shared_gate_up(
         status != cudaSuccess) {
         return cuda_error(status, "upload GLM-5.3 shared expert input");
     }
-    constexpr std::uint32_t threads = 128U;
+    // Eight threads per output row, so the launch is eight times the rows.
+    constexpr std::uint32_t threads = 256U;
     const std::uint32_t blocks =
-        (expert.intermediate + threads - 1U) / threads;
+        (expert.intermediate * 8U + threads - 1U) / threads;
     const auto scale_columns = expert.hidden / 128U;
     glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
         state.glm53_shared_gate,
@@ -1376,8 +1377,9 @@ ValidationResult CudaBackend::enqueue_glm53_shared_down(
         status != cudaSuccess) {
         return cuda_error(status, "upload GLM-5.3 shared expert activation");
     }
-    constexpr std::uint32_t threads = 128U;
-    const std::uint32_t blocks = (expert.hidden + threads - 1U) / threads;
+    constexpr std::uint32_t threads = 256U;
+    const std::uint32_t blocks =
+        (expert.hidden * 8U + threads - 1U) / threads;
     glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
         state.glm53_shared_output,
         static_cast<const unsigned char*>(expert.down_weights->impl_->data),

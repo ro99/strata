@@ -553,6 +553,99 @@ __global__ void glm53_mla_expand_value_kernel(
     attended[index] = glm53_bf16(value);
 }
 
+enum class Glm53KernelCategory : std::uint8_t {
+    Kda,
+    Mla,
+    Expert,
+    Other,
+};
+
+template <typename DeviceState>
+cudaError_t glm53_kernel_timing_begin(DeviceState& state, bool enabled,
+                                      Glm53KernelCategory category) {
+    if (!enabled) return cudaSuccess;
+    if (state.glm53_kernel_timing_active ||
+        state.glm53_kernel_timing_count >=
+            state.kGlm53KernelTimingCapacity) {
+        return cudaErrorInvalidValue;
+    }
+    const auto index = state.glm53_kernel_timing_count;
+    state.glm53_kernel_category[index] =
+        static_cast<std::uint8_t>(category);
+    if (auto status = cudaEventRecord(state.glm53_kernel_started[index],
+                                      state.stream);
+        status != cudaSuccess) {
+        return status;
+    }
+    state.glm53_kernel_timing_active = true;
+    return cudaSuccess;
+}
+
+template <typename DeviceState>
+cudaError_t glm53_kernel_timing_end(DeviceState& state, bool enabled) {
+    if (!enabled) return cudaSuccess;
+    if (!state.glm53_kernel_timing_active) return cudaErrorInvalidValue;
+    const auto index = state.glm53_kernel_timing_count;
+    if (auto status = cudaEventRecord(state.glm53_kernel_finished[index],
+                                      state.stream);
+        status != cudaSuccess) {
+        state.glm53_kernel_timing_active = false;
+        return status;
+    }
+    state.glm53_kernel_timing_active = false;
+    ++state.glm53_kernel_timing_count;
+    return cudaSuccess;
+}
+
+// Drain only after the stream is known complete (a natural command boundary
+// or stats()). The spans deliberately enclose consecutive direct kernels, not
+// transfers, so launch bookkeeping never introduces a synchronize of its own.
+template <typename Impl, typename DeviceState>
+cudaError_t glm53_kernel_timing_drain(Impl& impl, DeviceState& state,
+                                     int device, bool wait) {
+    if (!impl.detailed_timing || state.glm53_kernel_timing_count == 0U) {
+        return cudaSuccess;
+    }
+    if (state.glm53_kernel_timing_active) return cudaErrorInvalidValue;
+    if (wait) {
+        if (auto status = cudaEventSynchronize(
+                state.glm53_kernel_finished[
+                    state.glm53_kernel_timing_count - 1U]);
+            status != cudaSuccess) {
+            return status;
+        }
+    }
+    std::array<std::uint64_t, 4U> categories{};
+    for (std::uint32_t index = 0U;
+         index < state.glm53_kernel_timing_count; ++index) {
+        float milliseconds = 0.0F;
+        if (auto status = cudaEventElapsedTime(
+                &milliseconds, state.glm53_kernel_started[index],
+                state.glm53_kernel_finished[index]);
+            status != cudaSuccess) {
+            return status;
+        }
+        const auto nanoseconds = static_cast<std::uint64_t>(std::llround(
+            static_cast<double>(milliseconds) * 1.0e6));
+        categories[state.glm53_kernel_category[index]] += nanoseconds;
+    }
+    const auto total = categories[0U] + categories[1U] + categories[2U] +
+                       categories[3U];
+    {
+        std::scoped_lock lock(impl.mutex);
+        auto& stats = *std::find_if(
+            impl.stats.devices.begin(), impl.stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.kernel_nanoseconds += total;
+        stats.glm53_kda_kernel_nanoseconds += categories[0U];
+        stats.glm53_mla_kernel_nanoseconds += categories[1U];
+        stats.glm53_expert_kernel_nanoseconds += categories[2U];
+        stats.glm53_other_kernel_nanoseconds += categories[3U];
+    }
+    state.glm53_kernel_timing_count = 0U;
+    return cudaSuccess;
+}
+
 }  // namespace
 
 ValidationResult CudaBackend::glm53_kda_decode(
@@ -723,6 +816,13 @@ ValidationResult CudaBackend::glm53_kda_decode(
             constexpr unsigned int threads = 256U;
             const auto input_elements =
                 static_cast<std::uint64_t>(rows) * hidden;
+            if (auto status = glm53_kernel_timing_begin(
+                    device_state, impl_->detailed_timing,
+                    Glm53KernelCategory::Kda);
+                status != cudaSuccess) {
+                return cuda_error(status,
+                                  "start GLM-5.3 KDA page kernel timing");
+            }
             glm53_mhc_gather_page_input_kernel<<<
                 static_cast<unsigned int>((input_elements + threads - 1U) /
                                           threads),
@@ -857,6 +957,12 @@ ValidationResult CudaBackend::glm53_kda_decode(
             if (auto status = cudaGetLastError(); status != cudaSuccess) {
                 return cuda_error(status, "publish GLM-5.3 KDA page branch");
             }
+            if (auto status = glm53_kernel_timing_end(
+                    device_state, impl_->detailed_timing);
+                status != cudaSuccess) {
+                return cuda_error(status,
+                                  "finish GLM-5.3 KDA page kernel timing");
+            }
             for (std::uint32_t row = 0U; row + 1U < rows; ++row) {
                 device_state.dsv4_mhc_saved_slots[row].branch_ready = true;
             }
@@ -910,6 +1016,13 @@ ValidationResult CudaBackend::glm53_kda_decode(
         auto* heads_output = gate_low + request.head_dim;
         auto* final_output = heads_output + width;
         if (request.mhc_source_destination) {
+            if (auto status = glm53_kernel_timing_begin(
+                    device_state, impl_->detailed_timing,
+                    Glm53KernelCategory::Kda);
+                status != cudaSuccess) {
+                return cuda_error(status,
+                                  "start resident GLM-5.3 KDA kernel timing");
+            }
             constexpr std::uint32_t threads = 256U;
             constexpr std::uint32_t blocks =
                 (kDsv4MhcHidden + threads - 1U) / threads;
@@ -927,6 +1040,15 @@ ValidationResult CudaBackend::glm53_kda_decode(
                    status != cudaSuccess) {
             return cuda_error(status,
                               "upload fused GLM-5.3 KDA layer input");
+        }
+        if (!request.mhc_source_destination) {
+            if (auto status = glm53_kernel_timing_begin(
+                    device_state, impl_->detailed_timing,
+                    Glm53KernelCategory::Kda);
+                status != cudaSuccess) {
+                return cuda_error(status,
+                                  "start fused GLM-5.3 KDA kernel timing");
+            }
         }
         const auto project = [&](const CudaWeight* weight,
                                  float* source, float* destination,
@@ -1041,8 +1163,20 @@ ValidationResult CudaBackend::glm53_kda_decode(
                 return cuda_error(status,
                                   "publish resident GLM-5.3 KDA branch");
             }
+            if (auto status = glm53_kernel_timing_end(
+                    device_state, impl_->detailed_timing);
+                status != cudaSuccess) {
+                return cuda_error(status,
+                                  "finish resident GLM-5.3 KDA kernel timing");
+            }
             device_state.dsv4_mhc_branch_ready = true;
             return {};
+        }
+        if (auto status = glm53_kernel_timing_end(
+                device_state, impl_->detailed_timing);
+            status != cudaSuccess) {
+            return cuda_error(status,
+                              "finish fused GLM-5.3 KDA kernel timing");
         }
         if (auto status = cudaMemcpyAsync(
                 device_state.matmul_host_output, final_output, output_bytes,
@@ -1056,6 +1190,11 @@ ValidationResult CudaBackend::glm53_kda_decode(
             status != cudaSuccess) {
             return cuda_error(status,
                               "synchronize fused GLM-5.3 KDA layer");
+        }
+        if (auto status = glm53_kernel_timing_drain(
+                *impl_, device_state, device, false);
+            status != cudaSuccess) {
+            return cuda_error(status, "measure fused GLM-5.3 KDA kernels");
         }
         std::memcpy(output.data(), device_state.matmul_host_output,
                     output_bytes);
@@ -1137,6 +1276,12 @@ ValidationResult CudaBackend::glm53_kda_decode(
         status != cudaSuccess) {
         return cuda_error(status, "upload GLM-5.3 KDA activations");
     }
+    if (auto status = glm53_kernel_timing_begin(
+            device_state, impl_->detailed_timing,
+            Glm53KernelCategory::Kda);
+        status != cudaSuccess) {
+        return cuda_error(status, "start GLM-5.3 KDA kernel timing");
+    }
     auto* packed = static_cast<float*>(request.state->impl_->data);
     auto* recurrent = packed;
     auto* convolution = recurrent + recurrent_floats;
@@ -1198,6 +1343,11 @@ ValidationResult CudaBackend::glm53_kda_decode(
         }
         device_result = device_state.input;
     }
+    if (auto status = glm53_kernel_timing_end(
+            device_state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish GLM-5.3 KDA kernel timing");
+    }
     if (auto status = cudaMemcpyAsync(
             device_state.matmul_host_output, device_result, output_bytes,
             cudaMemcpyDeviceToHost, device_state.stream);
@@ -1208,6 +1358,11 @@ ValidationResult CudaBackend::glm53_kda_decode(
     if (auto status = cudaStreamSynchronize(device_state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "synchronize GLM-5.3 KDA recurrence");
+    }
+    if (auto status = glm53_kernel_timing_drain(
+            *impl_, device_state, device, false);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure GLM-5.3 KDA kernels");
     }
     std::memcpy(output.data(), device_state.matmul_host_output, output_bytes);
     const auto wait_nanoseconds = elapsed_nanoseconds_since(wait_started);
@@ -1270,11 +1425,23 @@ ValidationResult CudaBackend::glm53_mhc_router(
     constexpr unsigned int warps_per_block = threads / 32U;
     const auto blocks = static_cast<unsigned int>(
         (descriptor.rows + warps_per_block - 1U) / warps_per_block);
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Other);
+        status != cudaSuccess) {
+        return cuda_error(status, "start GLM-5.3 router kernel timing");
+    }
     bf16_input_matvec_kernel<<<blocks, threads, 0U, state.stream>>>(
         state.dsv4_mhc_workspace->glm53_router_logits,
         state.dsv4_mhc_workspace->layer_input,
         static_cast<const __nv_bfloat16*>(router.impl_->weights),
         descriptor.columns, descriptor.rows);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch GLM-5.3 resident router");
+    }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish GLM-5.3 router kernel timing");
+    }
     if (auto status = cudaMemcpyAsync(
             state.matmul_host_output,
             state.dsv4_mhc_workspace->glm53_router_logits, bytes,
@@ -1285,6 +1452,11 @@ ValidationResult CudaBackend::glm53_mhc_router(
         status != cudaSuccess) {
         return cuda_error(status,
                           "synchronize GLM-5.3 resident router logits");
+    }
+    if (auto status = glm53_kernel_timing_drain(
+            *impl_, state, device, false);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure GLM-5.3 router kernel");
     }
     std::memcpy(logits.data(), state.matmul_host_output, bytes);
     {
@@ -1360,6 +1532,12 @@ ValidationResult CudaBackend::glm53_mhc_swiglu(
     constexpr unsigned int warps = threads / 32U;
     constexpr unsigned int hidden_blocks =
         (kDsv4MhcHidden + threads - 1U) / threads;
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Other);
+        status != cudaSuccess) {
+        return cuda_error(status,
+                          "start resident GLM-5.3 SwiGLU kernel timing");
+    }
     dsv4_bf16_to_fp32<<<hidden_blocks, threads, 0U, state.stream>>>(
         state.dsv4_mhc_workspace->layer_input, state.moe_hidden,
         kDsv4MhcHidden);
@@ -1411,6 +1589,11 @@ ValidationResult CudaBackend::glm53_mhc_swiglu(
         kDsv4MhcHidden);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch resident GLM-5.3 SwiGLU");
+    }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status,
+                          "finish resident GLM-5.3 SwiGLU kernel timing");
     }
     state.dsv4_mhc_branch_ready = true;
     return {};
@@ -1532,6 +1715,11 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     constexpr unsigned int warps = threads / 32U;
     constexpr unsigned int hidden_blocks =
         (kDsv4MhcHidden + threads - 1U) / threads;
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Mla);
+        status != cudaSuccess) {
+        return cuda_error(status, "start resident GLM-5.3 MLA kernel timing");
+    }
     dsv4_bf16_to_fp32<<<hidden_blocks, threads, 0U, state.stream>>>(
         state.dsv4_mhc_workspace->layer_input, input, kDsv4MhcHidden);
     const auto project_one = [&](const CudaWeight* weight, float* source,
@@ -1616,6 +1804,10 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch resident GLM-5.3 MLA scores");
     }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish resident GLM-5.3 MLA kernel timing");
+    }
     if (auto status = cudaMemcpyAsync(
             scores.data(), coefficients, scores.size_bytes(),
             cudaMemcpyDeviceToHost, state.stream);
@@ -1625,6 +1817,11 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     if (auto status = cudaStreamSynchronize(state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "complete resident GLM-5.3 MLA scores");
+    }
+    if (auto status = glm53_kernel_timing_drain(
+            *impl_, state, device, false);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure resident GLM-5.3 MLA kernels");
     }
     state.glm53_mla_scores_pending = true;
     return {};
@@ -1671,6 +1868,11 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
         status != cudaSuccess) {
         return cuda_error(status, "upload resident GLM-5.3 MLA coefficients");
     }
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Mla);
+        status != cudaSuccess) {
+        return cuda_error(status, "start resident GLM-5.3 MLA finish timing");
+    }
     glm53_mla_weighted_kernel<<<request.heads, threads, 0U, state.stream>>>(
         coefficients, expanded, attended,
         static_cast<std::uint32_t>(history), request.heads, request.head_dim);
@@ -1709,6 +1911,10 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
         output, state.dsv4_mhc_workspace->branch, kDsv4MhcHidden);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch resident GLM-5.3 MLA");
+    }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish resident GLM-5.3 MLA finish timing");
     }
     state.glm53_mla_scores_pending = false;
     state.dsv4_mhc_branch_ready = true;
@@ -1881,6 +2087,11 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
         status != cudaSuccess) {
         return cuda_error(status, "upload GLM-5.3 expert batch input");
     }
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Expert);
+        status != cudaSuccess) {
+        return cuda_error(status, "start GLM-5.3 expert gate/up timing");
+    }
     constexpr std::uint32_t threads = 256U;
     const std::uint32_t blocks = (intermediate * 8U + threads - 1U) / threads;
     const auto scale_columns = hidden / 128U;
@@ -1917,6 +2128,10 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch GLM-5.3 expert batch gate and up");
+    }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish GLM-5.3 expert gate/up timing");
     }
     const auto batch_floats = experts.size() * intermediate;
     if (auto status = cudaMemcpyAsync(
@@ -1959,6 +2174,11 @@ ValidationResult CudaBackend::collect_glm53_expert_gate_up(
     state.glm53_shared_gate_up_in_flight = false;
     if (status != cudaSuccess) {
         return cuda_error(status, "complete GLM-5.3 expert batch gate and up");
+    }
+    if (auto timing_status = glm53_kernel_timing_drain(
+            *impl_, state, device, false);
+        timing_status != cudaSuccess) {
+        return cuda_error(timing_status, "measure GLM-5.3 expert gate/up");
     }
     std::copy_n(state.glm53_shared_staging, expected, gate.begin());
     std::copy_n(state.glm53_shared_staging + expected, expected, up.begin());
@@ -2020,6 +2240,11 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
         status != cudaSuccess) {
         return cuda_error(status, "upload GLM-5.3 expert batch activation");
     }
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Expert);
+        status != cudaSuccess) {
+        return cuda_error(status, "start GLM-5.3 expert down timing");
+    }
     constexpr std::uint32_t threads = 256U;
     const std::uint32_t blocks = (hidden * 8U + threads - 1U) / threads;
     for (std::size_t index = 0U; index < experts.size(); ++index) {
@@ -2044,6 +2269,10 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch GLM-5.3 expert batch down");
+    }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish GLM-5.3 expert down timing");
     }
     if (auto status = cudaMemcpyAsync(
             state.glm53_shared_staging, state.glm53_shared_output,
@@ -2079,6 +2308,11 @@ ValidationResult CudaBackend::collect_glm53_expert_down(
     state.glm53_shared_down_in_flight = false;
     if (status != cudaSuccess) {
         return cuda_error(status, "complete GLM-5.3 expert batch down");
+    }
+    if (auto timing_status = glm53_kernel_timing_drain(
+            *impl_, state, device, false);
+        timing_status != cudaSuccess) {
+        return cuda_error(timing_status, "measure GLM-5.3 expert down");
     }
     std::copy_n(state.glm53_shared_staging, expected, output.begin());
     return {};

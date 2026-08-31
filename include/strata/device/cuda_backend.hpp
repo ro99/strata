@@ -90,8 +90,10 @@ struct CudaSynchronizationStats {
 };
 
 struct CudaBackendStats {
-    // Byte and event totals sum devices. Aggregate durations are the maximum
-    // per-device service duration so concurrent device work is not double-counted.
+    // Byte and event totals sum devices. Most aggregate durations are the
+    // maximum per-device critical path. kernel_nanoseconds is deliberately
+    // total CUDA kernel service time across devices so it is externally
+    // reconcilable and never drops sequential work assigned to another GPU.
     struct Device {
         int device{-1};
         std::uint64_t weight_upload_bytes{};
@@ -126,6 +128,13 @@ struct CudaBackendStats {
         std::uint64_t weight_copy_nanoseconds{};
         std::uint64_t activation_h2d_nanoseconds{};
         std::uint64_t kernel_nanoseconds{};
+        // GLM-5.3 kernels launched directly by the hybrid recurrence backend.
+        // These categories are exhaustive for that backend and make the MLA
+        // term independently reconcilable with an external CUDA trace.
+        std::uint64_t glm53_kda_kernel_nanoseconds{};
+        std::uint64_t glm53_mla_kernel_nanoseconds{};
+        std::uint64_t glm53_expert_kernel_nanoseconds{};
+        std::uint64_t glm53_other_kernel_nanoseconds{};
         std::uint64_t activation_d2h_nanoseconds{};
         std::uint64_t deepseek_moe_calls{};
         std::uint64_t deepseek_moe_kernel_launches{};
@@ -217,6 +226,10 @@ struct CudaBackendStats {
     std::uint64_t weight_copy_nanoseconds{};
     std::uint64_t activation_h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
+    std::uint64_t glm53_kda_kernel_nanoseconds{};
+    std::uint64_t glm53_mla_kernel_nanoseconds{};
+    std::uint64_t glm53_expert_kernel_nanoseconds{};
+    std::uint64_t glm53_other_kernel_nanoseconds{};
     std::uint64_t activation_d2h_nanoseconds{};
     std::uint64_t deepseek_moe_calls{};
     std::uint64_t deepseek_moe_kernel_launches{};

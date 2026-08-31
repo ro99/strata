@@ -58,6 +58,19 @@ struct CudaBackend::Impl {
         cudaEvent_t router_started{};
         cudaEvent_t kernel_finished{};
         cudaEvent_t activation_downloaded{};
+        // Direct GLM-5.3 launch groups use a small event ledger instead of
+        // synchronizing after every kernel. Every direct kernel is enclosed by
+        // one of these spans; completed spans are drained at natural command
+        // boundaries and by stats().
+        static constexpr std::size_t kGlm53KernelTimingCapacity = 128U;
+        std::array<cudaEvent_t, kGlm53KernelTimingCapacity>
+            glm53_kernel_started{};
+        std::array<cudaEvent_t, kGlm53KernelTimingCapacity>
+            glm53_kernel_finished{};
+        std::array<std::uint8_t, kGlm53KernelTimingCapacity>
+            glm53_kernel_category{};
+        std::uint32_t glm53_kernel_timing_count{};
+        bool glm53_kernel_timing_active{};
         cudaEvent_t moe_start{};
         cudaEvent_t moe_hidden_uploaded{};
         cudaEvent_t moe_kernel_finished{};
@@ -557,6 +570,13 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaEventDestroy(state.router_started));
                 static_cast<void>(cudaEventDestroy(state.kernel_finished));
                 static_cast<void>(cudaEventDestroy(state.activation_downloaded));
+                for (std::size_t index = 0U;
+                     index < state.kGlm53KernelTimingCapacity; ++index) {
+                    static_cast<void>(cudaEventDestroy(
+                        state.glm53_kernel_started[index]));
+                    static_cast<void>(cudaEventDestroy(
+                        state.glm53_kernel_finished[index]));
+                }
             }
             if (state.moe_start != nullptr) {
                 static_cast<void>(cudaEventDestroy(state.moe_start));

@@ -201,6 +201,14 @@ void print_phase_metrics(std::ostream& output,
            << phase.cuda.synchronization_nanoseconds
            << ",\"kernel_nanoseconds\":"
            << phase.cuda.kernel_nanoseconds
+           << ",\"glm53_kda_kernel_nanoseconds\":"
+           << phase.cuda.glm53_kda_kernel_nanoseconds
+           << ",\"glm53_mla_kernel_nanoseconds\":"
+           << phase.cuda.glm53_mla_kernel_nanoseconds
+           << ",\"glm53_expert_kernel_nanoseconds\":"
+           << phase.cuda.glm53_expert_kernel_nanoseconds
+           << ",\"glm53_other_kernel_nanoseconds\":"
+           << phase.cuda.glm53_other_kernel_nanoseconds
            << "},\"cache\":{\"hits\":" << phase.cache.hits
            << ",\"misses\":" << phase.cache.misses
            << ",\"evictions\":" << phase.cache.evictions

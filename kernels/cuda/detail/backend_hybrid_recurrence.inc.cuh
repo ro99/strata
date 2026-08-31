@@ -405,9 +405,10 @@ __global__ void glm53_rms_norm_bf16_kernel(
 // computes `exp`, the sum and the coefficient, on the accepted fallback's own
 // code.
 //
-// One block per head with a single active thread, because the host accumulates
-// each score sequentially over the columns and the association has to match.
-__global__ void glm53_mla_scores_kernel(
+// The FP8 checkpoint still expands to F32 in the per-step workspace. Keep its
+// accepted kernel unchanged while the BF16 checkpoint uses the persistent
+// cache path below.
+__global__ void glm53_mla_scores_f32_kernel(
     const float* query, const float* expanded, float* scores,
     std::uint32_t history, std::uint32_t heads, std::uint32_t head_dim) {
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
@@ -426,6 +427,46 @@ __global__ void glm53_mla_scores_kernel(
         for (std::uint32_t column = 0U; column < head_dim; ++column) {
             score = __fmaf_rn(q[column], key[column], score);
         }
+        scores[static_cast<std::uint64_t>(head) * history + token] =
+            score * score_scale;
+    }
+}
+
+// One warp owns one independent (head, token) score. The warp coalesces each
+// 32-value key load, but lane zero consumes those values in source-lane order,
+// preserving the host's exact column-0..column-N FMA association. History is
+// therefore parallel without turning the dot itself into a parallel reduction.
+__global__ void glm53_mla_scores_bf16_kernel(
+    const float* query, const __nv_bfloat16* expanded, float* scores,
+    std::uint32_t history, std::uint32_t heads, std::uint32_t head_dim) {
+    constexpr std::uint32_t warps_per_block = 8U;
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto token = static_cast<std::uint32_t>(blockIdx.y) *
+                           warps_per_block + warp;
+    if (head >= heads || token >= history) return;
+    const auto* q = query + static_cast<std::uint64_t>(head) * head_dim;
+    const auto* key = expanded +
+        (static_cast<std::uint64_t>(token) * heads + head) *
+            (2U * head_dim);
+    float score = 0.0F;
+    for (std::uint32_t begin = 0U; begin < head_dim; begin += warpSize) {
+        const auto column = begin + lane;
+        const float loaded = column < head_dim
+            ? __bfloat162float(key[column]) : 0.0F;
+#pragma unroll
+        for (std::uint32_t source = 0U; source < warpSize; ++source) {
+            const float key_value = __shfl_sync(
+                0xFFFF'FFFFU, loaded, static_cast<int>(source));
+            if (lane == 0U && begin + source < head_dim) {
+                score = __fmaf_rn(q[begin + source], key_value, score);
+            }
+        }
+    }
+    if (lane == 0U) {
+        const float score_scale =
+            1.0F / sqrtf(static_cast<float>(head_dim));
         scores[static_cast<std::uint64_t>(head) * history + token] =
             score * score_scale;
     }
@@ -450,6 +491,29 @@ __global__ void glm53_mla_weighted_kernel(
             value += coefficients[
                 static_cast<std::uint64_t>(head) * history + token] *
                 values[column];
+        }
+        attended[static_cast<std::uint64_t>(head) * head_dim + column] =
+            glm53_bf16(value);
+    }
+}
+
+__global__ void glm53_mla_weighted_bf16_kernel(
+    const float* coefficients, const __nv_bfloat16* expanded,
+    float* attended, std::uint32_t history, std::uint32_t heads,
+    std::uint32_t head_dim) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= heads) return;
+    for (std::uint32_t column = threadIdx.x; column < head_dim;
+         column += blockDim.x) {
+        float value = 0.0F;
+        for (std::uint32_t token = 0U; token < history; ++token) {
+            const auto* values = expanded +
+                (static_cast<std::uint64_t>(token) * heads + head) *
+                    (2U * head_dim) + head_dim;
+            value = __fmaf_rn(
+                coefficients[
+                    static_cast<std::uint64_t>(head) * history + token],
+                __bfloat162float(values[column]), value);
         }
         attended[static_cast<std::uint64_t>(head) * head_dim + column] =
             glm53_bf16(value);
@@ -1599,6 +1663,99 @@ ValidationResult CudaBackend::glm53_mhc_swiglu(
     return {};
 }
 
+ValidationResult CudaBackend::glm53_mla_prepare_history(
+    const CudaGlm53MlaRequest& request, std::uint32_t history) {
+    if (request.state == nullptr || !request.state->valid() ||
+        request.key_value_b == nullptr || !request.key_value_b->valid() ||
+        request.maximum_context == 0U || history > request.maximum_context ||
+        request.heads == 0U || request.head_dim == 0U ||
+        request.query_rank == 0U || request.key_value_rank == 0U) {
+        return {{"CUDA GLM-5.3 MLA history preparation is invalid"}};
+    }
+    const auto device = request.state->device();
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end() ||
+        request.key_value_b->device() != device) {
+        return {{"CUDA GLM-5.3 MLA history targets an invalid device"}};
+    }
+    const auto width = static_cast<std::uint64_t>(request.heads) *
+                       request.head_dim;
+    const auto expanded_width = 2ULL * width;
+    const auto cache_floats =
+        static_cast<std::uint64_t>(request.maximum_context) *
+        request.key_value_rank;
+    const auto state_floats = cache_floats + request.query_rank +
+                              request.key_value_rank;
+    const auto required_bytes = state_floats * sizeof(float) +
+        static_cast<std::uint64_t>(request.maximum_context) *
+            expanded_width * sizeof(__nv_bfloat16);
+    const auto& descriptor = request.key_value_b->impl_->descriptor;
+    if (descriptor.encoding != CudaWeightEncoding::Plain ||
+        descriptor.dtype != SafetensorsDtype::Bf16 ||
+        descriptor.rows != expanded_width ||
+        descriptor.columns != request.key_value_rank ||
+        request.state->device_bytes() < required_bytes) {
+        return {{"CUDA GLM-5.3 MLA history cache shape is invalid"}};
+    }
+    auto& state = found->second;
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for MLA history preparation");
+    }
+    auto& buffer = *request.state->impl_;
+    buffer.glm53_mla_expanded_rows = 0U;
+    buffer.glm53_mla_maximum_context = request.maximum_context;
+    buffer.glm53_mla_expanded_width = expanded_width;
+    if (history == 0U) {
+        if (auto status = cudaStreamSynchronize(state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "synchronize empty MLA history");
+        }
+        return {};
+    }
+
+    auto* packed = static_cast<float*>(buffer.data);
+    auto* expanded = reinterpret_cast<__nv_bfloat16*>(
+        packed + state_floats);
+    constexpr unsigned int threads = 256U;
+    constexpr unsigned int warps = threads / 32U;
+    const dim3 grid(
+        static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
+        static_cast<unsigned int>(
+            (history + kBf16MatvecRowTile - 1U) /
+            kBf16MatvecRowTile),
+        1U);
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Mla);
+        status != cudaSuccess) {
+        return cuda_error(status, "start MLA history preparation timing");
+    }
+    bf16_matvec_rows_to_bf16_kernel<kBf16MatvecRowTile><<<
+        grid, threads, 0U, state.stream>>>(
+        expanded, packed,
+        static_cast<const __nv_bfloat16*>(
+            request.key_value_b->impl_->weights),
+        history, request.key_value_rank, expanded_width);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "project GLM-5.3 MLA history");
+    }
+    if (auto status = glm53_kernel_timing_end(state, impl_->detailed_timing);
+        status != cudaSuccess) {
+        return cuda_error(status, "finish MLA history preparation timing");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize MLA history preparation");
+    }
+    if (auto status = glm53_kernel_timing_drain(
+            *impl_, state, device, false);
+        status != cudaSuccess) {
+        return cuda_error(status, "measure MLA history preparation");
+    }
+    buffer.glm53_mla_expanded_rows = history;
+    return {};
+}
+
 ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     const CudaGlm53MlaRequest& request, std::span<float> scores) {
     if (request.state == nullptr || !request.state->valid() ||
@@ -1652,6 +1809,7 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
         !valid(request.output, kDsv4MhcHidden, width)) {
         return {{"CUDA GLM-5.3 resident MLA projection shapes are invalid"}};
     }
+    const auto& kv_descriptor = request.key_value_b->impl_->descriptor;
     const auto history = static_cast<std::uint64_t>(request.position) + 1U;
     // Keep the accepted host fallback's projection/attention association.
     // Absorbing the KV-B projection into the query is algebraically equivalent,
@@ -1659,25 +1817,29 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     // The resident path therefore expands the latent history exactly as the
     // fallback does before applying attention.
     //
-    // Size the workspace from the admitted context rather than the current
-    // position. The expanded history grows by `expanded_width` floats every
-    // token, so sizing it from `history` would cudaFree and cudaMalloc inside a
-    // timed decode step -- which M4's gate forbids outright, and which would
-    // also make a step's cost depend on when the buffer last happened to grow.
-    // Reserving once costs `maximum_context * expanded_width` floats: 268 MB at
-    // 2,048 tokens on this model, whose 64 heads and 256 head dim make
-    // `expanded_width` 32,768 because it holds key and value together. That
-    // sits inside the per-device workspace reserve the planner already
-    // withholds.
-    //
-    // The offsets below use the reserved extent too, so a pointer into the
-    // workspace means the same thing at every position.
+    // BF16 KV-B is expanded once into an exact BF16 cache appended to this
+    // layer's sequence state. FP8 KV-B retains the accepted F32 workspace path
+    // because its register-fed projection currently publishes F32 rows.
     const auto reserved_history = std::max<std::uint64_t>(
         history, request.maximum_context);
+    const auto persistent_cache_bytes = state_floats * sizeof(float) +
+        static_cast<std::uint64_t>(request.maximum_context) *
+            expanded_width * sizeof(__nv_bfloat16);
+    const bool persistent_bf16 =
+        kv_descriptor.encoding == CudaWeightEncoding::Plain &&
+        kv_descriptor.dtype == SafetensorsDtype::Bf16 &&
+        request.state->device_bytes() >= persistent_cache_bytes;
+    if (persistent_bf16 &&
+        (request.state->impl_->glm53_mla_maximum_context !=
+             request.maximum_context ||
+         request.state->impl_->glm53_mla_expanded_width != expanded_width)) {
+        return {{"CUDA GLM-5.3 resident MLA cache was not prepared"}};
+    }
     // The trailing `heads * reserved_history` holds the scores on the way out
     // and the normalized coefficients on the way back in.
     const auto workspace_floats = kDsv4MhcHidden + request.query_rank + width +
-        reserved_history * expanded_width + width + kDsv4MhcHidden +
+        (persistent_bf16 ? 0U : reserved_history * expanded_width) +
+        width + kDsv4MhcHidden +
         static_cast<std::uint64_t>(request.heads) * reserved_history;
     const auto workspace_bytes = workspace_floats * sizeof(float);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
@@ -1706,9 +1868,12 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
     auto* q_rank = input + kDsv4MhcHidden;
     auto* query = q_rank + request.query_rank;
     auto* expanded = query + width;
-    auto* attended = expanded + reserved_history * expanded_width;
+    auto* attended = expanded +
+        (persistent_bf16 ? 0U : reserved_history * expanded_width);
     auto* output = attended + width;
     auto* coefficients = output + kDsv4MhcHidden;
+    auto* expanded_bf16 = reinterpret_cast<__nv_bfloat16*>(
+        packed + state_floats);
     auto* latent = packed + static_cast<std::uint64_t>(request.position) *
                                 request.key_value_rank;
     constexpr unsigned int threads = 256U;
@@ -1762,8 +1927,52 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
         status != cudaSuccess) {
         return cuda_error(status, "project resident GLM-5.3 MLA query B");
     }
-    const auto& kv_descriptor = request.key_value_b->impl_->descriptor;
-    if (kv_descriptor.encoding == CudaWeightEncoding::Plain) {
+    if (persistent_bf16) {
+        auto& expanded_rows = request.state->impl_->glm53_mla_expanded_rows;
+        if (expanded_rows > history) {
+            return {{"CUDA GLM-5.3 MLA expansion cache is ahead of history"}};
+        }
+        const auto missing = static_cast<std::uint32_t>(
+            history - expanded_rows);
+        if (missing != 0U) {
+            const dim3 kv_grid(
+                static_cast<unsigned int>(
+                    (expanded_width + warps - 1U) / warps),
+                static_cast<unsigned int>(
+                    (missing + kBf16MatvecRowTile - 1U) /
+                    kBf16MatvecRowTile),
+                1U);
+            auto* expansion_destination = expanded_bf16 +
+                static_cast<std::uint64_t>(expanded_rows) * expanded_width;
+            const auto* expansion_source = packed +
+                static_cast<std::uint64_t>(expanded_rows) *
+                    request.key_value_rank;
+            const auto* expansion_weights =
+                static_cast<const __nv_bfloat16*>(
+                    request.key_value_b->impl_->weights);
+            if (missing == 1U) {
+                // The generic tile intentionally fills every accumulator in a
+                // partial tile. Decode appends exactly one row, so Tile=1
+                // avoids computing that row sixteen times.
+                bf16_matvec_rows_to_bf16_kernel<1U><<<
+                    kv_grid, threads, 0U, state.stream>>>(
+                    expansion_destination, expansion_source,
+                    expansion_weights, missing, request.key_value_rank,
+                    expanded_width);
+            } else {
+                bf16_matvec_rows_to_bf16_kernel<kBf16MatvecRowTile><<<
+                    kv_grid, threads, 0U, state.stream>>>(
+                    expansion_destination, expansion_source,
+                    expansion_weights, missing, request.key_value_rank,
+                    expanded_width);
+            }
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(
+                    status, "append GLM-5.3 MLA expansion cache");
+            }
+            expanded_rows = static_cast<std::uint32_t>(history);
+        }
+    } else if (kv_descriptor.encoding == CudaWeightEncoding::Plain) {
         const dim3 kv_grid(
             static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
             static_cast<unsigned int>(
@@ -1786,21 +1995,41 @@ ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
                    state.stream); status != cudaSuccess) {
         return cuda_error(status, "project resident GLM-5.3 MLA KV B");
     }
-    round_bf16_rows_kernel<<<
-        static_cast<unsigned int>(
-            std::min<std::uint64_t>(
-                (history * expanded_width + threads - 1U) / threads,
-                65535U)),
-        threads, 0U, state.stream>>>(expanded, history * expanded_width);
+    if (!persistent_bf16) {
+        round_bf16_rows_kernel<<<
+            static_cast<unsigned int>(
+                std::min<std::uint64_t>(
+                    (history * expanded_width + threads - 1U) / threads,
+                    65535U)),
+            threads, 0U, state.stream>>>(expanded,
+                                         history * expanded_width);
+    }
     // Stop at the scores and hand them back. The caller applies `exp`, the
     // normalization and the BF16 coefficient rounding on the host, then calls
     // `glm53_mla_decode_finish` to complete the layer.
     if (scores.size() != request.heads * history) {
         return {{"CUDA GLM-5.3 resident MLA score span has an invalid shape"}};
     }
-    glm53_mla_scores_kernel<<<request.heads, threads, 0U, state.stream>>>(
-        query, expanded, coefficients,
-        static_cast<std::uint32_t>(history), request.heads, request.head_dim);
+    if (persistent_bf16) {
+        constexpr unsigned int score_warps_per_block = threads / 32U;
+        const dim3 score_grid(
+            request.heads,
+            static_cast<unsigned int>(
+                (history + score_warps_per_block - 1U) /
+                score_warps_per_block),
+            1U);
+        glm53_mla_scores_bf16_kernel<<<
+            score_grid, threads, 0U, state.stream>>>(
+            query, expanded_bf16, coefficients,
+            static_cast<std::uint32_t>(history), request.heads,
+            request.head_dim);
+    } else {
+        glm53_mla_scores_f32_kernel<<<
+            request.heads, threads, 0U, state.stream>>>(
+            query, expanded, coefficients,
+            static_cast<std::uint32_t>(history), request.heads,
+            request.head_dim);
+    }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch resident GLM-5.3 MLA scores");
     }
@@ -1846,6 +2075,26 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
     const auto width = static_cast<std::uint64_t>(request.heads) *
                        request.head_dim;
     const auto expanded_width = 2ULL * width;
+    if (request.key_value_b == nullptr || !request.key_value_b->valid()) {
+        return {{"CUDA GLM-5.3 resident MLA finish is missing KV-B"}};
+    }
+    const auto cache_floats =
+        static_cast<std::uint64_t>(request.maximum_context) *
+        request.key_value_rank;
+    const auto state_floats = cache_floats + request.query_rank +
+                              request.key_value_rank;
+    const auto persistent_cache_bytes = state_floats * sizeof(float) +
+        static_cast<std::uint64_t>(request.maximum_context) *
+            expanded_width * sizeof(__nv_bfloat16);
+    const auto& kv_descriptor = request.key_value_b->impl_->descriptor;
+    const bool persistent_bf16 =
+        kv_descriptor.encoding == CudaWeightEncoding::Plain &&
+        kv_descriptor.dtype == SafetensorsDtype::Bf16 &&
+        request.state->device_bytes() >= persistent_cache_bytes;
+    if (persistent_bf16 &&
+        request.state->impl_->glm53_mla_expanded_rows < history) {
+        return {{"CUDA GLM-5.3 MLA expansion cache is incomplete"}};
+    }
     const auto reserved_history = std::max<std::uint64_t>(
         history, request.maximum_context);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
@@ -1855,9 +2104,13 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
     auto* workspace = reinterpret_cast<float*>(state.glm53_mla_workspace);
     auto* query = workspace + kDsv4MhcHidden + request.query_rank;
     auto* expanded = query + width;
-    auto* attended = expanded + reserved_history * expanded_width;
+    auto* attended = expanded +
+        (persistent_bf16 ? 0U : reserved_history * expanded_width);
     auto* output = attended + width;
     auto* coefficients = output + kDsv4MhcHidden;
+    auto* packed = static_cast<float*>(request.state->impl_->data);
+    auto* expanded_bf16 = reinterpret_cast<__nv_bfloat16*>(
+        packed + state_floats);
     constexpr unsigned int threads = 256U;
     const auto hidden_blocks =
         static_cast<unsigned int>((kDsv4MhcHidden + threads - 1U) / threads);
@@ -1873,9 +2126,19 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
         status != cudaSuccess) {
         return cuda_error(status, "start resident GLM-5.3 MLA finish timing");
     }
-    glm53_mla_weighted_kernel<<<request.heads, threads, 0U, state.stream>>>(
-        coefficients, expanded, attended,
-        static_cast<std::uint32_t>(history), request.heads, request.head_dim);
+    if (persistent_bf16) {
+        glm53_mla_weighted_bf16_kernel<<<
+            request.heads, threads, 0U, state.stream>>>(
+            coefficients, expanded_bf16, attended,
+            static_cast<std::uint32_t>(history), request.heads,
+            request.head_dim);
+    } else {
+        glm53_mla_weighted_kernel<<<
+            request.heads, threads, 0U, state.stream>>>(
+            coefficients, expanded, attended,
+            static_cast<std::uint32_t>(history), request.heads,
+            request.head_dim);
+    }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch resident GLM-5.3 MLA weighted sum");
     }

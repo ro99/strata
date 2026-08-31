@@ -31,6 +31,12 @@ struct CudaBuffer::Impl {
     void* data{};
     std::uint64_t bytes{};
     int device{-1};
+    // GLM-5.3 BF16 MLA state buffers append an exact BF16 expansion cache
+    // after their packed F32 latent state and norms. The row count is stream
+    // ordered with the projection kernels which populate that cache.
+    std::uint32_t glm53_mla_expanded_rows{};
+    std::uint32_t glm53_mla_maximum_context{};
+    std::uint64_t glm53_mla_expanded_width{};
 
     ~Impl() {
         if (device >= 0) static_cast<void>(cudaSetDevice(device));

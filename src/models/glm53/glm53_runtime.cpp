@@ -1680,6 +1680,37 @@ public:
         return backend_.glm53_mla_decode_finish(request, scores);
     }
 
+    [[nodiscard]] bool mla_kv_b_is_bf16(
+        std::string_view attention) const noexcept {
+        const auto* tensor = checkpoint_.find(
+            std::string(attention) + "kv_b_proj.weight");
+        return tensor != nullptr &&
+               tensor->source_dtype == SafetensorsDtype::Bf16;
+    }
+
+    [[nodiscard]] ValidationResult prepare_mla_history(
+        std::size_t slot, std::string_view attention,
+        CudaGlm53MlaRequest request, std::uint32_t history) {
+        if (slot >= states_.size() || request.state == nullptr) {
+            return {{"GLM-5.3 MLA history targets an invalid cache slot"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        const auto key = std::string(attention) + "kv_b_proj";
+        const auto found = state.entries.find(key);
+        if (found == state.entries.end() ||
+            found->second.weight.device() != request.state->device()) {
+            return {{"GLM-5.3 MLA KV-B projection was not admitted: " + key}};
+        }
+        ++found->second.leases;
+        struct Lease {
+            Entry& entry;
+            ~Lease() { --entry.leases; }
+        } lease{found->second};
+        request.key_value_b = &found->second.weight;
+        return backend_.glm53_mla_prepare_history(request, history);
+    }
+
     [[nodiscard]] ValidationResult swiglu_mhc(
         std::size_t slot, std::string_view prefix,
         std::uint32_t intermediate) {
@@ -5694,6 +5725,69 @@ struct Glm53Runtime::Impl {
         return true;
     }
 
+    [[nodiscard]] ValidationResult prepare_device_mla_layer(
+        std::uint32_t layer, Glm53SequenceState& sequence,
+        CudaBuffer& buffer) {
+        const auto attention = "model.language_model.layers." +
+            std::to_string(layer) + ".self_attn.";
+        const auto cache_floats =
+            static_cast<std::size_t>(config.maximum_context_tokens) * kKvRank;
+        std::vector<float> packed(
+            cache_floats + kQueryRank + kKvRank, 0.0F);
+        const auto latent = sequence.mla(layer).materialize();
+        if (latent.size() > cache_floats || latent.size() % kKvRank != 0U) {
+            return {{"GLM-5.3 resident MLA cache exceeds its admitted "
+                     "context"}};
+        }
+        std::copy(latent.begin(), latent.end(), packed.begin());
+        auto q_norm = host_tensor(
+            attention + "q_a_layernorm.weight", kQueryRank);
+        auto kv_norm = host_tensor(
+            attention + "kv_a_layernorm.weight", kKvRank);
+        if (!q_norm.ok() || !kv_norm.ok()) {
+            ValidationResult result;
+            append(result.errors, std::move(q_norm.errors));
+            append(result.errors, std::move(kv_norm.errors));
+            return result;
+        }
+        std::copy(q_norm.value->begin(), q_norm.value->end(),
+                  packed.begin() + static_cast<std::ptrdiff_t>(cache_floats));
+        std::copy(kv_norm.value->begin(), kv_norm.value->end(),
+                  packed.begin() + static_cast<std::ptrdiff_t>(
+                                       cache_floats + kQueryRank));
+
+        const auto history = static_cast<std::uint32_t>(
+            latent.size() / kKvRank);
+        const bool persistent_bf16 = history != 0U &&
+            weights->mla_kv_b_is_bf16(attention);
+        const auto packed_bytes =
+            std::as_bytes(std::span<const float>(packed));
+        if (!persistent_bf16) {
+            return cuda.upload_buffer(device_for(layer), packed_bytes, buffer);
+        }
+
+        constexpr std::uint64_t expanded_width =
+            static_cast<std::uint64_t>(kHeads) * 2U * kMlaHead;
+        const auto expanded_bytes =
+            static_cast<std::uint64_t>(config.maximum_context_tokens) *
+            expanded_width * sizeof(std::uint16_t);
+        auto result = cuda.allocate_buffer(
+            device_for(layer), packed_bytes.size() + expanded_bytes, buffer);
+        if (!result.ok()) return result;
+        const CudaBufferPatch patch{0U, packed_bytes};
+        result = cuda.update_buffer(buffer, std::span(&patch, 1U));
+        if (!result.ok()) return result;
+        CudaGlm53MlaRequest request;
+        request.state = &buffer;
+        request.maximum_context = config.maximum_context_tokens;
+        request.heads = kHeads;
+        request.head_dim = kMlaHead;
+        request.query_rank = kQueryRank;
+        request.key_value_rank = kKvRank;
+        return weights->prepare_mla_history(
+            slot_for(layer), attention, request, history);
+    }
+
     [[nodiscard]] ValidationResult prepare_device_sequence(
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
         ValidationResult result;
@@ -5701,36 +5795,8 @@ struct Glm53Runtime::Impl {
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";
             if (!glm53_kda_layer(layer)) {
-                const auto cache_floats =
-                    static_cast<std::size_t>(config.maximum_context_tokens) *
-                    kKvRank;
-                std::vector<float> packed(
-                    cache_floats + kQueryRank + kKvRank, 0.0F);
-                const auto latent = sequence.mla(layer).materialize();
-                if (latent.size() > cache_floats) {
-                    return {{"GLM-5.3 resident MLA cache exceeds its admitted "
-                             "context"}};
-                }
-                std::copy(latent.begin(), latent.end(), packed.begin());
-                auto q_norm = host_tensor(
-                    attention + "q_a_layernorm.weight", kQueryRank);
-                auto kv_norm = host_tensor(
-                    attention + "kv_a_layernorm.weight", kKvRank);
-                if (!q_norm.ok() || !kv_norm.ok()) {
-                    append(result.errors, std::move(q_norm.errors));
-                    append(result.errors, std::move(kv_norm.errors));
-                    return result;
-                }
-                std::copy(q_norm.value->begin(), q_norm.value->end(),
-                          packed.begin() +
-                              static_cast<std::ptrdiff_t>(cache_floats));
-                std::copy(kv_norm.value->begin(), kv_norm.value->end(),
-                          packed.begin() + static_cast<std::ptrdiff_t>(
-                                               cache_floats + kQueryRank));
-                result = cuda.upload_buffer(
-                    device_for(layer),
-                    std::as_bytes(std::span<const float>(packed)),
-                    device_sequence.mla[layer]);
+                result = prepare_device_mla_layer(
+                    layer, sequence, device_sequence.mla[layer]);
                 if (!result.ok()) return result;
                 continue;
             }
@@ -5884,6 +5950,21 @@ struct Glm53Runtime::Impl {
                 request->result.errors = std::move(synchronized.errors);
                 complete_request(request);
                 return;
+            }
+            // Page prefill owns MLA on the host, so the empty device buffers
+            // created before the first page do not contain its latent rows.
+            // Re-admit those exact rows now and build the BF16 expansion cache
+            // before decode timing begins.
+            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+                if (glm53_kda_layer(layer)) continue;
+                synchronized = prepare_device_mla_layer(
+                    layer, request->sequence,
+                    request->device_sequence.mla[layer]);
+                if (!synchronized.ok()) {
+                    request->result.errors = std::move(synchronized.errors);
+                    complete_request(request);
+                    return;
+                }
             }
         }
         request->result.metrics.prefill_tokens =

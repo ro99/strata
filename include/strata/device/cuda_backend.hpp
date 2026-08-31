@@ -1157,6 +1157,12 @@ public:
     // history 46 (record 0214). Phase one returns `heads * history` raw
     // scores; the caller applies `exp`, the normalization and the BF16
     // rounding on the accepted host path, then calls the finish phase.
+    // BF16 KV-B checkpoints keep the already-rounded expanded history beside
+    // the latent state. Preparing it before timed decode removes the otherwise
+    // quadratic re-projection of every old row; decode appends only newly
+    // admitted latent rows. FP8 KV-B checkpoints retain their existing path.
+    [[nodiscard]] ValidationResult glm53_mla_prepare_history(
+        const CudaGlm53MlaRequest& request, std::uint32_t history);
     [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
         const CudaGlm53MlaRequest& request, std::span<float> scores);
     [[nodiscard]] ValidationResult glm53_mla_decode_finish(

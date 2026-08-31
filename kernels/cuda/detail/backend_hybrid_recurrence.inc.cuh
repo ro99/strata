@@ -111,6 +111,121 @@ __global__ void glm53_kda_beta_kernel(float* beta, std::uint32_t heads) {
     if (index < heads) beta[index] = glm53_bf16(glm53_sigmoid(beta[index]));
 }
 
+__global__ void glm53_mhc_gather_page_input_kernel(
+    const Dsv4MhcWorkspace* slots, float* output, std::uint32_t rows,
+    std::uint32_t hidden) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const auto elements = static_cast<std::uint64_t>(rows) * hidden;
+    if (index >= elements) return;
+    const auto row = static_cast<std::uint32_t>(index / hidden);
+    const auto column = static_cast<std::uint32_t>(index % hidden);
+    output[index] = __bfloat162float(slots[row].layer_input[column]);
+}
+
+__global__ void glm53_mhc_scatter_page_branch_kernel(
+    const float* input, Dsv4MhcWorkspace* slots, std::uint32_t rows,
+    std::uint32_t hidden) {
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    const auto elements = static_cast<std::uint64_t>(rows) * hidden;
+    if (index >= elements) return;
+    const auto row = static_cast<std::uint32_t>(index / hidden);
+    const auto column = static_cast<std::uint32_t>(index % hidden);
+    slots[row].branch[column] = __float2bfloat16_rn(input[index]);
+}
+
+__global__ void glm53_kda_conv_page_row_kernel(
+    float* query, float* key, float* value, float* convolution,
+    const float* taps, std::uint32_t width, std::uint32_t kernel) {
+    const auto channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= width) return;
+    const auto history_width = kernel - 1U;
+    float* projections[3] = {query, key, value};
+    for (std::uint32_t projection = 0U; projection < 3U; ++projection) {
+        auto* history = convolution +
+            static_cast<std::size_t>(projection) * width * history_width +
+            static_cast<std::size_t>(channel) * history_width;
+        const auto* weights = taps +
+            static_cast<std::size_t>(projection) * width * kernel +
+            static_cast<std::size_t>(channel) * kernel;
+        float sum = weights[kernel - 1U] * projections[projection][channel];
+        for (std::uint32_t offset = 0U; offset < history_width; ++offset) {
+            sum += weights[offset] * history[offset];
+        }
+        for (std::uint32_t offset = 0U; offset + 1U < history_width; ++offset) {
+            history[offset] = history[offset + 1U];
+        }
+        history[history_width - 1U] = projections[projection][channel];
+        projections[projection][channel] =
+            glm53_bf16(sum * glm53_sigmoid(sum));
+    }
+}
+
+__global__ void glm53_kda_recurrence_page_row_kernel(
+    float* recurrent, const float* a_log, const float* dt_bias,
+    const float* norm_weight, const float* query, const float* key,
+    const float* value, const float* forget, const float* beta,
+    const float* gate, float* output, std::uint32_t heads,
+    std::uint32_t head_dim) {
+    const auto head = blockIdx.x;
+    const auto lane = threadIdx.x;
+    if (head >= heads || lane >= head_dim) return;
+    const auto base = head * head_dim;
+    extern __shared__ float scratch[];
+    auto* normalized_query = scratch;
+    auto* normalized_key = normalized_query + head_dim;
+    auto* decay = normalized_key + head_dim;
+    auto* raw = decay + head_dim;
+    __shared__ float query_inverse;
+    __shared__ float key_inverse;
+    __shared__ float output_inverse;
+    if (lane == 0U) {
+        float query_square = 0.0F;
+        float key_square = 0.0F;
+        for (std::uint32_t index = 0U; index < head_dim; ++index) {
+            query_square += query[base + index] * query[base + index];
+            key_square += key[base + index] * key[base + index];
+        }
+        query_inverse = rsqrtf(query_square + 1.0e-6F) /
+                        sqrtf(static_cast<float>(head_dim));
+        key_inverse = rsqrtf(key_square + 1.0e-6F);
+    }
+    __syncthreads();
+    normalized_query[lane] = query[base + lane] * query_inverse;
+    normalized_key[lane] = key[base + lane] * key_inverse;
+    decay[lane] = expf(-5.0F * glm53_sigmoid(
+        expf(a_log[head]) * (forget[base + lane] + dt_bias[base + lane])));
+    __syncthreads();
+    auto* state_row = recurrent +
+        (static_cast<std::size_t>(head) * head_dim + lane) * head_dim;
+    float projected = 0.0F;
+    for (std::uint32_t index = 0U; index < head_dim; ++index) {
+        state_row[index] *= decay[index];
+        projected += state_row[index] * normalized_key[index];
+    }
+    const auto delta = (value[base + lane] - projected) * beta[head];
+    float mixed = 0.0F;
+    for (std::uint32_t index = 0U; index < head_dim; ++index) {
+        state_row[index] += delta * normalized_key[index];
+        mixed += state_row[index] * normalized_query[index];
+    }
+    raw[lane] = glm53_bf16(mixed);
+    __syncthreads();
+    if (lane == 0U) {
+        float square = 0.0F;
+        for (std::uint32_t index = 0U; index < head_dim; ++index) {
+            square += raw[index] * raw[index];
+        }
+        output_inverse = rsqrtf(
+            square / static_cast<float>(head_dim) + 1.0e-5F);
+    }
+    __syncthreads();
+    output[base + lane] = glm53_bf16(
+        norm_weight[lane] * raw[lane] * output_inverse *
+        glm53_sigmoid(gate[base + lane]));
+}
+
 __global__ void glm53_moe_join_mhc_kernel(
     const float* expert_output, const float* coefficients,
     std::uint32_t routed, __nv_bfloat16* branch, std::uint32_t hidden,
@@ -325,7 +440,9 @@ ValidationResult CudaBackend::glm53_kda_decode(
     ValidationResult result;
     if (request.state == nullptr || !request.state->valid() ||
         request.heads == 0U || request.head_dim == 0U ||
-        request.head_dim > 256U || request.convolution_kernel < 2U) {
+        request.head_dim > 256U || request.convolution_kernel < 2U ||
+        request.page_rows == 0U ||
+        (request.page_rows != 1U && !request.mhc_source_destination)) {
         return {{"CUDA GLM-5.3 KDA command is invalid"}};
     }
     const auto width = static_cast<std::uint64_t>(request.heads) *
@@ -393,8 +510,9 @@ ValidationResult CudaBackend::glm53_kda_decode(
             (!request.mhc_source_destination &&
              request.input.size() != hidden) ||
             (request.mhc_source_destination && !request.input.empty()) ||
-            required_state_floats + workspace_floats >
-                request.state->device_bytes() / sizeof(float)) {
+            (request.page_rows == 1U &&
+             required_state_floats + workspace_floats >
+                 request.state->device_bytes() / sizeof(float))) {
             return {{"CUDA GLM-5.3 fused KDA layer workspace is invalid"}};
         }
         const std::array<const CudaWeight*, 9U> projections{
@@ -445,6 +563,185 @@ ValidationResult CudaBackend::glm53_kda_decode(
              device_state.dsv4_mhc_branch_ready ||
              device_state.dsv4_mhc_failed)) {
             return {{"CUDA GLM-5.3 fused KDA mHC command order is invalid"}};
+        }
+        if (request.page_rows > 1U) {
+            const auto rows = request.page_rows;
+            if (device_state.dsv4_mhc_slot_arena == nullptr ||
+                device_state.dsv4_mhc_slot_capacity < rows ||
+                device_state.dsv4_mhc_saved_slots.size() < rows ||
+                device_state.dsv4_mhc_active_slot != rows - 1U) {
+                return {{"CUDA GLM-5.3 KDA page mHC slots are invalid"}};
+            }
+            for (std::uint32_t row = 0U; row + 1U < rows; ++row) {
+                const auto& slot = device_state.dsv4_mhc_saved_slots[row];
+                if (slot.stage != 1U || slot.branch_ready) {
+                    return {{"CUDA GLM-5.3 KDA page mHC order is invalid"}};
+                }
+            }
+            const auto page_workspace_floats =
+                static_cast<std::uint64_t>(rows) * workspace_floats;
+            if (page_workspace_floats >
+                device_state.output_bytes / sizeof(float)) {
+                return {{"CUDA GLM-5.3 KDA page exceeds its admitted workspace"}};
+            }
+            auto* page = device_state.output;
+            auto* device_input = page;
+            auto* query = device_input + static_cast<std::uint64_t>(rows) * hidden;
+            auto* key = query + static_cast<std::uint64_t>(rows) * width;
+            auto* value = key + static_cast<std::uint64_t>(rows) * width;
+            auto* forget = value + static_cast<std::uint64_t>(rows) * width;
+            auto* gate = forget + static_cast<std::uint64_t>(rows) * width;
+            auto* beta = gate + static_cast<std::uint64_t>(rows) * width;
+            auto* forget_low = beta +
+                static_cast<std::uint64_t>(rows) * request.heads;
+            auto* gate_low = forget_low +
+                static_cast<std::uint64_t>(rows) * request.head_dim;
+            auto* heads_output = gate_low +
+                static_cast<std::uint64_t>(rows) * request.head_dim;
+            auto* final_output = heads_output +
+                static_cast<std::uint64_t>(rows) * width;
+            constexpr unsigned int threads = 256U;
+            const auto input_elements =
+                static_cast<std::uint64_t>(rows) * hidden;
+            glm53_mhc_gather_page_input_kernel<<<
+                static_cast<unsigned int>((input_elements + threads - 1U) /
+                                          threads),
+                threads, 0U, device_state.stream>>>(
+                device_state.dsv4_mhc_slot_arena, device_input, rows,
+                static_cast<std::uint32_t>(hidden));
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(status, "gather GLM-5.3 KDA page input");
+            }
+            const auto project_page = [&](const CudaWeight* weight,
+                                          const float* source,
+                                          float* destination,
+                                          std::uint64_t output_rows,
+                                          const char* operation)
+                -> ValidationResult {
+                const auto& descriptor = weight->impl_->descriptor;
+                if (descriptor.encoding == CudaWeightEncoding::Plain) {
+                    constexpr unsigned int warps = threads / 32U;
+                    const dim3 grid(
+                        static_cast<unsigned int>(
+                            (output_rows + warps - 1U) / warps),
+                        static_cast<unsigned int>(
+                            (rows + kBf16MatvecRowTile - 1U) /
+                            kBf16MatvecRowTile),
+                        1U);
+                    bf16_matvec_rows_kernel<kBf16MatvecRowTile><<<
+                        grid, threads, 0U, device_state.stream>>>(
+                        destination, source,
+                        static_cast<const __nv_bfloat16*>(
+                            weight->impl_->weights),
+                        rows, descriptor.columns, output_rows);
+                } else if (auto status = launch_regfed_fp8_f32_rows(
+                               device_state.moe_regfed, descriptor,
+                               weight->impl_->weights,
+                               weight->impl_->scales,
+                               weight->impl_->fragment_prepacked, source,
+                               destination, rows, device_state.stream);
+                           status != cudaSuccess) {
+                    return cuda_error(status, operation);
+                }
+                const auto elements =
+                    static_cast<std::uint64_t>(rows) * output_rows;
+                round_bf16_rows_kernel<<<
+                    static_cast<unsigned int>((elements + threads - 1U) /
+                                              threads),
+                    threads, 0U, device_state.stream>>>(destination, elements);
+                if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                    return cuda_error(status, operation);
+                }
+                return {};
+            };
+            for (const auto& command : std::array{
+                     std::tuple{request.query_projection, device_input, query,
+                                width, "project GLM-5.3 KDA page query"},
+                     std::tuple{request.key_projection, device_input, key,
+                                width, "project GLM-5.3 KDA page key"},
+                     std::tuple{request.value_projection, device_input, value,
+                                width, "project GLM-5.3 KDA page value"},
+                     std::tuple{request.forget_a_projection, device_input,
+                                forget_low,
+                                static_cast<std::uint64_t>(request.head_dim),
+                                "project GLM-5.3 KDA page forget A"},
+                     std::tuple{request.beta_projection, device_input, beta,
+                                static_cast<std::uint64_t>(request.heads),
+                                "project GLM-5.3 KDA page beta"},
+                     std::tuple{request.gate_a_projection, device_input,
+                                gate_low,
+                                static_cast<std::uint64_t>(request.head_dim),
+                                "project GLM-5.3 KDA page gate A"}}) {
+                auto projected_result = std::apply(project_page, command);
+                if (!projected_result.ok()) return projected_result;
+            }
+            auto projected_result = project_page(
+                request.forget_b_projection, forget_low, forget, width,
+                "project GLM-5.3 KDA page forget B");
+            if (!projected_result.ok()) return projected_result;
+            projected_result = project_page(
+                request.gate_b_projection, gate_low, gate, width,
+                "project GLM-5.3 KDA page gate B");
+            if (!projected_result.ok()) return projected_result;
+            const auto beta_elements =
+                static_cast<std::uint64_t>(rows) * request.heads;
+            glm53_kda_beta_kernel<<<
+                static_cast<unsigned int>((beta_elements + threads - 1U) /
+                                          threads),
+                threads, 0U, device_state.stream>>>(
+                beta, static_cast<std::uint32_t>(beta_elements));
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(status, "activate GLM-5.3 KDA page beta");
+            }
+            auto* packed = static_cast<float*>(request.state->impl_->data);
+            auto* recurrent = packed;
+            auto* convolution = recurrent + recurrent_floats;
+            const auto* taps = convolution + convolution_floats;
+            const auto* a_log = taps + tap_floats;
+            const auto* dt_bias = a_log + request.heads;
+            const auto* norm_weight = dt_bias + width;
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto wide_offset = static_cast<std::uint64_t>(row) * width;
+                glm53_kda_conv_page_row_kernel<<<
+                    static_cast<unsigned int>((width + threads - 1U) / threads),
+                    threads, 0U, device_state.stream>>>(
+                    query + wide_offset, key + wide_offset,
+                    value + wide_offset, convolution, taps,
+                    static_cast<std::uint32_t>(width),
+                    request.convolution_kernel);
+                glm53_kda_recurrence_page_row_kernel<<<
+                    request.heads, request.head_dim,
+                    static_cast<std::size_t>(4U * request.head_dim *
+                                             sizeof(float)),
+                    device_state.stream>>>(
+                    recurrent, a_log, dt_bias, norm_weight,
+                    query + wide_offset, key + wide_offset,
+                    value + wide_offset, forget + wide_offset,
+                    beta + static_cast<std::uint64_t>(row) * request.heads,
+                    gate + wide_offset, heads_output + wide_offset,
+                    request.heads, request.head_dim);
+            }
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(status, "launch GLM-5.3 KDA page recurrence");
+            }
+            projected_result = project_page(
+                request.output_projection, heads_output, final_output, hidden,
+                "project GLM-5.3 KDA page output");
+            if (!projected_result.ok()) return projected_result;
+            glm53_mhc_scatter_page_branch_kernel<<<
+                static_cast<unsigned int>((input_elements + threads - 1U) /
+                                          threads),
+                threads, 0U, device_state.stream>>>(
+                final_output, device_state.dsv4_mhc_slot_arena, rows,
+                static_cast<std::uint32_t>(hidden));
+            if (auto status = cudaGetLastError(); status != cudaSuccess) {
+                return cuda_error(status, "publish GLM-5.3 KDA page branch");
+            }
+            for (std::uint32_t row = 0U; row + 1U < rows; ++row) {
+                device_state.dsv4_mhc_saved_slots[row].branch_ready = true;
+            }
+            device_state.dsv4_mhc_branch_ready = true;
+            return {};
         }
         const auto input_bytes = hidden * sizeof(float);
         const auto output_bytes = hidden * sizeof(float);

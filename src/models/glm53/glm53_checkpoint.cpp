@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -142,6 +143,53 @@ ParseResult<std::vector<std::byte>> Glm53CheckpointReader::read(
         return result;
     }
     return read_slice(*tensor, 0U, tensor->source_bytes);
+}
+
+ValidationResult Glm53CheckpointReader::read_into(
+    std::string_view name, std::span<std::byte> destination) const {
+    ValidationResult result;
+    const auto* tensor = find(name);
+    if (tensor == nullptr) {
+        result.errors.push_back("unknown GLM-5.3 tensor " + std::string(name));
+        return result;
+    }
+    if (destination.size_bytes() != tensor->source_bytes) {
+        result.errors.push_back(
+            "GLM-5.3 tensor destination has the wrong byte size: " +
+            std::string(name));
+        return result;
+    }
+    return shards_.read(tensor->shard, tensor->source_offset, destination,
+                        tensor->name);
+}
+
+ValidationResult Glm53CheckpointReader::discard_shard_pages(
+    std::string_view shard) const {
+    ValidationResult result;
+    std::scoped_lock lock(mapping_mutex_);
+    const auto mapping = mappings_.find(std::string(shard));
+    if (mapping != mappings_.end() && mapping->second.address != nullptr &&
+        mapping->second.bytes != 0U &&
+        madvise(mapping->second.address,
+                static_cast<std::size_t>(mapping->second.bytes),
+                MADV_DONTNEED) != 0) {
+        result.errors.push_back("cannot discard mapped GLM-5.3 shard " +
+                                std::string(shard) + ": " +
+                                std::strerror(errno));
+    }
+    const int descriptor = shards_.descriptor(shard);
+    if (descriptor < 0) {
+        result.errors.push_back("GLM-5.3 checkpoint shard is not open: " +
+                                std::string(shard));
+        return result;
+    }
+    const int advice = posix_fadvise(descriptor, 0, 0, POSIX_FADV_DONTNEED);
+    if (advice != 0) {
+        result.errors.push_back("cannot drop GLM-5.3 shard page cache " +
+                                std::string(shard) + ": " +
+                                std::strerror(advice));
+    }
+    return result;
 }
 
 ParseResult<std::span<const std::byte>> Glm53CheckpointReader::view(

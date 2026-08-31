@@ -881,15 +881,32 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // on the host, so the tier is bit-exact -- 129-token decode is byte-identical
 // across five alternating arms.
 //
-// Off by default after the protected six-arm rerun. The coalesced kernel is
-// exact and fast, but three device arms measured +1.71% median decode wall and
-// only -0.21% host expert service against three host arms, both inside the
-// observed ranges. Prefill was neutral (+0.22%); initialization consistently
-// paid about 0.24 s and the tier consumes 1.06 GB. The exact primitive remains
-// for an explicitly selected resident policy. `1` opts in.
+// On by default. It was off from 0213 until 0221, on a measurement that is now
+// stale rather than wrong: three device arms then measured +1.71% median decode
+// wall and only -0.21% host expert service, so an 11.1% cut in host expert
+// bytes bought nothing. That audit predates the resident MLA chain (0214),
+// which took activation D2H from 2.265 to 0.002 GB per token and CUDA
+// synchronizations down 49.5%. The device was busy; the round trip queued
+// behind it. It is now idle -- kernel time is 0.77% of a decode step -- and the
+// round trip costs 70 us.
+//
+// Re-measured in 0221 as 3+3 alternating pairs with an ordering repeat, twice,
+// because a shipped default must not rest on a benchmark-only memory policy:
+//
+//   interleaved     decode 50.130 -> 46.650 s  -6.94%, service -7.77%
+//   default policy  decode 50.360 -> 46.890 s  -6.89%, service -7.50%
+//
+// Decomposed: 4.1-4.3 s of host dispatch work removed against 0.76 s of collect
+// wait added. Ranges do not overlap in either pair, ordering repeats drift
+// +/-0.20%, and all sixteen outputs hash `fe74dc4ec7ab`. `0` opts out.
+//
+// -1 is the default admission and 1 an explicit request; they differ only in
+// how a checkpoint that cannot host the tier is treated. The kernel decodes
+// E4M3 against F32 block scales, so an MXFP4 checkpoint declines silently at
+// -1 and reports an error at 1.
 [[nodiscard]] int shared_expert_device_override() noexcept {
     const char* value = std::getenv("STRATA_GLM53_SHARED_EXPERT_DEVICE");
-    if (value == nullptr || std::string_view(value) == "auto") return 0;
+    if (value == nullptr || std::string_view(value) == "auto") return -1;
     return std::string_view(value) != "0" &&
                    std::string_view(value) != "false" &&
                    std::string_view(value) != "off"

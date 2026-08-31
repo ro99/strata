@@ -731,10 +731,6 @@ struct CudaGlm53KdaRequest {
     // the active resident mHC workspace. `input` and `output` are empty and
     // the complete attention command remains stream ordered in this mode.
     bool mhc_source_destination{};
-    // A page uses mHC slots [0, page_rows) and one shared recurrent state.
-    // Projection work is row-batched, while convolution and recurrence advance
-    // in row order on the same stream. One preserves the decode command.
-    std::uint32_t page_rows{1U};
 };
 
 struct CudaGlm53MlaRequest {

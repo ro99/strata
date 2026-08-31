@@ -798,16 +798,6 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
-[[nodiscard]] bool device_prefill_enabled() noexcept {
-    static const bool enabled = [] {
-        const char* value = std::getenv("STRATA_GLM53_DEVICE_PREFILL");
-        return value != nullptr && std::string_view(value) != "0" &&
-               std::string_view(value) != "false" &&
-               std::string_view(value) != "off";
-    }();
-    return enabled;
-}
-
 [[nodiscard]] bool resident_mla_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_RESIDENT_MLA");
@@ -4775,119 +4765,6 @@ struct Glm53Runtime::Impl {
         return cuda.dsv4_mhc_finish_device(device, streams);
     }
 
-    [[nodiscard]] ValidationResult forward_layer_page_device(
-        std::span<float> streams, std::uint32_t rows, std::uint32_t layer,
-        Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
-        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
-        if (!resident_execution_active || !device_sequence.ready || rows == 0U ||
-            layer >= kLayers ||
-            streams.size() != static_cast<std::size_t>(rows) * stream_columns) {
-            return {{"GLM-5.3 device page command is not admissible"}};
-        }
-        const auto device = device_for(layer);
-        const auto prefix = "model.language_model.layers." +
-                            std::to_string(layer) + ".";
-        const auto attention = prefix + "self_attn.";
-        std::vector<float> normalized(
-            static_cast<std::size_t>(rows) * kHidden);
-        std::vector<float> branch(normalized.size());
-        ValidationResult result;
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = cuda.dsv4_mhc_select_slot(device, row);
-            if (!result.ok()) return result;
-            result = cuda.dsv4_mhc_begin_device(
-                device, resident_layers[layer].attention,
-                std::span<const float>(streams).subspan(
-                    static_cast<std::size_t>(row) * stream_columns,
-                    stream_columns));
-            if (!result.ok()) return result;
-            if (!glm53_kda_layer(layer)) {
-                result = cuda.dsv4_mhc_download_layer_input(
-                    device, std::span<float>(normalized).subspan(
-                                static_cast<std::size_t>(row) * kHidden,
-                                kHidden));
-                if (!result.ok()) return result;
-            }
-        }
-        const auto attention_started = std::chrono::steady_clock::now();
-        if (glm53_kda_layer(layer)) {
-            CudaGlm53KdaRequest request;
-            request.state = &device_sequence.kda[layer];
-            request.heads = kHeads;
-            request.head_dim = kLinearHead;
-            request.convolution_kernel = 4U;
-            request.mhc_source_destination = true;
-            request.page_rows = rows;
-            result = weights->kda_decode(
-                slot_for(layer), attention, request, {});
-        } else {
-            result = attention_mla_page(
-                branch, normalized, rows, layer, attention, sequence);
-            if (result.ok()) {
-                for (std::uint32_t row = 0U; row < rows; ++row) {
-                    result = cuda.dsv4_mhc_select_slot(device, row);
-                    if (!result.ok()) break;
-                    result = cuda.dsv4_mhc_publish_branch(
-                        device, std::span<const float>(branch).subspan(
-                                    static_cast<std::size_t>(row) * kHidden,
-                                    kHidden));
-                    if (!result.ok()) break;
-                }
-            }
-        }
-        if (!result.ok()) return result;
-        if (config.phase_profile) {
-            const auto elapsed = elapsed_nanoseconds(attention_started);
-            graph_attention_block_nanoseconds.fetch_add(
-                elapsed, std::memory_order_relaxed);
-            (glm53_kda_layer(layer) ? graph_kda_nanoseconds
-                                    : graph_mla_nanoseconds)
-                .fetch_add(elapsed, std::memory_order_relaxed);
-        }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = cuda.dsv4_mhc_select_slot(device, row);
-            if (!result.ok()) return result;
-            result = cuda.dsv4_mhc_transition_next_device(
-                device, resident_layers[layer].feedforward);
-            if (!result.ok()) return result;
-            result = cuda.dsv4_mhc_download_layer_input(
-                device, std::span<float>(normalized).subspan(
-                            static_cast<std::size_t>(row) * kHidden, kHidden));
-            if (!result.ok()) return result;
-        }
-        std::vector<std::uint64_t> route_requests(rows);
-        std::vector<std::uint32_t> route_positions(rows);
-        const auto position_base = sequence.token_count();
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            route_positions[row] = position_base + row;
-            route_requests[row] = route_request_key(
-                &sequence, route_positions[row]);
-        }
-        const auto feedforward_started = std::chrono::steady_clock::now();
-        result = feedforward_page(
-            branch, normalized, rows, layer, prefix, route_requests,
-            route_positions, false, true);
-        if (!result.ok()) return result;
-        if (config.phase_profile) {
-            graph_feedforward_block_nanoseconds.fetch_add(
-                elapsed_nanoseconds(feedforward_started),
-                std::memory_order_relaxed);
-        }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = cuda.dsv4_mhc_select_slot(device, row);
-            if (!result.ok()) return result;
-            result = cuda.dsv4_mhc_finish(
-                device,
-                std::span<const float>(branch).subspan(
-                    static_cast<std::size_t>(row) * kHidden, kHidden),
-                streams.subspan(
-                    static_cast<std::size_t>(row) * stream_columns,
-                    stream_columns));
-            if (!result.ok()) return result;
-        }
-        return cuda.dsv4_mhc_select_slot(device, 0U);
-    }
-
     [[nodiscard]] ValidationResult forward_layer_page(
         std::span<float> streams, std::uint32_t rows, std::uint32_t layer,
         Glm53SequenceState& sequence) {
@@ -5455,8 +5332,7 @@ struct Glm53Runtime::Impl {
         std::span<const std::uint32_t> tokens, std::span<float> logits,
         Glm53SequenceState& sequence,
         std::vector<float>* base_hidden_rows = nullptr,
-        bool all_row_logits = false,
-        DeviceSequenceState* device_sequence = nullptr) {
+        bool all_row_logits = false) {
         ValidationResult result;
         if (tokens.empty() ||
             logits.size() != (all_row_logits
@@ -5504,13 +5380,9 @@ struct Glm53Runtime::Impl {
         // layer's routed experts remain reusable in the bounded CUDA cache.
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
             const auto layer_started = std::chrono::steady_clock::now();
-            result = device_sequence == nullptr
-                ? forward_layer_page(
-                      streams, static_cast<std::uint32_t>(tokens.size()),
-                      layer, sequence)
-                : forward_layer_page_device(
-                      streams, static_cast<std::uint32_t>(tokens.size()),
-                      layer, sequence, *device_sequence);
+            result = forward_layer_page(
+                streams, static_cast<std::uint32_t>(tokens.size()), layer,
+                sequence);
             if (!result.ok()) return result;
             if (config.phase_profile) {
                 graph_layer_nanoseconds.fetch_add(
@@ -5656,30 +5528,6 @@ struct Glm53Runtime::Impl {
             request->base_hidden);
         request->result.metrics.reused_prompt_tokens = reused;
         request->prefill_cursor = reused;
-        if (device_prefill_enabled()) {
-            if (!resident_execution_active) {
-                request->result.errors.emplace_back(
-                    "GLM-5.3 device prefill requires the resident exact path");
-                complete_request(request);
-                return false;
-            }
-            auto prepared = prepare_device_sequence(
-                request->sequence, request->device_sequence);
-            if (!prepared.ok()) {
-                request->result.errors = std::move(prepared.errors);
-                complete_request(request);
-                return false;
-            }
-            for (const auto device : devices) {
-                prepared = cuda.dsv4_mhc_reserve_slots(
-                    device, config.prefill_page_tokens);
-                if (!prepared.ok()) {
-                    request->result.errors = std::move(prepared.errors);
-                    complete_request(request);
-                    return false;
-                }
-            }
-        }
         request->prefill_started = now_seconds();
         request->profile_started = profile_snapshot();
         request->prepared = true;
@@ -5783,39 +5631,6 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
-    [[nodiscard]] ValidationResult synchronize_kda_sequence_from_device(
-        Glm53SequenceState& sequence,
-        const DeviceSequenceState& device_sequence) {
-        if (!device_sequence.ready) {
-            return {{"GLM-5.3 device prefill state is not ready"}};
-        }
-        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
-            if (!glm53_kda_layer(layer)) continue;
-            auto recurrent = sequence.recurrent(layer);
-            std::array<std::span<float>, 3U> convolution{
-                sequence.convolution(layer, 0U),
-                sequence.convolution(layer, 1U),
-                sequence.convolution(layer, 2U)};
-            const auto convolution_elements =
-                convolution[0].size() + convolution[1].size() +
-                convolution[2].size();
-            std::vector<float> packed(
-                recurrent.size() + convolution_elements);
-            auto downloaded = cuda.download_buffer(
-                device_sequence.kda[layer], 0U,
-                std::as_writable_bytes(std::span<float>(packed)));
-            if (!downloaded.ok()) return downloaded;
-            auto source = packed.begin();
-            std::copy_n(source, recurrent.size(), recurrent.begin());
-            source += static_cast<std::ptrdiff_t>(recurrent.size());
-            for (auto destination : convolution) {
-                std::copy_n(source, destination.size(), destination.begin());
-                source += static_cast<std::ptrdiff_t>(destination.size());
-            }
-        }
-        return {};
-    }
-
     [[nodiscard]] std::uint64_t kda_state_hash(
         const Glm53SequenceState& sequence) const noexcept {
         auto hash = kDiagnosticFnvOffset;
@@ -5840,15 +5655,6 @@ struct Glm53Runtime::Impl {
     }
 
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
-        if (device_prefill_enabled()) {
-            auto synchronized = synchronize_kda_sequence_from_device(
-                request->sequence, request->device_sequence);
-            if (!synchronized.ok()) {
-                request->result.errors = std::move(synchronized.errors);
-                complete_request(request);
-                return;
-            }
-        }
         request->result.metrics.prefill_tokens =
             request->prompt.size() -
             request->result.metrics.reused_prompt_tokens;
@@ -5878,8 +5684,7 @@ struct Glm53Runtime::Impl {
                      request->base_hidden);
         // The prompt cache remains host/COW F32. Decode state is admitted once
         // after that immutable snapshot, then never read back per token.
-        if (request->maximum_new_tokens > 1U && fused_kda_enabled() &&
-            !request->device_sequence.ready) {
+        if (request->maximum_new_tokens > 1U && fused_kda_enabled()) {
             auto prepared = prepare_device_sequence(
                 request->sequence, request->device_sequence);
             if (!prepared.ok()) {
@@ -5917,8 +5722,7 @@ struct Glm53Runtime::Impl {
         auto prefill = forward_prompt(
             std::span<const std::uint32_t>(request->prompt).subspan(
                 request->prefill_cursor, count),
-            request->logits, request->sequence, &request->base_hidden, false,
-            device_prefill_enabled() ? &request->device_sequence : nullptr);
+            request->logits, request->sequence, &request->base_hidden);
         if (!prefill.ok()) {
             request->result.errors = std::move(prefill.errors);
             complete_request(request);

@@ -142,12 +142,30 @@ std::span<float> Glm53SequenceState::recurrent(std::uint32_t layer) {
             kGlm53KdaHeadWidth);
 }
 
+std::span<const float> Glm53SequenceState::recurrent(
+    std::uint32_t layer) const noexcept {
+    if (layer >= kGlm53LayerCount || !glm53_kda_layer(layer) ||
+        recurrent_[layer] == nullptr) {
+        return {};
+    }
+    return *recurrent_[layer];
+}
+
 std::span<float> Glm53SequenceState::convolution(
     std::uint32_t layer, std::uint32_t projection) {
     if (layer >= kGlm53LayerCount || projection >= 3U ||
         !glm53_kda_layer(layer)) return {};
     return writable(convolution_[layer][projection],
                     static_cast<std::size_t>(kGlm53KdaWidth) * 3U);
+}
+
+std::span<const float> Glm53SequenceState::convolution(
+    std::uint32_t layer, std::uint32_t projection) const noexcept {
+    if (layer >= kGlm53LayerCount || projection >= 3U ||
+        !glm53_kda_layer(layer) || convolution_[layer][projection] == nullptr) {
+        return {};
+    }
+    return *convolution_[layer][projection];
 }
 
 Glm53PagedRows& Glm53SequenceState::mla(std::uint32_t layer) {

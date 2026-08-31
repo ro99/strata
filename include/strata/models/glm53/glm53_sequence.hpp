@@ -70,8 +70,12 @@ public:
         std::uint32_t maximum_context_tokens,
         std::uint32_t mla_page_rows = 64U);
     [[nodiscard]] std::span<float> recurrent(std::uint32_t layer);
+    [[nodiscard]] std::span<const float> recurrent(
+        std::uint32_t layer) const noexcept;
     [[nodiscard]] std::span<float> convolution(
         std::uint32_t layer, std::uint32_t projection);
+    [[nodiscard]] std::span<const float> convolution(
+        std::uint32_t layer, std::uint32_t projection) const noexcept;
     [[nodiscard]] Glm53PagedRows& mla(std::uint32_t layer);
     [[nodiscard]] const Glm53PagedRows& mla(std::uint32_t layer) const;
     void copy_mla_from(std::uint32_t layer,

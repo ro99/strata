@@ -109,6 +109,14 @@ TEST_CASE("GLM-5.3 recurrent state forks lazily and exactly") {
     auto recurrent = state.recurrent(0U);
     REQUIRE(!recurrent.empty());
     recurrent[17U] = 3.25F;
+    auto convolution = state.convolution(0U, 1U);
+    REQUIRE(!convolution.empty());
+    convolution[9U] = 1.75F;
+    const auto& immutable = state;
+    REQUIRE(immutable.recurrent(0U)[17U] == 3.25F);
+    REQUIRE(immutable.convolution(0U, 1U)[9U] == 1.75F);
+    REQUIRE(immutable.recurrent(3U).empty());
+    REQUIRE(immutable.convolution(0U, 3U).empty());
     auto fork = state;
     auto forked = fork.recurrent(0U);
     REQUIRE(forked[17U] == 3.25F);

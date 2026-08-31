@@ -642,11 +642,17 @@ struct CudaDsv4AttentionPrepareRequest {
     bool host_only{};
 };
 
+enum class CudaGlm53ExpertEncoding : std::uint8_t {
+    Fp8E4m3Block128F32,
+    Bf16,
+};
+
 // One GLM-5.3 expert held on a device in checkpoint-native form.
 //
-// Its three matrices hold the E4M3 codes and F32 block scales verbatim -- not
-// prepacked, not widened -- because the device dot has to associate its sum
-// exactly as the host AVX2 dot does.
+// Its three matrices hold either E4M3 codes plus F32 block scales, or BF16
+// values with null scale pointers, verbatim -- not prepacked, not widened --
+// because the device dot has to associate its sum exactly as the matching host
+// AVX2 dot does.
 //
 // The shared expert is the ninth of the nine experts every MoE layer runs and
 // the only one the router does not select, so it can always be computed while
@@ -661,6 +667,8 @@ struct CudaGlm53Expert {
     const CudaBuffer* down_scales{};
     std::uint32_t hidden{};
     std::uint32_t intermediate{};
+    CudaGlm53ExpertEncoding encoding{
+        CudaGlm53ExpertEncoding::Fp8E4m3Block128F32};
 };
 
 class CudaBuffer {
@@ -1148,12 +1156,12 @@ public:
     // call with more of them.
     [[nodiscard]] ValidationResult enqueue_glm53_expert_gate_up(
         int device, std::span<const CudaGlm53Expert> experts,
-        std::span<const float> quantized_input);
+        std::span<const float> input);
     [[nodiscard]] ValidationResult collect_glm53_expert_gate_up(
         int device, std::span<float> gate, std::span<float> up);
     [[nodiscard]] ValidationResult enqueue_glm53_expert_down(
         int device, std::span<const CudaGlm53Expert> experts,
-        std::span<const float> quantized_activations);
+        std::span<const float> activations);
     [[nodiscard]] ValidationResult collect_glm53_expert_down(
         int device, std::span<float> output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(

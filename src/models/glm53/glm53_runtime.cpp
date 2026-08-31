@@ -901,9 +901,9 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // +/-0.20%, and all sixteen outputs hash `fe74dc4ec7ab`. `0` opts out.
 //
 // -1 is the default admission and 1 an explicit request; they differ only in
-// how a checkpoint that cannot host the tier is treated. The kernel decodes
-// E4M3 against F32 block scales, so an MXFP4 checkpoint declines silently at
-// -1 and reports an error at 1.
+// how a checkpoint that cannot fit the whole tier is treated. The descriptor
+// selects the checkpoint-native FP8 or BF16 dot, so both published releases
+// use the same overlap without changing their stored representation.
 [[nodiscard]] int shared_expert_device_override() noexcept {
     const char* value = std::getenv("STRATA_GLM53_SHARED_EXPERT_DEVICE");
     if (value == nullptr || std::string_view(value) == "auto") return -1;
@@ -2157,14 +2157,14 @@ struct Glm53Runtime::Impl {
     //
     // Every MoE layer runs nine experts and the router chooses only eight of
     // them: the ninth, the shared expert, is known before routing and never
-    // competes for the routed cache. It is also exactly one ninth of host
-    // expert service, which M0 attributed at 67.7% of a decode step, while the
-    // GPUs sit idle for 94% of that step. Moving it across costs 25.17 MB of
-    // VRAM per layer -- 1.06 GB for the tier -- and the device dot associates
-    // its sum exactly as the host AVX2 dot does, so the output is unchanged.
+    // competes for the routed cache. Moving it across costs 25.17 MB per FP8
+    // layer or 50.33 MB per BF16 layer -- 1.06 or 2.11 GB for the complete
+    // tier -- and the device dot associates its sum exactly as the matching
+    // host AVX2 dot does, so the output is unchanged.
     struct SharedExpertTier {
-        // Six buffers per admitted expert, in checkpoint-native FP8 with F32
-        // block scales. They own the device memory the descriptors point into.
+        // Six slots per admitted expert. FP8 uses weight/scale pairs; BF16
+        // uses the three weight slots and leaves each scale slot invalid. They
+        // own the device memory the descriptors point into.
         std::vector<CudaBuffer> storage;
         std::array<CudaGlm53Expert, kLayers + 1U> experts{};
         // The device holding each layer's tier, or -1 where it was not
@@ -2690,26 +2690,20 @@ struct Glm53Runtime::Impl {
         shared_experts.bytes_by_slot.assign(devices.size(), 0U);
         const auto override = shared_expert_device_override();
         if (override == 0 || !host_moe_active || devices.empty()) return {};
-        // `enqueue_glm53_expert_*` decodes E4M3 rows against F32 block scales.
-        // The MXFP4 release's shared expert is BF16, so the tier has nothing
-        // to upload there; an explicit opt-in says so rather than silently
-        // running the host path it asked to replace.
-        if (!fp8_expert_checkpoint()) {
-            if (override > 0) {
-                return {{"GLM-5.3 shared expert device tier requires the FP8 "
-                         "checkpoint; this release stores it BF16"}};
-            }
-            return {};
-        }
-
         constexpr std::uint32_t intermediate = 2048U;
-        // gate and up are intermediate x hidden, down is hidden x
-        // intermediate, and each carries one F32 scale per 128x128 tile.
+        const bool fp8 = fp8_expert_checkpoint();
+        const auto encoding = fp8
+            ? CudaGlm53ExpertEncoding::Fp8E4m3Block128F32
+            : CudaGlm53ExpertEncoding::Bf16;
+        // Gate and up are intermediate x hidden and down is hidden x
+        // intermediate. FP8 carries one F32 scale per 128x128 tile; BF16 is
+        // two checkpoint-native bytes per value and has no scale payload.
         const std::uint64_t projection_bytes =
-            static_cast<std::uint64_t>(intermediate) * kHidden;
-        const std::uint64_t scale_bytes =
+            static_cast<std::uint64_t>(intermediate) * kHidden *
+            (fp8 ? 1U : 2U);
+        const std::uint64_t scale_bytes = fp8 ?
             static_cast<std::uint64_t>(intermediate / 128U) *
-            (kHidden / 128U) * sizeof(float);
+                (kHidden / 128U) * sizeof(float) : 0U;
         const std::uint64_t layer_bytes = 3U * projection_bytes +
                                           3U * scale_bytes;
         std::vector<std::uint64_t> required(devices.size(), 0U);
@@ -2772,12 +2766,20 @@ struct Glm53Runtime::Impl {
                 auto weight_upload = cuda.upload_buffer(
                     device, linear.value.weights, weight_buffer);
                 if (!weight_upload.ok()) return weight_upload;
-                auto scale_upload = cuda.upload_buffer(
-                    device,
-                    std::as_bytes(linear.value.scales), scale_buffer);
-                if (!scale_upload.ok()) return scale_upload;
+                if (linear.value.encoding != (fp8
+                        ? Glm53ExpertEncoding::Fp8E4m3Block128F32
+                        : Glm53ExpertEncoding::Bf16)) {
+                    return {{"GLM-5.3 shared expert tier mixes checkpoint "
+                             "encodings"}};
+                }
                 uploaded[index * 2U] = &weight_buffer;
-                uploaded[index * 2U + 1U] = &scale_buffer;
+                if (fp8) {
+                    auto scale_upload = cuda.upload_buffer(
+                        device, std::as_bytes(linear.value.scales),
+                        scale_buffer);
+                    if (!scale_upload.ok()) return scale_upload;
+                    uploaded[index * 2U + 1U] = &scale_buffer;
+                }
                 shared_experts.bytes += linear.value.weights.size_bytes() +
                                         linear.value.scales.size_bytes();
                 shared_experts.bytes_by_slot[slot] +=
@@ -2787,7 +2789,7 @@ struct Glm53Runtime::Impl {
             shared_experts.experts[layer] = {
                 uploaded[0], uploaded[1], uploaded[2],
                 uploaded[3], uploaded[4], uploaded[5],
-                kHidden, intermediate};
+                kHidden, intermediate, encoding};
             shared_experts.devices[layer] = device;
         }
         shared_experts.active = true;
@@ -2943,8 +2945,10 @@ struct Glm53Runtime::Impl {
                 shared_expert_gate[row] =
                     bf16_round_f32(gate * sigmoid(gate) * up);
             }
-            glm53_quantize_activation(
-                std::span<float>(shared_expert_gate).first(intermediate));
+            if (fp8_expert_checkpoint()) {
+                glm53_quantize_activation(
+                    std::span<float>(shared_expert_gate).first(intermediate));
+            }
             result = cuda.enqueue_glm53_expert_down(
                 shared_device,
                 std::span<const CudaGlm53Expert>(
@@ -6282,6 +6286,11 @@ ValidationResult Glm53Runtime::initialize(
         impl_->host_moe_expert_outputs.resize(9U * kHidden);
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
+        if (impl_->shared_experts.active) {
+            impl_->shared_expert_gate.resize(2048U);
+            impl_->shared_expert_up.resize(2048U);
+            impl_->shared_expert_output.resize(kHidden);
+        }
     }
     // Allocate the arena only after every independently allocated resident
     // tier has reduced its capacity. This makes the physical allocation match

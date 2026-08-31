@@ -90,6 +90,8 @@ struct CudaBackend::Impl {
         float* glm53_shared_output{};
         std::uint32_t glm53_shared_hidden{};
         std::uint32_t glm53_shared_intermediate{};
+        CudaGlm53ExpertEncoding glm53_shared_encoding{
+            CudaGlm53ExpertEncoding::Fp8E4m3Block128F32};
         // Pinned host staging: a pageable cudaMemcpyAsync is not asynchronous,
         // and the whole point of this path is that the enqueue returns before
         // the host starts its eight routed experts.

@@ -3140,4 +3140,68 @@ __global__ void glm53_shared_expert_dot_kernel(
                             __fadd_rn(total[2], total[3]));
 }
 
+// The BF16 form uses the same eight-thread mapping and the exact same
+// association as `glm53_host_bf16_dot_avx2`: each thread owns one of the eight
+// AVX2 accumulators and its eight lanes, then the shuffle tree reproduces the
+// host vector additions and horizontal reduction. Only the checkpoint-native
+// weight decode differs from the FP8 kernel above. The raw dot comes back to
+// the host; rounding and SwiGLU deliberately do not move to CUDA.
+__global__ void glm53_shared_expert_bf16_dot_kernel(
+    float* output, const unsigned short* weights, const float* input,
+    std::uint32_t rows, std::uint32_t columns) {
+    constexpr std::uint32_t kGroups = 8U;
+    const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = thread / kGroups;
+    const std::uint32_t group = thread % kGroups;
+    if (row >= rows) return;
+    const unsigned short* weight = weights +
+        static_cast<std::uint64_t>(row) * columns + group * 8U;
+    const float* activation = input + group * 8U;
+    float accumulator[8];
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
+    for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
+        const ushort4 encoded_low =
+            *reinterpret_cast<const ushort4*>(weight + column);
+        const ushort4 encoded_high =
+            *reinterpret_cast<const ushort4*>(weight + column + 4U);
+        const float4 input_low =
+            *reinterpret_cast<const float4*>(activation + column);
+        const float4 input_high =
+            *reinterpret_cast<const float4*>(activation + column + 4U);
+        const unsigned short encoded[8] = {
+            encoded_low.x, encoded_low.y, encoded_low.z, encoded_low.w,
+            encoded_high.x, encoded_high.y, encoded_high.z, encoded_high.w};
+        const float values[8] = {
+            input_low.x, input_low.y, input_low.z, input_low.w,
+            input_high.x, input_high.y, input_high.z, input_high.w};
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            accumulator[lane] = __fmaf_rn(
+                __uint_as_float(static_cast<unsigned int>(encoded[lane]) << 16U),
+                values[lane], accumulator[lane]);
+        }
+    }
+    const unsigned mask = __activemask();
+#pragma unroll
+    for (int width = 4; width != 0; width >>= 1) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            const float other =
+                __shfl_down_sync(mask, accumulator[lane], width, kGroups);
+            if (static_cast<int>(group) < width) {
+                accumulator[lane] = __fadd_rn(accumulator[lane], other);
+            }
+        }
+    }
+    if (group != 0U) return;
+    float total[4];
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        total[lane] = __fadd_rn(accumulator[lane], accumulator[lane + 4]);
+    }
+    output[row] = __fadd_rn(__fadd_rn(total[0], total[1]),
+                            __fadd_rn(total[2], total[3]));
+}
+
 }  // namespace

@@ -816,6 +816,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
+[[nodiscard]] bool device_page_mla_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_DEVICE_PAGE_MLA");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool resident_mla_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_RESIDENT_MLA");
@@ -4827,6 +4838,9 @@ struct Glm53Runtime::Impl {
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
         const auto attention = prefix + "self_attn.";
+        const bool device_mla = !glm53_kda_layer(layer) &&
+            device_page_mla_enabled() &&
+            weights->mla_kv_b_is_bf16(attention);
         std::vector<float> normalized(
             static_cast<std::size_t>(rows) * kHidden);
         std::vector<float> branch(normalized.size());
@@ -4840,7 +4854,7 @@ struct Glm53Runtime::Impl {
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns));
             if (!result.ok()) return result;
-            if (!glm53_kda_layer(layer)) {
+            if (!glm53_kda_layer(layer) && !device_mla) {
                 result = cuda.dsv4_mhc_download_layer_input(
                     device, std::span<float>(normalized).subspan(
                                 static_cast<std::size_t>(row) * kHidden,
@@ -4859,6 +4873,57 @@ struct Glm53Runtime::Impl {
             request.page_rows = rows;
             result = weights->kda_decode(
                 slot_for(layer), attention, request, {});
+        } else if (device_mla) {
+            // Causal prompt rows share one MLA state, so advance it in token
+            // order. Each selected mHC slot retains that row's device input;
+            // the accepted resident primitive performs all linear algebra on
+            // the device and returns only raw scores for the exact GLIBC
+            // softmax. This removes the page-wide hidden-state download and
+            // branch upload while preserving every per-token association.
+            const auto position_base = sequence.token_count();
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = cuda.dsv4_mhc_select_slot(device, row);
+                if (!result.ok()) break;
+                CudaGlm53MlaRequest request;
+                request.state = &device_sequence.mla[layer];
+                request.position = position_base + row;
+                request.maximum_context = config.maximum_context_tokens;
+                request.heads = kHeads;
+                request.head_dim = kMlaHead;
+                request.query_rank = kQueryRank;
+                request.key_value_rank = kKvRank;
+                const auto history = request.position + 1U;
+                auto scores = std::span<float>(mla_softmax_scores).first(
+                    static_cast<std::size_t>(kHeads) * history);
+                result = weights->mla_decode_mhc(
+                    slot_for(layer), attention, request, scores,
+                    [](std::span<float> values, std::uint32_t heads,
+                       std::uint32_t tokens) {
+                        for (std::uint32_t head = 0U; head < heads; ++head) {
+                            auto* scores_row = values.data() +
+                                static_cast<std::size_t>(head) * tokens;
+                            float highest =
+                                -std::numeric_limits<float>::infinity();
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                highest = std::max(highest, scores_row[token]);
+                            }
+                            float total = 0.0F;
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                scores_row[token] =
+                                    std::exp(scores_row[token] - highest);
+                                total += scores_row[token];
+                            }
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                scores_row[token] = bf16_round_f32(
+                                    scores_row[token] / total);
+                            }
+                        }
+                    });
+                if (!result.ok()) break;
+            }
         } else {
             result = attention_mla_page(
                 branch, normalized, rows, layer, attention, sequence);
@@ -5758,7 +5823,9 @@ struct Glm53Runtime::Impl {
 
         const auto history = static_cast<std::uint32_t>(
             latent.size() / kKvRank);
-        const bool persistent_bf16 = history != 0U &&
+        // An empty prompt still needs the admitted BF16 expansion extent:
+        // device page MLA appends its first latent after this preparation.
+        const bool persistent_bf16 =
             weights->mla_kv_b_is_bf16(attention);
         const auto packed_bytes =
             std::as_bytes(std::span<const float>(packed));
@@ -5890,6 +5957,34 @@ struct Glm53Runtime::Impl {
         return {};
     }
 
+    [[nodiscard]] ValidationResult synchronize_mla_layer_from_device(
+        Glm53SequenceState& sequence,
+        const DeviceSequenceState& device_sequence, std::uint32_t layer) {
+        if (!device_sequence.ready) {
+            return {{"GLM-5.3 device prefill state is not ready"}};
+        }
+        if (layer >= kLayers || glm53_kda_layer(layer)) {
+            return {{"GLM-5.3 device MLA synchronization layer is invalid"}};
+        }
+        const auto required_rows = sequence.token_count();
+        auto& cache = sequence.mla(layer);
+        const auto existing_rows = cache.rows();
+        if (existing_rows > required_rows) {
+            return {{"GLM-5.3 host MLA state is ahead of device prefill"}};
+        }
+        const auto missing_rows = required_rows - existing_rows;
+        if (missing_rows == 0U) return {};
+        std::vector<float> latent(
+            static_cast<std::size_t>(missing_rows) * kKvRank);
+        const auto offset = static_cast<std::uint64_t>(existing_rows) *
+                            kKvRank * sizeof(float);
+        auto downloaded = cuda.download_buffer(
+            device_sequence.mla[layer], offset,
+            std::as_writable_bytes(std::span<float>(latent)));
+        if (!downloaded.ok()) return downloaded;
+        return cache.append_rows(latent, missing_rows);
+    }
+
     [[nodiscard]] std::uint64_t kda_state_hash(
         const Glm53SequenceState& sequence) const noexcept {
         auto hash = kDiagnosticFnvOffset;
@@ -5942,6 +6037,19 @@ struct Glm53Runtime::Impl {
         }
     }
 
+    void print_mla_layer_hashes(const Glm53SequenceState& sequence) const {
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            if (glm53_kda_layer(layer)) continue;
+            auto hash = kDiagnosticFnvOffset;
+            for (const auto value : sequence.mla(layer).materialize()) {
+                hash = diagnostic_hash_u32(
+                    hash, std::bit_cast<std::uint32_t>(value));
+            }
+            std::cerr << "[glm53-prefill-mla-layer] layer=" << layer
+                      << " latent=" << std::hex << hash << std::dec << '\n';
+        }
+    }
+
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
         if (device_prefill_enabled()) {
             auto synchronized = synchronize_kda_sequence_from_device(
@@ -5951,15 +6059,25 @@ struct Glm53Runtime::Impl {
                 complete_request(request);
                 return;
             }
-            // Page prefill owns MLA on the host, so the empty device buffers
-            // created before the first page do not contain its latent rows.
-            // Re-admit those exact rows now and build the BF16 expansion cache
-            // before decode timing begins.
             for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
                 if (glm53_kda_layer(layer)) continue;
-                synchronized = prepare_device_mla_layer(
-                    layer, request->sequence,
-                    request->device_sequence.mla[layer]);
+                const auto attention =
+                    "model.language_model.layers." +
+                    std::to_string(layer) + ".self_attn.";
+                if (device_page_mla_enabled() &&
+                    weights->mla_kv_b_is_bf16(attention)) {
+                    // Device page MLA owns the exact latent and expanded
+                    // histories. Preserve the small latent state in the host
+                    // prefix snapshot without replacing the live buffer.
+                    synchronized = synchronize_mla_layer_from_device(
+                        request->sequence, request->device_sequence, layer);
+                } else {
+                    // Control and FP8: page MLA ran on the host, so admit its
+                    // completed latent history for resident decode now.
+                    synchronized = prepare_device_mla_layer(
+                        layer, request->sequence,
+                        request->device_sequence.mla[layer]);
+                }
                 if (!synchronized.ok()) {
                     request->result.errors = std::move(synchronized.errors);
                     complete_request(request);
@@ -5980,6 +6098,7 @@ struct Glm53Runtime::Impl {
                       << std::hex << kda_state_hash(request->sequence)
                       << std::dec << '\n';
             print_kda_layer_hashes(request->sequence);
+            print_mla_layer_hashes(request->sequence);
         }
         const auto decode_prepare_started = std::chrono::steady_clock::now();
         if (mtp_enabled() && request->sampling.temperature == 0.0 &&
@@ -6466,6 +6585,12 @@ ValidationResult Glm53Runtime::initialize(
             maximum_matmul_output_bytes);
         if (!result.ok()) return result;
     }
+    // Both decode and causal device-page MLA return one raw score per
+    // (head, visible-token) to the exact host softmax. Admit its maximum span
+    // before either timed phase so a longer page never grows it in flight.
+    impl_->mla_softmax_scores.resize(
+        static_cast<std::size_t>(kHeads) *
+        impl_->config.maximum_context_tokens);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->device_budgets = device_plan.value.budgets;

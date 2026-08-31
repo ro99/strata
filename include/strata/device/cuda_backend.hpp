@@ -1182,6 +1182,12 @@ public:
         std::uint32_t maximum_query_columns,
         std::uint32_t maximum_kv_columns,
         std::uint32_t maximum_intermediate_columns);
+    // Reserves the model-neutral activation input/output and bounded pinned
+    // staging used by matmul before a timed page first reaches its widest
+    // admitted shape. The caller owns the shape and capacity accounting.
+    [[nodiscard]] ValidationResult reserve_matmul_workspace(
+        int device, std::uint64_t maximum_input_bytes,
+        std::uint64_t maximum_output_bytes);
     // Text-page prefill at any cache position. The complete layer chain stays
     // device-resident; all MXFP4 weights must carry the single Marlin layout.
     [[nodiscard]] ValidationResult gemma4_prefill_layers(

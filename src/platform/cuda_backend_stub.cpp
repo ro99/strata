@@ -166,6 +166,11 @@ ValidationResult CudaBackend::allocate_buffer(int, std::uint64_t, CudaBuffer&) {
     return cuda_unavailable();
 }
 
+ValidationResult CudaBackend::reserve_matmul_workspace(
+    int, std::uint64_t, std::uint64_t) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::glm53_kda_decode(
     const CudaGlm53KdaRequest&, std::span<float>) {
     return cuda_unavailable();

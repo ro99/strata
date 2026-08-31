@@ -2202,9 +2202,27 @@ struct Glm53Runtime::Impl {
     std::vector<float> shared_expert_gate;
     std::vector<float> shared_expert_up;
     std::vector<float> shared_expert_output;
-    // Paged-primitive scratch, same ownership reasoning. `page_groups` keeps
-    // its per-group assignment vectors alive between calls so their capacity is
-    // reused; only `clear()` is called on them, never destruction.
+    struct Glm53ExpertViews {
+        Glm53HostExpertLinear gate;
+        Glm53HostExpertLinear up;
+        Glm53HostExpertLinear down;
+    };
+    // Paged-primitive scratch. Group metadata and the flat assignment table
+    // retain their capacity between layers, so expert-major dispatch performs
+    // no allocation after admission.
+    struct PageAssignment {
+        std::size_t input_row{};
+        std::size_t output_slot{};
+    };
+    struct PageGroup {
+        std::uint32_t expert{};
+        bool shared{};
+        Glm53ExpertViews module;
+        std::size_t assignment_begin{};
+        std::size_t assignment_count{};
+    };
+    std::vector<PageGroup> page_groups;
+    std::vector<PageAssignment> page_assignments;
     std::vector<float> page_quantized_input;
     std::vector<float> page_activations;
     std::vector<float> page_expert_outputs;
@@ -2221,11 +2239,6 @@ struct Glm53Runtime::Impl {
     // Guarded rather than lock-free: the MoE call site is the scheduler thread
     // today, but nothing in the type system says so, and the lock is taken once
     // per call around the whole group rather than once per expert.
-    struct Glm53ExpertViews {
-        Glm53HostExpertLinear gate;
-        Glm53HostExpertLinear up;
-        Glm53HostExpertLinear down;
-    };
     static constexpr std::uint32_t kExpertSlots = 289U;  // 288 routed + shared
     mutable std::mutex expert_view_mutex;
     mutable std::vector<Glm53ExpertViews> expert_view_cache;
@@ -3050,26 +3063,10 @@ struct Glm53Runtime::Impl {
         }
         const auto started = std::chrono::steady_clock::now();
         const auto view_started = started;
-        struct Expert {
-            Glm53HostExpertLinear gate;
-            Glm53HostExpertLinear up;
-            Glm53HostExpertLinear down;
-        };
-        struct Assignment {
-            std::size_t input_row{};
-            std::size_t output_slot{};
-        };
-        struct Group {
-            std::uint32_t expert{};
-            bool shared{};
-            Expert module;
-            std::vector<Assignment> assignments;
-        };
-
         std::array<std::size_t, 288U> group_for_expert;
         group_for_expert.fill(std::numeric_limits<std::size_t>::max());
-        std::vector<Group> groups;
-        groups.reserve(std::min<std::size_t>(288U, rows * routes_per_row) + 1U);
+        auto& groups = page_groups;
+        groups.clear();
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto expert = routes[row][route].expert;
@@ -3079,19 +3076,34 @@ struct Glm53Runtime::Impl {
                 auto& group_index = group_for_expert[expert];
                 if (group_index == std::numeric_limits<std::size_t>::max()) {
                     group_index = groups.size();
-                    groups.push_back({expert, false, {}, {}});
+                    groups.push_back({expert, false, {}, 0U, 0U});
                 }
-                groups[group_index].assignments.push_back(
-                    {row, row * outputs_per_row + route});
+                ++groups[group_index].assignment_count;
             }
         }
-        std::uint64_t allocations = 0U;
-        groups.push_back({0U, true, {}, {}});
-        auto& shared = groups.back();
-        shared.assignments.reserve(rows);
+        groups.push_back({0U, true, {}, 0U, rows});
+        std::size_t assignment_begin = 0U;
+        for (auto& group : groups) {
+            group.assignment_begin = assignment_begin;
+            assignment_begin += group.assignment_count;
+        }
+        if (assignment_begin != rows * outputs_per_row ||
+            page_assignments.size() < assignment_begin) {
+            return {{"GLM-5.3 host page assignment scratch is too small"}};
+        }
+        std::array<std::size_t, 289U> cursors{};
+        for (std::size_t group = 0U; group < groups.size(); ++group) {
+            cursors[group] = groups[group].assignment_begin;
+        }
         for (std::size_t row = 0U; row < rows; ++row) {
-            shared.assignments.push_back(
-                {row, row * outputs_per_row + routes_per_row});
+            for (std::size_t route = 0U; route < routes_per_row; ++route) {
+                const auto group = group_for_expert[routes[row][route].expert];
+                page_assignments[cursors[group]++] = {
+                    row, row * outputs_per_row + route};
+            }
+            const auto shared_group = groups.size() - 1U;
+            page_assignments[cursors[shared_group]++] = {
+                row, row * outputs_per_row + routes_per_row};
         }
 
         for (auto& group : groups) {
@@ -3121,14 +3133,14 @@ struct Glm53Runtime::Impl {
                 down_bytes, std::memory_order_relaxed);
             host_moe_view_nanoseconds.fetch_add(
                 elapsed_nanoseconds(view_started), std::memory_order_relaxed);
-            host_moe_temporary_allocation_calls.fetch_add(
-                allocations, std::memory_order_relaxed);
         }
 
         const auto input_quantization_started =
             std::chrono::steady_clock::now();
         auto& quantized_input = page_quantized_input;
-        if (glm53_grow(quantized_input, input.size())) ++allocations;
+        if (quantized_input.size() < input.size()) {
+            return {{"GLM-5.3 host page input scratch is too small"}};
+        }
         std::copy(input.begin(), input.end(), quantized_input.begin());
         if (fp8_expert_checkpoint()) {
             result = host_moe_workers->parallel_for(
@@ -3147,7 +3159,9 @@ struct Glm53Runtime::Impl {
 
         const auto output_slots = rows * outputs_per_row;
         auto& activations = page_activations;
-        if (glm53_grow(activations, output_slots * intermediate)) ++allocations;
+        if (activations.size() < output_slots * intermediate) {
+            return {{"GLM-5.3 host page activation scratch is too small"}};
+        }
         const auto gate_up_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for_blocked(
             groups.size() * intermediate, expert_dispatch_block(),
@@ -3159,7 +3173,11 @@ struct Glm53Runtime::Impl {
                     glm53_host_expert_row(group.module.gate, projection_row);
                 const auto up_row =
                     glm53_host_expert_row(group.module.up, projection_row);
-                for (const auto& assignment : group.assignments) {
+                const auto assignments = std::span<const PageAssignment>(
+                    page_assignments)
+                    .subspan(group.assignment_begin,
+                             group.assignment_count);
+                for (const auto& assignment : assignments) {
                     const auto source = std::span<const float>(quantized_input)
                         .subspan(assignment.input_row * kHidden, kHidden);
                     auto gate = bf16_round_f32(
@@ -3196,7 +3214,9 @@ struct Glm53Runtime::Impl {
         }
 
         auto& expert_outputs = page_expert_outputs;
-        if (glm53_grow(expert_outputs, output_slots * kHidden)) ++allocations;
+        if (expert_outputs.size() < output_slots * kHidden) {
+            return {{"GLM-5.3 host page output scratch is too small"}};
+        }
         const auto down_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for_blocked(
             groups.size() * kHidden, expert_dispatch_block(),
@@ -3206,7 +3226,11 @@ struct Glm53Runtime::Impl {
                 const auto& group = groups[group_index];
                 const auto projection_view = glm53_host_expert_row(
                     group.module.down, projection_row);
-                for (const auto& assignment : group.assignments) {
+                const auto assignments = std::span<const PageAssignment>(
+                    page_assignments)
+                    .subspan(group.assignment_begin,
+                             group.assignment_count);
+                for (const auto& assignment : assignments) {
                     expert_outputs[assignment.output_slot * kHidden +
                                    projection_row] = bf16_round_f32(
                         glm53_host_expert_dot(
@@ -6110,6 +6134,23 @@ ValidationResult Glm53Runtime::initialize(
     result = impl_->cuda.initialize(impl_->devices,
                                     impl_->config.phase_profile);
     if (!result.ok()) return result;
+    const auto admitted_page_rows = static_cast<std::uint64_t>(
+        impl_->config.prefill_page_tokens);
+    const auto context_rows = static_cast<std::uint64_t>(
+        impl_->config.maximum_context_tokens);
+    const auto maximum_matmul_input_bytes = sizeof(float) * std::max(
+        admitted_page_rows * std::uint64_t{12288},
+        context_rows * static_cast<std::uint64_t>(kKvRank));
+    const auto maximum_matmul_output_bytes = sizeof(float) * std::max(
+        admitted_page_rows * std::uint64_t{12288},
+        context_rows * static_cast<std::uint64_t>(kHeads) * 2U *
+            static_cast<std::uint64_t>(kMlaHead));
+    for (const auto device : impl_->devices) {
+        result = impl_->cuda.reserve_matmul_workspace(
+            device, maximum_matmul_input_bytes,
+            maximum_matmul_output_bytes);
+        if (!result.ok()) return result;
+    }
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->device_budgets = device_plan.value.budgets;
@@ -6225,6 +6266,16 @@ ValidationResult Glm53Runtime::initialize(
         impl_->host_moe_quantized_input.resize(kHidden);
         impl_->host_moe_activations.resize(9U * 2048U);
         impl_->host_moe_expert_outputs.resize(9U * kHidden);
+        const auto page_rows = static_cast<std::size_t>(
+            impl_->config.prefill_page_tokens);
+        constexpr std::size_t outputs_per_page_row = 9U;
+        impl_->page_groups.reserve(Impl::kExpertSlots);
+        impl_->page_assignments.resize(page_rows * outputs_per_page_row);
+        impl_->page_quantized_input.resize(page_rows * kHidden);
+        impl_->page_activations.resize(
+            page_rows * outputs_per_page_row * 2048U);
+        impl_->page_expert_outputs.resize(
+            page_rows * outputs_per_page_row * kHidden);
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
         if (impl_->shared_experts.active) {

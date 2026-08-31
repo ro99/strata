@@ -1147,6 +1147,31 @@ TEST_CASE("native CUDA backend reuses a strict bounded weight arena when availab
     REQUIRE(stats.weight_upload_bytes == 704U);
 }
 
+TEST_CASE("native CUDA backend reserves bounded matmul workspace when available") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto before = backend.stats();
+    REQUIRE(backend.reserve_matmul_workspace(device, 4096U, 8192U).ok());
+    const auto reserved = backend.stats();
+    REQUIRE(reserved.workspace_allocation_calls -
+                before.workspace_allocation_calls == 4U);
+    REQUIRE(reserved.workspace_allocation_bytes -
+                before.workspace_allocation_bytes == 24'576U);
+
+    REQUIRE(backend.reserve_matmul_workspace(device, 2048U, 4096U).ok());
+    const auto repeated = backend.stats();
+    REQUIRE(repeated.workspace_allocation_calls ==
+            reserved.workspace_allocation_calls);
+    REQUIRE(repeated.workspace_allocation_bytes ==
+            reserved.workspace_allocation_bytes);
+}
+
 TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when available") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

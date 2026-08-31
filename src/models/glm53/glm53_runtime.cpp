@@ -8,7 +8,6 @@
 #include "strata/models/common/tokenizer.hpp"
 #include "strata/models/deepseek/deepseek_ops.hpp"
 #include "strata/models/glm53/glm53_checkpoint.hpp"
-#include "strata/models/glm53/glm53_expert_arena.hpp"
 #include "strata/models/kimi_k3/kimi_k3_ops.hpp"
 #include "strata/platform/hardware_profile.hpp"
 #include "strata/platform/numerics.hpp"
@@ -868,19 +867,6 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // 0/1 are explicit campaign overrides.
 [[nodiscard]] int host_moe_override() noexcept {
     const char* value = std::getenv("STRATA_GLM53_HOST_MOE");
-    if (value == nullptr || std::string_view(value) == "auto") return -1;
-    return std::string_view(value) != "0" &&
-                   std::string_view(value) != "false" &&
-                   std::string_view(value) != "off"
-               ? 1 : 0;
-}
-
-// -1 admits the exact anonymous representation when the discovered host
-// memory and transparent-huge-page capabilities can hold it. This naturally
-// selects MXFP4 on the 256 GiB campaign host, declines the larger FP8 release,
-// and can admit either one on a larger box. 0/1 are protected A/B overrides.
-[[nodiscard]] int expert_arena_override() noexcept {
-    const char* value = std::getenv("STRATA_GLM53_EXPERT_ARENA");
     if (value == nullptr || std::string_view(value) == "auto") return -1;
     return std::string_view(value) != "0" &&
                    std::string_view(value) != "false" &&
@@ -2109,9 +2095,6 @@ struct Glm53Runtime::Impl {
 
     Glm53RuntimeConfig config;
     std::unique_ptr<Glm53CheckpointReader> checkpoint;
-    // Declared after the checkpoint so it is released first. Its extents are
-    // independent strings, but staging and diagnostics still use the reader.
-    std::unique_ptr<Glm53ExpertArena> expert_arena;
     ModelTokenizer tokenizer;
     CudaBackend cuda;
     std::vector<int> devices;
@@ -2210,8 +2193,9 @@ struct Glm53Runtime::Impl {
     // Process-lifetime cache of resolved expert weight spans, indexed by
     // (layer, expert slot) with slot 288 the shared expert.
     //
-    // A span resolves into the admitted anonymous arena when present, or into
-    // the canonical shard mapping otherwise. What caching removes is per-call
+    // `Glm53CheckpointReader::view` computes a span into the mapping and
+    // touches no pages -- `read` is the one that moves bytes -- so caching a
+    // view changes nothing about what is read. What it removes is per-call
     // work that M0 counted every step: three module-name strings built and
     // three manifest lookups per expert, 27 per MoE call and 5,376 calls per
     // 128 decode tokens.
@@ -2569,9 +2553,8 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
-    // Resolves one expert projection into its process-lifetime view, from
-    // whichever of the three storage formats the open checkpoint actually
-    // holds. The shapes are
+    // Resolves one expert projection into a mapped view, from whichever of the
+    // three storage formats the open checkpoint actually holds. The shapes are
     // the discriminator, not a configuration flag: an FP8 checkpoint can only
     // present E4M3 rows and an MXFP4 checkpoint only packed nibbles or BF16, so
     // a mismatch here is a corrupt or unsupported checkpoint rather than a
@@ -2646,28 +2629,14 @@ struct Glm53Runtime::Impl {
             invalid("expert dtype");
             return result;
         }
-        const auto payload = [&](std::string_view name)
-            -> ParseResult<std::span<const std::byte>> {
-            ParseResult<std::span<const std::byte>> resolved;
-            if (expert_arena != nullptr && expert_arena->complete()) {
-                resolved.value = expert_arena->find(name);
-                if (resolved.value.empty()) {
-                    resolved.errors.push_back(
-                        "GLM-5.3 expert tensor is absent from the admitted "
-                        "arena: " + std::string(name));
-                }
-                return resolved;
-            }
-            return checkpoint->view(name);
-        };
-        auto weight_payload = payload(weight_name);
+        auto weight_payload = checkpoint->view(weight_name);
         if (!weight_payload.ok()) {
             result.errors = std::move(weight_payload.errors);
             return result;
         }
         std::span<const std::byte> scale_payload;
         if (!scale_name.empty()) {
-            auto scales = payload(scale_name);
+            auto scales = checkpoint->view(scale_name);
             if (!scales.ok()) {
                 result.errors = std::move(scales.errors);
                 return result;
@@ -2677,14 +2646,14 @@ struct Glm53Runtime::Impl {
                 reinterpret_cast<std::uintptr_t>(scale_payload.data()) %
                         alignof(float) != 0U) {
                 result.errors.push_back(
-                    "GLM-5.3 host expert payload is mis-aligned");
+                    "GLM-5.3 host expert mapped payload is mis-aligned");
                 return result;
             }
         }
         if (weight_payload.value.size_bytes() != expected_weight_bytes ||
             scale_payload.size_bytes() != expected_scale_bytes) {
             result.errors.push_back(
-                "GLM-5.3 host expert payload is mis-sized");
+                "GLM-5.3 host expert mapped payload is mis-sized");
             return result;
         }
         result.value = {weight_payload.value, scale_payload, rows, columns,
@@ -6294,31 +6263,6 @@ ValidationResult Glm53Runtime::initialize(
         impl_->host_moe_quantized_input.resize(kHidden);
         impl_->host_moe_activations.resize(9U * 2048U);
         impl_->host_moe_expert_outputs.resize(9U * kHidden);
-        const auto arena_policy = expert_arena_override();
-        const bool arena_include_mtp = mtp_enabled();
-        const auto arena_bytes = Glm53ExpertArena::required_bytes(
-            impl_->checkpoint->manifest(), arena_include_mtp);
-        const auto arena_ceiling = hardware.host_usable_bytes();
-        const bool arena_capable = arena_bytes != 0U &&
-            arena_bytes <= arena_ceiling &&
-            hardware.transparent_huge_pages_enabled;
-        if (arena_policy > 0 || (arena_policy < 0 && arena_capable)) {
-            auto arena = std::make_unique<Glm53ExpertArena>();
-            auto staged = arena->stage(*impl_->checkpoint, arena_ceiling,
-                                       arena_include_mtp);
-            if (!staged.ok()) {
-                if (arena_policy > 0) return staged;
-                std::cerr << "[glm53-expert-arena] mode=declined reason=";
-                for (std::size_t index = 0U; index < staged.errors.size();
-                     ++index) {
-                    if (index != 0U) std::cerr << "; ";
-                    std::cerr << staged.errors[index];
-                }
-                std::cerr << '\n';
-            } else {
-                impl_->expert_arena = std::move(arena);
-            }
-        }
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
     }
@@ -6409,48 +6353,7 @@ ValidationResult Glm53Runtime::initialize(
                   << " shared_expert_gib="
                   << static_cast<double>(impl_->shared_experts.bytes) /
                          static_cast<double>(1ULL << 30U)
-                  << " host_storage="
-                  << (impl_->expert_arena == nullptr
-                          ? "mapped-4k" : "anonymous-huge")
-                  << " arena_gib="
-                  << (impl_->expert_arena == nullptr
-                          ? 0.0
-                          : static_cast<double>(
-                                impl_->expert_arena->stats().logical_bytes) /
-                                static_cast<double>(1ULL << 30U))
-                  << " arena_huge_gib="
-                  << (impl_->expert_arena == nullptr
-                          ? 0.0
-                          : static_cast<double>(impl_->expert_arena->stats()
-                                                    .anonymous_huge_bytes) /
-                                static_cast<double>(1ULL << 30U))
-                  << " arena_prefault="
-                  << (impl_->expert_arena != nullptr &&
-                              impl_->expert_arena->stats().hugepage_prefaulted
-                          ? "yes"
-                          : "no")
-                  << " arena_stage_s="
-                  << (impl_->expert_arena == nullptr
-                          ? 0.0 : impl_->expert_arena->stats().stage_seconds)
-                  << " arena_numa="
-                  << (impl_->expert_arena != nullptr &&
-                              impl_->expert_arena->stats().numa_balanced
-                          ? "striped" : "none")
                   << '\n';
-        if (impl_->expert_arena != nullptr) {
-            std::cerr << "[glm53-expert-arena] tensors="
-                      << impl_->expert_arena->stats().tensors
-                      << " shards=" << impl_->expert_arena->stats().shards
-                      << " numa_gib=";
-            for (std::size_t node = 0U;
-                 node < impl_->expert_arena->stats().numa_bytes.size(); ++node) {
-                if (node != 0U) std::cerr << ',';
-                std::cerr << static_cast<double>(
-                                 impl_->expert_arena->stats().numa_bytes[node]) /
-                                 static_cast<double>(1ULL << 30U);
-            }
-            std::cerr << '\n';
-        }
     }
     if (replay_ssm_enabled() || phase_scheduler_enabled()) {
         auto worker_cpus = compute_worker_cpus();

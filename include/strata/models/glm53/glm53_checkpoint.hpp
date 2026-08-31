@@ -42,14 +42,6 @@ public:
         std::string_view name, std::uint64_t maximum_bytes) const;
     [[nodiscard]] ParseResult<std::span<const std::byte>> view(
         std::string_view name) const;
-    [[nodiscard]] ValidationResult read_into(
-        std::string_view name, std::span<std::byte> destination) const;
-    // Drops clean source pages after an anonymous arena has consumed a shard.
-    // The mapping, if one already exists, remains valid and faults again on a
-    // later non-expert access; it does not keep the canonical file pages
-    // resident alongside the transformed arena.
-    [[nodiscard]] ValidationResult discard_shard_pages(
-        std::string_view shard) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32(
         std::string_view name, std::uint64_t maximum_elements) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32_row(

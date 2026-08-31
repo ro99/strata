@@ -3,8 +3,6 @@
 #include "strata/engine/model_executor.hpp"
 #include "strata/models/common/tokenizer.hpp"
 #include "strata/models/glm53/glm53_manifest.hpp"
-#include "strata/models/glm53/glm53_expert_arena.hpp"
-#include "strata/platform/hardware_profile.hpp"
 #include "strata/models/glm53/glm53_runtime.hpp"
 #include "strata/models/glm53/glm53_sequence.hpp"
 
@@ -188,53 +186,4 @@ TEST_CASE("GLM-5.3 classifier places MXFP4 scale tensors with their module") {
                 layer, expert) == strata::Glm53TensorRole::RoutedExpert);
     REQUIRE(layer == 20);
     REQUIRE(expert == 7);
-}
-
-TEST_CASE("GLM-5.3 expert arena capacity counts only exact host payloads") {
-    strata::Glm53IndexManifest manifest;
-    strata::Glm53ManifestTensor routed;
-    routed.name = "routed.weight";
-    routed.role = strata::Glm53TensorRole::RoutedExpert;
-    routed.component = strata::Glm53TensorComponent::Weight;
-    routed.source_bytes = 65U;
-    manifest.tensors.push_back(routed);
-
-    strata::Glm53ManifestTensor shared;
-    shared.name = "shared.weight_scale";
-    shared.role = strata::Glm53TensorRole::SharedExpert;
-    shared.component = strata::Glm53TensorComponent::Scale;
-    shared.source_bytes = 64U;
-    manifest.tensors.push_back(shared);
-
-    auto mtp = routed;
-    mtp.name = "model.language_model.layers.45.mlp.experts.0.gate_proj.weight";
-    mtp.role = strata::Glm53TensorRole::Mtp;
-    mtp.source_bytes = 64U;
-    manifest.tensors.push_back(mtp);
-
-    auto ignored = routed;
-    ignored.name = "routed.bias";
-    ignored.component = strata::Glm53TensorComponent::Bias;
-    ignored.source_bytes = 1ULL << 30U;
-    manifest.tensors.push_back(ignored);
-    ignored.name = "norm.weight";
-    ignored.role = strata::Glm53TensorRole::Norm;
-    ignored.component = strata::Glm53TensorComponent::Weight;
-    manifest.tensors.push_back(ignored);
-
-    const auto reported = strata::host_hardware_profile().huge_page_bytes;
-    const auto huge = reported == 0U ? 2ULL << 20U : reported;
-    // 65 rounds to two 64-byte extents; each 64-byte expert occupies one.
-    const std::uint64_t default_logical = 192U;
-    const auto expected =
-        (default_logical + huge - 1U) / huge * huge;
-    REQUIRE(strata::Glm53ExpertArena::required_bytes(manifest) == expected);
-    const std::uint64_t mtp_logical = 256U;
-    const auto expected_with_mtp =
-        (mtp_logical + huge - 1U) / huge * huge;
-    REQUIRE(strata::Glm53ExpertArena::required_bytes(manifest, true) ==
-            expected_with_mtp);
-
-    manifest.tensors.clear();
-    REQUIRE(strata::Glm53ExpertArena::required_bytes(manifest) == 0U);
 }

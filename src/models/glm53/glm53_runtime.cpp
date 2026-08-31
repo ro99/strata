@@ -5839,6 +5839,35 @@ struct Glm53Runtime::Impl {
         return hash;
     }
 
+    void print_kda_layer_hashes(const Glm53SequenceState& sequence) const {
+        const auto span_hash = [](std::span<const float> values) {
+            auto hash = kDiagnosticFnvOffset;
+            for (const auto value : values) {
+                hash = diagnostic_hash_u32(
+                    hash, std::bit_cast<std::uint32_t>(value));
+            }
+            return hash;
+        };
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            if (!glm53_kda_layer(layer)) continue;
+            auto convolution_hash = kDiagnosticFnvOffset;
+            for (std::uint32_t projection = 0U; projection < 3U;
+                 ++projection) {
+                for (const auto value :
+                     sequence.convolution(layer, projection)) {
+                    convolution_hash = diagnostic_hash_u32(
+                        convolution_hash,
+                        std::bit_cast<std::uint32_t>(value));
+                }
+            }
+            std::cerr << "[glm53-prefill-kda-layer] layer=" << layer
+                      << " recurrent=" << std::hex
+                      << span_hash(sequence.recurrent(layer))
+                      << " convolution=" << convolution_hash << std::dec
+                      << '\n';
+        }
+    }
+
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
         if (device_prefill_enabled()) {
             auto synchronized = synchronize_kda_sequence_from_device(
@@ -5861,6 +5890,7 @@ struct Glm53Runtime::Impl {
             std::cerr << "[glm53-prefill-state] kda_raw_f32_hash="
                       << std::hex << kda_state_hash(request->sequence)
                       << std::dec << '\n';
+            print_kda_layer_hashes(request->sequence);
         }
         const auto decode_prepare_started = std::chrono::steady_clock::now();
         if (mtp_enabled() && request->sampling.temperature == 0.0 &&

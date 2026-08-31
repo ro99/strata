@@ -184,6 +184,21 @@ ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
     }
     std::uint64_t allocation_calls = 0U;
     std::uint64_t allocation_bytes = 0U;
+    if (state.dsv4_mhc_host_staging == nullptr) {
+        void* staging = nullptr;
+        if (auto status = cudaMallocHost(
+                &staging,
+                static_cast<std::size_t>(kDsv4MhcMaximumHostStagingBytes));
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "reserve pinned DeepSeek device mHC staging");
+        }
+        state.dsv4_mhc_host_staging = static_cast<std::byte*>(staging);
+        state.dsv4_mhc_host_staging_bytes =
+            kDsv4MhcMaximumHostStagingBytes;
+        ++allocation_calls;
+        allocation_bytes += kDsv4MhcMaximumHostStagingBytes;
+    }
     if (slots > state.dsv4_mhc_slot_capacity) {
         void* allocation = nullptr;
         const auto bytes = static_cast<std::size_t>(slots) *
@@ -201,6 +216,26 @@ ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
         }
         state.dsv4_mhc_slot_arena = static_cast<Dsv4MhcWorkspace*>(allocation);
         state.dsv4_mhc_slot_capacity = slots;
+        ++allocation_calls;
+        allocation_bytes += bytes;
+    }
+    if (slots > state.dsv4_mhc_slot_host_input_capacity) {
+        constexpr auto row_bytes = static_cast<std::size_t>(
+            kDsv4MhcMultiplier) * kDsv4MhcHidden * sizeof(std::uint16_t);
+        const auto bytes = static_cast<std::size_t>(slots) * row_bytes;
+        void* allocation = nullptr;
+        if (auto status = cudaMallocHost(&allocation, bytes);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "allocate pinned DeepSeek device mHC slot inputs");
+        }
+        if (state.dsv4_mhc_slot_host_input != nullptr) {
+            static_cast<void>(
+                cudaFreeHost(state.dsv4_mhc_slot_host_input));
+        }
+        state.dsv4_mhc_slot_host_input =
+            static_cast<std::byte*>(allocation);
+        state.dsv4_mhc_slot_host_input_capacity = slots;
         ++allocation_calls;
         allocation_bytes += bytes;
     }
@@ -292,8 +327,15 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         ++allocation_calls;
         allocation_bytes += kDsv4MhcMaximumHostStagingBytes;
     }
-    auto* host_hidden = reinterpret_cast<std::uint16_t*>(
-        state.dsv4_mhc_host_staging);
+    const auto h2d_bytes = hidden.size() * sizeof(std::uint16_t);
+    auto* host_hidden_bytes = state.dsv4_mhc_host_staging;
+    if (device_only && state.dsv4_mhc_slot_host_input != nullptr &&
+        state.dsv4_mhc_active_slot <
+            state.dsv4_mhc_slot_host_input_capacity) {
+        host_hidden_bytes = state.dsv4_mhc_slot_host_input +
+            static_cast<std::size_t>(state.dsv4_mhc_active_slot) * h2d_bytes;
+    }
+    auto* host_hidden = reinterpret_cast<std::uint16_t*>(host_hidden_bytes);
     for (std::size_t index = 0U; index < hidden.size(); ++index) {
         host_hidden[index] = bf16_encode(hidden[index]);
     }
@@ -307,7 +349,6 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         auxiliary + 3U * sizeof(float));
     const auto* norm = reinterpret_cast<const __nv_bfloat16*>(
         auxiliary + kDsv4MhcAuxNormOffset);
-    const auto h2d_bytes = hidden.size() * sizeof(std::uint16_t);
     const auto weighted_bytes = weighted.size() * sizeof(std::uint16_t);
     const auto layer_bytes = layer_input.size() * sizeof(std::uint16_t);
     const auto d2h_bytes = weighted_bytes + layer_bytes;

@@ -229,6 +229,12 @@ struct CudaBackend::Impl {
         std::uint32_t dsv4_mhc_active_slot{};
         Dsv4MhcWorkspace* dsv4_mhc_slot_arena{};
         std::uint32_t dsv4_mhc_slot_capacity{};
+        // Device-only page setup enqueues one asynchronous H2D upload per
+        // slot.  Each upload needs a distinct pinned source until the stream
+        // consumes it; sharing dsv4_mhc_host_staging races the CPU encoder
+        // against the preceding row's DMA.
+        std::byte* dsv4_mhc_slot_host_input{};
+        std::uint32_t dsv4_mhc_slot_host_input_capacity{};
         bool dsv4_mhc_failed{};
         float* dsv4_mhc_head_input{};
         float* dsv4_mhc_head_output{};
@@ -501,6 +507,10 @@ struct CudaBackend::Impl {
             }
             if (state.dsv4_mhc_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.dsv4_mhc_host_staging));
+            }
+            if (state.dsv4_mhc_slot_host_input != nullptr) {
+                static_cast<void>(
+                    cudaFreeHost(state.dsv4_mhc_slot_host_input));
             }
             if (state.dsv4_mhc_head_input != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_mhc_head_input));

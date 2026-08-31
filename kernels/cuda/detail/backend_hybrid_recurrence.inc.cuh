@@ -8,6 +8,75 @@ __device__ __forceinline__ float glm53_sigmoid(float value) {
     return 1.0F / (1.0F + expf(-value));
 }
 
+// GLIBC 2.35 and Arm optimized-routines use this table and FP64 cubic for
+// expf. The Arm source is MIT OR Apache-2.0 WITH LLVM-exception:
+// Copyright (c) 2017-2025, Arm Limited. Keeping the operations explicitly
+// rounded reproduces the host reference without a page-wide host round trip.
+__device__ __constant__ std::uint64_t kGlm53KdaExpTable[32] = {
+    0x3ff0000000000000ULL, 0x3fefd9b0d3158574ULL,
+    0x3fefb5586cf9890fULL, 0x3fef9301d0125b51ULL,
+    0x3fef72b83c7d517bULL, 0x3fef54873168b9aaULL,
+    0x3fef387a6e756238ULL, 0x3fef1e9df51fdee1ULL,
+    0x3fef06fe0a31b715ULL, 0x3feef1a7373aa9cbULL,
+    0x3feedea64c123422ULL, 0x3feece086061892dULL,
+    0x3feebfdad5362a27ULL, 0x3feeb42b569d4f82ULL,
+    0x3feeab07dd485429ULL, 0x3feea47eb03a5585ULL,
+    0x3feea09e667f3bcdULL, 0x3fee9f75e8ec5f74ULL,
+    0x3feea11473eb0187ULL, 0x3feea589994cce13ULL,
+    0x3feeace5422aa0dbULL, 0x3feeb737b0cdc5e5ULL,
+    0x3feec49182a3f090ULL, 0x3feed503b23e255dULL,
+    0x3feee89f995ad3adULL, 0x3feeff76f2fb5e47ULL,
+    0x3fef199bdd85529cULL, 0x3fef3720dcef9069ULL,
+    0x3fef5818dcfba487ULL, 0x3fef7c97337b9b5fULL,
+    0x3fefa4afa2a490daULL, 0x3fefd0765b6e4540ULL};
+
+__device__ __forceinline__ float glm53_kda_add(float left, float right) {
+    return __fadd_rn(left, right);
+}
+
+__device__ __forceinline__ float glm53_kda_multiply(float left, float right) {
+    return __fmul_rn(left, right);
+}
+
+__device__ __forceinline__ float glm53_kda_expf(float value) {
+    const auto value_bits = static_cast<std::uint32_t>(__float_as_uint(value));
+    const auto absolute_top = (value_bits >> 20U) & 0x7FFU;
+    constexpr auto boundary_top =
+        (std::bit_cast<std::uint32_t>(88.0F) >> 20U) & 0x7FFU;
+    if (absolute_top >= boundary_top) {
+        if (value_bits == 0xFF800000U) return 0.0F;
+        if (absolute_top >= 0x7F8U) return value + value;
+        if (value > 0x1.62e42ep6F) return __int_as_float(0x7F800000);
+        if (value < -0x1.9fe368p6F) return 0.0F;
+    }
+    constexpr double inverse_ln2_scaled = 0x1.71547652b82fep+0 * 32.0;
+    constexpr double shift = 0x1.8p+52;
+    constexpr double c0 = 0x1.c6af84b912394p-5 / (32.0 * 32.0 * 32.0);
+    constexpr double c1 = 0x1.ebfce50fac4f3p-3 / (32.0 * 32.0);
+    constexpr double c2 = 0x1.62e42ff0c52d6p-1 / 32.0;
+    const double x = static_cast<double>(value);
+    const double z = __dmul_rn(inverse_ln2_scaled, x);
+    double rounded = __dadd_rn(z, shift);
+    const auto integer =
+        static_cast<std::uint64_t>(__double_as_longlong(rounded));
+    rounded = __dadd_rn(rounded, -shift);
+    const double remainder = __dadd_rn(z, -rounded);
+    auto encoded = kGlm53KdaExpTable[integer & 31ULL];
+    encoded += integer << 47U;
+    const double scale = __longlong_as_double(
+        static_cast<unsigned long long>(encoded));
+    const double polynomial_high = __dadd_rn(__dmul_rn(c0, remainder), c1);
+    const double square = __dmul_rn(remainder, remainder);
+    double result = __dadd_rn(__dmul_rn(c2, remainder), 1.0);
+    result = __dadd_rn(__dmul_rn(polynomial_high, square), result);
+    result = __dmul_rn(result, scale);
+    return static_cast<float>(result);
+}
+
+__device__ __forceinline__ float glm53_kda_sigmoid(float value) {
+    return 1.0F / glm53_kda_add(1.0F, glm53_kda_expf(-value));
+}
+
 __global__ void glm53_kda_conv_kernel(
     float* activations, float* convolution, const float* taps,
     std::uint32_t width, std::uint32_t kernel) {
@@ -22,15 +91,18 @@ __global__ void glm53_kda_conv_kernel(
         const auto* weights = taps +
             static_cast<std::size_t>(projection) * width * kernel +
             static_cast<std::size_t>(channel) * kernel;
-        float sum = weights[kernel - 1U] * values[channel];
+        float sum = glm53_kda_multiply(
+            weights[kernel - 1U], values[channel]);
         for (std::uint32_t offset = 0U; offset < history_width; ++offset) {
-            sum += weights[offset] * history[offset];
+            sum = glm53_kda_add(
+                sum, glm53_kda_multiply(weights[offset], history[offset]));
         }
         for (std::uint32_t offset = 0U; offset + 1U < history_width; ++offset) {
             history[offset] = history[offset + 1U];
         }
         history[history_width - 1U] = values[channel];
-        values[channel] = glm53_bf16(sum * glm53_sigmoid(sum));
+        values[channel] = glm53_bf16(
+            glm53_kda_multiply(sum, glm53_kda_sigmoid(sum)));
     }
 }
 
@@ -63,52 +135,74 @@ __global__ void glm53_kda_recurrence_kernel(
         for (std::uint32_t index = 0U; index < head_dim; ++index) {
             const auto q = query[base + index];
             const auto k = key[base + index];
-            query_square += q * q;
-            key_square += k * k;
+            query_square = glm53_kda_add(
+                query_square, glm53_kda_multiply(q, q));
+            key_square = glm53_kda_add(
+                key_square, glm53_kda_multiply(k, k));
         }
-        query_inverse = rsqrtf(query_square + 1.0e-6F) /
-                        sqrtf(static_cast<float>(head_dim));
-        key_inverse = rsqrtf(key_square + 1.0e-6F);
+        query_inverse = 1.0F /
+                        sqrtf(glm53_kda_add(query_square, 1.0e-6F));
+        key_inverse = 1.0F /
+                      sqrtf(glm53_kda_add(key_square, 1.0e-6F));
     }
     __syncthreads();
-    normalized_query[lane] = query[base + lane] * query_inverse;
-    normalized_key[lane] = key[base + lane] * key_inverse;
-    decay[lane] = expf(-5.0F * glm53_sigmoid(
-        expf(a_log[head]) * (forget[base + lane] + dt_bias[base + lane])));
+    normalized_query[lane] = glm53_kda_multiply(
+        glm53_kda_multiply(query[base + lane], query_inverse),
+        1.0F / sqrtf(static_cast<float>(head_dim)));
+    normalized_key[lane] =
+        glm53_kda_multiply(key[base + lane], key_inverse);
+    const float biased_forget = glm53_kda_add(
+        forget[base + lane], dt_bias[base + lane]);
+    const float decay_logit = glm53_kda_multiply(
+        glm53_kda_expf(a_log[head]), biased_forget);
+    const float logarithm = glm53_kda_multiply(
+        -5.0F, glm53_kda_sigmoid(decay_logit));
+    decay[lane] = glm53_kda_expf(logarithm);
     __syncthreads();
     auto* state_row = recurrent +
         (static_cast<std::size_t>(head) * head_dim + lane) * head_dim;
     float projected = 0.0F;
     for (std::uint32_t index = 0U; index < head_dim; ++index) {
-        state_row[index] *= decay[index];
-        projected += state_row[index] * normalized_key[index];
+        state_row[index] =
+            glm53_kda_multiply(state_row[index], decay[index]);
+        projected = glm53_kda_add(
+            projected,
+            glm53_kda_multiply(state_row[index], normalized_key[index]));
     }
-    const auto delta =
-        (value[base + lane] - projected) * beta[head];
+    const auto delta = glm53_kda_multiply(
+        __fsub_rn(value[base + lane], projected), beta[head]);
     float mixed = 0.0F;
     for (std::uint32_t index = 0U; index < head_dim; ++index) {
-        state_row[index] += delta * normalized_key[index];
-        mixed += state_row[index] * normalized_query[index];
+        state_row[index] = glm53_kda_add(
+            state_row[index],
+            glm53_kda_multiply(delta, normalized_key[index]));
+        mixed = glm53_kda_add(
+            mixed,
+            glm53_kda_multiply(state_row[index], normalized_query[index]));
     }
     raw[lane] = glm53_bf16(mixed);
     __syncthreads();
     if (lane == 0U) {
         float square = 0.0F;
         for (std::uint32_t index = 0U; index < head_dim; ++index) {
-            square += raw[index] * raw[index];
+            square = glm53_kda_add(
+                square, glm53_kda_multiply(raw[index], raw[index]));
         }
-        output_inverse = rsqrtf(
-            square / static_cast<float>(head_dim) + 1.0e-5F);
+        output_inverse = 1.0F / sqrtf(glm53_kda_add(
+            square / static_cast<float>(head_dim), 1.0e-5F));
     }
     __syncthreads();
-    output[base + lane] = glm53_bf16(
-        norm_weight[lane] * raw[lane] * output_inverse *
-        glm53_sigmoid(gate[base + lane]));
+    const float normalized = glm53_kda_multiply(
+        norm_weight[lane], glm53_kda_multiply(raw[lane], output_inverse));
+    output[base + lane] = glm53_bf16(glm53_kda_multiply(
+        normalized, glm53_kda_sigmoid(gate[base + lane])));
 }
 
 __global__ void glm53_kda_beta_kernel(float* beta, std::uint32_t heads) {
     const auto index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < heads) beta[index] = glm53_bf16(glm53_sigmoid(beta[index]));
+    if (index < heads) {
+        beta[index] = glm53_bf16(glm53_kda_sigmoid(beta[index]));
+    }
 }
 
 __global__ void glm53_mhc_gather_page_input_kernel(
@@ -149,16 +243,18 @@ __global__ void glm53_kda_conv_page_row_kernel(
         const auto* weights = taps +
             static_cast<std::size_t>(projection) * width * kernel +
             static_cast<std::size_t>(channel) * kernel;
-        float sum = weights[kernel - 1U] * projections[projection][channel];
+        float sum = glm53_kda_multiply(
+            weights[kernel - 1U], projections[projection][channel]);
         for (std::uint32_t offset = 0U; offset < history_width; ++offset) {
-            sum += weights[offset] * history[offset];
+            sum = glm53_kda_add(
+                sum, glm53_kda_multiply(weights[offset], history[offset]));
         }
         for (std::uint32_t offset = 0U; offset + 1U < history_width; ++offset) {
             history[offset] = history[offset + 1U];
         }
         history[history_width - 1U] = projections[projection][channel];
-        projections[projection][channel] =
-            glm53_bf16(sum * glm53_sigmoid(sum));
+        projections[projection][channel] = glm53_bf16(
+            glm53_kda_multiply(sum, glm53_kda_sigmoid(sum)));
     }
 }
 
@@ -184,46 +280,70 @@ __global__ void glm53_kda_recurrence_page_row_kernel(
         float query_square = 0.0F;
         float key_square = 0.0F;
         for (std::uint32_t index = 0U; index < head_dim; ++index) {
-            query_square += query[base + index] * query[base + index];
-            key_square += key[base + index] * key[base + index];
+            query_square = glm53_kda_add(
+                query_square,
+                glm53_kda_multiply(query[base + index],
+                                   query[base + index]));
+            key_square = glm53_kda_add(
+                key_square,
+                glm53_kda_multiply(key[base + index], key[base + index]));
         }
-        query_inverse = rsqrtf(query_square + 1.0e-6F) /
-                        sqrtf(static_cast<float>(head_dim));
-        key_inverse = rsqrtf(key_square + 1.0e-6F);
+        query_inverse = 1.0F /
+                        sqrtf(glm53_kda_add(query_square, 1.0e-6F));
+        key_inverse = 1.0F /
+                      sqrtf(glm53_kda_add(key_square, 1.0e-6F));
     }
     __syncthreads();
-    normalized_query[lane] = query[base + lane] * query_inverse;
-    normalized_key[lane] = key[base + lane] * key_inverse;
-    decay[lane] = expf(-5.0F * glm53_sigmoid(
-        expf(a_log[head]) * (forget[base + lane] + dt_bias[base + lane])));
+    normalized_query[lane] = glm53_kda_multiply(
+        glm53_kda_multiply(query[base + lane], query_inverse),
+        1.0F / sqrtf(static_cast<float>(head_dim)));
+    normalized_key[lane] =
+        glm53_kda_multiply(key[base + lane], key_inverse);
+    const float biased_forget = glm53_kda_add(
+        forget[base + lane], dt_bias[base + lane]);
+    const float decay_logit = glm53_kda_multiply(
+        glm53_kda_expf(a_log[head]), biased_forget);
+    const float logarithm = glm53_kda_multiply(
+        -5.0F, glm53_kda_sigmoid(decay_logit));
+    decay[lane] = glm53_kda_expf(logarithm);
     __syncthreads();
     auto* state_row = recurrent +
         (static_cast<std::size_t>(head) * head_dim + lane) * head_dim;
     float projected = 0.0F;
     for (std::uint32_t index = 0U; index < head_dim; ++index) {
-        state_row[index] *= decay[index];
-        projected += state_row[index] * normalized_key[index];
+        state_row[index] =
+            glm53_kda_multiply(state_row[index], decay[index]);
+        projected = glm53_kda_add(
+            projected,
+            glm53_kda_multiply(state_row[index], normalized_key[index]));
     }
-    const auto delta = (value[base + lane] - projected) * beta[head];
+    const auto delta = glm53_kda_multiply(
+        __fsub_rn(value[base + lane], projected), beta[head]);
     float mixed = 0.0F;
     for (std::uint32_t index = 0U; index < head_dim; ++index) {
-        state_row[index] += delta * normalized_key[index];
-        mixed += state_row[index] * normalized_query[index];
+        state_row[index] = glm53_kda_add(
+            state_row[index],
+            glm53_kda_multiply(delta, normalized_key[index]));
+        mixed = glm53_kda_add(
+            mixed,
+            glm53_kda_multiply(state_row[index], normalized_query[index]));
     }
     raw[lane] = glm53_bf16(mixed);
     __syncthreads();
     if (lane == 0U) {
         float square = 0.0F;
         for (std::uint32_t index = 0U; index < head_dim; ++index) {
-            square += raw[index] * raw[index];
+            square = glm53_kda_add(
+                square, glm53_kda_multiply(raw[index], raw[index]));
         }
-        output_inverse = rsqrtf(
-            square / static_cast<float>(head_dim) + 1.0e-5F);
+        output_inverse = 1.0F / sqrtf(glm53_kda_add(
+            square / static_cast<float>(head_dim), 1.0e-5F));
     }
     __syncthreads();
-    output[base + lane] = glm53_bf16(
-        norm_weight[lane] * raw[lane] * output_inverse *
-        glm53_sigmoid(gate[base + lane]));
+    const float normalized = glm53_kda_multiply(
+        norm_weight[lane], glm53_kda_multiply(raw[lane], output_inverse));
+    output[base + lane] = glm53_bf16(glm53_kda_multiply(
+        normalized, glm53_kda_sigmoid(gate[base + lane])));
 }
 
 __global__ void glm53_moe_join_mhc_kernel(

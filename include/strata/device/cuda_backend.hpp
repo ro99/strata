@@ -657,6 +657,7 @@ struct CudaDsv4AttentionPrepareRequest {
 
 enum class CudaGlm53ExpertEncoding : std::uint8_t {
     Fp8E4m3Block128F32,
+    Fp4E2m1Group32E8m0,
     Bf16,
 };
 
@@ -682,6 +683,12 @@ struct CudaGlm53Expert {
     std::uint32_t intermediate{};
     CudaGlm53ExpertEncoding encoding{
         CudaGlm53ExpertEncoding::Fp8E4m3Block128F32};
+    // Static routed experts live inside the admitted weight arena as pinned
+    // CudaWeights. Shared experts retain their independently-owned raw
+    // buffers above. Exactly one representation is populated.
+    const CudaWeight* gate{};
+    const CudaWeight* up{};
+    const CudaWeight* down{};
 };
 
 class CudaBuffer {

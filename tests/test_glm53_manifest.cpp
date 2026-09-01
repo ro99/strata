@@ -2,6 +2,7 @@
 
 #include "strata/engine/model_executor.hpp"
 #include "strata/models/common/tokenizer.hpp"
+#include "strata/models/glm53/glm53_expert_profile.hpp"
 #include "strata/models/glm53/glm53_manifest.hpp"
 #include "strata/models/glm53/glm53_runtime.hpp"
 #include "strata/models/glm53/glm53_sequence.hpp"
@@ -26,6 +27,23 @@ TEST_CASE("GLM-5.3 schedule partitions KDA, sparse MLA, dense, and MoE layers") 
     REQUIRE(moe == 42U);
     REQUIRE(strata::glm53_full_attention_layer(3U));
     REQUIRE(strata::glm53_kda_layer(44U));
+}
+
+TEST_CASE("GLM-5.3 static expert profile is unique and geometry-valid") {
+    const auto ranking = strata::glm53_default_expert_ranking();
+    REQUIRE(ranking.size() == 1700U);
+    REQUIRE(ranking.front() == ((19U << 9U) | 238U));
+    std::array<bool, 45U * 288U> seen{};
+    for (const auto packed : ranking) {
+        const auto layer = static_cast<std::uint32_t>(packed >> 9U);
+        const auto expert = static_cast<std::uint32_t>(packed & 0x1ffU);
+        REQUIRE(layer < 45U);
+        REQUIRE(strata::glm53_moe_layer(layer));
+        REQUIRE(expert < 288U);
+        const auto index = static_cast<std::size_t>(layer) * 288U + expert;
+        REQUIRE(!seen[index]);
+        seen[index] = true;
+    }
 }
 
 TEST_CASE("GLM-5.3 tensor classifier separates text, MTP, and vision") {

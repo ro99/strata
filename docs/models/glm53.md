@@ -71,6 +71,18 @@ Both return raw linear results so every BF16 rounding, clamp and SwiGLU remains
 on the host. Set `STRATA_GLM53_SHARED_EXPERT_DEVICE=0` only to force the slower
 host control.
 
+The remaining admitted expert-arena capacity is filled once at startup with a
+static routed-expert tier. Its compact built-in ranking comes from the
+representative code, prose, multilingual, reasoning, and concurrent-server
+workloads; any route that misses the tier continues through the unchanged host
+path. The tier never replaces an expert during inference, so it has none of the
+replacement latency that rejected the earlier dynamic-cache experiment. The
+runtime discovers the available arena capacity and device placement rather
+than assuming a particular GPU count or memory size. It stores FP8 experts in
+their canonical E4M3 layout and MXFP4 experts in their checkpoint-native E2M1
+group-32 layout, and preserves the host dot-product association exactly. Set
+`STRATA_GLM53_STATIC_EXPERT=0` only for the same-binary diagnostic control.
+
 Prompt pages group rows by expert so an expert is traversed once for every row
 that selected it; decode does not reread routed experts from the checkpoint
 through Strata's explicit I/O path per token (the OS still owns page-cache
@@ -78,12 +90,15 @@ residency for mapped payloads). Systems with a high-speed two-GPU peer fabric
 additionally admit the full TP2 route; PCIe systems use a contiguous pipeline
 schedule.
 
-On the reference two-RTX-3090 host at the 36-token prompt / 128-step decode
-point, the MXFP4 release measures 3.88 tok/s. Moving its BF16 shared experts
-from host to device improves decode from 44.46 to 32.96 seconds (-25.9%) under
-the default memory policy, with byte-identical output. The independently
-protected current FP8 operating point is 2.74 tok/s; these are different
-checkpoint outputs, so quality is not inferred from the speed ratio.
+On the reference two-RTX-3090 host, the protected static-tier 3+3 alternating
+A/B used a bounded 16-token decode. MXFP4 improved from 3.84 to 3.07 seconds
+(-20.1%, 4.17 to 5.21 tok/s) while serving 35% of routed bytes from the tier;
+FP8 improved from 5.76 to 4.66 seconds (-19.1%, 2.78 to 3.43 tok/s) at 29%
+coverage. The control and candidate ranges did not overlap, every timed output
+matched its same-checkpoint control byte for byte, and the timed path performed
+no allocations. These are bounded short-context measurements, not projections
+of long-context throughput, and the two checkpoint outputs must not be used to
+infer relative quality.
 
 MTP drafting and verification are implemented but opt in because acceptance is
 workload-dependent. Set `STRATA_GLM53_MTP=1` for an acceptance campaign. The

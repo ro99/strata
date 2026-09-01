@@ -2195,30 +2195,76 @@ namespace {
         expert.hidden % 128U != 0U || expert.intermediate % 128U != 0U) {
         return {{"CUDA GLM-5.3 expert has an invalid shape"}};
     }
-    const CudaBuffer* weights[3] = {
-        expert.gate_weights, expert.up_weights, expert.down_weights};
-    for (const auto* buffer : weights) {
-        if (buffer == nullptr || !buffer->valid()) {
-            return {{"CUDA GLM-5.3 expert is missing a matrix"}};
+    const bool arena_backed = expert.gate != nullptr || expert.up != nullptr ||
+                              expert.down != nullptr;
+    const bool buffer_backed = expert.gate_weights != nullptr ||
+                               expert.up_weights != nullptr ||
+                               expert.down_weights != nullptr;
+    if (arena_backed == buffer_backed) {
+        return {{"CUDA GLM-5.3 expert has an ambiguous storage owner"}};
+    }
+    if (arena_backed) {
+        const CudaWeight* weights[3] = {expert.gate, expert.up, expert.down};
+        for (const auto* weight : weights) {
+            if (weight == nullptr || !weight->valid()) {
+                return {{"CUDA GLM-5.3 expert is missing an arena matrix"}};
+            }
+        }
+    } else {
+        const CudaBuffer* weights[3] = {
+            expert.gate_weights, expert.up_weights, expert.down_weights};
+        for (const auto* buffer : weights) {
+            if (buffer == nullptr || !buffer->valid()) {
+                return {{"CUDA GLM-5.3 expert is missing a matrix"}};
+            }
         }
     }
     const std::uint64_t projection =
         static_cast<std::uint64_t>(expert.intermediate) * expert.hidden;
+    const auto bytes = [&](const CudaBuffer* buffer,
+                           const CudaBuffer* scales,
+                           const CudaWeight* weight) {
+        return arena_backed
+            ? weight->device_bytes()
+            : buffer->device_bytes() +
+                  (scales == nullptr ? 0U : scales->device_bytes());
+    };
     if (expert.encoding == CudaGlm53ExpertEncoding::Bf16) {
         if (expert.gate_scales != nullptr || expert.up_scales != nullptr ||
             expert.down_scales != nullptr ||
-            expert.gate_weights->device_bytes() != 2U * projection ||
-            expert.up_weights->device_bytes() != 2U * projection ||
-            expert.down_weights->device_bytes() != 2U * projection) {
+            bytes(expert.gate_weights, expert.gate_scales, expert.gate) !=
+                2U * projection ||
+            bytes(expert.up_weights, expert.up_scales, expert.up) !=
+                2U * projection ||
+            bytes(expert.down_weights, expert.down_scales, expert.down) !=
+                2U * projection) {
             return {{"CUDA GLM-5.3 BF16 expert matrix is mis-sized"}};
         }
         return {};
     }
-    const CudaBuffer* scales[3] = {
-        expert.gate_scales, expert.up_scales, expert.down_scales};
-    for (const auto* buffer : scales) {
-        if (buffer == nullptr || !buffer->valid()) {
-            return {{"CUDA GLM-5.3 FP8 expert is missing block scales"}};
+    if (expert.encoding == CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0) {
+        const auto gate_up = projection / 2U + projection / 32U;
+        if (!arena_backed &&
+            (expert.gate_scales == nullptr || expert.up_scales == nullptr ||
+             expert.down_scales == nullptr)) {
+            return {{"CUDA GLM-5.3 MXFP4 expert is missing group scales"}};
+        }
+        if (bytes(expert.gate_weights, expert.gate_scales, expert.gate) !=
+                gate_up ||
+            bytes(expert.up_weights, expert.up_scales, expert.up) != gate_up ||
+            bytes(expert.down_weights, expert.down_scales, expert.down) !=
+                gate_up) {
+            return {{"CUDA GLM-5.3 MXFP4 expert matrix is mis-sized"}};
+        }
+        return {};
+    }
+    if (!arena_backed) {
+        const CudaBuffer* scales[3] = {
+            expert.gate_scales, expert.up_scales, expert.down_scales};
+        for (const auto* buffer : scales) {
+            if (buffer == nullptr || !buffer->valid()) {
+                return {{"CUDA GLM-5.3 FP8 expert is missing block scales"}};
+            }
         }
     }
     const std::uint64_t gate_up_scales =
@@ -2227,12 +2273,12 @@ namespace {
     const std::uint64_t down_scales =
         static_cast<std::uint64_t>(expert.hidden / 128U) *
         (expert.intermediate / 128U) * sizeof(float);
-    if (expert.gate_weights->device_bytes() != projection ||
-        expert.up_weights->device_bytes() != projection ||
-        expert.down_weights->device_bytes() != projection ||
-        expert.gate_scales->device_bytes() != gate_up_scales ||
-        expert.up_scales->device_bytes() != gate_up_scales ||
-        expert.down_scales->device_bytes() != down_scales) {
+    if (bytes(expert.gate_weights, expert.gate_scales, expert.gate) !=
+            projection + gate_up_scales ||
+        bytes(expert.up_weights, expert.up_scales, expert.up) !=
+            projection + gate_up_scales ||
+        bytes(expert.down_weights, expert.down_scales, expert.down) !=
+            projection + down_scales) {
         return {{"CUDA GLM-5.3 expert matrix is mis-sized"}};
     }
     return {};
@@ -2268,9 +2314,6 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
         if (expert.hidden != hidden || expert.intermediate != intermediate) {
             return {{"GLM-5.3 expert batch mixes shapes"}};
         }
-        if (expert.encoding != experts.front().encoding) {
-            return {{"GLM-5.3 expert batch mixes encodings"}};
-        }
         const CudaBuffer* buffers[6] = {
             expert.gate_weights, expert.up_weights, expert.down_weights,
             expert.gate_scales, expert.up_scales, expert.down_scales};
@@ -2278,6 +2321,12 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
             if (buffer == nullptr) continue;
             if (buffer->device() != device) {
                 return {{"GLM-5.3 expert matrix is on another device"}};
+            }
+        }
+        const CudaWeight* arena[3] = {expert.gate, expert.up, expert.down};
+        for (const auto* weight : arena) {
+            if (weight != nullptr && weight->device() != device) {
+                return {{"GLM-5.3 expert arena matrix is on another device"}};
             }
         }
     }
@@ -2339,8 +2388,7 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
         state.glm53_shared_encoding = experts.front().encoding;
     }
     if (state.glm53_shared_hidden != hidden ||
-        state.glm53_shared_intermediate != intermediate ||
-        state.glm53_shared_encoding != experts.front().encoding) {
+        state.glm53_shared_intermediate != intermediate) {
         return {{"GLM-5.3 expert batch shape changed after admission"}};
     }
     std::copy(input.begin(), input.end(), state.glm53_shared_staging);
@@ -2361,31 +2409,62 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     for (std::size_t index = 0U; index < experts.size(); ++index) {
         const auto& expert = experts[index];
         const auto offset = index * intermediate;
+        const auto weight_data = [](const CudaBuffer* buffer,
+                                    const CudaWeight* weight) {
+            return weight != nullptr ? weight->impl_->weights
+                                     : buffer->impl_->data;
+        };
+        const auto scale_data = [](const CudaBuffer* buffer,
+                                   const CudaWeight* weight) {
+            return weight != nullptr ? weight->impl_->scales
+                                     : (buffer == nullptr ? nullptr
+                                                          : buffer->impl_->data);
+        };
         if (expert.encoding == CudaGlm53ExpertEncoding::Bf16) {
             glm53_shared_expert_bf16_dot_kernel<<<
                 blocks, threads, 0U, state.stream>>>(
                 state.glm53_shared_gate + offset,
                 static_cast<const unsigned short*>(
-                    expert.gate_weights->impl_->data),
+                    weight_data(expert.gate_weights, expert.gate)),
                 state.glm53_shared_input, intermediate, hidden);
             glm53_shared_expert_bf16_dot_kernel<<<
                 blocks, threads, 0U, state.stream>>>(
                 state.glm53_shared_up + offset,
                 static_cast<const unsigned short*>(
-                    expert.up_weights->impl_->data),
+                    weight_data(expert.up_weights, expert.up)),
+                state.glm53_shared_input, intermediate, hidden);
+        } else if (expert.encoding ==
+                   CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0) {
+            glm53_shared_expert_fp4_dot_kernel<<<
+                blocks, threads, 0U, state.stream>>>(
+                state.glm53_shared_gate + offset,
+                static_cast<const unsigned char*>(
+                    weight_data(expert.gate_weights, expert.gate)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.gate_scales, expert.gate)),
+                state.glm53_shared_input, intermediate, hidden);
+            glm53_shared_expert_fp4_dot_kernel<<<
+                blocks, threads, 0U, state.stream>>>(
+                state.glm53_shared_up + offset,
+                static_cast<const unsigned char*>(
+                    weight_data(expert.up_weights, expert.up)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.up_scales, expert.up)),
                 state.glm53_shared_input, intermediate, hidden);
         } else {
             glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
                 state.glm53_shared_gate + offset,
                 static_cast<const unsigned char*>(
-                    expert.gate_weights->impl_->data),
-                static_cast<const float*>(expert.gate_scales->impl_->data),
+                    weight_data(expert.gate_weights, expert.gate)),
+                static_cast<const float*>(
+                    scale_data(expert.gate_scales, expert.gate)),
                 state.glm53_shared_input, intermediate, hidden, scale_columns);
             glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
                 state.glm53_shared_up + offset,
                 static_cast<const unsigned char*>(
-                    expert.up_weights->impl_->data),
-                static_cast<const float*>(expert.up_scales->impl_->data),
+                    weight_data(expert.up_weights, expert.up)),
+                static_cast<const float*>(
+                    scale_data(expert.up_scales, expert.up)),
                 state.glm53_shared_input, intermediate, hidden, scale_columns);
         }
     }
@@ -2475,9 +2554,6 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
         if (expert.hidden != hidden || expert.intermediate != intermediate) {
             return {{"GLM-5.3 expert batch mixes shapes"}};
         }
-        if (expert.encoding != state.glm53_shared_encoding) {
-            return {{"GLM-5.3 expert batch down changes encoding"}};
-        }
         const CudaBuffer* buffers[6] = {
             expert.gate_weights, expert.up_weights, expert.down_weights,
             expert.gate_scales, expert.up_scales, expert.down_scales};
@@ -2485,6 +2561,12 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
             if (buffer == nullptr) continue;
             if (buffer->device() != device) {
                 return {{"GLM-5.3 expert matrix is on another device"}};
+            }
+        }
+        const CudaWeight* arena[3] = {expert.gate, expert.up, expert.down};
+        for (const auto* weight : arena) {
+            if (weight != nullptr && weight->device() != device) {
+                return {{"GLM-5.3 expert arena matrix is on another device"}};
             }
         }
     }
@@ -2512,20 +2594,43 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
     const std::uint32_t blocks = (hidden * 8U + threads - 1U) / threads;
     for (std::size_t index = 0U; index < experts.size(); ++index) {
         const auto& expert = experts[index];
+        const auto weight_data = [](const CudaBuffer* buffer,
+                                    const CudaWeight* weight) {
+            return weight != nullptr ? weight->impl_->weights
+                                     : buffer->impl_->data;
+        };
+        const auto scale_data = [](const CudaBuffer* buffer,
+                                   const CudaWeight* weight) {
+            return weight != nullptr ? weight->impl_->scales
+                                     : (buffer == nullptr ? nullptr
+                                                          : buffer->impl_->data);
+        };
         if (expert.encoding == CudaGlm53ExpertEncoding::Bf16) {
             glm53_shared_expert_bf16_dot_kernel<<<
                 blocks, threads, 0U, state.stream>>>(
                 state.glm53_shared_output + index * hidden,
                 static_cast<const unsigned short*>(
-                    expert.down_weights->impl_->data),
+                    weight_data(expert.down_weights, expert.down)),
+                state.glm53_shared_activation + index * intermediate, hidden,
+                intermediate);
+        } else if (expert.encoding ==
+                   CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0) {
+            glm53_shared_expert_fp4_dot_kernel<<<
+                blocks, threads, 0U, state.stream>>>(
+                state.glm53_shared_output + index * hidden,
+                static_cast<const unsigned char*>(
+                    weight_data(expert.down_weights, expert.down)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.down_scales, expert.down)),
                 state.glm53_shared_activation + index * intermediate, hidden,
                 intermediate);
         } else {
             glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
                 state.glm53_shared_output + index * hidden,
                 static_cast<const unsigned char*>(
-                    expert.down_weights->impl_->data),
-                static_cast<const float*>(expert.down_scales->impl_->data),
+                    weight_data(expert.down_weights, expert.down)),
+                static_cast<const float*>(
+                    scale_data(expert.down_scales, expert.down)),
                 state.glm53_shared_activation + index * intermediate, hidden,
                 intermediate, intermediate / 128U);
         }

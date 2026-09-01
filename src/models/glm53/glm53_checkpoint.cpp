@@ -331,12 +331,17 @@ std::uint64_t Glm53CheckpointReader::cuda_linear_slice_storage_bytes(
 ValidationResult Glm53CheckpointReader::load_cuda_linear(
     std::string_view base_name, std::uint64_t rows, std::uint64_t columns,
     int device, CudaBackend& backend, CudaWeight& output,
-    bool concurrent_prefetch) const {
+    bool concurrent_prefetch, bool canonical_layout) const {
     ValidationResult result;
     const auto weight_name = std::string(base_name) + ".weight";
     const auto* weight = find(weight_name);
-    if (weight == nullptr || weight->source_shape !=
-            std::vector<std::uint64_t>{rows, columns}) {
+    const auto expected_shape = weight != nullptr &&
+                                weight->source_dtype == SafetensorsDtype::U8
+        ? std::vector<std::uint64_t>{rows, columns / 2U}
+        : std::vector<std::uint64_t>{rows, columns};
+    if (weight == nullptr || columns == 0U ||
+        (weight->source_dtype == SafetensorsDtype::U8 && columns % 32U != 0U) ||
+        weight->source_shape != expected_shape) {
         result.errors.push_back("GLM-5.3 linear has an unexpected or missing weight: " +
                                 weight_name);
         return result;
@@ -362,6 +367,24 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
         descriptor.packed_columns = columns;
         descriptor.scale_columns = scale_columns;
         descriptor.group_size = 128U;
+    } else if (weight->source_dtype == SafetensorsDtype::U8) {
+        scale_name = std::string(base_name) + ".weight_scale";
+        const auto* scale = find(scale_name);
+        const auto scale_columns = columns / 32U;
+        if (scale == nullptr || scale->source_dtype != SafetensorsDtype::U8 ||
+            scale->source_shape !=
+                std::vector<std::uint64_t>{rows, scale_columns}) {
+            result.errors.push_back(
+                "GLM-5.3 MXFP4 linear has an invalid scale: " + scale_name);
+            return result;
+        }
+        // The backend calls the byte-level E2M1 stream I8 even when the
+        // Safetensors container declares those identical bytes U8.
+        descriptor.dtype = SafetensorsDtype::I8;
+        descriptor.encoding = CudaWeightEncoding::Fp4E2m1Group32;
+        descriptor.packed_columns = columns / 2U;
+        descriptor.scale_columns = scale_columns;
+        descriptor.group_size = 32U;
     } else if (weight->source_dtype == SafetensorsDtype::Bf16 ||
                weight->source_dtype == SafetensorsDtype::F16 ||
                weight->source_dtype == SafetensorsDtype::F32) {
@@ -371,7 +394,7 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
                                 weight_name);
         return result;
     }
-    const auto fragment_layout =
+    const auto fragment_layout = !canonical_layout &&
         descriptor.encoding == CudaWeightEncoding::Fp8E4m3Block128F32 &&
                 backend.fp8_f32_register_fed_supported(device)
             ? CudaBackend::FragmentLayout::Prepack
@@ -400,9 +423,12 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
     if (!weights.ok()) return {std::move(weights.errors)};
     std::vector<std::byte> scales;
     if (!scale_name.empty()) {
-        auto loaded_scales = read(scale_name,
-                                  descriptor.scale_columns *
-                                      ((rows + 127U) / 128U) * sizeof(float));
+        const auto scale_bytes =
+            descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32
+            ? rows * descriptor.scale_columns
+            : descriptor.scale_columns * ((rows + 127U) / 128U) *
+                  sizeof(float);
+        auto loaded_scales = read(scale_name, scale_bytes);
         if (!loaded_scales.ok()) return {std::move(loaded_scales.errors)};
         scales = std::move(loaded_scales.value);
     }

@@ -4311,6 +4311,86 @@ TEST_CASE("GLM-5.3 BF16 device expert dots match the host AVX2 association") {
     require_exact_rows(host_weights[2], activation, down);
 }
 
+TEST_CASE("GLM-5.3 MXFP4 device expert dots match the host AVX2 association") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::uint32_t hidden = 128U;
+    constexpr std::uint32_t intermediate = 128U;
+    constexpr std::size_t elements = hidden * intermediate;
+    std::array<std::vector<std::byte>, 3U> host_weights;
+    std::array<std::vector<std::byte>, 3U> host_scales;
+    std::vector<strata::CudaBuffer> storage;
+    storage.reserve(6U);
+    std::array<const strata::CudaBuffer*, 6U> uploaded{};
+    for (std::size_t matrix = 0U; matrix < host_weights.size(); ++matrix) {
+        auto& weights = host_weights[matrix];
+        auto& scales = host_scales[matrix];
+        weights.resize(elements / 2U);
+        scales.resize(elements / 32U);
+        for (std::size_t index = 0U; index < weights.size(); ++index) {
+            const auto low = static_cast<unsigned int>(
+                1U + (index * 3U + matrix * 5U) % 15U);
+            const auto high = static_cast<unsigned int>(
+                1U + (index * 7U + matrix * 11U) % 15U);
+            weights[index] = static_cast<std::byte>(low | (high << 4U));
+        }
+        for (std::size_t index = 0U; index < scales.size(); ++index) {
+            scales[index] = static_cast<std::byte>(
+                124U + (index + matrix) % 7U);
+        }
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, weights, storage.back()).ok());
+        uploaded[matrix * 2U] = &storage.back();
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, scales, storage.back()).ok());
+        uploaded[matrix * 2U + 1U] = &storage.back();
+    }
+    const strata::CudaGlm53Expert expert{
+        uploaded[0], uploaded[1], uploaded[2], uploaded[3], uploaded[4],
+        uploaded[5], hidden, intermediate,
+        strata::CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0};
+    std::array<float, hidden> input{};
+    std::array<float, intermediate> activation{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index % 17U) - 8) /
+                       8.0F;
+        activation[index] =
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 16.0F;
+    }
+    std::array<float, intermediate> gate{};
+    std::array<float, intermediate> up{};
+    std::array<float, hidden> down{};
+    const std::span<const strata::CudaGlm53Expert> one(&expert, 1U);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(device, one, input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(device, gate, up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(device, one, activation).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, down).ok());
+
+    const auto require_exact_rows = [&](std::span<const std::byte> weights,
+                                        std::span<const std::byte> scales,
+                                        std::span<const float> values,
+                                        std::span<const float> actual) {
+        for (std::size_t row = 0U; row < actual.size(); ++row) {
+            const auto row_weights = weights.subspan(
+                row * values.size() / 2U, values.size() / 2U);
+            const auto row_scales = scales.subspan(
+                row * values.size() / 32U, values.size() / 32U);
+            const float expected = strata::glm53_host_fp4_group32_row_dot(
+                row_weights, row_scales, values, true);
+            REQUIRE(std::bit_cast<std::uint32_t>(actual[row]) ==
+                    std::bit_cast<std::uint32_t>(expected));
+        }
+    };
+    require_exact_rows(host_weights[0], host_scales[0], input, gate);
+    require_exact_rows(host_weights[1], host_scales[1], input, up);
+    require_exact_rows(host_weights[2], host_scales[2], activation, down);
+}
+
 TEST_CASE("a partially prepacked MXFP4 MoE batch is refused, not half-served") {
     const auto devices = strata::CudaBackend::available_devices();
     if (!strata::CudaBackend::compiled() || devices.empty()) return;

@@ -135,6 +135,7 @@ add_library(strata_models STATIC
     src/models/glm53/glm53_manifest.cpp
     src/models/glm53/glm53_sequence.cpp
     src/models/glm53/glm53_checkpoint.cpp
+    src/models/glm53/glm53_expert_profile.cpp
     src/models/glm53/glm53_runtime.cpp
     src/models/kimi_k3/kimi_k3_ops.cpp
     src/models/kimi_k3/kimi_k3_manifest.cpp

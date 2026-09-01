@@ -3140,6 +3140,61 @@ __global__ void glm53_shared_expert_dot_kernel(
                             __fadd_rn(total[2], total[3]));
 }
 
+// MXFP4 counterpart to the exact FP8 dot above. The publisher stores two
+// E2M1 codes per byte and one E8M0 scale per 32 columns. Eight threads retain
+// the host AVX2 path's eight accumulator vectors and the identical combine
+// tree; only the checkpoint-native decode differs.
+__global__ void glm53_shared_expert_fp4_dot_kernel(
+    float* output, const unsigned char* weights,
+    const unsigned char* scales, const float* input, std::uint32_t rows,
+    std::uint32_t columns) {
+    constexpr std::uint32_t kGroups = 8U;
+    const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = thread / kGroups;
+    const std::uint32_t group = thread % kGroups;
+    if (row >= rows) return;
+    const auto* weight_row = weights +
+        static_cast<std::uint64_t>(row) * (columns / 2U);
+    const auto* scale_row = scales +
+        static_cast<std::uint64_t>(row) * (columns / 32U);
+    float accumulator[8];
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
+    for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
+        const float scale = fp8_e8m0_scale_bits(
+            scale_row[column / 32U + group / 4U]);
+        const auto packed = *reinterpret_cast<const unsigned int*>(
+            weight_row + column / 2U + group * 4U);
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            const auto encoded = (packed >> (lane * 4U)) & 0x0FU;
+            accumulator[lane] = __fmaf_rn(
+                __fmul_rn(fp4_e2m1_value(encoded), scale),
+                input[column + group * 8U + lane], accumulator[lane]);
+        }
+    }
+    const unsigned mask = __activemask();
+#pragma unroll
+    for (int width = 4; width != 0; width >>= 1) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            const float other =
+                __shfl_down_sync(mask, accumulator[lane], width, kGroups);
+            if (static_cast<int>(group) < width) {
+                accumulator[lane] = __fadd_rn(accumulator[lane], other);
+            }
+        }
+    }
+    if (group != 0U) return;
+    float total[4];
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        total[lane] = __fadd_rn(accumulator[lane], accumulator[lane + 4]);
+    }
+    output[row] = __fadd_rn(__fadd_rn(total[0], total[1]),
+                            __fadd_rn(total[2], total[3]));
+}
+
 // The BF16 form uses the same eight-thread mapping and the exact same
 // association as `glm53_host_bf16_dot_avx2`: each thread owns one of the eight
 // AVX2 accumulators and its eight lanes, then the shuffle tree reproduces the

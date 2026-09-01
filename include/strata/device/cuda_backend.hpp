@@ -1181,6 +1181,10 @@ public:
     // returned raw, so the caller applies exactly the rounding the host path
     // applies. Outputs are laid out expert-major: gate and up hold
     // `experts.size() * intermediate` floats, down `experts.size() * hidden`.
+    // Input may be one hidden row broadcast to every expert, or one hidden
+    // row per expert for independent-sequence batching. Callers using
+    // independent inputs split mixed resident-tier encodings into homogeneous
+    // commands; the broadcast-input batch-1 path remains valid when mixed.
     //
     // The shared expert is the one-element case. A routed hot tier is the same
     // call with more of them.

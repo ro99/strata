@@ -3081,6 +3081,7 @@ void CUDART_CB run_dsv4_attention_prepare_host_callback(void* opaque) {
 //
 // The dot is returned raw. Every rounding and the SwiGLU stay on the host, so
 // no device libm function -- expf above all -- enters the comparison.
+template <std::uint32_t Batch>
 __global__ void glm53_shared_expert_dot_kernel(
     float* output, const unsigned char* weights, const float* scales,
     const float* input, std::uint32_t rows, std::uint32_t columns,
@@ -3094,25 +3095,35 @@ __global__ void glm53_shared_expert_dot_kernel(
         weights + static_cast<std::uint64_t>(row) * columns;
     const float* scale_row =
         scales + static_cast<std::uint64_t>(row / 128U) * scale_columns;
-    float accumulator[8];
+    float accumulator[Batch][8];
 #pragma unroll
-    for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
+    for (int item = 0; item < static_cast<int>(Batch); ++item) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            accumulator[item][lane] = 0.0F;
+        }
+    }
     for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
         const float scale = scale_row[column / 128U];
         const unsigned char* block = weight_row + column + group * 8U;
-        const float* activation = input + column + group * 8U;
         const uint2 packed = *reinterpret_cast<const uint2*>(block);
-        const float4 low = *reinterpret_cast<const float4*>(activation);
-        const float4 high = *reinterpret_cast<const float4*>(activation + 4);
         const unsigned char* bytes =
             reinterpret_cast<const unsigned char*>(&packed);
-        const float values[8] = {low.x, low.y, low.z, low.w,
-                                 high.x, high.y, high.z, high.w};
+        for (std::uint32_t item = 0U; item < Batch; ++item) {
+            const float* activation = input +
+                static_cast<std::uint64_t>(item) * columns + column +
+                group * 8U;
+            const float4 low = *reinterpret_cast<const float4*>(activation);
+            const float4 high =
+                *reinterpret_cast<const float4*>(activation + 4);
+            const float values[8] = {low.x, low.y, low.z, low.w,
+                                     high.x, high.y, high.z, high.w};
 #pragma unroll
-        for (int lane = 0; lane < 8; ++lane) {
-            accumulator[lane] = __fmaf_rn(
-                __fmul_rn(fp8_e4m3_value(bytes[lane]), scale), values[lane],
-                accumulator[lane]);
+            for (int lane = 0; lane < 8; ++lane) {
+                accumulator[item][lane] = __fmaf_rn(
+                    __fmul_rn(fp8_e4m3_value(bytes[lane]), scale), values[lane],
+                    accumulator[item][lane]);
+            }
         }
     }
     // `for (width = 4; width; width >>= 1) acc[i] += acc[i + width]`, which is
@@ -3120,30 +3131,38 @@ __global__ void glm53_shared_expert_dot_kernel(
     const unsigned mask = __activemask();
 #pragma unroll
     for (int width = 4; width != 0; width >>= 1) {
+        for (std::uint32_t item = 0U; item < Batch; ++item) {
 #pragma unroll
-        for (int lane = 0; lane < 8; ++lane) {
-            const float other =
-                __shfl_down_sync(mask, accumulator[lane], width, kGroups);
-            if (static_cast<int>(group) < width) {
-                accumulator[lane] = __fadd_rn(accumulator[lane], other);
+            for (int lane = 0; lane < 8; ++lane) {
+                const float other = __shfl_down_sync(
+                    mask, accumulator[item][lane], width, kGroups);
+                if (static_cast<int>(group) < width) {
+                    accumulator[item][lane] =
+                        __fadd_rn(accumulator[item][lane], other);
+                }
             }
         }
     }
     if (group != 0U) return;
     // _mm_add_ps of the two 128-bit halves, then the two _mm_hadd_ps.
-    float total[4];
+    for (std::uint32_t item = 0U; item < Batch; ++item) {
+        float total[4];
 #pragma unroll
-    for (int lane = 0; lane < 4; ++lane) {
-        total[lane] = __fadd_rn(accumulator[lane], accumulator[lane + 4]);
+        for (int lane = 0; lane < 4; ++lane) {
+            total[lane] = __fadd_rn(accumulator[item][lane],
+                                    accumulator[item][lane + 4]);
+        }
+        output[static_cast<std::uint64_t>(item) * rows + row] =
+            __fadd_rn(__fadd_rn(total[0], total[1]),
+                      __fadd_rn(total[2], total[3]));
     }
-    output[row] = __fadd_rn(__fadd_rn(total[0], total[1]),
-                            __fadd_rn(total[2], total[3]));
 }
 
 // MXFP4 counterpart to the exact FP8 dot above. The publisher stores two
 // E2M1 codes per byte and one E8M0 scale per 32 columns. Eight threads retain
 // the host AVX2 path's eight accumulator vectors and the identical combine
 // tree; only the checkpoint-native decode differs.
+template <std::uint32_t Batch>
 __global__ void glm53_shared_expert_fp4_dot_kernel(
     float* output, const unsigned char* weights,
     const unsigned char* scales, const float* input, std::uint32_t rows,
@@ -3157,9 +3176,14 @@ __global__ void glm53_shared_expert_fp4_dot_kernel(
         static_cast<std::uint64_t>(row) * (columns / 2U);
     const auto* scale_row = scales +
         static_cast<std::uint64_t>(row) * (columns / 32U);
-    float accumulator[8];
+    float accumulator[Batch][8];
 #pragma unroll
-    for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
+    for (int item = 0; item < static_cast<int>(Batch); ++item) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            accumulator[item][lane] = 0.0F;
+        }
+    }
     for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
         const float scale = fp8_e8m0_scale_bits(
             scale_row[column / 32U + group / 4U]);
@@ -3168,31 +3192,42 @@ __global__ void glm53_shared_expert_fp4_dot_kernel(
 #pragma unroll
         for (int lane = 0; lane < 8; ++lane) {
             const auto encoded = (packed >> (lane * 4U)) & 0x0FU;
-            accumulator[lane] = __fmaf_rn(
-                __fmul_rn(fp4_e2m1_value(encoded), scale),
-                input[column + group * 8U + lane], accumulator[lane]);
+            for (std::uint32_t item = 0U; item < Batch; ++item) {
+                accumulator[item][lane] = __fmaf_rn(
+                    __fmul_rn(fp4_e2m1_value(encoded), scale),
+                    input[static_cast<std::uint64_t>(item) * columns + column +
+                          group * 8U + lane],
+                    accumulator[item][lane]);
+            }
         }
     }
     const unsigned mask = __activemask();
 #pragma unroll
     for (int width = 4; width != 0; width >>= 1) {
+        for (std::uint32_t item = 0U; item < Batch; ++item) {
 #pragma unroll
-        for (int lane = 0; lane < 8; ++lane) {
-            const float other =
-                __shfl_down_sync(mask, accumulator[lane], width, kGroups);
-            if (static_cast<int>(group) < width) {
-                accumulator[lane] = __fadd_rn(accumulator[lane], other);
+            for (int lane = 0; lane < 8; ++lane) {
+                const float other = __shfl_down_sync(
+                    mask, accumulator[item][lane], width, kGroups);
+                if (static_cast<int>(group) < width) {
+                    accumulator[item][lane] =
+                        __fadd_rn(accumulator[item][lane], other);
+                }
             }
         }
     }
     if (group != 0U) return;
-    float total[4];
+    for (std::uint32_t item = 0U; item < Batch; ++item) {
+        float total[4];
 #pragma unroll
-    for (int lane = 0; lane < 4; ++lane) {
-        total[lane] = __fadd_rn(accumulator[lane], accumulator[lane + 4]);
+        for (int lane = 0; lane < 4; ++lane) {
+            total[lane] = __fadd_rn(accumulator[item][lane],
+                                    accumulator[item][lane + 4]);
+        }
+        output[static_cast<std::uint64_t>(item) * rows + row] =
+            __fadd_rn(__fadd_rn(total[0], total[1]),
+                      __fadd_rn(total[2], total[3]));
     }
-    output[row] = __fadd_rn(__fadd_rn(total[0], total[1]),
-                            __fadd_rn(total[2], total[3]));
 }
 
 // The BF16 form uses the same eight-thread mapping and the exact same
@@ -3201,6 +3236,7 @@ __global__ void glm53_shared_expert_fp4_dot_kernel(
 // host vector additions and horizontal reduction. Only the checkpoint-native
 // weight decode differs from the FP8 kernel above. The raw dot comes back to
 // the host; rounding and SwiGLU deliberately do not move to CUDA.
+template <std::uint32_t Batch>
 __global__ void glm53_shared_expert_bf16_dot_kernel(
     float* output, const unsigned short* weights, const float* input,
     std::uint32_t rows, std::uint32_t columns) {
@@ -3211,52 +3247,119 @@ __global__ void glm53_shared_expert_bf16_dot_kernel(
     if (row >= rows) return;
     const unsigned short* weight = weights +
         static_cast<std::uint64_t>(row) * columns + group * 8U;
-    const float* activation = input + group * 8U;
-    float accumulator[8];
+    float accumulator[Batch][8];
 #pragma unroll
-    for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
+    for (int item = 0; item < static_cast<int>(Batch); ++item) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            accumulator[item][lane] = 0.0F;
+        }
+    }
     for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
         const ushort4 encoded_low =
             *reinterpret_cast<const ushort4*>(weight + column);
         const ushort4 encoded_high =
             *reinterpret_cast<const ushort4*>(weight + column + 4U);
-        const float4 input_low =
-            *reinterpret_cast<const float4*>(activation + column);
-        const float4 input_high =
-            *reinterpret_cast<const float4*>(activation + column + 4U);
         const unsigned short encoded[8] = {
             encoded_low.x, encoded_low.y, encoded_low.z, encoded_low.w,
             encoded_high.x, encoded_high.y, encoded_high.z, encoded_high.w};
-        const float values[8] = {
-            input_low.x, input_low.y, input_low.z, input_low.w,
-            input_high.x, input_high.y, input_high.z, input_high.w};
+        for (std::uint32_t item = 0U; item < Batch; ++item) {
+            const float* activation = input +
+                static_cast<std::uint64_t>(item) * columns + group * 8U;
+            const float4 input_low =
+                *reinterpret_cast<const float4*>(activation + column);
+            const float4 input_high =
+                *reinterpret_cast<const float4*>(activation + column + 4U);
+            const float values[8] = {
+                input_low.x, input_low.y, input_low.z, input_low.w,
+                input_high.x, input_high.y, input_high.z, input_high.w};
 #pragma unroll
-        for (int lane = 0; lane < 8; ++lane) {
-            accumulator[lane] = __fmaf_rn(
-                __uint_as_float(static_cast<unsigned int>(encoded[lane]) << 16U),
-                values[lane], accumulator[lane]);
+            for (int lane = 0; lane < 8; ++lane) {
+                accumulator[item][lane] = __fmaf_rn(
+                    __uint_as_float(
+                        static_cast<unsigned int>(encoded[lane]) << 16U),
+                    values[lane], accumulator[item][lane]);
+            }
         }
     }
     const unsigned mask = __activemask();
 #pragma unroll
     for (int width = 4; width != 0; width >>= 1) {
+        for (std::uint32_t item = 0U; item < Batch; ++item) {
 #pragma unroll
-        for (int lane = 0; lane < 8; ++lane) {
-            const float other =
-                __shfl_down_sync(mask, accumulator[lane], width, kGroups);
-            if (static_cast<int>(group) < width) {
-                accumulator[lane] = __fadd_rn(accumulator[lane], other);
+            for (int lane = 0; lane < 8; ++lane) {
+                const float other = __shfl_down_sync(
+                    mask, accumulator[item][lane], width, kGroups);
+                if (static_cast<int>(group) < width) {
+                    accumulator[item][lane] =
+                        __fadd_rn(accumulator[item][lane], other);
+                }
             }
         }
     }
     if (group != 0U) return;
-    float total[4];
+    for (std::uint32_t item = 0U; item < Batch; ++item) {
+        float total[4];
 #pragma unroll
-    for (int lane = 0; lane < 4; ++lane) {
-        total[lane] = __fadd_rn(accumulator[lane], accumulator[lane + 4]);
+        for (int lane = 0; lane < 4; ++lane) {
+            total[lane] = __fadd_rn(accumulator[item][lane],
+                                    accumulator[item][lane + 4]);
+        }
+        output[static_cast<std::uint64_t>(item) * rows + row] =
+            __fadd_rn(__fadd_rn(total[0], total[1]),
+                      __fadd_rn(total[2], total[3]));
     }
-    output[row] = __fadd_rn(__fadd_rn(total[0], total[1]),
-                            __fadd_rn(total[2], total[3]));
+}
+
+inline void launch_glm53_shared_expert_dot(
+    dim3 blocks, dim3 threads, cudaStream_t stream, float* output,
+    const unsigned char* weights, const float* scales, const float* input,
+    std::uint32_t rows, std::uint32_t columns, std::uint32_t scale_columns,
+    std::uint32_t batch) {
+#define STRATA_GLM53_LAUNCH_FP8(BATCH)                                      \
+    glm53_shared_expert_dot_kernel<BATCH><<<blocks, threads, 0U, stream>>>( \
+        output, weights, scales, input, rows, columns, scale_columns)
+    switch (batch) {
+        case 4U: STRATA_GLM53_LAUNCH_FP8(4U); break;
+        case 3U: STRATA_GLM53_LAUNCH_FP8(3U); break;
+        case 2U: STRATA_GLM53_LAUNCH_FP8(2U); break;
+        default: STRATA_GLM53_LAUNCH_FP8(1U); break;
+    }
+#undef STRATA_GLM53_LAUNCH_FP8
+}
+
+inline void launch_glm53_shared_expert_fp4_dot(
+    dim3 blocks, dim3 threads, cudaStream_t stream, float* output,
+    const unsigned char* weights, const unsigned char* scales,
+    const float* input, std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t batch) {
+#define STRATA_GLM53_LAUNCH_FP4(BATCH)                                       \
+    glm53_shared_expert_fp4_dot_kernel<BATCH>                                \
+        <<<blocks, threads, 0U, stream>>>(output, weights, scales, input, rows, \
+                                          columns)
+    switch (batch) {
+        case 4U: STRATA_GLM53_LAUNCH_FP4(4U); break;
+        case 3U: STRATA_GLM53_LAUNCH_FP4(3U); break;
+        case 2U: STRATA_GLM53_LAUNCH_FP4(2U); break;
+        default: STRATA_GLM53_LAUNCH_FP4(1U); break;
+    }
+#undef STRATA_GLM53_LAUNCH_FP4
+}
+
+inline void launch_glm53_shared_expert_bf16_dot(
+    dim3 blocks, dim3 threads, cudaStream_t stream, float* output,
+    const unsigned short* weights, const float* input, std::uint32_t rows,
+    std::uint32_t columns, std::uint32_t batch) {
+#define STRATA_GLM53_LAUNCH_BF16(BATCH)                                    \
+    glm53_shared_expert_bf16_dot_kernel<BATCH>                             \
+        <<<blocks, threads, 0U, stream>>>(output, weights, input, rows, columns)
+    switch (batch) {
+        case 4U: STRATA_GLM53_LAUNCH_BF16(4U); break;
+        case 3U: STRATA_GLM53_LAUNCH_BF16(3U); break;
+        case 2U: STRATA_GLM53_LAUNCH_BF16(2U); break;
+        default: STRATA_GLM53_LAUNCH_BF16(1U); break;
+    }
+#undef STRATA_GLM53_LAUNCH_BF16
 }
 
 }  // namespace

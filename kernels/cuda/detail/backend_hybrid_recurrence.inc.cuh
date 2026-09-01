@@ -2284,9 +2284,26 @@ namespace {
     return {};
 }
 
-// Eight routed experts plus the shared one is the widest batch GLM-5.3 can
-// present at a single decode row, so the device scratch is sized for it once.
-constexpr std::size_t kGlm53MaxDeviceExperts = 9U;
+// Admission caps a cohort at 32 sequences. Each can contribute eight routed
+// experts plus the shared one. Duplicate descriptors are intentional: they
+// let a cohort apply one resident matrix to several independent activations
+// without introducing a completion per request.
+constexpr std::size_t kGlm53MaxDeviceExperts = 32U * 9U;
+constexpr std::size_t kGlm53ExpertKernelBatch = 4U;
+
+[[nodiscard]] bool same_glm53_expert(const CudaGlm53Expert& left,
+                                     const CudaGlm53Expert& right) noexcept {
+    return left.encoding == right.encoding && left.hidden == right.hidden &&
+           left.intermediate == right.intermediate &&
+           left.gate_weights == right.gate_weights &&
+           left.up_weights == right.up_weights &&
+           left.down_weights == right.down_weights &&
+           left.gate_scales == right.gate_scales &&
+           left.up_scales == right.up_scales &&
+           left.down_scales == right.down_scales &&
+           left.gate == right.gate && left.up == right.up &&
+           left.down == right.down;
+}
 
 }  // namespace
 
@@ -2330,7 +2347,8 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
             }
         }
     }
-    if (input.size() != hidden) {
+    const bool per_expert_input = input.size() == experts.size() * hidden;
+    if (input.size() != hidden && !per_expert_input) {
         return {{"GLM-5.3 expert batch input has an invalid shape"}};
     }
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
@@ -2350,7 +2368,7 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
             static_cast<std::uint64_t>(kGlm53MaxDeviceExperts) * intermediate;
         const std::uint64_t batch_hidden =
             static_cast<std::uint64_t>(kGlm53MaxDeviceExperts) * hidden;
-        if (auto status = allocate(state.glm53_shared_input, hidden);
+        if (auto status = allocate(state.glm53_shared_input, batch_hidden);
             status != cudaSuccess) {
             return cuda_error(status, "allocate GLM-5.3 expert batch input");
         }
@@ -2394,7 +2412,7 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     std::copy(input.begin(), input.end(), state.glm53_shared_staging);
     if (auto status = cudaMemcpyAsync(
             state.glm53_shared_input, state.glm53_shared_staging,
-            hidden * sizeof(float), cudaMemcpyHostToDevice, state.stream);
+            input.size() * sizeof(float), cudaMemcpyHostToDevice, state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "upload GLM-5.3 expert batch input");
     }
@@ -2406,9 +2424,20 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     constexpr std::uint32_t threads = 256U;
     const std::uint32_t blocks = (intermediate * 8U + threads - 1U) / threads;
     const auto scale_columns = hidden / 128U;
-    for (std::size_t index = 0U; index < experts.size(); ++index) {
+    for (std::size_t index = 0U; index < experts.size();) {
         const auto& expert = experts[index];
+        std::size_t batch = 1U;
+        while (per_expert_input &&
+               expert.encoding !=
+                   CudaGlm53ExpertEncoding::Fp8E4m3Block128F32 &&
+               batch < kGlm53ExpertKernelBatch &&
+               index + batch < experts.size() &&
+               same_glm53_expert(expert, experts[index + batch])) {
+            ++batch;
+        }
         const auto offset = index * intermediate;
+        const auto* expert_input = state.glm53_shared_input +
+            (per_expert_input ? index * hidden : 0U);
         const auto weight_data = [](const CudaBuffer* buffer,
                                     const CudaWeight* weight) {
             return weight != nullptr ? weight->impl_->weights
@@ -2421,52 +2450,61 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
                                                           : buffer->impl_->data);
         };
         if (expert.encoding == CudaGlm53ExpertEncoding::Bf16) {
-            glm53_shared_expert_bf16_dot_kernel<<<
-                blocks, threads, 0U, state.stream>>>(
+            launch_glm53_shared_expert_bf16_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_gate + offset,
                 static_cast<const unsigned short*>(
                     weight_data(expert.gate_weights, expert.gate)),
-                state.glm53_shared_input, intermediate, hidden);
-            glm53_shared_expert_bf16_dot_kernel<<<
-                blocks, threads, 0U, state.stream>>>(
+                expert_input, intermediate, hidden,
+                static_cast<std::uint32_t>(batch));
+            launch_glm53_shared_expert_bf16_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_up + offset,
                 static_cast<const unsigned short*>(
                     weight_data(expert.up_weights, expert.up)),
-                state.glm53_shared_input, intermediate, hidden);
+                expert_input, intermediate, hidden,
+                static_cast<std::uint32_t>(batch));
         } else if (expert.encoding ==
                    CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0) {
-            glm53_shared_expert_fp4_dot_kernel<<<
-                blocks, threads, 0U, state.stream>>>(
+            launch_glm53_shared_expert_fp4_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_gate + offset,
                 static_cast<const unsigned char*>(
                     weight_data(expert.gate_weights, expert.gate)),
                 static_cast<const unsigned char*>(
                     scale_data(expert.gate_scales, expert.gate)),
-                state.glm53_shared_input, intermediate, hidden);
-            glm53_shared_expert_fp4_dot_kernel<<<
-                blocks, threads, 0U, state.stream>>>(
+                expert_input, intermediate, hidden,
+                static_cast<std::uint32_t>(batch));
+            launch_glm53_shared_expert_fp4_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_up + offset,
                 static_cast<const unsigned char*>(
                     weight_data(expert.up_weights, expert.up)),
                 static_cast<const unsigned char*>(
                     scale_data(expert.up_scales, expert.up)),
-                state.glm53_shared_input, intermediate, hidden);
+                expert_input, intermediate, hidden,
+                static_cast<std::uint32_t>(batch));
         } else {
-            glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
+            launch_glm53_shared_expert_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_gate + offset,
                 static_cast<const unsigned char*>(
                     weight_data(expert.gate_weights, expert.gate)),
                 static_cast<const float*>(
                     scale_data(expert.gate_scales, expert.gate)),
-                state.glm53_shared_input, intermediate, hidden, scale_columns);
-            glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
+                expert_input, intermediate, hidden, scale_columns,
+                static_cast<std::uint32_t>(batch));
+            launch_glm53_shared_expert_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_up + offset,
                 static_cast<const unsigned char*>(
                     weight_data(expert.up_weights, expert.up)),
                 static_cast<const float*>(
                     scale_data(expert.up_scales, expert.up)),
-                state.glm53_shared_input, intermediate, hidden, scale_columns);
+                expert_input, intermediate, hidden, scale_columns,
+                static_cast<std::uint32_t>(batch));
         }
+        index += batch;
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch GLM-5.3 expert batch gate and up");
@@ -2592,8 +2630,16 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
     }
     constexpr std::uint32_t threads = 256U;
     const std::uint32_t blocks = (hidden * 8U + threads - 1U) / threads;
-    for (std::size_t index = 0U; index < experts.size(); ++index) {
+    for (std::size_t index = 0U; index < experts.size();) {
         const auto& expert = experts[index];
+        std::size_t batch = 1U;
+        while (expert.encoding !=
+                   CudaGlm53ExpertEncoding::Fp8E4m3Block128F32 &&
+               batch < kGlm53ExpertKernelBatch &&
+               index + batch < experts.size() &&
+               same_glm53_expert(expert, experts[index + batch])) {
+            ++batch;
+        }
         const auto weight_data = [](const CudaBuffer* buffer,
                                     const CudaWeight* weight) {
             return weight != nullptr ? weight->impl_->weights
@@ -2606,34 +2652,37 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
                                                           : buffer->impl_->data);
         };
         if (expert.encoding == CudaGlm53ExpertEncoding::Bf16) {
-            glm53_shared_expert_bf16_dot_kernel<<<
-                blocks, threads, 0U, state.stream>>>(
+            launch_glm53_shared_expert_bf16_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_output + index * hidden,
                 static_cast<const unsigned short*>(
                     weight_data(expert.down_weights, expert.down)),
                 state.glm53_shared_activation + index * intermediate, hidden,
-                intermediate);
+                intermediate, static_cast<std::uint32_t>(batch));
         } else if (expert.encoding ==
                    CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0) {
-            glm53_shared_expert_fp4_dot_kernel<<<
-                blocks, threads, 0U, state.stream>>>(
+            launch_glm53_shared_expert_fp4_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_output + index * hidden,
                 static_cast<const unsigned char*>(
                     weight_data(expert.down_weights, expert.down)),
                 static_cast<const unsigned char*>(
                     scale_data(expert.down_scales, expert.down)),
                 state.glm53_shared_activation + index * intermediate, hidden,
-                intermediate);
+                intermediate, static_cast<std::uint32_t>(batch));
         } else {
-            glm53_shared_expert_dot_kernel<<<blocks, threads, 0U, state.stream>>>(
+            launch_glm53_shared_expert_dot(
+                blocks, threads, state.stream,
                 state.glm53_shared_output + index * hidden,
                 static_cast<const unsigned char*>(
                     weight_data(expert.down_weights, expert.down)),
                 static_cast<const float*>(
                     scale_data(expert.down_scales, expert.down)),
                 state.glm53_shared_activation + index * intermediate, hidden,
-                intermediate, intermediate / 128U);
+                intermediate, intermediate / 128U,
+                static_cast<std::uint32_t>(batch));
         }
+        index += batch;
     }
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch GLM-5.3 expert batch down");

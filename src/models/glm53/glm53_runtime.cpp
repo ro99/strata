@@ -700,7 +700,7 @@ constexpr std::uint64_t kKdaWorkspaceFloats =
 constexpr std::uint64_t kDeviceWorkspaceReserve = 2ULL << 30U;
 constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 
-[[nodiscard]] std::size_t prefix_cache_entries(
+[[nodiscard]] std::uint64_t host_sequence_state_bytes(
     std::uint32_t maximum_context_tokens) noexcept {
     const auto kda_state = 34ULL * kHeads * kLinearHead * kLinearHead *
                            sizeof(float);
@@ -708,8 +708,22 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
         34ULL * 3ULL * kLinearWidth * 3ULL * sizeof(float);
     const auto mla_state = 11ULL * maximum_context_tokens * kKvRank *
                            sizeof(float);
-    const auto state_bytes = std::max<std::uint64_t>(
-        kda_state + convolution_state + mla_state, 1U);
+    const auto hidden_history =
+        static_cast<std::uint64_t>(maximum_context_tokens) * kHidden *
+        sizeof(float);
+    const auto logits = static_cast<std::uint64_t>(kVocabulary) *
+                        sizeof(float);
+    const auto tokens = static_cast<std::uint64_t>(maximum_context_tokens) *
+                        sizeof(std::uint32_t);
+    return std::max<std::uint64_t>(
+        kda_state + convolution_state + mla_state + hidden_history + logits +
+            tokens,
+        1U);
+}
+
+[[nodiscard]] std::size_t host_sequence_capacity(
+    std::uint32_t maximum_context_tokens) noexcept {
+    const auto state_bytes = host_sequence_state_bytes(maximum_context_tokens);
     const auto budget = host_hardware_profile().host_usable_bytes(0.05);
     if (budget == 0U) return 1U;
     return std::clamp<std::size_t>(
@@ -2226,6 +2240,11 @@ struct Glm53Runtime::Impl {
     };
 
     struct PrefixEntry {
+        // This cache is owned by one immutable runtime instance: checkpoint,
+        // tokenizer, adapter set, state layout and numerical-mode controls are
+        // fixed before the first entry exists. Tokens are therefore the only
+        // varying component of the full prefix key; entries can never cross a
+        // model or configuration boundary.
         std::vector<std::uint32_t> tokens;
         Glm53SequenceState state;
         std::vector<float> logits;
@@ -2397,6 +2416,9 @@ struct Glm53Runtime::Impl {
     };
     std::vector<PageGroup> page_groups;
     std::vector<PageAssignment> page_assignments;
+    std::vector<CudaGlm53Expert> page_device_experts;
+    std::vector<std::size_t> page_device_output_slots;
+    std::vector<float> page_device_inputs;
     std::vector<float> page_quantized_input;
     std::vector<float> page_activations;
     std::vector<float> page_expert_outputs;
@@ -2448,6 +2470,10 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> parallel_encode_pages{};
     std::atomic<std::uint64_t> prefix_cache_hits{};
     std::atomic<std::uint64_t> prefix_cache_tokens{};
+    std::atomic<std::uint64_t> prefix_cache_bytes{};
+    std::atomic<std::uint64_t> prefix_cache_entries{};
+    std::atomic<std::uint64_t> prefix_cache_evictions{};
+    std::atomic<std::uint64_t> prefix_cache_evicted_bytes{};
     std::mutex prefix_mutex;
     std::vector<PrefixEntry> prefix_cache;
     std::size_t prefix_cache_limit{1U};
@@ -2465,9 +2491,28 @@ struct Glm53Runtime::Impl {
     std::vector<std::shared_ptr<ScheduledRequest>> active_requests;
     std::thread scheduler_thread;
     std::size_t scheduler_capacity{1U};
+    std::size_t host_state_capacity{1U};
+    std::vector<std::uint64_t> sequence_device_bytes;
+    std::vector<std::uint64_t> sequence_device_free_bytes;
+    std::vector<std::uint64_t> sequence_device_safety_bytes;
+    std::vector<std::uint64_t> sequence_device_fragmented_bytes;
+    std::vector<std::size_t> sequence_device_capacities;
+    std::uint64_t host_state_fragmented_bytes{};
+    std::atomic<std::uint64_t> sequence_slots_live{};
+    std::atomic<std::uint64_t> sequence_slots_peak{};
     bool scheduler_stopping{};
     std::atomic<std::uint64_t> scheduler_iterations{};
     std::atomic<std::uint64_t> scheduler_batched_iterations{};
+    std::atomic<std::uint64_t> scheduler_single_forward_nanoseconds{};
+    std::atomic<std::uint64_t> scheduler_single_forward_tokens{};
+    std::atomic<std::uint64_t> scheduler_batch_forward_nanoseconds{};
+    std::atomic<std::uint64_t> scheduler_batch_forward_tokens{};
+    std::array<std::atomic<std::uint64_t>, 33U>
+        scheduler_width_iterations{};
+    std::array<std::atomic<std::uint64_t>, 33U>
+        scheduler_width_forward_nanoseconds{};
+    std::array<std::atomic<std::uint64_t>, 33U>
+        scheduler_width_tokens{};
     std::atomic<std::uint64_t> mtp_drafts{};
     std::atomic<std::uint64_t> mtp_accepted{};
     std::atomic<bool> profiler_captured{};
@@ -2674,6 +2719,123 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] int device_for(std::uint32_t layer) const noexcept {
         return devices[slot_for(layer)];
+    }
+
+    [[nodiscard]] std::vector<std::uint64_t>
+    expected_sequence_device_bytes() const {
+        std::vector<std::uint64_t> bytes(devices.size(), 0U);
+        const auto kda_floats =
+            static_cast<std::uint64_t>(kHeads) * kLinearHead * kLinearHead +
+            3ULL * kLinearWidth * 3ULL +
+            3ULL * kLinearWidth * 4ULL + kHeads + kLinearWidth +
+            kLinearHead + kKdaWorkspaceFloats;
+        const auto mla_floats =
+            static_cast<std::uint64_t>(config.maximum_context_tokens) *
+                kKvRank +
+            kQueryRank + kKvRank;
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto slot = slot_for(layer);
+            if (glm53_kda_layer(layer)) {
+                bytes[slot] += kda_floats * sizeof(float);
+                continue;
+            }
+            const auto attention = "model.language_model.layers." +
+                std::to_string(layer) + ".self_attn.";
+            // Both current releases store MLA KV-B in BF16. Key this ledger
+            // from the actual tensor dtype, not the checkpoint's routed-expert
+            // quantization label: otherwise FP8 is undercharged by the full
+            // persistent expanded-history allocation and over-admitted.
+            const bool persistent_mla_expansion = weights != nullptr &&
+                weights->mla_kv_b_is_bf16(attention);
+            const auto expanded_mla_bytes = persistent_mla_expansion
+                ? static_cast<std::uint64_t>(
+                      config.maximum_context_tokens) * kHeads * 2ULL *
+                      kMlaHead * sizeof(std::uint16_t)
+                : 0U;
+            bytes[slot] += mla_floats * sizeof(float) + expanded_mla_bytes;
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] std::vector<std::uint64_t> actual_sequence_device_bytes(
+        const DeviceSequenceState& sequence) const {
+        std::vector<std::uint64_t> bytes(devices.size(), 0U);
+        for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+            const auto& buffer = glm53_kda_layer(layer)
+                ? sequence.kda[layer] : sequence.mla[layer];
+            if (!buffer.valid()) continue;
+            const auto found = std::find(devices.begin(), devices.end(),
+                                         buffer.device());
+            if (found == devices.end()) continue;
+            bytes[static_cast<std::size_t>(found - devices.begin())] +=
+                buffer.device_bytes();
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] ValidationResult configure_sequence_admission() {
+        sequence_device_bytes = expected_sequence_device_bytes();
+        sequence_device_free_bytes.assign(devices.size(), 0U);
+        sequence_device_safety_bytes.assign(devices.size(), 0U);
+        sequence_device_fragmented_bytes.assign(devices.size(), 0U);
+        sequence_device_capacities.assign(devices.size(), 0U);
+        const auto host_state_size =
+            host_sequence_state_bytes(config.maximum_context_tokens);
+        const auto host_budget =
+            host_hardware_profile().host_usable_bytes(0.05);
+        host_state_fragmented_bytes = host_budget >
+                host_state_capacity * host_state_size
+            ? host_budget - host_state_capacity * host_state_size : 0U;
+        std::size_t capacity = std::min<std::size_t>(32U,
+                                                     host_state_capacity);
+        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+            auto memory = CudaBackend::device_memory(devices[slot]);
+            if (!memory.ok()) return {std::move(memory.errors)};
+            const auto free = memory.value.free_bytes;
+            // Keep five percent of the post-warm free pool outside admission
+            // for driver bookkeeping and transient CUDA launch state. This is
+            // discovered from the loaded process, not a card-size constant.
+            const auto safety = free / 20U;
+            const auto usable = free - safety;
+            const auto required = sequence_device_bytes[slot];
+            const auto slots = required == 0U
+                ? std::size_t{32U}
+                : static_cast<std::size_t>(usable / required);
+            sequence_device_free_bytes[slot] = free;
+            sequence_device_safety_bytes[slot] = safety;
+            sequence_device_fragmented_bytes[slot] = required == 0U
+                ? 0U : usable - static_cast<std::uint64_t>(slots) * required;
+            sequence_device_capacities[slot] = slots;
+            capacity = std::min(capacity, slots);
+        }
+        if (capacity == 0U) {
+            return {{"GLM-5.3 has insufficient post-warm CUDA capacity for "
+                     "one complete sequence state"}};
+        }
+        // Prefix snapshots own host-only COW state. Reserve one host block for
+        // that required M7 capability before publishing live-request
+        // capacity; if the host can hold only one state, keep serving exact
+        // requests and disable prefix retention instead of overcommitting.
+        scheduler_capacity = host_state_capacity > 1U
+            ? std::min(capacity, host_state_capacity - 1U) : capacity;
+        prefix_cache_limit = host_state_capacity > scheduler_capacity
+            ? host_state_capacity - scheduler_capacity : 0U;
+        std::cerr << "[glm53-sequence-admission] host_state_bytes="
+                  << host_sequence_state_bytes(config.maximum_context_tokens)
+                  << " host_capacity=" << host_state_capacity;
+        for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+            std::cerr << " cuda" << devices[slot] << "_state_bytes="
+                      << sequence_device_bytes[slot]
+                      << " cuda" << devices[slot] << "_free_bytes="
+                      << sequence_device_free_bytes[slot]
+                      << " cuda" << devices[slot] << "_safety_bytes="
+                      << sequence_device_safety_bytes[slot]
+                      << " cuda" << devices[slot] << "_capacity="
+                      << sequence_device_capacities[slot];
+        }
+        std::cerr << " scheduler_capacity=" << scheduler_capacity
+                  << " prefix_capacity=" << prefix_cache_limit << '\n';
+        return {};
     }
 
     [[nodiscard]] ParseResult<std::shared_ptr<const std::vector<float>>>
@@ -3412,7 +3574,8 @@ struct Glm53Runtime::Impl {
     [[nodiscard]] ValidationResult host_moe_page(
         std::uint32_t layer, std::string_view prefix,
         std::span<const std::array<KimiRoutedExpert, 8U>> routes,
-        std::span<const float> input, std::span<float> output) {
+        std::span<const float> input, std::span<float> output,
+        bool allow_device_tiers) {
         ValidationResult result;
         constexpr std::uint32_t intermediate = 2048U;
         constexpr std::size_t routes_per_row = 8U;
@@ -3425,15 +3588,43 @@ struct Glm53Runtime::Impl {
         }
         const auto started = std::chrono::steady_clock::now();
         const auto view_started = started;
+        const int layer_device = device_for(layer);
+        const int shared_device = allow_device_tiers &&
+                                  shared_experts.active &&
+                                  layer < shared_experts.devices.size()
+            ? shared_experts.devices[layer] : -1;
+        if (shared_device >= 0 && shared_device != layer_device) {
+            return {{"GLM-5.3 expert tiers disagree on layer owner"}};
+        }
         std::array<std::size_t, 288U> group_for_expert;
         group_for_expert.fill(std::numeric_limits<std::size_t>::max());
         auto& groups = page_groups;
         groups.clear();
+        auto& device_experts = page_device_experts;
+        auto& device_output_slots = page_device_output_slots;
+        device_experts.clear();
+        device_output_slots.clear();
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto expert = routes[row][route].expert;
                 if (expert >= group_for_expert.size()) {
                     return {{"GLM-5.3 host page route is out of range"}};
+                }
+                const bool resident = allow_device_tiers &&
+                    static_experts.active_tier &&
+                    static_experts.active[layer][expert] != 0U;
+                if (resident) {
+                    device_experts.push_back(
+                        static_experts.experts[layer][expert]);
+                    device_output_slots.push_back(
+                        row * outputs_per_row + route);
+                    static_experts.route_hits.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    continue;
+                }
+                if (allow_device_tiers && static_experts.active_tier) {
+                    static_experts.route_misses.fetch_add(
+                        1U, std::memory_order_relaxed);
                 }
                 auto& group_index = group_for_expert[expert];
                 if (group_index == std::numeric_limits<std::size_t>::max()) {
@@ -3442,14 +3633,61 @@ struct Glm53Runtime::Impl {
                 }
                 ++groups[group_index].assignment_count;
             }
+            if (shared_device >= 0) {
+                device_experts.push_back(shared_experts.experts[layer]);
+                device_output_slots.push_back(
+                    row * outputs_per_row + routes_per_row);
+                shared_expert_device_calls.fetch_add(
+                    1U, std::memory_order_relaxed);
+            }
         }
-        groups.push_back({0U, true, {}, 0U, rows});
+        if (shared_device < 0) {
+            groups.push_back({0U, true, {}, 0U, rows});
+            if (allow_device_tiers && shared_experts.active) {
+                shared_expert_host_calls.fetch_add(
+                    rows, std::memory_order_relaxed);
+                if (layer < 64U) {
+                    shared_expert_host_layers.fetch_or(
+                        std::uint64_t{1U} << layer,
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+        // Group identical resident matrices contiguously. The CUDA primitive
+        // then evaluates up to four independent activations while streaming a
+        // weight row once. Insertion sort is allocation-free and the admitted
+        // cohort is bounded to 32 * 9 assignments.
+        const auto device_key = [&](std::size_t output_slot) {
+            const auto row = output_slot / outputs_per_row;
+            const auto route = output_slot % outputs_per_row;
+            return route < routes_per_row
+                ? static_cast<std::uint32_t>(routes[row][route].expert)
+                : 288U;
+        };
+        for (std::size_t index = 1U; index < device_output_slots.size();
+             ++index) {
+            auto slot = device_output_slots[index];
+            auto descriptor = device_experts[index];
+            const auto key = device_key(slot);
+            auto insertion = index;
+            while (insertion != 0U &&
+                   device_key(device_output_slots[insertion - 1U]) > key) {
+                device_output_slots[insertion] =
+                    device_output_slots[insertion - 1U];
+                device_experts[insertion] = device_experts[insertion - 1U];
+                --insertion;
+            }
+            device_output_slots[insertion] = slot;
+            device_experts[insertion] = descriptor;
+        }
         std::size_t assignment_begin = 0U;
         for (auto& group : groups) {
             group.assignment_begin = assignment_begin;
             assignment_begin += group.assignment_count;
         }
-        if (assignment_begin != rows * outputs_per_row ||
+        if (assignment_begin + device_experts.size() !=
+                rows * outputs_per_row ||
+            device_experts.size() != device_output_slots.size() ||
             page_assignments.size() < assignment_begin) {
             return {{"GLM-5.3 host page assignment scratch is too small"}};
         }
@@ -3460,12 +3698,17 @@ struct Glm53Runtime::Impl {
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto group = group_for_expert[routes[row][route].expert];
+                if (group == std::numeric_limits<std::size_t>::max()) {
+                    continue;
+                }
                 page_assignments[cursors[group]++] = {
                     row, row * outputs_per_row + route};
             }
-            const auto shared_group = groups.size() - 1U;
-            page_assignments[cursors[shared_group]++] = {
-                row, row * outputs_per_row + routes_per_row};
+            if (shared_device < 0) {
+                const auto shared_group = groups.size() - 1U;
+                page_assignments[cursors[shared_group]++] = {
+                    row, row * outputs_per_row + routes_per_row};
+            }
         }
 
         for (auto& group : groups) {
@@ -3519,6 +3762,52 @@ struct Glm53Runtime::Impl {
                 std::memory_order_relaxed);
         }
 
+        const auto device_count = device_experts.size();
+        struct DeviceCommand {
+            std::size_t begin{};
+            std::size_t count{};
+        };
+        std::array<DeviceCommand, 2U> device_commands{};
+        std::size_t device_command_count = 0U;
+        for (std::size_t begin = 0U; begin < device_count;) {
+            auto end = begin + 1U;
+            while (end < device_count &&
+                   device_experts[end].encoding ==
+                       device_experts[begin].encoding) {
+                ++end;
+            }
+            if (device_command_count == device_commands.size()) {
+                return {{"GLM-5.3 device page requires too many expert "
+                         "encoding commands"}};
+            }
+            device_commands[device_command_count++] = {begin, end - begin};
+            begin = end;
+        }
+        auto& device_inputs = page_device_inputs;
+        if (device_inputs.size() < device_count * kHidden) {
+            return {{"GLM-5.3 device page input scratch is too small"}};
+        }
+        for (std::size_t index = 0U; index < device_count; ++index) {
+            const auto input_row =
+                device_output_slots[index] / outputs_per_row;
+            std::copy_n(quantized_input.begin() +
+                            static_cast<std::ptrdiff_t>(input_row * kHidden),
+                        kHidden,
+                        device_inputs.begin() +
+                            static_cast<std::ptrdiff_t>(index * kHidden));
+        }
+        if (device_command_count != 0U) {
+            const auto& command = device_commands.front();
+            result = cuda.enqueue_glm53_expert_gate_up(
+                layer_device,
+                std::span<const CudaGlm53Expert>(device_experts)
+                    .subspan(command.begin, command.count),
+                std::span<const float>(device_inputs)
+                    .subspan(command.begin * kHidden,
+                             command.count * kHidden));
+            if (!result.ok()) return result;
+        }
+
         const auto output_slots = rows * outputs_per_row;
         auto& activations = page_activations;
         if (activations.size() < output_slots * intermediate) {
@@ -3562,11 +3851,48 @@ struct Glm53Runtime::Impl {
         const auto activation_started = std::chrono::steady_clock::now();
         if (fp8_expert_checkpoint()) {
             result = host_moe_workers->parallel_for(
-                output_slots, [&](std::size_t slot) {
-                    glm53_quantize_activation(
-                        std::span<float>(activations)
-                            .subspan(slot * intermediate, intermediate));
+                assignment_begin, [&](std::size_t assignment) {
+                    const auto slot = page_assignments[assignment].output_slot;
+                    glm53_quantize_activation(std::span<float>(activations)
+                                                  .subspan(slot * intermediate,
+                                                           intermediate));
                 });
+            if (!result.ok()) return result;
+        }
+        const auto activate_device_command =
+            [&](const DeviceCommand& command) -> ValidationResult {
+            const auto begin = command.begin * intermediate;
+            const auto count = command.count * intermediate;
+            auto gate = std::span<float>(shared_expert_gate)
+                .subspan(begin, count);
+            auto up = std::span<float>(shared_expert_up)
+                .subspan(begin, count);
+            auto status = cuda.collect_glm53_expert_gate_up(
+                layer_device, gate, up);
+            if (!status.ok()) return status;
+            for (std::size_t index = 0U; index < count; ++index) {
+                auto gate_value = bf16_round_f32(gate[index]);
+                auto up_value = bf16_round_f32(up[index]);
+                gate_value = std::min(gate_value, 10.0F);
+                up_value = std::clamp(up_value, -10.0F, 10.0F);
+                gate[index] = bf16_round_f32(
+                    gate_value * sigmoid(gate_value) * up_value);
+            }
+            if (fp8_expert_checkpoint()) {
+                for (std::size_t expert = 0U; expert < command.count;
+                     ++expert) {
+                    glm53_quantize_activation(
+                        gate.subspan(expert * intermediate, intermediate));
+                }
+            }
+            return cuda.enqueue_glm53_expert_down(
+                layer_device,
+                std::span<const CudaGlm53Expert>(device_experts)
+                    .subspan(command.begin, command.count),
+                std::span<const float>(gate));
+        };
+        if (device_command_count != 0U) {
+            result = activate_device_command(device_commands.front());
             if (!result.ok()) return result;
         }
         if (config.phase_profile) {
@@ -3606,6 +3932,48 @@ struct Glm53Runtime::Impl {
         if (config.phase_profile) {
             host_moe_down_nanoseconds.fetch_add(
                 elapsed_nanoseconds(down_started), std::memory_order_relaxed);
+        }
+        const auto collect_device_command =
+            [&](const DeviceCommand& command) -> ValidationResult {
+            auto device_output = std::span<float>(shared_expert_output)
+                .subspan(command.begin * kHidden, command.count * kHidden);
+            auto status = cuda.collect_glm53_expert_down(
+                layer_device, device_output);
+            if (!status.ok()) return status;
+            for (std::size_t offset = 0U; offset < command.count; ++offset) {
+                const auto index = command.begin + offset;
+                const auto source = device_output.subspan(
+                    offset * kHidden, kHidden);
+                auto destination = std::span<float>(expert_outputs).subspan(
+                    device_output_slots[index] * kHidden, kHidden);
+                for (std::size_t column = 0U; column < kHidden; ++column) {
+                    // Match host_moe::term: CUDA dots are raw, and every
+                    // device expert output crosses the same BF16 boundary
+                    // before the shared/routed reduction.
+                    destination[column] = bf16_round_f32(source[column]);
+                }
+            }
+            return {};
+        };
+        if (device_command_count != 0U) {
+            result = collect_device_command(device_commands.front());
+            if (!result.ok()) return result;
+        }
+        for (std::size_t command_index = 1U;
+             command_index < device_command_count; ++command_index) {
+            const auto& command = device_commands[command_index];
+            result = cuda.enqueue_glm53_expert_gate_up(
+                layer_device,
+                std::span<const CudaGlm53Expert>(device_experts)
+                    .subspan(command.begin, command.count),
+                std::span<const float>(device_inputs)
+                    .subspan(command.begin * kHidden,
+                             command.count * kHidden));
+            if (!result.ok()) return result;
+            result = activate_device_command(command);
+            if (!result.ok()) return result;
+            result = collect_device_command(command);
+            if (!result.ok()) return result;
         }
         const auto reduction_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for(
@@ -3674,20 +4042,38 @@ struct Glm53Runtime::Impl {
         return best->tokens.size();
     }
 
+    [[nodiscard]] static std::uint64_t prefix_entry_bytes(
+        const PrefixEntry& entry) noexcept {
+        return entry.state.private_bytes() +
+            static_cast<std::uint64_t>(entry.tokens.capacity()) *
+                sizeof(std::uint32_t) +
+            static_cast<std::uint64_t>(entry.logits.capacity()) *
+                sizeof(float) +
+            static_cast<std::uint64_t>(entry.base_hidden.capacity()) *
+                sizeof(float);
+    }
+
     void store_prefix(std::span<const std::uint32_t> tokens,
                       const Glm53SequenceState& state,
                       std::span<const float> logits,
                       std::span<const float> base_hidden) {
-        if (tokens.empty() || state.token_count() != tokens.size()) return;
+        if (prefix_cache_limit == 0U || tokens.empty() ||
+            state.token_count() != tokens.size()) return;
         std::scoped_lock lock(prefix_mutex);
         for (auto& entry : prefix_cache) {
             if (entry.tokens.size() == tokens.size() &&
                 std::equal(entry.tokens.begin(), entry.tokens.end(),
                            tokens.begin())) {
+                const auto old_bytes = prefix_entry_bytes(entry);
                 entry.state = state;
                 entry.logits.assign(logits.begin(), logits.end());
                 entry.base_hidden.assign(base_hidden.begin(), base_hidden.end());
                 entry.recency = ++prefix_clock;
+                const auto current = prefix_cache_bytes.load(
+                    std::memory_order_relaxed);
+                prefix_cache_bytes.store(
+                    current - old_bytes + prefix_entry_bytes(entry),
+                    std::memory_order_relaxed);
                 return;
             }
         }
@@ -3697,7 +4083,18 @@ struct Glm53Runtime::Impl {
                 [](const PrefixEntry& left, const PrefixEntry& right) {
                     return left.recency < right.recency;
                 });
-            if (victim != prefix_cache.end()) prefix_cache.erase(victim);
+            if (victim != prefix_cache.end()) {
+                const auto bytes = prefix_entry_bytes(*victim);
+                prefix_cache_bytes.fetch_sub(bytes,
+                                             std::memory_order_relaxed);
+                prefix_cache_evictions.fetch_add(1U,
+                                                 std::memory_order_relaxed);
+                prefix_cache_evicted_bytes.fetch_add(
+                    bytes, std::memory_order_relaxed);
+                prefix_cache.erase(victim);
+                prefix_cache_entries.store(prefix_cache.size(),
+                                           std::memory_order_relaxed);
+            }
         }
         PrefixEntry entry;
         entry.tokens.assign(tokens.begin(), tokens.end());
@@ -3705,7 +4102,11 @@ struct Glm53Runtime::Impl {
         entry.logits.assign(logits.begin(), logits.end());
         entry.base_hidden.assign(base_hidden.begin(), base_hidden.end());
         entry.recency = ++prefix_clock;
+        prefix_cache_bytes.fetch_add(prefix_entry_bytes(entry),
+                                     std::memory_order_relaxed);
         prefix_cache.push_back(std::move(entry));
+        prefix_cache_entries.store(prefix_cache.size(),
+                                   std::memory_order_relaxed);
     }
 
     [[nodiscard]] ValidationResult warmup() {
@@ -3924,6 +4325,17 @@ struct Glm53Runtime::Impl {
         if (result.ok()) {
             auto static_status = admit_static_experts();
             if (!static_status.ok()) return static_status;
+            // The page and independent-sequence schedulers share the fused
+            // mHC slot arena. Reserve its maximum admitted row count before
+            // sampling free VRAM; previously the first request allocated it
+            // after admission and made the reported concurrency optimistic.
+            for (const auto device : devices) {
+                auto slots = cuda.dsv4_mhc_reserve_slots(
+                    device, config.prefill_page_tokens);
+                if (!slots.ok()) return slots;
+            }
+            auto sequence_status = configure_sequence_admission();
+            if (!sequence_status.ok()) return sequence_status;
         }
         if (config.verbose) {
             const auto stats = weights->stats();
@@ -4736,20 +5148,51 @@ struct Glm53Runtime::Impl {
         std::uint32_t rows, std::uint32_t layer, const std::string& prefix,
         std::span<const std::uint64_t> route_requests = {},
         std::span<const std::uint32_t> route_positions = {},
-        bool schedule_prefetch = false, bool route_prefill = false) {
+        bool schedule_prefetch = false, bool route_prefill = false,
+        bool allow_device_tiers = false) {
         if ((!route_requests.empty() || !route_positions.empty()) &&
             (route_requests.size() != rows || route_positions.size() != rows)) {
             return {{"GLM-5.3 route-observation page has an invalid shape"}};
         }
         if (layer != kMtpLayer && !glm53_moe_layer(layer)) {
+            if (allow_device_tiers) {
+                for (std::uint32_t row = 0U; row < rows; ++row) {
+                    auto result = swiglu_block(
+                        output.subspan(static_cast<std::size_t>(row) * kHidden,
+                                       kHidden),
+                        input.subspan(static_cast<std::size_t>(row) * kHidden,
+                                      kHidden),
+                        prefix + "mlp.", 12288U, layer);
+                    if (!result.ok()) return result;
+                }
+                return {};
+            }
             return swiglu_block_page(output, input, prefix + "mlp.", rows,
                                      12288U, layer);
         }
         ValidationResult result;
         std::vector<float> logits(static_cast<std::size_t>(rows) * 288U);
-        result = linear(prefix + "mlp.gate", input, rows, kHidden, logits,
-                        layer, false);
-        if (!result.ok()) return result;
+        if (allow_device_tiers) {
+            // Independent decode sequences share expert weights, not dense
+            // projection arithmetic. Preserve the accepted batch-1 router
+            // association for each row so a close route decision cannot move
+            // merely because another request joined the scheduler cohort.
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = linear(
+                    prefix + "mlp.gate",
+                    input.subspan(static_cast<std::size_t>(row) * kHidden,
+                                  kHidden),
+                    1U, kHidden,
+                    std::span<float>(logits).subspan(
+                        static_cast<std::size_t>(row) * 288U, 288U),
+                    layer, false);
+                if (!result.ok()) return result;
+            }
+        } else {
+            result = linear(prefix + "mlp.gate", input, rows, kHidden, logits,
+                            layer, false);
+            if (!result.ok()) return result;
+        }
         auto bias = host_tensor(
             prefix + "mlp.gate.e_score_correction_bias", 288U);
         if (!bias.ok()) return {std::move(bias.errors)};
@@ -4775,7 +5218,7 @@ struct Glm53Runtime::Impl {
         }
         if (host_moe_active) {
             return host_moe_page(layer, prefix + "mlp.", selected_rows, input,
-                                 output);
+                                 output, allow_device_tiers);
         }
         for (std::uint32_t row = 0U; row < rows; ++row) {
             result = weights->moe(
@@ -5420,6 +5863,143 @@ struct Glm53Runtime::Impl {
     // Independent sequence rows share the layer's resident weights while
     // retaining disjoint recurrent/MLA state. This is the decode batch shape:
     // unlike prompt pages, rows are not causally related to one another.
+    [[nodiscard]] ValidationResult forward_layer_sequences_resident(
+        std::span<float> streams, std::uint32_t layer,
+        std::span<const std::uint32_t> positions,
+        std::span<Glm53SequenceState* const> sequences,
+        std::span<DeviceSequenceState* const> device_sequences) {
+        const auto rows = static_cast<std::uint32_t>(sequences.size());
+        const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
+        if (!resident_execution_active || rows == 0U || layer >= kLayers ||
+            positions.size() != rows || device_sequences.size() != rows ||
+            streams.size() != static_cast<std::size_t>(rows) * stream_columns ||
+            std::any_of(device_sequences.begin(), device_sequences.end(),
+                        [](const auto* state) {
+                            return state == nullptr || !state->ready;
+                        })) {
+            return {{"GLM-5.3 resident sequence batch is not admissible"}};
+        }
+        const auto device = device_for(layer);
+        const auto prefix = "model.language_model.layers." +
+                            std::to_string(layer) + ".";
+        const auto attention = prefix + "self_attn.";
+        ValidationResult result;
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = cuda.dsv4_mhc_select_slot(device, row);
+            if (!result.ok()) return result;
+            result = cuda.dsv4_mhc_begin_device(
+                device, resident_layers[layer].attention,
+                streams.subspan(static_cast<std::size_t>(row) * stream_columns,
+                                stream_columns));
+            if (!result.ok()) return result;
+        }
+        const auto attention_started = std::chrono::steady_clock::now();
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = cuda.dsv4_mhc_select_slot(device, row);
+            if (!result.ok()) return result;
+            if (glm53_kda_layer(layer)) {
+                CudaGlm53KdaRequest request;
+                request.state = &device_sequences[row]->kda[layer];
+                request.heads = kHeads;
+                request.head_dim = kLinearHead;
+                request.convolution_kernel = 4U;
+                request.mhc_source_destination = true;
+                result = weights->kda_decode(
+                    slot_for(layer), attention, request, {});
+            } else {
+                CudaGlm53MlaRequest request;
+                request.state = &device_sequences[row]->mla[layer];
+                request.position = positions[row];
+                request.maximum_context = config.maximum_context_tokens;
+                request.heads = kHeads;
+                request.head_dim = kMlaHead;
+                request.query_rank = kQueryRank;
+                request.key_value_rank = kKvRank;
+                const auto history = positions[row] + 1U;
+                auto scores = std::span<float>(mla_softmax_scores).first(
+                    static_cast<std::size_t>(kHeads) * history);
+                result = weights->mla_decode_mhc(
+                    slot_for(layer), attention, request, scores,
+                    [](std::span<float> values, std::uint32_t heads,
+                       std::uint32_t tokens) {
+                        for (std::uint32_t head = 0U; head < heads; ++head) {
+                            auto* row_scores = values.data() +
+                                static_cast<std::size_t>(head) * tokens;
+                            float highest =
+                                -std::numeric_limits<float>::infinity();
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                highest = std::max(highest,
+                                                   row_scores[token]);
+                            }
+                            float total = 0.0F;
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                row_scores[token] =
+                                    std::exp(row_scores[token] - highest);
+                                total += row_scores[token];
+                            }
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                row_scores[token] = bf16_round_f32(
+                                    row_scores[token] / total);
+                            }
+                        }
+                    });
+            }
+            if (!result.ok()) return result;
+        }
+        if (config.phase_profile) {
+            const auto elapsed = elapsed_nanoseconds(attention_started);
+            graph_attention_block_nanoseconds.fetch_add(
+                elapsed, std::memory_order_relaxed);
+            (glm53_kda_layer(layer) ? graph_kda_nanoseconds
+                                    : graph_mla_nanoseconds)
+                .fetch_add(elapsed, std::memory_order_relaxed);
+        }
+        std::vector<float> normalized(
+            static_cast<std::size_t>(rows) * kHidden);
+        std::vector<float> branch(normalized.size());
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = cuda.dsv4_mhc_select_slot(device, row);
+            if (!result.ok()) return result;
+            result = cuda.dsv4_mhc_transition_next_device(
+                device, resident_layers[layer].feedforward);
+            if (!result.ok()) return result;
+            result = cuda.dsv4_mhc_download_layer_input(
+                device, std::span<float>(normalized).subspan(
+                            static_cast<std::size_t>(row) * kHidden, kHidden));
+            if (!result.ok()) return result;
+        }
+        std::vector<std::uint64_t> route_requests(rows);
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            route_requests[row] = route_request_key(sequences[row],
+                                                    positions[row]);
+        }
+        const auto feedforward_started = std::chrono::steady_clock::now();
+        result = feedforward_page(branch, normalized, rows, layer, prefix,
+                                  route_requests, positions, false, false,
+                                  true);
+        if (!result.ok()) return result;
+        if (config.phase_profile) {
+            graph_feedforward_block_nanoseconds.fetch_add(
+                elapsed_nanoseconds(feedforward_started),
+                std::memory_order_relaxed);
+        }
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = cuda.dsv4_mhc_select_slot(device, row);
+            if (!result.ok()) return result;
+            result = cuda.dsv4_mhc_finish(
+                device,
+                std::span<const float>(branch).subspan(
+                    static_cast<std::size_t>(row) * kHidden, kHidden),
+                streams.subspan(static_cast<std::size_t>(row) * stream_columns,
+                                stream_columns));
+            if (!result.ok()) return result;
+        }
+        return cuda.dsv4_mhc_select_slot(device, 0U);
+    }
+
     [[nodiscard]] ValidationResult forward_layer_sequences(
         std::span<float> streams, std::uint32_t layer,
         std::span<const std::uint32_t> positions,
@@ -5432,6 +6012,14 @@ struct Glm53Runtime::Impl {
             device_sequences.size() != rows ||
             streams.size() != static_cast<std::size_t>(rows) * stream_columns) {
             return {{"GLM-5.3 independent layer batch has an invalid shape"}};
+        }
+        if (rows > 1U && resident_execution_active &&
+            std::all_of(device_sequences.begin(), device_sequences.end(),
+                        [](const auto* state) {
+                            return state != nullptr && state->ready;
+                        })) {
+            return forward_layer_sequences_resident(
+                streams, layer, positions, sequences, device_sequences);
         }
         if (rows == 1U && device_sequences.front() != nullptr &&
             resident_execution_active &&
@@ -5700,6 +6288,29 @@ struct Glm53Runtime::Impl {
              base_hidden.size() != static_cast<std::size_t>(rows) * kHidden)) {
             return {{"GLM-5.3 decode batch has an invalid shape"}};
         }
+        // FP8's exact device-expert composition has not cleared the
+        // independent-row parity gate. Preserve its accepted batch-1 path for
+        // every request rather than silently changing tokens or replacing the
+        // resident tiers with a slower all-host page. MXFP4 retains the
+        // measured expert-major cohort path below.
+        if (rows > 1U && fp8_expert_checkpoint()) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto hidden = base_hidden.empty()
+                    ? std::span<float>{}
+                    : base_hidden.subspan(
+                          static_cast<std::size_t>(row) * kHidden, kHidden);
+                auto result = forward_token_batch(
+                    tokens.subspan(row, 1U), positions.subspan(row, 1U),
+                    sequences.subspan(row, 1U),
+                    device_sequences.subspan(row, 1U),
+                    logits.subspan(
+                        static_cast<std::size_t>(row) * kVocabulary,
+                        kVocabulary),
+                    hidden);
+                if (!result.ok()) return result;
+            }
+            return {};
+        }
         const auto stream_columns = static_cast<std::size_t>(kMhc) * kHidden;
         std::vector<float> streams(static_cast<std::size_t>(rows) *
                                    stream_columns);
@@ -5736,7 +6347,24 @@ struct Glm53Runtime::Impl {
             if (!collapsed.ok()) return collapsed;
         }
         const auto output_head_started = std::chrono::steady_clock::now();
-        auto result = finish_streams_page(streams, rows, logits);
+        ValidationResult result;
+        if (rows > 1U) {
+            // As with the router, the output head is not the M7 reuse target.
+            // Execute the exact accepted one-row primitive independently so
+            // batch membership cannot perturb greedy logits.
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = finish_streams_page(
+                    std::span<float>(streams).subspan(
+                        static_cast<std::size_t>(row) * stream_columns,
+                        stream_columns),
+                    1U,
+                    logits.subspan(static_cast<std::size_t>(row) * kVocabulary,
+                                   kVocabulary));
+                if (!result.ok()) break;
+            }
+        } else {
+            result = finish_streams_page(streams, rows, logits);
+        }
         if (config.phase_profile) {
             graph_output_head_nanoseconds.fetch_add(
                 elapsed_nanoseconds(output_head_started),
@@ -6055,6 +6683,15 @@ struct Glm53Runtime::Impl {
         request->result.metrics.device_vram_used_bytes =
             device_vram_used_bytes(devices);
         request->result.metrics.phase_profile = config.phase_profile;
+        // Release the scheduler's scarce persistent CUDA slot before waking
+        // the caller. Otherwise a completed request remains alive in the
+        // waiting API thread briefly after it leaves `active_requests`, and a
+        // replacement can transiently exceed the capacity ledger by one full
+        // sequence.
+        if (request->device_sequence.ready) {
+            sequence_slots_live.fetch_sub(1U, std::memory_order_relaxed);
+        }
+        request->device_sequence = DeviceSequenceState{};
         {
             std::scoped_lock lock(request->completion_mutex);
             request->done = true;
@@ -6181,6 +6818,7 @@ struct Glm53Runtime::Impl {
 
     [[nodiscard]] ValidationResult prepare_device_sequence(
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
+        if (device_sequence.ready) return {};
         ValidationResult result;
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
             const auto attention = "model.language_model.layers." +
@@ -6244,7 +6882,27 @@ struct Glm53Runtime::Impl {
                 device_sequence.kda[layer]);
             if (!result.ok()) return result;
         }
+        const auto actual = actual_sequence_device_bytes(device_sequence);
+        if (actual != sequence_device_bytes) {
+            return {{"GLM-5.3 sequence CUDA allocation disagrees with its "
+                     "admission ledger"}};
+        }
+        if (config.phase_profile) {
+            std::cerr << "[glm53-sequence-state] host_private_bytes="
+                      << sequence.private_bytes();
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                std::cerr << " cuda" << devices[slot] << "_bytes="
+                          << actual[slot];
+            }
+            std::cerr << '\n';
+        }
         device_sequence.ready = true;
+        const auto live = sequence_slots_live.fetch_add(
+                              1U, std::memory_order_relaxed) + 1U;
+        auto peak = sequence_slots_peak.load(std::memory_order_relaxed);
+        while (peak < live && !sequence_slots_peak.compare_exchange_weak(
+                   peak, live, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {}
         return result;
     }
 
@@ -6754,9 +7412,36 @@ struct Glm53Runtime::Impl {
                                           << started.errors.front() << '\n';
                             }
                         }
+                        const auto forward_started =
+                            std::chrono::steady_clock::now();
                         auto step = forward_token_batch(
                             step_tokens, step_positions, step_sequences,
                             step_device_sequences, step_logits, step_hidden);
+                        const auto forward_nanoseconds =
+                            elapsed_nanoseconds(forward_started);
+                        const auto width = std::min<std::size_t>(
+                            step_requests.size(),
+                            scheduler_width_iterations.size() - 1U);
+                        scheduler_width_iterations[width].fetch_add(
+                            1U, std::memory_order_relaxed);
+                        scheduler_width_forward_nanoseconds[width].fetch_add(
+                            forward_nanoseconds, std::memory_order_relaxed);
+                        scheduler_width_tokens[width].fetch_add(
+                            step_requests.size(), std::memory_order_relaxed);
+                        if (step_requests.size() == 1U) {
+                            scheduler_single_forward_nanoseconds.fetch_add(
+                                forward_nanoseconds,
+                                std::memory_order_relaxed);
+                            scheduler_single_forward_tokens.fetch_add(
+                                1U, std::memory_order_relaxed);
+                        } else {
+                            scheduler_batch_forward_nanoseconds.fetch_add(
+                                forward_nanoseconds,
+                                std::memory_order_relaxed);
+                            scheduler_batch_forward_tokens.fetch_add(
+                                step_requests.size(),
+                                std::memory_order_relaxed);
+                        }
                         if (capture) {
                             const auto stopped = cuda.profiler_stop();
                             if (!stopped.ok()) {
@@ -6868,10 +7553,13 @@ ValidationResult Glm53Runtime::initialize(
             "context window");
         return result;
     }
-    impl_->prefix_cache_limit =
-        prefix_cache_entries(config.maximum_context_tokens);
-    impl_->scheduler_capacity = std::max<std::size_t>(
-        1U, std::min<std::size_t>(32U, impl_->prefix_cache_limit));
+    impl_->host_state_capacity =
+        host_sequence_capacity(config.maximum_context_tokens);
+    // Warmup resolves the binding post-load CUDA capacity before the first
+    // request is prepared. Until then admit one request, never the former
+    // host-only estimate of as many as 32.
+    impl_->scheduler_capacity = 1U;
+    impl_->prefix_cache_limit = impl_->host_state_capacity;
     impl_->devices = resolve_runtime_devices(config.devices);
     result = validate_common_runtime_config(
         impl_->devices, config.vram_cache_fraction,
@@ -7037,8 +7725,15 @@ ValidationResult Glm53Runtime::initialize(
         const auto page_rows = static_cast<std::size_t>(
             impl_->config.prefill_page_tokens);
         constexpr std::size_t outputs_per_page_row = 9U;
+        constexpr std::size_t maximum_cohort_rows = 32U;
+        constexpr std::size_t maximum_device_assignments =
+            maximum_cohort_rows * outputs_per_page_row;
         impl_->page_groups.reserve(Impl::kExpertSlots);
         impl_->page_assignments.resize(page_rows * outputs_per_page_row);
+        impl_->page_device_experts.reserve(maximum_device_assignments);
+        impl_->page_device_output_slots.reserve(maximum_device_assignments);
+        impl_->page_device_inputs.resize(
+            maximum_device_assignments * kHidden);
         impl_->page_quantized_input.resize(page_rows * kHidden);
         impl_->page_activations.resize(
             page_rows * outputs_per_page_row * 2048U);
@@ -7046,11 +7741,14 @@ ValidationResult Glm53Runtime::initialize(
             page_rows * outputs_per_page_row * kHidden);
         auto admitted = impl_->admit_shared_experts();
         if (!admitted.ok()) return admitted;
-        if (impl_->shared_experts.active) {
-            impl_->shared_expert_gate.resize(2048U);
-            impl_->shared_expert_up.resize(2048U);
-            impl_->shared_expert_output.resize(kHidden);
-        }
+        // The same buffers carry either one decode row's resident tier or all
+        // device assignments in an admitted independent-sequence cohort.
+        impl_->shared_expert_gate.resize(
+            maximum_device_assignments * 2048U);
+        impl_->shared_expert_up.resize(
+            maximum_device_assignments * 2048U);
+        impl_->shared_expert_output.resize(
+            maximum_device_assignments * kHidden);
     }
     // Shared experts own independent cudaMalloc buffers and have already
     // reduced this capacity. Resident mHC weights are different: CudaWeight
@@ -7260,6 +7958,90 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << (cache_after.evictions - cache_before.evictions)
                   << '\n';
     }
+    std::cerr << "[glm53-scheduler] iterations="
+              << impl_->scheduler_iterations.load(std::memory_order_relaxed)
+              << " batched_iterations="
+              << impl_->scheduler_batched_iterations.load(
+                     std::memory_order_relaxed)
+              << " single_forward_ns="
+              << impl_->scheduler_single_forward_nanoseconds.load(
+                     std::memory_order_relaxed)
+              << " single_forward_tokens="
+              << impl_->scheduler_single_forward_tokens.load(
+                     std::memory_order_relaxed)
+              << " batch_forward_ns="
+              << impl_->scheduler_batch_forward_nanoseconds.load(
+                     std::memory_order_relaxed)
+              << " batch_forward_tokens="
+              << impl_->scheduler_batch_forward_tokens.load(
+                     std::memory_order_relaxed)
+              << '\n';
+    const auto live_slots = impl_->sequence_slots_live.load(
+        std::memory_order_relaxed);
+    std::cerr << "[glm53-state-pool] live_slots=" << live_slots
+              << " peak_slots="
+              << impl_->sequence_slots_peak.load(std::memory_order_relaxed)
+              << " free_slots="
+              << (impl_->scheduler_capacity > live_slots
+                      ? impl_->scheduler_capacity - live_slots : 0U)
+              << " host_block_bytes="
+              << host_sequence_state_bytes(
+                     impl_->config.maximum_context_tokens)
+              << " host_fragmented_bytes="
+              << impl_->host_state_fragmented_bytes
+              << " shared_prefix_entries="
+              << impl_->prefix_cache_entries.load(std::memory_order_relaxed)
+              << " shared_prefix_bytes="
+              << impl_->prefix_cache_bytes.load(std::memory_order_relaxed)
+              << " evicted_prefix_entries="
+              << impl_->prefix_cache_evictions.load(std::memory_order_relaxed)
+              << " evicted_prefix_bytes="
+              << impl_->prefix_cache_evicted_bytes.load(
+                     std::memory_order_relaxed);
+    for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+        const auto capacity = impl_->sequence_device_capacities[slot];
+        std::cerr << " cuda" << impl_->devices[slot] << "_live_bytes="
+                  << live_slots * impl_->sequence_device_bytes[slot]
+                  << " cuda" << impl_->devices[slot] << "_free_block_bytes="
+                  << (capacity > live_slots
+                          ? (capacity - live_slots) *
+                                impl_->sequence_device_bytes[slot] : 0U)
+                  << " cuda" << impl_->devices[slot]
+                  << "_fragmented_bytes="
+                  << impl_->sequence_device_fragmented_bytes[slot];
+    }
+    std::cerr << '\n';
+    // Build the cohort counter line before publishing it. Concurrent request
+    // completions otherwise interleave individual stream insertions and make
+    // the already-existing sharing counters impossible to attribute.
+    std::ostringstream batch_composition;
+    batch_composition << "[glm53-batch-composition]";
+    for (std::size_t width = 1U;
+         width < impl_->scheduler_width_iterations.size(); ++width) {
+        const auto iterations =
+            impl_->scheduler_width_iterations[width].load(
+                std::memory_order_relaxed);
+        if (iterations == 0U) continue;
+        batch_composition
+            << " width" << width << "_iterations=" << iterations
+            << " width" << width << "_tokens="
+            << impl_->scheduler_width_tokens[width].load(
+                   std::memory_order_relaxed)
+            << " width" << width << "_forward_ns="
+            << impl_->scheduler_width_forward_nanoseconds[width].load(
+                   std::memory_order_relaxed);
+    }
+    batch_composition
+        << " host_expert_calls="
+        << impl_->host_moe_calls.load(std::memory_order_relaxed)
+        << " host_expert_rows="
+        << impl_->host_moe_rows.load(std::memory_order_relaxed)
+        << " host_expert_weight_bytes="
+        << (impl_->host_moe_gate_up_weight_bytes.load(
+                std::memory_order_relaxed) +
+            impl_->host_moe_down_weight_bytes.load(
+                std::memory_order_relaxed));
+    std::cerr << batch_composition.str() << '\n';
     if (impl_->config.verbose) {
         std::cerr << "[glm53-projection] parallel_batches="
                   << impl_->parallel_projection_batches.load(
@@ -7281,6 +8063,18 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
                   << impl_->scheduler_iterations.load(std::memory_order_relaxed)
                   << " scheduler_batched_iterations="
                   << impl_->scheduler_batched_iterations.load(
+                         std::memory_order_relaxed)
+                  << " scheduler_single_forward_ns="
+                  << impl_->scheduler_single_forward_nanoseconds.load(
+                         std::memory_order_relaxed)
+                  << " scheduler_single_forward_tokens="
+                  << impl_->scheduler_single_forward_tokens.load(
+                         std::memory_order_relaxed)
+                  << " scheduler_batch_forward_ns="
+                  << impl_->scheduler_batch_forward_nanoseconds.load(
+                         std::memory_order_relaxed)
+                  << " scheduler_batch_forward_tokens="
+                  << impl_->scheduler_batch_forward_tokens.load(
                          std::memory_order_relaxed)
                   << " mtp_drafts="
                   << impl_->mtp_drafts.load(std::memory_order_relaxed)

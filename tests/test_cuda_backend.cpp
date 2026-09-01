@@ -4240,6 +4240,60 @@ TEST_CASE("GLM-5.3 expert batching preserves one-expert results and layout") {
                            single_down[expert_index].end(),
                            batch_down.begin() + expert_index * hidden));
     }
+
+    // Independent-sequence batching can present the same resident matrix with
+    // a different activation per request. The per-expert-input form must
+    // preserve every batch-1 result bit for bit whether the backend groups a
+    // checkpoint encoding or conservatively splits it.
+    std::array<float, hidden> second_input{};
+    std::array<float, intermediate> second_activation{};
+    for (std::size_t index = 0U; index < hidden; ++index) {
+        second_input[index] =
+            static_cast<float>(static_cast<int>(index % 11U) - 5) / 16.0F;
+        second_activation[index] =
+            static_cast<float>(static_cast<int>(index % 7U) - 3) / 8.0F;
+    }
+    std::vector<float> second_gate(intermediate), second_up(intermediate),
+        second_down(hidden);
+    const auto first = std::span<const strata::CudaGlm53Expert>(
+        &experts.front(), 1U);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(
+        device, first, second_input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(
+        device, second_gate, second_up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(
+        device, first, second_activation).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, second_down).ok());
+
+    const std::array<strata::CudaGlm53Expert, 2U> repeated{
+        experts.front(), experts.front()};
+    std::vector<float> independent_inputs(input.begin(), input.end());
+    independent_inputs.insert(independent_inputs.end(), second_input.begin(),
+                              second_input.end());
+    std::vector<float> independent_activations(
+        activations.front().begin(), activations.front().end());
+    independent_activations.insert(independent_activations.end(),
+                                   second_activation.begin(),
+                                   second_activation.end());
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(
+        device, repeated, independent_inputs).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(
+        device, batch_gate, batch_up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(
+        device, repeated, independent_activations).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, batch_down).ok());
+    REQUIRE(std::equal(single_gate.front().begin(), single_gate.front().end(),
+                       batch_gate.begin()));
+    REQUIRE(std::equal(second_gate.begin(), second_gate.end(),
+                       batch_gate.begin() + intermediate));
+    REQUIRE(std::equal(single_up.front().begin(), single_up.front().end(),
+                       batch_up.begin()));
+    REQUIRE(std::equal(second_up.begin(), second_up.end(),
+                       batch_up.begin() + intermediate));
+    REQUIRE(std::equal(single_down.front().begin(), single_down.front().end(),
+                       batch_down.begin()));
+    REQUIRE(std::equal(second_down.begin(), second_down.end(),
+                       batch_down.begin() + hidden));
 }
 
 TEST_CASE("GLM-5.3 BF16 device expert dots match the host AVX2 association") {

@@ -58,6 +58,29 @@ The server exposes the same text runtime through its OpenAI-compatible chat
 completion endpoint. Do not send image content: multimodal support is outside
 this adapter's current contract.
 
+The server admits requests from the memory that remains after model warm-up,
+not from a fixed request-count limit. It charges the complete persistent host
+state and the actual KDA/MLA CUDA allocation on every selected device, keeps a
+five-percent device safety reserve, and reserves host capacity independently
+for exact immutable prefix snapshots. Admission, live/free/fragmented state,
+prefix occupancy and eviction, scheduler batch width, TTFT, and inter-token
+latency are reported by the GLM runtime.
+
+Active MXFP4 decode requests are grouped at iteration boundaries. Their
+independent recurrent states stay disjoint while routed experts are executed
+expert-major across the cohort; static and shared device-resident experts use
+the same per-request inputs without changing reduction order. FP8 remains
+fully supported, but its multi-row device-expert composition did not pass the
+full-model exactness gate, so concurrent FP8 requests deliberately use the
+accepted batch-1 device path within each scheduler iteration. This is an exact
+checkpoint-specific fallback, not a precision or expert-policy change.
+
+Prefix reuse is runtime-local and keyed by the exact token prefix; checkpoint,
+tokenizer, configuration, state layout, and numerical mode are immutable
+properties of that runtime. Cached state is copy-on-write, mutable tails are
+never shared, and completion or cancellation releases the request's persistent
+CUDA state before another request is admitted.
+
 ## Current operating point
 
 The runtime discovers CPU width, free VRAM, peer topology and storage at

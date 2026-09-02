@@ -78,6 +78,11 @@ public:
         std::uint32_t layer, std::uint32_t projection) const noexcept;
     [[nodiscard]] Glm53PagedRows& mla(std::uint32_t layer);
     [[nodiscard]] const Glm53PagedRows& mla(std::uint32_t layer) const;
+    // Per-token sparse-indexer state for one sparse layer: the 128-wide
+    // normalized indexer key followed by the 128-wide k-pool gate, so one
+    // append keeps them contiguous and the pooling reads them together.
+    [[nodiscard]] Glm53PagedRows& indexer(std::uint32_t layer);
+    [[nodiscard]] const Glm53PagedRows& indexer(std::uint32_t layer) const;
     void copy_mla_from(std::uint32_t layer,
                        const Glm53SequenceState& source);
 
@@ -98,6 +103,7 @@ private:
     std::array<Buffer, kGlm53LayerCount> recurrent_{};
     std::array<std::array<Buffer, 3U>, kGlm53LayerCount> convolution_{};
     std::array<Glm53PagedRows, kGlm53LayerCount> mla_{};
+    std::array<Glm53PagedRows, kGlm53LayerCount> indexer_{};
     std::uint32_t maximum_context_tokens_{};
     std::uint32_t mla_page_rows_{64U};
     std::uint32_t token_count_{};

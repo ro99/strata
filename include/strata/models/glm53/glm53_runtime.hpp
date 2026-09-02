@@ -45,6 +45,24 @@ namespace strata {
     std::span<const std::byte> weights, std::span<const float> input,
     bool use_avx2) noexcept;
 
+// GLM-5.3 k-pool sparse indexer selection (record 0237). Chooses which history
+// positions one decode query attends to, so attention cost stops growing with
+// context. Exposed for test: below `index_topk` the selection is the identity,
+// which is the regression gate for everything above it.
+struct Glm53SparseIndexParameters {
+    static constexpr std::uint32_t heads = 32U;
+    static constexpr std::uint32_t head_dim = 128U;
+    static constexpr std::uint32_t top_k = 2048U;
+    static constexpr std::uint32_t pool = 4U;
+    static constexpr std::uint32_t selection_width = top_k + pool - 1U;
+};
+
+[[nodiscard]] std::size_t glm53_sparse_index_select_for_test(
+    std::span<std::uint32_t> selected, std::span<const float> indexer_query,
+    std::span<const float> indexer_keys, std::span<const float> gate_scores,
+    std::span<const float> pool_ape, std::span<const float> head_weights,
+    std::uint32_t history);
+
 struct Glm53RuntimeConfig {
     std::vector<int> devices;
     double vram_cache_fraction{0.85};

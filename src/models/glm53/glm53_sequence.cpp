@@ -63,7 +63,10 @@ ValidationResult Glm53PagedRows::append(std::span<const float> row_values) {
 ValidationResult Glm53PagedRows::append_rows(std::span<const float> values,
                                              std::uint32_t row_count) {
     if (values.size() != static_cast<std::size_t>(row_count) * columns_) {
-        return {{"GLM-5.3 physical MLA page append has an invalid shape"}};
+        return {{"GLM-5.3 physical MLA page append has an invalid shape: "
+                 "values=" + std::to_string(values.size()) +
+                 " rows=" + std::to_string(row_count) +
+                 " columns=" + std::to_string(columns_)}};
     }
     for (std::uint32_t row_index = 0U; row_index < row_count; ++row_index) {
         auto result = append(values.subspan(
@@ -121,6 +124,9 @@ ValidationResult Glm53SequenceState::reset(
     for (std::uint32_t layer = 0U; layer < kGlm53LayerCount; ++layer) {
         auto result = mla_[layer].reset(kGlm53MlaRank, mla_page_rows_);
         if (!result.ok()) return result;
+        // 128 indexer key channels followed by 128 k-pool gate channels.
+        result = indexer_[layer].reset(256U, mla_page_rows_);
+        if (!result.ok()) return result;
     }
     return {};
 }
@@ -172,8 +178,16 @@ Glm53PagedRows& Glm53SequenceState::mla(std::uint32_t layer) {
     return mla_.at(layer);
 }
 
+Glm53PagedRows& Glm53SequenceState::indexer(std::uint32_t layer) {
+    return indexer_.at(layer);
+}
+
 const Glm53PagedRows& Glm53SequenceState::mla(std::uint32_t layer) const {
     return mla_.at(layer);
+}
+
+const Glm53PagedRows& Glm53SequenceState::indexer(std::uint32_t layer) const {
+    return indexer_.at(layer);
 }
 
 void Glm53SequenceState::copy_mla_from(
@@ -194,6 +208,7 @@ std::uint64_t Glm53SequenceState::private_bytes() const noexcept {
         }
     }
     for (const auto& pages : mla_) result += pages.private_bytes();
+    for (const auto& pages : indexer_) result += pages.private_bytes();
     return result;
 }
 

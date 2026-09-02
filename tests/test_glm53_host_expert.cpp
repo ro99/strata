@@ -126,3 +126,80 @@ TEST_CASE("GLM-5.3 BF16 host dot matches an exact reference") {
     REQUIRE(std::abs(strata::glm53_host_bf16_row_dot(encoded, input, true) -
                      reference) <= tolerance);
 }
+
+namespace {
+
+// One decode query's indexer inputs, with every pool's key set to a distinct
+// constant so the ranking is controllable from the test.
+struct SparseIndexFixture {
+    std::vector<float> query, keys, gate, ape, weights;
+    explicit SparseIndexFixture(std::uint32_t history) {
+        constexpr auto D = strata::Glm53SparseIndexParameters::head_dim;
+        constexpr auto H = strata::Glm53SparseIndexParameters::heads;
+        query.assign(static_cast<std::size_t>(H) * D, 0.0F);
+        keys.assign(static_cast<std::size_t>(history) * D, 0.0F);
+        gate.assign(static_cast<std::size_t>(history) * D, 0.0F);
+        ape.assign(static_cast<std::size_t>(
+                       strata::Glm53SparseIndexParameters::pool) * D, 0.0F);
+        weights.assign(H, 1.0F);
+        // A query that reads only channel 0.
+        for (std::uint32_t head = 0U; head < H; ++head) query[head * D] = 1.0F;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("GLM-5.3 sparse index selection is the identity below index_topk") {
+    constexpr std::uint32_t history = 1500U;
+    SparseIndexFixture f(history);
+    std::vector<std::uint32_t> selected(
+        strata::Glm53SparseIndexParameters::selection_width);
+    const auto count = strata::glm53_sparse_index_select_for_test(
+        selected, f.query, f.keys, f.gate, f.ape, f.weights, history);
+    REQUIRE(count == history);
+    for (std::uint32_t token = 0U; token < history; ++token) {
+        REQUIRE(selected[token] == token);
+    }
+}
+
+TEST_CASE("GLM-5.3 sparse index selection bounds attention above index_topk") {
+    constexpr std::uint32_t history = 32768U;
+    constexpr auto D = strata::Glm53SparseIndexParameters::head_dim;
+    SparseIndexFixture f(history);
+    // Make later pools score higher, so the ranking is unambiguous.
+    for (std::uint32_t token = 0U; token < history; ++token) {
+        f.keys[static_cast<std::size_t>(token) * D] =
+            static_cast<float>(token) / static_cast<float>(history);
+    }
+    std::vector<std::uint32_t> selected(
+        strata::Glm53SparseIndexParameters::selection_width);
+    const auto count = strata::glm53_sparse_index_select_for_test(
+        selected, f.query, f.keys, f.gate, f.ape, f.weights, history);
+
+    // 512 pools of 4, and history is a multiple of 4 so there is no tail.
+    REQUIRE(count == strata::Glm53SparseIndexParameters::top_k);
+    REQUIRE(count <= strata::Glm53SparseIndexParameters::selection_width);
+    // Ascending, unique, in range.
+    for (std::size_t index = 0U; index < count; ++index) {
+        REQUIRE(selected[index] < history);
+        if (index != 0U) REQUIRE(selected[index] > selected[index - 1U]);
+    }
+    // Highest-scoring pools are the latest ones, so the selection must end at
+    // the final complete pool.
+    REQUIRE(selected[count - 1U] == history - 1U);
+}
+
+TEST_CASE("GLM-5.3 sparse index selection always appends the visible tail") {
+    // history % 4 == 3, so three raw tail positions follow the pooled ones.
+    constexpr std::uint32_t history = 32771U;
+    SparseIndexFixture f(history);
+    std::vector<std::uint32_t> selected(
+        strata::Glm53SparseIndexParameters::selection_width);
+    const auto count = strata::glm53_sparse_index_select_for_test(
+        selected, f.query, f.keys, f.gate, f.ape, f.weights, history);
+    REQUIRE(count == strata::Glm53SparseIndexParameters::top_k + 3U);
+    // The most recent tokens are never dropped, whatever the pool scores say.
+    REQUIRE(selected[count - 1U] == history - 1U);
+    REQUIRE(selected[count - 2U] == history - 2U);
+    REQUIRE(selected[count - 3U] == history - 3U);
+}

@@ -39,6 +39,10 @@ inline void assign_cuda_device_delta(CudaBackendStats::Device& result,
     STRATA_CUDA_DEVICE_DELTA(weight_copy_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(glm53_kda_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(glm53_mla_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(glm53_expert_kernel_nanoseconds);
+    STRATA_CUDA_DEVICE_DELTA(glm53_other_kernel_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(activation_d2h_nanoseconds);
     STRATA_CUDA_DEVICE_DELTA(deepseek_moe_calls);
     STRATA_CUDA_DEVICE_DELTA(deepseek_moe_kernel_launches);
@@ -136,6 +140,10 @@ inline void assign_cuda_delta(CudaBackendStats& result,
     STRATA_CUDA_DELTA(weight_copy_nanoseconds);
     STRATA_CUDA_DELTA(activation_h2d_nanoseconds);
     STRATA_CUDA_DELTA(kernel_nanoseconds);
+    STRATA_CUDA_DELTA(glm53_kda_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(glm53_mla_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(glm53_expert_kernel_nanoseconds);
+    STRATA_CUDA_DELTA(glm53_other_kernel_nanoseconds);
     STRATA_CUDA_DELTA(activation_d2h_nanoseconds);
     STRATA_CUDA_DELTA(deepseek_moe_calls);
     STRATA_CUDA_DELTA(deepseek_moe_kernel_launches);
@@ -261,8 +269,10 @@ inline void accumulate_cuda_critical_path(CudaBackendStats& result,
         result.weight_copy_nanoseconds, delta.weight_copy_nanoseconds);
     result.activation_h2d_nanoseconds = std::max(
         result.activation_h2d_nanoseconds, delta.activation_h2d_nanoseconds);
-    result.kernel_nanoseconds = std::max(
-        result.kernel_nanoseconds, delta.kernel_nanoseconds);
+    // Kernel time is service time, not a per-device wall critical path. Sum
+    // every device delta so sequential layer ownership cannot disappear from
+    // a phase report. This must match CudaBackend::stats() aggregation.
+    result.kernel_nanoseconds += delta.kernel_nanoseconds;
     result.activation_d2h_nanoseconds = std::max(
         result.activation_d2h_nanoseconds, delta.activation_d2h_nanoseconds);
     result.deepseek_moe_h2d_nanoseconds = std::max(

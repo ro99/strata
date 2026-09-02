@@ -106,3 +106,45 @@ TEST_CASE("worker pool accepts an empty dispatch and rejects a null operation") 
     REQUIRE(pool.parallel_for(0U, [](std::size_t) {}).ok());
     REQUIRE(!pool.parallel_for(4U, std::function<void(std::size_t)>{}).ok());
 }
+
+TEST_CASE("blocked dispatch visits every index exactly once") {
+    // Reordering is the whole point, so the contract is coverage, not order:
+    // every index runs, none runs twice, whatever the block size.
+    strata::HostWorkerPool pool(4U);
+    for (const std::size_t block : {1U, 3U, 64U, 1000U}) {
+        constexpr std::size_t tasks = 500U;
+        std::vector<std::atomic<int>> seen(tasks);
+        for (auto& count : seen) count.store(0);
+        const auto ran = pool.parallel_for_blocked(
+            tasks, block, [&](std::size_t index) { seen[index].fetch_add(1); });
+        REQUIRE(ran.ok());
+        for (std::size_t index = 0U; index < tasks; ++index) {
+            REQUIRE(seen[index].load() == 1);
+        }
+    }
+}
+
+TEST_CASE("blocked dispatch hands out contiguous runs to a single runner") {
+    // The reason this method exists: a runner must walk memory contiguously
+    // rather than with a stride of the pool width. With one runner the whole
+    // range is one run; the assertion is that indices arrive in order within a
+    // claim, which is what the prefetcher sees.
+    strata::HostWorkerPool pool(1U);
+    std::vector<std::size_t> order;
+    const auto ran = pool.parallel_for_blocked(
+        16U, 4U, [&](std::size_t index) { order.push_back(index); });
+    REQUIRE(ran.ok());
+    REQUIRE(order.size() == 16U);
+    for (std::size_t index = 0U; index < order.size(); ++index) {
+        REQUIRE(order[index] == index);
+    }
+}
+
+TEST_CASE("a zero block is treated as one rather than spinning forever") {
+    strata::HostWorkerPool pool(2U);
+    std::atomic<int> ran{0};
+    const auto status = pool.parallel_for_blocked(
+        8U, 0U, [&](std::size_t) { ran.fetch_add(1); });
+    REQUIRE(status.ok());
+    REQUIRE(ran.load() == 8);
+}

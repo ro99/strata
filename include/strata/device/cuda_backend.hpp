@@ -90,8 +90,10 @@ struct CudaSynchronizationStats {
 };
 
 struct CudaBackendStats {
-    // Byte and event totals sum devices. Aggregate durations are the maximum
-    // per-device service duration so concurrent device work is not double-counted.
+    // Byte and event totals sum devices. Most aggregate durations are the
+    // maximum per-device critical path. kernel_nanoseconds is deliberately
+    // total CUDA kernel service time across devices so it is externally
+    // reconcilable and never drops sequential work assigned to another GPU.
     struct Device {
         int device{-1};
         std::uint64_t weight_upload_bytes{};
@@ -126,6 +128,13 @@ struct CudaBackendStats {
         std::uint64_t weight_copy_nanoseconds{};
         std::uint64_t activation_h2d_nanoseconds{};
         std::uint64_t kernel_nanoseconds{};
+        // GLM-5.3 kernels launched directly by the hybrid recurrence backend.
+        // These categories are exhaustive for that backend and make the MLA
+        // term independently reconcilable with an external CUDA trace.
+        std::uint64_t glm53_kda_kernel_nanoseconds{};
+        std::uint64_t glm53_mla_kernel_nanoseconds{};
+        std::uint64_t glm53_expert_kernel_nanoseconds{};
+        std::uint64_t glm53_other_kernel_nanoseconds{};
         std::uint64_t activation_d2h_nanoseconds{};
         std::uint64_t deepseek_moe_calls{};
         std::uint64_t deepseek_moe_kernel_launches{};
@@ -217,6 +226,10 @@ struct CudaBackendStats {
     std::uint64_t weight_copy_nanoseconds{};
     std::uint64_t activation_h2d_nanoseconds{};
     std::uint64_t kernel_nanoseconds{};
+    std::uint64_t glm53_kda_kernel_nanoseconds{};
+    std::uint64_t glm53_mla_kernel_nanoseconds{};
+    std::uint64_t glm53_expert_kernel_nanoseconds{};
+    std::uint64_t glm53_other_kernel_nanoseconds{};
     std::uint64_t activation_d2h_nanoseconds{};
     std::uint64_t deepseek_moe_calls{};
     std::uint64_t deepseek_moe_kernel_launches{};
@@ -642,6 +655,42 @@ struct CudaDsv4AttentionPrepareRequest {
     bool host_only{};
 };
 
+enum class CudaGlm53ExpertEncoding : std::uint8_t {
+    Fp8E4m3Block128F32,
+    Fp4E2m1Group32E8m0,
+    Bf16,
+};
+
+// One GLM-5.3 expert held on a device in checkpoint-native form.
+//
+// Its three matrices hold either E4M3 codes plus F32 block scales, or BF16
+// values with null scale pointers, verbatim -- not prepacked, not widened --
+// because the device dot has to associate its sum exactly as the matching host
+// AVX2 dot does.
+//
+// The shared expert is the ninth of the nine experts every MoE layer runs and
+// the only one the router does not select, so it can always be computed while
+// the host works on the eight routed ones. A routed expert can be computed the
+// same way whenever it happens to be resident.
+struct CudaGlm53Expert {
+    const CudaBuffer* gate_weights{};
+    const CudaBuffer* gate_scales{};
+    const CudaBuffer* up_weights{};
+    const CudaBuffer* up_scales{};
+    const CudaBuffer* down_weights{};
+    const CudaBuffer* down_scales{};
+    std::uint32_t hidden{};
+    std::uint32_t intermediate{};
+    CudaGlm53ExpertEncoding encoding{
+        CudaGlm53ExpertEncoding::Fp8E4m3Block128F32};
+    // Static routed experts live inside the admitted weight arena as pinned
+    // CudaWeights. Shared experts retain their independently-owned raw
+    // buffers above. Exactly one representation is populated.
+    const CudaWeight* gate{};
+    const CudaWeight* up{};
+    const CudaWeight* down{};
+};
+
 class CudaBuffer {
 public:
     CudaBuffer();
@@ -702,6 +751,10 @@ struct CudaGlm53KdaRequest {
     // the active resident mHC workspace. `input` and `output` are empty and
     // the complete attention command remains stream ordered in this mode.
     bool mhc_source_destination{};
+    // A page uses mHC slots [0, page_rows) and one shared recurrent state.
+    // Projection work is row-batched, while convolution and recurrence advance
+    // in row order on the same stream. One preserves the decode command.
+    std::uint32_t page_rows{1U};
 };
 
 struct CudaGlm53MlaRequest {
@@ -1105,8 +1158,46 @@ public:
     [[nodiscard]] ValidationResult glm53_mhc_swiglu(
         int device, const CudaWeight& gate, const CudaWeight& up,
         const CudaWeight& down, std::uint32_t intermediate);
+    // Resident MLA in two phases, because the softmax cannot run on the
+    // device and stay bit-exact: CUDA's `expf` and glibc's disagree often
+    // enough to move a BF16 coefficient roughly once every nine tokens at
+    // history 46 (record 0214). Phase one returns `heads * history` raw
+    // scores; the caller applies `exp`, the normalization and the BF16
+    // rounding on the accepted host path, then calls the finish phase.
+    // BF16 KV-B checkpoints keep the already-rounded expanded history beside
+    // the latent state. Preparing it before timed decode removes the otherwise
+    // quadratic re-projection of every old row; decode appends only newly
+    // admitted latent rows. FP8 KV-B checkpoints retain their existing path.
+    [[nodiscard]] ValidationResult glm53_mla_prepare_history(
+        const CudaGlm53MlaRequest& request, std::uint32_t history);
     [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
-        const CudaGlm53MlaRequest& request);
+        const CudaGlm53MlaRequest& request, std::span<float> scores);
+    [[nodiscard]] ValidationResult glm53_mla_decode_finish(
+        const CudaGlm53MlaRequest& request,
+        std::span<const float> normalized_coefficients);
+    // A batch of device-resident experts in two halves, because the SwiGLU
+    // between them stays on the host. Each enqueue returns as soon as the work
+    // is on the stream; the matching collect completes it. Both dots are
+    // returned raw, so the caller applies exactly the rounding the host path
+    // applies. Outputs are laid out expert-major: gate and up hold
+    // `experts.size() * intermediate` floats, down `experts.size() * hidden`.
+    // Input may be one hidden row broadcast to every expert, or one hidden
+    // row per expert for independent-sequence batching. Callers using
+    // independent inputs split mixed resident-tier encodings into homogeneous
+    // commands; the broadcast-input batch-1 path remains valid when mixed.
+    //
+    // The shared expert is the one-element case. A routed hot tier is the same
+    // call with more of them.
+    [[nodiscard]] ValidationResult enqueue_glm53_expert_gate_up(
+        int device, std::span<const CudaGlm53Expert> experts,
+        std::span<const float> input);
+    [[nodiscard]] ValidationResult collect_glm53_expert_gate_up(
+        int device, std::span<float> gate, std::span<float> up);
+    [[nodiscard]] ValidationResult enqueue_glm53_expert_down(
+        int device, std::span<const CudaGlm53Expert> experts,
+        std::span<const float> activations);
+    [[nodiscard]] ValidationResult collect_glm53_expert_down(
+        int device, std::span<float> output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
         std::span<const std::uint16_t> values, std::uint32_t start,
@@ -1125,6 +1216,12 @@ public:
         std::uint32_t maximum_query_columns,
         std::uint32_t maximum_kv_columns,
         std::uint32_t maximum_intermediate_columns);
+    // Reserves the model-neutral activation input/output and bounded pinned
+    // staging used by matmul before a timed page first reaches its widest
+    // admitted shape. The caller owns the shape and capacity accounting.
+    [[nodiscard]] ValidationResult reserve_matmul_workspace(
+        int device, std::uint64_t maximum_input_bytes,
+        std::uint64_t maximum_output_bytes);
     // Text-page prefill at any cache position. The complete layer chain stays
     // device-resident; all MXFP4 weights must carry the single Marlin layout.
     [[nodiscard]] ValidationResult gemma4_prefill_layers(
@@ -1263,6 +1360,10 @@ public:
         int device, std::span<float> hidden);
     [[nodiscard]] ValidationResult dsv4_mhc_download_layer_input(
         int device, std::span<float> layer_input);
+    [[nodiscard]] ValidationResult dsv4_mhc_download_branch(
+        int device, std::span<float> branch);
+    [[nodiscard]] ValidationResult dsv4_mhc_publish_branch(
+        int device, std::span<const float> branch);
     // Device-only rank-local mHC bridges.  These preserve the existing state
     // machine while keeping the attention/FFN boundary on the CUDA stream.
     [[nodiscard]] ValidationResult dsv4_mhc_device_view(

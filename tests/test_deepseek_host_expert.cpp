@@ -10,6 +10,8 @@
 
 #include "strata/device/cuda_backend.hpp"
 #include "strata/models/deepseek/deepseek_host_expert.hpp"
+#include "strata/models/deepseek/deepseek_host_moe_executor.hpp"
+#include "strata/platform/hardware_profile.hpp"
 #include "test.hpp"
 
 namespace {
@@ -493,4 +495,23 @@ TEST_CASE("DeepSeek host FP4 expert reproduces the device kernel bit for bit") {
         REQUIRE(std::bit_cast<std::uint32_t>(host_output[index]) ==
                 std::bit_cast<std::uint32_t>(device_output[index]));
     }
+}
+
+TEST_CASE("the host MoE pool takes its width from the host, not a constant") {
+    // This width was a hard-coded 48: the development box's logical CPU count
+    // asserted as a constant, so every other machine was silently mis-sized.
+    // The policy -- one worker per usable CPU across every node, because a
+    // both-shards pool spans them -- stays in the executor; the measurement
+    // comes from the profile.
+    const strata::Dsv4HostMoeExecutor whole_host(0U, true, {});
+    REQUIRE(whole_host.workers() ==
+            strata::host_hardware_profile().worker_threads());
+    REQUIRE(whole_host.output_shards() == 2U);
+
+    // An explicit affinity list is used verbatim and its size is the width,
+    // which is the rank-local shape the production runtime constructs.
+    const std::vector<int> rank_cpus{0, 1, 2};
+    const strata::Dsv4HostMoeExecutor rank_local(0U, false, rank_cpus);
+    REQUIRE(rank_local.workers() == rank_cpus.size());
+    REQUIRE(rank_local.output_shards() == 1U);
 }

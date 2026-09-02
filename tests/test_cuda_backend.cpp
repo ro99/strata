@@ -5,6 +5,7 @@
 #include "strata/models/deepseek/deepseek_kv_cache.hpp"
 #include "strata/models/deepseek/deepseek_host_expert.hpp"
 #include "strata/models/deepseek/deepseek_ops.hpp"
+#include "strata/models/glm53/glm53_runtime.hpp"
 #include "strata/models/kimi_k3/kimi_k3_ops.hpp"
 #include "strata/models/deepseek/deepseek_attention_kv.hpp"
 #include "strata/platform/numerics.hpp"
@@ -1144,6 +1145,31 @@ TEST_CASE("native CUDA backend reuses a strict bounded weight arena when availab
     REQUIRE(stats.weight_allocation_calls == 1U);
     REQUIRE(stats.weight_allocation_bytes == 768U);
     REQUIRE(stats.weight_upload_bytes == 704U);
+}
+
+TEST_CASE("native CUDA backend reserves bounded matmul workspace when available") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected).ok());
+
+    const auto before = backend.stats();
+    REQUIRE(backend.reserve_matmul_workspace(device, 4096U, 8192U).ok());
+    const auto reserved = backend.stats();
+    REQUIRE(reserved.workspace_allocation_calls -
+                before.workspace_allocation_calls == 4U);
+    REQUIRE(reserved.workspace_allocation_bytes -
+                before.workspace_allocation_bytes == 24'576U);
+
+    REQUIRE(backend.reserve_matmul_workspace(device, 2048U, 4096U).ok());
+    const auto repeated = backend.stats();
+    REQUIRE(repeated.workspace_allocation_calls ==
+            reserved.workspace_allocation_calls);
+    REQUIRE(repeated.workspace_allocation_bytes ==
+            reserved.workspace_allocation_bytes);
 }
 
 TEST_CASE("native CUDA backend executes offset-packed groupwise matmul when available") {
@@ -4118,6 +4144,305 @@ TEST_CASE("register-fed MXFP4 MoE batch matches the scalar batch it replaces") {
                      worst);
     }
     REQUIRE(worst < 1e-4);
+}
+
+TEST_CASE("GLM-5.3 expert batching preserves one-expert results and layout") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::uint32_t hidden = 128U;
+    constexpr std::uint32_t intermediate = 128U;
+    constexpr std::size_t matrix_bytes = hidden * intermediate;
+    std::vector<strata::CudaBuffer> storage;
+    storage.reserve(12U);
+    std::array<strata::CudaGlm53Expert, 2U> experts{};
+    for (std::size_t expert_index = 0U; expert_index < experts.size();
+         ++expert_index) {
+        std::array<const strata::CudaBuffer*, 6U> uploaded{};
+        for (std::size_t matrix = 0U; matrix < 3U; ++matrix) {
+            std::vector<std::byte> weights(matrix_bytes);
+            for (std::size_t index = 0U; index < weights.size(); ++index) {
+                weights[index] = static_cast<std::byte>(
+                    0x20U + ((index + 7U * matrix + 13U * expert_index) % 31U));
+            }
+            storage.emplace_back();
+            REQUIRE(backend.upload_buffer(device, weights, storage.back()).ok());
+            uploaded[matrix * 2U] = &storage.back();
+            const std::array<float, 1U> scale{
+                expert_index == 0U ? 0.5F : 0.25F};
+            storage.emplace_back();
+            REQUIRE(backend.upload_buffer(
+                device, std::as_bytes(std::span<const float>(scale)),
+                storage.back()).ok());
+            uploaded[matrix * 2U + 1U] = &storage.back();
+        }
+        experts[expert_index] = {
+            uploaded[0], uploaded[1], uploaded[2],
+            uploaded[3], uploaded[4], uploaded[5], hidden, intermediate};
+    }
+
+    std::array<float, hidden> input{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index % 9U) - 4) /
+                       8.0F;
+    }
+    std::array<std::vector<float>, 2U> single_gate{
+        std::vector<float>(intermediate), std::vector<float>(intermediate)};
+    std::array<std::vector<float>, 2U> single_up{
+        std::vector<float>(intermediate), std::vector<float>(intermediate)};
+    std::array<std::vector<float>, 2U> single_down{
+        std::vector<float>(hidden), std::vector<float>(hidden)};
+    std::array<std::vector<float>, 2U> activations{
+        std::vector<float>(intermediate), std::vector<float>(intermediate)};
+    for (std::size_t expert_index = 0U; expert_index < experts.size();
+         ++expert_index) {
+        activations[expert_index].assign(
+            intermediate, expert_index == 0U ? 0.25F : -0.125F);
+        const auto one = std::span<const strata::CudaGlm53Expert>(
+            &experts[expert_index], 1U);
+        REQUIRE(backend.enqueue_glm53_expert_gate_up(device, one, input).ok());
+        REQUIRE(backend.collect_glm53_expert_gate_up(
+            device, single_gate[expert_index], single_up[expert_index]).ok());
+        REQUIRE(backend.enqueue_glm53_expert_down(
+            device, one, activations[expert_index]).ok());
+        REQUIRE(backend.collect_glm53_expert_down(
+            device, single_down[expert_index]).ok());
+    }
+
+    std::vector<float> batch_gate(2U * intermediate);
+    std::vector<float> batch_up(2U * intermediate);
+    std::vector<float> batch_activations;
+    batch_activations.insert(batch_activations.end(), activations[0].begin(),
+                             activations[0].end());
+    batch_activations.insert(batch_activations.end(), activations[1].begin(),
+                             activations[1].end());
+    std::vector<float> batch_down(2U * hidden);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(device, experts, input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(
+        device, batch_gate, batch_up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(
+        device, experts, batch_activations).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, batch_down).ok());
+
+    for (std::size_t expert_index = 0U; expert_index < experts.size();
+         ++expert_index) {
+        REQUIRE(std::equal(single_gate[expert_index].begin(),
+                           single_gate[expert_index].end(),
+                           batch_gate.begin() + expert_index * intermediate));
+        REQUIRE(std::equal(single_up[expert_index].begin(),
+                           single_up[expert_index].end(),
+                           batch_up.begin() + expert_index * intermediate));
+        REQUIRE(std::equal(single_down[expert_index].begin(),
+                           single_down[expert_index].end(),
+                           batch_down.begin() + expert_index * hidden));
+    }
+
+    // Independent-sequence batching can present the same resident matrix with
+    // a different activation per request. The per-expert-input form must
+    // preserve every batch-1 result bit for bit whether the backend groups a
+    // checkpoint encoding or conservatively splits it.
+    std::array<float, hidden> second_input{};
+    std::array<float, intermediate> second_activation{};
+    for (std::size_t index = 0U; index < hidden; ++index) {
+        second_input[index] =
+            static_cast<float>(static_cast<int>(index % 11U) - 5) / 16.0F;
+        second_activation[index] =
+            static_cast<float>(static_cast<int>(index % 7U) - 3) / 8.0F;
+    }
+    std::vector<float> second_gate(intermediate), second_up(intermediate),
+        second_down(hidden);
+    const auto first = std::span<const strata::CudaGlm53Expert>(
+        &experts.front(), 1U);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(
+        device, first, second_input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(
+        device, second_gate, second_up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(
+        device, first, second_activation).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, second_down).ok());
+
+    const std::array<strata::CudaGlm53Expert, 2U> repeated{
+        experts.front(), experts.front()};
+    std::vector<float> independent_inputs(input.begin(), input.end());
+    independent_inputs.insert(independent_inputs.end(), second_input.begin(),
+                              second_input.end());
+    std::vector<float> independent_activations(
+        activations.front().begin(), activations.front().end());
+    independent_activations.insert(independent_activations.end(),
+                                   second_activation.begin(),
+                                   second_activation.end());
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(
+        device, repeated, independent_inputs).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(
+        device, batch_gate, batch_up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(
+        device, repeated, independent_activations).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, batch_down).ok());
+    REQUIRE(std::equal(single_gate.front().begin(), single_gate.front().end(),
+                       batch_gate.begin()));
+    REQUIRE(std::equal(second_gate.begin(), second_gate.end(),
+                       batch_gate.begin() + intermediate));
+    REQUIRE(std::equal(single_up.front().begin(), single_up.front().end(),
+                       batch_up.begin()));
+    REQUIRE(std::equal(second_up.begin(), second_up.end(),
+                       batch_up.begin() + intermediate));
+    REQUIRE(std::equal(single_down.front().begin(), single_down.front().end(),
+                       batch_down.begin()));
+    REQUIRE(std::equal(second_down.begin(), second_down.end(),
+                       batch_down.begin() + hidden));
+}
+
+TEST_CASE("GLM-5.3 BF16 device expert dots match the host AVX2 association") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::uint32_t hidden = 128U;
+    constexpr std::uint32_t intermediate = 128U;
+    constexpr std::size_t elements = hidden * intermediate;
+    std::array<std::vector<std::byte>, 3U> host_weights;
+    std::vector<strata::CudaBuffer> storage;
+    storage.reserve(host_weights.size());
+    std::array<const strata::CudaBuffer*, 3U> device_weights{};
+    for (std::size_t matrix = 0U; matrix < host_weights.size(); ++matrix) {
+        auto& weights = host_weights[matrix];
+        weights.resize(elements * sizeof(std::uint16_t));
+        for (std::size_t index = 0U; index < elements; ++index) {
+            const float value = static_cast<float>(
+                static_cast<int>((index * 5U + matrix * 11U) % 31U) - 15) /
+                16.0F;
+            const auto encoded = bf16(value);
+            weights[index * 2U] = encoded[0];
+            weights[index * 2U + 1U] = encoded[1];
+        }
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, weights, storage.back()).ok());
+        device_weights[matrix] = &storage.back();
+    }
+    const strata::CudaGlm53Expert expert{
+        device_weights[0], nullptr, device_weights[1], nullptr,
+        device_weights[2], nullptr, hidden, intermediate,
+        strata::CudaGlm53ExpertEncoding::Bf16};
+    std::array<float, hidden> input{};
+    std::array<float, intermediate> activation{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index % 17U) - 8) /
+                       8.0F;
+        activation[index] =
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 16.0F;
+    }
+    std::array<float, intermediate> gate{};
+    std::array<float, intermediate> up{};
+    std::array<float, hidden> down{};
+    const std::span<const strata::CudaGlm53Expert> one(&expert, 1U);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(device, one, input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(device, gate, up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(device, one, activation).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, down).ok());
+
+    const auto require_exact_rows = [&](std::span<const std::byte> weights,
+                                        std::span<const float> values,
+                                        std::span<const float> actual) {
+        for (std::size_t row = 0U; row < actual.size(); ++row) {
+            const auto bytes = weights.subspan(
+                row * values.size() * sizeof(std::uint16_t),
+                values.size() * sizeof(std::uint16_t));
+            const float expected =
+                strata::glm53_host_bf16_row_dot(bytes, values, true);
+            REQUIRE(std::bit_cast<std::uint32_t>(actual[row]) ==
+                    std::bit_cast<std::uint32_t>(expected));
+        }
+    };
+    require_exact_rows(host_weights[0], input, gate);
+    require_exact_rows(host_weights[1], input, up);
+    require_exact_rows(host_weights[2], activation, down);
+}
+
+TEST_CASE("GLM-5.3 MXFP4 device expert dots match the host AVX2 association") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::uint32_t hidden = 128U;
+    constexpr std::uint32_t intermediate = 128U;
+    constexpr std::size_t elements = hidden * intermediate;
+    std::array<std::vector<std::byte>, 3U> host_weights;
+    std::array<std::vector<std::byte>, 3U> host_scales;
+    std::vector<strata::CudaBuffer> storage;
+    storage.reserve(6U);
+    std::array<const strata::CudaBuffer*, 6U> uploaded{};
+    for (std::size_t matrix = 0U; matrix < host_weights.size(); ++matrix) {
+        auto& weights = host_weights[matrix];
+        auto& scales = host_scales[matrix];
+        weights.resize(elements / 2U);
+        scales.resize(elements / 32U);
+        for (std::size_t index = 0U; index < weights.size(); ++index) {
+            const auto low = static_cast<unsigned int>(
+                1U + (index * 3U + matrix * 5U) % 15U);
+            const auto high = static_cast<unsigned int>(
+                1U + (index * 7U + matrix * 11U) % 15U);
+            weights[index] = static_cast<std::byte>(low | (high << 4U));
+        }
+        for (std::size_t index = 0U; index < scales.size(); ++index) {
+            scales[index] = static_cast<std::byte>(
+                124U + (index + matrix) % 7U);
+        }
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, weights, storage.back()).ok());
+        uploaded[matrix * 2U] = &storage.back();
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, scales, storage.back()).ok());
+        uploaded[matrix * 2U + 1U] = &storage.back();
+    }
+    const strata::CudaGlm53Expert expert{
+        uploaded[0], uploaded[1], uploaded[2], uploaded[3], uploaded[4],
+        uploaded[5], hidden, intermediate,
+        strata::CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0};
+    std::array<float, hidden> input{};
+    std::array<float, intermediate> activation{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index % 17U) - 8) /
+                       8.0F;
+        activation[index] =
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 16.0F;
+    }
+    std::array<float, intermediate> gate{};
+    std::array<float, intermediate> up{};
+    std::array<float, hidden> down{};
+    const std::span<const strata::CudaGlm53Expert> one(&expert, 1U);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(device, one, input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(device, gate, up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(device, one, activation).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, down).ok());
+
+    const auto require_exact_rows = [&](std::span<const std::byte> weights,
+                                        std::span<const std::byte> scales,
+                                        std::span<const float> values,
+                                        std::span<const float> actual) {
+        for (std::size_t row = 0U; row < actual.size(); ++row) {
+            const auto row_weights = weights.subspan(
+                row * values.size() / 2U, values.size() / 2U);
+            const auto row_scales = scales.subspan(
+                row * values.size() / 32U, values.size() / 32U);
+            const float expected = strata::glm53_host_fp4_group32_row_dot(
+                row_weights, row_scales, values, true);
+            REQUIRE(std::bit_cast<std::uint32_t>(actual[row]) ==
+                    std::bit_cast<std::uint32_t>(expected));
+        }
+    };
+    require_exact_rows(host_weights[0], host_scales[0], input, gate);
+    require_exact_rows(host_weights[1], host_scales[1], input, up);
+    require_exact_rows(host_weights[2], host_scales[2], activation, down);
 }
 
 TEST_CASE("a partially prepacked MXFP4 MoE batch is refused, not half-served") {

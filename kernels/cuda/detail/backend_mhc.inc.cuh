@@ -184,6 +184,21 @@ ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
     }
     std::uint64_t allocation_calls = 0U;
     std::uint64_t allocation_bytes = 0U;
+    if (state.dsv4_mhc_host_staging == nullptr) {
+        void* staging = nullptr;
+        if (auto status = cudaMallocHost(
+                &staging,
+                static_cast<std::size_t>(kDsv4MhcMaximumHostStagingBytes));
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "reserve pinned DeepSeek device mHC staging");
+        }
+        state.dsv4_mhc_host_staging = static_cast<std::byte*>(staging);
+        state.dsv4_mhc_host_staging_bytes =
+            kDsv4MhcMaximumHostStagingBytes;
+        ++allocation_calls;
+        allocation_bytes += kDsv4MhcMaximumHostStagingBytes;
+    }
     if (slots > state.dsv4_mhc_slot_capacity) {
         void* allocation = nullptr;
         const auto bytes = static_cast<std::size_t>(slots) *
@@ -201,6 +216,26 @@ ValidationResult CudaBackend::dsv4_mhc_reserve_slots(
         }
         state.dsv4_mhc_slot_arena = static_cast<Dsv4MhcWorkspace*>(allocation);
         state.dsv4_mhc_slot_capacity = slots;
+        ++allocation_calls;
+        allocation_bytes += bytes;
+    }
+    if (slots > state.dsv4_mhc_slot_host_input_capacity) {
+        constexpr auto row_bytes = static_cast<std::size_t>(
+            kDsv4MhcMultiplier) * kDsv4MhcHidden * sizeof(std::uint16_t);
+        const auto bytes = static_cast<std::size_t>(slots) * row_bytes;
+        void* allocation = nullptr;
+        if (auto status = cudaMallocHost(&allocation, bytes);
+            status != cudaSuccess) {
+            return cuda_error(
+                status, "allocate pinned DeepSeek device mHC slot inputs");
+        }
+        if (state.dsv4_mhc_slot_host_input != nullptr) {
+            static_cast<void>(
+                cudaFreeHost(state.dsv4_mhc_slot_host_input));
+        }
+        state.dsv4_mhc_slot_host_input =
+            static_cast<std::byte*>(allocation);
+        state.dsv4_mhc_slot_host_input_capacity = slots;
         ++allocation_calls;
         allocation_bytes += bytes;
     }
@@ -292,8 +327,15 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         ++allocation_calls;
         allocation_bytes += kDsv4MhcMaximumHostStagingBytes;
     }
-    auto* host_hidden = reinterpret_cast<std::uint16_t*>(
-        state.dsv4_mhc_host_staging);
+    const auto h2d_bytes = hidden.size() * sizeof(std::uint16_t);
+    auto* host_hidden_bytes = state.dsv4_mhc_host_staging;
+    if (device_only && state.dsv4_mhc_slot_host_input != nullptr &&
+        state.dsv4_mhc_active_slot <
+            state.dsv4_mhc_slot_host_input_capacity) {
+        host_hidden_bytes = state.dsv4_mhc_slot_host_input +
+            static_cast<std::size_t>(state.dsv4_mhc_active_slot) * h2d_bytes;
+    }
+    auto* host_hidden = reinterpret_cast<std::uint16_t*>(host_hidden_bytes);
     for (std::size_t index = 0U; index < hidden.size(); ++index) {
         host_hidden[index] = bf16_encode(hidden[index]);
     }
@@ -307,7 +349,6 @@ ValidationResult CudaBackend::dsv4_mhc_begin_impl(
         auxiliary + 3U * sizeof(float));
     const auto* norm = reinterpret_cast<const __nv_bfloat16*>(
         auxiliary + kDsv4MhcAuxNormOffset);
-    const auto h2d_bytes = hidden.size() * sizeof(std::uint16_t);
     const auto weighted_bytes = weighted.size() * sizeof(std::uint16_t);
     const auto layer_bytes = layer_input.size() * sizeof(std::uint16_t);
     const auto d2h_bytes = weighted_bytes + layer_bytes;
@@ -778,7 +819,7 @@ ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
     }
     auto& state = found->second;
     if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
-        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.dsv4_mhc_workspace == nullptr ||
         state.moe_in_flight || state.dsv4_mhc_failed ||
         layer_input.size() != kDsv4MhcHidden ||
         state.dsv4_mhc_host_staging == nullptr ||
@@ -811,6 +852,94 @@ ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
         }
     }
     return result;
+}
+
+ValidationResult CudaBackend::dsv4_mhc_download_branch(
+    int device, std::span<float> branch) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"mHC branch download targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || !state.dsv4_mhc_branch_ready ||
+        state.moe_in_flight || state.dsv4_mhc_failed ||
+        branch.size() != kDsv4MhcHidden ||
+        state.dsv4_mhc_host_staging == nullptr ||
+        state.dsv4_mhc_host_staging_bytes <
+            kDsv4MhcHidden * sizeof(std::uint16_t)) {
+        return {{"mHC branch download violates command order"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch download");
+    }
+    const auto bytes = kDsv4MhcHidden * sizeof(std::uint16_t);
+    if (auto status = cudaMemcpyAsync(
+            state.dsv4_mhc_host_staging,
+            state.dsv4_mhc_workspace->branch, bytes,
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download mHC branch");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize mHC branch download");
+    }
+    const auto* encoded = reinterpret_cast<const std::uint16_t*>(
+        state.dsv4_mhc_host_staging);
+    for (std::size_t index = 0U; index < branch.size(); ++index) {
+        branch[index] = std::bit_cast<float>(
+            static_cast<std::uint32_t>(encoded[index]) << 16U);
+    }
+    return {};
+}
+
+// Publishes a host-computed branch into the resident chain, so a layer can run
+// its attention on the host while the rest of the layer stays on the device.
+//
+// This exists for the resident MLA control arm: host `mhc_pre` and the device
+// mHC are not the same function, so a control that runs the whole layer on the
+// host also swaps the mHC and measures the wrong variable. Publishing the
+// branch keeps the device mHC on both sides and isolates the attention.
+ValidationResult CudaBackend::dsv4_mhc_publish_branch(
+    int device, std::span<const float> branch) {
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"mHC branch publish targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
+        state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
+        state.moe_in_flight || state.dsv4_mhc_failed ||
+        branch.size() != kDsv4MhcHidden ||
+        state.dsv4_mhc_host_staging == nullptr ||
+        state.dsv4_mhc_host_staging_bytes <
+            kDsv4MhcHidden * sizeof(std::uint16_t)) {
+        return {{"mHC branch publish violates command order"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for mHC branch publish");
+    }
+    // The branch is BF16 on the device, and the resident path's own producer
+    // writes it through `dsv4_fp32_to_bf16`, so encode identically here.
+    auto* encoded = reinterpret_cast<std::uint16_t*>(
+        state.dsv4_mhc_host_staging);
+    for (std::size_t index = 0U; index < branch.size(); ++index) {
+        encoded[index] = bf16_encode(branch[index]);
+    }
+    const auto bytes = kDsv4MhcHidden * sizeof(std::uint16_t);
+    if (auto status = cudaMemcpyAsync(
+            state.dsv4_mhc_workspace->branch, encoded, bytes,
+            cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload mHC branch");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize mHC branch publish");
+    }
+    state.dsv4_mhc_branch_ready = true;
+    return {};
 }
 
 ValidationResult CudaBackend::dsv4_mhc_device_view(

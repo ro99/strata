@@ -67,6 +67,7 @@ add_library(strata_platform STATIC
     src/platform/json_cursor.cpp
     src/platform/numa_topology.cpp
     src/platform/numerics.cpp
+    src/platform/process_stats.cpp
     src/platform/safetensors.cpp
     src/platform/trace.cpp
     src/platform/worker_pool.cpp
@@ -103,6 +104,7 @@ target_link_libraries(strata_kernels PUBLIC strata_device)
 
 add_library(strata_engine STATIC
     src/engine/chat_protocol.cpp
+    src/engine/load_report.cpp
     src/engine/placement.cpp
     src/engine/placement_cache.cpp
     src/engine/model_registry.cpp
@@ -133,6 +135,7 @@ add_library(strata_models STATIC
     src/models/glm53/glm53_manifest.cpp
     src/models/glm53/glm53_sequence.cpp
     src/models/glm53/glm53_checkpoint.cpp
+    src/models/glm53/glm53_expert_profile.cpp
     src/models/glm53/glm53_runtime.cpp
     src/models/kimi_k3/kimi_k3_ops.cpp
     src/models/kimi_k3/kimi_k3_manifest.cpp
@@ -372,6 +375,8 @@ if(BUILD_TESTING)
         tests/test_deepseek_expert_residency.cpp
         tests/test_fp4_decode.cpp
         tests/test_glm52_ops.cpp
+        tests/test_load_report.cpp
+        tests/test_glm53_host_expert.cpp
         tests/test_glm53_manifest.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp

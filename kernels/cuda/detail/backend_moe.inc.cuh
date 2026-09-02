@@ -3935,6 +3935,17 @@ ValidationResult CudaBackend::synchronize(int device) {
 }
 
 CudaBackendStats CudaBackend::stats() const noexcept {
+    // Phase snapshots are natural command boundaries. Resolve any direct
+    // GLM-5.3 spans that did not end at an explicit stream synchronize before
+    // copying the counters. This is the only wait introduced by the ledger.
+    if (impl_->detailed_timing) {
+        for (auto& [device, state] : impl_->devices) {
+            if (state.glm53_kernel_timing_count == 0U) continue;
+            if (cudaSetDevice(device) != cudaSuccess) continue;
+            static_cast<void>(glm53_kernel_timing_drain(
+                *impl_, state, device, true));
+        }
+    }
     std::scoped_lock lock(impl_->mutex);
     auto result = impl_->stats;
     for (const auto& device : result.devices) {
@@ -3985,8 +3996,19 @@ CudaBackendStats CudaBackend::stats() const noexcept {
             result.weight_copy_nanoseconds, device.weight_copy_nanoseconds);
         result.activation_h2d_nanoseconds = std::max(
             result.activation_h2d_nanoseconds, device.activation_h2d_nanoseconds);
-        result.kernel_nanoseconds = std::max(
-            result.kernel_nanoseconds, device.kernel_nanoseconds);
+        // This is CUDA kernel service time, so sum every timed launch across
+        // devices. The old max-per-device reduction discarded sequential
+        // GLM-5.3 layers assigned to the other GPU and could not reconcile to
+        // an external CUDA trace.
+        result.kernel_nanoseconds += device.kernel_nanoseconds;
+        result.glm53_kda_kernel_nanoseconds +=
+            device.glm53_kda_kernel_nanoseconds;
+        result.glm53_mla_kernel_nanoseconds +=
+            device.glm53_mla_kernel_nanoseconds;
+        result.glm53_expert_kernel_nanoseconds +=
+            device.glm53_expert_kernel_nanoseconds;
+        result.glm53_other_kernel_nanoseconds +=
+            device.glm53_other_kernel_nanoseconds;
         result.activation_d2h_nanoseconds = std::max(
             result.activation_d2h_nanoseconds, device.activation_d2h_nanoseconds);
         result.deepseek_moe_calls += device.deepseek_moe_calls;

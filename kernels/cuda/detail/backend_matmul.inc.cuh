@@ -14,6 +14,90 @@ void record_cuda_matmul_route(CudaMatmulRoute route) noexcept {
         1U, std::memory_order_relaxed);
 }
 
+ValidationResult CudaBackend::reserve_matmul_workspace(
+    int device, std::uint64_t maximum_input_bytes,
+    std::uint64_t maximum_output_bytes) {
+    if (maximum_input_bytes == 0U || maximum_output_bytes == 0U ||
+        maximum_input_bytes > std::numeric_limits<std::size_t>::max() ||
+        maximum_output_bytes > std::numeric_limits<std::size_t>::max()) {
+        return {{"CUDA matmul workspace reservation is invalid"}};
+    }
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"CUDA matmul workspace targets an uninitialized device"}};
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA matmul workspace device");
+    }
+    auto& state = found->second;
+    std::uint64_t allocation_calls = 0U;
+    std::uint64_t allocation_bytes = 0U;
+    const auto grow_device = [&](auto*& pointer, std::uint64_t& capacity,
+                                 std::uint64_t required,
+                                 const char* operation) -> ValidationResult {
+        if (required <= capacity) return {};
+        using Pointer = std::remove_reference_t<decltype(pointer)>;
+        Pointer replacement = nullptr;
+        if (auto status = cudaMalloc(
+                &replacement, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            return cuda_error(status, operation);
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+        pointer = replacement;
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return {};
+    };
+    auto result = grow_device(
+        state.input, state.input_bytes, maximum_input_bytes,
+        "reserve CUDA matmul input workspace");
+    if (!result.ok()) return result;
+    result = grow_device(
+        state.output, state.output_bytes, maximum_output_bytes,
+        "reserve CUDA matmul output workspace");
+    if (!result.ok()) return result;
+
+    constexpr std::uint64_t host_staging_ceiling = 64ULL << 20U;
+    const auto grow_host = [&](std::byte*& pointer, std::uint64_t& capacity,
+                               std::uint64_t maximum,
+                               const char* operation) -> ValidationResult {
+        const auto bounded = std::min(maximum, host_staging_ceiling);
+        const auto required = std::bit_ceil(bounded);
+        if (required <= capacity) return {};
+        void* replacement = nullptr;
+        if (auto status = cudaMallocHost(
+                &replacement, static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            return cuda_error(status, operation);
+        }
+        if (pointer != nullptr) static_cast<void>(cudaFreeHost(pointer));
+        pointer = static_cast<std::byte*>(replacement);
+        capacity = required;
+        ++allocation_calls;
+        allocation_bytes += required;
+        return {};
+    };
+    result = grow_host(
+        state.matmul_host_input, state.matmul_host_input_bytes,
+        maximum_input_bytes, "reserve pinned CUDA matmul input staging");
+    if (!result.ok()) return result;
+    result = grow_host(
+        state.matmul_host_output, state.matmul_host_output_bytes,
+        maximum_output_bytes, "reserve pinned CUDA matmul output staging");
+    if (!result.ok()) return result;
+    if (allocation_calls != 0U) {
+        std::scoped_lock lock(impl_->mutex);
+        auto& stats = *std::find_if(
+            impl_->stats.devices.begin(), impl_->stats.devices.end(),
+            [device](const auto& value) { return value.device == device; });
+        stats.workspace_allocation_calls += allocation_calls;
+        stats.workspace_allocation_bytes += allocation_bytes;
+    }
+    return {};
+}
+
 bool CudaBackend::fragment_prepacked(const CudaWeight& weight) noexcept {
     return weight.impl_ != nullptr && weight.impl_->fragment_prepacked;
 }

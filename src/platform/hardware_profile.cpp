@@ -36,6 +36,29 @@ namespace {
     return 0U;
 }
 
+// One `Key:  value kB` field of /proc/meminfo, in its own units. Returns zero
+// when absent, which for a huge-page field means "this host reserved none"
+// rather than "unknown": the kernel omits the fields entirely only on builds
+// without huge-page support, where zero is also the right answer.
+[[nodiscard]] std::uint64_t read_meminfo_field(std::string_view key) noexcept {
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo) return 0U;
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        if (line.compare(0U, key.size(), key) != 0) continue;
+        std::string_view rest(line);
+        rest.remove_prefix(key.size());
+        while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1U);
+        std::uint64_t value = 0U;
+        const auto* begin = rest.data();
+        if (std::from_chars(begin, begin + rest.size(), value).ec != std::errc{}) {
+            return 0U;
+        }
+        return value;
+    }
+    return 0U;
+}
+
 // The process's CPU affinity mask, not the machine's CPU count: a cgroup or a
 // taskset makes those differ, and threads beyond the mask only contend.
 [[nodiscard]] std::vector<int> read_usable_cpu_ids() noexcept {
@@ -73,6 +96,21 @@ namespace {
     // one node, so the minimum is the whole mask rather than zero.
     profile.minimum_cpus_per_node =
         smallest != 0U ? smallest : profile.usable_cpus;
+
+    profile.huge_page_bytes = read_meminfo_field("Hugepagesize:") * 1024U;
+    profile.explicit_huge_pages_total = read_meminfo_field("HugePages_Total:");
+    profile.explicit_huge_pages_free = read_meminfo_field("HugePages_Free:");
+    // The setting is rendered as a bracketed choice, e.g.
+    // `always [madvise] never`, so the active mode is the bracketed token.
+    std::ifstream thp("/sys/kernel/mm/transparent_hugepage/enabled");
+    std::string mode;
+    if (thp && std::getline(thp, mode)) {
+        profile.transparent_huge_pages_always =
+            mode.find("[always]") != std::string::npos;
+        profile.transparent_huge_pages_enabled =
+            profile.transparent_huge_pages_always ||
+            mode.find("[madvise]") != std::string::npos;
+    }
     return profile;
 }
 

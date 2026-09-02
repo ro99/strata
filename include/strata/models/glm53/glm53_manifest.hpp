@@ -12,6 +12,22 @@
 
 namespace strata {
 
+// The two GLM-5.3-Flash releases Strata executes. Both quantize only the
+// routed experts; every other module is BF16 in the MXFP4 release and FP8 in
+// the FP8 release. The distinction is a property of the checkpoint, resolved
+// once at open and carried on the manifest, never a build-time choice.
+enum class Glm53Quantization : std::uint8_t {
+    // GLM-5.3-Flash FP8: E4M3 payload with one F32 inverse scale per 128x128
+    // weight block.
+    Fp8E4m3Block128,
+    // GLM-5.3-Flash MXFP4 (quark "quark" export): E2M1 nibble pairs packed two
+    // per byte along the input dimension, with one E8M0 scale byte per 32
+    // columns of each row. Routed experts in layers 3, 5, 6 and the MTP layer
+    // stay BF16 by the publisher's mixed-precision correction.
+    Mxfp4Group32,
+    Unsupported,
+};
+
 struct Glm53TextConfig {
     std::uint32_t hidden_size{};
     std::uint32_t layer_count{};
@@ -59,8 +75,11 @@ struct Glm53TextConfig {
     std::string hidden_activation;
     std::string router_scoring;
     std::string topk_method;
+    std::uint32_t quantization_group_size{};
     std::string quantization_method;
     std::string quantization_format;
+    std::string quantization_weight_dtype;
+    std::string quantization_scale_format;
     std::vector<std::string> attention_layer_types;
     std::vector<std::string> mlp_layer_types;
     std::vector<std::uint32_t> full_attention_layers;
@@ -101,6 +120,7 @@ enum class Glm53TensorComponent : std::uint8_t {
 enum class Glm53TensorEncoding : std::uint8_t {
     Plain,
     Fp8E4m3Block128F32,
+    Fp4E2m1Group32E8m0,
 };
 
 struct Glm53ManifestTensor {
@@ -118,6 +138,7 @@ struct Glm53ManifestTensor {
 };
 
 struct Glm53IndexManifest {
+    Glm53Quantization quantization{Glm53Quantization::Fp8E4m3Block128};
     std::uint64_t indexed_tensor_bytes{};
     std::vector<std::string> shards;
     std::vector<Glm53ManifestTensor> tensors;
@@ -160,6 +181,11 @@ struct Glm53CheckpointOptions {
 [[nodiscard]] Glm53ConfigResult parse_glm53_config(std::string_view json);
 [[nodiscard]] ValidationResult validate_glm53_config(
     const Glm53TextConfig& config);
+// Names the release a parsed config describes, or Unsupported when it matches
+// neither. Validation reports the diagnostic; this is the selector every other
+// layer branches on.
+[[nodiscard]] Glm53Quantization glm53_config_quantization(
+    const Glm53TextConfig& config) noexcept;
 [[nodiscard]] Glm53TensorRole classify_glm53_tensor(
     std::string_view name, std::int32_t& layer, std::int32_t& expert) noexcept;
 [[nodiscard]] Glm53ManifestResult build_glm53_index_manifest(
@@ -169,5 +195,6 @@ struct Glm53CheckpointOptions {
     const Glm53CheckpointOptions& options = {});
 [[nodiscard]] std::string_view to_string(Glm53TensorRole role) noexcept;
 [[nodiscard]] std::string_view to_string(Glm53TensorEncoding encoding) noexcept;
+[[nodiscard]] std::string_view to_string(Glm53Quantization quantization) noexcept;
 
 }  // namespace strata

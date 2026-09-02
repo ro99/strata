@@ -31,6 +31,12 @@ struct CudaBuffer::Impl {
     void* data{};
     std::uint64_t bytes{};
     int device{-1};
+    // GLM-5.3 BF16 MLA state buffers append an exact BF16 expansion cache
+    // after their packed F32 latent state and norms. The row count is stream
+    // ordered with the projection kernels which populate that cache.
+    std::uint32_t glm53_mla_expanded_rows{};
+    std::uint32_t glm53_mla_maximum_context{};
+    std::uint64_t glm53_mla_expanded_width{};
 
     ~Impl() {
         if (device >= 0) static_cast<void>(cudaSetDevice(device));
@@ -58,6 +64,19 @@ struct CudaBackend::Impl {
         cudaEvent_t router_started{};
         cudaEvent_t kernel_finished{};
         cudaEvent_t activation_downloaded{};
+        // Direct GLM-5.3 launch groups use a small event ledger instead of
+        // synchronizing after every kernel. Every direct kernel is enclosed by
+        // one of these spans; completed spans are drained at natural command
+        // boundaries and by stats().
+        static constexpr std::size_t kGlm53KernelTimingCapacity = 128U;
+        std::array<cudaEvent_t, kGlm53KernelTimingCapacity>
+            glm53_kernel_started{};
+        std::array<cudaEvent_t, kGlm53KernelTimingCapacity>
+            glm53_kernel_finished{};
+        std::array<std::uint8_t, kGlm53KernelTimingCapacity>
+            glm53_kernel_category{};
+        std::uint32_t glm53_kernel_timing_count{};
+        bool glm53_kernel_timing_active{};
         cudaEvent_t moe_start{};
         cudaEvent_t moe_hidden_uploaded{};
         cudaEvent_t moe_kernel_finished{};
@@ -80,6 +99,27 @@ struct CudaBackend::Impl {
         // matmul round trips a step. FlashAttention and the MoE command already
         // stage through pinned host memory; this is the same for the generic
         // matmul.
+        // GLM-5.3 shared-expert scratch. The tier is resident for the life
+        // of the runtime and every layer runs the same three shapes, so these
+        // are allocated once on first use and never grow again.
+        float* glm53_shared_input{};
+        float* glm53_shared_gate{};
+        float* glm53_shared_up{};
+        float* glm53_shared_activation{};
+        float* glm53_shared_output{};
+        std::uint32_t glm53_shared_hidden{};
+        std::uint32_t glm53_shared_intermediate{};
+        CudaGlm53ExpertEncoding glm53_shared_encoding{
+            CudaGlm53ExpertEncoding::Fp8E4m3Block128F32};
+        // Pinned host staging: a pageable cudaMemcpyAsync is not asynchronous,
+        // and the whole point of this path is that the enqueue returns before
+        // the host starts its eight routed experts.
+        float* glm53_shared_staging{};
+        std::uint32_t glm53_shared_staging_floats{};
+        bool glm53_mla_scores_pending{};
+        std::uint32_t glm53_shared_batch{};
+        bool glm53_shared_gate_up_in_flight{};
+        bool glm53_shared_down_in_flight{};
         std::byte* matmul_host_input{};
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};
@@ -208,6 +248,12 @@ struct CudaBackend::Impl {
         std::uint32_t dsv4_mhc_active_slot{};
         Dsv4MhcWorkspace* dsv4_mhc_slot_arena{};
         std::uint32_t dsv4_mhc_slot_capacity{};
+        // Device-only page setup enqueues one asynchronous H2D upload per
+        // slot.  Each upload needs a distinct pinned source until the stream
+        // consumes it; sharing dsv4_mhc_host_staging races the CPU encoder
+        // against the preceding row's DMA.
+        std::byte* dsv4_mhc_slot_host_input{};
+        std::uint32_t dsv4_mhc_slot_host_input_capacity{};
         bool dsv4_mhc_failed{};
         float* dsv4_mhc_head_input{};
         float* dsv4_mhc_head_output{};
@@ -420,6 +466,24 @@ struct CudaBackend::Impl {
             if (state.regfed_scratch != nullptr) {
                 static_cast<void>(cudaFree(state.regfed_scratch));
             }
+            if (state.glm53_shared_input != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_input));
+            }
+            if (state.glm53_shared_gate != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_gate));
+            }
+            if (state.glm53_shared_up != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_up));
+            }
+            if (state.glm53_shared_activation != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_activation));
+            }
+            if (state.glm53_shared_output != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_shared_output));
+            }
+            if (state.glm53_shared_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.glm53_shared_staging));
+            }
             if (state.matmul_host_input != nullptr) {
                 static_cast<void>(cudaFreeHost(state.matmul_host_input));
             }
@@ -462,6 +526,10 @@ struct CudaBackend::Impl {
             }
             if (state.dsv4_mhc_host_staging != nullptr) {
                 static_cast<void>(cudaFreeHost(state.dsv4_mhc_host_staging));
+            }
+            if (state.dsv4_mhc_slot_host_input != nullptr) {
+                static_cast<void>(
+                    cudaFreeHost(state.dsv4_mhc_slot_host_input));
             }
             if (state.dsv4_mhc_head_input != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_mhc_head_input));
@@ -508,6 +576,13 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaEventDestroy(state.router_started));
                 static_cast<void>(cudaEventDestroy(state.kernel_finished));
                 static_cast<void>(cudaEventDestroy(state.activation_downloaded));
+                for (std::size_t index = 0U;
+                     index < state.kGlm53KernelTimingCapacity; ++index) {
+                    static_cast<void>(cudaEventDestroy(
+                        state.glm53_kernel_started[index]));
+                    static_cast<void>(cudaEventDestroy(
+                        state.glm53_kernel_finished[index]));
+                }
             }
             if (state.moe_start != nullptr) {
                 static_cast<void>(cudaEventDestroy(state.moe_start));

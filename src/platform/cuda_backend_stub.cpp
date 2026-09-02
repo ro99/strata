@@ -166,8 +166,59 @@ ValidationResult CudaBackend::allocate_buffer(int, std::uint64_t, CudaBuffer&) {
     return cuda_unavailable();
 }
 
+ValidationResult CudaBackend::reserve_matmul_workspace(
+    int, std::uint64_t, std::uint64_t) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::glm53_kda_decode(
     const CudaGlm53KdaRequest&, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mhc_router(
+    int, const CudaWeight&, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mhc_swiglu(
+    int, const CudaWeight&, const CudaWeight&, const CudaWeight&,
+    std::uint32_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mla_decode_to_mhc(
+    const CudaGlm53MlaRequest&, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mla_prepare_history(
+    const CudaGlm53MlaRequest&, std::uint32_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::glm53_mla_decode_finish(
+    const CudaGlm53MlaRequest&, std::span<const float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
+    int, std::span<const CudaGlm53Expert>, std::span<const float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::collect_glm53_expert_gate_up(
+    int, std::span<float>, std::span<float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::enqueue_glm53_expert_down(
+    int, std::span<const CudaGlm53Expert>, std::span<const float>) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::collect_glm53_expert_down(
+    int, std::span<float>) {
     return cuda_unavailable();
 }
 
@@ -345,6 +396,11 @@ ValidationResult CudaBackend::dsv4_mhc_download_layer_input(
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
 }
 
+ValidationResult CudaBackend::dsv4_mhc_download_branch(
+    int, std::span<float>) {
+    return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
+}
+
 ValidationResult CudaBackend::dsv4_mhc_device_view(
     int, CudaDsv4MhcDeviceView&) {
     return {{"DeepSeek device mHC requires a CUDA-enabled build"}};
@@ -374,6 +430,11 @@ ValidationResult CudaBackend::dsv4_mhc_transition_next_device(
 }
 
 ValidationResult CudaBackend::reserve_dsv4_mhc_head(int, std::uint64_t) {
+    return cuda_unavailable();
+}
+
+ValidationResult CudaBackend::dsv4_mhc_publish_branch(
+    int, std::span<const float>) {
     return cuda_unavailable();
 }
 
@@ -482,6 +543,12 @@ ValidationResult CudaBackend::enqueue_moe(
     return {{"CUDA support was not compiled into this build"}};
 }
 
+ValidationResult CudaBackend::enqueue_glm53_moe_from_mhc(
+    int, std::span<const CudaMoeExpert>, const CudaMoeExpert&,
+    std::span<const float>, float) {
+    return cuda_unavailable();
+}
+
 ValidationResult CudaBackend::dsv4_tier_reserve(
     int, std::uint32_t, std::uint32_t) {
     return cuda_unavailable();
@@ -517,6 +584,10 @@ ValidationResult CudaBackend::matmul_impl(
 ValidationResult CudaBackend::synchronize(int) {
     return {{"CUDA support was not compiled into this build"}};
 }
+
+ValidationResult CudaBackend::profiler_start() { return cuda_unavailable(); }
+
+ValidationResult CudaBackend::profiler_stop() { return cuda_unavailable(); }
 
 CudaBackendStats CudaBackend::stats() const noexcept { return {}; }
 

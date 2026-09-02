@@ -54,7 +54,8 @@ public:
     [[nodiscard]] ValidationResult load_cuda_linear(
         std::string_view base_name, std::uint64_t rows,
         std::uint64_t columns, int device, CudaBackend& backend,
-        CudaWeight& output, bool concurrent_prefetch = false) const;
+        CudaWeight& output, bool concurrent_prefetch = false,
+        bool canonical_layout = false) const;
     [[nodiscard]] ValidationResult load_cuda_linear_slice(
         std::string_view base_name, std::uint64_t total_rows,
         std::uint64_t columns, std::uint64_t row_begin,

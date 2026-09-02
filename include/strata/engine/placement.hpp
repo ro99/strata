@@ -17,7 +17,12 @@ namespace strata {
 // block device, because the tier is the read-only source file and its device is
 // not necessarily an NVMe: on the Kimi-K3 target it is a SATA SSD, and calling
 // it NVMe reported bytes as coming from somewhere they do not.
-inline constexpr std::uint32_t kPlacementPlanVersion = 2U;
+//
+// v3 records per-device NUMA locality and the high-speed peer matrix. A v2 plan
+// carries neither, and silently reading one as "no peer link anywhere" would
+// let a cached plan refuse a fast path the machine actually has, so v2 plans
+// are discarded rather than upgraded.
+inline constexpr std::uint32_t kPlacementPlanVersion = 3U;
 
 enum class PlacementModel : std::uint8_t {
     Glm52,
@@ -125,6 +130,11 @@ struct PlacementDevice {
     std::string name;
     std::uint64_t total_bytes{};
     std::uint64_t free_bytes{};
+    // The host NUMA node this device hangs off, or -1 when the driver does not
+    // say. PCIe locality decides which cores should stage its transfers, and
+    // on a two-socket box the wrong choice crosses the interconnect for every
+    // byte.
+    int numa_node{-1};
 };
 
 // The block device a path actually resolves to. The overflow tier is a file on
@@ -146,8 +156,23 @@ struct PlacementStorage {
 
 struct PlacementHardware {
     std::vector<PlacementDevice> devices;
+    // Row-major `devices.size()` square matrix, 1 where the CUDA driver ranks
+    // the pair as best peer-performance (NVLink or NVSwitch) rather than merely
+    // peer-addressable over a host bridge. Empty when no probe ran.
+    //
+    // Recorded rather than only queried because M3's rank-local execution is
+    // admitted or refused on exactly this, and a plan that does not carry the
+    // topology it was built for cannot be verified against the machine that
+    // later reuses it.
+    std::vector<std::uint8_t> high_speed_peer;
     std::uint64_t host_total_bytes{};
     std::uint64_t host_available_bytes{};
+    [[nodiscard]] bool peer_is_high_speed(std::size_t from,
+                                          std::size_t to) const noexcept {
+        const auto n = devices.size();
+        if (high_speed_peer.size() != n * n || from >= n || to >= n) return false;
+        return high_speed_peer[from * n + to] != 0U;
+    }
     // Where the checkpoint's shards live. Empty when the probe did not run.
     PlacementStorage storage;
 };

@@ -337,7 +337,23 @@ ParseResult<PlacementHardware> probe_placement_hardware(
         entry.name = "cuda:" + std::to_string(device);
         entry.total_bytes = memory.value.total_bytes;
         entry.free_bytes = memory.value.free_bytes;
+        entry.numa_node = CudaBackend::device_numa_node(device);
         result.value.devices.push_back(std::move(entry));
+    }
+    // Peer ranking is a property of the admitted set, so it is probed once the
+    // set is known rather than per device. The diagonal stays zero: a device is
+    // not its own peer, and treating it as one would let a single-GPU topology
+    // masquerade as a peer-linked pair.
+    const auto device_count = result.value.devices.size();
+    result.value.high_speed_peer.assign(device_count * device_count, 0U);
+    for (std::size_t from = 0U; from < device_count; ++from) {
+        for (std::size_t to = 0U; to < device_count; ++to) {
+            if (from == to) continue;
+            const bool fast = CudaBackend::high_speed_peer_access_supported(
+                result.value.devices[from].id, result.value.devices[to].id);
+            result.value.high_speed_peer[from * device_count + to] =
+                fast ? 1U : 0U;
+        }
     }
     constexpr std::uint64_t kilobyte = 1024U;
     result.value.host_total_bytes = read_meminfo_kilobytes("MemTotal") * kilobyte;
@@ -783,6 +799,15 @@ ValidationResult verify_placement_plan(const PlacementPlan& plan,
                 " is free; free VRAM or re-run with --replan");
         }
     }
+    // Peer topology is part of "the same topology". A plan cached on a
+    // peer-linked machine and replayed on one without the link would admit a
+    // fast path the hardware cannot serve, and unlike a capacity mismatch that
+    // failure is silent: the run would simply be slower and wrongly attributed.
+    if (plan.hardware.high_speed_peer != hardware.high_speed_peer) {
+        result.errors.emplace_back(
+            "placement plan was made for a different peer topology; "
+            "re-run with --replan");
+    }
     if (plan.host_resident_bytes > hardware.host_available_bytes) {
         result.errors.emplace_back(
             "placement plan needs " + format_bytes(plan.host_resident_bytes) +
@@ -805,7 +830,28 @@ std::string render_placement_report(const PlacementPlan& plan) {
         if (slot != 0U) text << ", ";
         text << plan.hardware.devices[slot].name << " ("
              << format_bytes(plan.hardware.devices[slot].free_bytes) << " free of "
-             << format_bytes(plan.hardware.devices[slot].total_bytes) << ')';
+             << format_bytes(plan.hardware.devices[slot].total_bytes);
+        if (plan.hardware.devices[slot].numa_node >= 0) {
+            text << ", numa " << plan.hardware.devices[slot].numa_node;
+        }
+        text << ')';
+    }
+    // The peer topology decides whether rank-local execution is admissible, so
+    // it is reported even when it is empty -- "no high-speed peer link" is an
+    // answer a reader needs, not an absence to be inferred from silence.
+    if (slots > 1U) {
+        text << "\n  peer          ";
+        bool any = false;
+        for (std::size_t from = 0U; from < slots; ++from) {
+            for (std::size_t to = from + 1U; to < slots; ++to) {
+                if (!plan.hardware.peer_is_high_speed(from, to)) continue;
+                if (any) text << ", ";
+                text << plan.hardware.devices[from].name << " <-> "
+                     << plan.hardware.devices[to].name;
+                any = true;
+            }
+        }
+        if (!any) text << "no high-speed peer link between admitted devices";
     }
     text << "\n  host          " << format_bytes(plan.hardware.host_available_bytes)
          << " available of " << format_bytes(plan.hardware.host_total_bytes)

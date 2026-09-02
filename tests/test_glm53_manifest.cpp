@@ -2,6 +2,7 @@
 
 #include "strata/engine/model_executor.hpp"
 #include "strata/models/common/tokenizer.hpp"
+#include "strata/models/glm53/glm53_expert_profile.hpp"
 #include "strata/models/glm53/glm53_manifest.hpp"
 #include "strata/models/glm53/glm53_runtime.hpp"
 #include "strata/models/glm53/glm53_sequence.hpp"
@@ -26,6 +27,23 @@ TEST_CASE("GLM-5.3 schedule partitions KDA, sparse MLA, dense, and MoE layers") 
     REQUIRE(moe == 42U);
     REQUIRE(strata::glm53_full_attention_layer(3U));
     REQUIRE(strata::glm53_kda_layer(44U));
+}
+
+TEST_CASE("GLM-5.3 static expert profile is unique and geometry-valid") {
+    const auto ranking = strata::glm53_default_expert_ranking();
+    REQUIRE(ranking.size() == 1700U);
+    REQUIRE(ranking.front() == ((19U << 9U) | 238U));
+    std::array<bool, 45U * 288U> seen{};
+    for (const auto packed : ranking) {
+        const auto layer = static_cast<std::uint32_t>(packed >> 9U);
+        const auto expert = static_cast<std::uint32_t>(packed & 0x1ffU);
+        REQUIRE(layer < 45U);
+        REQUIRE(strata::glm53_moe_layer(layer));
+        REQUIRE(expert < 288U);
+        const auto index = static_cast<std::size_t>(layer) * 288U + expert;
+        REQUIRE(!seen[index]);
+        seen[index] = true;
+    }
 }
 
 TEST_CASE("GLM-5.3 tensor classifier separates text, MTP, and vision") {
@@ -109,6 +127,14 @@ TEST_CASE("GLM-5.3 recurrent state forks lazily and exactly") {
     auto recurrent = state.recurrent(0U);
     REQUIRE(!recurrent.empty());
     recurrent[17U] = 3.25F;
+    auto convolution = state.convolution(0U, 1U);
+    REQUIRE(!convolution.empty());
+    convolution[9U] = 1.75F;
+    const auto& immutable = state;
+    REQUIRE(immutable.recurrent(0U)[17U] == 3.25F);
+    REQUIRE(immutable.convolution(0U, 1U)[9U] == 1.75F);
+    REQUIRE(immutable.recurrent(3U).empty());
+    REQUIRE(immutable.convolution(0U, 3U).empty());
     auto fork = state;
     auto forked = fork.recurrent(0U);
     REQUIRE(forked[17U] == 3.25F);
@@ -135,4 +161,55 @@ TEST_CASE("GLM-5.3 chat rendering matches its text-only Jinja contract") {
                 "unsupported", true) ==
             "[gMASK]<sop><|system|>Reasoning Effort: Max"
             "<|user|>x<|assistant|><think>");
+}
+
+TEST_CASE("GLM-5.3 accepts the FP8 and quark MXFP4 releases and nothing else") {
+    strata::Glm53TextConfig config;
+    config.quantization_method = "fp8";
+    config.quantization_format = "e4m3";
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Fp8E4m3Block128);
+    config = {};
+    config.quantization_method = "quark";
+    config.quantization_weight_dtype = "fp4";
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Mxfp4Group32);
+    config.quantization_weight_dtype = "int4";
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Unsupported);
+    config = {};
+    REQUIRE(strata::glm53_config_quantization(config) ==
+            strata::Glm53Quantization::Unsupported);
+}
+
+TEST_CASE("GLM-5.3 config parser reads quark's nested weight format") {
+    const auto parsed = strata::parse_glm53_config(
+        R"({"architectures":["Glm5NextForConditionalGeneration"],)"
+        R"("quantization_config":{"quant_method":"quark","exclude":["a","b"],)"
+        R"("global_quant_config":{"input_tensors":{"dtype":"fp4"},)"
+        R"("weight":{"dtype":"fp4","group_size":32,"scale_format":"e8m0",)"
+        R"("observer_cls":"PerBlockMXObserver"}}}})");
+    REQUIRE(parsed.ok());
+    REQUIRE(parsed.value.quantization_method == "quark");
+    REQUIRE(parsed.value.quantization_weight_dtype == "fp4");
+    REQUIRE(parsed.value.quantization_scale_format == "e8m0");
+    REQUIRE(parsed.value.quantization_group_size == 32U);
+    // The FP8 release's flat form must still parse into the same fields.
+    const auto fp8 = strata::parse_glm53_config(
+        R"({"quantization_config":{"quant_method":"fp8","fmt":"e4m3",)"
+        R"("weight_block_size":[128,128]}})");
+    REQUIRE(fp8.ok());
+    REQUIRE(fp8.value.fp8_block_rows == 128U);
+    REQUIRE(fp8.value.fp8_block_columns == 128U);
+}
+
+TEST_CASE("GLM-5.3 classifier places MXFP4 scale tensors with their module") {
+    std::int32_t layer = -1;
+    std::int32_t expert = -1;
+    REQUIRE(strata::classify_glm53_tensor(
+                "model.language_model.layers.20.mlp.experts.7.up_proj"
+                ".weight_scale",
+                layer, expert) == strata::Glm53TensorRole::RoutedExpert);
+    REQUIRE(layer == 20);
+    REQUIRE(expert == 7);
 }

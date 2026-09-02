@@ -213,6 +213,21 @@ ValidationResult CudaBackend::initialize(std::span<const int> devices,
                     return cuda_error(status, "create CUDA timing event");
                 }
             }
+            for (std::size_t index = 0U;
+                 index < state.kGlm53KernelTimingCapacity; ++index) {
+                if (auto status = cudaEventCreate(
+                        &state.glm53_kernel_started[index]);
+                    status != cudaSuccess) {
+                    return cuda_error(status,
+                                      "create GLM-5.3 kernel start event");
+                }
+                if (auto status = cudaEventCreate(
+                        &state.glm53_kernel_finished[index]);
+                    status != cudaSuccess) {
+                    return cuda_error(status,
+                                      "create GLM-5.3 kernel finish event");
+                }
+            }
         }
         for (auto* event : {&state.moe_start, &state.moe_hidden_uploaded,
                             &state.moe_kernel_finished, &state.moe_download_started,

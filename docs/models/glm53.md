@@ -15,11 +15,11 @@ host expert decoder, activation boundary, and device shared-expert kernel. A
 checkpoint matching neither pinned release is refused rather than guessed at.
 
 This adapter currently supports text only. Image or video content is rejected
-before generation. The admitted context is capped at 2,048 tokens. At that
-length the model's sparse index `top_k` is 2,048, so every causally visible key
-is selected and dense causal MLA is exactly equivalent to running the sparse
-indexer. Longer contexts fail admission until the k-pool indexer is implemented;
-there is no silent dense or truncated fallback.
+before generation. It implements the checkpoint's k-pool sparse indexer, so the
+admitted context is 262,144 tokens. At or below the model's sparse index
+`top_k` of 2,048 the selection is the identity -- every causally visible key is
+chosen -- and the runtime keeps the dense causal MLA path there, bit for bit.
+Above 2,048 the indexer chooses which history each query reads.
 
 ## Build and preflight
 
@@ -32,6 +32,9 @@ cmake --build build-release --parallel --target strata-chat strata-server
   --devices 1,2 --context-size 2048 --max-new 256 \
   --vram-fraction 0.85 --dry-run
 ```
+
+`--context-size` above 2,048 selects the sparse indexer path; see "Context and
+the k-pool sparse indexer" below for what that changes.
 
 | release | shards | indexed tensors | indexed payload bytes |
 |---|---:|---:|---:|
@@ -84,28 +87,100 @@ env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   --vram-fraction 0.85 --temperature 0 --seed 33377335 --no-color
 ```
 
-## Context limit: 2,048 tokens
+## Context and the k-pool sparse indexer
 
-**This adapter refuses any context above 2,048 tokens**, and it is a missing
-feature rather than a tuning knob:
+GLM-5.3 chooses which history a sparse-attention layer reads through a k-pool
+indexer (`index_topk` 2,048, `index_kpool` 4, `index_kpool_always_select_tail`).
+Each query scores compressed four-token pools, keeps the best 512, expands them
+back to 2,048 raw positions, and appends the current incomplete pool as a tail,
+for a selection at most 2,051 wide. The adapter runs that selection and attends
+only to the positions it names.
 
-```
-GLM-5.3 text context must be within [1, 2048]; above 2048 the
-checkpoint's exact k-pool sparse indexer is required
-```
+Two details are taken from the reference rather than inferred, and both are
+silent at or below 2,048 and wrong above it: the softmax scale is applied
+*inside* the ReLU, where DeepSeek-V4's otherwise similar indexer applies it
+outside; and the indexer's key norm is `nn.LayerNorm(head_dim, eps=1e-6)` --
+mean subtracting, with a bias -- not the RMSNorm this model uses everywhere
+else, including the attention `k_norm`.
 
-GLM-5.3 selects which history a sparse-attention layer reads through a k-pool
-indexer (`index_topk` 2048, `index_kpool` 4). This adapter attends densely over
-the retained history instead, which is exact at or below 2,048 and neither
-exact nor affordable above it. The MLA workspace is dense in history —
-`history x 32,768 x 4 B` per sparse layer — so the eleven MLA layers need about
-2.95 GiB at 2,048 tokens, 11.8 GiB at 8,192 and **47.2 GiB at 32,768**, against
-a 2 GiB per-device workspace reserve.
+This is what bounds cost at long context. The MLA workspace was dense in
+history -- `history x 32,768 x 4 B` per sparse layer, so 2.95 GiB across the
+eleven layers at 2,048 tokens but 47.2 GiB at 32,768 -- and with the selection
+it is constant at any context. Decode is bounded the same way: MLA expands a
+fixed selection instead of the whole history.
 
-Raising the limit therefore requires implementing the checkpoint's k-pool
-indexer so attention reads a bounded selection rather than the whole history.
-Until then, longer contexts are refused at admission rather than silently
-truncated or approximated.
+| context | dense MLA workspace | with selection |
+|---:|---:|---:|
+| 2,048 | 2.95 GiB | 2.95 GiB |
+| 32,768 | 47.24 GiB | 2.95 GiB |
+| 131,072 | 188.98 GiB | 2.95 GiB |
+| 262,144 | 377.96 GiB | 2.95 GiB |
+
+262,144 is the admitted ceiling. The remaining bound is host sequence state --
+about 33.5 KB per token across the eleven sparse layers, the 512-wide latent
+plus the 256-wide indexer row -- which is roughly 8.8 GiB at that length. The
+checkpoint declares 1,048,576; that is not offered until it has been measured.
+
+### Where the attention runs
+
+The indexer lives on the host path, so a sequence admitted with a context above
+2,048 runs its MLA attention on the host for its whole life, and device prefill
+is disabled for it. That is a property of the admitted context, not of the
+current position: the resident device chain keeps its own latent cache and
+computes no indexer state, so switching at the crossing would leave the host
+MLA and indexer caches empty for every earlier token. A sequence admitted at or
+below 2,048 cannot reach a non-identity selection, keeps the resident device
+path, and pays nothing for the indexer.
+
+The consequence is that long context and the resident device MLA are currently
+exclusive. Porting the indexer into the resident CUDA chain is open work.
+
+### Measured long-context behaviour
+
+On the reference two-RTX-3090 host with the MXFP4 release, a 2,591-token prompt
+at `--context-size 4096` completes and answers correctly from a fact placed
+around token 550 -- inside the pooled region, far from the always-selected tail:
+`prefill 2,591 tok in 1816.31 s (1.43 tok/s)`, `decode 127 tok in 556.74 s
+(0.23 tok/s)`.
+
+**Long-context decode is much slower than the 2,048-token rate and this is a
+known open item, not a tuning gap.** At 2,048 tokens decode is 0.182 s/token and
+MLA is nearly free because the resident device chain attends against a
+pre-expanded KV cache. Above the threshold the indexer forces attention onto the
+host, which moves `selection x 32,768 x 4 B` -- about 2.96 GB per token at a
+saturated selection -- across PCIe every step. Phase profiling puts 88% of a
+long-context decode step in MLA, with no MLA device kernels at all.
+
+The measured feed-forward floor is 0.206 s/token and does not depend on history,
+so the 2,048-token operating point is MoE-bound. Because the selection makes MLA
+work constant in context, long-context decode should ultimately equal
+short-context decode; reaching that requires the indexer to run in the resident
+CUDA chain so nothing proportional to context crosses the link. That is the
+open performance item.
+
+Decode cost against history, seconds per token, cold process:
+
+| history | seconds/token |
+|---:|---:|
+| 89 | 0.405 |
+| 534 | 0.525 |
+| 1,046 | 0.778 |
+
+`--context-size` above 2,048 selects the sparse path for *every* sequence the
+runtime admits, whatever its prompt length, so these short-prompt arms exercise
+exactly the long-context decode path and make it measurable in minutes rather
+than in a 30-minute prefill.
+
+### Exactness
+
+At or below 2,048 the selection is the identity, so the sparse and dense paths
+must agree byte for byte; that is the adapter's regression gate and it is free.
+It is also blind to everything above 2,048, which is why the indexer went
+unimplemented through a whole performance campaign while every gate passed. The
+gate that is not blind is `tests/fixtures/glm53/indexer-oracle.json`, frozen by
+`scripts/glm53_indexer_oracle.py` from `Glm5NextTextIndexer` in
+`huggingface/transformers`, which pins the selected positions on both sides of
+the threshold against the reference implementation.
 
 The server exposes the same text runtime through its OpenAI-compatible chat
 completion endpoint. Do not send image content: multimodal support is outside

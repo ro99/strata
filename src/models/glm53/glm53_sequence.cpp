@@ -127,6 +127,8 @@ ValidationResult Glm53SequenceState::reset(
         // 128 indexer key channels followed by 128 k-pool gate channels.
         result = indexer_[layer].reset(256U, mla_page_rows_);
         if (!result.ok()) return result;
+        result = index_pool_[layer].reset(128U, mla_page_rows_);
+        if (!result.ok()) return result;
     }
     return {};
 }
@@ -190,9 +192,23 @@ const Glm53PagedRows& Glm53SequenceState::indexer(std::uint32_t layer) const {
     return indexer_.at(layer);
 }
 
+Glm53PagedRows& Glm53SequenceState::index_pool(std::uint32_t layer) {
+    return index_pool_.at(layer);
+}
+
+const Glm53PagedRows& Glm53SequenceState::index_pool(
+    std::uint32_t layer) const {
+    return index_pool_.at(layer);
+}
+
 void Glm53SequenceState::copy_mla_from(
     std::uint32_t layer, const Glm53SequenceState& source) {
     mla_.at(layer) = source.mla_.at(layer);
+    // The indexer rows are this layer's state for the same positions. Restoring
+    // one without the other leaves the two page tables at different lengths,
+    // and the next query rejects the sequence as non-contiguous.
+    indexer_.at(layer) = source.indexer_.at(layer);
+    index_pool_.at(layer) = source.index_pool_.at(layer);
 }
 
 std::uint64_t Glm53SequenceState::private_bytes() const noexcept {
@@ -209,6 +225,7 @@ std::uint64_t Glm53SequenceState::private_bytes() const noexcept {
     }
     for (const auto& pages : mla_) result += pages.private_bytes();
     for (const auto& pages : indexer_) result += pages.private_bytes();
+    for (const auto& pages : index_pool_) result += pages.private_bytes();
     return result;
 }
 

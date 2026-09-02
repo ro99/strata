@@ -28,6 +28,7 @@
 #include <functional>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <list>
 #include <limits>
 #include <map>
@@ -694,7 +695,6 @@ constexpr std::uint32_t kQueryRank = 1536U;
 constexpr std::uint32_t kKvRank = 512U;
 constexpr std::uint32_t kMhc = 4U;
 constexpr std::uint32_t kVocabulary = 154880U;
-constexpr std::uint32_t kExactSparseContext = 2048U;
 // With the k-pool indexer the MLA workspace no longer grows with history, so
 // the bound is host sequence state: about 33.5 KB per token across the eleven
 // sparse layers (512-wide latent plus the 256-wide indexer row). 262,144
@@ -714,6 +714,22 @@ constexpr std::uint32_t kIndexPool = 4U;
 // Selected pools expand to kIndexTopK tokens; the always-selected tail adds at
 // most one incomplete pool, i.e. kIndexPool - 1 further raw positions.
 constexpr std::uint32_t kIndexSelectionWidth = kIndexTopK + kIndexPool - 1U;
+
+// Whether a sequence runs the k-pool indexer at all. Only the host attention
+// path implements it, so this decides where a sequence's MLA attention lives.
+//
+// It is deliberately a property of the admitted *context*, not of the current
+// position. Switching at the crossing looks cheaper -- run the resident device
+// chain until history reaches `kIndexTopK`, then move -- but the device chain
+// keeps its own latent cache and computes no indexer state at all, so the host
+// MLA and indexer caches would be empty for every token before the crossing and
+// the first host step would find no history to pool. Below the threshold the
+// selection is the identity, so a sequence that cannot cross it keeps the
+// resident device path and is unaffected.
+[[nodiscard]] constexpr bool sparse_indexer_active(
+    std::uint32_t maximum_context_tokens) noexcept {
+    return maximum_context_tokens > kIndexTopK;
+}
 
 // Chooses which history positions one decode query attends to. Returns the
 // selected positions in ascending order.
@@ -762,10 +778,59 @@ void glm53_indexer_layer_norm(std::span<float> values,
     }
 }
 
+// One complete pool's learned key: a per-channel softmax average over the
+// pool's four members, `logits = gate + index_kpool_compress_ape`.
+//
+// This depends on the pool's members alone -- not on the query -- so it is
+// computed once, when the pool completes, and cached on the sequence. Rebuilding
+// it per query is the indexer's dominant cost: it is `index_kpool x head_dim`
+// exponentials per pool, and a 64-row prefill page was paying about 190 million
+// of them to rebuild keys that are identical across all 64 rows.
+//
+// `key_at(token)` and `gate_at(token)` return one position's 128-wide
+// normalized indexer key and k-pool gate. They are accessors rather than
+// contiguous spans because the caller's history is a page table: materializing
+// it would copy `history x 256 x 4 B` per query.
+template <typename KeyAt, typename GateAt>
+void glm53_index_pool_key(std::span<float> pool_key, std::uint32_t pool,
+                          KeyAt&& key_at, GateAt&& gate_at,
+                          std::span<const float> pool_ape) {
+    const auto base = pool * kIndexPool;
+    std::array<const float*, kIndexPool> member_key{};
+    std::array<const float*, kIndexPool> member_gate{};
+    for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
+        member_key[member] = key_at(base + member);
+        member_gate[member] = gate_at(base + member);
+    }
+    std::array<float, kIndexPool> probability{};
+    for (std::uint32_t channel = 0U; channel < kIndexHeadDim; ++channel) {
+        float highest = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
+            const auto logit =
+                member_gate[member][channel] +
+                pool_ape[static_cast<std::size_t>(member) * kIndexHeadDim +
+                         channel];
+            probability[member] = logit;
+            highest = std::max(highest, logit);
+        }
+        float total = 0.0F;
+        for (auto& value : probability) {
+            value = std::exp(value - highest);
+            total += value;
+        }
+        float mixed = 0.0F;
+        for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
+            mixed += (probability[member] / total) * member_key[member][channel];
+        }
+        pool_key[channel] = mixed;
+    }
+}
+
+// `pool_key_at(pool)` returns that complete pool's cached 128-wide key.
+template <typename PoolKeyAt>
 [[nodiscard]] std::size_t glm53_sparse_index_select(
     std::span<std::uint32_t> selected, std::span<const float> indexer_query,
-    std::span<const float> indexer_keys, std::span<const float> gate_scores,
-    std::span<const float> pool_ape, std::span<const float> head_weights,
+    PoolKeyAt&& pool_key_at, std::span<const float> head_weights,
     std::uint32_t history) {
     if (history <= kIndexTopK) {
         // Selection is the identity here. Returning the dense range keeps the
@@ -781,36 +846,11 @@ void glm53_indexer_layer_norm(std::span<float> values,
     const auto scale = 1.0F / std::sqrt(static_cast<float>(kIndexHeadDim));
     const auto head_scale = 1.0F / std::sqrt(static_cast<float>(kIndexHeads));
 
-    std::vector<float> pool_key(kIndexHeadDim);
-    std::vector<float> probability(kIndexPool);
     std::vector<std::pair<float, std::uint32_t>> ranked;
     ranked.reserve(pools);
 
     for (std::uint32_t pool = 0U; pool < pools; ++pool) {
-        const auto base = static_cast<std::size_t>(pool) * kIndexPool;
-        // Learned softmax average over the pool's members, per channel.
-        for (std::uint32_t channel = 0U; channel < kIndexHeadDim; ++channel) {
-            float highest = -std::numeric_limits<float>::infinity();
-            for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
-                const auto logit =
-                    gate_scores[(base + member) * kIndexHeadDim + channel] +
-                    pool_ape[static_cast<std::size_t>(member) * kIndexHeadDim +
-                             channel];
-                probability[member] = logit;
-                highest = std::max(highest, logit);
-            }
-            float total = 0.0F;
-            for (auto& value : probability) {
-                value = std::exp(value - highest);
-                total += value;
-            }
-            float mixed = 0.0F;
-            for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
-                mixed += (probability[member] / total) *
-                         indexer_keys[(base + member) * kIndexHeadDim + channel];
-            }
-            pool_key[channel] = mixed;
-        }
+        const auto* pool_key = pool_key_at(pool);
         float score = 0.0F;
         for (std::uint32_t head = 0U; head < kIndexHeads; ++head) {
             const auto* q = indexer_query.data() +
@@ -1000,7 +1040,8 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 
 bool device_prefill_for_context(
     std::uint32_t maximum_context_tokens) noexcept {
-    return device_prefill_enabled() && maximum_context_tokens <= 2048U;
+    return device_prefill_enabled() &&
+           !sparse_indexer_active(maximum_context_tokens);
 }
 
 [[nodiscard]] bool device_page_mla_enabled() noexcept {
@@ -2563,6 +2604,16 @@ struct Glm53Runtime::Impl {
     // Resident MLA softmax scratch, `kHeads * history` floats. Grown with the
     // context and reused, so no allocation happens inside a timed step.
     std::vector<float> mla_softmax_scores;
+    // Expansion scratch for the host MLA paths. These are the largest buffers
+    // in the model's steady state -- `attended_rows x 32,768 x 4 B`, 268 MiB at
+    // a saturated selection -- and allocating them per layer per token made
+    // decode fault in and zero about 1.5 GB of fresh anonymous pages every
+    // token, then take the D2H into pageable memory. Measured at 0.86 s per GB,
+    // roughly ten times what the link costs. Decode, dense prefill and sparse
+    // prefill never run concurrently, so one set serves all three.
+    std::vector<float> mla_expanded_scratch;
+    std::vector<float> mla_gathered_scratch;
+    std::vector<float> mla_head_score_scratch;
     std::vector<float> shared_expert_gate;
     std::vector<float> shared_expert_up;
     std::vector<float> shared_expert_output;
@@ -2910,6 +2961,13 @@ struct Glm53Runtime::Impl {
                 bytes[slot] += kda_floats * sizeof(float);
                 continue;
             }
+            // A sequence running the k-pool indexer attends on the host and
+            // `prepare_device_sequence` reserves no resident MLA state for it.
+            // Charging for state that is never allocated would refuse
+            // admission outright at the context lengths the indexer exists to
+            // reach: the expanded history alone is 17 GiB per layer at 262,144
+            // tokens.
+            if (sparse_indexer_active(config.maximum_context_tokens)) continue;
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";
             // Both current releases store MLA KV-B in BF16. Key this ledger
@@ -5117,7 +5175,7 @@ struct Glm53Runtime::Impl {
         // reach a query where the selection is anything but the identity, so
         // it pays nothing for the indexer at all.
         const bool sparse_reachable =
-            sequence.maximum_context_tokens() > kIndexTopK;
+            sparse_indexer_active(sequence.maximum_context_tokens());
         if (sparse_reachable) {
             std::vector<float> index_key(kIndexHeadDim);
             std::vector<float> index_gate(kIndexHeadDim);
@@ -5191,29 +5249,18 @@ struct Glm53Runtime::Impl {
             result = index_cache.append(packed);
             if (!result.ok()) return result;
 
+            result = complete_index_pools(sequence, layer, attention);
+            if (!result.ok()) return result;
             if (history > kIndexTopK) {
-                auto ape = host_tensor(
-                    attention + "indexer.index_kpool_compress_ape",
-                    kIndexPool * kIndexHeadDim);
-                if (!ape.ok()) return {std::move(ape.errors)};
-                const auto packed_history = index_cache.materialize();
-                std::vector<float> keys(
-                    static_cast<std::size_t>(history) * kIndexHeadDim);
-                std::vector<float> gates(keys.size());
-                for (std::uint32_t token = 0U; token < history; ++token) {
-                    const auto* row = packed_history.data() +
-                        static_cast<std::size_t>(token) * 2U * kIndexHeadDim;
-                    std::copy_n(row, kIndexHeadDim,
-                                keys.begin() +
-                                    static_cast<std::size_t>(token) *
-                                        kIndexHeadDim);
-                    std::copy_n(row + kIndexHeadDim, kIndexHeadDim,
-                                gates.begin() +
-                                    static_cast<std::size_t>(token) *
-                                        kIndexHeadDim);
-                }
+                // Read the cached pool keys in place. Materializing the indexer
+                // history here would copy `history x 256 x 4 B` per layer per
+                // token, which grows with context exactly as the dense path did.
+                const auto& pool_cache = sequence.index_pool(layer);
                 selected_count = glm53_sparse_index_select(
-                    selected, index_query, keys, gates, *ape.value,
+                    selected, index_query,
+                    [&](std::uint32_t pool) {
+                        return pool_cache.row(pool).data();
+                    },
                     head_weights, history);
             }
         }
@@ -5227,26 +5274,30 @@ struct Glm53Runtime::Impl {
         // Expand only the selected latents. This is what bounds both the MLA
         // workspace and the decode cost at any context.
         const auto attended_rows = static_cast<std::uint32_t>(selected_count);
-        std::vector<float> expanded(
-            static_cast<std::size_t>(attended_rows) * kHeads * 2U * kMlaHead);
+        static_cast<void>(glm53_grow(
+            mla_expanded_scratch,
+            static_cast<std::size_t>(attended_rows) * kHeads * 2U * kMlaHead));
+        const auto expanded = std::span<float>(mla_expanded_scratch)
+            .first(static_cast<std::size_t>(attended_rows) * kHeads * 2U *
+                   kMlaHead);
         const std::array<std::string, 2U> second_bases{
             attention + "q_b_proj", attention + "kv_b_proj"};
-        const auto latent_storage = cache.materialize();
-        std::vector<float> gathered;
-        std::span<const float> latent_history;
-        if (attended_rows == history) {
-            latent_history = std::span<const float>(latent_storage);
-        } else {
-            gathered.resize(static_cast<std::size_t>(attended_rows) * kKvRank);
-            for (std::uint32_t row = 0U; row < attended_rows; ++row) {
-                std::copy_n(latent_storage.data() +
-                                static_cast<std::size_t>(selected[row]) * kKvRank,
-                            kKvRank,
-                            gathered.begin() +
-                                static_cast<std::size_t>(row) * kKvRank);
-            }
-            latent_history = std::span<const float>(gathered);
+        // Gather straight out of the page table. The selection is bounded by
+        // kIndexSelectionWidth, so this copy is bounded too; materializing the
+        // whole latent history first would not be.
+        static_cast<void>(glm53_grow(
+            mla_gathered_scratch,
+            static_cast<std::size_t>(attended_rows) * kKvRank));
+        const auto gathered = std::span<float>(mla_gathered_scratch)
+            .first(static_cast<std::size_t>(attended_rows) * kKvRank);
+        for (std::uint32_t row = 0U; row < attended_rows; ++row) {
+            const auto source = cache.row(selected[row]);
+            std::copy(source.begin(), source.end(),
+                      gathered.begin() +
+                          static_cast<std::ptrdiff_t>(
+                              static_cast<std::size_t>(row) * kKvRank));
         }
+        const auto latent_history = std::span<const float>(gathered);
         const std::array<Glm53WeightCache::LinearRequest, 2U> second{
             {{second_bases[0], kMlaWidth, kQueryRank, q_rank, 1U, query, true},
              {second_bases[1], kHeads * 2U * kMlaHead, kKvRank, latent_history,
@@ -5255,9 +5306,19 @@ struct Glm53Runtime::Impl {
         if (!result.ok()) return result;
         std::vector<float> attended(kMlaWidth, 0.0F);
         const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
-        std::vector<float> scores(attended_rows);
-        for (std::uint32_t head = 0U; head < kHeads; ++head) {
-            const auto* q = query.data() + static_cast<std::size_t>(head) * kMlaHead;
+        // The 64 heads are independent: each reads the shared expansion and
+        // writes its own slice of `attended`, and the accumulation order within
+        // a head is untouched, so spreading them across the pool is exact. This
+        // loop is 93 ms per layer at a 2,051-position selection -- 1.02 s per
+        // token across the eleven sparse layers -- and it was serial and scalar.
+        static_cast<void>(glm53_grow(
+            mla_head_score_scratch,
+            static_cast<std::size_t>(kHeads) * attended_rows));
+        auto* const head_scores = mla_head_score_scratch.data();
+        const auto attend_head = [&](std::size_t head) {
+            auto* scores = head_scores +
+                           head * static_cast<std::size_t>(attended_rows);
+            const auto* q = query.data() + head * kMlaHead;
             float highest = -std::numeric_limits<float>::infinity();
             for (std::uint32_t token = 0U; token < attended_rows; ++token) {
                 const auto* kv = expanded.data() +
@@ -5271,12 +5332,11 @@ struct Glm53Runtime::Impl {
                 highest = std::max(highest, scores[token]);
             }
             float total = 0.0F;
-            for (auto& score : scores) {
-                score = std::exp(score - highest);
-                total += score;
+            for (std::uint32_t token = 0U; token < attended_rows; ++token) {
+                scores[token] = std::exp(scores[token] - highest);
+                total += scores[token];
             }
-            auto* destination = attended.data() +
-                                static_cast<std::size_t>(head) * kMlaHead;
+            auto* destination = attended.data() + head * kMlaHead;
             for (std::uint32_t token = 0U; token < attended_rows; ++token) {
                 const auto* values = expanded.data() +
                     (static_cast<std::size_t>(token) * kHeads + head) *
@@ -5286,28 +5346,76 @@ struct Glm53Runtime::Impl {
                     destination[column] += coefficient * values[column];
                 }
             }
+        };
+        if (kda_workers != nullptr) {
+            auto attended_all = kda_workers->parallel_for(kHeads, attend_head);
+            if (!attended_all.ok()) return attended_all;
+        } else {
+            for (std::size_t head = 0U; head < kHeads; ++head) attend_head(head);
         }
         round_bf16(attended);
         return linear(attention + "o_proj", attended, 1U, kMlaWidth,
                       output, layer);
     }
 
+    // Bring this layer's pool-key store up to date with its indexer store.
+    // Every group of `kIndexPool` consecutive positions that has just become
+    // complete gets its key computed once, here, and never again.
+    [[nodiscard]] ValidationResult complete_index_pools(
+        Glm53SequenceState& sequence, std::uint32_t layer,
+        const std::string& attention) {
+        const auto& index_cache = sequence.indexer(layer);
+        auto& pool_cache = sequence.index_pool(layer);
+        const auto complete = index_cache.rows() / kIndexPool;
+        if (pool_cache.rows() >= complete) return {};
+        auto ape = host_tensor(attention + "indexer.index_kpool_compress_ape",
+                               kIndexPool * kIndexHeadDim);
+        if (!ape.ok()) return {std::move(ape.errors)};
+        std::vector<float> pool_key(kIndexHeadDim);
+        for (auto pool = pool_cache.rows(); pool < complete; ++pool) {
+            glm53_index_pool_key(
+                pool_key, pool,
+                [&](std::uint32_t token) {
+                    return index_cache.row(token).data();
+                },
+                [&](std::uint32_t token) {
+                    return index_cache.row(token).data() + kIndexHeadDim;
+                },
+                *ape.value);
+            auto appended = pool_cache.append(pool_key);
+            if (!appended.ok()) return appended;
+        }
+        return {};
+    }
+
     // Bounded prefill attention for histories past the selection threshold.
-    // Each row expands only the positions its own indexer selection names, so
-    // the working set is at most kIndexSelectionWidth rows of expanded KV --
-    // about 268 MiB -- whatever the context length.
+    //
+    // The dense page path expands the whole history once and shares it across
+    // the page's rows, which is what makes prefill cheap per token; its problem
+    // is only that `history x 32,768 x 4 B` grows without bound. Expanding each
+    // row's own selection instead fixes the bound and destroys the sharing:
+    // every row would re-expand about `kIndexTopK` latents, 64 times the work of
+    // one dense expansion for a 64-row page.
+    //
+    // So expand the *union* of the group's selections once. Consecutive prompt
+    // rows score nearly the same history, so their selections overlap heavily
+    // and the union stays close to one row's width. The group is closed as soon
+    // as the union would exceed `kMaxExpandedRows`, which caps the working set
+    // whatever the context length while keeping the dense path's sharing.
     [[nodiscard]] ValidationResult attention_mla_page_sparse(
         std::span<float> output, std::span<const float> input,
         std::uint32_t rows, std::uint32_t layer, const std::string& attention,
         Glm53SequenceState& sequence, std::span<const float> q_rank,
-        std::span<const float> latent_history, std::uint32_t history_begin,
-        std::uint32_t history_rows) {
-        ValidationResult result;
-        auto& index_cache = sequence.indexer(layer);
-        const auto packed_history = index_cache.materialize();
-        auto ape = host_tensor(attention + "indexer.index_kpool_compress_ape",
-                               kIndexPool * kIndexHeadDim);
-        if (!ape.ok()) return {std::move(ape.errors)};
+        const Glm53PagedRows& latent_rows, std::uint32_t history_begin) {
+        // 4,096 expanded rows is 512 MiB, the same order as the dense path's
+        // expansion at the context lengths it could still serve, and at least
+        // twice the widest single selection so a row can never fail to fit.
+        constexpr std::uint32_t kMaxExpandedRows = 4096U;
+        static_assert(kMaxExpandedRows >= kIndexSelectionWidth);
+        ValidationResult result = complete_index_pools(sequence, layer,
+                                                       attention);
+        if (!result.ok()) return result;
+        const auto& pool_cache = sequence.index_pool(layer);
 
         std::vector<float> index_query(
             static_cast<std::size_t>(rows) * kIndexHeads * kIndexHeadDim);
@@ -5346,96 +5454,137 @@ struct Glm53Runtime::Impl {
             }
         }
 
-        const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
-        std::vector<std::uint32_t> selected(kIndexSelectionWidth);
-        std::vector<float> keys, gates, gathered, expanded, scores;
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            const auto visible = history_begin + row + 1U;
-            keys.assign(static_cast<std::size_t>(visible) * kIndexHeadDim, 0.0F);
-            gates.assign(keys.size(), 0.0F);
-            for (std::uint32_t token = 0U; token < visible; ++token) {
-                const auto* source = packed_history.data() +
-                    static_cast<std::size_t>(token) * 2U * kIndexHeadDim;
-                std::copy_n(source, kIndexHeadDim,
-                            keys.begin() +
-                                static_cast<std::size_t>(token) * kIndexHeadDim);
-                std::copy_n(source + kIndexHeadDim, kIndexHeadDim,
-                            gates.begin() +
-                                static_cast<std::size_t>(token) * kIndexHeadDim);
+        // Every row's selection first, so the group boundaries can be chosen
+        // from the unions they actually produce rather than guessed.
+        std::vector<std::vector<std::uint32_t>> selection(rows);
+        {
+            std::vector<std::uint32_t> selected(kIndexSelectionWidth);
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto visible = history_begin + row + 1U;
+                const auto count = glm53_sparse_index_select(
+                    selected,
+                    std::span<const float>(index_query).subspan(
+                        static_cast<std::size_t>(row) * kIndexHeads * kIndexHeadDim,
+                        static_cast<std::size_t>(kIndexHeads) * kIndexHeadDim),
+                    [&](std::uint32_t pool) {
+                        return pool_cache.row(pool).data();
+                    },
+                    std::span<const float>(head_weights).subspan(
+                        static_cast<std::size_t>(row) * kIndexHeads, kIndexHeads),
+                    visible);
+                selection[row].assign(selected.begin(),
+                                      selected.begin() +
+                                          static_cast<std::ptrdiff_t>(count));
             }
-            const auto count = glm53_sparse_index_select(
-                selected,
-                std::span<const float>(index_query).subspan(
-                    static_cast<std::size_t>(row) * kIndexHeads * kIndexHeadDim,
-                    static_cast<std::size_t>(kIndexHeads) * kIndexHeadDim),
-                keys, gates, *ape.value,
-                std::span<const float>(head_weights).subspan(
-                    static_cast<std::size_t>(row) * kIndexHeads, kIndexHeads),
-                visible);
-            const auto attended_rows = static_cast<std::uint32_t>(count);
+        }
 
-            gathered.assign(
-                static_cast<std::size_t>(attended_rows) * kKvRank, 0.0F);
-            for (std::uint32_t index = 0U; index < attended_rows; ++index) {
-                std::copy_n(latent_history.data() +
-                                static_cast<std::size_t>(selected[index]) *
-                                    kKvRank,
-                            kKvRank,
-                            gathered.begin() +
-                                static_cast<std::size_t>(index) * kKvRank);
+        const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
+        // One row of `attended` per prompt row, so `o_proj` runs once for the
+        // page exactly as it does on the dense path.
+        std::vector<float> attended(
+            static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
+        std::vector<std::uint32_t> group_union, merged;
+        std::vector<float> scores;
+        for (std::uint32_t group_begin = 0U; group_begin < rows;) {
+            group_union.clear();
+            auto group_end = group_begin;
+            while (group_end < rows) {
+                merged.clear();
+                std::set_union(group_union.begin(), group_union.end(),
+                               selection[group_end].begin(),
+                               selection[group_end].end(),
+                               std::back_inserter(merged));
+                if (group_end != group_begin &&
+                    merged.size() > kMaxExpandedRows) {
+                    break;
+                }
+                group_union.swap(merged);
+                ++group_end;
             }
-            expanded.assign(static_cast<std::size_t>(attended_rows) * kHeads *
-                                2U * kMlaHead,
-                            0.0F);
+            const auto expanded_rows =
+                static_cast<std::uint32_t>(group_union.size());
+            static_cast<void>(glm53_grow(
+                mla_gathered_scratch,
+                static_cast<std::size_t>(expanded_rows) * kKvRank));
+            const auto gathered = std::span<float>(mla_gathered_scratch)
+                .first(static_cast<std::size_t>(expanded_rows) * kKvRank);
+            for (std::uint32_t index = 0U; index < expanded_rows; ++index) {
+                const auto source = latent_rows.row(group_union[index]);
+                std::copy(source.begin(), source.end(),
+                          gathered.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  static_cast<std::size_t>(index) * kKvRank));
+            }
+            static_cast<void>(glm53_grow(
+                mla_expanded_scratch,
+                static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                    kMlaHead));
+            const auto expanded = std::span<float>(mla_expanded_scratch)
+                .first(static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                       kMlaHead);
             const std::array<Glm53WeightCache::LinearRequest, 1U> expand{
                 {{bases[3], kHeads * 2U * kMlaHead, kKvRank,
-                  gathered, attended_rows, expanded, true}}};
+                  gathered, expanded_rows, expanded, true}}};
             result = linear_batch(expand, layer);
             if (!result.ok()) return result;
 
-            scores.assign(attended_rows, 0.0F);
-            auto destination = output.subspan(
-                static_cast<std::size_t>(row) * kHidden, kHidden);
-            std::vector<float> attended(kMlaWidth, 0.0F);
-            for (std::uint32_t head = 0U; head < kHeads; ++head) {
-                const auto* q = query.data() +
-                    (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
-                float highest = -std::numeric_limits<float>::infinity();
-                for (std::uint32_t token = 0U; token < attended_rows; ++token) {
-                    const auto* kv = expanded.data() +
-                        (static_cast<std::size_t>(token) * kHeads + head) *
-                            (2U * kMlaHead);
-                    float score = 0.0F;
-                    for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
-                        score += q[column] * kv[column];
+            for (auto row = group_begin; row < group_end; ++row) {
+                // The group's union is sorted and so is each selection, so the
+                // mapped positions stay ascending and the accumulation order is
+                // the dense path's.
+                const auto& chosen = selection[row];
+                const auto attended_rows =
+                    static_cast<std::uint32_t>(chosen.size());
+                std::vector<std::uint32_t> local(attended_rows);
+                for (std::uint32_t index = 0U; index < attended_rows; ++index) {
+                    local[index] = static_cast<std::uint32_t>(
+                        std::lower_bound(group_union.begin(), group_union.end(),
+                                         chosen[index]) -
+                        group_union.begin());
+                }
+                scores.assign(attended_rows, 0.0F);
+                for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                    const auto* q = query.data() +
+                        (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
+                    float highest = -std::numeric_limits<float>::infinity();
+                    for (std::uint32_t token = 0U; token < attended_rows; ++token) {
+                        const auto* kv = expanded.data() +
+                            (static_cast<std::size_t>(local[token]) * kHeads +
+                             head) * (2U * kMlaHead);
+                        float score = 0.0F;
+                        for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
+                            score += q[column] * kv[column];
+                        }
+                        scores[token] = score * score_scale;
+                        highest = std::max(highest, scores[token]);
                     }
-                    scores[token] = score * score_scale;
-                    highest = std::max(highest, scores[token]);
-                }
-                float total = 0.0F;
-                for (auto& score : scores) {
-                    score = std::exp(score - highest);
-                    total += score;
-                }
-                auto* out = attended.data() +
-                            static_cast<std::size_t>(head) * kMlaHead;
-                for (std::uint32_t token = 0U; token < attended_rows; ++token) {
-                    const auto weight = scores[token] / total;
-                    const auto* value = expanded.data() +
-                        (static_cast<std::size_t>(token) * kHeads + head) *
-                            (2U * kMlaHead) + kMlaHead;
-                    for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
-                        out[column] += weight * value[column];
+                    float total = 0.0F;
+                    for (auto& score : scores) {
+                        score = std::exp(score - highest);
+                        total += score;
+                    }
+                    auto* out = attended.data() +
+                        (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
+                    for (std::uint32_t token = 0U; token < attended_rows; ++token) {
+                        // The accepted softmax arithmetic, element for element
+                        // with the dense page path: the coefficient is rounded
+                        // to BF16 before it ever multiplies a value.
+                        const auto coefficient =
+                            bf16_round_f32(scores[token] / total);
+                        const auto* value = expanded.data() +
+                            (static_cast<std::size_t>(local[token]) * kHeads +
+                             head) * (2U * kMlaHead) + kMlaHead;
+                        for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
+                            out[column] += coefficient * value[column];
+                        }
                     }
                 }
             }
-            const std::array<Glm53WeightCache::LinearRequest, 1U> project{
-                {{bases[4], kHidden, kMlaWidth, attended, 1U,
-                  destination, true}}};
-            result = linear_batch(project, layer);
-            if (!result.ok()) return result;
+            group_begin = group_end;
         }
-        return result;
+        round_bf16(attended);
+        return linear(attention + "o_proj", attended, rows, kMlaWidth,
+                      output, layer);
     }
 
     [[nodiscard]] ValidationResult attention_mla_page(
@@ -5464,14 +5613,13 @@ struct Glm53Runtime::Impl {
         result = cache.append_rows(latent, rows);
         if (!result.ok()) return result;
         const auto history_rows = cache.rows();
-        const auto latent_history = cache.materialize();
 
         // Record this page's indexer keys and gates so later queries -- in this
         // page or a later one -- can pool them. Only needed when the sequence
         // can actually reach the selection threshold.
         auto& index_cache = sequence.indexer(layer);
         const bool sparse_reachable =
-            sequence.maximum_context_tokens() > kIndexTopK;
+            sparse_indexer_active(sequence.maximum_context_tokens());
         if (sparse_reachable) {
             std::vector<float> page_keys(
                 static_cast<std::size_t>(rows) * kIndexHeadDim);
@@ -5544,11 +5692,16 @@ struct Glm53Runtime::Impl {
         if (sparse_reachable && history_rows > kIndexTopK) {
             return attention_mla_page_sparse(
                 output, input, rows, layer, attention, sequence, q_rank,
-                latent_history, history_begin, history_rows);
+                cache, history_begin);
         }
 
-        std::vector<float> expanded(
-            static_cast<std::size_t>(history_rows) * kHeads * 2U * kMlaHead);
+        const auto latent_history = cache.materialize();
+        static_cast<void>(glm53_grow(
+            mla_expanded_scratch,
+            static_cast<std::size_t>(history_rows) * kHeads * 2U * kMlaHead));
+        const auto expanded = std::span<float>(mla_expanded_scratch)
+            .first(static_cast<std::size_t>(history_rows) * kHeads * 2U *
+                   kMlaHead);
         const std::array<std::string, 2U> second_bases{
             attention + "q_b_proj", attention + "kv_b_proj"};
         const std::array<Glm53WeightCache::LinearRequest, 2U> second{
@@ -5560,8 +5713,13 @@ struct Glm53Runtime::Impl {
         std::vector<float> attended(
             static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
         const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            const auto visible = history_begin + row + 1U;
+        // Prefill rows are independent given the shared expansion: each writes
+        // its own slice of `attended` and its own scores. This loop is what a
+        // dense page spends its time in -- about 46 GMAC per page across the
+        // eleven layers at a 2,000-token history -- and it was serial.
+        const auto attend_row = [&](std::size_t row) {
+            const auto visible =
+                history_begin + static_cast<std::uint32_t>(row) + 1U;
             std::vector<float> scores(visible);
             for (std::uint32_t head = 0U; head < kHeads; ++head) {
                 const auto* q = query.data() +
@@ -5584,7 +5742,7 @@ struct Glm53Runtime::Impl {
                     total += score;
                 }
                 auto* destination = attended.data() +
-                    (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
+                    (row * kHeads + head) * kMlaHead;
                 for (std::uint32_t token = 0U; token < visible; ++token) {
                     const auto* values = expanded.data() +
                         (static_cast<std::size_t>(token) * kHeads + head) *
@@ -5596,6 +5754,12 @@ struct Glm53Runtime::Impl {
                     }
                 }
             }
+        };
+        if (kda_workers != nullptr) {
+            auto attended_all = kda_workers->parallel_for(rows, attend_row);
+            if (!attended_all.ok()) return attended_all;
+        } else {
+            for (std::size_t row = 0U; row < rows; ++row) attend_row(row);
         }
         round_bf16(attended);
         return linear(attention + "o_proj", attended, rows, kMlaWidth,
@@ -5919,11 +6083,12 @@ struct Glm53Runtime::Impl {
             result = weights->kda_decode(
                 slot_for(layer), attention, request, {});
         } else if (resident_mla_host_attention() ||
-                   position + 1U > kIndexTopK) {
+                   sparse_indexer_active(config.maximum_context_tokens)) {
             // Two callers. The control arm moves attention to the host by
-            // request; above kIndexTopK it moves because only the host path
-            // implements the k-pool sparse indexer, and the resident device
-            // chain would otherwise attend densely -- wrong, and unaffordable.
+            // request; a sequence that can cross kIndexTopK moves because only
+            // the host path implements the k-pool sparse indexer, and the
+            // resident device chain would otherwise attend densely -- wrong,
+            // and unaffordable.
             // Device mHC still produces this layer's input and consumes the
             // published branch, so only the attention itself moves.
             std::vector<float> normalized(kHidden), branch(kHidden);
@@ -6447,6 +6612,19 @@ struct Glm53Runtime::Impl {
                 request.mhc_source_destination = true;
                 result = weights->kda_decode(
                     slot_for(layer), attention, request, {});
+            } else if (sparse_indexer_active(config.maximum_context_tokens)) {
+                // The indexer lives on the host, exactly as in the single-row
+                // resident path. Device mHC still produces this row's input and
+                // consumes the published branch, so only attention moves and
+                // the cohort keeps one mHC implementation.
+                std::vector<float> normalized(kHidden), attended(kHidden);
+                result = cuda.dsv4_mhc_download_layer_input(device, normalized);
+                if (!result.ok()) return result;
+                result = attention_mla(attended, normalized, layer,
+                                       positions[row], attention,
+                                       *sequences[row]);
+                if (!result.ok()) return result;
+                result = cuda.dsv4_mhc_publish_branch(device, attended);
             } else {
                 CudaGlm53MlaRequest request;
                 request.state = &device_sequences[row]->mla[layer];
@@ -7365,6 +7543,15 @@ struct Glm53Runtime::Impl {
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";
             if (!glm53_kda_layer(layer)) {
+                // The resident MLA history is `maximum_context x 32,768 x 2 B`
+                // of expanded KV plus its latent -- 537 MiB per layer at 8,192
+                // tokens and 17 GiB at 262,144. A sequence running the k-pool
+                // indexer attends on the host and never reads it, so reserving
+                // it would exhaust VRAM at exactly the context lengths the
+                // indexer exists to make reachable.
+                if (sparse_indexer_active(config.maximum_context_tokens)) {
+                    continue;
+                }
                 result = prepare_device_mla_layer(
                     layer, sequence, device_sequence.mla[layer]);
                 if (!result.ok()) return result;
@@ -8719,9 +8906,42 @@ std::size_t glm53_sparse_index_select_for_test(
     std::span<const float> indexer_keys, std::span<const float> gate_scores,
     std::span<const float> pool_ape, std::span<const float> head_weights,
     std::uint32_t history) {
-    return glm53_sparse_index_select(selected, indexer_query, indexer_keys,
-                                     gate_scores, pool_ape, head_weights,
-                                     history);
+    constexpr auto width = Glm53SparseIndexParameters::head_dim;
+    const auto pools = history / Glm53SparseIndexParameters::pool;
+    std::vector<float> pool_keys(static_cast<std::size_t>(pools) * width);
+    for (std::uint32_t pool = 0U; pool < pools; ++pool) {
+        glm53_index_pool_key(
+            std::span<float>(pool_keys).subspan(
+                static_cast<std::size_t>(pool) * width, width),
+            pool,
+            [&](std::uint32_t token) {
+                return indexer_keys.data() +
+                       static_cast<std::size_t>(token) * width;
+            },
+            [&](std::uint32_t token) {
+                return gate_scores.data() +
+                       static_cast<std::size_t>(token) * width;
+            },
+            pool_ape);
+    }
+    return glm53_sparse_index_select(
+        selected, indexer_query,
+        [&](std::uint32_t pool) {
+            return pool_keys.data() + static_cast<std::size_t>(pool) * width;
+        },
+        head_weights, history);
+}
+
+void glm53_indexer_gate_for_test(std::span<float> output,
+                                 std::span<const float> input,
+                                 std::span<const float> weight) noexcept {
+    glm53_indexer_gate(output, input, weight);
+}
+
+void glm53_indexer_layer_norm_for_test(std::span<float> values,
+                                       std::span<const float> weight,
+                                       std::span<const float> bias) noexcept {
+    glm53_indexer_layer_norm(values, weight, bias);
 }
 
 }  // namespace strata

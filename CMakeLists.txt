@@ -377,6 +377,7 @@ if(BUILD_TESTING)
         tests/test_glm52_ops.cpp
         tests/test_load_report.cpp
         tests/test_glm53_host_expert.cpp
+        tests/test_glm53_indexer_oracle.cpp
         tests/test_glm53_manifest.cpp
         tests/test_gemma4_ops.cpp
         tests/test_gemma4_checkpoint.cpp

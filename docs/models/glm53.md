@@ -44,15 +44,68 @@ block geometry before generation.
 
 ## Chat and server
 
-```bash
-./build-release/strata-chat \
-  --model models/glm53f-mxfp4 --model-type glm53 \
-  --devices 1,2 --context-size 2048 --max-new 256
+Two prefixes are **required** to reach the measured rates, not optional tuning:
 
-./build-release/strata-server \
+- `CUDA_DEVICE_ORDER=PCI_BUS_ID` — many shells export `FASTEST_FIRST`. Without
+  this, `--devices 1,2` can silently select a different card than intended; on
+  the reference host it picks the 16 GiB RTX 5060 Ti plus one 3090 instead of
+  the two 3090s, and the run still succeeds while producing different output.
+- `numactl --interleave=all` — worth about 1.13x, and it removes a run-to-run
+  placement lottery. Under the default policy the checkpoint lands 55.9/44.1
+  across the two NUMA nodes in one run and 44.4/55.6 in the next, random in
+  direction, which is a 6.7% spread on identical code (record 0218).
+
+```bash
+env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+  ./build-release/strata-chat \
+  --model models/glm53f-mxfp4 --model-type glm53 \
+  --devices 1,2 --context-size 2048 --max-new 256 \
+  --vram-fraction 0.85
+
+env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+  ./build-release/strata-server \
   --model models/glm53f-mxfp4 --model-type glm53 --model-id glm53f-mxfp4 \
-  --devices 1,2 --context-size 2048 --max-new 256 --port 8080
+  --devices 1,2 --context-size 2048 --max-new 256 \
+  --vram-fraction 0.85 --port 8080
 ```
+
+### Reproducing the published decode rate
+
+The 5.490 tok/s MXFP4 / 3.550 tok/s FP8 figures are this exact command. Run it
+twice and read the second run: the static expert tier uploads about 9.5 GiB at
+startup, so a cold first process understates by up to 1.8x.
+
+```bash
+env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+  ./build-release/strata-chat \
+  --model models/glm53f-mxfp4 --model-type glm53 \
+  --prompt 'Write the natural numbers in order, one per line, starting at 1. Continue until you reach 1000.' \
+  --context-size 2048 --max-new 129 --devices 1,2 \
+  --vram-fraction 0.85 --temperature 0 --seed 33377335 --no-color
+```
+
+## Context limit: 2,048 tokens
+
+**This adapter refuses any context above 2,048 tokens**, and it is a missing
+feature rather than a tuning knob:
+
+```
+GLM-5.3 text context must be within [1, 2048]; above 2048 the
+checkpoint's exact k-pool sparse indexer is required
+```
+
+GLM-5.3 selects which history a sparse-attention layer reads through a k-pool
+indexer (`index_topk` 2048, `index_kpool` 4). This adapter attends densely over
+the retained history instead, which is exact at or below 2,048 and neither
+exact nor affordable above it. The MLA workspace is dense in history —
+`history x 32,768 x 4 B` per sparse layer — so the eleven MLA layers need about
+2.95 GiB at 2,048 tokens, 11.8 GiB at 8,192 and **47.2 GiB at 32,768**, against
+a 2 GiB per-device workspace reserve.
+
+Raising the limit therefore requires implementing the checkpoint's k-pool
+indexer so attention reads a bounded selection rather than the whole history.
+Until then, longer contexts are refused at admission rather than silently
+truncated or approximated.
 
 The server exposes the same text runtime through its OpenAI-compatible chat
 completion endpoint. Do not send image content: multimodal support is outside

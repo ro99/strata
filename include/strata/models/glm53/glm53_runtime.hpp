@@ -45,6 +45,36 @@ namespace strata {
     std::span<const std::byte> weights, std::span<const float> input,
     bool use_avx2) noexcept;
 
+// GLM-5.3 k-pool sparse indexer selection (record 0237). Chooses which history
+// positions one decode query attends to, so attention cost stops growing with
+// context. Exposed for test: below `index_topk` the selection is the identity,
+// which is the regression gate for everything above it.
+struct Glm53SparseIndexParameters {
+    static constexpr std::uint32_t heads = 32U;
+    static constexpr std::uint32_t head_dim = 128U;
+    static constexpr std::uint32_t top_k = 2048U;
+    static constexpr std::uint32_t pool = 4U;
+    static constexpr std::uint32_t selection_width = top_k + pool - 1U;
+};
+
+[[nodiscard]] std::size_t glm53_sparse_index_select_for_test(
+    std::span<std::uint32_t> selected, std::span<const float> indexer_query,
+    std::span<const float> indexer_keys, std::span<const float> gate_scores,
+    std::span<const float> pool_ape, std::span<const float> head_weights,
+    std::uint32_t history);
+
+// The two projections the selection is fed from, exposed so the reference
+// oracle can drive the whole indexer chain rather than only its ranking. The
+// key norm is `nn.LayerNorm(head_dim, eps=1e-6)` -- mean subtracting, with a
+// bias -- and not the RMSNorm this model uses everywhere else, which is a
+// difference no gate at or below `index_topk` can see.
+void glm53_indexer_gate_for_test(std::span<float> output,
+                                 std::span<const float> input,
+                                 std::span<const float> weight) noexcept;
+void glm53_indexer_layer_norm_for_test(std::span<float> values,
+                                       std::span<const float> weight,
+                                       std::span<const float> bias) noexcept;
+
 struct Glm53RuntimeConfig {
     std::vector<int> devices;
     double vram_cache_fraction{0.85};

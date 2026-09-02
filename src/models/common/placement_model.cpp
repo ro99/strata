@@ -1156,7 +1156,12 @@ struct OpenCheckpoints {
         case PlacementModel::Glm52:
             return kGlm52ExecutionContract.maximum_context_tokens;
         case PlacementModel::Glm53:
-            return 2048U;
+            // Was 2,048 while the checkpoint's k-pool sparse indexer was
+            // unimplemented and attention ran densely, which is exact only up
+            // to `index_topk`. With the indexer the MLA workspace no longer
+            // grows with history; the bound is host sequence state, about
+            // 33.5 KB per token across the eleven sparse layers.
+            return 262144U;
         case PlacementModel::Laguna:
             return kLagunaExecutionContract.maximum_context_tokens;
         case PlacementModel::Inkling:

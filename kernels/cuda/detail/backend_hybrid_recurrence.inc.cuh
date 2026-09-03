@@ -2710,15 +2710,18 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
             state, impl_->detailed_timing); status != cudaSuccess) {
         return cuda_error(status, "finish sparse GLM-5.3 MLA kernel timing");
     }
+    // `scores` is ordinary host memory, so the CUDA runtime may perform the
+    // wait while staging this nominally-async copy. Time the whole retrieval
+    // boundary, not only the synchronize that follows it.
+    const auto scores_wait_started = request.host_timing != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (auto status = cudaMemcpyAsync(
             scores.data(), coefficients, scores.size_bytes(),
             cudaMemcpyDeviceToHost, state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "download sparse GLM-5.3 MLA scores");
     }
-    const auto scores_wait_started = request.host_timing != nullptr
-        ? std::chrono::steady_clock::now()
-        : std::chrono::steady_clock::time_point{};
     if (auto status = cudaStreamSynchronize(state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "complete sparse GLM-5.3 MLA scores");

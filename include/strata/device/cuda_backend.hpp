@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -1206,7 +1207,8 @@ public:
     // boundary; gathered selection is added at the threshold without changing
     // the dense kernels above.
     [[nodiscard]] ValidationResult glm53_sparse_mla_decode_to_mhc(
-        const CudaGlm53MlaRequest& request, std::span<float> scores);
+        const CudaGlm53MlaRequest& request, std::span<float> scores,
+        const std::function<ValidationResult()>& overlap);
     [[nodiscard]] ValidationResult glm53_sparse_mla_decode_finish(
         const CudaGlm53MlaRequest& request,
         std::span<const float> normalized_coefficients);

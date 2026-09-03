@@ -2347,7 +2347,8 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
 }
 
 ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
-    const CudaGlm53MlaRequest& request, std::span<float> scores) {
+    const CudaGlm53MlaRequest& request, std::span<float> scores,
+    const std::function<ValidationResult()>& overlap) {
     if (request.state == nullptr || !request.state->valid() ||
         request.position >= request.maximum_context || request.heads == 0U ||
         request.head_dim == 0U || request.query_rank == 0U ||
@@ -2710,6 +2711,11 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
             state, impl_->detailed_timing); status != cudaSuccess) {
         return cuda_error(status, "finish sparse GLM-5.3 MLA kernel timing");
     }
+    // The stream can execute the already-enqueued projections, sparse arena
+    // updates and score kernels while the caller advances host-only state
+    // needed by later tokens. Nothing in `overlap` may affect this command.
+    ValidationResult overlap_result;
+    if (overlap) overlap_result = overlap();
     // `scores` is ordinary host memory, so the CUDA runtime may perform the
     // wait while staging this nominally-async copy. Time the whole retrieval
     // boundary, not only the synchronize that follows it.
@@ -2737,6 +2743,7 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
             *impl_, state, device, false); status != cudaSuccess) {
         return cuda_error(status, "measure sparse GLM-5.3 MLA kernels");
     }
+    if (!overlap_result.ok()) return overlap_result;
     state.glm53_mla_scores_pending = true;
     return {};
 }

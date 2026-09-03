@@ -2128,6 +2128,7 @@ public:
     [[nodiscard]] ValidationResult sparse_mla_decode_mhc(
         std::size_t slot, std::string_view attention,
         CudaGlm53MlaRequest request, std::span<float> scores,
+        const std::function<ValidationResult()>& overlap,
         const std::function<void(std::span<float>, std::uint32_t,
                                  std::uint32_t)>& softmax) {
         if (slot >= states_.size() || request.state == nullptr) {
@@ -2165,7 +2166,7 @@ public:
         request.key_value_b = &entries[3]->weight;
         request.output = &entries[4]->weight;
         auto scored = backend_.glm53_sparse_mla_decode_to_mhc(
-            request, scores);
+            request, scores, overlap);
         if (!scored.ok()) return scored;
         const auto attended_rows = request.selected_positions.empty()
             ? static_cast<std::uint32_t>(request.position) + 1U
@@ -5656,33 +5657,21 @@ struct Glm53Runtime::Impl {
         return {};
     }
 
-    // Maintain the exact host indexer while sparse MLA itself remains in the
-    // resident CUDA chain. Selection above index_topk is delegated to the
-    // already-oracled host implementation and only its ascending positions
-    // cross to the device. Below the threshold this records future pool state
-    // but returns an empty selection, leaving the independent identity MLA
-    // path untouched.
-    [[nodiscard]] ValidationResult prepare_sparse_device_selection(
-        std::vector<std::uint32_t>& selected,
-        std::vector<std::uint32_t>& arena_rows,
-        std::vector<std::uint32_t>& expansion_sources,
-        std::vector<std::uint32_t>& expansion_destinations,
+    // Append the current token's exact indexer key and compression gate. This
+    // state is consumed only after its four-token pool becomes complete. The
+    // identity attention path never consumes it in the current command, and
+    // above the threshold only every fourth token completes a selectable pool.
+    [[nodiscard]] ValidationResult append_sparse_device_index_state(
         std::span<const float> input, std::uint32_t layer,
         std::uint32_t position, const std::string& attention,
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence,
         Glm53SparseMlaMetrics* timing) {
-        selected.clear();
-        arena_rows.clear();
-        expansion_sources.clear();
-        expansion_destinations.clear();
         const auto history = position + 1U;
         std::vector<float> index_key(kIndexHeadDim);
         std::vector<float> index_gate(kIndexHeadDim);
-        const std::array<std::string, 4U> indexer_bases{
+        const std::array<std::string, 2U> indexer_bases{
             attention + "indexer.wk.weight",
-            attention + "indexer.index_kpool_compress_gate",
-            attention + "indexer.wq_b.weight",
-            attention + "indexer.weights_proj.weight"};
+            attention + "indexer.index_kpool_compress_gate"};
         const auto indexer_projection_started = timing != nullptr
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
@@ -5739,8 +5728,40 @@ struct Glm53Runtime::Impl {
         auto& arena = device_sequence.sparse_mla_arenas[layer];
         if (history <= kIndexTopK) {
             arena.identity_rows = history;
-            return {};
         }
+        return {};
+    }
+
+    // Maintain the exact host indexer while sparse MLA itself remains in the
+    // resident CUDA chain. Selection above index_topk is delegated to the
+    // already-oracled host implementation and only its ascending positions
+    // cross to the device. `defer_index_state` identifies work which affects
+    // only later tokens and can run after this command's score kernels launch.
+    [[nodiscard]] ValidationResult prepare_sparse_device_selection(
+        std::vector<std::uint32_t>& selected,
+        std::vector<std::uint32_t>& arena_rows,
+        std::vector<std::uint32_t>& expansion_sources,
+        std::vector<std::uint32_t>& expansion_destinations,
+        bool& defer_index_state, std::span<const float> input,
+        std::uint32_t layer, std::uint32_t position,
+        const std::string& attention, Glm53SequenceState& sequence,
+        DeviceSequenceState& device_sequence,
+        Glm53SparseMlaMetrics* timing) {
+        selected.clear();
+        arena_rows.clear();
+        expansion_sources.clear();
+        expansion_destinations.clear();
+        const auto history = position + 1U;
+        auto& arena = device_sequence.sparse_mla_arenas[layer];
+        defer_index_state = history <= kIndexTopK ||
+                            history % kIndexPool != 0U;
+        if (!defer_index_state) {
+            auto appended = append_sparse_device_index_state(
+                input, layer, position, attention, sequence,
+                device_sequence, timing);
+            if (!appended.ok()) return appended;
+        }
+        if (history <= kIndexTopK) return {};
 
         std::vector<float> q_rank(kQueryRank);
         const auto query_rank_started = timing != nullptr
@@ -5763,7 +5784,7 @@ struct Glm53Runtime::Impl {
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
         auto wq = host_tensor(
-            indexer_bases[2],
+            attention + "indexer.wq_b.weight",
             static_cast<std::uint64_t>(kIndexHeads) * kIndexHeadDim *
                 kQueryRank);
         if (!wq.ok()) return {std::move(wq.errors)};
@@ -5771,7 +5792,7 @@ struct Glm53Runtime::Impl {
             index_query, q_rank, *wq.value, kda_workers.get());
         if (!projected_query.ok()) return projected_query;
         auto wp = host_tensor(
-            indexer_bases[3],
+            attention + "indexer.weights_proj.weight",
             static_cast<std::uint64_t>(kIndexHeads) * kHidden);
         if (!wp.ok()) return {std::move(wp.errors)};
         auto projected_weights = glm53_indexer_gate_parallel(
@@ -6645,10 +6666,12 @@ struct Glm53Runtime::Impl {
                 sparse_timing.input_download_nanoseconds +=
                     elapsed_nanoseconds(input_download_started);
             }
+            bool defer_index_state = false;
             result = prepare_sparse_device_selection(
                 mla_selected_positions, mla_arena_rows,
                 mla_expansion_source_positions,
-                mla_expansion_destination_rows, normalized, layer,
+                mla_expansion_destination_rows, defer_index_state,
+                normalized, layer,
                 position, attention, sequence, device_sequence,
                 sparse_timing_ptr);
             if (!result.ok()) return result;
@@ -6674,6 +6697,12 @@ struct Glm53Runtime::Impl {
                 slot_for(layer), attention, request,
                 std::span<float>(scores).first(
                     static_cast<std::size_t>(kHeads) * attended_rows),
+                [&]() -> ValidationResult {
+                    if (!defer_index_state) return {};
+                    return append_sparse_device_index_state(
+                        normalized, layer, position, attention, sequence,
+                        device_sequence, sparse_timing_ptr);
+                },
                 [](std::span<float> values, std::uint32_t heads,
                    std::uint32_t tokens) {
                     for (std::uint32_t head = 0U; head < heads; ++head) {
@@ -7267,10 +7296,12 @@ struct Glm53Runtime::Impl {
                     sparse_timing.input_download_nanoseconds +=
                         elapsed_nanoseconds(input_download_started);
                 }
+                bool defer_index_state = false;
                 result = prepare_sparse_device_selection(
                     mla_selected_positions, mla_arena_rows,
                     mla_expansion_source_positions,
-                    mla_expansion_destination_rows, normalized, layer,
+                    mla_expansion_destination_rows, defer_index_state,
+                    normalized, layer,
                     positions[row], attention, *sequences[row],
                     *device_sequences[row], sparse_timing_ptr);
                 if (!result.ok()) return result;
@@ -7296,6 +7327,13 @@ struct Glm53Runtime::Impl {
                     static_cast<std::size_t>(kHeads) * attended_rows);
                 result = weights->sparse_mla_decode_mhc(
                     slot_for(layer), attention, request, scores,
+                    [&]() -> ValidationResult {
+                        if (!defer_index_state) return {};
+                        return append_sparse_device_index_state(
+                            normalized, layer, positions[row], attention,
+                            *sequences[row], *device_sequences[row],
+                            sparse_timing_ptr);
+                    },
                     [](std::span<float> values, std::uint32_t heads,
                        std::uint32_t tokens) {
                         for (std::uint32_t head = 0U; head < heads; ++head) {

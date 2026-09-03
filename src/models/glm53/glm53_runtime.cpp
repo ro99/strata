@@ -2490,6 +2490,7 @@ struct Glm53Runtime::Impl {
     struct DeviceSequenceState {
         std::array<CudaBuffer, kLayers> kda;
         std::array<CudaBuffer, kLayers> mla;
+        std::vector<CudaBuffer> sparse_mla_expanded;
         bool ready{};
     };
 
@@ -3031,6 +3032,12 @@ struct Glm53Runtime::Impl {
                 : 0U;
             bytes[slot] += mla_floats * sizeof(float) + expanded_mla_bytes;
         }
+        if (sparse_indexer_active(config.maximum_context_tokens)) {
+            const auto scratch_bytes =
+                static_cast<std::uint64_t>(kIndexSelectionWidth) * kHeads *
+                2ULL * kMlaHead * sizeof(std::uint16_t);
+            for (auto& device_bytes : bytes) device_bytes += scratch_bytes;
+        }
         return bytes;
     }
 
@@ -3040,6 +3047,14 @@ struct Glm53Runtime::Impl {
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
             const auto& buffer = glm53_kda_layer(layer)
                 ? sequence.kda[layer] : sequence.mla[layer];
+            if (!buffer.valid()) continue;
+            const auto found = std::find(devices.begin(), devices.end(),
+                                         buffer.device());
+            if (found == devices.end()) continue;
+            bytes[static_cast<std::size_t>(found - devices.begin())] +=
+                buffer.device_bytes();
+        }
+        for (const auto& buffer : sequence.sparse_mla_expanded) {
             if (!buffer.valid()) continue;
             const auto found = std::find(devices.begin(), devices.end(),
                                          buffer.device());
@@ -6144,6 +6159,8 @@ struct Glm53Runtime::Impl {
         } else if (sparse_indexer_active(config.maximum_context_tokens)) {
             CudaGlm53MlaRequest request;
             request.state = &device_sequence.mla[layer];
+            request.sparse_expanded =
+                &device_sequence.sparse_mla_expanded[slot_for(layer)];
             request.position = position;
             request.maximum_context = config.maximum_context_tokens;
             request.heads = kHeads;
@@ -6707,6 +6724,9 @@ struct Glm53Runtime::Impl {
                            config.maximum_context_tokens)) {
                 CudaGlm53MlaRequest request;
                 request.state = &device_sequences[row]->mla[layer];
+                request.sparse_expanded =
+                    &device_sequences[row]
+                         ->sparse_mla_expanded[slot_for(layer)];
                 request.position = positions[row];
                 request.maximum_context = config.maximum_context_tokens;
                 request.heads = kHeads;
@@ -7696,6 +7716,18 @@ struct Glm53Runtime::Impl {
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
         if (device_sequence.ready) return {};
         ValidationResult result;
+        if (sparse_indexer_active(config.maximum_context_tokens)) {
+            const auto scratch_bytes =
+                static_cast<std::uint64_t>(kIndexSelectionWidth) * kHeads *
+                2ULL * kMlaHead * sizeof(std::uint16_t);
+            device_sequence.sparse_mla_expanded.resize(devices.size());
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                result = cuda.allocate_buffer(
+                    devices[slot], scratch_bytes,
+                    device_sequence.sparse_mla_expanded[slot]);
+                if (!result.ok()) return result;
+            }
+        }
         for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";

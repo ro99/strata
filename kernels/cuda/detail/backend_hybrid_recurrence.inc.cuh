@@ -2299,7 +2299,9 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
     }
     const auto device = request.state->device();
     const auto found = impl_->devices.find(device);
-    if (found == impl_->devices.end()) {
+    if (found == impl_->devices.end() || request.sparse_expanded == nullptr ||
+        !request.sparse_expanded->valid() ||
+        request.sparse_expanded->device() != device) {
         return {{"CUDA GLM-5.3 sparse MLA targets an uninitialized device"}};
     }
     auto& state = found->second;
@@ -2312,6 +2314,12 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
     const auto width = static_cast<std::uint64_t>(request.heads) *
                        request.head_dim;
     const auto expanded_width = 2ULL * width;
+    constexpr std::uint64_t selection_width = 2051U;
+    const auto required_scratch_bytes = selection_width * expanded_width *
+                                        sizeof(__nv_bfloat16);
+    if (request.sparse_expanded->device_bytes() < required_scratch_bytes) {
+        return {{"CUDA GLM-5.3 sparse MLA expansion scratch is too small"}};
+    }
     const auto cache_floats =
         static_cast<std::uint64_t>(request.maximum_context) *
         request.key_value_rank;
@@ -2348,11 +2356,9 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
         kv_descriptor.dtype != SafetensorsDtype::Bf16) {
         return {{"CUDA GLM-5.3 sparse MLA requires canonical BF16 KV-B"}};
     }
-    const auto compressed_width =
-        static_cast<std::uint64_t>(request.heads) * request.key_value_rank;
     const auto workspace_floats =
-        kDsv4MhcHidden + request.query_rank + width + compressed_width +
-        compressed_width + width + kDsv4MhcHidden + request.heads * history;
+        kDsv4MhcHidden + request.query_rank + width + width +
+        kDsv4MhcHidden + request.heads * history;
     const auto workspace_bytes = workspace_floats * sizeof(float);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status,
@@ -2381,11 +2387,11 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
     auto* input = workspace;
     auto* q_rank = input + kDsv4MhcHidden;
     auto* query = q_rank + request.query_rank;
-    auto* compressed_query = query + width;
-    auto* weighted_latent = compressed_query + compressed_width;
-    auto* attended = weighted_latent + compressed_width;
+    auto* attended = query + width;
     auto* output = attended + width;
     auto* coefficients = output + kDsv4MhcHidden;
+    auto* expanded = static_cast<__nv_bfloat16*>(
+        request.sparse_expanded->impl_->data);
     constexpr unsigned int threads = 256U;
     constexpr unsigned int warps = threads / 32U;
     constexpr unsigned int hidden_blocks =
@@ -2437,22 +2443,36 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
         status != cudaSuccess) {
         return cuda_error(status, "project sparse GLM-5.3 MLA query B");
     }
-    const auto compressed_blocks = static_cast<unsigned int>(
-        (compressed_width + threads - 1U) / threads);
-    glm53_sparse_mla_absorb_query_kernel<<<
-        compressed_blocks, threads, 0U, state.stream>>>(
-        query, static_cast<const __nv_bfloat16*>(
-                   request.key_value_b->impl_->weights),
-        compressed_query, request.heads, request.head_dim,
-        request.key_value_rank);
+    // Identity selection is the ascending range [0, history). Project those
+    // latents through the same BF16 row kernel as the dense prepared cache.
+    // The destination is bounded by kIndexSelectionWidth and reused by every
+    // sparse layer on this device.
+    const dim3 expansion_grid(
+        static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
+        static_cast<unsigned int>(
+            (history + kBf16MatvecRowTile - 1U) / kBf16MatvecRowTile),
+        1U);
+    bf16_matvec_rows_to_bf16_kernel<kBf16MatvecRowTile><<<
+        expansion_grid, threads, 0U, state.stream>>>(
+        expanded, packed,
+        static_cast<const __nv_bfloat16*>(
+            request.key_value_b->impl_->weights),
+        static_cast<std::uint32_t>(history), request.key_value_rank,
+        expanded_width);
     if (scores.size() != request.heads * history) {
         return {{"CUDA GLM-5.3 sparse MLA score span has an invalid shape"}};
     }
-    glm53_sparse_mla_scores_kernel<<<
-        request.heads, threads, 0U, state.stream>>>(
-        compressed_query, packed, coefficients,
-        static_cast<std::uint32_t>(history), request.heads, request.head_dim,
-        request.key_value_rank);
+    constexpr unsigned int score_warps_per_block = threads / 32U;
+    const dim3 score_grid(
+        request.heads,
+        static_cast<unsigned int>(
+            (history + score_warps_per_block - 1U) /
+            score_warps_per_block),
+        1U);
+    glm53_mla_scores_bf16_kernel<<<
+        score_grid, threads, 0U, state.stream>>>(
+        query, expanded, coefficients, static_cast<std::uint32_t>(history),
+        request.heads, request.head_dim);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch sparse GLM-5.3 MLA scores");
     }
@@ -2483,7 +2503,9 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_finish(
     std::span<const float> normalized_coefficients) {
     const auto device = request.state == nullptr ? -1 : request.state->device();
     const auto found = impl_->devices.find(device);
-    if (found == impl_->devices.end()) {
+    if (found == impl_->devices.end() || request.sparse_expanded == nullptr ||
+        !request.sparse_expanded->valid() ||
+        request.sparse_expanded->device() != device) {
         return {{"CUDA GLM-5.3 sparse MLA targets an uninitialized device"}};
     }
     auto& state = found->second;
@@ -2501,16 +2523,13 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_finish(
     }
     const auto width = static_cast<std::uint64_t>(request.heads) *
                        request.head_dim;
-    const auto compressed_width =
-        static_cast<std::uint64_t>(request.heads) * request.key_value_rank;
     auto* workspace = reinterpret_cast<float*>(state.glm53_mla_workspace);
     auto* query = workspace + kDsv4MhcHidden + request.query_rank;
-    auto* compressed_query = query + width;
-    auto* weighted_latent = compressed_query + compressed_width;
-    auto* attended = weighted_latent + compressed_width;
+    auto* attended = query + width;
     auto* output = attended + width;
     auto* coefficients = output + kDsv4MhcHidden;
-    auto* packed = static_cast<float*>(request.state->impl_->data);
+    auto* expanded = static_cast<__nv_bfloat16*>(
+        request.sparse_expanded->impl_->data);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status,
                           "select CUDA device for GLM-5.3 sparse MLA finish");
@@ -2527,18 +2546,11 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_finish(
         return cuda_error(status, "start sparse GLM-5.3 MLA finish timing");
     }
     constexpr unsigned int threads = 256U;
-    glm53_sparse_mla_weighted_latent_kernel<<<
+    glm53_mla_weighted_bf16_kernel<<<
         request.heads, threads, 0U, state.stream>>>(
-        coefficients, packed, weighted_latent,
+        coefficients, expanded, attended,
         static_cast<std::uint32_t>(history), request.heads,
-        request.key_value_rank);
-    const auto width_blocks = static_cast<unsigned int>(
-        (width + threads - 1U) / threads);
-    glm53_sparse_mla_expand_value_kernel<<<
-        width_blocks, threads, 0U, state.stream>>>(
-        weighted_latent, static_cast<const __nv_bfloat16*>(
-                             request.key_value_b->impl_->weights),
-        attended, request.heads, request.head_dim, request.key_value_rank);
+        request.head_dim);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
         return cuda_error(status, "launch sparse GLM-5.3 MLA weighted sum");
     }

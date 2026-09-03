@@ -2413,6 +2413,12 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
         request.sparse_expanded->device() != device) {
         return {{"CUDA GLM-5.3 sparse MLA targets an uninitialized device"}};
     }
+    if (request.validate_sparse_identity_rows &&
+        request.sparse_expanded->impl_->glm53_mla_expanded_rows !=
+            request.sparse_identity_rows) {
+        return {{"CUDA GLM-5.3 sparse MLA identity seed disagrees with its "
+                 "device expansion counter"}};
+    }
     auto& state = found->second;
     if (!state.dsv4_mhc_supported || state.dsv4_mhc_stage != 1U ||
         state.dsv4_mhc_workspace == nullptr || state.dsv4_mhc_branch_ready ||
@@ -2566,6 +2572,9 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
     // existing history once. This is the same BF16 projection and append
     // structure as the accepted dense cache.
     if (gathered) {
+        const auto index_upload_started = request.host_timing != nullptr
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         if (auto status = cudaMemcpyAsync(
                 arena_rows_device, request.sparse_arena_rows.data(),
                 request.sparse_arena_rows.size_bytes(),
@@ -2596,6 +2605,15 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
                     status,
                     "upload sparse GLM-5.3 MLA expansion destinations");
             }
+        }
+        if (request.host_timing != nullptr) {
+            request.host_timing->index_upload_nanoseconds +=
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        index_upload_started).count());
+        }
+        if (expansion_count != 0U) {
             const dim3 expansion_grid(
                 static_cast<unsigned int>(
                     (expanded_width + warps - 1U) / warps),
@@ -2698,9 +2716,19 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
         status != cudaSuccess) {
         return cuda_error(status, "download sparse GLM-5.3 MLA scores");
     }
+    const auto scores_wait_started = request.host_timing != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (auto status = cudaStreamSynchronize(state.stream);
         status != cudaSuccess) {
         return cuda_error(status, "complete sparse GLM-5.3 MLA scores");
+    }
+    if (request.host_timing != nullptr) {
+        request.host_timing->device_scores_wait_nanoseconds +=
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() -
+                    scores_wait_started).count());
     }
     if (auto status = glm53_kernel_timing_drain(
             *impl_, state, device, false); status != cudaSuccess) {
@@ -2752,11 +2780,21 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_finish(
         return cuda_error(status,
                           "select CUDA device for GLM-5.3 sparse MLA finish");
     }
+    const auto coefficient_upload_started = request.host_timing != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (auto status = cudaMemcpyAsync(
             coefficients, normalized_coefficients.data(),
             normalized_coefficients.size_bytes(), cudaMemcpyHostToDevice,
             state.stream); status != cudaSuccess) {
         return cuda_error(status, "upload sparse GLM-5.3 MLA coefficients");
+    }
+    if (request.host_timing != nullptr) {
+        request.host_timing->coefficient_upload_nanoseconds +=
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() -
+                    coefficient_upload_started).count());
     }
     if (auto status = glm53_kernel_timing_begin(
             state, impl_->detailed_timing, Glm53KernelCategory::Mla);

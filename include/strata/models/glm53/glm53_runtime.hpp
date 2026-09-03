@@ -128,11 +128,31 @@ struct Glm53GraphMetrics {
     std::uint64_t sampling_nanoseconds{};
 };
 
+// Wall-clock attribution inside sparse resident MLA. CUDA kernel event time
+// remains in CudaBackendStats; the device-scores wait deliberately includes
+// queued device work because it measures the serialization boundary seen by
+// the host thread.
+struct Glm53SparseMlaMetrics {
+    std::uint64_t calls{};
+    std::uint64_t input_download_nanoseconds{};
+    std::uint64_t indexer_projection_nanoseconds{};
+    std::uint64_t indexer_state_nanoseconds{};
+    std::uint64_t query_rank_projection_nanoseconds{};
+    std::uint64_t pool_scoring_nanoseconds{};
+    std::uint64_t topk_sort_nanoseconds{};
+    std::uint64_t arena_bookkeeping_nanoseconds{};
+    std::uint64_t index_upload_nanoseconds{};
+    std::uint64_t device_scores_wait_nanoseconds{};
+    std::uint64_t host_softmax_nanoseconds{};
+    std::uint64_t coefficient_upload_nanoseconds{};
+};
+
 struct Glm53PhaseMetrics {
     CudaBackendStats cuda;
     Glm53CacheMetrics cache;
     Glm53HostExpertMetrics host_experts;
     Glm53GraphMetrics graph;
+    Glm53SparseMlaMetrics sparse_mla;
 };
 
 struct Glm53RunMetrics {

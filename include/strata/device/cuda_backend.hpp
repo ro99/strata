@@ -772,6 +772,17 @@ struct CudaGlm53MlaRequest {
     std::span<const std::uint32_t> sparse_arena_rows;
     std::span<const std::uint32_t> sparse_expansion_sources;
     std::span<const std::uint32_t> sparse_expansion_destinations;
+    // The first gathered command validates the host arena's identity seed
+    // against the device buffer's own append counter. This closes the only
+    // coupling between independently-maintained host and device cache state.
+    bool validate_sparse_identity_rows{};
+    std::uint32_t sparse_identity_rows{};
+    struct HostTiming {
+        std::uint64_t index_upload_nanoseconds{};
+        std::uint64_t device_scores_wait_nanoseconds{};
+        std::uint64_t host_softmax_nanoseconds{};
+        std::uint64_t coefficient_upload_nanoseconds{};
+    }* host_timing{};
     const CudaWeight* query_a{};
     const CudaWeight* key_value_a{};
     const CudaWeight* query_b{};

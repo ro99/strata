@@ -2020,7 +2020,9 @@ public:
 
     [[nodiscard]] ValidationResult sparse_mla_decode_mhc(
         std::size_t slot, std::string_view attention,
-        CudaGlm53MlaRequest request) {
+        CudaGlm53MlaRequest request, std::span<float> scores,
+        const std::function<void(std::span<float>, std::uint32_t,
+                                 std::uint32_t)>& softmax) {
         if (slot >= states_.size() || request.state == nullptr) {
             return {{"GLM-5.3 sparse resident MLA targets an invalid cache "
                      "slot"}};
@@ -2055,7 +2057,12 @@ public:
         request.query_b = &entries[2]->weight;
         request.key_value_b = &entries[3]->weight;
         request.output = &entries[4]->weight;
-        return backend_.glm53_sparse_mla_decode_to_mhc(request);
+        auto scored = backend_.glm53_sparse_mla_decode_to_mhc(
+            request, scores);
+        if (!scored.ok()) return scored;
+        softmax(scores, request.heads,
+                static_cast<std::uint32_t>(request.position) + 1U);
+        return backend_.glm53_sparse_mla_decode_finish(request, scores);
     }
 
     [[nodiscard]] bool mla_kv_b_is_bf16(
@@ -6143,8 +6150,36 @@ struct Glm53Runtime::Impl {
             request.head_dim = kMlaHead;
             request.query_rank = kQueryRank;
             request.key_value_rank = kKvRank;
+            auto& scores = mla_softmax_scores;
+            const auto history = position + 1U;
+            static_cast<void>(glm53_grow(
+                scores, static_cast<std::size_t>(kHeads) * history));
             result = weights->sparse_mla_decode_mhc(
-                slot_for(layer), attention, request);
+                slot_for(layer), attention, request,
+                std::span<float>(scores).first(
+                    static_cast<std::size_t>(kHeads) * history),
+                [](std::span<float> values, std::uint32_t heads,
+                   std::uint32_t tokens) {
+                    for (std::uint32_t head = 0U; head < heads; ++head) {
+                        auto* row = values.data() +
+                            static_cast<std::size_t>(head) * tokens;
+                        float highest = -std::numeric_limits<float>::infinity();
+                        for (std::uint32_t token = 0U; token < tokens;
+                             ++token) {
+                            highest = std::max(highest, row[token]);
+                        }
+                        float total = 0.0F;
+                        for (std::uint32_t token = 0U; token < tokens;
+                             ++token) {
+                            row[token] = std::exp(row[token] - highest);
+                            total += row[token];
+                        }
+                        for (std::uint32_t token = 0U; token < tokens;
+                             ++token) {
+                            row[token] = bf16_round_f32(row[token] / total);
+                        }
+                    }
+                });
         } else {
             CudaGlm53MlaRequest request;
             request.state = &device_sequence.mla[layer];
@@ -6678,8 +6713,40 @@ struct Glm53Runtime::Impl {
                 request.head_dim = kMlaHead;
                 request.query_rank = kQueryRank;
                 request.key_value_rank = kKvRank;
+                const auto history = positions[row] + 1U;
+                static_cast<void>(glm53_grow(
+                    mla_softmax_scores,
+                    static_cast<std::size_t>(kHeads) * history));
+                auto scores = std::span<float>(mla_softmax_scores).first(
+                    static_cast<std::size_t>(kHeads) * history);
                 result = weights->sparse_mla_decode_mhc(
-                    slot_for(layer), attention, request);
+                    slot_for(layer), attention, request, scores,
+                    [](std::span<float> values, std::uint32_t heads,
+                       std::uint32_t tokens) {
+                        for (std::uint32_t head = 0U; head < heads; ++head) {
+                            auto* row_scores = values.data() +
+                                static_cast<std::size_t>(head) * tokens;
+                            float highest =
+                                -std::numeric_limits<float>::infinity();
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                highest = std::max(highest,
+                                                   row_scores[token]);
+                            }
+                            float total = 0.0F;
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                row_scores[token] =
+                                    std::exp(row_scores[token] - highest);
+                                total += row_scores[token];
+                            }
+                            for (std::uint32_t token = 0U; token < tokens;
+                                 ++token) {
+                                row_scores[token] = bf16_round_f32(
+                                    row_scores[token] / total);
+                            }
+                        }
+                    });
             } else {
                 CudaGlm53MlaRequest request;
                 request.state = &device_sequences[row]->mla[layer];

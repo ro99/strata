@@ -644,47 +644,42 @@ __global__ void glm53_sparse_mla_absorb_query_kernel(
     compressed[index] = value;
 }
 
-__global__ void glm53_sparse_mla_identity_attention_kernel(
-    const float* compressed_query, const float* latent_cache,
+__global__ void glm53_sparse_mla_scores_kernel(
+    const float* compressed_query, const float* latent_cache, float* scores,
+    std::uint32_t history, std::uint32_t heads, std::uint32_t head_dim,
+    std::uint32_t latent_dim) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= heads || threadIdx.x != 0U) return;
+    for (std::uint32_t token = 0U; token < history; ++token) {
+        float score = 0.0F;
+        for (std::uint32_t column = 0U; column < latent_dim; ++column) {
+            score = __fadd_rn(
+                score,
+                __fmul_rn(
+                    compressed_query[
+                        static_cast<std::uint64_t>(head) * latent_dim +
+                        column],
+                    latent_cache[
+                        static_cast<std::uint64_t>(token) * latent_dim +
+                        column]));
+        }
+        scores[static_cast<std::uint64_t>(head) * history + token] =
+            score * rsqrtf(static_cast<float>(head_dim));
+    }
+}
+
+__global__ void glm53_sparse_mla_weighted_latent_kernel(
+    const float* coefficients, const float* latent_cache,
     float* weighted_latent, std::uint32_t history, std::uint32_t heads,
-    std::uint32_t head_dim, std::uint32_t latent_dim) {
-    extern __shared__ float scores[];
+    std::uint32_t latent_dim) {
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
     if (head >= heads) return;
-    if (threadIdx.x == 0U) {
-        float highest = -INFINITY;
-        for (std::uint32_t token = 0U; token < history; ++token) {
-            float score = 0.0F;
-            for (std::uint32_t column = 0U; column < latent_dim; ++column) {
-                score = __fadd_rn(
-                    score,
-                    __fmul_rn(
-                        compressed_query[
-                            static_cast<std::uint64_t>(head) * latent_dim +
-                            column],
-                        latent_cache[
-                            static_cast<std::uint64_t>(token) * latent_dim +
-                            column]));
-            }
-            score *= rsqrtf(static_cast<float>(head_dim));
-            scores[token] = score;
-            highest = fmaxf(highest, score);
-        }
-        float total = 0.0F;
-        for (std::uint32_t token = 0U; token < history; ++token) {
-            scores[token] = expf(scores[token] - highest);
-            total += scores[token];
-        }
-        for (std::uint32_t token = 0U; token < history; ++token) {
-            scores[token] = glm53_bf16(scores[token] / total);
-        }
-    }
-    __syncthreads();
     for (std::uint32_t column = threadIdx.x; column < latent_dim;
          column += blockDim.x) {
         float value = 0.0F;
         for (std::uint32_t token = 0U; token < history; ++token) {
-            value += scores[token] *
+            value += coefficients[
+                         static_cast<std::uint64_t>(head) * history + token] *
                 latent_cache[static_cast<std::uint64_t>(token) * latent_dim +
                              column];
         }
@@ -2286,7 +2281,7 @@ ValidationResult CudaBackend::glm53_mla_decode_finish(
 }
 
 ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
-    const CudaGlm53MlaRequest& request) {
+    const CudaGlm53MlaRequest& request, std::span<float> scores) {
     if (request.state == nullptr || !request.state->valid() ||
         request.position >= request.maximum_context || request.heads == 0U ||
         request.head_dim == 0U || request.query_rank == 0U ||
@@ -2357,7 +2352,7 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
         static_cast<std::uint64_t>(request.heads) * request.key_value_rank;
     const auto workspace_floats =
         kDsv4MhcHidden + request.query_rank + width + compressed_width +
-        compressed_width + width + kDsv4MhcHidden;
+        compressed_width + width + kDsv4MhcHidden + request.heads * history;
     const auto workspace_bytes = workspace_floats * sizeof(float);
     if (auto status = cudaSetDevice(device); status != cudaSuccess) {
         return cuda_error(status,
@@ -2390,6 +2385,7 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
     auto* weighted_latent = compressed_query + compressed_width;
     auto* attended = weighted_latent + compressed_width;
     auto* output = attended + width;
+    auto* coefficients = output + kDsv4MhcHidden;
     constexpr unsigned int threads = 256U;
     constexpr unsigned int warps = threads / 32U;
     constexpr unsigned int hidden_blocks =
@@ -2449,10 +2445,92 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
                    request.key_value_b->impl_->weights),
         compressed_query, request.heads, request.head_dim,
         request.key_value_rank);
-    glm53_sparse_mla_identity_attention_kernel<<<
-        request.heads, threads, history * sizeof(float), state.stream>>>(
-        compressed_query, packed, weighted_latent,
+    if (scores.size() != request.heads * history) {
+        return {{"CUDA GLM-5.3 sparse MLA score span has an invalid shape"}};
+    }
+    glm53_sparse_mla_scores_kernel<<<
+        request.heads, threads, 0U, state.stream>>>(
+        compressed_query, packed, coefficients,
         static_cast<std::uint32_t>(history), request.heads, request.head_dim,
+        request.key_value_rank);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch sparse GLM-5.3 MLA scores");
+    }
+    if (auto status = glm53_kernel_timing_end(
+            state, impl_->detailed_timing); status != cudaSuccess) {
+        return cuda_error(status, "finish sparse GLM-5.3 MLA kernel timing");
+    }
+    if (auto status = cudaMemcpyAsync(
+            scores.data(), coefficients, scores.size_bytes(),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download sparse GLM-5.3 MLA scores");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "complete sparse GLM-5.3 MLA scores");
+    }
+    if (auto status = glm53_kernel_timing_drain(
+            *impl_, state, device, false); status != cudaSuccess) {
+        return cuda_error(status, "measure sparse GLM-5.3 MLA kernels");
+    }
+    state.glm53_mla_scores_pending = true;
+    return {};
+}
+
+ValidationResult CudaBackend::glm53_sparse_mla_decode_finish(
+    const CudaGlm53MlaRequest& request,
+    std::span<const float> normalized_coefficients) {
+    const auto device = request.state == nullptr ? -1 : request.state->device();
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        return {{"CUDA GLM-5.3 sparse MLA targets an uninitialized device"}};
+    }
+    auto& state = found->second;
+    if (!state.glm53_mla_scores_pending) {
+        return {{"CUDA GLM-5.3 sparse MLA finish has no pending scores"}};
+    }
+    const auto history = static_cast<std::uint64_t>(request.position) + 1U;
+    if (normalized_coefficients.size() != request.heads * history) {
+        return {{"CUDA GLM-5.3 sparse MLA coefficient span is invalid"}};
+    }
+    if (request.key_value_b == nullptr ||
+        !request.key_value_b->valid() || request.output == nullptr ||
+        !request.output->valid()) {
+        return {{"CUDA GLM-5.3 sparse MLA finish is missing a projection"}};
+    }
+    const auto width = static_cast<std::uint64_t>(request.heads) *
+                       request.head_dim;
+    const auto compressed_width =
+        static_cast<std::uint64_t>(request.heads) * request.key_value_rank;
+    auto* workspace = reinterpret_cast<float*>(state.glm53_mla_workspace);
+    auto* query = workspace + kDsv4MhcHidden + request.query_rank;
+    auto* compressed_query = query + width;
+    auto* weighted_latent = compressed_query + compressed_width;
+    auto* attended = weighted_latent + compressed_width;
+    auto* output = attended + width;
+    auto* coefficients = output + kDsv4MhcHidden;
+    auto* packed = static_cast<float*>(request.state->impl_->data);
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status,
+                          "select CUDA device for GLM-5.3 sparse MLA finish");
+    }
+    if (auto status = cudaMemcpyAsync(
+            coefficients, normalized_coefficients.data(),
+            normalized_coefficients.size_bytes(), cudaMemcpyHostToDevice,
+            state.stream); status != cudaSuccess) {
+        return cuda_error(status, "upload sparse GLM-5.3 MLA coefficients");
+    }
+    if (auto status = glm53_kernel_timing_begin(
+            state, impl_->detailed_timing, Glm53KernelCategory::Mla);
+        status != cudaSuccess) {
+        return cuda_error(status, "start sparse GLM-5.3 MLA finish timing");
+    }
+    constexpr unsigned int threads = 256U;
+    glm53_sparse_mla_weighted_latent_kernel<<<
+        request.heads, threads, 0U, state.stream>>>(
+        coefficients, packed, weighted_latent,
+        static_cast<std::uint32_t>(history), request.heads,
         request.key_value_rank);
     const auto width_blocks = static_cast<unsigned int>(
         (width + threads - 1U) / threads);
@@ -2462,13 +2540,38 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
                              request.key_value_b->impl_->weights),
         attended, request.heads, request.head_dim, request.key_value_rank);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
-        return cuda_error(status, "launch sparse GLM-5.3 MLA attention");
+        return cuda_error(status, "launch sparse GLM-5.3 MLA weighted sum");
     }
+    const auto project_one = [&](const CudaWeight* weight, const float* source,
+                                 float* destination,
+                                 std::uint64_t rows) -> cudaError_t {
+        const auto& descriptor = weight->impl_->descriptor;
+        if (descriptor.encoding == CudaWeightEncoding::Plain) {
+            bf16_matvec_kernel<<<
+                static_cast<unsigned int>((rows + 7U) / 8U), threads, 0U,
+                state.stream>>>(
+                destination, source,
+                static_cast<const __nv_bfloat16*>(weight->impl_->weights),
+                descriptor.columns, rows);
+        } else if (auto status = launch_regfed_fp8_f32_rows(
+                       state.moe_regfed, descriptor, weight->impl_->weights,
+                       weight->impl_->scales,
+                       weight->impl_->fragment_prepacked, source, destination,
+                       1U, state.stream); status != cudaSuccess) {
+            return status;
+        }
+        round_bf16_rows_kernel<<<
+            static_cast<unsigned int>((rows + threads - 1U) / threads),
+            threads, 0U, state.stream>>>(destination, rows);
+        return cudaGetLastError();
+    };
     if (auto status = project_one(request.output, attended, output,
                                   kDsv4MhcHidden);
         status != cudaSuccess) {
         return cuda_error(status, "project sparse GLM-5.3 MLA output");
     }
+    const auto hidden_blocks = static_cast<unsigned int>(
+        (kDsv4MhcHidden + threads - 1U) / threads);
     dsv4_fp32_to_bf16<<<hidden_blocks, threads, 0U, state.stream>>>(
         output, state.dsv4_mhc_workspace->branch, kDsv4MhcHidden);
     if (auto status = cudaGetLastError(); status != cudaSuccess) {
@@ -2476,8 +2579,9 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
     }
     if (auto status = glm53_kernel_timing_end(
             state, impl_->detailed_timing); status != cudaSuccess) {
-        return cuda_error(status, "finish sparse GLM-5.3 MLA kernel timing");
+        return cuda_error(status, "finish sparse GLM-5.3 MLA finish timing");
     }
+    state.glm53_mla_scores_pending = false;
     state.dsv4_mhc_branch_ready = true;
     return {};
 }

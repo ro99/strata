@@ -151,23 +151,25 @@ token are expanded, with 45% of tokens expanding none. Scores are computed on
 device; the softmax stays on the host in glibc `exp` with BF16-rounded
 coefficients, because that is what keeps the path byte-exact.
 
-**Attention is no longer the constraint at long context.** Of a 276.9 ms
-decode step at 2,591 tokens, feed-forward is 221.3 ms -- 77% -- and all
-remaining MLA-side cost is about 51 ms. The MoE term is the same floor
-short-context decode already pays, so with attention at exactly zero this
-prompt would still reach only about 4.43 tok/s. The current step is 81% of
-that ceiling.
+**The MoE term is flat in context; what still grows is MLA-side.** Of a 277.96 ms decode step at 2,591 tokens, feed-forward is 184.41 ms -- 66% -- and MLA-side cost is 91.79 ms, of which graph MLA is 80.00 and KDA 4.07. With attention at exactly zero this prompt would reach about 5.42 tok/s, and the measured 3.59 tok/s is 66% of that ceiling.
 
-Two figures that are easy to misread:
+Feed-forward per decode token does not depend on history:
 
-- **The MoE floor is prompt-dependent.** 221.3 ms/token belongs to this prompt's
-  expert routing, not to the model. The published 5.49 tok/s short-context rate
-  comes from a different prompt with cheaper routing, so it is not a like-for-like
-  target for a long-context run.
-- **Feed-forward measured 183.2 ms/token at history 1,046 and 216-221 ms at
-  2,591** on the same prompt family, with a byte-identical static expert tier in
-  both runs. That roughly 20% rise with context is unexplained and is tracked
-  separately; it is not attributable to the indexer.
+| history | decode window | feed-forward ms/token |
+|---:|---:|---:|
+| 89 | 15 | 179.4 |
+| 534 | 15 | 181.2 |
+| 1,046 | 15 | 183.1 |
+| 1,046 | 127 | 181.5 |
+| 2,591 | 127 | 184.4 |
+
+That is a 2.8% spread over a 29x range of history. Routed weight volume is flat as well at 3.69-3.89 GB/token, and at a matched 127-token decode window history 2,591 reads slightly *fewer* routed bytes per token than history 1,046, 3.838 against 3.888, and misses the static tier slightly less often, 228.8 against 231.7 per token. The static-tier coverage difference that looks like a context effect is decode-position aliasing: widening the window from 15 to 127 tokens at constant history moves misses from 218.1 to 231.7 per token, because later generated tokens route to less popular experts.
+
+Two figures that are easy to misread, and one that was wrong:
+
+- **An earlier revision of this section reported 221.3 ms/token of feed-forward at 2,591, 77% of the step, about 51 ms of MLA-side cost left over, and a 4.43 tok/s ceiling that the run was 81% of.** That subtraction crossed two commits. The 276.9 ms step was measured at `ec1a044`; the 221.3 ms feed-forward came from `3ddee8a`, whose own profile records 284.4 ms/token of MLA-side cost in a 505.7 ms step. Feed-forward at a fixed operating point varies by up to 2.4x across commits according to how much concurrent host work the MLA path is doing, so it has to be read from the same profile as the step it is subtracted from. Record 0239 has the measurements.
+- **The MoE floor is prompt-dependent.** 184.4 ms/token belongs to this prompt's expert routing, not to the model, and the published 5.49 tok/s short-context rate comes from a different prompt, so it is not a like-for-like target. But the ceiling this prompt's MoE floor allows is 5.42 tok/s, so a long-context rate near the short-context one is not arithmetically excluded the way the earlier 4.43 figure made it look.
+- **The context-dependent term is the indexer, not the MoE.** At 2,591 the largest host-side sparse-MLA phases are pool scoring at 24.5 ms/token and indexer projection at 22.96, against 7.96 for the projection at history 1,046, because `wq_b` runs only above `index_topk`. Pools grow as `history/4`, so pool scoring is the term that sets the long-context bound.
 
 At short context the sparse path is at parity with the dense one it replaces:
 on the same prompt, dense 5.27 tok/s against sparse 5.14.
@@ -181,10 +183,7 @@ Decode cost against history, seconds per token, cold process:
 | 1,046 | 0.224 |
 | 2,591 (saturated) | 0.277 |
 
-`--context-size` above 2,048 selects the sparse path for *every* sequence the
-runtime admits, whatever its prompt length, so short-prompt arms exercise the
-same decode path and make it measurable in minutes rather than in a 19-minute
-prefill.
+`--context-size` above 2,048 selects the sparse path for *every* sequence the runtime admits, whatever its prompt length, so short-prompt arms exercise the same decode path and make it measurable in minutes rather than in a 19-minute prefill. One term escapes them: `wq_b` runs only above `index_topk`, so an arm whose *history* is below 2,048 never executes it, and indexer projection reads 7.96 ms/token there against 22.96 at history 2,591. The short harness is blind to the largest context-dependent term in the indexer, which is exactly the kind of thing it was built to find.
 
 Cold and warm runs agree here: the same saturated arm measured 3.50 tok/s cold
 and 3.52 warm, 0.6% apart. The runbook's warm-up caveat describes short bounded

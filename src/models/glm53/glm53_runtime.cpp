@@ -336,24 +336,31 @@ constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
 
-// The three storage formats a GLM-5.3 routed or shared expert can arrive in.
+// The four storage formats a GLM-5.3 routed or shared expert can arrive in.
 // The FP8 release uses only the first; the MXFP4 release uses the second for
-// routed experts in the 39 quantized layers and the third everywhere else,
+// routed experts in the 39 quantized layers and the fourth everywhere else,
 // including the shared expert and the routed experts of layers 3, 5 and 6 that
-// the publisher's mixed-precision correction left in BF16.
+// the publisher's mixed-precision correction left in BF16. The NVFP4 release
+// uses the third for the routed experts of every MoE layer and the fourth for
+// its shared experts, which stay BF16.
 enum class Glm53ExpertEncoding : std::uint8_t {
     Fp8E4m3Block128F32,
     Fp4E2m1Group32E8m0,
+    Nvfp4Group16E4m3,
     Bf16,
 };
 
 struct Glm53HostExpertLinear {
     std::span<const std::byte> weights;
     // FP8: F32 inverse scales, one per 128x128 block, row-major over blocks.
-    // MXFP4: E8M0 bytes, one per 32 columns of each row. BF16: empty.
+    // MXFP4: E8M0 bytes, one per 32 columns of each row. NVFP4: E4M3 bytes,
+    // one per 16 columns of each row. BF16: empty.
     std::span<const std::byte> scales;
     std::uint32_t rows{};
     std::uint32_t columns{};
+    // NVFP4's per-tensor divisor; one for every other encoding, which leaves
+    // the group scale unchanged.
+    float global_scale{1.0F};
     Glm53ExpertEncoding encoding{Glm53ExpertEncoding::Fp8E4m3Block128F32};
 };
 
@@ -363,6 +370,7 @@ struct Glm53HostExpertLinear {
 struct Glm53HostExpertRow {
     const std::byte* weights{};
     const void* scales{};
+    float global_scale{1.0F};
     Glm53ExpertEncoding encoding{Glm53ExpertEncoding::Fp8E4m3Block128F32};
 };
 
@@ -626,6 +634,132 @@ __attribute__((target("avx2,fma")))
     return glm53_host_fp4_dot_scalar(packed, scales, input);
 }
 
+// NVFP4 ("nvfp4-pack-quantized"): the same E2M1 nibble pairs MXFP4 packs, but
+// one E4M3 scale byte per 16 columns and one F32 per-tensor divisor. A weight
+// is `nibble * (e4m3_scale / global_scale)`, and the division comes first --
+// that is the order the reference dequantization, the Laguna host matvec and
+// `nvfp4_group16_matmul_kernel` all use, so keeping it here is what lets a host
+// result and a device result be compared at all.
+//
+// The divisor is constant across the row, so both paths divide once per group
+// rather than once per column. `kNvfp4MaxRowGroups` bounds the decoded-scale
+// buffer the AVX2 path fills: 8,192 columns, four times the widest projection
+// this model has.
+constexpr std::size_t kNvfp4MaxRowGroups = 512U;
+
+[[nodiscard]] float glm53_host_nvfp4_dot_scalar(
+    const std::byte* packed, const std::uint8_t* scales, float global_scale,
+    std::span<const float> input) noexcept {
+    const auto& values = glm53_fp4_values();
+    const auto& codes = glm53_fp8_values();
+    float sum = 0.0F;
+    for (std::size_t column = 0U; column < input.size(); ++column) {
+        const auto byte = std::to_integer<std::uint8_t>(packed[column / 2U]);
+        const auto nibble = static_cast<std::uint8_t>(
+            (column % 2U == 0U) ? (byte & 0x0FU) : (byte >> 4U));
+        sum = std::fma(input[column] * values[nibble],
+                       codes[scales[column / 16U]] / global_scale, sum);
+    }
+    return sum;
+}
+
+#if STRATA_GLM53_HOST_AVX2
+__attribute__((target("avx2,fma")))
+[[nodiscard]] float glm53_host_nvfp4_dot_avx2(
+    const std::byte* packed, const std::uint8_t* scales, float global_scale,
+    std::span<const float> input) noexcept {
+    const auto& values = glm53_fp4_values();
+    const auto& codes = glm53_fp8_values();
+    const auto groups = (input.size() + 15U) / 16U;
+    if (groups > kNvfp4MaxRowGroups) {
+        return glm53_host_nvfp4_dot_scalar(packed, scales, global_scale, input);
+    }
+    // Decode the row's group scales once. `vdivps` is correctly rounded, so
+    // every entry equals the scalar path's `codes[..] / global_scale` bit for
+    // bit; what changes is that the 512 divisions a 8,192-column row would
+    // otherwise issue inside the accumulation become 64 outside it.
+    alignas(32) std::array<float, kNvfp4MaxRowGroups> decoded{};
+    const auto divisor = _mm256_set1_ps(global_scale);
+    std::size_t group = 0U;
+    for (; group + 8U <= groups; group += 8U) {
+        alignas(32) std::array<float, 8U> lane{};
+        for (std::size_t index = 0U; index < 8U; ++index) {
+            lane[index] = codes[scales[group + index]];
+        }
+        _mm256_store_ps(decoded.data() + group,
+                        _mm256_div_ps(_mm256_load_ps(lane.data()), divisor));
+    }
+    for (; group < groups; ++group) {
+        decoded[group] = codes[scales[group]] / global_scale;
+    }
+    const auto shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    const auto mask = _mm256_set1_epi32(0x0F);
+    const auto magnitudes =
+        _mm256_setr_ps(0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F);
+    const auto magnitude_mask = _mm256_set1_epi32(0x07);
+    const auto sign_mask = _mm256_set1_epi32(0x08);
+    __m256 accumulators[8]{
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()};
+    std::size_t column = 0U;
+    for (; column + 64U <= input.size(); column += 64U) {
+        // Sixty-four columns span exactly four group-16 scales, one for each
+        // pair of the eight independent accumulator chains.
+        const auto* row_scales = decoded.data() + column / 16U;
+        for (std::size_t lane_group = 0U; lane_group < 8U; ++lane_group) {
+            const auto offset = column + lane_group * 8U;
+            std::uint32_t word = 0U;
+            std::memcpy(&word, packed + offset / 2U, sizeof(word));
+            const auto nibbles = _mm256_and_si256(
+                _mm256_srlv_epi32(_mm256_set1_epi32(
+                                      static_cast<int>(word)), shifts), mask);
+            const auto decoded_weights = _mm256_xor_ps(
+                _mm256_permutevar8x32_ps(
+                    magnitudes, _mm256_and_si256(nibbles, magnitude_mask)),
+                _mm256_castsi256_ps(_mm256_slli_epi32(
+                    _mm256_and_si256(nibbles, sign_mask), 28)));
+            const auto scale = _mm256_set1_ps(row_scales[lane_group / 2U]);
+            const auto activation = _mm256_loadu_ps(input.data() + offset);
+            accumulators[lane_group] = _mm256_fmadd_ps(
+                _mm256_mul_ps(decoded_weights, scale), activation,
+                accumulators[lane_group]);
+        }
+    }
+    for (std::size_t width = 4U; width != 0U; width >>= 1U) {
+        for (std::size_t index = 0U; index < width; ++index) {
+            accumulators[index] = _mm256_add_ps(
+                accumulators[index], accumulators[index + width]);
+        }
+    }
+    const __m128 low = _mm256_castps256_ps128(accumulators[0]);
+    const __m128 high = _mm256_extractf128_ps(accumulators[0], 1);
+    __m128 total = _mm_add_ps(low, high);
+    total = _mm_hadd_ps(total, total);
+    total = _mm_hadd_ps(total, total);
+    float sum = _mm_cvtss_f32(total);
+    for (; column < input.size(); ++column) {
+        const auto byte = std::to_integer<std::uint8_t>(packed[column / 2U]);
+        const auto nibble = static_cast<std::uint8_t>(
+            (column % 2U == 0U) ? (byte & 0x0FU) : (byte >> 4U));
+        sum = std::fma(input[column] * values[nibble], decoded[column / 16U],
+                       sum);
+    }
+    return sum;
+}
+#endif
+
+[[nodiscard]] float glm53_host_nvfp4_dot(
+    const std::byte* packed, const std::uint8_t* scales, float global_scale,
+    std::span<const float> input) noexcept {
+#if STRATA_GLM53_HOST_AVX2
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        return glm53_host_nvfp4_dot_avx2(packed, scales, global_scale, input);
+    }
+#endif
+    return glm53_host_nvfp4_dot_scalar(packed, scales, global_scale, input);
+}
+
 // BF16 rows carry no scale. The MXFP4 release leaves the shared expert and the
 // routed experts of layers 3, 5 and 6 in this form, so the host MoE meets it on
 // every one of those layers, not as an exceptional case.
@@ -714,6 +848,13 @@ __attribute__((target("avx2,fma")))
                 reinterpret_cast<const std::uint8_t*>(linear.scales.data()) +
                 row * (linear.columns / 32U);
             break;
+        case Glm53ExpertEncoding::Nvfp4Group16E4m3:
+            view.weights = linear.weights.data() + row * (linear.columns / 2U);
+            view.scales =
+                reinterpret_cast<const std::uint8_t*>(linear.scales.data()) +
+                row * (linear.columns / 16U);
+            view.global_scale = linear.global_scale;
+            break;
         case Glm53ExpertEncoding::Bf16:
             view.weights = linear.weights.data() + row * linear.columns * 2U;
             break;
@@ -728,6 +869,10 @@ __attribute__((target("avx2,fma")))
             return glm53_host_fp4_dot(
                 row.weights, static_cast<const std::uint8_t*>(row.scales),
                 input);
+        case Glm53ExpertEncoding::Nvfp4Group16E4m3:
+            return glm53_host_nvfp4_dot(
+                row.weights, static_cast<const std::uint8_t*>(row.scales),
+                row.global_scale, input);
         case Glm53ExpertEncoding::Bf16:
             return glm53_host_bf16_dot(row.weights, input);
         case Glm53ExpertEncoding::Fp8E4m3Block128F32:
@@ -1558,16 +1703,23 @@ public:
           devices_(std::move(devices)) {
         std::uint64_t largest_linear = 0U;
         for (const auto& tensor : checkpoint_.manifest().tensors) {
-            if ((tensor.role != Glm53TensorRole::RoutedExpert &&
-                 tensor.role != Glm53TensorRole::SharedExpert) ||
-                !tensor.name.ends_with(".weight") ||
-                tensor.source_shape.size() != 2U) {
+            if (tensor.role != Glm53TensorRole::RoutedExpert &&
+                tensor.role != Glm53TensorRole::SharedExpert) {
                 continue;
             }
+            // NVFP4 names the payload `weight_packed`, so matching only
+            // `.weight` would size the reserve from the BF16 shared experts
+            // alone and never see a routed one.
+            const std::string_view suffix =
+                tensor.name.ends_with(".weight_packed") ? ".weight_packed"
+                : tensor.name.ends_with(".weight")      ? ".weight"
+                                                        : std::string_view{};
+            if (suffix.empty() || tensor.source_shape.size() != 2U) continue;
             largest_linear = std::max(
                 largest_linear,
                 checkpoint_.cuda_linear_storage_bytes(
-                    tensor.name.substr(0U, tensor.name.size() - 7U)));
+                    std::string_view(tensor.name).substr(
+                        0U, tensor.name.size() - suffix.size())));
         }
         const auto fragmentation_reserve =
             largest_linear <= std::numeric_limits<std::uint64_t>::max() / 2U
@@ -1729,15 +1881,21 @@ public:
             }
             entries[index] = &found->second;
         }
-        const auto* weight = checkpoint_.find(projections[0].key + ".weight");
+        const auto weight_name =
+            checkpoint_.weight_tensor_name(projections[0].key);
+        const auto* weight = checkpoint_.find(weight_name);
         if (weight == nullptr) {
             return {{"GLM-5.3 static expert has no source descriptor"}};
         }
         CudaGlm53ExpertEncoding encoding{};
+        // The two FP4 payloads are both U8, so the tensor name is what tells
+        // them apart -- the same discriminator the host path uses.
+        const bool nvfp4 = weight_name.ends_with(".weight_packed");
         if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
             encoding = CudaGlm53ExpertEncoding::Fp8E4m3Block128F32;
         } else if (weight->source_dtype == SafetensorsDtype::U8) {
-            encoding = CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0;
+            encoding = nvfp4 ? CudaGlm53ExpertEncoding::Nvfp4Group16E4m3
+                             : CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0;
         } else if (weight->source_dtype == SafetensorsDtype::Bf16) {
             encoding = CudaGlm53ExpertEncoding::Bf16;
         } else {
@@ -1747,6 +1905,19 @@ public:
         descriptor.hidden = kHidden;
         descriptor.intermediate = 2048U;
         descriptor.encoding = encoding;
+        if (nvfp4) {
+            // Each projection carries its own divisor, so all three are read
+            // rather than one being reused for the triplet.
+            std::array<float*, 3U> targets{&descriptor.gate_global_scale,
+                                           &descriptor.up_global_scale,
+                                           &descriptor.down_global_scale};
+            for (std::size_t index = 0U; index < projections.size(); ++index) {
+                auto divisor =
+                    checkpoint_.nvfp4_global_scale(projections[index].key);
+                if (!divisor.ok()) return {std::move(divisor.errors)};
+                *targets[index] = divisor.value;
+            }
+        }
         descriptor.gate = &entries[0]->weight;
         descriptor.up = &entries[1]->weight;
         descriptor.down = &entries[2]->weight;
@@ -3424,16 +3595,17 @@ struct Glm53Runtime::Impl {
     }
 
     // Resolves one expert projection into a mapped view, from whichever of the
-    // three storage formats the open checkpoint actually holds. The shapes are
-    // the discriminator, not a configuration flag: an FP8 checkpoint can only
-    // present E4M3 rows and an MXFP4 checkpoint only packed nibbles or BF16, so
-    // a mismatch here is a corrupt or unsupported checkpoint rather than a
+    // four storage formats the open checkpoint actually holds. The names and
+    // shapes are the discriminator, not a configuration flag: an FP8 checkpoint
+    // can only present E4M3 rows, an MXFP4 checkpoint only `weight` nibbles or
+    // BF16, and an NVFP4 checkpoint only `weight_packed` nibbles or BF16, so a
+    // mismatch here is a corrupt or unsupported checkpoint rather than a
     // wrongly selected path.
     [[nodiscard]] ParseResult<Glm53HostExpertLinear> host_expert_linear(
         std::string_view base, std::uint32_t rows,
         std::uint32_t columns) const {
         ParseResult<Glm53HostExpertLinear> result;
-        const auto weight_name = std::string(base) + ".weight";
+        const auto weight_name = checkpoint->weight_tensor_name(base);
         const auto* descriptor = checkpoint->find(weight_name);
         if (descriptor == nullptr) {
             result.errors.push_back(
@@ -3449,7 +3621,33 @@ struct Glm53Runtime::Impl {
         std::uint64_t expected_weight_bytes = 0U;
         std::uint64_t expected_scale_bytes = 0U;
         Glm53ExpertEncoding encoding{};
-        if (descriptor->source_dtype == SafetensorsDtype::F8E4M3) {
+        float global_scale = 1.0F;
+        if (weight_name.ends_with(".weight_packed")) {
+            scale_name = std::string(base) + ".weight_scale";
+            const auto* scale = checkpoint->find(scale_name);
+            if (descriptor->source_dtype != SafetensorsDtype::U8 ||
+                columns % 16U != 0U ||
+                descriptor->source_shape !=
+                    std::vector<std::uint64_t>{rows, columns / 2U} ||
+                scale == nullptr ||
+                scale->source_dtype != SafetensorsDtype::F8E4M3 ||
+                scale->source_shape !=
+                    std::vector<std::uint64_t>{rows, columns / 16U}) {
+                invalid("NVFP4 linear");
+                return result;
+            }
+            auto divisor = checkpoint->nvfp4_global_scale(base);
+            if (!divisor.ok()) {
+                result.errors = std::move(divisor.errors);
+                return result;
+            }
+            global_scale = divisor.value;
+            encoding = Glm53ExpertEncoding::Nvfp4Group16E4m3;
+            expected_weight_bytes =
+                static_cast<std::uint64_t>(rows) * (columns / 2U);
+            expected_scale_bytes =
+                static_cast<std::uint64_t>(rows) * (columns / 16U);
+        } else if (descriptor->source_dtype == SafetensorsDtype::F8E4M3) {
             const auto scale_rows = (rows + 127U) / 128U;
             const auto scale_columns = (columns + 127U) / 128U;
             scale_name = std::string(base) + ".weight_scale_inv";
@@ -3527,7 +3725,7 @@ struct Glm53Runtime::Impl {
             return result;
         }
         result.value = {weight_payload.value, scale_payload, rows, columns,
-                        encoding};
+                        global_scale, encoding};
         return result;
     }
 
@@ -3639,10 +3837,12 @@ struct Glm53Runtime::Impl {
                     linear.value.weights.size_bytes() +
                     linear.value.scales.size_bytes();
             }
+            // The shared expert is never NVFP4: both FP4 releases leave it in
+            // BF16, so the three divisors keep their identity value here.
             shared_experts.experts[layer] = {
                 uploaded[0], uploaded[1], uploaded[2],
                 uploaded[3], uploaded[4], uploaded[5],
-                kHidden, intermediate, encoding};
+                kHidden, intermediate, 1.0F, 1.0F, 1.0F, encoding};
             shared_experts.devices[layer] = device;
         }
         shared_experts.active = true;
@@ -9429,12 +9629,17 @@ ValidationResult Glm53Runtime::initialize(
                           ? "fused-layer"
                           : "host-boundary-fallback")
                   << '\n';
+        const auto host_moe_mode = [&]() -> std::string_view {
+            switch (impl_->checkpoint->manifest().quantization) {
+                case Glm53Quantization::Mxfp4Group32: return "host-mxfp4";
+                case Glm53Quantization::Nvfp4Group16E4m3: return "host-nvfp4";
+                case Glm53Quantization::Fp8E4m3Block128:
+                case Glm53Quantization::Unsupported: break;
+            }
+            return "host-fp8";
+        };
         std::cerr << "[glm53-expert-tier] mode="
-                  << (impl_->host_moe_active
-                          ? (impl_->checkpoint->manifest().quantization ==
-                                     Glm53Quantization::Mxfp4Group32
-                                 ? "host-mxfp4" : "host-fp8")
-                          : "cuda-lru")
+                  << (impl_->host_moe_active ? host_moe_mode() : "cuda-lru")
                   << " workers="
                   << (impl_->host_moe_workers == nullptr
                           ? 0U : impl_->host_moe_workers->size())
@@ -9773,6 +9978,23 @@ float glm53_host_fp4_group32_row_dot(
     static_cast<void>(use_avx2);
 #endif
     return glm53_host_fp4_dot_scalar(packed.data(), codes, input);
+}
+
+float glm53_host_nvfp4_group16_row_dot(
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    float global_scale, std::span<const float> input, bool use_avx2) noexcept {
+    const auto* codes =
+        reinterpret_cast<const std::uint8_t*>(scales.data());
+#if STRATA_GLM53_HOST_AVX2
+    if (use_avx2) {
+        return glm53_host_nvfp4_dot_avx2(packed.data(), codes, global_scale,
+                                         input);
+    }
+#else
+    static_cast<void>(use_avx2);
+#endif
+    return glm53_host_nvfp4_dot_scalar(packed.data(), codes, global_scale,
+                                       input);
 }
 
 float glm53_host_fp8_block128_row_dot(

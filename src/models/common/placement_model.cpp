@@ -362,7 +362,14 @@ struct Gemma4Linear {
 }
 
 [[nodiscard]] std::string glm53_module_base(std::string_view name) {
-    for (const auto suffix : {std::string_view{".weight_scale_inv"},
+    // Longest first, so `weight_scale` is not mistaken for `weight` and
+    // `weight_global_scale` not for `weight_scale`. Without the FP4 suffixes a
+    // quantized module's scales become their own inventory entries instead of
+    // joining the module whose bytes they belong to.
+    for (const auto suffix : {std::string_view{".weight_global_scale"},
+                              std::string_view{".weight_scale_inv"},
+                              std::string_view{".weight_packed"},
+                              std::string_view{".weight_scale"},
                               std::string_view{".weight"},
                               std::string_view{".bias"}}) {
         if (name.size() >= suffix.size() &&

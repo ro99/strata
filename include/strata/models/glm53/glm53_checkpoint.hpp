@@ -46,6 +46,21 @@ public:
         std::string_view name, std::uint64_t maximum_elements) const;
     [[nodiscard]] ParseResult<std::vector<float>> read_f32_row(
         std::string_view name, std::uint64_t row) const;
+    // The payload tensor of one linear module. compressed-tensors NVFP4 names
+    // it `weight_packed`; FP8, MXFP4 and every BF16 module name it `weight`.
+    // Resolving it here keeps the suffix out of the call sites that only want
+    // "the weight of this module", and returns the `.weight` form unchanged
+    // when neither exists so the caller's own diagnostic still names it.
+    [[nodiscard]] std::string weight_tensor_name(
+        std::string_view base_name) const;
+    [[nodiscard]] const Glm53ManifestTensor* find_weight(
+        std::string_view base_name) const noexcept;
+    // The F32 per-tensor divisor an NVFP4 module's group scales are expressed
+    // against. Fails for a module that is not NVFP4, or whose divisor is not a
+    // single positive finite scalar -- dividing by a bad one would silently
+    // scale a whole projection rather than reject it.
+    [[nodiscard]] ParseResult<float> nvfp4_global_scale(
+        std::string_view base_name) const;
     [[nodiscard]] std::uint64_t cuda_linear_storage_bytes(
         std::string_view base_name) const;
     [[nodiscard]] std::uint64_t cuda_linear_slice_storage_bytes(

@@ -3230,6 +3230,81 @@ __global__ void glm53_shared_expert_fp4_dot_kernel(
     }
 }
 
+// NVFP4 counterpart. The nibble packing is MXFP4's, but a scale covers 16
+// columns rather than 32 and is an E4M3 code divided by the tensor's F32
+// global scale. Eight columns is exactly half a group, so the eight threads
+// pair up onto four scales per 64-column step instead of splitting into two
+// halves; everything else -- the accumulator vectors, the shuffle tree, the
+// combine order -- is the FP4 kernel's, so the two formats differ only in the
+// decode, as they do on the host.
+template <std::uint32_t Batch>
+__global__ void glm53_shared_expert_nvfp4_dot_kernel(
+    float* output, const unsigned char* weights,
+    const unsigned char* scales, float global_scale, const float* input,
+    std::uint32_t rows, std::uint32_t columns) {
+    constexpr std::uint32_t kGroups = 8U;
+    const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = thread / kGroups;
+    const std::uint32_t group = thread % kGroups;
+    if (row >= rows) return;
+    const auto* weight_row = weights +
+        static_cast<std::uint64_t>(row) * (columns / 2U);
+    const auto* scale_row = scales +
+        static_cast<std::uint64_t>(row) * (columns / 16U);
+    float accumulator[Batch][8];
+#pragma unroll
+    for (int item = 0; item < static_cast<int>(Batch); ++item) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            accumulator[item][lane] = 0.0F;
+        }
+    }
+    for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
+        const float scale =
+            fp8_e4m3_value(scale_row[column / 16U + group / 2U]) / global_scale;
+        const auto packed = *reinterpret_cast<const unsigned int*>(
+            weight_row + column / 2U + group * 4U);
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            const auto encoded = (packed >> (lane * 4U)) & 0x0FU;
+            for (std::uint32_t item = 0U; item < Batch; ++item) {
+                accumulator[item][lane] = __fmaf_rn(
+                    __fmul_rn(fp4_e2m1_value(encoded), scale),
+                    input[static_cast<std::uint64_t>(item) * columns + column +
+                          group * 8U + lane],
+                    accumulator[item][lane]);
+            }
+        }
+    }
+    const unsigned mask = __activemask();
+#pragma unroll
+    for (int width = 4; width != 0; width >>= 1) {
+        for (std::uint32_t item = 0U; item < Batch; ++item) {
+#pragma unroll
+            for (int lane = 0; lane < 8; ++lane) {
+                const float other = __shfl_down_sync(
+                    mask, accumulator[item][lane], width, kGroups);
+                if (static_cast<int>(group) < width) {
+                    accumulator[item][lane] =
+                        __fadd_rn(accumulator[item][lane], other);
+                }
+            }
+        }
+    }
+    if (group != 0U) return;
+    for (std::uint32_t item = 0U; item < Batch; ++item) {
+        float total[4];
+#pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            total[lane] = __fadd_rn(accumulator[item][lane],
+                                    accumulator[item][lane + 4]);
+        }
+        output[static_cast<std::uint64_t>(item) * rows + row] =
+            __fadd_rn(__fadd_rn(total[0], total[1]),
+                      __fadd_rn(total[2], total[3]));
+    }
+}
+
 // The BF16 form uses the same eight-thread mapping and the exact same
 // association as `glm53_host_bf16_dot_avx2`: each thread owns one of the eight
 // AVX2 accumulators and its eight lanes, then the shuffle tree reproduces the
@@ -3326,6 +3401,24 @@ inline void launch_glm53_shared_expert_dot(
         default: STRATA_GLM53_LAUNCH_FP8(1U); break;
     }
 #undef STRATA_GLM53_LAUNCH_FP8
+}
+
+inline void launch_glm53_shared_expert_nvfp4_dot(
+    dim3 blocks, dim3 threads, cudaStream_t stream, float* output,
+    const unsigned char* weights, const unsigned char* scales,
+    float global_scale, const float* input, std::uint32_t rows,
+    std::uint32_t columns, std::uint32_t batch) {
+#define STRATA_GLM53_LAUNCH_NVFP4(BATCH)                                     \
+    glm53_shared_expert_nvfp4_dot_kernel<BATCH>                              \
+        <<<blocks, threads, 0U, stream>>>(output, weights, scales,           \
+                                          global_scale, input, rows, columns)
+    switch (batch) {
+        case 4U: STRATA_GLM53_LAUNCH_NVFP4(4U); break;
+        case 3U: STRATA_GLM53_LAUNCH_NVFP4(3U); break;
+        case 2U: STRATA_GLM53_LAUNCH_NVFP4(2U); break;
+        default: STRATA_GLM53_LAUNCH_NVFP4(1U); break;
+    }
+#undef STRATA_GLM53_LAUNCH_NVFP4
 }
 
 inline void launch_glm53_shared_expert_fp4_dot(

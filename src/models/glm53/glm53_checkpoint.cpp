@@ -2,6 +2,7 @@
 
 #include "../common/checkpoint_common.hpp"
 
+#include <cmath>
 #include <filesystem>
 #include <cerrno>
 #include <cstdlib>
@@ -276,14 +277,59 @@ ParseResult<std::vector<float>> Glm53CheckpointReader::read_f32_row(
     return result;
 }
 
+std::string Glm53CheckpointReader::weight_tensor_name(
+    std::string_view base_name) const {
+    auto packed = std::string(base_name) + ".weight_packed";
+    if (find(packed) != nullptr) return packed;
+    return std::string(base_name) + ".weight";
+}
+
+const Glm53ManifestTensor* Glm53CheckpointReader::find_weight(
+    std::string_view base_name) const noexcept {
+    return find(weight_tensor_name(base_name));
+}
+
+ParseResult<float> Glm53CheckpointReader::nvfp4_global_scale(
+    std::string_view base_name) const {
+    ParseResult<float> result;
+    const auto name = std::string(base_name) + ".weight_global_scale";
+    const auto* tensor = find(name);
+    if (tensor == nullptr || tensor->source_dtype != SafetensorsDtype::F32 ||
+        tensor->source_shape != std::vector<std::uint64_t>{1U}) {
+        result.errors.push_back(
+            "GLM-5.3 NVFP4 global scale is missing or is not an F32 scalar: " +
+            name);
+        return result;
+    }
+    auto loaded = read_f32(name, 1U);
+    if (!loaded.ok()) {
+        result.errors = std::move(loaded.errors);
+        return result;
+    }
+    const float value = loaded.value.front();
+    if (!std::isfinite(value) || value <= 0.0F) {
+        result.errors.push_back(
+            "GLM-5.3 NVFP4 global scale must be finite and positive: " + name);
+        return result;
+    }
+    result.value = value;
+    return result;
+}
+
 std::uint64_t Glm53CheckpointReader::cuda_linear_storage_bytes(
     std::string_view base_name) const {
-    const auto weight_name = std::string(base_name) + ".weight";
+    const auto weight_name = weight_tensor_name(base_name);
     const auto* weight = find(weight_name);
     if (weight == nullptr) return 0U;
     std::uint64_t scale_bytes = 0U;
-    if (weight->source_dtype == SafetensorsDtype::F8E4M3 ||
-        weight->source_dtype == SafetensorsDtype::U8) {
+    if (weight_name.ends_with(".weight_packed")) {
+        // NVFP4's F32 divisor rides on the descriptor rather than in device
+        // memory, so only the E4M3 group scales are stored beside the payload.
+        const auto* scale = find(std::string(base_name) + ".weight_scale");
+        if (scale == nullptr) return 0U;
+        scale_bytes = scale->source_bytes;
+    } else if (weight->source_dtype == SafetensorsDtype::F8E4M3 ||
+               weight->source_dtype == SafetensorsDtype::U8) {
         const auto* scale = find(
             std::string(base_name) +
             (weight->source_dtype == SafetensorsDtype::U8 ? ".weight_scale"
@@ -333,14 +379,19 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
     int device, CudaBackend& backend, CudaWeight& output,
     bool concurrent_prefetch, bool canonical_layout) const {
     ValidationResult result;
-    const auto weight_name = std::string(base_name) + ".weight";
+    const auto weight_name = weight_tensor_name(base_name);
     const auto* weight = find(weight_name);
+    // Both FP4 encodings halve the stored columns; NVFP4 is told apart from
+    // MXFP4 by the tensor name, because the two are byte-identical U8 payloads
+    // and only their scale tensors differ.
+    const bool nvfp4 = weight_name.ends_with(".weight_packed");
     const auto expected_shape = weight != nullptr &&
                                 weight->source_dtype == SafetensorsDtype::U8
         ? std::vector<std::uint64_t>{rows, columns / 2U}
         : std::vector<std::uint64_t>{rows, columns};
     if (weight == nullptr || columns == 0U ||
-        (weight->source_dtype == SafetensorsDtype::U8 && columns % 32U != 0U) ||
+        (weight->source_dtype == SafetensorsDtype::U8 &&
+         columns % (nvfp4 ? 16U : 32U) != 0U) ||
         weight->source_shape != expected_shape) {
         result.errors.push_back("GLM-5.3 linear has an unexpected or missing weight: " +
                                 weight_name);
@@ -367,6 +418,25 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
         descriptor.packed_columns = columns;
         descriptor.scale_columns = scale_columns;
         descriptor.group_size = 128U;
+    } else if (weight->source_dtype == SafetensorsDtype::U8 && nvfp4) {
+        scale_name = std::string(base_name) + ".weight_scale";
+        const auto* scale = find(scale_name);
+        const auto scale_columns = columns / 16U;
+        if (scale == nullptr ||
+            scale->source_dtype != SafetensorsDtype::F8E4M3 ||
+            scale->source_shape !=
+                std::vector<std::uint64_t>{rows, scale_columns}) {
+            result.errors.push_back(
+                "GLM-5.3 NVFP4 linear has an invalid scale: " + scale_name);
+            return result;
+        }
+        auto global_scale = nvfp4_global_scale(base_name);
+        if (!global_scale.ok()) return {std::move(global_scale.errors)};
+        descriptor.encoding = CudaWeightEncoding::Nvfp4Group16;
+        descriptor.packed_columns = columns / 2U;
+        descriptor.scale_columns = scale_columns;
+        descriptor.group_size = 16U;
+        descriptor.global_scale = global_scale.value;
     } else if (weight->source_dtype == SafetensorsDtype::U8) {
         scale_name = std::string(base_name) + ".weight_scale";
         const auto* scale = find(scale_name);
@@ -424,7 +494,8 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
     std::vector<std::byte> scales;
     if (!scale_name.empty()) {
         const auto scale_bytes =
-            descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32
+            descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32 ||
+                    descriptor.encoding == CudaWeightEncoding::Nvfp4Group16
             ? rows * descriptor.scale_columns
             : descriptor.scale_columns * ((rows + 127U) / 128U) *
                   sizeof(float);

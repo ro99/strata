@@ -33,7 +33,139 @@ constexpr std::size_t kColumns = 4096U;  // one GLM-5.3 expert gate/up row
     return static_cast<float>(sum);
 }
 
+// The NVFP4 reference, written the same way: value = e2m1(nibble) *
+// (e4m3(code) / global_scale), one E4M3 code per 16 columns. The division is
+// applied to the group scale and not to the sum, which is the order the
+// exporter, the device kernel and the other NVFP4 host paths all use.
+[[nodiscard]] float reference_nvfp4_dot(
+    const std::vector<std::byte>& packed, const std::vector<std::byte>& scales,
+    float global_scale, const std::vector<float>& input) {
+    double sum = 0.0;
+    for (std::size_t column = 0U; column < input.size(); ++column) {
+        const auto byte = std::to_integer<std::uint8_t>(packed[column / 2U]);
+        const auto nibble = static_cast<std::uint8_t>(
+            column % 2U == 0U ? (byte & 0x0FU) : (byte >> 4U));
+        const auto code = std::to_integer<std::uint8_t>(scales[column / 16U]);
+        sum += static_cast<double>(input[column]) *
+               static_cast<double>(strata::fp4_e2m1_f32(nibble)) *
+               static_cast<double>(strata::fp8_e4m3_f32(code) / global_scale);
+    }
+    return static_cast<float>(sum);
+}
+
 }  // namespace
+
+TEST_CASE("GLM-5.3 NVFP4 host dot agrees with a reference dequantization") {
+    std::mt19937 engine(20260903U);
+    std::uniform_int_distribution<int> nibbles(0, 255);
+    // E4M3 codes with a positive sign and a moderate exponent: the format's
+    // NaN code is 0x7F, and the checkpoint's own divisor brings the products
+    // back to unit range, so this keeps both decoders and the double reference
+    // comparable on precision rather than on magnitude.
+    std::uniform_int_distribution<int> codes(0x30, 0x50);
+    std::uniform_real_distribution<float> activations(-2.0F, 2.0F);
+    // 21,504 is (448 * 6) / 0.125, the divisor this checkpoint's exporter fits
+    // to a routed-expert projection; it is deliberately not a power of two, so
+    // a decoder that multiplied by a reciprocal instead of dividing would not
+    // reproduce the reference bit for bit.
+    constexpr float kGlobalScale = 21504.0F;
+
+    std::vector<std::byte> packed(kColumns / 2U);
+    std::vector<std::byte> scales(kColumns / 16U);
+    std::vector<float> input(kColumns);
+    for (auto& byte : packed) byte = static_cast<std::byte>(nibbles(engine));
+    for (auto& byte : scales) byte = static_cast<std::byte>(codes(engine));
+    for (auto& value : input) value = activations(engine);
+
+    const auto expected =
+        reference_nvfp4_dot(packed, scales, kGlobalScale, input);
+    const auto scalar = strata::glm53_host_nvfp4_group16_row_dot(
+        packed, scales, kGlobalScale, input, false);
+    const auto vectorized = strata::glm53_host_nvfp4_group16_row_dot(
+        packed, scales, kGlobalScale, input, true);
+    const auto tolerance = 1.0e-3F * std::max(1.0F, std::abs(expected));
+    REQUIRE(std::abs(scalar - expected) <= tolerance);
+    REQUIRE(std::abs(vectorized - expected) <= tolerance);
+}
+
+TEST_CASE("GLM-5.3 NVFP4 host dot decodes every E2M1 code in column order") {
+    // The same nibble-order gate MXFP4 gets, over one group of 16 rather than
+    // 32. A scale of 1.0 and a divisor of 1.0 leave the decoded weight alone,
+    // so any difference here is the nibble mapping and nothing else.
+    std::vector<std::byte> packed(8U);
+    std::vector<std::byte> scales(1U, static_cast<std::byte>(0x38U));  // 1.0
+    std::vector<float> input(16U, 0.0F);
+    for (std::size_t byte = 0U; byte < packed.size(); ++byte) {
+        packed[byte] = static_cast<std::byte>(
+            (byte & 0x0FU) | ((15U - byte) << 4U));
+    }
+    REQUIRE(strata::fp8_e4m3_f32(0x38U) == 1.0F);
+    for (std::size_t column = 0U; column < input.size(); ++column) {
+        std::fill(input.begin(), input.end(), 0.0F);
+        input[column] = 1.0F;
+        const auto expected = strata::fp4_e2m1_f32(static_cast<std::uint8_t>(
+            column % 2U == 0U ? column / 2U : 15U - column / 2U));
+        REQUIRE(strata::glm53_host_nvfp4_group16_row_dot(
+                    packed, scales, 1.0F, input, false) == expected);
+        REQUIRE(strata::glm53_host_nvfp4_group16_row_dot(
+                    packed, scales, 1.0F, input, true) == expected);
+    }
+}
+
+TEST_CASE("GLM-5.3 NVFP4 host dot applies one E4M3 scale per 16 columns") {
+    // Group 16, not MXFP4's 32: a decoder that kept the wider group would read
+    // the first scale for the first 32 columns and land on the wrong total.
+    std::vector<std::byte> packed(kColumns / 2U,
+                                  static_cast<std::byte>(0x22U));  // 1.0, 1.0
+    std::vector<std::byte> scales(kColumns / 16U);
+    std::vector<float> input(kColumns, 1.0F);
+    for (std::size_t group = 0U; group < scales.size(); ++group) {
+        // 1.0 and 2.0 in E4M3, alternating per group.
+        scales[group] = static_cast<std::byte>(group % 2U == 0U ? 0x38U : 0x40U);
+    }
+    REQUIRE(strata::fp8_e4m3_f32(0x40U) == 2.0F);
+    // Halving the divisor doubles every weight, so the expected total states
+    // the divide direction rather than assuming it.
+    constexpr float kGlobalScale = 0.5F;
+    const auto expected = static_cast<float>(kColumns / 2U) * 2.0F +
+                          static_cast<float>(kColumns / 2U) * 4.0F;
+    REQUIRE(strata::glm53_host_nvfp4_group16_row_dot(
+                packed, scales, kGlobalScale, input, false) == expected);
+    REQUIRE(strata::glm53_host_nvfp4_group16_row_dot(
+                packed, scales, kGlobalScale, input, true) == expected);
+}
+
+TEST_CASE("GLM-5.3 NVFP4 host dot decodes a row the vector step cannot cover") {
+    // 208 columns is three 64-column vector steps and a 16-column remainder,
+    // so the AVX2 path's scalar tail runs. The tail indexes the decoded group
+    // scales the body built rather than re-deriving them, and reading the wrong
+    // one there is the mistake this catches. The two paths associate their sums
+    // differently by design, so each is checked against the reference and not
+    // against the other.
+    std::mt19937 engine(20260904U);
+    std::uniform_int_distribution<int> nibbles(0, 255);
+    std::uniform_int_distribution<int> codes(0x30, 0x50);
+    std::uniform_real_distribution<float> activations(-2.0F, 2.0F);
+    constexpr std::size_t kPartial = 208U;
+    constexpr float kGlobalScale = 21504.0F;
+
+    std::vector<std::byte> packed(kPartial / 2U);
+    std::vector<std::byte> scales(kPartial / 16U);
+    std::vector<float> input(kPartial);
+    for (auto& byte : packed) byte = static_cast<std::byte>(nibbles(engine));
+    for (auto& byte : scales) byte = static_cast<std::byte>(codes(engine));
+    for (auto& value : input) value = activations(engine);
+
+    const auto expected =
+        reference_nvfp4_dot(packed, scales, kGlobalScale, input);
+    const auto tolerance = 1.0e-3F * std::max(1.0F, std::abs(expected));
+    REQUIRE(std::abs(strata::glm53_host_nvfp4_group16_row_dot(
+                packed, scales, kGlobalScale, input, false) - expected) <=
+            tolerance);
+    REQUIRE(std::abs(strata::glm53_host_nvfp4_group16_row_dot(
+                packed, scales, kGlobalScale, input, true) - expected) <=
+            tolerance);
+}
 
 TEST_CASE("GLM-5.3 MXFP4 host dot agrees with a reference dequantization") {
     std::mt19937 engine(20260830U);

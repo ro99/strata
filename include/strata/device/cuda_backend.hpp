@@ -659,6 +659,7 @@ struct CudaDsv4AttentionPrepareRequest {
 enum class CudaGlm53ExpertEncoding : std::uint8_t {
     Fp8E4m3Block128F32,
     Fp4E2m1Group32E8m0,
+    Nvfp4Group16E4m3,
     Bf16,
 };
 
@@ -682,6 +683,11 @@ struct CudaGlm53Expert {
     const CudaBuffer* down_scales{};
     std::uint32_t hidden{};
     std::uint32_t intermediate{};
+    // NVFP4's per-tensor divisor, one per projection because the exporter fits
+    // one to each. Unused -- and left at one -- by every other encoding.
+    float gate_global_scale{1.0F};
+    float up_global_scale{1.0F};
+    float down_global_scale{1.0F};
     CudaGlm53ExpertEncoding encoding{
         CudaGlm53ExpertEncoding::Fp8E4m3Block128F32};
     // Static routed experts live inside the admitted weight arena as pinned

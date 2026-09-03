@@ -24,7 +24,7 @@ namespace strata {
     std::span<const std::uint64_t> capacities,
     std::size_t preferred_slot);
 
-// Host decoders for the two expert storage formats the MXFP4 release adds.
+// Host decoders for the expert storage formats the two FP4 releases add.
 // Exposed so the vectorized and scalar decoders can be compared against each
 // other and against a reference dequantization; the host MoE calls exactly
 // these functions. `use_avx2` false forces the scalar reference.
@@ -34,6 +34,14 @@ namespace strata {
 [[nodiscard]] float glm53_host_fp4_group32_row_dot(
     std::span<const std::byte> packed, std::span<const std::byte> scales,
     std::span<const float> input, bool use_avx2) noexcept;
+// NVFP4: the same nibble packing, but `scales` holds one E4M3 byte per 16
+// columns and every group scale is divided by `global_scale` before it is
+// applied. The division is part of the weight, not of the sum, and it comes
+// first: that is the order the reference dequantization and the device kernel
+// both use.
+[[nodiscard]] float glm53_host_nvfp4_group16_row_dot(
+    std::span<const std::byte> packed, std::span<const std::byte> scales,
+    float global_scale, std::span<const float> input, bool use_avx2) noexcept;
 // FP8: `weights` holds one row's E4M3 codes and `scales` the F32 inverse
 // scales for that row's 128-column blocks. Exposed alongside the other two so
 // the three formats can be priced against each other on the same input.

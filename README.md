@@ -51,7 +51,7 @@ There is also an OpenAI-compatible server (`strata-server`).
 | **Laguna S 2.1** | 48 layers 1:3 global/sliding, 256 experts + 1 shared, top-10 | NVFP4 or MXFP4 experts, BF16 elsewhere | Spine in VRAM; experts stream from RAM |
 | **Inkling Small** | 42 layers, 256 experts + 2 sinks, top-6, no rotary | NVFP4 or MXFP4 experts, BF16 elsewhere | Experts stream from RAM |
 | **GLM-5.2** | 78 layers, 256 experts, top-8 | INT4 group-128, W4A16 | Exceeds combined memory; I/O-dependent |
-| **GLM-5.3-Flash** | 45 layers, 3 KDA : 1 sparse MLA, 288 experts + 1 shared, top-8 | FP8 E4M3 block-128, or MXFP4 routed experts with BF16 corrections | Text-only; automatic release selection, exact through 2,048 tokens; **3.88 tok/s MXFP4 decode** |
+| **GLM-5.3-Flash** | 45 layers, 3 KDA : 1 sparse MLA, 288 experts + 1 shared, top-8 | FP8 E4M3 block-128, or MXFP4 / NVFP4 routed experts with BF16 shared experts | Text-only; automatic release selection, exact through 2,048 tokens; **3.88 tok/s MXFP4 decode** |
 | **Kimi-K3** | 93 layers, 3 KDA : 1 gated MLA, 896 experts, top-16 | MXFP4 experts, BF16 elsewhere | 1.45 TB; I/O-dependent, 38.6 s/step. Vision not implemented |
 
 Each runs its declared semantics as-is — hybrid compressed attention and

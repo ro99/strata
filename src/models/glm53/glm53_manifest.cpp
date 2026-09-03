@@ -21,17 +21,25 @@ constexpr std::string_view kLayerPrefix = "model.language_model.layers.";
 // been validated against, and the manifest refuses it rather than guessing.
 struct Glm53ReleaseProfile {
     Glm53Quantization quantization;
+    // `metadata.total_size` as the checkpoint's index declares it, and the sum
+    // of the tensor extents the shards actually hold. Both published FP8 and
+    // MXFP4 exports follow the Hugging Face convention where those coincide;
+    // the NVFP4 export declares the shard file total instead, so the two are
+    // pinned separately rather than one being checked twice.
     std::uint64_t indexed_bytes;
+    std::uint64_t payload_bytes;
     std::uint64_t shard_file_bytes;
     std::uint64_t tensor_count;
     std::uint32_t shard_count;
 };
 
-constexpr std::array<Glm53ReleaseProfile, 2U> kReleases{{
+constexpr std::array<Glm53ReleaseProfile, 3U> kReleases{{
     {Glm53Quantization::Fp8E4m3Block128, 328'326'771'576ULL,
-     328'337'455'672ULL, 76'108ULL, 62U},
-    {Glm53Quantization::Mxfp4Group32, 227'486'055'288ULL, 227'496'161'368ULL,
-     72'466ULL, 120U},
+     328'326'771'576ULL, 328'337'455'672ULL, 76'108ULL, 62U},
+    {Glm53Quantization::Mxfp4Group32, 227'486'055'288ULL, 227'486'055'288ULL,
+     227'496'161'368ULL, 72'466ULL, 120U},
+    {Glm53Quantization::Nvfp4Group16E4m3, 190'213'869'288ULL,
+     190'198'265'848ULL, 190'213'869'288ULL, 110'457ULL, 62U},
 }};
 
 [[nodiscard]] const Glm53ReleaseProfile* release_profile(
@@ -185,6 +193,65 @@ void parse_quark_weight(JsonCursor& cursor, Glm53TextConfig& config) {
     }
 }
 
+// compressed-tensors records the weight format per config group rather than
+// once. Every GLM-5.3 NVFP4 group quantizes the same routed-expert projections
+// with the same rule, so the first group is read into the same fields the
+// quark and FP8 exports fill and validation sees one shape of answer.
+void parse_compressed_tensors_weights(JsonCursor& cursor,
+                                      Glm53TextConfig& config) {
+    cursor.expect('{');
+    if (cursor.consume('}')) return;
+    std::uint32_t bits = 0U;
+    std::string type;
+    for (;;) {
+        const auto key = cursor.parse_string();
+        cursor.expect(':');
+        if (key == "num_bits") {
+            bits = static_cast<std::uint32_t>(cursor.parse_uint64());
+        } else if (key == "type") {
+            type = cursor.parse_string();
+        } else if (key == "group_size") {
+            config.quantization_group_size =
+                static_cast<std::uint32_t>(cursor.parse_uint64());
+        } else {
+            cursor.skip_value();
+        }
+        if (cursor.consume('}')) break;
+        cursor.expect(',');
+    }
+    if (bits == 4U && type == "float") config.quantization_weight_dtype = "fp4";
+}
+
+void parse_compressed_tensors_group(JsonCursor& cursor,
+                                    Glm53TextConfig& config) {
+    cursor.expect('{');
+    if (cursor.consume('}')) return;
+    for (;;) {
+        const auto key = cursor.parse_string();
+        cursor.expect(':');
+        if (key == "weights") parse_compressed_tensors_weights(cursor, config);
+        else cursor.skip_value();
+        if (cursor.consume('}')) return;
+        cursor.expect(',');
+    }
+}
+
+void parse_compressed_tensors_groups(JsonCursor& cursor,
+                                     Glm53TextConfig& config) {
+    cursor.expect('{');
+    if (cursor.consume('}')) return;
+    bool first = true;
+    for (;;) {
+        static_cast<void>(cursor.parse_string());
+        cursor.expect(':');
+        if (first) parse_compressed_tensors_group(cursor, config);
+        else cursor.skip_value();
+        first = false;
+        if (cursor.consume('}')) return;
+        cursor.expect(',');
+    }
+}
+
 void parse_quark_global(JsonCursor& cursor, Glm53TextConfig& config) {
     cursor.expect('{');
     if (cursor.consume('}')) return;
@@ -206,6 +273,11 @@ void parse_quantization(JsonCursor& cursor, Glm53TextConfig& config) {
         cursor.expect(':');
         if (key == "quant_method") config.quantization_method = cursor.parse_string();
         else if (key == "fmt") config.quantization_format = cursor.parse_string();
+        // compressed-tensors spells the same field `format`. It also repeats it
+        // inside each config group, but only the top level is read here, so the
+        // two never contend.
+        else if (key == "format") config.quantization_format = cursor.parse_string();
+        else if (key == "config_groups") parse_compressed_tensors_groups(cursor, config);
         else if (key == "global_quant_config") parse_quark_global(cursor, config);
         else if (key == "weight_block_size") {
             std::vector<std::uint32_t> dimensions;
@@ -221,14 +293,20 @@ void parse_quantization(JsonCursor& cursor, Glm53TextConfig& config) {
 }
 
 Glm53TensorComponent component_of(std::string_view name) noexcept {
+    // NVFP4 carries two scale tensors per module -- the E4M3 group scales and
+    // the F32 per-tensor divisor -- and names the payload `weight_packed`
+    // rather than `weight`, so neither suffix is reachable from the rules the
+    // other two releases need.
     if (has_suffix(name, ".weight_scale_inv") ||
+        has_suffix(name, ".weight_global_scale") ||
         has_suffix(name, ".weight_scale")) {
         return Glm53TensorComponent::Scale;
     }
     if (has_suffix(name, ".bias") || has_suffix(name, "_bias")) {
         return Glm53TensorComponent::Bias;
     }
-    if (has_suffix(name, ".weight") || has_suffix(name, "_fn")) {
+    if (has_suffix(name, ".weight") || has_suffix(name, ".weight_packed") ||
+        has_suffix(name, "_fn")) {
         return Glm53TensorComponent::Weight;
     }
     return Glm53TensorComponent::State;
@@ -279,6 +357,10 @@ Glm53Quantization glm53_config_quantization(
     if (config.quantization_method == "quark" &&
         config.quantization_weight_dtype == "fp4") {
         return Glm53Quantization::Mxfp4Group32;
+    }
+    if (config.quantization_method == "compressed-tensors" &&
+        config.quantization_format == "nvfp4-pack-quantized") {
+        return Glm53Quantization::Nvfp4Group16E4m3;
     }
     return Glm53Quantization::Unsupported;
 }
@@ -354,10 +436,16 @@ ValidationResult validate_glm53_config(const Glm53TextConfig& config) {
             require(config.quantization_scale_format == "e8m0",
                     "GLM-5.3 MXFP4 scales must be E8M0");
             break;
+        case Glm53Quantization::Nvfp4Group16E4m3:
+            equal(config.quantization_group_size, 16U, "NVFP4 group size");
+            require(config.quantization_weight_dtype == "fp4",
+                    "GLM-5.3 NVFP4 weights must be 4-bit float");
+            break;
         case Glm53Quantization::Unsupported:
             require(false,
-                    "GLM-5.3 quantization must be FP8 E4M3 block-128 or "
-                    "quark MXFP4 E2M1 group-32");
+                    "GLM-5.3 quantization must be FP8 E4M3 block-128, quark "
+                    "MXFP4 E2M1 group-32 or compressed-tensors NVFP4 E2M1 "
+                    "group-16");
             break;
     }
     require(config.attention_layer_types.size() == config.layer_count,
@@ -469,11 +557,21 @@ Glm53ManifestResult build_glm53_index_manifest(SafetensorsIndex index) {
         tensor.shard = std::move(entry.shard);
         tensor.role = role;
         tensor.component = component_of(tensor.name);
-        tensor.encoding = tensor.component == Glm53TensorComponent::Scale
-            ? (profile->quantization == Glm53Quantization::Mxfp4Group32
-                   ? Glm53TensorEncoding::Fp4E2m1Group32E8m0
-                   : Glm53TensorEncoding::Fp8E4m3Block128F32)
-            : Glm53TensorEncoding::Plain;
+        tensor.encoding = Glm53TensorEncoding::Plain;
+        if (tensor.component == Glm53TensorComponent::Scale) {
+            switch (profile->quantization) {
+                case Glm53Quantization::Mxfp4Group32:
+                    tensor.encoding = Glm53TensorEncoding::Fp4E2m1Group32E8m0;
+                    break;
+                case Glm53Quantization::Nvfp4Group16E4m3:
+                    tensor.encoding = Glm53TensorEncoding::Fp4E2m1Group16E4m3;
+                    break;
+                case Glm53Quantization::Fp8E4m3Block128:
+                case Glm53Quantization::Unsupported:
+                    tensor.encoding = Glm53TensorEncoding::Fp8E4m3Block128F32;
+                    break;
+            }
+        }
         tensor.layer = layer;
         tensor.expert = expert;
         ++manifest.role_counts[static_cast<std::size_t>(role)];
@@ -542,7 +640,7 @@ Glm53ManifestResult validate_glm53_checkpoint(
     if (profile == nullptr || out.scanned_shards != profile->shard_count ||
         out.shard_file_bytes != profile->shard_file_bytes ||
         resolved != out.tensors.size() ||
-        out.tensor_payload_bytes != profile->indexed_bytes) {
+        out.tensor_payload_bytes != profile->payload_bytes) {
         result.errors.emplace_back(
             "GLM-5.3 shard or tensor extent does not match the pinned Flash release");
         return result;
@@ -575,12 +673,12 @@ Glm53ManifestResult validate_glm53_checkpoint(
             expect(prefix + "self_attn.q_proj.weight", {8192U, 4096U}, SafetensorsDtype::Bf16);
             expect(prefix + "self_attn.A_log", {64U}, SafetensorsDtype::F32);
         } else {
-            // Only the routed experts are quantized in the MXFP4 release, so
-            // its attention spine is BF16 where the FP8 release is E4M3.
+            // Only the routed experts are quantized in the two FP4 releases,
+            // so their attention spine is BF16 where the FP8 release is E4M3.
             expect(prefix + "self_attn.q_a_proj.weight", {1536U, 4096U},
-                   out.quantization == Glm53Quantization::Mxfp4Group32
-                       ? SafetensorsDtype::Bf16
-                       : SafetensorsDtype::F8E4M3);
+                   out.quantization == Glm53Quantization::Fp8E4m3Block128
+                       ? SafetensorsDtype::F8E4M3
+                       : SafetensorsDtype::Bf16);
             expect(prefix + "self_attn.kv_b_proj.weight", {32768U, 512U}, SafetensorsDtype::Bf16);
         }
         if (result.errors.size() >= options.maximum_errors) break;
@@ -597,6 +695,30 @@ Glm53ManifestResult validate_glm53_checkpoint(
         expect(expert + "down_proj.weight", {4096U, 1024U}, SafetensorsDtype::U8);
         expect(expert + "down_proj.weight_scale", {4096U, 64U},
                SafetensorsDtype::U8);
+    }
+    // The NVFP4 release packs every MoE layer, so layer 3 -- the first one, and
+    // the one the MXFP4 release leaves BF16 -- is the sample that proves it.
+    // Group 16 halves the columns per scale byte against MXFP4's 32 and adds
+    // the scalar F32 divisor, so all three tensors are checked per projection.
+    if (out.quantization == Glm53Quantization::Nvfp4Group16E4m3) {
+        const std::string expert =
+            "model.language_model.layers.3.mlp.experts.0.";
+        expect(expert + "gate_proj.weight_packed", {2048U, 2048U},
+               SafetensorsDtype::U8);
+        expect(expert + "gate_proj.weight_scale", {2048U, 256U},
+               SafetensorsDtype::F8E4M3);
+        expect(expert + "gate_proj.weight_global_scale", {1U},
+               SafetensorsDtype::F32);
+        expect(expert + "down_proj.weight_packed", {4096U, 1024U},
+               SafetensorsDtype::U8);
+        expect(expert + "down_proj.weight_scale", {4096U, 128U},
+               SafetensorsDtype::F8E4M3);
+        expect(expert + "down_proj.weight_global_scale", {1U},
+               SafetensorsDtype::F32);
+        // The shared expert stays BF16 in this release, which is why the host
+        // and device expert paths must keep meeting both encodings per layer.
+        expect("model.language_model.layers.3.mlp.shared_experts.gate_proj.weight",
+               {2048U, 4096U}, SafetensorsDtype::Bf16);
     }
     return result;
 }
@@ -625,6 +747,7 @@ std::string_view to_string(Glm53Quantization quantization) noexcept {
     switch (quantization) {
         case Glm53Quantization::Fp8E4m3Block128: return "fp8-e4m3-block128";
         case Glm53Quantization::Mxfp4Group32: return "mxfp4-e2m1-group32";
+        case Glm53Quantization::Nvfp4Group16E4m3: return "nvfp4-e2m1-group16";
         case Glm53Quantization::Unsupported: break;
     }
     return "unsupported";
@@ -635,6 +758,8 @@ std::string_view to_string(Glm53TensorEncoding encoding) noexcept {
         case Glm53TensorEncoding::Plain: return "plain";
         case Glm53TensorEncoding::Fp4E2m1Group32E8m0:
             return "fp4-e2m1-group32-e8m0";
+        case Glm53TensorEncoding::Fp4E2m1Group16E4m3:
+            return "fp4-e2m1-group16-e4m3";
         case Glm53TensorEncoding::Fp8E4m3Block128F32:
             return "fp8-e4m3-block128-f32-scale";
     }

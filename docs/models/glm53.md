@@ -2,17 +2,36 @@
 
 GLM-5.3-Flash is a 45-layer, 288-routed-expert model with four mHC streams,
 three Kimi Delta Attention layers for every sparse MLA layer, eight selected
-experts plus one shared expert. Strata supports both published representations:
-block-128 FP8 E4M3 with F32 inverse scales, and the Quark MXFP4 release whose
-routed experts use E2M1 group-32 weights while its mixed-precision corrections
-and shared experts remain BF16. It consumes either checkpoint as published; it
-does not requantize the model or reduce its expert count or top-k.
+experts plus one shared expert. Strata supports all three published
+representations:
+
+- **FP8**: block-128 E4M3 with F32 inverse scales, throughout.
+- **MXFP4** (Quark): routed experts in E2M1 group-32 with E8M0 scale bytes,
+  while the mixed-precision corrections -- layers 3, 5 and 6 -- and the shared
+  experts remain BF16.
+- **NVFP4** (compressed-tensors `nvfp4-pack-quantized`): routed experts in the
+  same E2M1 nibble packing, but with an E4M3 scale byte per 16 columns and one
+  F32 per-tensor global scale. Its correction leaves no routed expert behind,
+  so every MoE layer from 3 to 44 is packed; the shared experts stay BF16.
+
+It consumes any of the three as published; it does not requantize the model or
+reduce its expert count or top-k.
 
 The release is resolved once from the checkpoint index and tensor contract.
-There is no precision flag: point `--model` at `models/glm53f` or
-`models/glm53f-mxfp4`, and the runtime selects the corresponding validators,
-host expert decoder, activation boundary, and device shared-expert kernel. A
-checkpoint matching neither pinned release is refused rather than guessed at.
+There is no precision flag: point `--model` at `models/glm53f`,
+`models/glm53f-mxfp4` or `models/glm53f-nvfp4`, and the runtime selects the
+corresponding validators, host expert decoder, activation boundary, and device
+shared-expert kernel. A checkpoint matching no pinned release is refused rather
+than guessed at.
+
+An NVFP4 weight is `e2m1(nibble) * (e4m3(scale) / global_scale)`. The division
+is applied to the group scale before the weight is formed, not to the finished
+sum, because that is the order the exporter's own dequantization uses; the host
+scalar dot, the host AVX2 dot and the device expert kernel all follow it, which
+is what lets a host result and a device result be compared bit for bit. Note
+that this is the compressed-tensors direction: the ModelOpt NVFP4 exports
+Strata reads for other models *multiply* by their per-tensor scale, and the two
+must never be interchanged.
 
 This adapter currently supports text only. Image or video content is rejected
 before generation. It implements the checkpoint's k-pool sparse indexer, so the
@@ -36,10 +55,17 @@ cmake --build build-release --parallel --target strata-chat strata-server
 `--context-size` above 2,048 selects the sparse indexer path; see "Context and
 the k-pool sparse indexer" below for what that changes.
 
-| release | shards | indexed tensors | indexed payload bytes |
-|---|---:|---:|---:|
-| FP8 E4M3 block-128 | 62 | 76,108 | 328,326,771,576 |
-| MXFP4 group-32 | 120 | 72,466 | 227,486,055,288 |
+| release | shards | indexed tensors | declared `total_size` | tensor payload bytes |
+|---|---:|---:|---:|---:|
+| FP8 E4M3 block-128 | 62 | 76,108 | 328,326,771,576 | 328,326,771,576 |
+| MXFP4 group-32 | 120 | 72,466 | 227,486,055,288 | 227,486,055,288 |
+| NVFP4 group-16 | 62 | 110,457 | 190,213,869,288 | 190,198,265,848 |
+
+The last two columns coincide for the FP8 and MXFP4 exports, which follow the
+Hugging Face convention where `metadata.total_size` is the sum of the tensor
+extents. The NVFP4 export declares the shard file total there instead, so the
+index's claim and what the shards actually hold are pinned separately rather
+than one number being checked twice.
 
 Admission validates the selected release's exact extents, hybrid layer
 schedule, text tensor roles, representative shapes and dtypes, and quantized
@@ -268,9 +294,9 @@ CUDA cache, it maps checkpoint-native routed experts once and executes them
 directly from host memory while keeping the non-expert spine, fused KDA/MLA
 state and mHC transitions on CUDA. The one shared expert in each MoE layer is
 resident on that layer's GPU and overlaps the eight routed host experts. FP8
-uses its E4M3/F32-scale dot; MXFP4's BF16 shared weights use an exact BF16 dot.
-Both return raw linear results so every BF16 rounding, clamp and SwiGLU remains
-on the host. Set `STRATA_GLM53_SHARED_EXPERT_DEVICE=0` only to force the slower
+uses its E4M3/F32-scale dot; the BF16 shared weights of both FP4 releases use an
+exact BF16 dot. All return raw linear results so every BF16 rounding, clamp and
+SwiGLU remains on the host. Set `STRATA_GLM53_SHARED_EXPERT_DEVICE=0` only to force the slower
 host control.
 
 The remaining admitted expert-arena capacity is filled once at startup with a
@@ -281,8 +307,10 @@ path. The tier never replaces an expert during inference, so it has none of the
 replacement latency that rejected the earlier dynamic-cache experiment. The
 runtime discovers the available arena capacity and device placement rather
 than assuming a particular GPU count or memory size. It stores FP8 experts in
-their canonical E4M3 layout and MXFP4 experts in their checkpoint-native E2M1
-group-32 layout, and preserves the host dot-product association exactly. Set
+their canonical E4M3 layout, MXFP4 experts in their checkpoint-native E2M1
+group-32 layout and NVFP4 experts in their E2M1 group-16 layout with the F32
+divisor carried on the descriptor rather than in device memory, and preserves
+the host dot-product association exactly. Set
 `STRATA_GLM53_STATIC_EXPERT=0` only for the same-binary diagnostic control.
 
 Prompt pages group rows by expert so an expert is traversed once for every row

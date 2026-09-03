@@ -4329,6 +4329,7 @@ TEST_CASE("GLM-5.3 BF16 device expert dots match the host AVX2 association") {
     const strata::CudaGlm53Expert expert{
         device_weights[0], nullptr, device_weights[1], nullptr,
         device_weights[2], nullptr, hidden, intermediate,
+        1.0F, 1.0F, 1.0F,
         strata::CudaGlm53ExpertEncoding::Bf16};
     std::array<float, hidden> input{};
     std::array<float, intermediate> activation{};
@@ -4407,6 +4408,7 @@ TEST_CASE("GLM-5.3 MXFP4 device expert dots match the host AVX2 association") {
     const strata::CudaGlm53Expert expert{
         uploaded[0], uploaded[1], uploaded[2], uploaded[3], uploaded[4],
         uploaded[5], hidden, intermediate,
+        1.0F, 1.0F, 1.0F,
         strata::CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0};
     std::array<float, hidden> input{};
     std::array<float, intermediate> activation{};
@@ -4443,6 +4445,131 @@ TEST_CASE("GLM-5.3 MXFP4 device expert dots match the host AVX2 association") {
     require_exact_rows(host_weights[0], host_scales[0], input, gate);
     require_exact_rows(host_weights[1], host_scales[1], input, up);
     require_exact_rows(host_weights[2], host_scales[2], activation, down);
+}
+
+TEST_CASE("GLM-5.3 NVFP4 device expert dots match the host AVX2 association") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::uint32_t hidden = 128U;
+    constexpr std::uint32_t intermediate = 128U;
+    constexpr std::size_t elements = hidden * intermediate;
+    // Not a power of two, and a different value per projection: the kernel
+    // divides by the divisor it was handed, so a path that reused one for the
+    // triplet or folded in a reciprocal would not land on the host's bits.
+    const std::array<float, 3U> global_scales{21504.0F, 17280.0F, 12288.0F};
+    std::array<std::vector<std::byte>, 3U> host_weights;
+    std::array<std::vector<std::byte>, 3U> host_scales;
+    std::vector<strata::CudaBuffer> storage;
+    storage.reserve(6U);
+    std::array<const strata::CudaBuffer*, 6U> uploaded{};
+    for (std::size_t matrix = 0U; matrix < host_weights.size(); ++matrix) {
+        auto& weights = host_weights[matrix];
+        auto& scales = host_scales[matrix];
+        weights.resize(elements / 2U);
+        scales.resize(elements / 16U);
+        for (std::size_t index = 0U; index < weights.size(); ++index) {
+            const auto low = static_cast<unsigned int>(
+                1U + (index * 3U + matrix * 5U) % 15U);
+            const auto high = static_cast<unsigned int>(
+                1U + (index * 7U + matrix * 11U) % 15U);
+            weights[index] = static_cast<std::byte>(low | (high << 4U));
+        }
+        for (std::size_t index = 0U; index < scales.size(); ++index) {
+            // 0x30..0x3F: positive, normal, and clear of the E4M3 NaN code.
+            scales[index] = static_cast<std::byte>(
+                0x30U + (index + matrix) % 16U);
+        }
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, weights, storage.back()).ok());
+        uploaded[matrix * 2U] = &storage.back();
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, scales, storage.back()).ok());
+        uploaded[matrix * 2U + 1U] = &storage.back();
+    }
+    const strata::CudaGlm53Expert expert{
+        uploaded[0], uploaded[1], uploaded[2], uploaded[3], uploaded[4],
+        uploaded[5], hidden, intermediate,
+        global_scales[0], global_scales[1], global_scales[2],
+        strata::CudaGlm53ExpertEncoding::Nvfp4Group16E4m3};
+    std::array<float, hidden> input{};
+    std::array<float, intermediate> activation{};
+    for (std::size_t index = 0U; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<int>(index % 17U) - 8) /
+                       8.0F;
+        activation[index] =
+            static_cast<float>(static_cast<int>(index % 13U) - 6) / 16.0F;
+    }
+    std::array<float, intermediate> gate{};
+    std::array<float, intermediate> up{};
+    std::array<float, hidden> down{};
+    const std::span<const strata::CudaGlm53Expert> one(&expert, 1U);
+    REQUIRE(backend.enqueue_glm53_expert_gate_up(device, one, input).ok());
+    REQUIRE(backend.collect_glm53_expert_gate_up(device, gate, up).ok());
+    REQUIRE(backend.enqueue_glm53_expert_down(device, one, activation).ok());
+    REQUIRE(backend.collect_glm53_expert_down(device, down).ok());
+
+    const auto require_exact_rows = [&](std::span<const std::byte> weights,
+                                        std::span<const std::byte> scales,
+                                        float global_scale,
+                                        std::span<const float> values,
+                                        std::span<const float> actual) {
+        for (std::size_t row = 0U; row < actual.size(); ++row) {
+            const auto row_weights = weights.subspan(
+                row * values.size() / 2U, values.size() / 2U);
+            const auto row_scales = scales.subspan(
+                row * values.size() / 16U, values.size() / 16U);
+            const float expected = strata::glm53_host_nvfp4_group16_row_dot(
+                row_weights, row_scales, global_scale, values, true);
+            REQUIRE(std::bit_cast<std::uint32_t>(actual[row]) ==
+                    std::bit_cast<std::uint32_t>(expected));
+        }
+    };
+    require_exact_rows(host_weights[0], host_scales[0], global_scales[0], input,
+                       gate);
+    require_exact_rows(host_weights[1], host_scales[1], global_scales[1], input,
+                       up);
+    require_exact_rows(host_weights[2], host_scales[2], global_scales[2],
+                       activation, down);
+}
+
+TEST_CASE("GLM-5.3 NVFP4 device expert rejects a non-positive global scale") {
+    const auto devices = strata::CudaBackend::available_devices();
+    if (!strata::CudaBackend::compiled() || devices.empty()) return;
+    const int device = devices.front();
+    strata::CudaBackend backend;
+    const std::array<int, 1> selected{device};
+    REQUIRE(backend.initialize(selected, true).ok());
+
+    constexpr std::uint32_t hidden = 128U;
+    constexpr std::uint32_t intermediate = 128U;
+    constexpr std::size_t elements = hidden * intermediate;
+    std::vector<std::byte> weights(elements / 2U, static_cast<std::byte>(0x22U));
+    std::vector<std::byte> scales(elements / 16U, static_cast<std::byte>(0x38U));
+    std::vector<strata::CudaBuffer> storage;
+    storage.reserve(6U);
+    std::array<const strata::CudaBuffer*, 6U> uploaded{};
+    for (std::size_t matrix = 0U; matrix < 3U; ++matrix) {
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, weights, storage.back()).ok());
+        uploaded[matrix * 2U] = &storage.back();
+        storage.emplace_back();
+        REQUIRE(backend.upload_buffer(device, scales, storage.back()).ok());
+        uploaded[matrix * 2U + 1U] = &storage.back();
+    }
+    // A zero divisor would turn every weight into an infinity rather than
+    // failing, so it is refused before the kernel is issued.
+    const strata::CudaGlm53Expert expert{
+        uploaded[0], uploaded[1], uploaded[2], uploaded[3], uploaded[4],
+        uploaded[5], hidden, intermediate, 21504.0F, 0.0F, 21504.0F,
+        strata::CudaGlm53ExpertEncoding::Nvfp4Group16E4m3};
+    std::array<float, hidden> input{};
+    const std::span<const strata::CudaGlm53Expert> one(&expert, 1U);
+    REQUIRE(!backend.enqueue_glm53_expert_gate_up(device, one, input).ok());
 }
 
 TEST_CASE("a partially prepacked MXFP4 MoE batch is refused, not half-served") {

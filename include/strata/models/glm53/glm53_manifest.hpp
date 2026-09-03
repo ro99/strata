@@ -12,10 +12,11 @@
 
 namespace strata {
 
-// The two GLM-5.3-Flash releases Strata executes. Both quantize only the
-// routed experts; every other module is BF16 in the MXFP4 release and FP8 in
-// the FP8 release. The distinction is a property of the checkpoint, resolved
-// once at open and carried on the manifest, never a build-time choice.
+// The three GLM-5.3-Flash releases Strata executes. All three quantize only
+// the routed experts; every other module is BF16 in the two FP4 releases and
+// FP8 in the FP8 release. The distinction is a property of the checkpoint,
+// resolved once at open and carried on the manifest, never a build-time
+// choice.
 enum class Glm53Quantization : std::uint8_t {
     // GLM-5.3-Flash FP8: E4M3 payload with one F32 inverse scale per 128x128
     // weight block.
@@ -25,6 +26,12 @@ enum class Glm53Quantization : std::uint8_t {
     // columns of each row. Routed experts in layers 3, 5, 6 and the MTP layer
     // stay BF16 by the publisher's mixed-precision correction.
     Mxfp4Group32,
+    // GLM-5.3-Flash NVFP4 (compressed-tensors "nvfp4-pack-quantized"): E2M1
+    // nibble pairs packed the same way, but with one E4M3 scale byte per 16
+    // columns of each row and one F32 per-tensor global scale that divides
+    // them. Unlike the MXFP4 release its mixed-precision correction leaves no
+    // routed expert in BF16, so every MoE layer from 3 to 44 is packed.
+    Nvfp4Group16E4m3,
     Unsupported,
 };
 
@@ -121,6 +128,7 @@ enum class Glm53TensorEncoding : std::uint8_t {
     Plain,
     Fp8E4m3Block128F32,
     Fp4E2m1Group32E8m0,
+    Fp4E2m1Group16E4m3,
 };
 
 struct Glm53ManifestTensor {
@@ -182,8 +190,8 @@ struct Glm53CheckpointOptions {
 [[nodiscard]] ValidationResult validate_glm53_config(
     const Glm53TextConfig& config);
 // Names the release a parsed config describes, or Unsupported when it matches
-// neither. Validation reports the diagnostic; this is the selector every other
-// layer branches on.
+// none of them. Validation reports the diagnostic; this is the selector every
+// other layer branches on.
 [[nodiscard]] Glm53Quantization glm53_config_quantization(
     const Glm53TextConfig& config) noexcept;
 [[nodiscard]] Glm53TensorRole classify_glm53_tensor(

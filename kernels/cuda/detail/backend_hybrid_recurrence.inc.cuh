@@ -2930,6 +2930,33 @@ namespace {
         }
         return {};
     }
+    if (expert.encoding == CudaGlm53ExpertEncoding::Nvfp4Group16E4m3) {
+        // Group 16 stores twice MXFP4's scale bytes for the same payload, and
+        // the F32 divisors ride on the descriptor rather than in device memory.
+        const auto gate_up = projection / 2U + projection / 16U;
+        if (!arena_backed &&
+            (expert.gate_scales == nullptr || expert.up_scales == nullptr ||
+             expert.down_scales == nullptr)) {
+            return {{"CUDA GLM-5.3 NVFP4 expert is missing group scales"}};
+        }
+        const float divisors[3] = {expert.gate_global_scale,
+                                   expert.up_global_scale,
+                                   expert.down_global_scale};
+        for (const float divisor : divisors) {
+            if (!std::isfinite(divisor) || divisor <= 0.0F) {
+                return {{"CUDA GLM-5.3 NVFP4 expert global scale must be "
+                         "finite and positive"}};
+            }
+        }
+        if (bytes(expert.gate_weights, expert.gate_scales, expert.gate) !=
+                gate_up ||
+            bytes(expert.up_weights, expert.up_scales, expert.up) != gate_up ||
+            bytes(expert.down_weights, expert.down_scales, expert.down) !=
+                gate_up) {
+            return {{"CUDA GLM-5.3 NVFP4 expert matrix is mis-sized"}};
+        }
+        return {};
+    }
     if (expert.encoding == CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0) {
         const auto gate_up = projection / 2U + projection / 32U;
         if (!arena_backed &&
@@ -2989,6 +3016,9 @@ constexpr std::size_t kGlm53ExpertKernelBatch = 4U;
            left.gate_scales == right.gate_scales &&
            left.up_scales == right.up_scales &&
            left.down_scales == right.down_scales &&
+           left.gate_global_scale == right.gate_global_scale &&
+           left.up_global_scale == right.up_global_scale &&
+           left.down_global_scale == right.down_global_scale &&
            left.gate == right.gate && left.up == right.up &&
            left.down == right.down;
 }
@@ -3150,6 +3180,28 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
                 state.glm53_shared_up + offset,
                 static_cast<const unsigned short*>(
                     weight_data(expert.up_weights, expert.up)),
+                expert_input, intermediate, hidden,
+                static_cast<std::uint32_t>(batch));
+        } else if (expert.encoding ==
+                   CudaGlm53ExpertEncoding::Nvfp4Group16E4m3) {
+            launch_glm53_shared_expert_nvfp4_dot(
+                blocks, threads, state.stream,
+                state.glm53_shared_gate + offset,
+                static_cast<const unsigned char*>(
+                    weight_data(expert.gate_weights, expert.gate)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.gate_scales, expert.gate)),
+                expert.gate_global_scale,
+                expert_input, intermediate, hidden,
+                static_cast<std::uint32_t>(batch));
+            launch_glm53_shared_expert_nvfp4_dot(
+                blocks, threads, state.stream,
+                state.glm53_shared_up + offset,
+                static_cast<const unsigned char*>(
+                    weight_data(expert.up_weights, expert.up)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.up_scales, expert.up)),
+                expert.up_global_scale,
                 expert_input, intermediate, hidden,
                 static_cast<std::uint32_t>(batch));
         } else if (expert.encoding ==
@@ -3345,6 +3397,18 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
                 state.glm53_shared_output + index * hidden,
                 static_cast<const unsigned short*>(
                     weight_data(expert.down_weights, expert.down)),
+                state.glm53_shared_activation + index * intermediate, hidden,
+                intermediate, static_cast<std::uint32_t>(batch));
+        } else if (expert.encoding ==
+                   CudaGlm53ExpertEncoding::Nvfp4Group16E4m3) {
+            launch_glm53_shared_expert_nvfp4_dot(
+                blocks, threads, state.stream,
+                state.glm53_shared_output + index * hidden,
+                static_cast<const unsigned char*>(
+                    weight_data(expert.down_weights, expert.down)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.down_scales, expert.down)),
+                expert.down_global_scale,
                 state.glm53_shared_activation + index * intermediate, hidden,
                 intermediate, static_cast<std::uint32_t>(batch));
         } else if (expert.encoding ==

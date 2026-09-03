@@ -763,6 +763,10 @@ struct CudaGlm53MlaRequest {
     // one so identity selections can retain previously expanded rows across
     // decode tokens.
     const CudaBuffer* sparse_expanded{};
+    // Empty below index_topk, where the independent identity implementation
+    // remains the control arm. Above it, these are the verified host
+    // indexer's selected latent positions in ascending order.
+    std::span<const std::uint32_t> selected_positions;
     const CudaWeight* query_a{};
     const CudaWeight* key_value_a{};
     const CudaWeight* query_b{};

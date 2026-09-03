@@ -821,6 +821,55 @@ __global__ void bf16_matvec_rows_to_bf16_kernel(
     }
 }
 
+// Sparse MLA's gathered expansion keeps a separate entry point from the
+// dense cache builder above so the <=index_topk identity oracle retains two
+// independent implementations. Apart from selecting the input row, its
+// multiply/add order and BF16 store are element-for-element identical to
+// bf16_matvec_rows_to_bf16_kernel.
+template <std::uint32_t Tile>
+__global__ void bf16_gathered_matvec_rows_to_bf16_kernel(
+    __nv_bfloat16* output, const float* input,
+    const std::uint32_t* selected_rows, const __nv_bfloat16* weights,
+    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows) {
+    constexpr unsigned int warps_per_block = 8U;
+    const auto warp = threadIdx.x / warpSize;
+    const auto lane = threadIdx.x % warpSize;
+    const auto output_row = static_cast<std::uint64_t>(blockIdx.x) *
+                                warps_per_block + warp;
+    const std::uint32_t tile_begin = blockIdx.y * Tile;
+    if (output_row >= rows || tile_begin >= batch) return;
+    const std::uint32_t tile_rows = min(Tile, batch - tile_begin);
+
+    const auto base = output_row * columns;
+    float sum[Tile];
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) sum[index] = 0.0F;
+    for (std::uint64_t column = lane; column < columns; column += warpSize) {
+        const float weight = __bfloat162float(weights[base + column]);
+#pragma unroll
+        for (std::uint32_t index = 0U; index < Tile; ++index) {
+            const std::uint32_t local = index < tile_rows ? index : 0U;
+            const auto selected = selected_rows[tile_begin + local];
+            const auto input_base =
+                static_cast<std::uint64_t>(selected) * columns;
+            sum[index] = __fadd_rn(
+                sum[index], __fmul_rn(input[input_base + column], weight));
+        }
+    }
+#pragma unroll
+    for (std::uint32_t index = 0U; index < Tile; ++index) {
+        float value = sum[index];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = __fadd_rn(
+                value, __shfl_down_sync(0xFFFF'FFFFU, value, offset));
+        }
+        if (lane == 0U && index < tile_rows) {
+            output[static_cast<std::uint64_t>(tile_begin + index) * rows +
+                   output_row] = __float2bfloat16_rn(value);
+        }
+    }
+}
+
 // Same accumulation contract as bf16_matvec_kernel, with an already-resident
 // BF16 activation source. The generic host bridge expands this exact source to
 // FP32 before upload; decoding in the multiply loop is bit-equivalent and

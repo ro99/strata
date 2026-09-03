@@ -2060,8 +2060,11 @@ public:
         auto scored = backend_.glm53_sparse_mla_decode_to_mhc(
             request, scores);
         if (!scored.ok()) return scored;
-        softmax(scores, request.heads,
-                static_cast<std::uint32_t>(request.position) + 1U);
+        const auto attended_rows = request.selected_positions.empty()
+            ? static_cast<std::uint32_t>(request.position) + 1U
+            : static_cast<std::uint32_t>(
+                  request.selected_positions.size());
+        softmax(scores, request.heads, attended_rows);
         return backend_.glm53_sparse_mla_decode_finish(request, scores);
     }
 
@@ -2491,6 +2494,8 @@ struct Glm53Runtime::Impl {
         std::array<CudaBuffer, kLayers> kda;
         std::array<CudaBuffer, kLayers> mla;
         std::array<CudaBuffer, kLayers> sparse_mla_expanded;
+        std::array<std::vector<std::uint32_t>, kLayers>
+            sparse_mla_previous_pools;
         bool ready{};
     };
 
@@ -2652,6 +2657,8 @@ struct Glm53Runtime::Impl {
     // Resident MLA softmax scratch, `kHeads * history` floats. Grown with the
     // context and reused, so no allocation happens inside a timed step.
     std::vector<float> mla_softmax_scores;
+    std::vector<float> sparse_index_input;
+    std::vector<std::uint32_t> mla_selected_positions;
     // Expansion scratch for the host MLA paths. These are the largest buffers
     // in the model's steady state -- `attended_rows x 32,768 x 4 B`, 268 MiB at
     // a saturated selection -- and allocating them per layer per token made
@@ -5449,6 +5456,133 @@ struct Glm53Runtime::Impl {
         return {};
     }
 
+    // Maintain the exact host indexer while sparse MLA itself remains in the
+    // resident CUDA chain. Selection above index_topk is delegated to the
+    // already-oracled host implementation and only its ascending positions
+    // cross to the device. Below the threshold this records future pool state
+    // but returns an empty selection, leaving the independent identity MLA
+    // path untouched.
+    [[nodiscard]] ValidationResult prepare_sparse_device_selection(
+        std::vector<std::uint32_t>& selected,
+        std::span<const float> input, std::uint32_t layer,
+        std::uint32_t position, const std::string& attention,
+        Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
+        selected.clear();
+        const auto history = position + 1U;
+        std::vector<float> index_key(kIndexHeadDim);
+        std::vector<float> index_gate(kIndexHeadDim);
+        const std::array<std::string, 4U> indexer_bases{
+            attention + "indexer.wk.weight",
+            attention + "indexer.index_kpool_compress_gate",
+            attention + "indexer.wq_b.weight",
+            attention + "indexer.weights_proj.weight"};
+        {
+            auto wk = host_tensor(
+                indexer_bases[0],
+                static_cast<std::uint64_t>(kIndexHeadDim) * kHidden);
+            if (!wk.ok()) return {std::move(wk.errors)};
+            glm53_indexer_gate(index_key, input, *wk.value);
+        }
+        {
+            auto gate = host_tensor(
+                indexer_bases[1],
+                static_cast<std::uint64_t>(kIndexHeadDim) * kHidden);
+            if (!gate.ok()) return {std::move(gate.errors)};
+            glm53_indexer_gate(index_gate, input, *gate.value);
+        }
+        auto norm_weight =
+            host_tensor(attention + "indexer.k_norm.weight", kIndexHeadDim);
+        if (!norm_weight.ok()) return {std::move(norm_weight.errors)};
+        auto norm_bias =
+            host_tensor(attention + "indexer.k_norm.bias", kIndexHeadDim);
+        if (!norm_bias.ok()) return {std::move(norm_bias.errors)};
+        glm53_indexer_layer_norm(index_key, *norm_weight.value,
+                                 *norm_bias.value);
+
+        auto& index_cache = sequence.indexer(layer);
+        if (index_cache.rows() != position) {
+            return {{"GLM-5.3 resident indexer position is not contiguous"}};
+        }
+        std::vector<float> packed(2U * kIndexHeadDim);
+        std::copy(index_key.begin(), index_key.end(), packed.begin());
+        std::copy(index_gate.begin(), index_gate.end(),
+                  packed.begin() + kIndexHeadDim);
+        auto appended = index_cache.append(packed);
+        if (!appended.ok()) return appended;
+        auto completed = complete_index_pools(sequence, layer, attention);
+        if (!completed.ok()) return completed;
+        if (history <= kIndexTopK) return {};
+
+        std::vector<float> q_rank(kQueryRank);
+        auto projected = linear(attention + "q_a_proj", input, 1U, kHidden,
+                                q_rank, layer);
+        if (!projected.ok()) return projected;
+        projected = norm(q_rank, q_rank,
+                         attention + "q_a_layernorm.weight");
+        if (!projected.ok()) return projected;
+        std::vector<float> index_query(
+            static_cast<std::size_t>(kIndexHeads) * kIndexHeadDim);
+        std::vector<float> head_weights(kIndexHeads);
+        auto wq = host_tensor(
+            indexer_bases[2],
+            static_cast<std::uint64_t>(kIndexHeads) * kIndexHeadDim *
+                kQueryRank);
+        if (!wq.ok()) return {std::move(wq.errors)};
+        glm53_indexer_gate(index_query, q_rank, *wq.value);
+        auto wp = host_tensor(
+            indexer_bases[3],
+            static_cast<std::uint64_t>(kIndexHeads) * kHidden);
+        if (!wp.ok()) return {std::move(wp.errors)};
+        glm53_indexer_gate(head_weights, input, *wp.value);
+
+        selected.resize(kIndexSelectionWidth);
+        const auto& pool_cache = sequence.index_pool(layer);
+        const auto selected_count = glm53_sparse_index_select(
+            selected, index_query,
+            [&](std::uint32_t pool) {
+                return pool_cache.row(pool).data();
+            },
+            head_weights, history);
+        selected.resize(selected_count);
+
+        std::vector<std::uint32_t> selected_pools;
+        selected_pools.reserve(kIndexTopK / kIndexPool);
+        const auto complete_tokens = history / kIndexPool * kIndexPool;
+        for (const auto token : selected) {
+            if (token >= complete_tokens) continue;
+            const auto pool = token / kIndexPool;
+            if (selected_pools.empty() || selected_pools.back() != pool) {
+                selected_pools.push_back(pool);
+            }
+        }
+        auto& previous = device_sequence.sparse_mla_previous_pools[layer];
+        if (!previous.empty()) {
+            std::size_t left = 0U;
+            std::size_t right = 0U;
+            std::size_t overlap = 0U;
+            while (left < previous.size() && right < selected_pools.size()) {
+                if (previous[left] < selected_pools[right]) {
+                    ++left;
+                } else if (selected_pools[right] < previous[left]) {
+                    ++right;
+                } else {
+                    ++overlap;
+                    ++left;
+                    ++right;
+                }
+            }
+            std::cerr << "[glm53-sparse-selection-overlap] layer=" << layer
+                      << " history=" << history
+                      << " pools=" << selected_pools.size()
+                      << " previous=" << previous.size()
+                      << " overlap=" << overlap
+                      << " entering=" << (selected_pools.size() - overlap)
+                      << '\n';
+        }
+        previous = std::move(selected_pools);
+        return {};
+    }
+
     // Bounded prefill attention for histories past the selection threshold.
     //
     // The dense page path expands the whole history once and shares it across
@@ -6165,14 +6299,27 @@ struct Glm53Runtime::Impl {
             request.head_dim = kMlaHead;
             request.query_rank = kQueryRank;
             request.key_value_rank = kKvRank;
+            static_cast<void>(glm53_grow(sparse_index_input, kHidden));
+            auto normalized = std::span<float>(sparse_index_input)
+                .first(kHidden);
+            result = cuda.dsv4_mhc_download_layer_input(device, normalized);
+            if (!result.ok()) return result;
+            result = prepare_sparse_device_selection(
+                mla_selected_positions, normalized, layer, position,
+                attention, sequence, device_sequence);
+            if (!result.ok()) return result;
+            request.selected_positions = mla_selected_positions;
             auto& scores = mla_softmax_scores;
             const auto history = position + 1U;
+            const auto attended_rows = request.selected_positions.empty()
+                ? static_cast<std::size_t>(history)
+                : request.selected_positions.size();
             static_cast<void>(glm53_grow(
-                scores, static_cast<std::size_t>(kHeads) * history));
+                scores, static_cast<std::size_t>(kHeads) * attended_rows));
             result = weights->sparse_mla_decode_mhc(
                 slot_for(layer), attention, request,
                 std::span<float>(scores).first(
-                    static_cast<std::size_t>(kHeads) * history),
+                    static_cast<std::size_t>(kHeads) * attended_rows),
                 [](std::span<float> values, std::uint32_t heads,
                    std::uint32_t tokens) {
                     for (std::uint32_t head = 0U; head < heads; ++head) {
@@ -6730,12 +6877,27 @@ struct Glm53Runtime::Impl {
                 request.head_dim = kMlaHead;
                 request.query_rank = kQueryRank;
                 request.key_value_rank = kKvRank;
+                static_cast<void>(glm53_grow(sparse_index_input, kHidden));
+                auto normalized = std::span<float>(sparse_index_input)
+                    .first(kHidden);
+                result = cuda.dsv4_mhc_download_layer_input(
+                    device, normalized);
+                if (!result.ok()) return result;
+                result = prepare_sparse_device_selection(
+                    mla_selected_positions, normalized, layer,
+                    positions[row], attention, *sequences[row],
+                    *device_sequences[row]);
+                if (!result.ok()) return result;
+                request.selected_positions = mla_selected_positions;
                 const auto history = positions[row] + 1U;
+                const auto attended_rows = request.selected_positions.empty()
+                    ? static_cast<std::size_t>(history)
+                    : request.selected_positions.size();
                 static_cast<void>(glm53_grow(
                     mla_softmax_scores,
-                    static_cast<std::size_t>(kHeads) * history));
+                    static_cast<std::size_t>(kHeads) * attended_rows));
                 auto scores = std::span<float>(mla_softmax_scores).first(
-                    static_cast<std::size_t>(kHeads) * history);
+                    static_cast<std::size_t>(kHeads) * attended_rows);
                 result = weights->sparse_mla_decode_mhc(
                     slot_for(layer), attention, request, scores,
                     [](std::span<float> values, std::uint32_t heads,

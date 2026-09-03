@@ -759,8 +759,9 @@ struct CudaGlm53KdaRequest {
 
 struct CudaGlm53MlaRequest {
     const CudaBuffer* state{};
-    // Sparse MLA's bounded BF16 expansion scratch. One buffer per sequence
-    // device is reused by every sparse layer assigned to that device.
+    // Sparse MLA's bounded BF16 expansion cache. Each sparse MLA layer owns
+    // one so identity selections can retain previously expanded rows across
+    // decode tokens.
     const CudaBuffer* sparse_expanded{};
     const CudaWeight* query_a{};
     const CudaWeight* key_value_a{};

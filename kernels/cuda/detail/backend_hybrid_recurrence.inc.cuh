@@ -2443,22 +2443,50 @@ ValidationResult CudaBackend::glm53_sparse_mla_decode_to_mhc(
         status != cudaSuccess) {
         return cuda_error(status, "project sparse GLM-5.3 MLA query B");
     }
-    // Identity selection is the ascending range [0, history). Project those
-    // latents through the same BF16 row kernel as the dense prepared cache.
-    // The destination is bounded by kIndexSelectionWidth and reused by every
-    // sparse layer on this device.
-    const dim3 expansion_grid(
-        static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
-        static_cast<unsigned int>(
-            (history + kBf16MatvecRowTile - 1U) / kBf16MatvecRowTile),
-        1U);
-    bf16_matvec_rows_to_bf16_kernel<kBf16MatvecRowTile><<<
-        expansion_grid, threads, 0U, state.stream>>>(
-        expanded, packed,
-        static_cast<const __nv_bfloat16*>(
-            request.key_value_b->impl_->weights),
-        static_cast<std::uint32_t>(history), request.key_value_rank,
-        expanded_width);
+    // Identity selection is the ascending range [0, history). The per-layer
+    // cache already contains [0, expanded_rows), so decode normally projects
+    // only the newly appended row. First use after host prefill fills the
+    // existing history once. This is the same BF16 projection and append
+    // structure as the accepted dense cache.
+    auto& expanded_rows =
+        request.sparse_expanded->impl_->glm53_mla_expanded_rows;
+    if (expanded_rows > history) {
+        return {{"CUDA GLM-5.3 sparse MLA expansion cache is ahead of "
+                 "history"}};
+    }
+    const auto missing = static_cast<std::uint32_t>(history - expanded_rows);
+    if (missing != 0U) {
+        const dim3 expansion_grid(
+            static_cast<unsigned int>((expanded_width + warps - 1U) / warps),
+            static_cast<unsigned int>(
+                (missing + kBf16MatvecRowTile - 1U) /
+                kBf16MatvecRowTile),
+            1U);
+        auto* expansion_destination = expanded +
+            static_cast<std::uint64_t>(expanded_rows) * expanded_width;
+        const auto* expansion_source = packed +
+            static_cast<std::uint64_t>(expanded_rows) *
+                request.key_value_rank;
+        const auto* expansion_weights =
+            static_cast<const __nv_bfloat16*>(
+                request.key_value_b->impl_->weights);
+        if (missing == 1U) {
+            bf16_matvec_rows_to_bf16_kernel<1U><<<
+                expansion_grid, threads, 0U, state.stream>>>(
+                expansion_destination, expansion_source, expansion_weights,
+                missing, request.key_value_rank, expanded_width);
+        } else {
+            bf16_matvec_rows_to_bf16_kernel<kBf16MatvecRowTile><<<
+                expansion_grid, threads, 0U, state.stream>>>(
+                expansion_destination, expansion_source, expansion_weights,
+                missing, request.key_value_rank, expanded_width);
+        }
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(
+                status, "append sparse GLM-5.3 MLA expansion cache");
+        }
+        expanded_rows = static_cast<std::uint32_t>(history);
+    }
     if (scores.size() != request.heads * history) {
         return {{"CUDA GLM-5.3 sparse MLA score span has an invalid shape"}};
     }

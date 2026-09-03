@@ -769,6 +769,13 @@ constexpr std::uint32_t kIndexArenaPools =
     kIndexTopK / kIndexPool + 128U;
 constexpr std::uint32_t kIndexArenaRows =
     kIndexArenaPools * kIndexPool + kIndexPool - 1U;
+// The widest KV-B expansion any sparse phase performs in one call: prefill
+// groups prompt rows until their combined selection would exceed this, and a
+// decode step expands at most one selection. It replaces the context as the
+// bound on the MLA activation workspace once the indexer is active, which is
+// what keeps that workspace flat rather than growing to `context x 32,768 x 4 B`.
+constexpr std::uint32_t kSparseExpansionRows = 4096U;
+static_assert(kSparseExpansionRows >= kIndexSelectionWidth);
 
 // Whether a sequence runs the k-pool indexer at all. Only the host attention
 // path implements it, so this decides where a sequence's MLA attention lives.
@@ -3191,8 +3198,13 @@ struct Glm53Runtime::Impl {
         return devices[slot_for(layer)];
     }
 
+    // `assume_bf16_mla_expansion` answers the dense arm's question before the
+    // weights exist: at initialization this ledger is needed to size the weight
+    // arena, and both published releases store MLA KV-B in BF16, so charging
+    // the expansion is the honest estimate rather than an optimistic zero.
     [[nodiscard]] std::vector<std::uint64_t>
-    expected_sequence_device_bytes() const {
+    expected_sequence_device_bytes(
+        bool assume_bf16_mla_expansion = false) const {
         std::vector<std::uint64_t> bytes(devices.size(), 0U);
         const auto kda_floats =
             static_cast<std::uint64_t>(kHeads) * kLinearHead * kLinearHead +
@@ -3227,8 +3239,9 @@ struct Glm53Runtime::Impl {
             // from the actual tensor dtype, not the checkpoint's routed-expert
             // quantization label: otherwise FP8 is undercharged by the full
             // persistent expanded-history allocation and over-admitted.
-            const bool persistent_mla_expansion = weights != nullptr &&
-                weights->mla_kv_b_is_bf16(attention);
+            const bool persistent_mla_expansion = weights != nullptr
+                ? weights->mla_kv_b_is_bf16(attention)
+                : assume_bf16_mla_expansion;
             const auto expanded_mla_bytes = persistent_mla_expansion
                 ? static_cast<std::uint64_t>(
                       config.maximum_context_tokens) * kHeads * 2ULL *
@@ -5951,8 +5964,7 @@ struct Glm53Runtime::Impl {
         // 4,096 expanded rows is 512 MiB, the same order as the dense path's
         // expansion at the context lengths it could still serve, and at least
         // twice the widest single selection so a row can never fail to fit.
-        constexpr std::uint32_t kMaxExpandedRows = 4096U;
-        static_assert(kMaxExpandedRows >= kIndexSelectionWidth);
+        constexpr std::uint32_t kMaxExpandedRows = kSparseExpansionRows;
         ValidationResult result = complete_index_pools(sequence, layer,
                                                        attention);
         if (!result.ok()) return result;
@@ -6991,6 +7003,9 @@ struct Glm53Runtime::Impl {
                 request.query_rank = kQueryRank;
                 request.key_value_rank = kKvRank;
                 const auto history = request.position + 1U;
+                static_cast<void>(glm53_grow(
+                    mla_softmax_scores,
+                    static_cast<std::size_t>(kHeads) * history));
                 auto scores = std::span<float>(mla_softmax_scores).first(
                     static_cast<std::size_t>(kHeads) * history);
                 result = weights->mla_decode_mhc(
@@ -7384,6 +7399,9 @@ struct Glm53Runtime::Impl {
                 request.query_rank = kQueryRank;
                 request.key_value_rank = kKvRank;
                 const auto history = positions[row] + 1U;
+                static_cast<void>(glm53_grow(
+                    mla_softmax_scores,
+                    static_cast<std::size_t>(kHeads) * history));
                 auto scores = std::span<float>(mla_softmax_scores).first(
                     static_cast<std::size_t>(kHeads) * history);
                 result = weights->mla_decode_mhc(
@@ -9110,29 +9128,43 @@ ValidationResult Glm53Runtime::initialize(
     result = impl_->cuda.initialize(impl_->devices,
                                     impl_->config.phase_profile);
     if (!result.ok()) return result;
-    const auto admitted_page_rows = static_cast<std::uint64_t>(
+    // Free VRAM with the CUDA context established and nothing of this model's
+    // yet allocated. `plan_runtime_devices` measured before that context
+    // existed, so this is the smaller, truthful figure the reservation below
+    // has to divide up.
+    std::vector<std::uint64_t> post_context_free_bytes;
+    post_context_free_bytes.reserve(impl_->devices.size());
+    for (const auto device : impl_->devices) {
+        auto memory = CudaBackend::device_memory(device);
+        if (!memory.ok()) return {std::move(memory.errors)};
+        post_context_free_bytes.push_back(memory.value.free_bytes);
+    }
+    // The MLA activation workspace this context needs. It is flat above the
+    // indexer threshold, where a call expands a bounded selection rather than
+    // the visible history; reserving the dense extent for a sparse context
+    // takes 4 GiB per device at 32,768 and 32 GiB at the admitted ceiling of
+    // 262,144, out of the headroom the weight arena, the sequence state and the
+    // mHC workspace then have to share. That is why a context only slightly
+    // larger than one that loaded could fail.
+    const auto mla_workspace = glm53_mla_workspace_bytes(
+        impl_->config.maximum_context_tokens,
         impl_->config.prefill_page_tokens);
-    const auto context_rows = static_cast<std::uint64_t>(
-        impl_->config.maximum_context_tokens);
-    const auto maximum_matmul_input_bytes = sizeof(float) * std::max(
-        admitted_page_rows * std::uint64_t{12288},
-        context_rows * static_cast<std::uint64_t>(kKvRank));
-    const auto maximum_matmul_output_bytes = sizeof(float) * std::max(
-        admitted_page_rows * std::uint64_t{12288},
-        context_rows * static_cast<std::uint64_t>(kHeads) * 2U *
-            static_cast<std::uint64_t>(kMlaHead));
+    const auto matmul_workspace_bytes = mla_workspace.total();
     for (const auto device : impl_->devices) {
         result = impl_->cuda.reserve_matmul_workspace(
-            device, maximum_matmul_input_bytes,
-            maximum_matmul_output_bytes);
+            device, mla_workspace.input, mla_workspace.output);
         if (!result.ok()) return result;
     }
     // Both decode and causal device-page MLA return one raw score per
     // (head, visible-token) to the exact host softmax. Admit its maximum span
-    // before either timed phase so a longer page never grows it in flight.
+    // before either timed phase so a longer page never grows it in flight. The
+    // sparse path scores a selection, never the history, so its span is bounded
+    // by the selection width -- the same substitution as the workspace above.
     impl_->mla_softmax_scores.resize(
         static_cast<std::size_t>(kHeads) *
-        impl_->config.maximum_context_tokens);
+        (sparse_indexer_active(impl_->config.maximum_context_tokens)
+             ? kIndexSelectionWidth
+             : impl_->config.maximum_context_tokens));
     impl_->mla_selected_positions.reserve(kIndexSelectionWidth);
     impl_->mla_arena_rows.reserve(kIndexSelectionWidth);
     impl_->mla_expansion_source_positions.reserve(kIndexSelectionWidth);
@@ -9191,6 +9223,52 @@ ValidationResult Glm53Runtime::initialize(
             for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
                 impl_->weight_capacities[slot] -= resident_reserve[slot];
             }
+        }
+    }
+    // Make the weight arena pay for the context.
+    //
+    // The arena's budget is a fraction of free VRAM and does not depend on
+    // `--context-size`, but two allocations that live outside it do: the MLA
+    // activation workspace reserved above, and one complete sequence state --
+    // the per-layer latent cache, its BF16 expansion or bounded sparse arena,
+    // and the KDA state. Both were being taken from whatever the vram fraction
+    // happened to leave over, so a long context succeeded or failed on a margin
+    // of tens of megabytes: 32,000 loaded and 32,768 did not, on the same host,
+    // with no diagnosis available to the user beyond trying another number.
+    //
+    // Charge only the excess over the headroom that is already outside the
+    // arena, so the short-context operating point is unchanged and a longer
+    // context spends the static expert tier -- slower, but serving -- instead
+    // of running the device out of memory.
+    {
+        const auto context_state_bytes =
+            impl_->expected_sequence_device_bytes(true);
+        for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+            const auto free_bytes = post_context_free_bytes[slot];
+            const auto committed = impl_->weight_capacities[slot] +
+                                   impl_->resident_reserve_bytes[slot];
+            const auto headroom =
+                free_bytes > committed ? free_bytes - committed : 0U;
+            // The five percent `configure_sequence_admission` keeps outside
+            // admission for driver bookkeeping is part of what the context has
+            // to fit inside, or the run loads and then admits no sequence.
+            const auto required = matmul_workspace_bytes +
+                                  context_state_bytes[slot] + free_bytes / 20U;
+            if (required <= headroom) continue;
+            const auto shortfall = required - headroom;
+            if (impl_->weight_capacities[slot] <=
+                shortfall + kMinimumDeviceBudget) {
+                return {{"GLM-5.3 cannot admit a context of " +
+                         std::to_string(impl_->config.maximum_context_tokens) +
+                         " tokens on CUDA device " +
+                         std::to_string(impl_->devices[slot]) +
+                         ": its sequence state and activation workspace need " +
+                         std::to_string(required) +
+                         " bytes and only " + std::to_string(headroom) +
+                         " bytes remain outside the weight arena. Reduce "
+                         "--context-size or raise --vram-fraction"}};
+            }
+            impl_->weight_capacities[slot] -= shortfall;
         }
     }
     // Layer 3 is the first MoE layer, but the MXFP4 release leaves its routed
@@ -9433,16 +9511,30 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
             }
         }
     }
-    auto encoded = impl_->tokenizer.encode(
-        render_glm53_chat_prompt(messages, "max", true));
+    // Render, encode, and drop the oldest turn until the conversation plus the
+    // requested generation fits -- the same helper the other chat runtimes use.
+    // Rejecting instead made a multi-turn session fail permanently the moment
+    // its history crossed the context, which is a combination of `--max-new`
+    // and `--context-size` that worked until it silently did not.
+    ChatPromptRequest prompt_request;
+    prompt_request.messages = messages;
+    prompt_request.maximum_new_tokens = maximum_new_tokens;
+    prompt_request.maximum_context_tokens =
+        impl_->config.maximum_context_tokens;
+    prompt_request.render = [](std::span<const ChatMessage> active) {
+        return render_glm53_chat_prompt(active, "max", true);
+    };
+    prompt_request.encode = [&](const std::string& text) {
+        return impl_->tokenizer.encode(text);
+    };
+    auto encoded = prepare_chat_prompt(prompt_request);
     if (!encoded.ok()) {
         result.errors = std::move(encoded.errors);
         return result;
     }
-    if (encoded.value.empty() || encoded.value.size() + maximum_new_tokens >
-            impl_->config.maximum_context_tokens) {
+    if (encoded.token_ids.empty()) {
         result.errors.emplace_back(
-            "GLM-5.3 prompt and requested generation exceed the admitted text context");
+            "GLM-5.3 chat prompt encoded to no tokens");
         return result;
     }
     const auto mtp_drafts_before =
@@ -9452,7 +9544,7 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
     const auto prefetch_requests_before =
         impl_->prefetch_requests.load(std::memory_order_relaxed);
     const auto cache_before = impl_->weights->stats();
-    result = impl_->schedule(std::move(encoded.value), maximum_new_tokens,
+    result = impl_->schedule(std::move(encoded.token_ids), maximum_new_tokens,
                              sampling, stop, on_token);
     const auto request_mtp_drafts =
         impl_->mtp_drafts.load(std::memory_order_relaxed) - mtp_drafts_before;
@@ -9705,6 +9797,25 @@ float glm53_host_bf16_row_dot(
     static_cast<void>(use_avx2);
 #endif
     return glm53_host_bf16_dot_scalar(weights.data(), input);
+}
+
+Glm53MlaWorkspaceBytes glm53_mla_workspace_bytes(
+    std::uint32_t maximum_context_tokens,
+    std::uint32_t prefill_page_tokens) noexcept {
+    const auto page_rows = static_cast<std::uint64_t>(prefill_page_tokens);
+    // The widest KV-B expansion the MLA path performs in a single call.
+    const auto mla_rows = sparse_indexer_active(maximum_context_tokens)
+        ? static_cast<std::uint64_t>(kSparseExpansionRows)
+        : static_cast<std::uint64_t>(maximum_context_tokens);
+    Glm53MlaWorkspaceBytes bytes;
+    bytes.input = sizeof(float) * std::max(
+        page_rows * std::uint64_t{12288},
+        mla_rows * static_cast<std::uint64_t>(kKvRank));
+    bytes.output = sizeof(float) * std::max(
+        page_rows * std::uint64_t{12288},
+        mla_rows * static_cast<std::uint64_t>(kHeads) * 2U *
+            static_cast<std::uint64_t>(kMlaHead));
+    return bytes;
 }
 
 std::size_t glm53_sparse_index_select_for_test(

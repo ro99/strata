@@ -514,6 +514,16 @@ bool parse_options(int argc, char** argv, Options& options) {
                   << '\n';
         return false;
     }
+    // A turn is a prompt plus its generation, and both live in the same
+    // context. Say so here rather than after several minutes of checkpoint
+    // load, which is where the runtime would otherwise report it.
+    if (options.max_new_tokens >= options.context_size) {
+        std::cerr << "error: --max-new " << options.max_new_tokens
+                  << " leaves no room for a prompt in --context-size "
+                  << options.context_size
+                  << "; the two share the context window\n";
+        return false;
+    }
     return true;
 }
 

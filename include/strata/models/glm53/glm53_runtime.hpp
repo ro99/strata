@@ -75,6 +75,26 @@ void glm53_indexer_layer_norm_for_test(std::span<float> values,
                                        std::span<const float> weight,
                                        std::span<const float> bias) noexcept;
 
+// The per-device MLA activation workspace the runtime reserves for an admitted
+// context, in bytes. The dense path expands the whole visible history, so its
+// widest call scales with the context; the k-pool indexer expands a bounded
+// selection instead, so above `top_k` the reservation is flat. Reserving the
+// dense extent for a sparse context is 4 GiB per device at 32,768 and 32 GiB at
+// the admitted ceiling, which is memory the weight arena, the sequence state
+// and the mHC workspace then have to do without.
+struct Glm53MlaWorkspaceBytes {
+    std::uint64_t input{};
+    std::uint64_t output{};
+
+    [[nodiscard]] std::uint64_t total() const noexcept {
+        return input + output;
+    }
+};
+
+[[nodiscard]] Glm53MlaWorkspaceBytes glm53_mla_workspace_bytes(
+    std::uint32_t maximum_context_tokens,
+    std::uint32_t prefill_page_tokens) noexcept;
+
 struct Glm53RuntimeConfig {
     std::vector<int> devices;
     double vram_cache_fraction{0.85};

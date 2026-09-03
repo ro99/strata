@@ -121,6 +121,34 @@ about 33.5 KB per token across the eleven sparse layers, the 512-wide latent
 plus the 256-wide indexer row -- which is roughly 8.8 GiB at that length. The
 checkpoint declares 1,048,576; that is not offered until it has been measured.
 
+### Choosing `--context-size` and `--max-new`
+
+Any context in [1, 262,144] loads, and any `--max-new` below it generates.
+There is no combination to discover by trial: the only rule is that a turn's
+prompt and its generation share the one window, so `--max-new` must leave room
+for a prompt. Both `strata-chat` and `strata-server` reject `--max-new >=
+--context-size` at argument parsing rather than after the checkpoint has
+loaded, and a chat whose history outgrows the window drops its oldest turn and
+re-renders, as the other runtimes do, instead of failing the session.
+
+What a larger context costs is VRAM, and the runtime now charges it rather
+than hoping it fits. Two allocations live outside the weight arena and scale
+with the admitted context: the MLA activation workspace, and one complete
+sequence state -- the per-layer latent cache plus either the dense BF16
+expansion or the bounded sparse arena. Above the indexer threshold the
+workspace is flat, because a call expands a bounded selection instead of the
+history; the sequence state still grows as the latent cache does. Whatever
+those two need beyond the headroom the vram fraction already leaves is taken
+out of the static routed-expert tier, so a long context serves at a lower tier
+coverage instead of running the device out of memory. The short-context
+operating point above is unchanged: at 2,048 the demand fits the existing
+headroom and the tier is not touched.
+
+Until this was charged, the dense workspace was reserved for sparse contexts
+too -- 4 GiB per device at 32,768 and 32 GiB at the ceiling -- so admission
+turned on a margin of tens of megabytes. On the reference host `--context-size
+32000` loaded and `32768` did not, with nothing to tell the two apart.
+
 ### Where the attention runs
 
 The indexer lives on the host path, so a sequence admitted with a context above

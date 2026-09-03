@@ -203,3 +203,30 @@ TEST_CASE("GLM-5.3 sparse index selection always appends the visible tail") {
     REQUIRE(selected[count - 2U] == history - 2U);
     REQUIRE(selected[count - 3U] == history - 3U);
 }
+
+TEST_CASE("GLM-5.3 MLA workspace stops growing with the admitted context") {
+    constexpr std::uint32_t page_tokens = 64U;
+    const auto dense = strata::glm53_mla_workspace_bytes(2048U, page_tokens);
+    // Below the threshold a call expands the whole visible history, so the
+    // reservation is the dense extent: history x 64 heads x 2 x 256 x 4 B.
+    REQUIRE(dense.output == 2048ULL * 64ULL * 2ULL * 256ULL * sizeof(float));
+
+    // Above it the indexer expands a bounded selection instead. This is the
+    // regression the runbook's own context table describes: the workspace must
+    // be flat in context, not 4 GiB at 32,768 and 32 GiB at the ceiling.
+    const auto sparse = strata::glm53_mla_workspace_bytes(32768U, page_tokens);
+    const auto ceiling = strata::glm53_mla_workspace_bytes(262144U, page_tokens);
+    REQUIRE(sparse.input == ceiling.input);
+    REQUIRE(sparse.output == ceiling.output);
+    REQUIRE(ceiling.total() < (1ULL << 30U));
+
+    // Every admitted context, in both regimes, stays inside the per-device
+    // workspace reserve the weight-arena budget is planned against.
+    constexpr std::uint64_t workspace_reserve = 2ULL << 30U;
+    for (const std::uint32_t context :
+         {1U, 2048U, 2049U, 4096U, 32000U, 32768U, 65536U, 131072U, 262144U}) {
+        const auto bytes = strata::glm53_mla_workspace_bytes(
+            context, page_tokens);
+        REQUIRE(bytes.total() < workspace_reserve);
+    }
+}

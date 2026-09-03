@@ -252,6 +252,16 @@ bool parse_options(int argc, char** argv, Options& options) {
     if (options.model_id.empty() && !options.model.empty()) {
         options.model_id = std::filesystem::path(options.model).filename().string();
     }
+    // A request's prompt and its generation share one context window, so a
+    // default --max-new that fills it would reject every request after the
+    // model had already loaded.
+    if (options.max_new_tokens >= options.context_size) {
+        std::cerr << "error: --max-new " << options.max_new_tokens
+                  << " leaves no room for a prompt in --context-size "
+                  << options.context_size
+                  << "; the two share the context window\n";
+        return false;
+    }
     // Resolved through the model registry rather than a hardcoded list, so a
     // new model needs no edit here.
     return !options.model.empty() && !options.model_id.empty() &&

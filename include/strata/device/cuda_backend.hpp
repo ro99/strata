@@ -1175,6 +1175,13 @@ public:
     [[nodiscard]] ValidationResult glm53_mla_decode_finish(
         const CudaGlm53MlaRequest& request,
         std::span<const float> normalized_coefficients);
+    // Sparse-context MLA owns an independent device entry point so the
+    // <=2,048 resident implementation remains a fixed control arm. This
+    // first-stage command attends the identity selection directly from the
+    // compressed latent cache; gathered selection is added at the threshold
+    // without changing the dense kernels above.
+    [[nodiscard]] ValidationResult glm53_sparse_mla_decode_to_mhc(
+        const CudaGlm53MlaRequest& request);
     // A batch of device-resident experts in two halves, because the SwiGLU
     // between them stays on the host. Each enqueue returns as soon as the work
     // is on the stream; the matching collect completes it. Both dots are

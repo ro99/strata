@@ -2018,6 +2018,46 @@ public:
         return backend_.glm53_mla_decode_finish(request, scores);
     }
 
+    [[nodiscard]] ValidationResult sparse_mla_decode_mhc(
+        std::size_t slot, std::string_view attention,
+        CudaGlm53MlaRequest request) {
+        if (slot >= states_.size() || request.state == nullptr) {
+            return {{"GLM-5.3 sparse resident MLA targets an invalid cache "
+                     "slot"}};
+        }
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        const std::array<std::string, 5U> keys{
+            std::string(attention) + "q_a_proj",
+            std::string(attention) + "kv_a_proj_with_mqa",
+            std::string(attention) + "q_b_proj",
+            std::string(attention) + "kv_b_proj",
+            std::string(attention) + "o_proj"};
+        std::array<Entry*, 5U> entries{};
+        for (std::size_t index = 0U; index < keys.size(); ++index) {
+            const auto found = state.entries.find(keys[index]);
+            if (found == state.entries.end() ||
+                found->second.weight.device() != request.state->device()) {
+                return {{"GLM-5.3 sparse resident MLA projection was not "
+                         "admitted: " + keys[index]}};
+            }
+            entries[index] = &found->second;
+        }
+        for (auto* entry : entries) ++entry->leases;
+        struct Lease {
+            std::array<Entry*, 5U>& entries;
+            ~Lease() {
+                for (auto* entry : entries) --entry->leases;
+            }
+        } lease{entries};
+        request.query_a = &entries[0]->weight;
+        request.key_value_a = &entries[1]->weight;
+        request.query_b = &entries[2]->weight;
+        request.key_value_b = &entries[3]->weight;
+        request.output = &entries[4]->weight;
+        return backend_.glm53_sparse_mla_decode_to_mhc(request);
+    }
+
     [[nodiscard]] bool mla_kv_b_is_bf16(
         std::string_view attention) const noexcept {
         const auto* tensor = checkpoint_.find(
@@ -2961,13 +3001,14 @@ struct Glm53Runtime::Impl {
                 bytes[slot] += kda_floats * sizeof(float);
                 continue;
             }
-            // A sequence running the k-pool indexer attends on the host and
-            // `prepare_device_sequence` reserves no resident MLA state for it.
-            // Charging for state that is never allocated would refuse
-            // admission outright at the context lengths the indexer exists to
-            // reach: the expanded history alone is 17 GiB per layer at 262,144
-            // tokens.
-            if (sparse_indexer_active(config.maximum_context_tokens)) continue;
+            // Sparse MLA keeps only the compressed latent history and its two
+            // norm vectors resident. It must be charged here exactly as
+            // `prepare_device_sequence` allocates it; unlike the dense arm it
+            // never reserves the maximum-context expanded KV cache.
+            if (sparse_indexer_active(config.maximum_context_tokens)) {
+                bytes[slot] += mla_floats * sizeof(float);
+                continue;
+            }
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";
             // Both current releases store MLA KV-B in BF16. Key this ledger
@@ -6082,15 +6123,10 @@ struct Glm53Runtime::Impl {
             request.mhc_source_destination = true;
             result = weights->kda_decode(
                 slot_for(layer), attention, request, {});
-        } else if (resident_mla_host_attention() ||
-                   sparse_indexer_active(config.maximum_context_tokens)) {
-            // Two callers. The control arm moves attention to the host by
-            // request; a sequence that can cross kIndexTopK moves because only
-            // the host path implements the k-pool sparse indexer, and the
-            // resident device chain would otherwise attend densely -- wrong,
-            // and unaffordable.
-            // Device mHC still produces this layer's input and consumes the
-            // published branch, so only the attention itself moves.
+        } else if (resident_mla_host_attention()) {
+            // Explicit diagnostic control: move only attention to the host.
+            // Sparse contexts have their own independent device entry point
+            // below and never share the <=2,048 resident MLA kernels.
             std::vector<float> normalized(kHidden), branch(kHidden);
             result = cuda.dsv4_mhc_download_layer_input(device, normalized);
             if (!result.ok()) return result;
@@ -6098,6 +6134,17 @@ struct Glm53Runtime::Impl {
                                    attention, sequence);
             if (!result.ok()) return result;
             result = cuda.dsv4_mhc_publish_branch(device, branch);
+        } else if (sparse_indexer_active(config.maximum_context_tokens)) {
+            CudaGlm53MlaRequest request;
+            request.state = &device_sequence.mla[layer];
+            request.position = position;
+            request.maximum_context = config.maximum_context_tokens;
+            request.heads = kHeads;
+            request.head_dim = kMlaHead;
+            request.query_rank = kQueryRank;
+            request.key_value_rank = kKvRank;
+            result = weights->sparse_mla_decode_mhc(
+                slot_for(layer), attention, request);
         } else {
             CudaGlm53MlaRequest request;
             request.state = &device_sequence.mla[layer];
@@ -6612,11 +6659,7 @@ struct Glm53Runtime::Impl {
                 request.mhc_source_destination = true;
                 result = weights->kda_decode(
                     slot_for(layer), attention, request, {});
-            } else if (sparse_indexer_active(config.maximum_context_tokens)) {
-                // The indexer lives on the host, exactly as in the single-row
-                // resident path. Device mHC still produces this row's input and
-                // consumes the published branch, so only attention moves and
-                // the cohort keeps one mHC implementation.
+            } else if (resident_mla_host_attention()) {
                 std::vector<float> normalized(kHidden), attended(kHidden);
                 result = cuda.dsv4_mhc_download_layer_input(device, normalized);
                 if (!result.ok()) return result;
@@ -6625,6 +6668,18 @@ struct Glm53Runtime::Impl {
                                        *sequences[row]);
                 if (!result.ok()) return result;
                 result = cuda.dsv4_mhc_publish_branch(device, attended);
+            } else if (sparse_indexer_active(
+                           config.maximum_context_tokens)) {
+                CudaGlm53MlaRequest request;
+                request.state = &device_sequences[row]->mla[layer];
+                request.position = positions[row];
+                request.maximum_context = config.maximum_context_tokens;
+                request.heads = kHeads;
+                request.head_dim = kMlaHead;
+                request.query_rank = kQueryRank;
+                request.key_value_rank = kKvRank;
+                result = weights->sparse_mla_decode_mhc(
+                    slot_for(layer), attention, request);
             } else {
                 CudaGlm53MlaRequest request;
                 request.state = &device_sequences[row]->mla[layer];
@@ -7535,6 +7590,41 @@ struct Glm53Runtime::Impl {
             slot_for(layer), attention, request, history);
     }
 
+    [[nodiscard]] ValidationResult prepare_device_sparse_mla_layer(
+        std::uint32_t layer, Glm53SequenceState& sequence,
+        CudaBuffer& buffer) {
+        const auto attention = "model.language_model.layers." +
+            std::to_string(layer) + ".self_attn.";
+        const auto cache_floats =
+            static_cast<std::size_t>(config.maximum_context_tokens) * kKvRank;
+        std::vector<float> packed(
+            cache_floats + kQueryRank + kKvRank, 0.0F);
+        const auto latent = sequence.mla(layer).materialize();
+        if (latent.size() > cache_floats || latent.size() % kKvRank != 0U) {
+            return {{"GLM-5.3 sparse resident MLA cache exceeds its admitted "
+                     "context"}};
+        }
+        std::copy(latent.begin(), latent.end(), packed.begin());
+        auto q_norm = host_tensor(
+            attention + "q_a_layernorm.weight", kQueryRank);
+        auto kv_norm = host_tensor(
+            attention + "kv_a_layernorm.weight", kKvRank);
+        if (!q_norm.ok() || !kv_norm.ok()) {
+            ValidationResult result;
+            append(result.errors, std::move(q_norm.errors));
+            append(result.errors, std::move(kv_norm.errors));
+            return result;
+        }
+        std::copy(q_norm.value->begin(), q_norm.value->end(),
+                  packed.begin() + static_cast<std::ptrdiff_t>(cache_floats));
+        std::copy(kv_norm.value->begin(), kv_norm.value->end(),
+                  packed.begin() + static_cast<std::ptrdiff_t>(
+                                       cache_floats + kQueryRank));
+        return cuda.upload_buffer(
+            device_for(layer), std::as_bytes(std::span<const float>(packed)),
+            buffer);
+    }
+
     [[nodiscard]] ValidationResult prepare_device_sequence(
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
         if (device_sequence.ready) return {};
@@ -7543,13 +7633,13 @@ struct Glm53Runtime::Impl {
             const auto attention = "model.language_model.layers." +
                 std::to_string(layer) + ".self_attn.";
             if (!glm53_kda_layer(layer)) {
-                // The resident MLA history is `maximum_context x 32,768 x 2 B`
-                // of expanded KV plus its latent -- 537 MiB per layer at 8,192
-                // tokens and 17 GiB at 262,144. A sequence running the k-pool
-                // indexer attends on the host and never reads it, so reserving
-                // it would exhaust VRAM at exactly the context lengths the
-                // indexer exists to make reachable.
+                // Sparse contexts reserve only their latent cache. Dense MLA
+                // keeps its accepted expanded-BF16 history allocation and its
+                // preparation path unchanged as the identity control arm.
                 if (sparse_indexer_active(config.maximum_context_tokens)) {
+                    result = prepare_device_sparse_mla_layer(
+                        layer, sequence, device_sequence.mla[layer]);
+                    if (!result.ok()) return result;
                     continue;
                 }
                 result = prepare_device_mla_layer(

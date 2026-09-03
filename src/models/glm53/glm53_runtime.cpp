@@ -9566,11 +9566,16 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
         << impl_->host_moe_calls.load(std::memory_order_relaxed)
         << " host_expert_rows="
         << impl_->host_moe_rows.load(std::memory_order_relaxed)
-        << " host_expert_weight_bytes="
-        << (impl_->host_moe_gate_up_weight_bytes.load(
-                std::memory_order_relaxed) +
-            impl_->host_moe_down_weight_bytes.load(
-                std::memory_order_relaxed));
+        << " host_expert_weight_bytes=";
+    if (impl_->config.phase_profile) {
+        batch_composition
+            << (impl_->host_moe_gate_up_weight_bytes.load(
+                    std::memory_order_relaxed) +
+                impl_->host_moe_down_weight_bytes.load(
+                    std::memory_order_relaxed));
+    } else {
+        batch_composition << "unavailable";
+    }
     std::cerr << batch_composition.str() << '\n';
     if (impl_->config.verbose) {
         std::cerr << "[glm53-projection] parallel_batches="

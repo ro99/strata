@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -759,6 +760,30 @@ struct CudaGlm53KdaRequest {
 
 struct CudaGlm53MlaRequest {
     const CudaBuffer* state{};
+    // Sparse MLA's bounded BF16 expansion cache. Each sparse MLA layer owns
+    // one so identity selections can retain previously expanded rows across
+    // decode tokens.
+    const CudaBuffer* sparse_expanded{};
+    // Empty below index_topk, where the independent identity implementation
+    // remains the control arm. Above it, these are the verified host
+    // indexer's selected latent positions in ascending order.
+    std::span<const std::uint32_t> selected_positions;
+    // Physical BF16 arena row for every position in the ascending consumed
+    // view, plus the source/destination pairs that must be expanded this step.
+    std::span<const std::uint32_t> sparse_arena_rows;
+    std::span<const std::uint32_t> sparse_expansion_sources;
+    std::span<const std::uint32_t> sparse_expansion_destinations;
+    // The first gathered command validates the host arena's identity seed
+    // against the device buffer's own append counter. This closes the only
+    // coupling between independently-maintained host and device cache state.
+    bool validate_sparse_identity_rows{};
+    std::uint32_t sparse_identity_rows{};
+    struct HostTiming {
+        std::uint64_t index_upload_nanoseconds{};
+        std::uint64_t device_scores_wait_nanoseconds{};
+        std::uint64_t host_softmax_nanoseconds{};
+        std::uint64_t coefficient_upload_nanoseconds{};
+    }* host_timing{};
     const CudaWeight* query_a{};
     const CudaWeight* key_value_a{};
     const CudaWeight* query_b{};
@@ -1173,6 +1198,18 @@ public:
     [[nodiscard]] ValidationResult glm53_mla_decode_to_mhc(
         const CudaGlm53MlaRequest& request, std::span<float> scores);
     [[nodiscard]] ValidationResult glm53_mla_decode_finish(
+        const CudaGlm53MlaRequest& request,
+        std::span<const float> normalized_coefficients);
+    // Sparse-context MLA owns an independent device entry point so the
+    // <=2,048 resident implementation remains a fixed control arm. This
+    // first-stage command scores the identity selection directly from the
+    // compressed latent cache. It retains the accepted raw-score/host-softmax
+    // boundary; gathered selection is added at the threshold without changing
+    // the dense kernels above.
+    [[nodiscard]] ValidationResult glm53_sparse_mla_decode_to_mhc(
+        const CudaGlm53MlaRequest& request, std::span<float> scores,
+        const std::function<ValidationResult()>& overlap);
+    [[nodiscard]] ValidationResult glm53_sparse_mla_decode_finish(
         const CudaGlm53MlaRequest& request,
         std::span<const float> normalized_coefficients);
     // A batch of device-resident experts in two halves, because the SwiGLU

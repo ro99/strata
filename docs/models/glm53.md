@@ -140,36 +140,60 @@ exclusive. Porting the indexer into the resident CUDA chain is open work.
 On the reference two-RTX-3090 host with the MXFP4 release, a 2,591-token prompt
 at `--context-size 4096` completes and answers correctly from a fact placed
 around token 550 -- inside the pooled region, far from the always-selected tail:
-`prefill 2,591 tok in 1816.31 s (1.43 tok/s)`, `decode 127 tok in 556.74 s
-(0.23 tok/s)`.
+`prefill 2,591 tok in 1139.72 s (2.27 tok/s)`, `decode 127 tok in 35.16 s
+(3.61 tok/s)`.
 
-**Long-context decode is much slower than the 2,048-token rate and this is a
-known open item, not a tuning gap.** At 2,048 tokens decode is 0.182 s/token and
-MLA is nearly free because the resident device chain attends against a
-pre-expanded KV cache. Above the threshold the indexer forces attention onto the
-host, which moves `selection x 32,768 x 4 B` -- about 2.96 GB per token at a
-saturated selection -- across PCIe every step. Phase profiling puts 88% of a
-long-context decode step in MLA, with no MLA device kernels at all.
+The indexer runs in the resident CUDA chain. It keeps the compressed latent
+history on device, gathers the selection into a bounded BF16 arena and expands
+only the pools that entered it since the previous token -- measured pool overlap
+between consecutive tokens is 94%, and in practice fewer than two pools per
+token are expanded, with 45% of tokens expanding none. Scores are computed on
+device; the softmax stays on the host in glibc `exp` with BF16-rounded
+coefficients, because that is what keeps the path byte-exact.
 
-The measured feed-forward floor is 0.206 s/token and does not depend on history,
-so the 2,048-token operating point is MoE-bound. Because the selection makes MLA
-work constant in context, long-context decode should ultimately equal
-short-context decode; reaching that requires the indexer to run in the resident
-CUDA chain so nothing proportional to context crosses the link. That is the
-open performance item.
+**Attention is no longer the constraint at long context.** Of a 276.9 ms
+decode step at 2,591 tokens, feed-forward is 221.3 ms -- 77% -- and all
+remaining MLA-side cost is about 51 ms. The MoE term is the same floor
+short-context decode already pays, so with attention at exactly zero this
+prompt would still reach only about 4.43 tok/s. The current step is 81% of
+that ceiling.
+
+Two figures that are easy to misread:
+
+- **The MoE floor is prompt-dependent.** 221.3 ms/token belongs to this prompt's
+  expert routing, not to the model. The published 5.49 tok/s short-context rate
+  comes from a different prompt with cheaper routing, so it is not a like-for-like
+  target for a long-context run.
+- **Feed-forward measured 183.2 ms/token at history 1,046 and 216-221 ms at
+  2,591** on the same prompt family, with a byte-identical static expert tier in
+  both runs. That roughly 20% rise with context is unexplained and is tracked
+  separately; it is not attributable to the indexer.
+
+At short context the sparse path is at parity with the dense one it replaces:
+on the same prompt, dense 5.27 tok/s against sparse 5.14.
 
 Decode cost against history, seconds per token, cold process:
 
 | history | seconds/token |
 |---:|---:|
-| 89 | 0.405 |
-| 534 | 0.525 |
-| 1,046 | 0.778 |
+| 89 | ~0.20 |
+| 534 | ~0.21 |
+| 1,046 | 0.224 |
+| 2,591 (saturated) | 0.277 |
 
 `--context-size` above 2,048 selects the sparse path for *every* sequence the
-runtime admits, whatever its prompt length, so these short-prompt arms exercise
-exactly the long-context decode path and make it measurable in minutes rather
-than in a 30-minute prefill.
+runtime admits, whatever its prompt length, so short-prompt arms exercise the
+same decode path and make it measurable in minutes rather than in a 19-minute
+prefill.
+
+Cold and warm runs agree here: the same saturated arm measured 3.50 tok/s cold
+and 3.52 warm, 0.6% apart. The runbook's warm-up caveat describes short bounded
+runs, where the 9.5 GiB static-tier upload is a large share of the arm; a long
+prefill amortizes it away.
+
+**Cost of the device path.** Delta reuse needs one persistent expanded arena per
+sparse layer, since expanded rows are layer-specific -- eleven arenas totalling
+about 1.85 GB. That reduces concurrent sequence admission to four on this host.
 
 ### Exactness
 

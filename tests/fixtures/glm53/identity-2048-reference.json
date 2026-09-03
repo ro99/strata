@@ -1,0 +1,6 @@
+{
+  "source_commit": "3b8fd4dcfcfd3372b09c4807f8d09a479e3b4eb6",
+  "build": "build-release/strata-chat",
+  "command": "CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all ./build-release/strata-chat --model models/glm53f-mxfp4 --model-type glm53 --prompt 'Write the natural numbers in order, one per line, starting at 1. Continue until you reach 1000.' --context-size 2048 --max-new 129 --devices 1,2 --vram-fraction 0.85 --temperature 0 --seed 33377335 --no-color",
+  "generated_text": "The user wants me to write natural numbers from 1 to 1000, one per line. This is a straightforward request. Let me think about whether this is something I should do.\n\nThe request is simple and clear: write numbers 1 through 1000, one per line. This would be 1000 lines of output. That's a lot of text, but it's what the user asked for.\n\nIs there any reason not to do this? It's not harmful, it's not deceptive, it's just a mechanical task. Some might argue it's a waste of tokens, but the user explicitly asked for it. The"
+}

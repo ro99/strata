@@ -801,9 +801,11 @@ constexpr std::uint32_t kIndexArenaRows =
 // else, including the attention k_norm. Taken from the reference; getting it
 // wrong is silent below index_topk and wrong above it.
 // `index_kpool_compress_gate` is [head_dim, hidden] applied as F.linear.
-void glm53_indexer_gate(std::span<float> output, std::span<const float> input,
-                        std::span<const float> weight) noexcept {
-    for (std::size_t row = 0U; row < output.size(); ++row) {
+void glm53_indexer_gate_rows(std::span<float> output,
+                             std::span<const float> input,
+                             std::span<const float> weight, std::size_t begin,
+                             std::size_t end) noexcept {
+    for (std::size_t row = begin; row < end; ++row) {
         const auto* w = weight.data() + row * input.size();
         float sum = 0.0F;
         for (std::size_t column = 0U; column < input.size(); ++column) {
@@ -811,6 +813,42 @@ void glm53_indexer_gate(std::span<float> output, std::span<const float> input,
         }
         output[row] = sum;
     }
+}
+
+void glm53_indexer_gate(std::span<float> output, std::span<const float> input,
+                        std::span<const float> weight) noexcept {
+    glm53_indexer_gate_rows(output, input, weight, 0U, output.size());
+}
+
+// The same projection spread across the host pool. Each output row is an
+// independent dot product and the inner accumulation order is untouched, so
+// this is bit-identical to the serial form.
+//
+// It matters because `wq_b` is 4,096 x 1,536 -- 6.3 MFMA per layer against
+// 1.0 for `wk` and the k-pool gate together -- and it runs only above
+// `index_topk`, so it was invisible to every measurement taken below the
+// threshold. Measured serially, this projection family ran at 0.38 GFLOP/s and
+// was the largest single term in saturated host-side MLA.
+template <typename Pool>
+[[nodiscard]] ValidationResult glm53_indexer_gate_parallel(
+    std::span<float> output, std::span<const float> input,
+    std::span<const float> weight, Pool* workers) {
+    // `wk` and the k-pool gate are 128 rows each and are the measured
+    // identity-regime cost (30.39 ms/token for 11.5 MFMA, 0.38 GFLOP/s), so the
+    // cutoff has to sit below 128 or the dominant term stays serial.
+    constexpr std::size_t kSerialRows = 32U;
+    if (workers == nullptr || output.size() <= kSerialRows) {
+        glm53_indexer_gate(output, input, weight);
+        return {};
+    }
+    const auto lanes = std::min<std::size_t>(workers->size(), output.size());
+    const auto stride = (output.size() + lanes - 1U) / lanes;
+    return workers->parallel_for(lanes, [&](std::size_t lane) {
+        const auto begin = lane * stride;
+        if (begin >= output.size()) return;
+        glm53_indexer_gate_rows(output, input, weight, begin,
+                                std::min(begin + stride, output.size()));
+    });
 }
 
 void glm53_indexer_layer_norm(std::span<float> values,
@@ -5427,7 +5465,9 @@ struct Glm53Runtime::Impl {
                                       static_cast<std::uint64_t>(kIndexHeadDim) *
                                           kHidden);
                 if (!wk.ok()) return {std::move(wk.errors)};
-                glm53_indexer_gate(index_key, input, *wk.value);
+                result = glm53_indexer_gate_parallel(
+                    index_key, input, *wk.value, kda_workers.get());
+                if (!result.ok()) return result;
             }
             // `index_kpool_compress_gate` is a bare nn.Parameter, not a Linear
             // module, so it has no ".weight" suffix and cannot be keyed into
@@ -5437,7 +5477,9 @@ struct Glm53Runtime::Impl {
                                         static_cast<std::uint64_t>(kIndexHeadDim) *
                                             kHidden);
                 if (!gate.ok()) return {std::move(gate.errors)};
-                glm53_indexer_gate(index_gate, input, *gate.value);
+                result = glm53_indexer_gate_parallel(
+                    index_gate, input, *gate.value, kda_workers.get());
+                if (!result.ok()) return result;
             }
             if (history > kIndexTopK) {
                 auto wq = host_tensor(
@@ -5445,12 +5487,16 @@ struct Glm53Runtime::Impl {
                     static_cast<std::uint64_t>(kIndexHeads) * kIndexHeadDim *
                         kQueryRank);
                 if (!wq.ok()) return {std::move(wq.errors)};
-                glm53_indexer_gate(index_query, q_rank, *wq.value);
+                result = glm53_indexer_gate_parallel(
+                    index_query, q_rank, *wq.value, kda_workers.get());
+                if (!result.ok()) return result;
                 auto wp = host_tensor(
                     indexer_bases[3],
                     static_cast<std::uint64_t>(kIndexHeads) * kHidden);
                 if (!wp.ok()) return {std::move(wp.errors)};
-                glm53_indexer_gate(head_weights, input, *wp.value);
+                result = glm53_indexer_gate_parallel(
+                    head_weights, input, *wp.value, kda_workers.get());
+                if (!result.ok()) return result;
             }
             auto norm_weight =
                 host_tensor(attention + "indexer.k_norm.weight", kIndexHeadDim);
@@ -5645,14 +5691,18 @@ struct Glm53Runtime::Impl {
                 indexer_bases[0],
                 static_cast<std::uint64_t>(kIndexHeadDim) * kHidden);
             if (!wk.ok()) return {std::move(wk.errors)};
-            glm53_indexer_gate(index_key, input, *wk.value);
+            auto projected_key = glm53_indexer_gate_parallel(
+                index_key, input, *wk.value, kda_workers.get());
+            if (!projected_key.ok()) return projected_key;
         }
         {
             auto gate = host_tensor(
                 indexer_bases[1],
                 static_cast<std::uint64_t>(kIndexHeadDim) * kHidden);
             if (!gate.ok()) return {std::move(gate.errors)};
-            glm53_indexer_gate(index_gate, input, *gate.value);
+            auto projected_gate = glm53_indexer_gate_parallel(
+                index_gate, input, *gate.value, kda_workers.get());
+            if (!projected_gate.ok()) return projected_gate;
         }
         if (timing != nullptr) {
             timing->indexer_projection_nanoseconds +=
@@ -5717,12 +5767,16 @@ struct Glm53Runtime::Impl {
             static_cast<std::uint64_t>(kIndexHeads) * kIndexHeadDim *
                 kQueryRank);
         if (!wq.ok()) return {std::move(wq.errors)};
-        glm53_indexer_gate(index_query, q_rank, *wq.value);
+        auto projected_query = glm53_indexer_gate_parallel(
+            index_query, q_rank, *wq.value, kda_workers.get());
+        if (!projected_query.ok()) return projected_query;
         auto wp = host_tensor(
             indexer_bases[3],
             static_cast<std::uint64_t>(kIndexHeads) * kHidden);
         if (!wp.ok()) return {std::move(wp.errors)};
-        glm53_indexer_gate(head_weights, input, *wp.value);
+        auto projected_weights = glm53_indexer_gate_parallel(
+            head_weights, input, *wp.value, kda_workers.get());
+        if (!projected_weights.ok()) return projected_weights;
         if (timing != nullptr) {
             timing->indexer_projection_nanoseconds +=
                 elapsed_nanoseconds(query_projection_started);

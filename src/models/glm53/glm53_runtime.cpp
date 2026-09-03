@@ -714,6 +714,14 @@ constexpr std::uint32_t kIndexPool = 4U;
 // Selected pools expand to kIndexTopK tokens; the always-selected tail adds at
 // most one incomplete pool, i.e. kIndexPool - 1 further raw positions.
 constexpr std::uint32_t kIndexSelectionWidth = kIndexTopK + kIndexPool - 1U;
+// The saturated selection owns 512 live pools. The measured maximum churn was
+// 89 pools per token, so retain 128 additional recently-used pools as bounded
+// headroom; a pool that leaves and promptly re-enters need not be expanded
+// again. Three dedicated rows hold the always-selected incomplete tail.
+constexpr std::uint32_t kIndexArenaPools =
+    kIndexTopK / kIndexPool + 128U;
+constexpr std::uint32_t kIndexArenaRows =
+    kIndexArenaPools * kIndexPool + kIndexPool - 1U;
 
 // Whether a sequence runs the k-pool indexer at all. Only the host attention
 // path implements it, so this decides where a sequence's MLA attention lives.
@@ -2491,11 +2499,18 @@ struct Glm53Runtime::Impl {
     };
 
     struct DeviceSequenceState {
+        struct SparseMlaArena {
+            std::vector<std::uint32_t> slot_pools;
+            std::vector<std::uint64_t> slot_recency;
+            std::vector<std::uint32_t> previous_pools;
+            std::uint64_t clock{};
+            std::uint32_t identity_rows{};
+            bool seeded{};
+        };
         std::array<CudaBuffer, kLayers> kda;
         std::array<CudaBuffer, kLayers> mla;
         std::array<CudaBuffer, kLayers> sparse_mla_expanded;
-        std::array<std::vector<std::uint32_t>, kLayers>
-            sparse_mla_previous_pools;
+        std::array<SparseMlaArena, kLayers> sparse_mla_arenas;
         bool ready{};
     };
 
@@ -2659,6 +2674,9 @@ struct Glm53Runtime::Impl {
     std::vector<float> mla_softmax_scores;
     std::vector<float> sparse_index_input;
     std::vector<std::uint32_t> mla_selected_positions;
+    std::vector<std::uint32_t> mla_arena_rows;
+    std::vector<std::uint32_t> mla_expansion_source_positions;
+    std::vector<std::uint32_t> mla_expansion_destination_rows;
     // Expansion scratch for the host MLA paths. These are the largest buffers
     // in the model's steady state -- `attended_rows x 32,768 x 4 B`, 268 MiB at
     // a saturated selection -- and allocating them per layer per token made
@@ -3022,7 +3040,7 @@ struct Glm53Runtime::Impl {
             // never reserves the maximum-context expanded KV cache.
             if (sparse_indexer_active(config.maximum_context_tokens)) {
                 const auto expanded_mla_bytes =
-                    static_cast<std::uint64_t>(kIndexSelectionWidth) *
+                    static_cast<std::uint64_t>(kIndexArenaRows) *
                     kHeads * 2ULL * kMlaHead * sizeof(std::uint16_t);
                 bytes[slot] += mla_floats * sizeof(float) +
                                expanded_mla_bytes;
@@ -5464,10 +5482,16 @@ struct Glm53Runtime::Impl {
     // path untouched.
     [[nodiscard]] ValidationResult prepare_sparse_device_selection(
         std::vector<std::uint32_t>& selected,
+        std::vector<std::uint32_t>& arena_rows,
+        std::vector<std::uint32_t>& expansion_sources,
+        std::vector<std::uint32_t>& expansion_destinations,
         std::span<const float> input, std::uint32_t layer,
         std::uint32_t position, const std::string& attention,
         Glm53SequenceState& sequence, DeviceSequenceState& device_sequence) {
         selected.clear();
+        arena_rows.clear();
+        expansion_sources.clear();
+        expansion_destinations.clear();
         const auto history = position + 1U;
         std::vector<float> index_key(kIndexHeadDim);
         std::vector<float> index_gate(kIndexHeadDim);
@@ -5511,7 +5535,11 @@ struct Glm53Runtime::Impl {
         if (!appended.ok()) return appended;
         auto completed = complete_index_pools(sequence, layer, attention);
         if (!completed.ok()) return completed;
-        if (history <= kIndexTopK) return {};
+        auto& arena = device_sequence.sparse_mla_arenas[layer];
+        if (history <= kIndexTopK) {
+            arena.identity_rows = history;
+            return {};
+        }
 
         std::vector<float> q_rank(kQueryRank);
         auto projected = linear(attention + "q_a_proj", input, 1U, kHidden,
@@ -5555,15 +5583,17 @@ struct Glm53Runtime::Impl {
                 selected_pools.push_back(pool);
             }
         }
-        auto& previous = device_sequence.sparse_mla_previous_pools[layer];
-        if (!previous.empty()) {
+        std::size_t overlap = 0U;
+        const auto has_previous = !arena.previous_pools.empty();
+        if (has_previous) {
             std::size_t left = 0U;
             std::size_t right = 0U;
-            std::size_t overlap = 0U;
-            while (left < previous.size() && right < selected_pools.size()) {
-                if (previous[left] < selected_pools[right]) {
+            while (left < arena.previous_pools.size() &&
+                   right < selected_pools.size()) {
+                if (arena.previous_pools[left] < selected_pools[right]) {
                     ++left;
-                } else if (selected_pools[right] < previous[left]) {
+                } else if (selected_pools[right] <
+                           arena.previous_pools[left]) {
                     ++right;
                 } else {
                     ++overlap;
@@ -5571,15 +5601,103 @@ struct Glm53Runtime::Impl {
                     ++right;
                 }
             }
-            std::cerr << "[glm53-sparse-selection-overlap] layer=" << layer
-                      << " history=" << history
-                      << " pools=" << selected_pools.size()
-                      << " previous=" << previous.size()
-                      << " overlap=" << overlap
-                      << " entering=" << (selected_pools.size() - overlap)
-                      << '\n';
         }
-        previous = std::move(selected_pools);
+        arena.previous_pools = selected_pools;
+
+        if (!arena.seeded) {
+            // If this sequence decoded through the entire identity region,
+            // physical rows [0, 2048) already contain pools [0, 512). A long
+            // host-prefilled prompt has no such device contents and starts
+            // with an empty arena instead.
+            if (arena.identity_rows == kIndexTopK) {
+                for (std::uint32_t pool = 0U;
+                     pool < kIndexTopK / kIndexPool; ++pool) {
+                    arena.slot_pools[pool] = pool;
+                }
+            }
+            arena.seeded = true;
+        }
+        ++arena.clock;
+        const auto find_slot = [&](std::uint32_t pool) {
+            const auto found = std::find(arena.slot_pools.begin(),
+                                         arena.slot_pools.end(), pool);
+            return found == arena.slot_pools.end()
+                ? kIndexArenaPools
+                : static_cast<std::uint32_t>(
+                      found - arena.slot_pools.begin());
+        };
+        for (const auto pool : selected_pools) {
+            auto slot = find_slot(pool);
+            if (slot == kIndexArenaPools) {
+                for (std::uint32_t candidate = 0U;
+                     candidate < kIndexArenaPools; ++candidate) {
+                    if (arena.slot_pools[candidate] ==
+                        std::numeric_limits<std::uint32_t>::max()) {
+                        slot = candidate;
+                        break;
+                    }
+                }
+            }
+            if (slot == kIndexArenaPools) {
+                std::uint64_t oldest =
+                    std::numeric_limits<std::uint64_t>::max();
+                for (std::uint32_t candidate = 0U;
+                     candidate < kIndexArenaPools; ++candidate) {
+                    if (std::binary_search(
+                            selected_pools.begin(), selected_pools.end(),
+                            arena.slot_pools[candidate])) {
+                        continue;
+                    }
+                    if (arena.slot_recency[candidate] < oldest) {
+                        oldest = arena.slot_recency[candidate];
+                        slot = candidate;
+                    }
+                }
+            }
+            if (slot == kIndexArenaPools) {
+                return {{"GLM-5.3 sparse MLA arena has no evictable pool"}};
+            }
+            if (arena.slot_pools[slot] != pool) {
+                arena.slot_pools[slot] = pool;
+                for (std::uint32_t member = 0U; member < kIndexPool;
+                     ++member) {
+                    expansion_sources.push_back(pool * kIndexPool + member);
+                    expansion_destinations.push_back(
+                        slot * kIndexPool + member);
+                }
+            }
+            arena.slot_recency[slot] = arena.clock;
+        }
+
+        const auto tail_begin = history / kIndexPool * kIndexPool;
+        const auto tail_arena_begin = kIndexArenaPools * kIndexPool;
+        arena_rows.reserve(selected.size());
+        for (const auto token : selected) {
+            if (token >= tail_begin) {
+                const auto tail_row = tail_arena_begin + token - tail_begin;
+                arena_rows.push_back(tail_row);
+                expansion_sources.push_back(token);
+                expansion_destinations.push_back(tail_row);
+                continue;
+            }
+            const auto slot = find_slot(token / kIndexPool);
+            if (slot == kIndexArenaPools) {
+                return {{"GLM-5.3 sparse MLA consumed pool is not cached"}};
+            }
+            arena_rows.push_back(slot * kIndexPool + token % kIndexPool);
+        }
+        const auto tail_rows = history % kIndexPool;
+        const auto expanded_pools =
+            (expansion_sources.size() - tail_rows) / kIndexPool;
+        std::cerr << "[glm53-sparse-delta] layer=" << layer
+                  << " history=" << history
+                  << " pools=" << selected_pools.size()
+                  << " overlap=" << (has_previous ? overlap : 0U)
+                  << " entering="
+                  << (has_previous ? selected_pools.size() - overlap
+                                   : selected_pools.size())
+                  << " expanded_pools=" << expanded_pools
+                  << " tail_rows=" << tail_rows << '\n';
         return {};
     }
 
@@ -6305,10 +6423,17 @@ struct Glm53Runtime::Impl {
             result = cuda.dsv4_mhc_download_layer_input(device, normalized);
             if (!result.ok()) return result;
             result = prepare_sparse_device_selection(
-                mla_selected_positions, normalized, layer, position,
-                attention, sequence, device_sequence);
+                mla_selected_positions, mla_arena_rows,
+                mla_expansion_source_positions,
+                mla_expansion_destination_rows, normalized, layer,
+                position, attention, sequence, device_sequence);
             if (!result.ok()) return result;
             request.selected_positions = mla_selected_positions;
+            request.sparse_arena_rows = mla_arena_rows;
+            request.sparse_expansion_sources =
+                mla_expansion_source_positions;
+            request.sparse_expansion_destinations =
+                mla_expansion_destination_rows;
             auto& scores = mla_softmax_scores;
             const auto history = position + 1U;
             const auto attended_rows = request.selected_positions.empty()
@@ -6884,11 +7009,18 @@ struct Glm53Runtime::Impl {
                     device, normalized);
                 if (!result.ok()) return result;
                 result = prepare_sparse_device_selection(
-                    mla_selected_positions, normalized, layer,
+                    mla_selected_positions, mla_arena_rows,
+                    mla_expansion_source_positions,
+                    mla_expansion_destination_rows, normalized, layer,
                     positions[row], attention, *sequences[row],
                     *device_sequences[row]);
                 if (!result.ok()) return result;
                 request.selected_positions = mla_selected_positions;
+                request.sparse_arena_rows = mla_arena_rows;
+                request.sparse_expansion_sources =
+                    mla_expansion_source_positions;
+                request.sparse_expansion_destinations =
+                    mla_expansion_destination_rows;
                 const auto history = positions[row] + 1U;
                 const auto attended_rows = request.selected_positions.empty()
                     ? static_cast<std::size_t>(history)
@@ -7884,12 +8016,19 @@ struct Glm53Runtime::Impl {
                 // preparation path unchanged as the identity control arm.
                 if (sparse_indexer_active(config.maximum_context_tokens)) {
                     const auto scratch_bytes =
-                        static_cast<std::uint64_t>(kIndexSelectionWidth) *
+                        static_cast<std::uint64_t>(kIndexArenaRows) *
                         kHeads * 2ULL * kMlaHead * sizeof(std::uint16_t);
                     result = cuda.allocate_buffer(
                         device_for(layer), scratch_bytes,
                         device_sequence.sparse_mla_expanded[layer]);
                     if (!result.ok()) return result;
+                    auto& arena =
+                        device_sequence.sparse_mla_arenas[layer];
+                    arena.slot_pools.assign(
+                        kIndexArenaPools,
+                        std::numeric_limits<std::uint32_t>::max());
+                    arena.slot_recency.assign(kIndexArenaPools, 0U);
+                    arena.previous_pools.reserve(kIndexTopK / kIndexPool);
                     result = prepare_device_sparse_mla_layer(
                         layer, sequence, device_sequence.mla[layer]);
                     if (!result.ok()) return result;
@@ -8679,6 +8818,10 @@ ValidationResult Glm53Runtime::initialize(
     impl_->mla_softmax_scores.resize(
         static_cast<std::size_t>(kHeads) *
         impl_->config.maximum_context_tokens);
+    impl_->mla_selected_positions.reserve(kIndexSelectionWidth);
+    impl_->mla_arena_rows.reserve(kIndexSelectionWidth);
+    impl_->mla_expansion_source_positions.reserve(kIndexSelectionWidth);
+    impl_->mla_expansion_destination_rows.reserve(kIndexSelectionWidth);
     impl_->tokenizer = std::move(tokenizer.value);
     impl_->checkpoint = std::move(checkpoint.value);
     impl_->device_budgets = device_plan.value.budgets;

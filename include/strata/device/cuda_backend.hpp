@@ -767,6 +767,11 @@ struct CudaGlm53MlaRequest {
     // remains the control arm. Above it, these are the verified host
     // indexer's selected latent positions in ascending order.
     std::span<const std::uint32_t> selected_positions;
+    // Physical BF16 arena row for every position in the ascending consumed
+    // view, plus the source/destination pairs that must be expanded this step.
+    std::span<const std::uint32_t> sparse_arena_rows;
+    std::span<const std::uint32_t> sparse_expansion_sources;
+    std::span<const std::uint32_t> sparse_expansion_destinations;
     const CudaWeight* query_a{};
     const CudaWeight* key_value_a{};
     const CudaWeight* query_b{};

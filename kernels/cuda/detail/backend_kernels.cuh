@@ -829,8 +829,10 @@ __global__ void bf16_matvec_rows_to_bf16_kernel(
 template <std::uint32_t Tile>
 __global__ void bf16_gathered_matvec_rows_to_bf16_kernel(
     __nv_bfloat16* output, const float* input,
-    const std::uint32_t* selected_rows, const __nv_bfloat16* weights,
-    std::uint32_t batch, std::uint64_t columns, std::uint64_t rows) {
+    const std::uint32_t* selected_rows,
+    const std::uint32_t* destination_rows,
+    const __nv_bfloat16* weights, std::uint32_t batch,
+    std::uint64_t columns, std::uint64_t rows) {
     constexpr unsigned int warps_per_block = 8U;
     const auto warp = threadIdx.x / warpSize;
     const auto lane = threadIdx.x % warpSize;
@@ -864,7 +866,8 @@ __global__ void bf16_gathered_matvec_rows_to_bf16_kernel(
                 value, __shfl_down_sync(0xFFFF'FFFFU, value, offset));
         }
         if (lane == 0U && index < tile_rows) {
-            output[static_cast<std::uint64_t>(tile_begin + index) * rows +
+            output[static_cast<std::uint64_t>(
+                       destination_rows[tile_begin + index]) * rows +
                    output_row] = __float2bfloat16_rn(value);
         }
     }

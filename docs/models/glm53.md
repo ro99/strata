@@ -73,7 +73,7 @@ block geometry before generation.
 
 ## Chat and server
 
-Two prefixes are **required** to reach the measured rates, not optional tuning:
+Two prefixes and one flag are **required** to reach the measured rates, not optional tuning:
 
 - `CUDA_DEVICE_ORDER=PCI_BUS_ID` — many shells export `FASTEST_FIRST`. Without
   this, `--devices 1,2` can silently select a different card than intended; on
@@ -83,19 +83,26 @@ Two prefixes are **required** to reach the measured rates, not optional tuning:
   placement lottery. Under the default policy the checkpoint lands 55.9/44.1
   across the two NUMA nodes in one run and 44.4/55.6 in the next, random in
   direction, which is a 6.7% spread on identical code (record 0218).
+- `--prefill-page-tokens 128` — worth **1.18x** on prompt processing, byte-identical.
+  The compiled default is 64, and the measured curve is flat from 128 upward, so 128
+  is the knee (record 0241). Below it the page re-traverses each layer's expert set
+  more times than it needs to: at 619 tokens, width 64 streams 529.2 GB of expert
+  weight against 342.3 GB at width 128. Going wider still removes another 3x of
+  bytes and buys nothing, because the host expert path is compute-bound at these
+  shapes, saturating near 77 GMAC/s.
 
 ```bash
 env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-chat \
   --model models/glm53f-mxfp4 --model-type glm53 \
   --devices 1,2 --context-size 2048 --max-new 256 \
-  --vram-fraction 0.85
+  --prefill-page-tokens 128 --vram-fraction 0.85
 
 env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-server \
   --model models/glm53f-mxfp4 --model-type glm53 --model-id glm53f-mxfp4 \
   --devices 1,2 --context-size 2048 --max-new 256 \
-  --vram-fraction 0.85 --port 8080
+  --prefill-page-tokens 128 --vram-fraction 0.85 --port 8080
 ```
 
 ### Reasoning

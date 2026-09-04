@@ -60,6 +60,7 @@ struct Options {
     bool device_resident_runtime{};
     bool rank_local_decode{};
     bool pin_resident_arena{};
+    bool device_prefill{};
     // Prompt rows per prefill page. The device-resident path executes a page
     // layer-major and groups its rows by expert, which is exact and faster;
     // 1 restores row-at-a-time prompt processing.
@@ -97,7 +98,7 @@ void usage() {
         << "                     [--pin-resident-arena]\n"
         << "                     [--device-resident-runtime]\n"
         << "                     [--decode-topology centralized|rank-local-tp2]\n"
-        << "                     [--prefill-page-tokens N]\n"
+        << "                     [--prefill-page-tokens N] [--device-prefill]\n"
         << "                     [--static-expert-plan PATH]\n"
         << "                     [--static-expert-bytes BYTES]\n"
         << "                     [--dry-run] [--replan]\n"
@@ -149,6 +150,8 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--pin-resident-arena") {
             options.pin_resident_arena = true;
+        } else if (argument == "--device-prefill") {
+            options.device_prefill = true;
             continue;
         }
         if (argument == "--dry-run") {
@@ -1573,6 +1576,7 @@ int main(int argc, char** argv) {
     config.deepseek_static_expert_plan = options.static_expert_plan;
     config.deepseek_static_expert_bytes = options.static_expert_bytes;
     config.pin_resident_arena = options.pin_resident_arena;
+    config.device_prefill = options.device_prefill;
     config.verbose = registration->verbose_by_default;
     config.load_progress = registration->progress_by_default;
     config.placement_cache_directory = options.plan_cache;

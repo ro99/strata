@@ -300,6 +300,8 @@ Flags worth knowing:
 | `--vram-fraction F` | Fraction of free VRAM budgeted for weight caching (default `0.85`) |
 | `--host-memory 216G` | Host RAM ceiling for the resident weight arena |
 | `--pin-resident-arena` | Page-lock DeepSeek's resident weights for faster host-to-device demand loads |
+| `--prefill-page-tokens N` | Prompt rows per layer-major prefill page, for models whose runtime pages prefill (DeepSeek, GLM-5.3). Zero keeps the runtime default |
+| `--device-prefill` | Build prompt attention state on the device instead of the host, where the runtime offers it. On GLM-5.3 it is worth about 1.38x and is unavailable above `--context-size 2048` |
 | `--flash-attention` | Use the exact CUDA attention fast path where it is faster |
 | `--no-prepack-mhc` | Disable the default exact AVX2-packed mHC projection path |
 | `--dry-run` | Size and place every component against this machine, print the plan, cache it, and exit without reading weights |

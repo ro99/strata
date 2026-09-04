@@ -79,6 +79,7 @@ struct Options {
     bool device_resident_runtime{};
     bool rank_local_decode{};
     bool pin_resident_arena{};
+    bool device_prefill{};
     bool prepack_mhc{true};
     bool no_colour{};
     std::string plan_cache;
@@ -145,7 +146,7 @@ bool takes_value(std::string_view argument) {
         "--model", "--model-type", "--prompt", "--system", "--plan-cache",
         "--reasoning-effort",
         "--decode-topology", "--context-size", "--max-context", "--max-new",
-        "--prefill-page-tokens",
+        "--prefill-page-tokens", "--device-prefill",
         "--temperature", "--vram-fraction", "--seed", "--preset", "--top-k",
         "--top-p", "--min-p", "--typical-p", "--xtc-probability",
         "--xtc-threshold", "--presence-penalty", "--frequency-penalty",
@@ -191,6 +192,7 @@ execution:
   --decode-topology T         centralized (default) | rank-local-tp2
   --prefill-page-tokens N     prompt rows per layer-major prefill page
   --pin-resident-arena        pin the resident weight arena
+  --device-prefill            build prompt attention state on the device
   --no-prepack-mhc            keep mHC projections in their stored layout
 
 placement:
@@ -273,6 +275,8 @@ bool parse_options(int argc, char** argv, Options& options) {
         }
         if (argument == "--pin-resident-arena") {
             options.pin_resident_arena = true;
+        } else if (argument == "--device-prefill") {
+            options.device_prefill = true;
             continue;
         }
         if (argument == "--no-prepack-mhc") {
@@ -1047,6 +1051,7 @@ int main(int argc, char** argv) {
     config.deepseek_rank_local_decode = options.rank_local_decode;
     config.prefill_page_tokens = options.prefill_page_tokens;
     config.pin_resident_arena = options.pin_resident_arena;
+    config.device_prefill = options.device_prefill;
     config.prepack_mhc_projection = options.prepack_mhc;
     config.placement_cache_directory = options.plan_cache;
     config.use_placement_cache = options.use_plan_cache;

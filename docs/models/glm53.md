@@ -83,12 +83,12 @@ Two prefixes and one flag are **required** to reach the measured rates, not opti
   placement lottery. Under the default policy the checkpoint lands 55.9/44.1
   across the two NUMA nodes in one run and 44.4/55.6 in the next, random in
   direction, which is a 6.7% spread on identical code (record 0218).
-- `STRATA_GLM53_DEVICE_PREFILL=1` — worth **1.38x** on prompt processing and by far the
-  larger of the two prefill levers, almost entirely by moving KDA off the host: 15.69 s
-  to 0.14 s at 619 tokens, 112x (record 0240). It is an environment variable with no CLI
-  flag and it defaults **off**. It is unavailable above `--context-size 2048`, because the
-  device chain computes no indexer k-pool state and `device_prefill_for_context()`
-  refuses it for any context that can cross `kIndexTopK`.
+- `--device-prefill` — worth **1.38x** on prompt processing and by far the larger of the
+  two prefill levers, almost entirely by moving KDA off the host: 15.69 s to 0.14 s at
+  619 tokens, 112x (record 0240). It defaults **off**, and it is unavailable above
+  `--context-size 2048`, because the device chain computes no indexer k-pool state and
+  `device_prefill_for_context()` refuses it for any context that can cross `kIndexTopK`.
+  `STRATA_GLM53_DEVICE_PREFILL=1` still sets it; the flag and the variable are OR-ed.
 - `--prefill-page-tokens 128` — worth a further **1.02x**, byte-identical. The compiled
   default is 64 and the curve is flat from 128 upward, so 128 is the knee. Do not expect
   more from it: weight bytes fall 4.7x between width 64 and 619 and prefill barely moves,
@@ -100,19 +100,17 @@ medians of interleaved repetitions. Above `--context-size 2048` only the width h
 applies, and it is worth about 1.06x.
 
 ```bash
-env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_GLM53_DEVICE_PREFILL=1 \
-  numactl --interleave=all \
+env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-chat \
   --model models/glm53f-mxfp4 --model-type glm53 \
   --devices 1,2 --context-size 2048 --max-new 256 \
-  --prefill-page-tokens 128 --vram-fraction 0.85
+  --device-prefill --prefill-page-tokens 128 --vram-fraction 0.85
 
-env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_GLM53_DEVICE_PREFILL=1 \
-  numactl --interleave=all \
+env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-server \
   --model models/glm53f-mxfp4 --model-type glm53 --model-id glm53f-mxfp4 \
   --devices 1,2 --context-size 2048 --max-new 256 \
-  --prefill-page-tokens 128 --vram-fraction 0.85 --port 8080
+  --device-prefill --prefill-page-tokens 128 --vram-fraction 0.85 --port 8080
 ```
 
 ### Reasoning

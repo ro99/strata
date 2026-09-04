@@ -90,6 +90,10 @@ struct RuntimeConfig {
     std::string deepseek_static_expert_plan;
     std::uint64_t deepseek_static_expert_bytes{};
     bool pin_resident_arena{};
+    // Build prompt attention state on the device rather than the host, for
+    // models whose runtime offers a device prefill path. A model that has no
+    // such path, or cannot use it for the requested context, ignores it.
+    bool device_prefill{};
     bool prepack_mhc_projection{true};
     // Placement plan cache. An empty directory selects the default location;
     // see placement_cache_directory. A cached plan that matches this

@@ -319,6 +319,7 @@ constexpr std::uint32_t kMtpLayer = 45U;
 // 1.96 GB/s blocked on identical cold bytes.
 constexpr std::size_t kExpertDispatchBlock = 64U;
 
+
 // STRATA_GLM53_EXPERT_DISPATCH_BLOCK overrides it for the M2 A/B. 1 reproduces
 // the previous single-index dispatch exactly, so both arms of the comparison
 // run the same binary and the build cannot be a confound. Production default
@@ -332,6 +333,7 @@ constexpr std::size_t kExpertDispatchBlock = 64U;
     }();
     return block;
 }
+
 constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
@@ -1284,10 +1286,7 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // device chain does not compute the k-pool keys and gates, so a sequence that
 // can cross kIndexTopK must prefill on the host or its indexer history is
 // missing exactly where it is first needed.
-[[nodiscard]] bool device_prefill_for_context(
-    std::uint32_t maximum_context_tokens) noexcept;
-
-[[nodiscard]] bool device_prefill_enabled() noexcept {
+[[nodiscard]] bool device_prefill_environment_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_PREFILL");
         return value != nullptr && std::string_view(value) != "0" &&
@@ -1297,10 +1296,11 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return enabled;
 }
 
-bool device_prefill_for_context(
-    std::uint32_t maximum_context_tokens) noexcept {
-    return device_prefill_enabled() &&
-           !sparse_indexer_active(maximum_context_tokens);
+// `requested` is the resolved configuration flag, which the runtime seeds from
+// the caller and from the environment once at initialization.
+[[nodiscard]] bool device_prefill_for_context(
+    bool requested, std::uint32_t maximum_context_tokens) noexcept {
+    return requested && !sparse_indexer_active(maximum_context_tokens);
 }
 
 [[nodiscard]] bool device_page_mla_enabled() noexcept {
@@ -8407,7 +8407,7 @@ struct Glm53Runtime::Impl {
             request->base_hidden);
         request->result.metrics.reused_prompt_tokens = reused;
         request->prefill_cursor = reused;
-        if (device_prefill_for_context(config.maximum_context_tokens)) {
+        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)) {
             if (!resident_execution_active) {
                 request->result.errors.emplace_back(
                     "GLM-5.3 device prefill requires the resident exact path");
@@ -8776,7 +8776,7 @@ struct Glm53Runtime::Impl {
     }
 
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
-        if (device_prefill_for_context(config.maximum_context_tokens)) {
+        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)) {
             auto synchronized = synchronize_kda_sequence_from_device(
                 request->sequence, request->device_sequence);
             if (!synchronized.ok()) {
@@ -8885,7 +8885,7 @@ struct Glm53Runtime::Impl {
             std::span<const std::uint32_t>(request->prompt).subspan(
                 request->prefill_cursor, count),
             request->logits, request->sequence, &request->base_hidden, false,
-            device_prefill_for_context(config.maximum_context_tokens)
+            device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)
                 ? &request->device_sequence : nullptr);
         if (!prefill.ok()) {
             request->result.errors = std::move(prefill.errors);
@@ -9288,6 +9288,8 @@ ValidationResult Glm53Runtime::initialize(
     impl_->config = config;
     impl_->config.phase_profile =
         config.phase_profile || phase_profile_environment_enabled();
+    impl_->config.device_prefill =
+        config.device_prefill || device_prefill_environment_enabled();
     impl_->config.prefill_page_tokens =
         prefill_page_tokens_from_environment(config.prefill_page_tokens);
     if (impl_->config.prefill_page_tokens == 0U ||

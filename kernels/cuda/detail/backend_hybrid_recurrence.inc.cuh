@@ -3005,6 +3005,15 @@ namespace {
 // without introducing a completion per request.
 constexpr std::size_t kGlm53MaxDeviceExperts =
     CudaBackend::kMaximumGlm53DeviceExperts;
+// Rows of the same expert folded into one launch. The kernel keeps a
+// float[Batch][8] register accumulator.
+//
+// Do not widen this without fixing the kernel first. Instantiating the
+// template at 8 and 16 is measurably faster -- 79.75 s to 68.05 s of kernel at
+// 1,925 tokens, 230 to 269 GMAC/s -- and it CHANGES THE OUTPUT: stdout
+// SHA-256 moves from 70fa50481ecc to 5410f72d64f0. The template is correct
+// only at the widths it was validated at, so the win is not available until
+// that is understood and fixed. Record 0245.
 constexpr std::size_t kGlm53ExpertKernelBatch = 4U;
 
 [[nodiscard]] bool same_glm53_expert(const CudaGlm53Expert& left,

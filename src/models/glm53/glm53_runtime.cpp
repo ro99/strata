@@ -3184,6 +3184,9 @@ struct Glm53Runtime::Impl {
         std::size_t count{};
     };
     std::vector<DeviceCommand> page_device_commands;
+    std::vector<std::size_t> page_device_sort_counts;
+    std::vector<std::size_t> page_device_sorted_slots;
+    std::vector<CudaGlm53Expert> page_device_sorted_experts;
     std::vector<float> page_device_inputs;
     std::vector<float> page_quantized_input;
     std::vector<float> page_activations;
@@ -4608,21 +4611,35 @@ struct Glm53Runtime::Impl {
                 ? static_cast<std::uint32_t>(routes[row][route].expert)
                 : 288U;
         };
-        for (std::size_t index = 1U; index < device_output_slots.size();
-             ++index) {
-            auto slot = device_output_slots[index];
-            auto descriptor = device_experts[index];
-            const auto key = device_key(slot);
-            auto insertion = index;
-            while (insertion != 0U &&
-                   device_key(device_output_slots[insertion - 1U]) > key) {
-                device_output_slots[insertion] =
-                    device_output_slots[insertion - 1U];
-                device_experts[insertion] = device_experts[insertion - 1U];
-                --insertion;
+        // Group identical experts so the kernel can fold their rows into one
+        // launch. Keys are expert ids plus one shared bucket, so this is a
+        // stable counting sort rather than the insertion sort this used to be:
+        // a decode cohort presents at most 288 entries, where O(n^2) is free,
+        // but a 1,925-row prefill page presents 17,325 and the insertion sort
+        // cost about 150 million moves per layer. Stability preserves the
+        // previous ordering exactly, so the result is unchanged.
+        {
+            const auto count = device_output_slots.size();
+            auto& counts = page_device_sort_counts;
+            counts.assign(290U, 0U);
+            for (std::size_t index = 0U; index < count; ++index) {
+                ++counts[device_key(device_output_slots[index]) + 1U];
             }
-            device_output_slots[insertion] = slot;
-            device_experts[insertion] = descriptor;
+            for (std::size_t bucket = 1U; bucket < counts.size(); ++bucket) {
+                counts[bucket] += counts[bucket - 1U];
+            }
+            auto& sorted_slots = page_device_sorted_slots;
+            auto& sorted_experts = page_device_sorted_experts;
+            sorted_slots.resize(count);
+            sorted_experts.resize(count);
+            for (std::size_t index = 0U; index < count; ++index) {
+                const auto slot = device_output_slots[index];
+                const auto destination = counts[device_key(slot)]++;
+                sorted_slots[destination] = slot;
+                sorted_experts[destination] = device_experts[index];
+            }
+            device_output_slots.swap(sorted_slots);
+            device_experts.swap(sorted_experts);
         }
         std::size_t assignment_begin = 0U;
         for (auto& group : groups) {

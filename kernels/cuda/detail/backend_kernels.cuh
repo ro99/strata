@@ -4358,10 +4358,88 @@ __global__ __launch_bounds__(128) void regfed_fp4_matmul_kernel(
     }
 }
 
-// The NVFP4 counterpart. Codes are the same E2M1 nibble pairs in the same
-// fragment order, so `regfed_fp4_prepack_codes_kernel` serves both formats
-// unchanged and `regfed_fp4_prepack_scales_kernel` is already parameterised by
-// `scale_columns`. Three things differ:
+// Split one FP32 activation into kTerms BF16 B-fragments, stored as kTerms
+// planes of the layout `regfed_activation_fragment_kernel` already produces.
+//
+// WHY THIS EXISTS. Experiment 0247 measured the single-term NVFP4 kernel at
+// 6.108e-03 against the scalar kernel over 60 real fixtures -- four orders
+// outside 0157's 7.53e-07 -- while its control arm, which feeds both kernels a
+// BF16-exact activation, measured 5.621e-07 on the same fixtures. So the whole
+// departure is this boundary and none of it is the weight path: BF16 keeps
+// eight significand bits, so rounding an FP32 activation costs 2^-8 relative
+// per element, and an exact weight operand cannot recover it.
+//
+// FP32 carries 24 significand bits, so THREE BF16 terms carry an FP32
+// activation exactly. `hi = bf16(x)` takes the top eight; `x - hi` is exact in
+// FP32 because it needs only the sixteen bits the rounding discarded; `mid`
+// takes the next eight and `lo` the last eight. Accumulating
+// sum(w*hi) + sum(w*mid) + sum(w*lo) therefore multiplies the same real number
+// the scalar kernel multiplies, and the production arm collapses onto the
+// control arm -- what is left is summation order, which the contract already
+// permits. Two terms leave 2^-16 and one leaves 2^-8.
+//
+// The cost is kTerms mma per K-tile and kTerms times the activation traffic.
+// The weight stream is unchanged and dominates: one 2048x4096 expert is 4.5 MB
+// of codes and scales against 64 KB of activation fragments at M=8.
+__device__ __forceinline__ void regfed_bf16_split(float value,
+                                                  std::uint32_t terms,
+                                                  std::uint32_t* out) {
+    for (std::uint32_t t = 0U; t < terms; ++t) {
+        const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+        out[t] = static_cast<std::uint32_t>(__bfloat16_as_ushort(rounded));
+        // Exact in FP32: the residual needs only the bits the rounding dropped.
+        value -= __bfloat162float(rounded);
+    }
+}
+
+template <std::uint32_t kTerms>
+__global__ void regfed_nvfp4_activation_fragment_kernel(
+    uint2* __restrict__ destination, const float* __restrict__ source,
+    std::uint32_t m, std::uint32_t columns, std::uint32_t column_blocks,
+    std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t total = k_tiles * column_blocks * groups_per_block * 4U;
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const std::uint32_t thread = index % 4U;
+        const std::uint32_t group = (index / 4U) % groups_per_block;
+        const std::uint32_t block =
+            (index / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile =
+            index / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        // b0 carries K rows {2t, 2t+1} and b1 carries {2t+8, 2t+9}, exactly as
+        // the single-term kernel lays them out.
+        std::uint32_t part[4][kTerms];
+#pragma unroll
+        for (std::uint32_t i = 0U; i < 4U; ++i)
+#pragma unroll
+            for (std::uint32_t t = 0U; t < kTerms; ++t) part[i][t] = 0U;
+        if (column < m) {
+            const float* row = source +
+                static_cast<std::size_t>(column) * columns +
+                k_tile * kRegfedTileK;
+            const std::uint32_t offset[4] = {thread * 2U, thread * 2U + 1U,
+                                             thread * 2U + 8U,
+                                             thread * 2U + 9U};
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                regfed_bf16_split(row[offset[i]], kTerms, part[i]);
+            }
+        }
+#pragma unroll
+        for (std::uint32_t t = 0U; t < kTerms; ++t) {
+            destination[static_cast<std::size_t>(t) * total + index] =
+                make_uint2(part[0][t] | (part[1][t] << 16U),
+                           part[2][t] | (part[3][t] << 16U));
+        }
+    }
+}
+
+// The NVFP4 counterpart of `regfed_fp4_matmul_kernel`. Codes are the same E2M1
+// nibble pairs in the same fragment order, so `regfed_fp4_prepack_codes_kernel`
+// serves both formats unchanged and `regfed_fp4_prepack_scales_kernel` is
+// already parameterised by `scale_columns`. Three things differ:
 //
 //   * groups of 16, so one K-tile is exactly one scale group and a block of
 //     four K-tiles reads four uint4 of scales where MXFP4 reads two;
@@ -4378,12 +4456,13 @@ __global__ __launch_bounds__(128) void regfed_fp4_matmul_kernel(
 // (sum(x_i * w_i * s_i)) / g. Division is used rather than a reciprocal
 // multiply so the single rounding matches the scalar kernel's operation.
 //
-// This path is therefore held to a tolerance, not to an output hash, under the
-// owner ruling of 2026-09-04. The activation boundary is the other half of
-// that: GLM's NVFP4 activation is FP32 and `regfed_activation_fragment_kernel`
-// rounds it to BF16 for the tensor op, where the scalar kernel keeps FP32.
-template <std::uint32_t kColBlocks>
-__global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
+// This path is held to a tolerance, not to an output hash, under the owner
+// ruling of 2026-09-04. With kTerms = 3 the activation boundary is exact and
+// the tolerance is the reassociation alone; experiment 0247 measured both.
+//
+// The body is shared with the grouped form below so the two cannot drift.
+template <std::uint32_t kColBlocks, std::uint32_t kTerms>
+__device__ __forceinline__ void regfed_nvfp4_matmul_body(
     float* __restrict__ output, const std::uint32_t* __restrict__ codes,
     const unsigned char* __restrict__ scales, float global_scale,
     const uint2* __restrict__ activations, std::uint32_t columns,
@@ -4400,6 +4479,9 @@ __global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
     const std::uint32_t group = lane >> 2U;
     const std::uint32_t thread = lane & 3U;
     const std::uint32_t shift = (group & 3U) * 8U;
+    // One activation plane per BF16 term, in the order the split kernel wrote.
+    const std::size_t plane = static_cast<std::size_t>(k_tiles) * kColBlocks *
+                              groups_per_block * 4U;
     __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
 
     bool live[kColBlocks];
@@ -4415,11 +4497,24 @@ __global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
          work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
         const std::uint32_t n_tile = work / split;
         const std::uint32_t slice = work % split;
-        float acc[kColBlocks][4];
+        // ONE ACCUMULATOR PER TERM, not one shared accumulator.
+        //
+        // Experiment 0247 measured the shared form at 2.222e-06 against the
+        // scalar kernel with a three-term split that represents the activation
+        // EXACTLY -- so the residual was not the split. It was this: a mid-term
+        // product is 2^-8 of a hi-term product, and adding it into a running
+        // sum of hi-terms rounds at 2^-24 of that running sum, which discards
+        // most of what the extra term was computed to recover. Summing each
+        // term in its own accumulator keeps the mid sum accurate relative to
+        // its own magnitude, and the three are combined once at publication,
+        // smallest first.
+        float acc[kColBlocks][kTerms][4];
 #pragma unroll
         for (std::uint32_t c = 0U; c < kColBlocks; ++c)
 #pragma unroll
-            for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][i] = 0.0F;
+            for (std::uint32_t t = 0U; t < kTerms; ++t)
+#pragma unroll
+                for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][t][i] = 0.0F;
 
         const uint4* code4 = reinterpret_cast<const uint4*>(codes);
         const std::uint32_t begin = slice * blocks_per_slice;
@@ -4450,11 +4545,20 @@ __global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
                     kColBlocks * groups_per_block * 4U;
 #pragma unroll
                 for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
-                    const uint2 b =
-                        live[c] ? activations[tile_base + activation_offset[c]]
-                                : make_uint2(0U, 0U);
-                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
-                                      a[0], a[1], a[2], a[3], b.x, b.y);
+                    // Every term shares the decoded weight fragment, so the
+                    // extra cost is the mma and the fragment read, never a
+                    // second pass over the weight stream.
+#pragma unroll
+                    for (std::uint32_t t = 0U; t < kTerms; ++t) {
+                        const uint2 b =
+                            live[c] ? activations[static_cast<std::size_t>(t) *
+                                                      plane + tile_base +
+                                                  activation_offset[c]]
+                                    : make_uint2(0U, 0U);
+                        dsv4_mma_m16n8k16(acc[c][t][0], acc[c][t][1],
+                                          acc[c][t][2], acc[c][t][3], a[0],
+                                          a[1], a[2], a[3], b.x, b.y);
+                    }
                 }
             }
         }
@@ -4468,7 +4572,14 @@ __global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
                 const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
                 const std::uint32_t column =
                     c * kRegfedTileM + thread * 2U + (i & 1U);
-                if (column < m) slot[row * m + column] = acc[c][i];
+                // Smallest term first, so the correction is not lost to the
+                // rounding of the sum it is correcting.
+                float total = acc[c][kTerms - 1U][i];
+#pragma unroll
+                for (std::uint32_t t = kTerms - 1U; t > 0U; --t) {
+                    total += acc[c][t - 1U][i];
+                }
+                if (column < m) slot[row * m + column] = total;
             }
         }
 
@@ -4495,6 +4606,55 @@ __global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
             if (lane == 0U) counters[n_tile] = 0U;
         }
     }
+}
+
+template <std::uint32_t kColBlocks, std::uint32_t kTerms = 1U>
+__global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
+    float* __restrict__ output, const std::uint32_t* __restrict__ codes,
+    const unsigned char* __restrict__ scales, float global_scale,
+    const uint2* __restrict__ activations, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t split, std::uint32_t m,
+    std::uint32_t groups_per_block, float* __restrict__ partials,
+    std::uint32_t* __restrict__ counters) {
+    regfed_nvfp4_matmul_body<kColBlocks, kTerms>(
+        output, codes, scales, global_scale, activations, columns, rows, split,
+        m, groups_per_block, partials, counters);
+}
+
+// One routed expert of a grouped dispatch. Partials and counters are per
+// expert because blocks of different experts are resident at the same time and
+// the split-K fold is a counter handshake, so sharing either is a race.
+struct RegfedNvfp4Slice {
+    const std::uint32_t* codes;
+    const unsigned char* scales;
+    const uint2* activations;
+    float* output;
+    float* partials;
+    std::uint32_t* counters;
+    float global_scale;
+};
+
+// The grouped form, on the same shape as
+// `glm53_shared_expert_nvfp4_dot_grouped_kernel`: `blockIdx.y` selects the
+// expert and one launch covers every expert of a page.
+//
+// WHY THIS EXISTS. Experiment 0247 measured the single-expert launch at 337
+// GB/s against 0148's >=632 gate, and found the split-K sweep monotone all the
+// way to split 16 -- where split-K partial traffic is 45% of the useful weight
+// bytes and still wins. A kernel that gains from paying 45% overhead is starved
+// of parallelism, not bandwidth-bound: one 2048x4096 expert is 128 N-tiles, so
+// a single-expert launch offers 32 blocks at split 1 on 82 SMs. 0148's accepted
+// 704-750 GB/s was measured at 32 experts per launch, and this is that shape.
+template <std::uint32_t kColBlocks, std::uint32_t kTerms = 1U>
+__global__ __launch_bounds__(128) void regfed_nvfp4_grouped_matmul_kernel(
+    const RegfedNvfp4Slice* __restrict__ slices, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t split, std::uint32_t m,
+    std::uint32_t groups_per_block) {
+    const RegfedNvfp4Slice slice = slices[blockIdx.y];
+    regfed_nvfp4_matmul_body<kColBlocks, kTerms>(
+        slice.output, slice.codes, slice.scales, slice.global_scale,
+        slice.activations, columns, rows, split, m, groups_per_block,
+        slice.partials, slice.counters);
 }
 
 template <std::uint32_t kColBlocks>

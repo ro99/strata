@@ -368,6 +368,7 @@ constexpr std::size_t kExpertReductionBlock = 1024U;
 // crossover, because only those two widths were measured. Unset selects it by
 // width; an explicit 0/1 forces it either way.
 constexpr std::uint32_t kDevicePageStagingMinimumRows = 1536U;
+constexpr std::uint64_t kDevicePageStagingReserveBytes = 2ULL << 30U;
 
 [[nodiscard]] int device_page_staging_override() noexcept {
     static const int setting = [] {
@@ -1971,9 +1972,15 @@ public:
         return {};
     }
 
+    // `reserve` is device cache the tier must not take. A wide prefill page
+    // demand-stages its experts through the same cache, and the tier otherwise
+    // fills it completely at load, so staging would find no room and every
+    // routed expert would fall back to the host -- which is exactly what the
+    // shipped default did before this reserve existed.
     [[nodiscard]] ValidationResult pin_expert(
         std::size_t slot, std::uint32_t layer, std::uint32_t expert,
-        CudaGlm53Expert& descriptor, bool& admitted) {
+        CudaGlm53Expert& descriptor, bool& admitted,
+        std::uint64_t reserve = 0U) {
         admitted = false;
         if (slot >= states_.size() || layer >= kLayers || expert >= 288U ||
             !glm53_moe_layer(layer)) {
@@ -1994,7 +2001,8 @@ public:
                 required += bytes;
             }
         }
-        if (required > state.capacity - state.used) return {};
+        const auto free_bytes = state.capacity - state.used;
+        if (required + reserve > free_bytes) return {};
         std::array<Entry*, 3U> entries{};
         for (std::size_t index = 0U; index < projections.size(); ++index) {
             const auto& projection = projections[index];
@@ -3569,6 +3577,21 @@ struct Glm53Runtime::Impl {
         }
     }
 
+    // Cache the static tier must leave free on each device so a wide prefill
+    // page can demand-stage into it. Zero when the configured page is too
+    // narrow to use staging, so a decode-shaped deployment keeps the whole
+    // tier and loses nothing.
+    //
+    // One layer's routed set is on the order of a hundred experts, split
+    // across the devices, so a couple of gigabytes per device covers it with
+    // room for the rolling replacement.
+    [[nodiscard]] std::uint64_t static_expert_staging_reserve() const noexcept {
+        if (!device_page_staging_enabled(config.prefill_page_tokens)) {
+            return 0U;
+        }
+        return kDevicePageStagingReserveBytes;
+    }
+
     [[nodiscard]] std::size_t slot_for(std::uint32_t layer) const noexcept {
         const auto target_layer = std::min(layer, kLayers - 1U);
         return device_schedule[target_layer % device_schedule.size()];
@@ -4177,7 +4200,8 @@ struct Glm53Runtime::Impl {
             CudaGlm53Expert descriptor;
             bool admitted = false;
             auto status = weights->pin_expert(
-                slot, candidate.layer, candidate.expert, descriptor, admitted);
+                slot, candidate.layer, candidate.expert, descriptor, admitted,
+                static_expert_staging_reserve());
             if (!status.ok()) return status;
             if (!admitted) continue;
             const auto bytes = descriptor.gate->device_bytes() +

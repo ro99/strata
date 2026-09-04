@@ -3003,7 +3003,8 @@ namespace {
 // experts plus the shared one. Duplicate descriptors are intentional: they
 // let a cohort apply one resident matrix to several independent activations
 // without introducing a completion per request.
-constexpr std::size_t kGlm53MaxDeviceExperts = 32U * 9U;
+constexpr std::size_t kGlm53MaxDeviceExperts =
+    CudaBackend::kMaximumGlm53DeviceExperts;
 constexpr std::size_t kGlm53ExpertKernelBatch = 4U;
 
 [[nodiscard]] bool same_glm53_expert(const CudaGlm53Expert& left,

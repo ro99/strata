@@ -1231,6 +1231,12 @@ public:
     //
     // The shared expert is the one-element case. A routed hot tier is the same
     // call with more of them.
+    // The most experts one enqueue accepts. It bounds the device-side gate,
+    // up and down workspaces, so a caller with more work than this -- a wide
+    // prefill page puts every (row, route) pair on the device -- splits into
+    // several commands rather than growing the workspace.
+    static constexpr std::size_t kMaximumGlm53DeviceExperts = 32U * 9U;
+
     [[nodiscard]] ValidationResult enqueue_glm53_expert_gate_up(
         int device, std::span<const CudaGlm53Expert> experts,
         std::span<const float> input);

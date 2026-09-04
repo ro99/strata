@@ -346,6 +346,38 @@ constexpr std::size_t kExpertReductionBlock = 1024U;
 // STRATA_GLM53_EXPERT_REDUCTION_BLOCK does the same for the reduction. 1
 // reproduces the previous per-(row, column) dispatch exactly, so both arms of
 // that comparison also run one binary.
+// Let a prefill page execute its routed experts on the device: tier-resident
+// experts cost no upload at all, and the rest are demand-staged into the
+// device weight cache. Both prefill page call sites left `allow_device_tiers`
+// defaulted to false, so before this the static tier served decode only and a
+// prefill page ran every routed expert on the host -- measured at 4,476
+// identical host traversals with the tier on and off (this session).
+// Demand-stage a prefill page's non-tier routed experts into the device
+// weight cache. Separate from the tier switch above because the two have
+// different resource stories: the tier costs no upload and is bounded by what
+// was pinned at load, while staging trades PCIe bytes for host arithmetic and
+// is bounded by whatever cache capacity the pinned tier left behind.
+[[nodiscard]] bool device_page_staging_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_DEVICE_PAGE_STAGING");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool device_page_experts_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_DEVICE_PAGE_EXPERTS");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 [[nodiscard]] std::size_t expert_reduction_block() noexcept {
     static const std::size_t block = [] {
         const char* value = std::getenv("STRATA_GLM53_EXPERT_REDUCTION_BLOCK");
@@ -1838,6 +1870,72 @@ public:
     // Pin one complete routed expert atomically inside the already-admitted
     // weight arena. Static residency consumes the arena's measured reusable
     // tail; it never allocates a second representation outside the ledger.
+    // The three projections that make up one routed expert. Shared by the
+    // pinned static tier, the prefetch path, and the demand-staged prefill
+    // path so the three cannot drift on key spelling or extents.
+    struct ExpertProjection {
+        std::string key;
+        std::uint64_t rows{};
+        std::uint64_t columns{};
+    };
+
+    [[nodiscard]] static std::array<ExpertProjection, 3U> expert_projections(
+        std::uint32_t layer, std::uint32_t expert) {
+        const auto prefix = "model.language_model.layers." +
+                            std::to_string(layer) + ".mlp.experts." +
+                            std::to_string(expert) + ".";
+        return {{{prefix + "gate_proj", 2048U, kHidden},
+                 {prefix + "up_proj", 2048U, kHidden},
+                 {prefix + "down_proj", kHidden, 2048U}}};
+    }
+
+    [[nodiscard]] ValidationResult describe_expert(
+        std::span<const ExpertProjection> projections,
+        std::span<Entry* const> entries,
+        CudaGlm53Expert& descriptor) {
+        const auto weight_name =
+            checkpoint_.weight_tensor_name(projections[0].key);
+        const auto* weight = checkpoint_.find(weight_name);
+        if (weight == nullptr) {
+            return {{"GLM-5.3 routed expert has no source descriptor"}};
+        }
+        CudaGlm53ExpertEncoding encoding{};
+        // The two FP4 payloads are both U8, so the tensor name is what tells
+        // them apart -- the same discriminator the host path uses.
+        const bool nvfp4 = weight_name.ends_with(".weight_packed");
+        if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
+            encoding = CudaGlm53ExpertEncoding::Fp8E4m3Block128F32;
+        } else if (weight->source_dtype == SafetensorsDtype::U8) {
+            encoding = nvfp4 ? CudaGlm53ExpertEncoding::Nvfp4Group16E4m3
+                             : CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0;
+        } else if (weight->source_dtype == SafetensorsDtype::Bf16) {
+            encoding = CudaGlm53ExpertEncoding::Bf16;
+        } else {
+            return {{"GLM-5.3 routed expert encoding is unsupported"}};
+        }
+        descriptor = {};
+        descriptor.hidden = kHidden;
+        descriptor.intermediate = 2048U;
+        descriptor.encoding = encoding;
+        if (nvfp4) {
+            // Each projection carries its own divisor, so all three are read
+            // rather than one being reused for the triplet.
+            std::array<float*, 3U> targets{&descriptor.gate_global_scale,
+                                           &descriptor.up_global_scale,
+                                           &descriptor.down_global_scale};
+            for (std::size_t index = 0U; index < projections.size(); ++index) {
+                auto divisor =
+                    checkpoint_.nvfp4_global_scale(projections[index].key);
+                if (!divisor.ok()) return {std::move(divisor.errors)};
+                *targets[index] = divisor.value;
+            }
+        }
+        descriptor.gate = &entries[0]->weight;
+        descriptor.up = &entries[1]->weight;
+        descriptor.down = &entries[2]->weight;
+        return {};
+    }
+
     [[nodiscard]] ValidationResult pin_expert(
         std::size_t slot, std::uint32_t layer, std::uint32_t expert,
         CudaGlm53Expert& descriptor, bool& admitted) {
@@ -1846,18 +1944,7 @@ public:
             !glm53_moe_layer(layer)) {
             return {{"GLM-5.3 static expert references an invalid target"}};
         }
-        const auto prefix = "model.language_model.layers." +
-                            std::to_string(layer) + ".mlp.experts." +
-                            std::to_string(expert) + ".";
-        struct Projection {
-            std::string key;
-            std::uint64_t rows{};
-            std::uint64_t columns{};
-        };
-        const std::array<Projection, 3U> projections{{
-            {prefix + "gate_proj", 2048U, kHidden},
-            {prefix + "up_proj", 2048U, kHidden},
-            {prefix + "down_proj", kHidden, 2048U}}};
+        const auto projections = expert_projections(layer, expert);
         auto& state = *states_[slot];
         std::scoped_lock lock(state.mutex);
         std::uint64_t required = 0U;
@@ -1902,48 +1989,108 @@ public:
             }
             entries[index] = &found->second;
         }
-        const auto weight_name =
-            checkpoint_.weight_tensor_name(projections[0].key);
-        const auto* weight = checkpoint_.find(weight_name);
-        if (weight == nullptr) {
-            return {{"GLM-5.3 static expert has no source descriptor"}};
-        }
-        CudaGlm53ExpertEncoding encoding{};
-        // The two FP4 payloads are both U8, so the tensor name is what tells
-        // them apart -- the same discriminator the host path uses.
-        const bool nvfp4 = weight_name.ends_with(".weight_packed");
-        if (weight->source_dtype == SafetensorsDtype::F8E4M3) {
-            encoding = CudaGlm53ExpertEncoding::Fp8E4m3Block128F32;
-        } else if (weight->source_dtype == SafetensorsDtype::U8) {
-            encoding = nvfp4 ? CudaGlm53ExpertEncoding::Nvfp4Group16E4m3
-                             : CudaGlm53ExpertEncoding::Fp4E2m1Group32E8m0;
-        } else if (weight->source_dtype == SafetensorsDtype::Bf16) {
-            encoding = CudaGlm53ExpertEncoding::Bf16;
-        } else {
-            return {{"GLM-5.3 static expert encoding is unsupported"}};
-        }
-        descriptor = {};
-        descriptor.hidden = kHidden;
-        descriptor.intermediate = 2048U;
-        descriptor.encoding = encoding;
-        if (nvfp4) {
-            // Each projection carries its own divisor, so all three are read
-            // rather than one being reused for the triplet.
-            std::array<float*, 3U> targets{&descriptor.gate_global_scale,
-                                           &descriptor.up_global_scale,
-                                           &descriptor.down_global_scale};
-            for (std::size_t index = 0U; index < projections.size(); ++index) {
-                auto divisor =
-                    checkpoint_.nvfp4_global_scale(projections[index].key);
-                if (!divisor.ok()) return {std::move(divisor.errors)};
-                *targets[index] = divisor.value;
-            }
-        }
-        descriptor.gate = &entries[0]->weight;
-        descriptor.up = &entries[1]->weight;
-        descriptor.down = &entries[2]->weight;
+        auto status = describe_expert(projections, entries, descriptor);
+        if (!status.ok()) return status;
         admitted = true;
         return {};
+    }
+
+    // Demand-stage one routed expert into the device weight cache for a
+    // prefill page, and describe it for the device expert kernels.
+    //
+    // This is pin_expert's twin, and the difference is the whole point: the
+    // static tier admits only into free capacity and pins what it takes, so it
+    // stops once the arena is full and never recycles. A prefill page instead
+    // sweeps a layer's whole routed set once, so it wants the ordinary LRU
+    // path -- evict the coldest unpinned, unleased entry and load -- which
+    // bounds residency at the page's per-layer working set instead of at the
+    // model's expert count.
+    //
+    // `staged` comes back false, without an error, when the cache cannot hold
+    // the expert; the caller keeps that expert on the host. That is a capacity
+    // answer, not a failure, and it is what makes the mechanism degrade into
+    // the existing host path rather than fail closed.
+    [[nodiscard]] ValidationResult stage_expert(
+        std::size_t slot, std::uint32_t layer, std::uint32_t expert,
+        CudaGlm53Expert& descriptor, bool& staged) {
+        staged = false;
+        if (slot >= states_.size() || layer >= kLayers || expert >= 288U ||
+            !glm53_moe_layer(layer)) {
+            return {{"GLM-5.3 staged expert references an invalid target"}};
+        }
+        const auto projections = expert_projections(layer, expert);
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        std::array<Entry*, 3U> entries{};
+        for (std::size_t index = 0U; index < projections.size(); ++index) {
+            const auto& projection = projections[index];
+            auto found = state.entries.find(projection.key);
+            if (found != state.entries.end()) {
+                // Keep the whole triplet hot together: an expert whose gate is
+                // resident but whose down has aged out is worse than useless,
+                // because the page pays a fault mid-expert.
+                state.recency.splice(state.recency.end(), state.recency,
+                                     found->second.recency);
+                ++state.hits;
+                entries[index] = &found->second;
+                continue;
+            }
+            const auto bytes =
+                checkpoint_.cuda_linear_storage_bytes(projection.key);
+            if (bytes == 0U) {
+                return {{"GLM-5.3 staged expert projection is absent: " +
+                         projection.key}};
+            }
+            if (bytes > state.capacity) return {};
+            while (state.used + bytes > state.capacity) {
+                if (!evict_one(state)) return {};
+            }
+            Entry entry;
+            auto loaded = checkpoint_.load_cuda_linear(
+                projection.key, projection.rows, projection.columns,
+                devices_[slot], backend_, entry.weight, false, true);
+            while (!loaded.ok() && arena_exhausted(loaded) &&
+                   evict_one(state)) {
+                entry.weight = CudaWeight{};
+                loaded = checkpoint_.load_cuda_linear(
+                    projection.key, projection.rows, projection.columns,
+                    devices_[slot], backend_, entry.weight, false, true);
+            }
+            if (!loaded.ok()) return loaded;
+            const auto actual = entry.weight.device_bytes();
+            if (actual > state.capacity - state.used) return {};
+            state.recency.push_back(projection.key);
+            entry.recency = std::prev(state.recency.end());
+            state.used += actual;
+            ++state.misses;
+            entries[index] = &state.entries.emplace(
+                projection.key, std::move(entry)).first->second;
+        }
+        auto status = describe_expert(projections, entries, descriptor);
+        if (!status.ok()) return status;
+        // Lease the triplet. The page memoizes this descriptor for the rest of
+        // the layer, and a later miss must not evict the buffers it points at.
+        for (auto* entry : entries) ++entry->leases;
+        staged = true;
+        return {};
+    }
+
+    // Drop the lease stage_expert took. Safe to call for an expert that was
+    // never staged: the entry may already have been evicted after release.
+    void release_staged_expert(
+        std::size_t slot, std::uint32_t layer, std::uint32_t expert) {
+        if (slot >= states_.size() || layer >= kLayers || expert >= 288U) {
+            return;
+        }
+        const auto projections = expert_projections(layer, expert);
+        auto& state = *states_[slot];
+        std::scoped_lock lock(state.mutex);
+        for (const auto& projection : projections) {
+            const auto found = state.entries.find(projection.key);
+            if (found != state.entries.end() && found->second.leases != 0U) {
+                --found->second.leases;
+            }
+        }
     }
 
     [[nodiscard]] ValidationResult matmul(
@@ -2090,18 +2237,7 @@ public:
             !glm53_moe_layer(layer)) {
             return { {"GLM-5.3 expert prefetch has an invalid target"} };
         }
-        const auto prefix = "model.language_model.layers." +
-                            std::to_string(layer) + ".mlp.experts." +
-                            std::to_string(expert) + ".";
-        struct Projection {
-            std::string key;
-            std::uint64_t rows{};
-            std::uint64_t columns{};
-        };
-        const std::array<Projection, 3U> projections{{
-            {prefix + "gate_proj", 2048U, kHidden},
-            {prefix + "up_proj", 2048U, kHidden},
-            {prefix + "down_proj", kHidden, 2048U}}};
+        const auto projections = expert_projections(layer, expert);
         auto& state = *states_[slot];
         std::scoped_lock lock(state.mutex);
         bool admitted = false;
@@ -3020,6 +3156,14 @@ struct Glm53Runtime::Impl {
     std::vector<PageAssignment> page_assignments;
     std::vector<CudaGlm53Expert> page_device_experts;
     std::vector<std::size_t> page_device_output_slots;
+    enum class StagingState : std::uint8_t { Unknown, Staged, Unavailable };
+    std::atomic<std::uint64_t> page_staged_routes{};
+
+    struct DeviceCommand {
+        std::size_t begin{};
+        std::size_t count{};
+    };
+    std::vector<DeviceCommand> page_device_commands;
     std::vector<float> page_device_inputs;
     std::vector<float> page_quantized_input;
     std::vector<float> page_activations;
@@ -4328,6 +4472,31 @@ struct Glm53Runtime::Impl {
         auto& device_output_slots = page_device_output_slots;
         device_experts.clear();
         device_output_slots.clear();
+        // Demand-staged experts for this layer. The guard releases every lease
+        // on the way out, including the early returns below, so a failed page
+        // cannot strand entries the cache would then refuse to evict.
+        const auto layer_device_slot = slot_for(layer);
+        struct StagingScratch {
+            Glm53WeightCache* weights{};
+            std::size_t slot{};
+            std::uint32_t layer{};
+            bool enabled{};
+            std::array<StagingState, 288U> state{};
+            std::array<CudaGlm53Expert, 288U> descriptor{};
+            std::vector<std::uint32_t> leased;
+            ~StagingScratch() {
+                for (const auto expert : leased) {
+                    weights->release_staged_expert(slot, layer, expert);
+                }
+            }
+        };
+        StagingScratch staging;
+        staging.weights = weights.get();
+        staging.slot = layer_device_slot;
+        staging.layer = layer;
+        staging.enabled =
+            allow_device_tiers && device_page_staging_enabled();
+        staging.leased.reserve(288U);
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto expert = routes[row][route].expert;
@@ -4345,6 +4514,37 @@ struct Glm53Runtime::Impl {
                     static_experts.route_hits.fetch_add(
                         1U, std::memory_order_relaxed);
                     continue;
+                }
+                // Not in the pinned tier. Demand-stage it into the device
+                // weight cache and run it on the device anyway. Resolved once
+                // per expert per layer and memoized, because a page sweeps its
+                // rows in row order and would otherwise re-resolve the same
+                // expert on every row that routes to it.
+                if (allow_device_tiers && staging.enabled) {
+                    auto& slot_state = staging.state[expert];
+                    if (slot_state == StagingState::Unknown) {
+                        CudaGlm53Expert staged_descriptor{};
+                        bool staged = false;
+                        auto status = weights->stage_expert(
+                            layer_device_slot, layer, expert,
+                            staged_descriptor, staged);
+                        if (!status.ok()) return status;
+                        if (staged) {
+                            staging.descriptor[expert] = staged_descriptor;
+                            staging.leased.push_back(expert);
+                            slot_state = StagingState::Staged;
+                        } else {
+                            slot_state = StagingState::Unavailable;
+                        }
+                    }
+                    if (slot_state == StagingState::Staged) {
+                        device_experts.push_back(staging.descriptor[expert]);
+                        device_output_slots.push_back(
+                            row * outputs_per_row + route);
+                        page_staged_routes.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        continue;
+                    }
                 }
                 if (allow_device_tiers && static_experts.active_tier) {
                     static_experts.route_misses.fetch_add(
@@ -4487,26 +4687,26 @@ struct Glm53Runtime::Impl {
         }
 
         const auto device_count = device_experts.size();
-        struct DeviceCommand {
-            std::size_t begin{};
-            std::size_t count{};
-        };
-        std::array<DeviceCommand, 2U> device_commands{};
-        std::size_t device_command_count = 0U;
+        // Commands split on two boundaries: a change of encoding, because one
+        // enqueue is homogeneous, and the kernel's batch limit, because that
+        // limit sizes the device gate/up/down workspaces. A decode cohort
+        // never reached the second one -- admission caps it at 32 sequences,
+        // which is exactly the limit -- but a prefill page puts every
+        // (row, route) pair on the device and passes it on the first layer.
+        auto& device_commands = page_device_commands;
+        device_commands.clear();
         for (std::size_t begin = 0U; begin < device_count;) {
             auto end = begin + 1U;
             while (end < device_count &&
+                   end - begin < CudaBackend::kMaximumGlm53DeviceExperts &&
                    device_experts[end].encoding ==
                        device_experts[begin].encoding) {
                 ++end;
             }
-            if (device_command_count == device_commands.size()) {
-                return {{"GLM-5.3 device page requires too many expert "
-                         "encoding commands"}};
-            }
-            device_commands[device_command_count++] = {begin, end - begin};
+            device_commands.push_back({begin, end - begin});
             begin = end;
         }
+        const auto device_command_count = device_commands.size();
         auto& device_inputs = page_device_inputs;
         if (device_inputs.size() < device_count * kHidden) {
             return {{"GLM-5.3 device page input scratch is too small"}};
@@ -7304,7 +7504,7 @@ struct Glm53Runtime::Impl {
         const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward_page(
             branch, normalized, rows, layer, prefix, route_requests,
-            route_positions, false, true);
+            route_positions, false, true, device_page_experts_enabled());
         if (!result.ok()) return result;
         if (config.phase_profile) {
             graph_feedforward_block_nanoseconds.fetch_add(
@@ -7417,7 +7617,8 @@ struct Glm53Runtime::Impl {
         }
         const auto feedforward_started = std::chrono::steady_clock::now();
         result = feedforward_page(branch, normalized, rows, layer, prefix,
-                                  route_requests, route_positions, false, true);
+                                  route_requests, route_positions, false, true,
+                                  device_page_experts_enabled());
         if (!result.ok()) return result;
         if (config.phase_profile) {
             graph_feedforward_block_nanoseconds.fetch_add(
@@ -9557,8 +9758,14 @@ ValidationResult Glm53Runtime::initialize(
             impl_->config.prefill_page_tokens);
         constexpr std::size_t outputs_per_page_row = 9U;
         constexpr std::size_t maximum_cohort_rows = 32U;
-        constexpr std::size_t maximum_device_assignments =
-            maximum_cohort_rows * outputs_per_page_row;
+        // A prefill page can put every one of its (row, route) pairs on the
+        // device, which is far more than a decode cohort ever produces. These
+        // buffers were sized for the cohort alone, so enabling device experts
+        // on the page path failed closed with "device page input scratch is
+        // too small" until the page's own width was admitted here.
+        const std::size_t maximum_device_assignments = std::max(
+            maximum_cohort_rows * outputs_per_page_row,
+            page_rows * outputs_per_page_row);
         impl_->page_groups.reserve(Impl::kExpertSlots);
         impl_->page_assignments.resize(page_rows * outputs_per_page_row);
         impl_->page_device_experts.reserve(maximum_device_assignments);

@@ -3985,6 +3985,7 @@ constexpr std::uint32_t kRegfedTileM = 8U;    // MMA N dimension = activation co
 constexpr std::uint32_t kRegfedTileK = 16U;   // MMA K dimension
 constexpr std::uint32_t kRegfedWarp = 32U;
 constexpr std::uint32_t kRegfedGroup = 32U;   // E8M0 group along K for FP4
+constexpr std::uint32_t kRegfedNvfp4Group = 16U;  // E4M3 group along K, NVFP4
 // Experiment 0140 measured argmax as load granularity: one uint4 per lane per
 // four K-tiles makes a warp issue one fully coalesced 512-byte transaction that
 // feeds four MMAs.
@@ -4007,6 +4008,51 @@ __constant__ std::uint32_t kRegfedFp4MagnitudeLow[2] = {0xC080'0000U,
 __device__ __forceinline__ std::uint32_t regfed_fp4_scale_pair(
     std::uint32_t code) {
     return (code << 7U) * 0x0001'0001U;
+}
+
+// One NVFP4 E4M3 group scale to the same broadcast BF16 pair.
+//
+// The E8M0 form above is two instructions because a power-of-two scale is only
+// an exponent field. An E4M3 scale carries three mantissa bits, so the code has
+// to be widened into BF16's fields and re-biased: E4M3's exponent bias is 7 and
+// BF16's is 127, which is the constant 120 added to the exponent. Both formats
+// then reach `regfed_fp4_decode_fragment` as an ordinary BF16 multiplier, so
+// the decode itself is shared and only this helper differs.
+//
+// Exactness. The widened field is exact -- an E4M3 value has three mantissa
+// bits and BF16 has seven -- and so is the product with an E2M1 code, whose
+// significand needs one bit: (1 + a/8)(1 + b/2) has at most four fractional
+// bits before normalisation and five after, still inside BF16's seven. The
+// scaled weight the tensor op consumes is therefore the same real number the
+// scalar kernel multiplies, exactly as the header's contract requires.
+//
+// Subnormals are normalised rather than widened. An E4M3 subnormal is
+// mmm * 2^-9, which BF16 represents as a normal number, and feeding the mma a
+// subnormal operand would risk flush-to-zero on a value the scalar oracle
+// keeps. The branch is uniform-false for every scale in the shipped
+// checkpoint and predicates away.
+//
+// Codes 0x7F and 0xFF are E4M3 NaN, and this construction maps them to a large
+// finite BF16 rather than to NaN, where `fp8_e4m3_value` returns NaN. That is
+// the E4M3 counterpart of 0148's open E8M0 0/255 admission check and it is a
+// load-time question, not a kernel one: it belongs beside
+// `dsv4_admit_e8m0_scales` when this path is integrated. Experiment 0247
+// censuses the shipped checkpoint for these codes and reports the count.
+__device__ __forceinline__ std::uint32_t regfed_nvfp4_scale_pair(
+    std::uint32_t code) {
+    const std::uint32_t sign = (code << 8U) & 0x0000'8000U;
+    // eeeemmm lands in bits 10..4: exponent at BF16's bit 7, mantissa below it.
+    std::uint32_t bits = ((code & 0x7FU) << 4U) + (120U << 7U);
+    if ((code & 0x78U) == 0U) {
+        const std::uint32_t mantissa = code & 0x07U;
+        // mmm * 2^-9 == 2^(s-9) * (1 + f), s = floor(log2(mmm)).
+        const std::uint32_t shift = 31U - __clz(mantissa | 1U);
+        bits = mantissa == 0U
+                   ? 0U
+                   : (((127U - 9U + shift) << 7U) |
+                      ((mantissa << (7U - shift)) & 0x7FU));
+    }
+    return (bits | sign) * 0x0001'0001U;
 }
 
 // Eight E2M1 codes to four packed BF16 pairs, in MMA A-fragment register order.
@@ -4312,6 +4358,145 @@ __global__ __launch_bounds__(128) void regfed_fp4_matmul_kernel(
     }
 }
 
+// The NVFP4 counterpart. Codes are the same E2M1 nibble pairs in the same
+// fragment order, so `regfed_fp4_prepack_codes_kernel` serves both formats
+// unchanged and `regfed_fp4_prepack_scales_kernel` is already parameterised by
+// `scale_columns`. Three things differ:
+//
+//   * groups of 16, so one K-tile is exactly one scale group and a block of
+//     four K-tiles reads four uint4 of scales where MXFP4 reads two;
+//   * an E4M3 scale, decoded by `regfed_nvfp4_scale_pair`;
+//   * a per-tensor FP32 divisor.
+//
+// THE DIVISOR IS A REASSOCIATION, AND IT IS THE ONE DELIBERATE NUMERICAL
+// DIFFERENCE IN THIS KERNEL. `glm53_shared_expert_nvfp4_dot_kernel` divides
+// every group scale by `global_scale` before multiplying, accumulating
+// sum(x_i * w_i * (s_i / g)). It cannot fold into the BF16 weight here: the
+// quotient s_i/g is an arbitrary FP32 value, and rounding it into BF16 would
+// destroy the exactness the scaled weight otherwise has. So it applies once to
+// the FP32 accumulator after the mma and after the split-K reduction, giving
+// (sum(x_i * w_i * s_i)) / g. Division is used rather than a reciprocal
+// multiply so the single rounding matches the scalar kernel's operation.
+//
+// This path is therefore held to a tolerance, not to an output hash, under the
+// owner ruling of 2026-09-04. The activation boundary is the other half of
+// that: GLM's NVFP4 activation is FP32 and `regfed_activation_fragment_kernel`
+// rounds it to BF16 for the tensor op, where the scalar kernel keeps FP32.
+template <std::uint32_t kColBlocks>
+__global__ __launch_bounds__(128) void regfed_nvfp4_matmul_kernel(
+    float* __restrict__ output, const std::uint32_t* __restrict__ codes,
+    const unsigned char* __restrict__ scales, float global_scale,
+    const uint2* __restrict__ activations, std::uint32_t columns,
+    std::uint32_t rows, std::uint32_t split, std::uint32_t m,
+    std::uint32_t groups_per_block, float* __restrict__ partials,
+    std::uint32_t* __restrict__ counters) {
+    const std::uint32_t lane = threadIdx.x & 31U;
+    const std::uint32_t warp = threadIdx.x >> 5U;
+    const std::uint32_t n_tiles = rows / kRegfedTileN;
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t k_blocks = k_tiles / kRegfedKPerLoad;
+    const std::uint32_t blocks_per_slice = k_blocks / split;
+    const std::uint32_t scale_columns = columns / kRegfedNvfp4Group;
+    const std::uint32_t group = lane >> 2U;
+    const std::uint32_t thread = lane & 3U;
+    const std::uint32_t shift = (group & 3U) * 8U;
+    __shared__ std::uint32_t arrived[kRegfedWarpsPerBlock];
+
+    bool live[kColBlocks];
+    std::size_t activation_offset[kColBlocks];
+#pragma unroll
+    for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+        live[c] = group < groups_per_block && c * kRegfedTileM + group < m;
+        activation_offset[c] =
+            (static_cast<std::size_t>(c) * groups_per_block + group) * 4U + thread;
+    }
+
+    for (std::uint32_t work = blockIdx.x * kRegfedWarpsPerBlock + warp;
+         work < n_tiles * split; work += gridDim.x * kRegfedWarpsPerBlock) {
+        const std::uint32_t n_tile = work / split;
+        const std::uint32_t slice = work % split;
+        float acc[kColBlocks][4];
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c)
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) acc[c][i] = 0.0F;
+
+        const uint4* code4 = reinterpret_cast<const uint4*>(codes);
+        const std::uint32_t begin = slice * blocks_per_slice;
+        const std::uint32_t end = begin + blocks_per_slice;
+        for (std::uint32_t block = begin; block < end; ++block) {
+            const uint4 packed =
+                code4[(static_cast<std::size_t>(n_tile) * k_blocks + block) *
+                          kRegfedWarp + lane];
+            // One K-tile is one group of 16, so the block's four K-tiles need
+            // four scale groups where the E8M0 path needs two.
+            const unsigned char* base =
+                scales + (static_cast<std::size_t>(n_tile) * scale_columns +
+                          block * kRegfedKPerLoad) * kRegfedTileN;
+            const std::uint32_t word[kRegfedKPerLoad] = {packed.x, packed.y,
+                                                         packed.z, packed.w};
+#pragma unroll
+            for (std::uint32_t j = 0U; j < kRegfedKPerLoad; ++j) {
+                const uint4 chosen = *reinterpret_cast<const uint4*>(
+                    base + j * kRegfedTileN);
+                const std::uint32_t low_word = (group < 4U) ? chosen.x : chosen.y;
+                const std::uint32_t high_word = (group < 4U) ? chosen.z : chosen.w;
+                std::uint32_t a[4];
+                regfed_fp4_decode_fragment(
+                    word[j], regfed_nvfp4_scale_pair((low_word >> shift) & 0xFFU),
+                    regfed_nvfp4_scale_pair((high_word >> shift) & 0xFFU), a);
+                const std::size_t tile_base =
+                    (static_cast<std::size_t>(block) * kRegfedKPerLoad + j) *
+                    kColBlocks * groups_per_block * 4U;
+#pragma unroll
+                for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+                    const uint2 b =
+                        live[c] ? activations[tile_base + activation_offset[c]]
+                                : make_uint2(0U, 0U);
+                    dsv4_mma_m16n8k16(acc[c][0], acc[c][1], acc[c][2], acc[c][3],
+                                      a[0], a[1], a[2], a[3], b.x, b.y);
+                }
+            }
+        }
+
+        float* slot = partials + (static_cast<std::size_t>(work)) *
+                                     kRegfedTileN * kRegfedMaxM;
+#pragma unroll
+        for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                const std::uint32_t row = group + ((i >= 2U) ? 8U : 0U);
+                const std::uint32_t column =
+                    c * kRegfedTileM + thread * 2U + (i & 1U);
+                if (column < m) slot[row * m + column] = acc[c][i];
+            }
+        }
+
+        __threadfence();
+        __syncwarp();
+        if (lane == 0U) {
+            arrived[warp] = atomicAdd(&counters[n_tile], 1U);
+        }
+        __syncwarp();
+        if (arrived[warp] == split - 1U) {
+            if (lane < kRegfedTileN) {
+                for (std::uint32_t column = 0U; column < m; ++column) {
+                    float sum = 0.0F;
+                    for (std::uint32_t s = 0U; s < split; ++s) {
+                        sum += partials[(static_cast<std::size_t>(n_tile) *
+                                             split + s) * kRegfedTileN *
+                                            kRegfedMaxM + lane * m + column];
+                    }
+                    // The per-tensor divisor, once, on the completed FP32 sum.
+                    output[static_cast<std::size_t>(column) * rows +
+                           n_tile * kRegfedTileN + lane] = sum / global_scale;
+                }
+            }
+            if (lane == 0U) counters[n_tile] = 0U;
+        }
+    }
+}
+
 template <std::uint32_t kColBlocks>
 __global__ __launch_bounds__(128) void regfed_fp8_matmul_kernel(
     float* __restrict__ output, const uint4* __restrict__ codes,
@@ -4570,6 +4755,18 @@ __global__ __launch_bounds__(128) void regfed_fp8_f32_matmul_kernel(
     return rows % kRegfedTileN == 0U &&
            columns % (kRegfedTileK * kRegfedKPerLoad) == 0U &&
            columns % kRegfedGroup == 0U && rows >= kRegfedTileN &&
+           columns >= kRegfedTileK * kRegfedKPerLoad;
+}
+
+// NVFP4 admits strictly more shapes than MXFP4: a group of 16 is exactly one
+// K-tile, so the group constraint is implied by the K-block one and only the
+// tile extents remain. Both of GLM's routed expert shapes -- 2048x4096 for
+// gate and up, 4096x2048 for down -- satisfy it.
+[[nodiscard]] inline bool regfed_nvfp4_shape_admissible(
+    std::uint64_t rows, std::uint64_t columns) noexcept {
+    return rows % kRegfedTileN == 0U &&
+           columns % (kRegfedTileK * kRegfedKPerLoad) == 0U &&
+           rows >= kRegfedTileN &&
            columns >= kRegfedTileK * kRegfedKPerLoad;
 }
 

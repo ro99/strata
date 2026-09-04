@@ -83,22 +83,32 @@ Two prefixes and one flag are **required** to reach the measured rates, not opti
   placement lottery. Under the default policy the checkpoint lands 55.9/44.1
   across the two NUMA nodes in one run and 44.4/55.6 in the next, random in
   direction, which is a 6.7% spread on identical code (record 0218).
-- `--prefill-page-tokens 128` — worth **1.18x** on prompt processing, byte-identical.
-  The compiled default is 64, and the measured curve is flat from 128 upward, so 128
-  is the knee (record 0241). Below it the page re-traverses each layer's expert set
-  more times than it needs to: at 619 tokens, width 64 streams 529.2 GB of expert
-  weight against 342.3 GB at width 128. Going wider still removes another 3x of
-  bytes and buys nothing, because the host expert path is compute-bound at these
-  shapes, saturating near 77 GMAC/s.
+- `STRATA_GLM53_DEVICE_PREFILL=1` — worth **1.38x** on prompt processing and by far the
+  larger of the two prefill levers, almost entirely by moving KDA off the host: 15.69 s
+  to 0.14 s at 619 tokens, 112x (record 0240). It is an environment variable with no CLI
+  flag and it defaults **off**. It is unavailable above `--context-size 2048`, because the
+  device chain computes no indexer k-pool state and `device_prefill_for_context()`
+  refuses it for any context that can cross `kIndexTopK`.
+- `--prefill-page-tokens 128` — worth a further **1.02x**, byte-identical. The compiled
+  default is 64 and the curve is flat from 128 upward, so 128 is the knee. Do not expect
+  more from it: weight bytes fall 4.7x between width 64 and 619 and prefill barely moves,
+  because the host expert path is **compute-bound** at these shapes, saturating near
+  77 GMAC/s — roughly 11% of this host's AVX2 FMA peak (records 0241, 0242).
+
+Together the two are **1.411x** at 619 tokens, byte-identical: 129.40 s to 91.71 s,
+medians of interleaved repetitions. Above `--context-size 2048` only the width half
+applies, and it is worth about 1.06x.
 
 ```bash
-env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_GLM53_DEVICE_PREFILL=1 \
+  numactl --interleave=all \
   ./build-release/strata-chat \
   --model models/glm53f-mxfp4 --model-type glm53 \
   --devices 1,2 --context-size 2048 --max-new 256 \
   --prefill-page-tokens 128 --vram-fraction 0.85
 
-env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_GLM53_DEVICE_PREFILL=1 \
+  numactl --interleave=all \
   ./build-release/strata-server \
   --model models/glm53f-mxfp4 --model-type glm53 --model-id glm53f-mxfp4 \
   --devices 1,2 --context-size 2048 --max-new 256 \
@@ -167,7 +177,8 @@ twice and read the second run: the static expert tier uploads about 9.5 GiB at
 startup, so a cold first process understates by up to 1.8x.
 
 ```bash
-env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_GLM53_DEVICE_PREFILL=1 \
+  numactl --interleave=all \
   ./build-release/strata-chat \
   --model models/glm53f-mxfp4 --model-type glm53 \
   --prompt 'Write the natural numbers in order, one per line, starting at 1. Continue until you reach 1000.' \

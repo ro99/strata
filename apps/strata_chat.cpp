@@ -189,7 +189,7 @@ execution:
   --block-kv-cache            DeepSeek physical KV pages
   --device-resident-runtime   the whole DeepSeek device-resident decode contract
   --decode-topology T         centralized (default) | rank-local-tp2
-  --prefill-page-tokens N     DeepSeek prompt rows per layer-major page
+  --prefill-page-tokens N     prompt rows per layer-major prefill page
   --pin-resident-arena        pin the resident weight arena
   --no-prepack-mhc            keep mHC projections in their stored layout
 
@@ -1045,7 +1045,7 @@ int main(int argc, char** argv) {
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
     config.deepseek_rank_local_decode = options.rank_local_decode;
-    config.deepseek_prefill_page_tokens = options.prefill_page_tokens;
+    config.prefill_page_tokens = options.prefill_page_tokens;
     config.pin_resident_arena = options.pin_resident_arena;
     config.prepack_mhc_projection = options.prepack_mhc;
     config.placement_cache_directory = options.plan_cache;

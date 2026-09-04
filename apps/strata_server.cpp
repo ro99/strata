@@ -1568,7 +1568,7 @@ int main(int argc, char** argv) {
         options.flash_attention || registration->flash_attention_by_default;
     config.deepseek_block_kv_cache = options.block_kv_cache;
     config.deepseek_device_resident_runtime = options.device_resident_runtime;
-    config.deepseek_prefill_page_tokens = options.prefill_page_tokens;
+    config.prefill_page_tokens = options.prefill_page_tokens;
     config.deepseek_rank_local_decode = options.rank_local_decode;
     config.deepseek_static_expert_plan = options.static_expert_plan;
     config.deepseek_static_expert_bytes = options.static_expert_bytes;

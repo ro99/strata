@@ -78,11 +78,11 @@ struct RuntimeConfig {
     // NCCL build and exactly two devices, and implies the device-resident
     // contract above.
     bool deepseek_rank_local_decode{};
-    // Prompt rows per prefill page. Zero keeps the runtime default. The
-    // device-resident path executes a page layer-major over one mHC slot per
-    // row and groups the page's rows by expert; 1 restores row-at-a-time
-    // prompt processing.
-    std::uint32_t deepseek_prefill_page_tokens{};
+    // Prompt rows per prefill page, for every model whose runtime pages its
+    // prefill. Zero keeps that runtime's own default. A page is executed
+    // layer-major and its rows are grouped by expert, so one weight traversal
+    // serves the whole page; 1 restores row-at-a-time prompt processing.
+    std::uint32_t prefill_page_tokens{};
     // Routed-expert tier: a plan produced by the offline experiment planner,
     // VRAM each rank device spends holding its slice of it. The bytes come out
     // of the centralized prefill expert cache, which decode never reads.

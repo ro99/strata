@@ -116,6 +116,11 @@ struct CudaBackend::Impl {
         // the host starts its eight routed experts.
         float* glm53_shared_staging{};
         std::uint32_t glm53_shared_staging_floats{};
+        // Grouped expert launch: one device slice per (expert, assignment),
+        // so a whole command is one kernel instead of one per four rows.
+        Glm53ExpertSlice* glm53_expert_slices{};
+        Glm53ExpertSlice* glm53_expert_slices_host{};
+        std::uint32_t glm53_expert_slice_capacity{};
         bool glm53_mla_scores_pending{};
         std::uint32_t glm53_shared_batch{};
         bool glm53_shared_gate_up_in_flight{};

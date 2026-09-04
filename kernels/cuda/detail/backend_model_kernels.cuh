@@ -3233,6 +3233,90 @@ __global__ void glm53_shared_expert_fp4_dot_kernel(
 // NVFP4 counterpart. The nibble packing is MXFP4's, but a scale covers 16
 // columns rather than 32 and is an E4M3 code divided by the tensor's F32
 // global scale. Eight columns is exactly half a group, so the eight threads
+// One slice of a grouped expert launch: the weights, scales and input row for
+// a single (expert, assignment) pair, plus where its dot lands.
+struct Glm53ExpertSlice {
+    const unsigned char* weights;
+    const unsigned char* scales;
+    const float* input;
+    float* output;
+    float global_scale;
+};
+
+// The grouped form of the kernel below. Per-thread arithmetic, the eight-group
+// mapping, the shuffle tree and the final association are all identical; the
+// only change is that blockIdx.y selects which (expert, row) pair a block
+// serves, so one launch covers every assignment in a command instead of one
+// launch per group of at most four.
+//
+// That matters because the ungrouped grid is (intermediate * 8 / threads) = 64
+// blocks, which cannot fill an 82-SM device: a 1,925-token page issued roughly
+// 363,000 such launches and measured 230 GMAC/s, about 0.66% of tensor peak.
+//
+// Being a pure re-mapping, this is bit-identical by construction. Widening the
+// Batch template is not -- see kGlm53ExpertKernelBatch.
+__global__ void glm53_shared_expert_nvfp4_dot_grouped_kernel(
+    const Glm53ExpertSlice* slices, std::uint32_t rows,
+    std::uint32_t columns) {
+    constexpr std::uint32_t kGroups = 8U;
+    const Glm53ExpertSlice slice = slices[blockIdx.y];
+    const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t row = thread / kGroups;
+    const std::uint32_t group = thread % kGroups;
+    if (row >= rows) return;
+    const auto* weight_row = slice.weights +
+        static_cast<std::uint64_t>(row) * (columns / 2U);
+    const auto* scale_row = slice.scales +
+        static_cast<std::uint64_t>(row) * (columns / 16U);
+    float accumulator[8];
+#pragma unroll
+    for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
+    for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
+        const float scale =
+            fp8_e4m3_value(scale_row[column / 16U + group / 2U]) /
+            slice.global_scale;
+        const auto packed = *reinterpret_cast<const unsigned int*>(
+            weight_row + column / 2U + group * 4U);
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            const auto encoded = (packed >> (lane * 4U)) & 0x0FU;
+            accumulator[lane] = __fmaf_rn(
+                __fmul_rn(fp4_e2m1_value(encoded), scale),
+                slice.input[column + group * 8U + lane],
+                accumulator[lane]);
+        }
+    }
+    const unsigned mask = __activemask();
+#pragma unroll
+    for (int width = 4; width != 0; width >>= 1) {
+#pragma unroll
+        for (int lane = 0; lane < 8; ++lane) {
+            const float other = __shfl_down_sync(
+                mask, accumulator[lane], width, kGroups);
+            if (static_cast<int>(group) < width) {
+                accumulator[lane] = __fadd_rn(accumulator[lane], other);
+            }
+        }
+    }
+    if (group != 0U) return;
+    float total[4];
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        total[lane] = __fadd_rn(accumulator[lane], accumulator[lane + 4]);
+    }
+    slice.output[row] = __fadd_rn(__fadd_rn(total[0], total[1]),
+                                  __fadd_rn(total[2], total[3]));
+}
+
+inline void launch_glm53_shared_expert_nvfp4_dot_grouped(
+    dim3 blocks, dim3 threads, cudaStream_t stream,
+    const Glm53ExpertSlice* slices, std::uint32_t rows,
+    std::uint32_t columns) {
+    glm53_shared_expert_nvfp4_dot_grouped_kernel<<<blocks, threads, 0U,
+                                                   stream>>>(slices, rows,
+                                                             columns);
+}
+
 // pair up onto four scales per 64-column step instead of splitting into two
 // halves; everything else -- the accumulator vectors, the shuffle tree, the
 // combine order -- is the FP4 kernel's, so the two formats differ only in the

@@ -381,6 +381,21 @@ constexpr std::uint32_t kDevicePageStagingMinimumRows = 1536U;
     return setting;
 }
 
+// Split a page's staged experts across every device instead of staging them
+// all onto the layer's own. Layers execute in sequence because layer L+1
+// consumes layer L, so the cards that do not own the current layer would
+// otherwise sit idle for the whole prefill.
+[[nodiscard]] bool device_expert_parallel_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_DEVICE_EXPERT_PARALLEL");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool device_page_staging_enabled(std::uint32_t rows) noexcept {
     const auto override = device_page_staging_override();
     if (override >= 0) return override == 1;
@@ -3182,11 +3197,17 @@ struct Glm53Runtime::Impl {
     struct DeviceCommand {
         std::size_t begin{};
         std::size_t count{};
+        std::uint8_t slot{};
     };
     std::vector<DeviceCommand> page_device_commands;
+    // Which device each device-expert entry's weights live on. The tier pins
+    // an expert to one device and the shared expert has its own, so this is
+    // tracked rather than derived from the layer.
+    std::vector<std::uint8_t> page_device_entry_slots;
     std::vector<std::size_t> page_device_sort_counts;
     std::vector<std::size_t> page_device_sorted_slots;
     std::vector<CudaGlm53Expert> page_device_sorted_experts;
+    std::vector<std::uint8_t> page_device_sorted_entry_slots;
     std::vector<float> page_device_inputs;
     std::vector<float> page_quantized_input;
     std::vector<float> page_activations;
@@ -4480,6 +4501,7 @@ struct Glm53Runtime::Impl {
         const auto started = std::chrono::steady_clock::now();
         const auto view_started = started;
         const int layer_device = device_for(layer);
+        const auto layer_device_slot = slot_for(layer);
         const int shared_device = allow_device_tiers &&
                                   shared_experts.active &&
                                   layer < shared_experts.devices.size()
@@ -4487,29 +4509,36 @@ struct Glm53Runtime::Impl {
         if (shared_device >= 0 && shared_device != layer_device) {
             return {{"GLM-5.3 expert tiers disagree on layer owner"}};
         }
+        const auto shared_device_slot = layer_device_slot;
         std::array<std::size_t, 288U> group_for_expert;
         group_for_expert.fill(std::numeric_limits<std::size_t>::max());
         auto& groups = page_groups;
         groups.clear();
         auto& device_experts = page_device_experts;
         auto& device_output_slots = page_device_output_slots;
+        auto& device_entry_slots = page_device_entry_slots;
         device_experts.clear();
         device_output_slots.clear();
+        device_entry_slots.clear();
         // Demand-staged experts for this layer. The guard releases every lease
         // on the way out, including the early returns below, so a failed page
         // cannot strand entries the cache would then refuse to evict.
-        const auto layer_device_slot = slot_for(layer);
         struct StagingScratch {
             Glm53WeightCache* weights{};
             std::size_t slot{};
             std::uint32_t layer{};
             bool enabled{};
+            bool parallel{};
+            std::size_t slot_count{1U};
             std::array<StagingState, 288U> state{};
             std::array<CudaGlm53Expert, 288U> descriptor{};
+            std::array<std::uint8_t, 288U> slot_for_expert{};
             std::vector<std::uint32_t> leased;
+            std::vector<std::uint8_t> leased_slot;
             ~StagingScratch() {
-                for (const auto expert : leased) {
-                    weights->release_staged_expert(slot, layer, expert);
+                for (std::size_t index = 0U; index < leased.size(); ++index) {
+                    weights->release_staged_expert(leased_slot[index], layer,
+                                                   leased[index]);
                 }
             }
         };
@@ -4520,6 +4549,11 @@ struct Glm53Runtime::Impl {
         staging.enabled =
             allow_device_tiers && device_page_staging_enabled(rows);
         staging.leased.reserve(288U);
+        staging.leased_slot.reserve(288U);
+        staging.slot_count = devices.size();
+        staging.parallel =
+            staging.enabled && device_expert_parallel_enabled() &&
+            staging.slot_count > 1U;
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto expert = routes[row][route].expert;
@@ -4534,6 +4568,8 @@ struct Glm53Runtime::Impl {
                         static_experts.experts[layer][expert]);
                     device_output_slots.push_back(
                         row * outputs_per_row + route);
+                    device_entry_slots.push_back(
+                        static_cast<std::uint8_t>(layer_device_slot));
                     static_experts.route_hits.fetch_add(
                         1U, std::memory_order_relaxed);
                     continue;
@@ -4548,13 +4584,26 @@ struct Glm53Runtime::Impl {
                     if (slot_state == StagingState::Unknown) {
                         CudaGlm53Expert staged_descriptor{};
                         bool staged = false;
+                        // Spread a layer's experts across every device rather
+                        // than piling them on the layer's own. Layers run in
+                        // sequence, so without this the other card idles
+                        // through the whole page; experts are independent and
+                        // host-mediated, so splitting them reassociates
+                        // nothing.
+                        const auto target = staging.parallel
+                            ? static_cast<std::size_t>(expert) %
+                                  staging.slot_count
+                            : layer_device_slot;
                         auto status = weights->stage_expert(
-                            layer_device_slot, layer, expert,
-                            staged_descriptor, staged);
+                            target, layer, expert, staged_descriptor, staged);
                         if (!status.ok()) return status;
                         if (staged) {
                             staging.descriptor[expert] = staged_descriptor;
+                            staging.slot_for_expert[expert] =
+                                static_cast<std::uint8_t>(target);
                             staging.leased.push_back(expert);
+                            staging.leased_slot.push_back(
+                                static_cast<std::uint8_t>(target));
                             slot_state = StagingState::Staged;
                         } else {
                             slot_state = StagingState::Unavailable;
@@ -4564,6 +4613,8 @@ struct Glm53Runtime::Impl {
                         device_experts.push_back(staging.descriptor[expert]);
                         device_output_slots.push_back(
                             row * outputs_per_row + route);
+                        device_entry_slots.push_back(
+                            staging.slot_for_expert[expert]);
                         page_staged_routes.fetch_add(
                             1U, std::memory_order_relaxed);
                         continue;
@@ -4584,6 +4635,8 @@ struct Glm53Runtime::Impl {
                 device_experts.push_back(shared_experts.experts[layer]);
                 device_output_slots.push_back(
                     row * outputs_per_row + routes_per_row);
+                device_entry_slots.push_back(
+                    static_cast<std::uint8_t>(shared_device_slot));
                 shared_expert_device_calls.fetch_add(
                     1U, std::memory_order_relaxed);
             }
@@ -4620,26 +4673,34 @@ struct Glm53Runtime::Impl {
         // previous ordering exactly, so the result is unchanged.
         {
             const auto count = device_output_slots.size();
+            const auto slot_count = devices.size();
+            const auto bucket_of = [&](std::size_t index) {
+                return static_cast<std::size_t>(device_entry_slots[index]) *
+                           290U + device_key(device_output_slots[index]);
+            };
             auto& counts = page_device_sort_counts;
-            counts.assign(290U, 0U);
+            counts.assign(slot_count * 290U + 1U, 0U);
             for (std::size_t index = 0U; index < count; ++index) {
-                ++counts[device_key(device_output_slots[index]) + 1U];
+                ++counts[bucket_of(index) + 1U];
             }
             for (std::size_t bucket = 1U; bucket < counts.size(); ++bucket) {
                 counts[bucket] += counts[bucket - 1U];
             }
             auto& sorted_slots = page_device_sorted_slots;
             auto& sorted_experts = page_device_sorted_experts;
+            auto& sorted_entry_slots = page_device_sorted_entry_slots;
             sorted_slots.resize(count);
             sorted_experts.resize(count);
+            sorted_entry_slots.resize(count);
             for (std::size_t index = 0U; index < count; ++index) {
-                const auto slot = device_output_slots[index];
-                const auto destination = counts[device_key(slot)]++;
-                sorted_slots[destination] = slot;
+                const auto destination = counts[bucket_of(index)]++;
+                sorted_slots[destination] = device_output_slots[index];
                 sorted_experts[destination] = device_experts[index];
+                sorted_entry_slots[destination] = device_entry_slots[index];
             }
             device_output_slots.swap(sorted_slots);
             device_experts.swap(sorted_experts);
+            device_entry_slots.swap(sorted_entry_slots);
         }
         std::size_t assignment_begin = 0U;
         for (auto& group : groups) {
@@ -4736,11 +4797,13 @@ struct Glm53Runtime::Impl {
             auto end = begin + 1U;
             while (end < device_count &&
                    end - begin < CudaBackend::kMaximumGlm53DeviceExperts &&
+                   device_entry_slots[end] == device_entry_slots[begin] &&
                    device_experts[end].encoding ==
                        device_experts[begin].encoding) {
                 ++end;
             }
-            device_commands.push_back({begin, end - begin});
+            device_commands.push_back(
+                {begin, end - begin, device_entry_slots[begin]});
             begin = end;
         }
         const auto device_command_count = device_commands.size();
@@ -4760,7 +4823,7 @@ struct Glm53Runtime::Impl {
         if (device_command_count != 0U) {
             const auto& command = device_commands.front();
             result = cuda.enqueue_glm53_expert_gate_up(
-                layer_device,
+                devices[command.slot],
                 std::span<const CudaGlm53Expert>(device_experts)
                     .subspan(command.begin, command.count),
                 std::span<const float>(device_inputs)
@@ -4829,7 +4892,7 @@ struct Glm53Runtime::Impl {
             auto up = std::span<float>(shared_expert_up)
                 .subspan(begin, count);
             auto status = cuda.collect_glm53_expert_gate_up(
-                layer_device, gate, up);
+                devices[command.slot], gate, up);
             if (!status.ok()) return status;
             for (std::size_t index = 0U; index < count; ++index) {
                 auto gate_value = bf16_round_f32(gate[index]);
@@ -4847,7 +4910,7 @@ struct Glm53Runtime::Impl {
                 }
             }
             return cuda.enqueue_glm53_expert_down(
-                layer_device,
+                devices[command.slot],
                 std::span<const CudaGlm53Expert>(device_experts)
                     .subspan(command.begin, command.count),
                 std::span<const float>(gate));
@@ -4899,7 +4962,7 @@ struct Glm53Runtime::Impl {
             auto device_output = std::span<float>(shared_expert_output)
                 .subspan(command.begin * kHidden, command.count * kHidden);
             auto status = cuda.collect_glm53_expert_down(
-                layer_device, device_output);
+                devices[command.slot], device_output);
             if (!status.ok()) return status;
             for (std::size_t offset = 0U; offset < command.count; ++offset) {
                 const auto index = command.begin + offset;
@@ -4920,21 +4983,67 @@ struct Glm53Runtime::Impl {
             result = collect_device_command(device_commands.front());
             if (!result.ok()) return result;
         }
-        for (std::size_t command_index = 1U;
-             command_index < device_command_count; ++command_index) {
-            const auto& command = device_commands[command_index];
-            result = cuda.enqueue_glm53_expert_gate_up(
-                layer_device,
-                std::span<const CudaGlm53Expert>(device_experts)
-                    .subspan(command.begin, command.count),
-                std::span<const float>(device_inputs)
-                    .subspan(command.begin * kHidden,
-                             command.count * kHidden));
-            if (!result.ok()) return result;
-            result = activate_device_command(command);
-            if (!result.ok()) return result;
-            result = collect_device_command(command);
-            if (!result.ok()) return result;
+        // Walk the remaining commands with one in flight per device. Commands
+        // are contiguous per device after the sort, so this keeps every card
+        // busy: while one drains its gate/up and runs the host SwiGLU, the
+        // others are already computing theirs. With a single device it reduces
+        // to the previous sequential walk.
+        {
+            const auto enqueue_command =
+                [&](const DeviceCommand& command) -> ValidationResult {
+                return cuda.enqueue_glm53_expert_gate_up(
+                    devices[command.slot],
+                    std::span<const CudaGlm53Expert>(device_experts)
+                        .subspan(command.begin, command.count),
+                    std::span<const float>(device_inputs)
+                        .subspan(command.begin * kHidden,
+                                 command.count * kHidden));
+            };
+            std::vector<std::size_t> next(devices.size(), 0U);
+            std::vector<std::size_t> end(devices.size(), 0U);
+            for (std::size_t index = 1U; index < device_command_count;
+                 ++index) {
+                const auto slot = device_commands[index].slot;
+                if (next[slot] == 0U) next[slot] = index;
+                end[slot] = index + 1U;
+            }
+            std::vector<std::size_t> live(devices.size(),
+                                          std::numeric_limits<std::size_t>::max());
+            for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                if (next[slot] == 0U || next[slot] >= end[slot]) continue;
+                result = enqueue_command(device_commands[next[slot]]);
+                if (!result.ok()) return result;
+                live[slot] = next[slot]++;
+            }
+            for (;;) {
+                bool progressed = false;
+                for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                    if (live[slot] == std::numeric_limits<std::size_t>::max()) {
+                        continue;
+                    }
+                    progressed = true;
+                    result =
+                        activate_device_command(device_commands[live[slot]]);
+                    if (!result.ok()) return result;
+                }
+                for (std::size_t slot = 0U; slot < devices.size(); ++slot) {
+                    if (live[slot] == std::numeric_limits<std::size_t>::max()) {
+                        continue;
+                    }
+                    result =
+                        collect_device_command(device_commands[live[slot]]);
+                    if (!result.ok()) return result;
+                    if (next[slot] < end[slot]) {
+                        result = enqueue_command(device_commands[next[slot]]);
+                        if (!result.ok()) return result;
+                        live[slot] = next[slot]++;
+                    } else {
+                        live[slot] =
+                            std::numeric_limits<std::size_t>::max();
+                    }
+                }
+                if (!progressed) break;
+            }
         }
         const auto reduction_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for_blocked(

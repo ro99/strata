@@ -357,14 +357,34 @@ constexpr std::size_t kExpertReductionBlock = 1024U;
 // different resource stories: the tier costs no upload and is bounded by what
 // was pinned at load, while staging trades PCIe bytes for host arithmetic and
 // is bounded by whatever cache capacity the pinned tier left behind.
-[[nodiscard]] bool device_page_staging_enabled() noexcept {
-    static const bool enabled = [] {
+// Staging pays for itself only once a page is wide enough to amortize the
+// upload. Upload volume is set by (layers x distinct experts per layer) and is
+// nearly flat in row count -- measured 110.6 GB at 619 rows against 118.3 GB
+// at 1,925, 7% more bytes for 3.1x the tokens -- while the host arithmetic it
+// replaces grows linearly. So it loses 2.3 s at 619 rows and wins 1.273x at
+// 1,925 (248.60 s to 195.29 s), both byte-identical. Record 0244.
+//
+// The threshold sits inside the measured win rather than at the interpolated
+// crossover, because only those two widths were measured. Unset selects it by
+// width; an explicit 0/1 forces it either way.
+constexpr std::uint32_t kDevicePageStagingMinimumRows = 1536U;
+
+[[nodiscard]] int device_page_staging_override() noexcept {
+    static const int setting = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_PAGE_STAGING");
-        return value != nullptr && std::string_view(value) != "0" &&
-               std::string_view(value) != "false" &&
-               std::string_view(value) != "off";
+        if (value == nullptr || std::string_view(value) == "auto") return -1;
+        return std::string_view(value) != "0" &&
+                       std::string_view(value) != "false" &&
+                       std::string_view(value) != "off"
+                   ? 1 : 0;
     }();
-    return enabled;
+    return setting;
+}
+
+[[nodiscard]] bool device_page_staging_enabled(std::uint32_t rows) noexcept {
+    const auto override = device_page_staging_override();
+    if (override >= 0) return override == 1;
+    return rows >= kDevicePageStagingMinimumRows;
 }
 
 [[nodiscard]] bool device_page_experts_enabled() noexcept {
@@ -4495,7 +4515,7 @@ struct Glm53Runtime::Impl {
         staging.slot = layer_device_slot;
         staging.layer = layer;
         staging.enabled =
-            allow_device_tiers && device_page_staging_enabled();
+            allow_device_tiers && device_page_staging_enabled(rows);
         staging.leased.reserve(288U);
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
@@ -10272,10 +10292,16 @@ Glm53MlaWorkspaceBytes glm53_mla_workspace_bytes(
     bytes.input = sizeof(float) * std::max(
         page_rows * std::uint64_t{12288},
         mla_rows * static_cast<std::uint64_t>(kKvRank));
-    bytes.output = sizeof(float) * std::max(
+    // The KDA page shares this output arena and needs kKdaWorkspaceFloats per
+    // row -- far more than the 12,288 the MLA page asks for. Without it the
+    // arena was sized from the context term alone, so a wide page failed with
+    // "KDA page exceeds its admitted workspace" at a width the MLA path could
+    // otherwise carry.
+    bytes.output = sizeof(float) * std::max({
         page_rows * std::uint64_t{12288},
+        page_rows * kKdaWorkspaceFloats,
         mla_rows * static_cast<std::uint64_t>(kHeads) * 2U *
-            static_cast<std::uint64_t>(kMlaHead));
+            static_cast<std::uint64_t>(kMlaHead)});
     return bytes;
 }
 

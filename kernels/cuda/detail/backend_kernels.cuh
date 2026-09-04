@@ -4436,6 +4436,64 @@ __global__ void regfed_nvfp4_activation_fragment_kernel(
     }
 }
 
+// The batched activation split, over experts, for the grouped dispatch. One
+// launch covers a whole page's activations for the same reason
+// regfed_nvfp4_grouped_matmul_kernel covers its matmuls: a page presents
+// hundreds of experts and a per-expert launch is the starvation experiment 0247
+// measured at 337 GB/s.
+//
+// Layout is expert-major with the kTerms planes inside, so slice `e`'s
+// activation pointer is `base + e * kTerms * per_expert` and the matmul body's
+// own plane stride is unchanged.
+template <std::uint32_t kTerms>
+__global__ void regfed_nvfp4_moe_activation_fragment_kernel(
+    uint2* __restrict__ destination, const float* __restrict__ source,
+    std::uint32_t experts, std::uint32_t m, std::uint32_t columns,
+    std::uint32_t column_blocks, std::uint32_t groups_per_block) {
+    const std::uint32_t k_tiles = columns / kRegfedTileK;
+    const std::uint32_t per_expert =
+        k_tiles * column_blocks * groups_per_block * 4U;
+    const std::uint64_t total =
+        static_cast<std::uint64_t>(experts) * per_expert;
+    for (std::uint64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += gridDim.x * blockDim.x) {
+        const auto local = static_cast<std::uint32_t>(index % per_expert);
+        const auto expert = static_cast<std::uint32_t>(index / per_expert);
+        const std::uint32_t thread = local % 4U;
+        const std::uint32_t group = (local / 4U) % groups_per_block;
+        const std::uint32_t block =
+            (local / (4U * groups_per_block)) % column_blocks;
+        const std::uint32_t k_tile =
+            local / (4U * groups_per_block * column_blocks);
+        const std::uint32_t column = block * kRegfedTileM + group;
+        std::uint32_t part[4][kTerms];
+#pragma unroll
+        for (std::uint32_t i = 0U; i < 4U; ++i)
+#pragma unroll
+            for (std::uint32_t t = 0U; t < kTerms; ++t) part[i][t] = 0U;
+        if (column < m) {
+            const float* row = source +
+                (static_cast<std::size_t>(expert) * m + column) * columns +
+                k_tile * kRegfedTileK;
+            const std::uint32_t offset[4] = {thread * 2U, thread * 2U + 1U,
+                                             thread * 2U + 8U,
+                                             thread * 2U + 9U};
+#pragma unroll
+            for (std::uint32_t i = 0U; i < 4U; ++i) {
+                regfed_bf16_split(row[offset[i]], kTerms, part[i]);
+            }
+        }
+        const std::size_t base =
+            static_cast<std::size_t>(expert) * kTerms * per_expert;
+#pragma unroll
+        for (std::uint32_t t = 0U; t < kTerms; ++t) {
+            destination[base + static_cast<std::size_t>(t) * per_expert + local] =
+                make_uint2(part[0][t] | (part[1][t] << 16U),
+                           part[2][t] | (part[3][t] << 16U));
+        }
+    }
+}
+
 // The NVFP4 counterpart of `regfed_fp4_matmul_kernel`. Codes are the same E2M1
 // nibble pairs in the same fragment order, so `regfed_fp4_prepack_codes_kernel`
 // serves both formats unchanged and `regfed_fp4_prepack_scales_kernel` is
@@ -4462,6 +4520,7 @@ __global__ void regfed_nvfp4_activation_fragment_kernel(
 //
 // The body is shared with the grouped form below so the two cannot drift.
 template <std::uint32_t kColBlocks, std::uint32_t kTerms>
+
 __device__ __forceinline__ void regfed_nvfp4_matmul_body(
     float* __restrict__ output, const std::uint32_t* __restrict__ codes,
     const unsigned char* __restrict__ scales, float global_scale,
@@ -4563,8 +4622,11 @@ __device__ __forceinline__ void regfed_nvfp4_matmul_body(
             }
         }
 
+        // Stride on the live m, not on kRegfedMaxM: only 16 x m of each slot
+        // is ever written, and a wide prefill page allocates one slot per
+        // expert, so the padded stride costs 16x the partial workspace at M=1.
         float* slot = partials + (static_cast<std::size_t>(work)) *
-                                     kRegfedTileN * kRegfedMaxM;
+                                     kRegfedTileN * m;
 #pragma unroll
         for (std::uint32_t c = 0U; c < kColBlocks; ++c) {
 #pragma unroll
@@ -4595,8 +4657,8 @@ __device__ __forceinline__ void regfed_nvfp4_matmul_body(
                     float sum = 0.0F;
                     for (std::uint32_t s = 0U; s < split; ++s) {
                         sum += partials[(static_cast<std::size_t>(n_tile) *
-                                             split + s) * kRegfedTileN *
-                                            kRegfedMaxM + lane * m + column];
+                                             split + s) * kRegfedTileN * m +
+                                        lane * m + column];
                     }
                     // The per-tensor divisor, once, on the completed FP32 sum.
                     output[static_cast<std::size_t>(column) * rows +
@@ -5636,6 +5698,20 @@ __global__ void regfed_mxfp4_moe_reduce_kernel(
     }
     if (descriptor.encoding == CudaWeightEncoding::Fp4E2m1Group32) {
         if (!regfed_fp4_shape_admissible(descriptor.rows, descriptor.columns)) {
+            return 0U;
+        }
+        return descriptor.rows * descriptor.packed_columns;
+    }
+    // NVFP4 shares the FP4 code permutation exactly -- the same E2M1 nibble
+    // pairs in the same fragment order -- and differs only in the group width
+    // the scale permutation is told about, which it already reads from the
+    // descriptor. The scratch is the larger of the two copies it stages, and
+    // packed_columns is columns/2 against scale_columns of columns/16, so the
+    // code copy bounds it.
+    if (descriptor.encoding == CudaWeightEncoding::Nvfp4Group16) {
+        if (!regfed_nvfp4_shape_admissible(descriptor.rows,
+                                           descriptor.columns) ||
+            descriptor.group_size != kRegfedNvfp4Group) {
             return 0U;
         }
         return descriptor.rows * descriptor.packed_columns;

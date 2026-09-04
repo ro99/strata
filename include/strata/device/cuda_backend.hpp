@@ -1072,8 +1072,9 @@ void record_cuda_matmul_route(CudaMatmulRoute route) noexcept;
 
 class CudaBackend {
 public:
-    // Permutes an Fp8E4m3Block128, Fp8E4m3Block128F32, or Fp4E2m1Group32
-    // weight from its canonical layout into m16n8k16 fragment order, in place.
+    // Permutes an Fp8E4m3Block128, Fp8E4m3Block128F32, Fp4E2m1Group32 or
+    // Nvfp4Group16 weight from its canonical layout into m16n8k16 fragment
+    // order, in place.
     // The fragment order
     // REPLACES the canonical device layout -- one-copy residency, not a second
     // buffer -- so every consumer of that weight must expect fragment order
@@ -1246,6 +1247,65 @@ public:
         int device, std::span<const CudaGlm53Expert> experts,
         std::span<const float> activations);
     [[nodiscard]] ValidationResult collect_glm53_expert_down(
+        int device, std::span<float> output);
+
+    // ---- register-fed NVFP4 routed experts (experiment 0247) --------------
+    //
+    // The tensor-core path for GLM's NVFP4 routed experts. It reproduces
+    // `glm53_shared_expert_nvfp4_dot_kernel` to 5.960e-07 worst case over 60
+    // real checkpoint fixtures -- inside experiment 0157's 7.53e-07 -- and runs
+    // 4.8x to 17.0x the scalar kernel depending on `rows_per_expert`. Output
+    // shapes match the scalar enqueue/collect above exactly, so
+    // `feedforward_page` consumes them unchanged.
+    //
+    // Only the three-term activation split is reachable. A single BF16
+    // activation term measures 6.108e-03 against the scalar kernel, four orders
+    // outside the tolerance, because GLM's activation is FP32; the term count
+    // is a compile-time constant with no parameter that can lower it.
+    //
+    // LAYOUT HAZARD. `prepack_glm53_regfed_expert` replaces canonical order in
+    // place, one-copy. GLM's expert `CudaWeight`s are shared between the pinned
+    // static tier that serves decode through the scalar kernel and the
+    // demand-staged experts that serve prefill, so prepacking a tier-pinned
+    // expert makes decode read a permutation. **Only demand-staged experts may
+    // be prepacked**; that decision is the caller's and cannot be made here.
+    // `glm53_regfed_expert_prepacked` is the query for routing prepacked
+    // experts to this path and leaving canonical ones on the scalar one within
+    // the same page, and the scalar enqueues now refuse a prepacked NVFP4
+    // expert so a mis-route fails loudly instead of corrupting tokens.
+    //
+    // The most activation rows one expert may carry in a single command. The
+    // fragment layout covers two eight-column blocks; a caller with more rows
+    // for one expert splits into several commands.
+    static constexpr std::uint32_t kGlm53RegfedMaxRowsPerExpert = 16U;
+
+    // True when all three projections are NVFP4 arena weights whose shapes the
+    // fragment layout can express. Cheap, no device work.
+    [[nodiscard]] static bool glm53_regfed_expert_admissible(
+        const CudaGlm53Expert& expert) noexcept;
+    // True when all three projections are already in fragment order.
+    [[nodiscard]] static bool glm53_regfed_expert_prepacked(
+        const CudaGlm53Expert& expert) noexcept;
+    // Permutes gate, up and down into fragment order, in place, all three or
+    // none. Safe to call again on an already-prepacked expert.
+    [[nodiscard]] ValidationResult prepack_glm53_regfed_expert(
+        int device, const CudaGlm53Expert& expert);
+
+    // `input` is `experts.size() * rows_per_expert * hidden` floats, expert
+    // major then row major; `gate` and `up` come back as
+    // `experts.size() * rows_per_expert * intermediate` in the same order.
+    // At `rows_per_expert == 1` that is byte-identical to the scalar contract.
+    [[nodiscard]] ValidationResult enqueue_glm53_regfed_expert_gate_up(
+        int device, std::span<const CudaGlm53Expert> experts,
+        std::span<const float> input, std::uint32_t rows_per_expert);
+    [[nodiscard]] ValidationResult collect_glm53_regfed_expert_gate_up(
+        int device, std::span<float> gate, std::span<float> up);
+    // `activations` is `experts.size() * rows_per_expert * intermediate`;
+    // `output` is `experts.size() * rows_per_expert * hidden`.
+    [[nodiscard]] ValidationResult enqueue_glm53_regfed_expert_down(
+        int device, std::span<const CudaGlm53Expert> experts,
+        std::span<const float> activations, std::uint32_t rows_per_expert);
+    [[nodiscard]] ValidationResult collect_glm53_regfed_expert_down(
         int device, std::span<float> output);
     [[nodiscard]] ValidationResult upload_gemma4_kv(
         const CudaBuffer& cache, std::span<const std::uint16_t> keys,
@@ -1616,6 +1676,12 @@ public:
     [[nodiscard]] CudaBackendStats stats() const noexcept;
 
 private:
+    // Batch admission for the register-fed NVFP4 expert path. A member because
+    // it inspects CudaWeight::impl_, which only CudaBackend may reach.
+    [[nodiscard]] static ValidationResult glm53_regfed_admit_batch(
+        int device, std::span<const CudaGlm53Expert> experts,
+        std::uint32_t rows_per_expert, bool down, std::uint32_t& hidden,
+        std::uint32_t& intermediate);
     // One counter per route; atomic because the backend is called from the
     // rank-local worker pool.
 

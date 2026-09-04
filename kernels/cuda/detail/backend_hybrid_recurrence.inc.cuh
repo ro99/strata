@@ -3085,6 +3085,36 @@ template <typename DeviceState>
 
 }  // namespace
 
+// THE LAYOUT GUARD for the register-fed NVFP4 path (experiment 0247).
+//
+// `prepack_fragment` replaces canonical order in place, one-copy, and GLM's
+// expert CudaWeights are shared between the pinned static tier that serves
+// decode through the scalar kernels below and the demand-staged experts that
+// serve prefill. A prepacked expert reaching a scalar kernel would be read as
+// though it were canonical: no error, no NaN, just a permuted dot product on
+// every token. This turns that into a refusal at the boundary.
+//
+// It is deliberately a hard error rather than a silent reroute. A caller that
+// prepacked a tier-pinned expert has made a routing mistake that a fallback
+// would hide, and the whole point of the fragment_prepacked query is that the
+// caller decides which experts go where.
+[[nodiscard]] inline ValidationResult glm53_scalar_expert_layout_ok(
+    std::span<const CudaGlm53Expert> experts) {
+    for (const auto& expert : experts) {
+        const CudaWeight* projections[3] = {expert.gate, expert.up,
+                                            expert.down};
+        for (const auto* weight : projections) {
+            if (weight != nullptr && CudaBackend::fragment_prepacked(*weight)) {
+                return {{"GLM-5.3 scalar expert kernel refuses a "
+                         "fragment-prepacked weight: this expert belongs on the "
+                         "register-fed path, and reading it canonically would "
+                         "silently permute every token"}};
+            }
+        }
+    }
+    return {};
+}
+
 ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     int device, std::span<const CudaGlm53Expert> experts,
     std::span<const float> input) {
@@ -3099,6 +3129,9 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     }
     if (experts.empty() || experts.size() > kGlm53MaxDeviceExperts) {
         return {{"GLM-5.3 expert batch has an invalid width"}};
+    }
+    if (auto layout = glm53_scalar_expert_layout_ok(experts); !layout.ok()) {
+        return layout;
     }
     const auto hidden = experts.front().hidden;
     const auto intermediate = experts.front().intermediate;
@@ -3446,6 +3479,9 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
     }
     if (experts.empty() || experts.size() != state.glm53_shared_batch) {
         return {{"GLM-5.3 expert batch down does not match its gate and up"}};
+    }
+    if (auto layout = glm53_scalar_expert_layout_ok(experts); !layout.ok()) {
+        return layout;
     }
     const auto hidden = state.glm53_shared_hidden;
     const auto intermediate = state.glm53_shared_intermediate;

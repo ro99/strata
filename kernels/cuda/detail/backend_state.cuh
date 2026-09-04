@@ -125,6 +125,36 @@ struct CudaBackend::Impl {
         std::uint32_t glm53_shared_batch{};
         bool glm53_shared_gate_up_in_flight{};
         bool glm53_shared_down_in_flight{};
+        // Register-fed NVFP4 routed-expert path (experiment 0247). Deliberately
+        // separate from the glm53_shared_* workspaces above: within one prefill
+        // page the prepacked experts route here and the canonical ones stay on
+        // the scalar path, so both must be able to be in flight at once.
+        float* glm53_regfed_input{};
+        float* glm53_regfed_gate{};
+        float* glm53_regfed_up{};
+        float* glm53_regfed_output{};
+        float* glm53_regfed_staging{};
+        uint2* glm53_regfed_fragments{};
+        float* glm53_regfed_partials{};
+        std::uint32_t* glm53_regfed_counters{};
+        RegfedNvfp4Slice* glm53_regfed_slices{};
+        RegfedNvfp4Slice* glm53_regfed_slices_host{};
+        std::uint64_t glm53_regfed_input_bytes{};
+        std::uint64_t glm53_regfed_gate_bytes{};
+        std::uint64_t glm53_regfed_up_bytes{};
+        std::uint64_t glm53_regfed_output_bytes{};
+        std::uint64_t glm53_regfed_staging_bytes{};
+        std::uint64_t glm53_regfed_fragment_bytes{};
+        std::uint64_t glm53_regfed_partial_bytes{};
+        std::uint64_t glm53_regfed_counter_bytes{};
+        std::uint64_t glm53_regfed_slice_bytes{};
+        std::uint64_t glm53_regfed_slice_host_bytes{};
+        std::uint32_t glm53_regfed_batch{};
+        std::uint32_t glm53_regfed_rows{};
+        std::uint32_t glm53_regfed_hidden{};
+        std::uint32_t glm53_regfed_intermediate{};
+        bool glm53_regfed_gate_up_in_flight{};
+        bool glm53_regfed_down_in_flight{};
         std::byte* matmul_host_input{};
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};
@@ -458,6 +488,23 @@ struct CudaBackend::Impl {
                                   state.gemma_marlin.reorder,
                                   state.gemma_marlin.locks}) {
                 if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            for (void* pointer :
+                 {static_cast<void*>(state.glm53_regfed_input),
+                  static_cast<void*>(state.glm53_regfed_gate),
+                  static_cast<void*>(state.glm53_regfed_up),
+                  static_cast<void*>(state.glm53_regfed_output),
+                  static_cast<void*>(state.glm53_regfed_fragments),
+                  static_cast<void*>(state.glm53_regfed_partials),
+                  static_cast<void*>(state.glm53_regfed_counters),
+                  static_cast<void*>(state.glm53_regfed_slices)}) {
+                if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+            }
+            if (state.glm53_regfed_staging != nullptr) {
+                static_cast<void>(cudaFreeHost(state.glm53_regfed_staging));
+            }
+            if (state.glm53_regfed_slices_host != nullptr) {
+                static_cast<void>(cudaFreeHost(state.glm53_regfed_slices_host));
             }
             if (state.regfed_activation != nullptr) {
                 static_cast<void>(cudaFree(state.regfed_activation));

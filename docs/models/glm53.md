@@ -108,7 +108,10 @@ It is the default since `2d454be`; `STRATA_GLM53_EXPERT_REDUCTION_BLOCK=1` resto
 old behaviour for A/B work.
 
 **Current best at 619 tokens: 129.40 s to 76.59 s, 4.784 to 8.082 tok/s, 1.690x**, with
-no kernel rewrite, no precision change and no placement change.
+no kernel rewrite, no precision change and no placement change. In the long-context
+regime (`--context-size 4096`, where device prefill is unavailable) the same three
+changes give **147.04 s to 125.89 s, 1.168x**; the reduction fix carries there in full
+absolute terms and attention, at 28.6% of the phase, becomes the next target.
 
 ```bash
 env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \

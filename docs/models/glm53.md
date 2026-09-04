@@ -107,8 +107,17 @@ of page width or prefill placement. Blocking that dispatch at 1024 takes the ter
 It is the default since `2d454be`; `STRATA_GLM53_EXPERT_REDUCTION_BLOCK=1` restores the
 old behaviour for A/B work.
 
-**Current best at 619 tokens: 129.40 s to 76.59 s, 4.784 to 8.082 tok/s, 1.690x**, with
-no kernel rewrite, no precision change and no placement change. In the long-context
+A prefill page also runs its routed experts on the device now, using the pinned
+expert tier that previously served decode only -- `feedforward_page`'s
+`allow_device_tiers` defaulted to false at both prefill call sites, so a page ran
+every routed expert on the host. Worth a further **1.09x**, byte-identical, on VRAM
+that was already allocated and idle during prefill (record 0244). Demand-staging
+the *non*-tier experts is implemented and exact but off by default
+(`STRATA_GLM53_DEVICE_PAGE_STAGING=1`): it moves 100% of routed experts to the GPU
+and still loses 2.3 s, because the 110.6 GB it uploads runs serially at 3.80 GB/s.
+
+**Current best at 619 tokens: 129.40 s to 70.07 s, 4.784 to 8.834 tok/s, 1.847x**, with
+no kernel rewrite and no precision change. In the long-context
 regime (`--context-size 4096`, where device prefill is unavailable) the same three
 changes give **147.04 s to 125.89 s, 1.168x**; the reduction fix carries there in full
 absolute terms and attention, at 28.6% of the phase, becomes the next target.

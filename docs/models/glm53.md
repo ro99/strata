@@ -117,10 +117,14 @@ the *non*-tier experts is implemented and exact but off by default
 and still loses 2.3 s, because the 110.6 GB it uploads runs serially at 3.80 GB/s.
 
 At long prompts the routed experts are demand-staged to the device and every one
-of them executes there: at 1,925 tokens prefill falls **248.60 s to 173.57 s,
-7.743 to 11.091 tok/s (1.43x)**, byte-identical, across staging (1.27x), an O(n)
-counting sort replacing a quadratic one (1.09x) and a grouped kernel launch
-(1.03x). Records 0244 and 0245.
+of them executes there, on **both** cards rather than only the one that owns the
+layer. At 1,925 tokens prefill falls **248.60 s to 148.95 s, 7.743 to 12.924
+tok/s (1.67x)**, byte-identical, on defaults with no environment overrides:
+staging (1.27x), an O(n) counting sort replacing a quadratic one (1.09x), a
+grouped kernel launch (1.03x), expert parallelism across devices (1.13x), and a
+staging reserve without which none of it engages (1.66x on its own, because the
+static tier otherwise fills the device cache at load and leaves demand staging
+no room). Records 0244 and 0245.
 
 **Current best at 619 tokens: 129.40 s to 70.07 s, 4.784 to 8.834 tok/s, 1.847x**, with
 no kernel rewrite and no precision change. In the long-context

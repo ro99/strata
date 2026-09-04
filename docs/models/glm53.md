@@ -99,6 +99,17 @@ Together the two are **1.411x** at 619 tokens, byte-identical: 129.40 s to 91.71
 medians of interleaved repetitions. Above `--context-size 2048` only the width half
 applies, and it is worth about 1.06x.
 
+A third improvement needs no flag at all. The routed page-MoE reduction used to
+dispatch one worker task per (row, column) -- about nine multiply-adds behind one
+contended atomic increment -- which cost a flat **16.4 s** of every prefill regardless
+of page width or prefill placement. Blocking that dispatch at 1024 takes the term to
+**0.19 s**, worth **1.194x** on total prefill on its own, byte-identical (record 0243).
+It is the default since `2d454be`; `STRATA_GLM53_EXPERT_REDUCTION_BLOCK=1` restores the
+old behaviour for A/B work.
+
+**Current best at 619 tokens: 129.40 s to 76.59 s, 4.784 to 8.082 tok/s, 1.690x**, with
+no kernel rewrite, no precision change and no placement change.
+
 ```bash
 env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-chat \

@@ -3260,6 +3260,19 @@ __global__ void glm53_shared_expert_nvfp4_dot_grouped_kernel(
     std::uint32_t columns) {
     constexpr std::uint32_t kGroups = 8U;
     const Glm53ExpertSlice slice = slices[blockIdx.y];
+    // Every block serves one slice, so its divisor is uniform and there are
+    // only 256 possible E4M3 scale codes. Decoding and dividing all of them
+    // once costs 256 divisions per block instead of one per scale read -- the
+    // inner loop was doing 64 IEEE divisions per thread, which on this device
+    // is comparable to the 512 FMAs they feed. Same decode, same division,
+    // same value, so the result is unchanged.
+    __shared__ float scale_table[256];
+    if (threadIdx.x < 256U) {
+        scale_table[threadIdx.x] =
+            fp8_e4m3_value(static_cast<unsigned char>(threadIdx.x)) /
+            slice.global_scale;
+    }
+    __syncthreads();
     const std::uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
     const std::uint32_t row = thread / kGroups;
     const std::uint32_t group = thread % kGroups;
@@ -3272,9 +3285,7 @@ __global__ void glm53_shared_expert_nvfp4_dot_grouped_kernel(
 #pragma unroll
     for (int lane = 0; lane < 8; ++lane) accumulator[lane] = 0.0F;
     for (std::uint32_t column = 0U; column + 64U <= columns; column += 64U) {
-        const float scale =
-            fp8_e4m3_value(scale_row[column / 16U + group / 2U]) /
-            slice.global_scale;
+        const float scale = scale_table[scale_row[column / 16U + group / 2U]];
         const auto packed = *reinterpret_cast<const unsigned int*>(
             weight_row + column / 2U + group * 4U);
 #pragma unroll

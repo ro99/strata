@@ -23,6 +23,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <charconv>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -221,6 +222,12 @@ void print_phase_metrics(std::ostream& output,
            << phase.cuda.weight_allocation_calls
            << ",\"workspace_allocation_calls\":"
            << phase.cuda.workspace_allocation_calls
+           << ",\"dsv4_mhc_calls\":"
+           << phase.cuda.dsv4_mhc_calls
+           << ",\"dsv4_mhc_kernel_launches\":"
+           << phase.cuda.dsv4_mhc_kernel_launches
+           << ",\"dsv4_mhc_nanoseconds\":"
+           << phase.cuda.dsv4_mhc_nanoseconds
            << ",\"synchronization_calls\":"
            << phase.cuda.synchronization_calls
            << ",\"synchronization_nanoseconds\":"
@@ -386,6 +393,35 @@ constexpr std::uint64_t kDevicePageStagingReserveBytes = 2ULL << 30U;
 // all onto the layer's own. Layers execute in sequence because layer L+1
 // consumes layer L, so the cards that do not own the current layer would
 // otherwise sit idle for the whole prefill.
+// Devices that may compute routed experts but own no layers. A prefill page's
+// expert work is host-mediated -- the input is uploaded from the host and the
+// output returns to it -- so a device can serve an expert for a layer it does
+// not own. That is what lets an otherwise idle accelerator join without
+// disturbing the layer schedule or the resident fused-layer path, which
+// requires SM86 on every LAYER-OWNING device and would otherwise fall back.
+[[nodiscard]] std::vector<int> auxiliary_expert_devices_from_environment() {
+    std::vector<int> devices;
+    const char* value = std::getenv("STRATA_GLM53_EXPERT_DEVICES");
+    if (value == nullptr || *value == '\0') return devices;
+    std::string_view text(value);
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        const auto field = text.substr(0U, comma);
+        if (!field.empty()) {
+            int parsed = 0;
+            const auto* begin = field.data();
+            const auto* end = begin + field.size();
+            if (std::from_chars(begin, end, parsed).ec == std::errc{} &&
+                parsed >= 0) {
+                devices.push_back(parsed);
+            }
+        }
+        if (comma == std::string_view::npos) break;
+        text.remove_prefix(comma + 1U);
+    }
+    return devices;
+}
+
 [[nodiscard]] bool device_expert_parallel_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_EXPERT_PARALLEL");
@@ -3067,6 +3103,10 @@ struct Glm53Runtime::Impl {
     std::vector<std::size_t> device_schedule;
     std::vector<std::uint64_t> device_budgets;
     std::vector<std::uint64_t> weight_capacities;
+    // Layer-owning devices followed by auxiliary expert-only devices. Slots
+    // 0..devices.size()-1 are identical to `devices`, so every existing
+    // slot_for(layer) lookup keeps its meaning.
+    std::vector<int> expert_devices;
     std::vector<std::uint64_t> resident_reserve_bytes;
     std::vector<Glm53RowRange> lm_head_ranges;
     std::unique_ptr<Glm53WeightCache> weights;
@@ -3128,6 +3168,11 @@ struct Glm53Runtime::Impl {
     struct StaticExpertTier {
         std::array<std::array<CudaGlm53Expert, 288U>, kLayers> experts{};
         std::array<std::array<std::uint8_t, 288U>, kLayers> active{};
+        // Which device holds each pinned expert. An expert is normally pinned
+        // on its layer's own device, but an auxiliary expert device owns no
+        // layers and can hold any layer's expert, so the owner is recorded
+        // rather than derived from the layer.
+        std::array<std::array<std::uint8_t, 288U>, kLayers> slot{};
         std::vector<std::uint64_t> bytes_by_slot;
         std::uint64_t bytes{};
         std::uint64_t experts_admitted{};
@@ -4082,7 +4127,7 @@ struct Glm53Runtime::Impl {
     }
 
     [[nodiscard]] ValidationResult admit_static_experts() {
-        static_experts.bytes_by_slot.assign(devices.size(), 0U);
+        static_experts.bytes_by_slot.assign(expert_devices.size(), 0U);
         static_experts.bytes = 0U;
         static_experts.experts_admitted = 0U;
         static_experts.active_tier = false;
@@ -4196,13 +4241,28 @@ struct Glm53Runtime::Impl {
             }
         }
         for (const auto& candidate : candidates) {
-            const auto slot = slot_for(candidate.layer);
+            auto slot = slot_for(candidate.layer);
             CudaGlm53Expert descriptor;
             bool admitted = false;
             auto status = weights->pin_expert(
                 slot, candidate.layer, candidate.expert, descriptor, admitted,
                 static_expert_staging_reserve());
             if (!status.ok()) return status;
+            // A layer-owning device is full once its tier plus the staging
+            // reserve fill it. An auxiliary expert device owns no layers, no
+            // resident spine and no MLA workspace, and it can serve any
+            // layer's expert because the expert path is host-mediated -- so
+            // spill the rest of the ranked profile onto it. Those experts then
+            // cost no upload at all for the life of the process, which is the
+            // half of the cost a demand-staged expert never escapes.
+            for (std::size_t aux = devices.size();
+                 !admitted && aux < expert_devices.size(); ++aux) {
+                status = weights->pin_expert(aux, candidate.layer,
+                                             candidate.expert, descriptor,
+                                             admitted, 0U);
+                if (!status.ok()) return status;
+                if (admitted) slot = aux;
+            }
             if (!admitted) continue;
             const auto bytes = descriptor.gate->device_bytes() +
                                descriptor.up->device_bytes() +
@@ -4210,6 +4270,8 @@ struct Glm53Runtime::Impl {
             static_experts.experts[candidate.layer][candidate.expert] =
                 descriptor;
             static_experts.active[candidate.layer][candidate.expert] = 1U;
+            static_experts.slot[candidate.layer][candidate.expert] =
+                static_cast<std::uint8_t>(slot);
             static_experts.bytes_by_slot[slot] += bytes;
             static_experts.bytes += bytes;
             ++static_experts.experts_admitted;
@@ -4574,7 +4636,7 @@ struct Glm53Runtime::Impl {
             allow_device_tiers && device_page_staging_enabled(rows);
         staging.leased.reserve(288U);
         staging.leased_slot.reserve(288U);
-        staging.slot_count = devices.size();
+        staging.slot_count = expert_devices.size();
         staging.parallel =
             staging.enabled && device_expert_parallel_enabled() &&
             staging.slot_count > 1U;
@@ -4697,7 +4759,10 @@ struct Glm53Runtime::Impl {
         // previous ordering exactly, so the result is unchanged.
         {
             const auto count = device_output_slots.size();
-            const auto slot_count = devices.size();
+            // Entry slots range over the expert devices, not just the
+            // layer-owning ones, so the bucket table must too. Sizing it from
+            // devices.size() let an auxiliary-slot entry write past the end.
+            const auto slot_count = expert_devices.size();
             const auto bucket_of = [&](std::size_t index) {
                 return static_cast<std::size_t>(device_entry_slots[index]) *
                            290U + device_key(device_output_slots[index]);
@@ -4847,7 +4912,7 @@ struct Glm53Runtime::Impl {
         if (device_command_count != 0U) {
             const auto& command = device_commands.front();
             result = cuda.enqueue_glm53_expert_gate_up(
-                devices[command.slot],
+                expert_devices[command.slot],
                 std::span<const CudaGlm53Expert>(device_experts)
                     .subspan(command.begin, command.count),
                 std::span<const float>(device_inputs)
@@ -4916,7 +4981,7 @@ struct Glm53Runtime::Impl {
             auto up = std::span<float>(shared_expert_up)
                 .subspan(begin, count);
             auto status = cuda.collect_glm53_expert_gate_up(
-                devices[command.slot], gate, up);
+                expert_devices[command.slot], gate, up);
             if (!status.ok()) return status;
             for (std::size_t index = 0U; index < count; ++index) {
                 auto gate_value = bf16_round_f32(gate[index]);
@@ -4934,7 +4999,7 @@ struct Glm53Runtime::Impl {
                 }
             }
             return cuda.enqueue_glm53_expert_down(
-                devices[command.slot],
+                expert_devices[command.slot],
                 std::span<const CudaGlm53Expert>(device_experts)
                     .subspan(command.begin, command.count),
                 std::span<const float>(gate));
@@ -4986,7 +5051,7 @@ struct Glm53Runtime::Impl {
             auto device_output = std::span<float>(shared_expert_output)
                 .subspan(command.begin * kHidden, command.count * kHidden);
             auto status = cuda.collect_glm53_expert_down(
-                devices[command.slot], device_output);
+                expert_devices[command.slot], device_output);
             if (!status.ok()) return status;
             for (std::size_t offset = 0U; offset < command.count; ++offset) {
                 const auto index = command.begin + offset;
@@ -5016,7 +5081,7 @@ struct Glm53Runtime::Impl {
             const auto enqueue_command =
                 [&](const DeviceCommand& command) -> ValidationResult {
                 return cuda.enqueue_glm53_expert_gate_up(
-                    devices[command.slot],
+                    expert_devices[command.slot],
                     std::span<const CudaGlm53Expert>(device_experts)
                         .subspan(command.begin, command.count),
                     std::span<const float>(device_inputs)
@@ -9719,7 +9784,19 @@ ValidationResult Glm53Runtime::initialize(
     }
     auto checkpoint = Glm53CheckpointReader::open(model_directory);
     if (!checkpoint.ok()) return {std::move(checkpoint.errors)};
-    result = impl_->cuda.initialize(impl_->devices,
+    impl_->expert_devices = impl_->devices;
+    for (const auto candidate : auxiliary_expert_devices_from_environment()) {
+        if (std::find(impl_->expert_devices.begin(),
+                      impl_->expert_devices.end(),
+                      candidate) == impl_->expert_devices.end()) {
+            impl_->expert_devices.push_back(candidate);
+        }
+    }
+    // Initialize every expert device, but keep `impl_->devices` to the
+    // layer-owning set: the resident fused-layer path validates mHC over that
+    // list and mHC is SM86-only, so an SM120 auxiliary device would otherwise
+    // drop the whole runtime to the host boundary fallback.
+    result = impl_->cuda.initialize(impl_->expert_devices,
                                     impl_->config.phase_profile);
     if (!result.ok()) return result;
     // Free VRAM with the CUDA context established and nothing of this model's
@@ -9965,15 +10042,34 @@ ValidationResult Glm53Runtime::initialize(
     // and expose only the cache part to Glm53WeightCache. Otherwise the direct
     // mHC uploads consume invisible arena space and an apparently admissible
     // final cached expert fails partway through its triplet.
-    for (std::size_t slot = 0U; slot < impl_->devices.size(); ++slot) {
+    // An auxiliary expert device owns no layers, no resident spine and no MLA
+    // workspace, so its whole admitted fraction is expert cache.
+    //
+    // These are kept SEPARATE from impl_->weight_capacities, which means "per
+    // layer-owning device" everywhere else -- warmup() splits the LM head and
+    // the wide linears across exactly that many devices. Appending an
+    // auxiliary entry there gave the vector two meanings and overran a
+    // devices.size()-sized task list.
+    std::vector<std::uint64_t> expert_capacities = impl_->weight_capacities;
+    std::vector<std::uint64_t> expert_reserves = impl_->resident_reserve_bytes;
+    for (std::size_t index = impl_->devices.size();
+         index < impl_->expert_devices.size(); ++index) {
+        auto memory = CudaBackend::device_memory(impl_->expert_devices[index]);
+        if (!memory.ok()) return {std::move(memory.errors)};
+        expert_capacities.push_back(static_cast<std::uint64_t>(
+            static_cast<double>(memory.value.free_bytes) *
+            impl_->config.vram_cache_fraction));
+        expert_reserves.push_back(0U);
+    }
+    for (std::size_t slot = 0U; slot < impl_->expert_devices.size(); ++slot) {
         result = impl_->cuda.reserve_weight_arena(
-            impl_->devices[slot], impl_->weight_capacities[slot] +
-                                      impl_->resident_reserve_bytes[slot]);
+            impl_->expert_devices[slot],
+            expert_capacities[slot] + expert_reserves[slot]);
         if (!result.ok()) return result;
     }
     impl_->weights = std::make_unique<Glm53WeightCache>(
-        *impl_->checkpoint, impl_->cuda, impl_->devices,
-        impl_->weight_capacities);
+        *impl_->checkpoint, impl_->cuda, impl_->expert_devices,
+        expert_capacities);
     const auto cache_bytes = std::accumulate(
         impl_->weight_capacities.begin(), impl_->weight_capacities.end(),
         std::uint64_t{0U});

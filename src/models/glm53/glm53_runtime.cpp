@@ -319,6 +319,15 @@ constexpr std::uint32_t kMtpLayer = 45U;
 // 1.96 GB/s blocked on identical cold bytes.
 constexpr std::size_t kExpertDispatchBlock = 64U;
 
+// The routed page reduction dispatches one task per (row, column), and each
+// task is about nine multiply-adds. `parallel_for` blocks at 1, so the shared
+// task counter -- one contended atomic increment per task -- rather than the
+// arithmetic sets the cost: a 619-token prefill issues about 106 million
+// increments for roughly a billion flops, and the term measured 16.2-16.6 s
+// invariantly across every page width and both prefill placements (records
+// 0240-0242). Blocking amortizes the counter without changing what any task
+// computes, so the reduction stays bit-identical.
+constexpr std::size_t kExpertReductionBlock = 1024U;
 
 // STRATA_GLM53_EXPERT_DISPATCH_BLOCK overrides it for the M2 A/B. 1 reproduces
 // the previous single-index dispatch exactly, so both arms of the comparison
@@ -334,6 +343,18 @@ constexpr std::size_t kExpertDispatchBlock = 64U;
     return block;
 }
 
+// STRATA_GLM53_EXPERT_REDUCTION_BLOCK does the same for the reduction. 1
+// reproduces the previous per-(row, column) dispatch exactly, so both arms of
+// that comparison also run one binary.
+[[nodiscard]] std::size_t expert_reduction_block() noexcept {
+    static const std::size_t block = [] {
+        const char* value = std::getenv("STRATA_GLM53_EXPERT_REDUCTION_BLOCK");
+        if (value == nullptr) return kExpertReductionBlock;
+        const std::size_t parsed = std::strtoul(value, nullptr, 10);
+        return parsed == 0U ? kExpertReductionBlock : parsed;
+    }();
+    return block;
+}
 constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kLinearHead = 128U;
 constexpr std::uint32_t kLinearWidth = kHeads * kLinearHead;
@@ -4679,8 +4700,8 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
         }
         const auto reduction_started = std::chrono::steady_clock::now();
-        result = host_moe_workers->parallel_for(
-            rows * kHidden, [&](std::size_t task) {
+        result = host_moe_workers->parallel_for_blocked(
+            rows * kHidden, expert_reduction_block(), [&](std::size_t task) {
                 const auto row = task / kHidden;
                 const auto column = task % kHidden;
                 auto value = expert_outputs[

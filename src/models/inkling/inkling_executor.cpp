@@ -44,6 +44,9 @@ private:
 const ModelRegistrar registrar{{
     RuntimeModel::Inkling, "Inkling", "inkling", PlacementModel::Inkling,
     false, true, false, false,
+    // This model\'s reasoning, if any, is not separated yet; its output is
+    // passed through whole and it accepts no budget.
+    ReasoningFormat{},
     [] { return std::unique_ptr<ModelExecutor>(new InklingExecutor()); }}};
 
 }  // namespace

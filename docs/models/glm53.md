@@ -98,6 +98,61 @@ env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   --vram-fraction 0.85 --port 8080
 ```
 
+### Reasoning
+
+GLM-5.3-Flash always reasons. Its chat template opens a `<think>` block
+unconditionally and ships no `enable_thinking` toggle, so unlike GLM-5.2 --
+whose renderer emits `<think></think>` when thinking is disabled -- there is no
+value that turns it off. What the template does accept is a budget:
+
+```bash
+--reasoning-effort low | high | max      # default max
+```
+
+The flag is rejected for a model whose registration declares no budget, and an
+unrecognized value is rejected rather than accepted, because the template maps
+anything it does not recognize to `Max` -- silently running the most verbose
+setting for a request that asked for the least.
+
+Budget interacts with `--max-new`: generation has to reach `</think>` before
+any answer appears, so a `--max-new` that expires inside the scratchpad returns
+reasoning and no answer. At `max` on a 26-token prompt, 48 tokens were not
+enough to finish thinking; at `low` the same prompt answered in 10.
+
+`strata-server` takes the same flag as the server-wide default, and a request
+may override it per call. Both the OpenAI spelling and the `chat_template_kwargs`
+form vLLM clients send are accepted:
+
+```jsonc
+{"reasoning_effort": "low"}                          // OpenAI
+{"chat_template_kwargs": {"reasoning_effort": "low"}} // vLLM
+```
+
+Other template kwargs are skipped rather than rejected, so a client that also
+talks to vLLM and sends `enable_thinking` keeps working -- but note that
+`enable_thinking` does nothing here, exactly as it does nothing on vLLM against
+this checkpoint, because the template never reads it. A budget the model does
+not accept is a 400, not a 500.
+
+Chat responses separate the two halves, matching the shape vLLM produces with
+`--reasoning-parser`:
+
+```jsonc
+"message": {"role": "assistant",
+            "reasoning_content": "15*37 = 555",
+            "content": "555"}
+```
+
+Streaming emits `reasoning_content` deltas and then `content` deltas; the piece
+that completes `</think>` may carry both. `include_reasoning: false` withholds
+the reasoning from the response -- it is still generated, because the model
+cannot be told not to. The completions endpoint has no field for reasoning, so
+its text is passed through whole. JSON mode validates the answer rather than the
+scratchpad.
+
+`strata-chat` applies the budget but does not split the block, so `</think>`
+appears inline in its output.
+
 ### Reproducing the published decode rate
 
 The 5.490 tok/s MXFP4 / 3.550 tok/s FP8 figures are this exact command. Run it

@@ -222,10 +222,17 @@ public:
     [[nodiscard]] ValidationResult initialize(
         const std::string& model_directory,
         const Glm53RuntimeConfig& config = {});
+    // `reasoning_effort` is the budget the checkpoint's chat template accepts:
+    // "low", "high", or "max". The template silently falls back to "max" for
+    // anything else, so this rejects an unrecognized value rather than running
+    // the most verbose setting under a name that asked for the least. There is
+    // no value that turns reasoning off: GLM-5.3's template opens a <think>
+    // block unconditionally and ships no enable_thinking toggle.
     [[nodiscard]] Glm53GenerationResult generate_chat_stream(
         std::span<const ChatMessage> messages,
         std::uint32_t maximum_new_tokens, const SamplingOptions& sampling,
         std::span<const std::string> stop,
+        std::string_view reasoning_effort = "max",
         const TokenStreamCallback& on_token = {});
 
 private:

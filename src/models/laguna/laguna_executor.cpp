@@ -45,6 +45,9 @@ private:
 const ModelRegistrar registrar{{
     RuntimeModel::Laguna, "Laguna", "laguna", PlacementModel::Laguna,
     false, true, true, false,
+    // This model\'s reasoning, if any, is not separated yet; its output is
+    // passed through whole and it accepts no budget.
+    ReasoningFormat{},
     [] { return std::unique_ptr<ModelExecutor>(new LagunaExecutor()); }}};
 
 }  // namespace

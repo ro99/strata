@@ -79,6 +79,9 @@ private:
 const ModelRegistrar registrar{{
     RuntimeModel::DeepSeekV4, "DeepSeek-V4", "deepseek",
     PlacementModel::DeepSeekV4, true, false, false, true,
+    // This model\'s reasoning, if any, is not separated yet; its output is
+    // passed through whole and it accepts no budget.
+    ReasoningFormat{},
     [] { return std::unique_ptr<ModelExecutor>(new Dsv4Executor()); }}};
 
 }  // namespace

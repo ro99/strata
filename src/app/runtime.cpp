@@ -14,6 +14,7 @@ namespace strata {
 struct RuntimeSession::Impl {
     std::unique_ptr<ModelExecutor> executor;
     SamplingOptions sampling;
+    std::string reasoning_effort;
     PlacementPlan placement;
     bool placement_ready{};
     // Contract section 8's load report. Started before placement resolution so
@@ -99,6 +100,7 @@ ValidationResult RuntimeSession::initialize(
         }
     }
     impl_->sampling = config.sampling;
+    impl_->reasoning_effort = config.reasoning_effort;
     impl_->report_load = config.report_placement_plan;
     impl_->load_report.begin(resolve_backing_storage(model_directory).disk);
     // Set before the first mark so `load` and `first-token` both carry a VRAM
@@ -196,6 +198,12 @@ GenerationResult RuntimeSession::generate_chat_stream(
         result.errors.emplace_back("runtime session is not initialized");
         return result;
     }
+    // A request that names no budget inherits the session's, so a server
+    // default applies to every request that does not override it.
+    GenerationOptions resolved = options;
+    if (resolved.reasoning_effort.empty()) {
+        resolved.reasoning_effort = impl_->reasoning_effort;
+    }
     const bool has_images = std::any_of(
         messages.begin(), messages.end(), [](const ChatMessage& message) {
             return std::any_of(message.parts.begin(), message.parts.end(),
@@ -226,9 +234,10 @@ GenerationResult RuntimeSession::generate_chat_stream(
                 }
                 return on_token ? on_token(token, text) : true;
             };
-        return impl_->executor->generate_chat_stream(messages, options, wrapped);
+        return impl_->executor->generate_chat_stream(messages, resolved,
+                                                     wrapped);
     }
-    return impl_->executor->generate_chat_stream(messages, options, on_token);
+    return impl_->executor->generate_chat_stream(messages, resolved, on_token);
 }
 
 }  // namespace strata

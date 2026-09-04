@@ -69,4 +69,18 @@ std::span<const ModelRegistration> registered_models() noexcept {
     return registry();
 }
 
+bool reasoning_effort_accepted(const ReasoningFormat& format,
+                               std::string_view value) noexcept {
+    if (!format.accepts_effort() || value.empty()) return false;
+    std::string_view accepted(format.efforts);
+    while (!accepted.empty()) {
+        const auto comma = accepted.find(',');
+        const auto entry = accepted.substr(0U, comma);
+        if (entry == value) return true;
+        if (comma == std::string_view::npos) break;
+        accepted.remove_prefix(comma + 1U);
+    }
+    return false;
+}
+
 }  // namespace strata

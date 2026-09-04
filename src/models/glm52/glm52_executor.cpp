@@ -45,6 +45,9 @@ private:
 const ModelRegistrar registrar{{
     RuntimeModel::Glm52, "GLM-5.2", "glm", PlacementModel::Glm52,
     false, true, false, false,
+    // This model\'s reasoning, if any, is not separated yet; its output is
+    // passed through whole and it accepts no budget.
+    ReasoningFormat{},
     [] { return std::unique_ptr<ModelExecutor>(new Glm52Executor()); }}};
 
 }  // namespace

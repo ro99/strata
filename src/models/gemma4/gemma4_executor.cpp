@@ -49,6 +49,9 @@ private:
 const ModelRegistrar registrar{{
     RuntimeModel::Gemma4, "Gemma 4", "gemma4", PlacementModel::Gemma4,
     false, true, true, false,
+    // This model\'s reasoning, if any, is not separated yet; its output is
+    // passed through whole and it accepts no budget.
+    ReasoningFormat{},
     [] { return std::unique_ptr<ModelExecutor>(new Gemma4Executor()); }}};
 
 }  // namespace

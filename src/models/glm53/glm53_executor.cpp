@@ -27,7 +27,10 @@ public:
         GenerationResult result;
         auto concrete = runtime_.generate_chat_stream(
             messages, options.maximum_new_tokens, options.sampling,
-            options.stop, on_token);
+            options.stop,
+            options.reasoning_effort.empty() ? "max"
+                                             : options.reasoning_effort,
+            on_token);
         detail::copy_common_generation(result, concrete);
         result.metrics.reused_prompt_tokens =
             concrete.metrics.reused_prompt_tokens;
@@ -39,9 +42,14 @@ private:
     Glm53Runtime runtime_;
 };
 
+// The rendered prompt already ends with <think>, so generation starts inside
+// the reasoning block and emits only the closing tag. The budgets are the three
+// the checkpoint's chat template accepts; it has no value that disables
+// reasoning and ships no enable_thinking toggle.
 const ModelRegistrar registrar{{
     RuntimeModel::Glm53, "GLM-5.3-Flash", "glm53", PlacementModel::Glm53,
     false, true, false, false,
+    ReasoningFormat{"<think>", "</think>", true, "low,high,max"},
     [] { return std::unique_ptr<ModelExecutor>(new Glm53Executor()); }}};
 
 }  // namespace

@@ -65,6 +65,7 @@ struct Options {
     std::string model_type;
     std::string prompt;
     std::string system_prompt;
+    std::string reasoning_effort;
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
     std::uint32_t max_new_tokens{256U};
@@ -142,6 +143,7 @@ bool apply_sampler_preset(std::string_view name, strata::SamplingOptions& sampli
 bool takes_value(std::string_view argument) {
     static constexpr std::string_view names[] = {
         "--model", "--model-type", "--prompt", "--system", "--plan-cache",
+        "--reasoning-effort",
         "--decode-topology", "--context-size", "--max-context", "--max-new",
         "--prefill-page-tokens",
         "--temperature", "--vram-fraction", "--seed", "--preset", "--top-k",
@@ -173,6 +175,8 @@ required:
 session:
   --prompt TEXT               answer TEXT and exit instead of prompting
   --system TEXT               prepend a system message to the conversation
+  --reasoning-effort E        reasoning budget, for models that accept one
+                              (GLM-5.3: low | high | max, default max)
   --context-size N            context window in tokens (default 2048)
   --max-new N                 tokens generated per turn (default 256)
   --devices 0,1,2             CUDA devices to use
@@ -312,6 +316,7 @@ bool parse_options(int argc, char** argv, Options& options) {
         else if (argument == "--model-type") options.model_type = std::string(next());
         else if (argument == "--prompt") options.prompt = std::string(next());
         else if (argument == "--system") options.system_prompt = std::string(next());
+        else if (argument == "--reasoning-effort") options.reasoning_effort = std::string(next());
         else if (argument == "--plan-cache") options.plan_cache = std::string(next());
         else if (argument == "--decode-topology") {
             const auto topology = next();
@@ -513,6 +518,26 @@ bool parse_options(int argc, char** argv, Options& options) {
                   << (options.model_type.empty() ? "(missing)" : options.model_type)
                   << '\n';
         return false;
+    }
+    // The accepted budgets come from the model's own registration, so this
+    // rejects a value the selected model's template would silently map to its
+    // most verbose setting -- and rejects any budget at all for a model that
+    // takes none, rather than accepting a flag that does nothing.
+    if (!options.reasoning_effort.empty()) {
+        const auto& reasoning =
+            strata::find_model_by_cli_name(options.model_type)->reasoning;
+        if (!reasoning.accepts_effort()) {
+            std::cerr << "error: --reasoning-effort is not supported by "
+                      << options.model_type << '\n';
+            return false;
+        }
+        if (!strata::reasoning_effort_accepted(reasoning,
+                                               options.reasoning_effort)) {
+            std::cerr << "error: unknown --reasoning-effort: "
+                      << options.reasoning_effort << "; " << options.model_type
+                      << " accepts " << reasoning.efforts << '\n';
+            return false;
+        }
     }
     // A turn is a prompt plus its generation, and both live in the same
     // context. Say so here rather than after several minutes of checkpoint
@@ -1013,6 +1038,7 @@ int main(int argc, char** argv) {
     config.verbose = registration->verbose_by_default;
     config.load_progress = registration->progress_by_default;
     config.sampling = options.sampling;
+    config.reasoning_effort = options.reasoning_effort;
     config.enable_flash_attention =
         options.flash_attention || registration->flash_attention_by_default;
     config.enable_incremental_kv_continuation = options.incremental_kv_continuation;

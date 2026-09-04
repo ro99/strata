@@ -9692,10 +9692,19 @@ ValidationResult Glm53Runtime::initialize(
 Glm53GenerationResult Glm53Runtime::generate_chat_stream(
     std::span<const ChatMessage> messages, std::uint32_t maximum_new_tokens,
     const SamplingOptions& sampling, std::span<const std::string> stop,
-    const TokenStreamCallback& on_token) {
+    std::string_view reasoning_effort, const TokenStreamCallback& on_token) {
     Glm53GenerationResult result;
     if (!impl_->ready) {
         result.errors.emplace_back("GLM-5.3 runtime is not initialized");
+        return result;
+    }
+    // The template maps anything it does not recognize to Max, so an
+    // unrecognized budget would quietly run the most verbose setting.
+    if (reasoning_effort != "low" && reasoning_effort != "high" &&
+        reasoning_effort != "max") {
+        result.errors.push_back(
+            "GLM-5.3 reasoning effort must be low, high or max, not \"" +
+            std::string(reasoning_effort) + "\"");
         return result;
     }
     std::string error;
@@ -9726,8 +9735,8 @@ Glm53GenerationResult Glm53Runtime::generate_chat_stream(
     prompt_request.maximum_new_tokens = maximum_new_tokens;
     prompt_request.maximum_context_tokens =
         impl_->config.maximum_context_tokens;
-    prompt_request.render = [](std::span<const ChatMessage> active) {
-        return render_glm53_chat_prompt(active, "max", true);
+    prompt_request.render = [&](std::span<const ChatMessage> active) {
+        return render_glm53_chat_prompt(active, reasoning_effort, true);
     };
     prompt_request.encode = [&](const std::string& text) {
         return impl_->tokenizer.encode(text);

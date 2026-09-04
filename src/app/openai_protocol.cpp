@@ -292,6 +292,31 @@ bool parse_logit_bias(detail::JsonCursor& cursor, SamplingOptions& sampling,
     return true;
 }
 
+// The template kwargs vLLM clients already send. Only the keys this server can
+// honour are read; the rest are skipped rather than rejected, because a client
+// that also talks to vLLM will send kwargs meant for other models and failing
+// the request on an unknown one would break it for no gain.
+[[nodiscard]] bool parse_chat_template_kwargs(detail::JsonCursor& cursor,
+                                              OpenAiChatRequest& request) {
+    if (cursor.peek() == 'n') {
+        cursor.skip_value();
+        return true;
+    }
+    cursor.expect('{');
+    if (cursor.consume('}')) return true;
+    for (;;) {
+        const auto key = cursor.parse_string();
+        cursor.expect(':');
+        if (key == "reasoning_effort" && cursor.peek() == '"') {
+            request.generation.reasoning_effort = cursor.parse_string();
+        } else {
+            cursor.skip_value();
+        }
+        if (cursor.consume('}')) return true;
+        cursor.expect(',');
+    }
+}
+
 bool parse_response_format(detail::JsonCursor& cursor, bool& json_object,
                            std::string& error) {
     cursor.expect('{');
@@ -382,6 +407,17 @@ bool parse_openai_chat_request(
                     request.generation.sampling.seed = cursor.parse_uint64();
                     request.has_seed = true;
                 }
+            } else if (key == "reasoning_effort") {
+                // OpenAI spells the budget at the top level; vLLM additionally
+                // accepts it inside chat_template_kwargs. Both spellings land
+                // here, and the model's runtime rejects a value its own
+                // template would not honour.
+                if (cursor.peek() == 'n') cursor.skip_value();
+                else request.generation.reasoning_effort = cursor.parse_string();
+            } else if (key == "chat_template_kwargs") {
+                if (!parse_chat_template_kwargs(cursor, request)) return false;
+            } else if (key == "include_reasoning") {
+                request.include_reasoning = cursor.parse_bool();
             } else if (key == "user") {
                 if (cursor.peek() == 'n') cursor.skip_value();
                 else request.user = cursor.parse_string();
@@ -670,6 +706,88 @@ std::string render_openai_timings(const GenerationMetrics& metrics) {
            << ",\"predicted_per_second\":" << predicted_per_second
            << ",\"cache_n\":" << metrics.reused_prompt_tokens.value_or(0U) << '}';
     return output.str();
+}
+
+
+namespace {
+
+// Longest suffix of `text` that is a proper prefix of `tag`. Those bytes could
+// still turn into the delimiter once more text arrives, so they are held back.
+[[nodiscard]] std::size_t held_prefix(std::string_view text,
+                                      std::string_view tag) noexcept {
+    const auto most = std::min(text.size(), tag.size() - 1U);
+    for (std::size_t length = most; length != 0U; --length) {
+        if (text.substr(text.size() - length) == tag.substr(0U, length)) {
+            return length;
+        }
+    }
+    return 0U;
+}
+
+}  // namespace
+
+ReasoningSplitter::ReasoningSplitter(const ReasoningFormat& format) noexcept
+    : open_(format.open == nullptr ? std::string_view{} : format.open),
+      close_(format.close == nullptr ? std::string_view{} : format.close),
+      reasoning_(format.splits_reasoning() && format.opened_by_prompt),
+      done_(!format.splits_reasoning()) {
+    // A format that opens its own block but names no opening tag has no way to
+    // find one, so it is treated as carrying no reasoning at all.
+    if (!done_ && !reasoning_ && open_.empty()) done_ = true;
+}
+
+ReasoningSplitter::Delta ReasoningSplitter::consume(std::string_view piece) {
+    Delta delta;
+    if (done_) {
+        delta.content.assign(piece);
+        return delta;
+    }
+    pending_.append(piece);
+    for (;;) {
+        const auto target = reasoning_ ? close_ : open_;
+        const auto found = pending_.find(target);
+        if (found != std::string::npos) {
+            auto& sink = reasoning_ ? delta.reasoning : delta.content;
+            sink.append(pending_, 0U, found);
+            pending_.erase(0U, found + target.size());
+            if (reasoning_) {
+                // One block per generation: everything after it is answer, and
+                // the answer may legitimately contain a tag's literal text.
+                reasoning_ = false;
+                done_ = true;
+                delta.content.append(pending_);
+                pending_.clear();
+                return delta;
+            }
+            reasoning_ = true;
+            continue;
+        }
+        const auto held = held_prefix(pending_, target);
+        auto& sink = reasoning_ ? delta.reasoning : delta.content;
+        sink.append(pending_, 0U, pending_.size() - held);
+        pending_.erase(0U, pending_.size() - held);
+        return delta;
+    }
+}
+
+ReasoningSplitter::Delta ReasoningSplitter::finish() {
+    Delta delta;
+    if (pending_.empty()) return delta;
+    // The stream stopped inside what might have been a delimiter. Those bytes
+    // are real output and belong to whichever side was open.
+    (reasoning_ ? delta.reasoning : delta.content).append(pending_);
+    pending_.clear();
+    return delta;
+}
+
+ReasoningSplitter::Delta split_reasoning(const ReasoningFormat& format,
+                                         std::string_view text) {
+    ReasoningSplitter splitter(format);
+    auto delta = splitter.consume(text);
+    auto tail = splitter.finish();
+    delta.reasoning += tail.reasoning;
+    delta.content += tail.content;
+    return delta;
 }
 
 }  // namespace strata

@@ -57,6 +57,11 @@ struct RuntimeConfig {
     // Session default sampler. Greedy unless the caller asks otherwise, so a
     // run stays reproducible until someone opts into a stochastic stage.
     SamplingOptions sampling{greedy_sampling()};
+    // Session default reasoning budget, used for any request that does not set
+    // its own -- the equivalent of a server-level default. Empty keeps the
+    // model's own default, and is the only valid value for a model that
+    // accepts no budget.
+    std::string reasoning_effort;
     bool verbose{};
     bool load_progress{};
     bool enable_flash_attention{};
@@ -126,7 +131,48 @@ struct GenerationOptions {
     std::uint32_t maximum_new_tokens{256U};
     SamplingOptions sampling;
     std::vector<std::string> stop;
+    // Reasoning budget for models whose chat template accepts one, as the
+    // template spells it. Empty keeps the model's own default, which is what
+    // every model that has no such budget sees.
+    //
+    // This is a budget, not a switch. A template that opens a reasoning block
+    // unconditionally -- GLM-5.3's does -- has no value here that turns
+    // reasoning off, and the lowest budget still reasons.
+    std::string reasoning_effort;
 };
+
+// How a model's generated text delimits reasoning from the answer, so a caller
+// can separate the two without knowing which model produced them. A registration
+// that leaves `close` empty declares that the model emits no reasoning, and its
+// output is passed through whole.
+//
+// `opened_by_prompt` is the case GLM-5.3 presents: the rendered prompt already
+// ends with the opening tag, so generation begins *inside* the block and the
+// text carries only the closing one. A model that emits its own opening tag
+// leaves this false.
+struct ReasoningFormat {
+    const char* open{};
+    const char* close{};
+    bool opened_by_prompt{};
+    // Comma-separated budgets this model's template accepts, lowest first.
+    // Empty means the model takes no budget, and a request that sets one is
+    // rejected rather than silently ignored -- GLM-5.3's template falls back
+    // to its most verbose setting for an unrecognized value, which would
+    // otherwise turn a typo into the opposite of what was asked for.
+    const char* efforts{};
+
+    [[nodiscard]] bool splits_reasoning() const noexcept {
+        return close != nullptr && *close != '\0';
+    }
+    [[nodiscard]] bool accepts_effort() const noexcept {
+        return efforts != nullptr && *efforts != '\0';
+    }
+};
+
+// Whether `value` is one of a model's accepted reasoning budgets. False for
+// every value when the model accepts none.
+[[nodiscard]] bool reasoning_effort_accepted(const ReasoningFormat& format,
+                                            std::string_view value) noexcept;
 
 // One loaded model. Implementations wrap a concrete runtime and own the
 // translation between its architecture-specific config/result types and the
@@ -173,6 +219,8 @@ struct ModelRegistration {
     // quietly ran a centralized GLM would report the accepted path while
     // executing a different one.
     bool accepts_deepseek_controls{};
+    // Empty for a model that emits no reasoning; see ReasoningFormat.
+    ReasoningFormat reasoning{};
     std::unique_ptr<ModelExecutor> (*make)(){};
 };
 

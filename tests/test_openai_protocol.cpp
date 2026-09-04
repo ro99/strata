@@ -187,3 +187,113 @@ TEST_CASE("legacy completions and tokenize requests parse") {
     REQUIRE(strata::is_json_object("{\"ok\":true}"));
     REQUIRE(!strata::is_json_object("[1,2]"));
 }
+
+namespace {
+
+// GLM-5.3's shape: the prompt already opened the block, so generation starts
+// inside it and carries only the closing tag.
+constexpr strata::ReasoningFormat kGlm53{"<think>", "</think>", true,
+                                         "low,high,max"};
+
+}  // namespace
+
+TEST_CASE("reasoning splits at the closing tag when the prompt opened it") {
+    const auto whole = strata::split_reasoning(
+        kGlm53, "weighing it up</think>The answer is 555.");
+    REQUIRE(whole.reasoning == "weighing it up");
+    REQUIRE(whole.content == "The answer is 555.");
+}
+
+TEST_CASE("reasoning splitter holds a tag that straddles two pieces") {
+    // The tokenizer puts the boundary wherever it likes, so the closing tag
+    // arrives in fragments. Nothing may be emitted as content until the tag is
+    // resolved, and nothing may be lost.
+    strata::ReasoningSplitter splitter(kGlm53);
+    std::string reasoning;
+    std::string content;
+    for (const auto piece : {"think", "ing</", "thi", "nk>ans", "wer"}) {
+        const auto delta = splitter.consume(piece);
+        reasoning += delta.reasoning;
+        content += delta.content;
+    }
+    const auto tail = splitter.finish();
+    reasoning += tail.reasoning;
+    content += tail.content;
+    REQUIRE(reasoning == "thinking");
+    REQUIRE(content == "answer");
+}
+
+TEST_CASE("reasoning splitter releases a stream that ended mid-tag") {
+    // Truncation inside the scratchpad is the documented failure when --max-new
+    // is too small to reach </think>. The held bytes are real output.
+    strata::ReasoningSplitter splitter(kGlm53);
+    auto delta = splitter.consume("still thinking</thin");
+    REQUIRE(delta.reasoning == "still thinking");
+    REQUIRE(delta.content.empty());
+    const auto tail = splitter.finish();
+    REQUIRE(tail.reasoning == "</thin");
+    REQUIRE(tail.content.empty());
+    REQUIRE(splitter.reasoning_open());
+}
+
+TEST_CASE("reasoning splitter stops scanning after the block closes") {
+    // One block per generation: an answer may quote a tag's literal text
+    // without being re-parsed as reasoning.
+    const auto whole = strata::split_reasoning(
+        kGlm53, "brief</think>write <think> to open a block");
+    REQUIRE(whole.reasoning == "brief");
+    REQUIRE(whole.content == "write <think> to open a block");
+}
+
+TEST_CASE("an unannotated model passes its whole output through as content") {
+    const auto whole = strata::split_reasoning(
+        strata::ReasoningFormat{}, "plain <think> output</think>");
+    REQUIRE(whole.reasoning.empty());
+    REQUIRE(whole.content == "plain <think> output</think>");
+}
+
+TEST_CASE("a model that emits its own opening tag is split on both") {
+    constexpr strata::ReasoningFormat self_opening{"<think>", "</think>", false,
+                                                   ""};
+    const auto whole = strata::split_reasoning(
+        self_opening, "lead<think>why</think>answer");
+    REQUIRE(whole.reasoning == "why");
+    REQUIRE(whole.content == "leadanswer");
+}
+
+TEST_CASE("chat requests carry a reasoning budget and reasoning visibility") {
+    strata::OpenAiChatRequest request;
+    std::string error;
+    REQUIRE(strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"hi"}],)"
+        R"("reasoning_effort":"low","include_reasoning":false})",
+        request, error));
+    REQUIRE(error.empty());
+    REQUIRE(request.generation.reasoning_effort == "low");
+    REQUIRE(!request.include_reasoning);
+}
+
+TEST_CASE("chat_template_kwargs supplies the budget vLLM clients already send") {
+    strata::OpenAiChatRequest request;
+    std::string error;
+    // A client that also talks to vLLM sends kwargs meant for other models.
+    // The ones this server cannot honour are skipped, not rejected.
+    REQUIRE(strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"hi"}],)"
+        R"("chat_template_kwargs":{"enable_thinking":false,)"
+        R"("reasoning_effort":"high","clear_thinking":true}})",
+        request, error));
+    REQUIRE(error.empty());
+    REQUIRE(request.generation.reasoning_effort == "high");
+    REQUIRE(request.include_reasoning);
+}
+
+TEST_CASE("a request naming no budget leaves the model's own default") {
+    strata::OpenAiChatRequest request;
+    std::string error;
+    REQUIRE(strata::parse_openai_chat_request(
+        R"({"model":"local","messages":[{"role":"user","content":"hi"}]})",
+        request, error));
+    REQUIRE(request.generation.reasoning_effort.empty());
+    REQUIRE(request.include_reasoning);
+}

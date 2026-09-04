@@ -42,6 +42,7 @@ struct Options {
     std::string model_type;
     std::string model_id;
     std::string models_preset;
+    std::string reasoning_effort;
     std::string host{"127.0.0.1"};
     std::vector<int> devices;
     std::uint32_t context_size{2048U};
@@ -102,6 +103,7 @@ void usage() {
         << "                     [--dry-run] [--replan]\n"
         << "                     [--plan-cache DIR] [--no-plan-cache]\n"
         << "                     [--temperature F] [--top-p F] [--seed N]\n"
+        << "                     [--reasoning-effort E]\n"
         << "   or: strata-server --models-preset FILE [--models-max N]\n"
         << "                     [--no-models-autoload] [--host ADDRESS] [--port N]\n\n"
         << "--device-resident-runtime is the DeepSeek device-resident decode\n"
@@ -176,6 +178,7 @@ bool parse_options(int argc, char** argv, Options& options) {
         else if (argument == "--plan-cache") options.plan_cache = next();
         else if (argument == "--model-type") options.model_type = next();
         else if (argument == "--model-id") options.model_id = next();
+        else if (argument == "--reasoning-effort") options.reasoning_effort = next();
         else if (argument == "--host") options.host = next();
         else if (argument == "--decode-topology") {
             const auto topology = next();
@@ -264,8 +267,26 @@ bool parse_options(int argc, char** argv, Options& options) {
     }
     // Resolved through the model registry rather than a hardcoded list, so a
     // new model needs no edit here.
-    return !options.model.empty() && !options.model_id.empty() &&
-        strata::find_model_by_cli_name(options.model_type) != nullptr;
+    const auto* registration =
+        strata::find_model_by_cli_name(options.model_type);
+    if (registration == nullptr) return false;
+    // The server default every request inherits unless it names its own, so an
+    // unusable value has to fail here rather than on every request.
+    if (!options.reasoning_effort.empty()) {
+        if (!registration->reasoning.accepts_effort()) {
+            std::cerr << "error: --reasoning-effort is not supported by "
+                      << options.model_type << '\n';
+            return false;
+        }
+        if (!strata::reasoning_effort_accepted(registration->reasoning,
+                                               options.reasoning_effort)) {
+            std::cerr << "error: unknown --reasoning-effort: "
+                      << options.reasoning_effort << "; " << options.model_type
+                      << " accepts " << registration->reasoning.efforts << '\n';
+            return false;
+        }
+    }
+    return !options.model.empty() && !options.model_id.empty();
 }
 
 std::string lower(std::string_view text) {
@@ -467,8 +488,10 @@ std::string token_logprobs_json(
 class ApiServer {
 public:
     ApiServer(const Options& options, strata::RuntimeSession& runtime,
-              strata::ModelTokenizer tokenizer)
-        : options_(options), runtime_(runtime), tokenizer_(std::move(tokenizer)) {}
+              strata::ModelTokenizer tokenizer,
+              strata::ReasoningFormat reasoning)
+        : options_(options), runtime_(runtime), tokenizer_(std::move(tokenizer)),
+          reasoning_(reasoning) {}
 
     void handle(int socket, const HttpRequest& http) {
         const auto query = http.target.find('?');
@@ -570,6 +593,23 @@ private:
                        "invalid_request_error", "unsupported_parameter");
             return;
         }
+        // A budget the loaded model does not accept is a bad parameter, not a
+        // server fault. The runtime rejects it too, but only after the request
+        // has been admitted, which would report it as a 500.
+        if (!request.generation.reasoning_effort.empty() &&
+            !strata::reasoning_effort_accepted(
+                reasoning_, request.generation.reasoning_effort)) {
+            std::cerr << "[request] id=" << id
+                      << " phase=rejected status=400 error=invalid_reasoning_effort\n";
+            send_error(socket, 400, "Bad Request",
+                       reasoning_.accepts_effort()
+                           ? "reasoning_effort must be one of: " +
+                                 std::string(reasoning_.efforts)
+                           : "reasoning_effort is not supported by this "
+                             "loaded model",
+                       "invalid_request_error", "unsupported_parameter");
+            return;
+        }
         for (const auto& [token, bias] : request.generation.sampling.logit_bias) {
             static_cast<void>(bias);
             if (token >= tokenizer_.vocabulary_size()) {
@@ -655,6 +695,39 @@ private:
             bool valid_utf8 = true;
             bool first_token = true;
             std::string utf8_pending;
+            strata::ReasoningSplitter splitter(chat_reasoning(chat));
+            // One delta object may carry both halves: the piece that completes
+            // the closing tag ends the reasoning and opens the answer.
+            const auto delta_json =
+                [&](const strata::ReasoningSplitter::Delta& delta) {
+                    std::ostringstream fields;
+                    fields << "\"delta\":{";
+                    bool written = false;
+                    if (request.include_reasoning && !delta.reasoning.empty()) {
+                        fields << "\"reasoning_content\":\""
+                               << strata::cli::json_escape(delta.reasoning)
+                               << '"';
+                        written = true;
+                    }
+                    if (!delta.content.empty()) {
+                        if (written) fields << ',';
+                        fields << "\"content\":\""
+                               << strata::cli::json_escape(delta.content) << '"';
+                    }
+                    fields << '}';
+                    return fields.str();
+                };
+            const auto send_chunk = [&](const std::string& body) {
+                std::ostringstream chunk;
+                chunk << "data: {\"id\":\"" << id << "\",\"object\":\""
+                      << (chat ? "chat.completion.chunk" : "text_completion")
+                      << "\",\"created\":" << created << ",\"model\":\""
+                      << strata::cli::json_escape(request.model)
+                      << "\",\"choices\":[{\"index\":" << index << ','
+                      << body
+                      << ",\"logprobs\":null,\"finish_reason\":null}]}\n\n";
+                return send_all(socket, chunk.str());
+            };
             std::cerr << "[request] id=" << id
                       << " phase=generation_start choice=" << index << '\n';
             const strata::TokenStreamCallback callback =
@@ -678,22 +751,32 @@ private:
                         return false;
                     }
                     if (complete == 0U) return true;
-                    piece = std::string_view(utf8_pending).substr(0U, complete);
-                    std::ostringstream chunk;
-                    chunk << "data: {\"id\":\"" << id << "\",\"object\":\""
-                          << (chat ? "chat.completion.chunk" : "text_completion")
-                          << "\",\"created\":" << created << ",\"model\":\""
-                          << strata::cli::json_escape(request.model)
-                          << "\",\"choices\":[{\"index\":" << index << ',';
-                    if (chat) chunk << "\"delta\":{\"content\":\""
-                                    << strata::cli::json_escape(piece) << "\"}";
-                    else chunk << "\"text\":\"" << strata::cli::json_escape(piece) << '"';
-                    chunk << ",\"logprobs\":null,\"finish_reason\":null}]}\n\n";
-                    connected = send_all(socket, chunk.str());
+                    // Copied out before the buffer is trimmed: a view into
+                    // `utf8_pending` would dangle the moment it is erased.
+                    const std::string ready(utf8_pending, 0U, complete);
                     utf8_pending.erase(0U, complete);
+                    if (!chat) {
+                        connected = send_chunk(
+                            "\"text\":\"" +
+                            strata::cli::json_escape(ready) + '"');
+                        return connected;
+                    }
+                    const auto delta = splitter.consume(ready);
+                    // A piece held back as a possible delimiter produces no
+                    // delta yet; sending an empty one would be a chunk that
+                    // says nothing.
+                    if (delta.empty()) return true;
+                    connected = send_chunk(delta_json(delta));
                     return connected;
                 };
             auto result = runtime_.generate_chat_stream(request.messages, options, callback);
+            // Whatever the splitter still holds was real output: a generation
+            // that stopped inside the closing tag -- the documented outcome
+            // when --max-new cannot reach it -- must not silently lose it.
+            if (result.ok() && connected && chat) {
+                const auto tail = splitter.finish();
+                if (!tail.empty()) connected = send_chunk(delta_json(tail));
+            }
             if (!result.ok()) {
                 std::cerr << "[request] id=" << id
                           << " phase=error stage=generation error="
@@ -803,7 +886,13 @@ private:
                            "server_error");
                 return;
             }
-            if (request.json_object && !strata::is_json_object(result.text)) {
+            // Judge the answer, not the scratchpad. A reasoning model's raw
+            // text always opens with its reasoning, so checking that would fail
+            // every JSON-mode request the model actually answered correctly.
+            if (request.json_object &&
+                !strata::is_json_object(
+                    strata::split_reasoning(chat_reasoning(chat),
+                                            result.text).content)) {
                 send_error(socket, 500, "Internal Server Error",
                            "model did not produce a valid JSON object", "server_error");
                 return;
@@ -833,8 +922,16 @@ private:
                 result.metrics.reused_prompt_tokens.value_or(0U);
             response << "{\"index\":" << index << ',';
             if (chat) {
-                response << "\"message\":{\"role\":\"assistant\",\"content\":\""
-                         << strata::cli::json_escape(result.text)
+                const auto split = strata::split_reasoning(chat_reasoning(true),
+                                                           result.text);
+                response << "\"message\":{\"role\":\"assistant\",";
+                if (request.include_reasoning && !split.reasoning.empty()) {
+                    response << "\"reasoning_content\":\""
+                             << strata::cli::json_escape(split.reasoning)
+                             << "\",";
+                }
+                response << "\"content\":\""
+                         << strata::cli::json_escape(split.content)
                          << "\",\"refusal\":null,\"tool_calls\":null}";
             } else {
                 response << "\"text\":\"" << strata::cli::json_escape(result.text) << '"';
@@ -876,9 +973,17 @@ private:
         send_response(socket, 200, "OK", "application/json", response.str());
     }
 
+    // How this model delimits reasoning, from its registration. Chat responses
+    // return the two halves separately; the completions API has no field for
+    // reasoning, so its text is passed through whole.
+    [[nodiscard]] strata::ReasoningFormat chat_reasoning(bool chat) const noexcept {
+        return chat ? reasoning_ : strata::ReasoningFormat{};
+    }
+
     const Options& options_;
     strata::RuntimeSession& runtime_;
     strata::ModelTokenizer tokenizer_;
+    strata::ReasoningFormat reasoning_{};
     std::atomic<std::uint64_t> request_id_{};
 };
 
@@ -1474,6 +1579,7 @@ int main(int argc, char** argv) {
     config.use_placement_cache = options.use_plan_cache;
     config.refresh_placement_plan = options.replan;
     config.report_placement_plan = true;
+    config.reasoning_effort = options.reasoning_effort;
 
     if (options.dry_run) {
         const auto resolved = strata::resolve_placement_plan(
@@ -1513,7 +1619,8 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, stop_server);
     std::signal(SIGPIPE, SIG_IGN);
     std::cerr << "[ready] http://" << options.host << ':' << options.port << "\n";
-    ApiServer server(options, runtime, std::move(tokenizer.value));
+    ApiServer server(options, runtime, std::move(tokenizer.value),
+                     registration->reasoning);
     const bool concurrent_requests =
         registration->model == strata::RuntimeModel::Glm53;
     // The GLM scheduler multiplexes generation iterations, so its HTTP front

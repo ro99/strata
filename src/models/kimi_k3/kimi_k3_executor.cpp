@@ -42,6 +42,9 @@ private:
 const ModelRegistrar registrar{{
     RuntimeModel::KimiK3, "Kimi-K3", "kimi-k3", PlacementModel::KimiK3,
     false, true, false, false,
+    // This model\'s reasoning, if any, is not separated yet; its output is
+    // passed through whole and it accepts no budget.
+    ReasoningFormat{},
     [] { return std::unique_ptr<ModelExecutor>(new KimiK3Executor()); }}};
 
 }  // namespace

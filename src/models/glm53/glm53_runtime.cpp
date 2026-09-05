@@ -15,6 +15,8 @@
 #include "strata/platform/numerics.hpp"
 #include "strata/platform/worker_pool.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1744,6 +1746,14 @@ struct Glm53RowRange {
 double now_seconds() {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Whether stderr is a terminal, resolved once. Progress that overwrites itself
+// with a carriage return is legible on a TTY and is pure volume in a captured
+// server log, so the two get different reporting rather than the same.
+[[nodiscard]] bool progress_is_terminal() noexcept {
+    static const bool terminal = ::isatty(STDERR_FILENO) == 1;
+    return terminal;
 }
 
 float sigmoid(float value) noexcept {
@@ -9105,12 +9115,17 @@ struct Glm53Runtime::Impl {
                     elapsed_nanoseconds(layer_started),
                     std::memory_order_relaxed);
             }
-            if (config.load_progress) {
+            // Only on a terminal. This is a carriage-return spinner: it
+            // overwrites itself on a TTY and, in a redirected server log,
+            // becomes 45 indistinguishable lines per page with nothing to say
+            // which page they belong to. The page line in advance_prefill is
+            // what a log wants.
+            if (config.load_progress && progress_is_terminal()) {
                 std::cerr << "\r[glm53-prefill] layer " << (layer + 1U) << '/'
                           << kLayers << " rows " << tokens.size() << std::flush;
             }
         }
-        if (config.load_progress) {
+        if (config.load_progress && progress_is_terminal()) {
             std::cerr << '\r' << std::string(48U, ' ') << '\r';
         }
         if (base_hidden_rows != nullptr) {
@@ -9755,6 +9770,33 @@ struct Glm53Runtime::Impl {
             return;
         }
         request->prefill_cursor += count;
+        // Page-level progress, which is the only place that knows the prompt
+        // total. A long prompt is minutes of prefill with no output of its own,
+        // so report where it is and when it ends rather than which layer of an
+        // unnumbered page it is on. The rate is measured over this request's
+        // completed pages, so the estimate sharpens as it goes; it is a
+        // projection of observed throughput, not a promise.
+        if (config.load_progress && !request->prompt.empty()) {
+            const auto done = request->prefill_cursor;
+            const auto total = request->prompt.size();
+            const auto elapsed = now_seconds() - request->prefill_started;
+            const auto share = static_cast<double>(done) /
+                               static_cast<double>(total);
+            std::ostringstream line;
+            line.setf(std::ios::fixed);
+            line << "[glm53-prefill] " << done << '/' << total << " tokens ("
+                 << std::setprecision(1) << (share * 100.0) << "%)";
+            if (elapsed > 0.0 && done != 0U) {
+                const auto rate = static_cast<double>(done) / elapsed;
+                line << " " << std::setprecision(2) << rate << " tok/s elapsed "
+                     << std::setprecision(1) << elapsed << " s";
+                if (done < total) {
+                    line << " eta "
+                         << (static_cast<double>(total - done) / rate) << " s";
+                }
+            }
+            std::cerr << line.str() << '\n' << std::flush;
+        }
         if (request->prefill_cursor == request->prompt.size()) {
             finish_prefill(request);
         }

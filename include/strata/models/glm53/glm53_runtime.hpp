@@ -139,6 +139,7 @@ struct Glm53CacheMetrics {
 struct Glm53HostExpertMetrics {
     std::uint64_t calls{};
     std::uint64_t rows{};
+    std::uint64_t group_windows{};
     std::uint64_t gate_up_weight_bytes{};
     std::uint64_t down_weight_bytes{};
     std::uint64_t view_resolution_nanoseconds{};

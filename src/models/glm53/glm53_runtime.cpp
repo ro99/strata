@@ -147,6 +147,7 @@ namespace {
     return {
         after.calls - before.calls,
         after.rows - before.rows,
+        after.group_windows - before.group_windows,
         after.gate_up_weight_bytes - before.gate_up_weight_bytes,
         after.down_weight_bytes - before.down_weight_bytes,
         after.view_resolution_nanoseconds - before.view_resolution_nanoseconds,
@@ -254,6 +255,7 @@ void print_phase_metrics(std::ostream& output,
            << "},\"host_experts\":{\"calls\":"
            << phase.host_experts.calls
            << ",\"rows\":" << phase.host_experts.rows
+           << ",\"group_windows\":" << phase.host_experts.group_windows
            << ",\"gate_up_weight_bytes\":"
            << phase.host_experts.gate_up_weight_bytes
            << ",\"down_weight_bytes\":"
@@ -3327,6 +3329,7 @@ struct Glm53Runtime::Impl {
     bool host_moe_active{};
     std::atomic<std::uint64_t> host_moe_calls{};
     std::atomic<std::uint64_t> host_moe_rows{};
+    std::atomic<std::uint64_t> host_moe_group_windows{};
     std::atomic<std::uint64_t> host_moe_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_gate_up_weight_bytes{};
     std::atomic<std::uint64_t> host_moe_down_weight_bytes{};
@@ -3425,6 +3428,7 @@ struct Glm53Runtime::Impl {
         return {
             host_moe_calls.load(std::memory_order_relaxed),
             host_moe_rows.load(std::memory_order_relaxed),
+            host_moe_group_windows.load(std::memory_order_relaxed),
             host_moe_gate_up_weight_bytes.load(std::memory_order_relaxed),
             host_moe_down_weight_bytes.load(std::memory_order_relaxed),
             host_moe_view_nanoseconds.load(std::memory_order_relaxed),
@@ -5135,6 +5139,12 @@ struct Glm53Runtime::Impl {
             return {{"GLM-5.3 host page activation scratch is too small"}};
         }
         const auto gate_up_started = std::chrono::steady_clock::now();
+        // Diagnostic for the item-2 investigation (record 0250): sum of
+        // expert groups per gate_up dispatch. tasks = group_windows * 2048,
+        // mean assignments/group = rows * 8 / group_windows. Zero behavior
+        // change: one relaxed increment per MoE call.
+        host_moe_group_windows.fetch_add(groups.size(),
+                                         std::memory_order_relaxed);
         result = host_moe_workers->parallel_for_blocked(
             groups.size() * intermediate, expert_dispatch_block(),
             [&](std::size_t task) {

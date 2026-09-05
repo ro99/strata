@@ -6172,9 +6172,19 @@ struct Glm53Runtime::Impl {
         return result;
     }
 
-    [[nodiscard]] ValidationResult mhc_pre(
-        std::span<float> collapsed, Dsv4MhcMix& mix,
-        std::span<const float> streams, const std::string& prefix) {
+    // Prefetched mHC projection weights for one (layer, block) pair. Fetching
+    // them once per page instead of once per row removes tens of thousands of
+    // string concatenations and cache lookups from a prefill (record 0250).
+    // The pointed-to vectors are immutable after load, so sharing them across
+    // row workers is exact.
+    struct MhcPreWeights {
+        std::shared_ptr<const std::vector<float>> projection;
+        std::shared_ptr<const std::vector<float>> base;
+        std::shared_ptr<const std::vector<float>> scale;
+    };
+
+    [[nodiscard]] ValidationResult mhc_pre_weights(
+        MhcPreWeights& weights, const std::string& prefix) {
         ValidationResult result;
         auto projection = host_tensor(prefix + "_fn", 24U * 16384U);
         auto base = host_tensor(prefix + "_base", 24U);
@@ -6185,6 +6195,16 @@ struct Glm53Runtime::Impl {
             append(result.errors, std::move(scale.errors));
             return result;
         }
+        weights.projection = projection.value;
+        weights.base = base.value;
+        weights.scale = scale.value;
+        return result;
+    }
+
+    [[nodiscard]] ValidationResult mhc_pre_with_weights(
+        std::span<float> collapsed, Dsv4MhcMix& mix,
+        std::span<const float> streams, const MhcPreWeights& weights) {
+        ValidationResult result;
         double square_sum = 0.0;
         for (const auto value : streams) square_sum += static_cast<double>(value) * value;
         const auto reciprocal = 1.0F / std::sqrt(
@@ -6194,13 +6214,13 @@ struct Glm53Runtime::Impl {
         for (std::size_t row = 0U; row < projected.size(); ++row) {
             double sum = 0.0;
             for (std::size_t column = 0U; column < streams.size(); ++column) {
-                sum += static_cast<double>((*projection.value)[row * streams.size() + column]) *
+                sum += static_cast<double>((*weights.projection)[row * streams.size() + column]) *
                        streams[column];
             }
             projected[row] = static_cast<float>(sum) * reciprocal;
         }
         auto split = dsv4_mhc_split_sinkhorn_f32(
-            projected, *scale.value, *base.value, kMhc, 20U, 1.0e-6F);
+            projected, *weights.scale, *weights.base, kMhc, 20U, 1.0e-6F);
         if (!split.ok()) return {std::move(split.errors)};
         mix = std::move(split.value);
         round_bf16(mix.post);
@@ -6214,6 +6234,53 @@ struct Glm53Runtime::Impl {
         }
         round_bf16(collapsed);
         return result;
+    }
+
+    [[nodiscard]] ValidationResult mhc_pre(
+        std::span<float> collapsed, Dsv4MhcMix& mix,
+        std::span<const float> streams, const std::string& prefix) {
+        MhcPreWeights weights;
+        ValidationResult result = mhc_pre_weights(weights, prefix);
+        if (!result.ok()) return result;
+        return mhc_pre_with_weights(collapsed, mix, streams, weights);
+    }
+
+    // Row-parallel driver for per-row page glue (record 0250). Every row of a
+    // prefill page computes the same function of disjoint spans -- one MHC
+    // projection, one post-mix, one norm -- so running rows on the MoE worker
+    // pool changes scheduling only: each row keeps its exact scalar-double
+    // operation order and the output is bit-for-bit the sequential one. Falls
+    // back to sequential when the pool is unavailable, so single-row callers
+    // (decode) pay no dispatch cost.
+    [[nodiscard]] ValidationResult parallel_page_rows(
+        std::uint32_t rows,
+        const std::function<ValidationResult(std::uint32_t)>& row_fn) {
+        if (rows == 0U) return {};
+        if (host_moe_workers == nullptr || !host_moe_active ||
+            host_moe_workers->size() <= 1U || rows == 1U) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                ValidationResult step = row_fn(row);
+                if (!step.ok()) return step;
+            }
+            return {};
+        }
+        const std::size_t workers = host_moe_workers->size();
+        const std::size_t block = std::max<std::size_t>(
+            1U, (static_cast<std::size_t>(rows) + workers * 4U - 1U) /
+                      (workers * 4U));
+        std::mutex error_mutex;
+        ValidationResult first_error;
+        ValidationResult dispatch = host_moe_workers->parallel_for_blocked(
+            rows, block, [&](std::size_t task) {
+                ValidationResult step =
+                    row_fn(static_cast<std::uint32_t>(task));
+                if (!step.ok()) {
+                    std::scoped_lock lock(error_mutex);
+                    if (first_error.ok()) first_error = std::move(step);
+                }
+            });
+        if (!dispatch.ok()) return dispatch;
+        return first_error;
     }
 
     [[nodiscard]] ValidationResult attention_kda(
@@ -8193,17 +8260,20 @@ struct Glm53Runtime::Impl {
         std::vector<Dsv4MhcMix> mixes(rows);
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+        MhcPreWeights attn_pre_weights;
+        result = mhc_pre_weights(attn_pre_weights, prefix + "hc_attn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_attn");
-            if (!result.ok()) return result;
-        }
+                attn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
@@ -8227,33 +8297,38 @@ struct Glm53Runtime::Impl {
                                                 std::memory_order_relaxed);
             }
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
+        MhcPreWeights ffn_pre_weights;
+        result = mhc_pre_weights(ffn_pre_weights, prefix + "hc_ffn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_ffn");
-            if (!result.ok()) return result;
-        }
+                ffn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
@@ -8275,22 +8350,24 @@ struct Glm53Runtime::Impl {
                 elapsed_nanoseconds(feedforward_started),
                 std::memory_order_relaxed);
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
         return result;
     }
 
@@ -8593,17 +8670,20 @@ struct Glm53Runtime::Impl {
         std::vector<Dsv4MhcMix> mixes(rows);
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+        MhcPreWeights attn_pre_weights;
+        result = mhc_pre_weights(attn_pre_weights, prefix + "hc_attn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_attn");
-            if (!result.ok()) return result;
-        }
+                attn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
@@ -8636,33 +8716,38 @@ struct Glm53Runtime::Impl {
                                                 std::memory_order_relaxed);
             }
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
+        MhcPreWeights ffn_pre_weights;
+        result = mhc_pre_weights(ffn_pre_weights, prefix + "hc_ffn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_ffn");
-            if (!result.ok()) return result;
-        }
+                ffn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
@@ -8680,22 +8765,24 @@ struct Glm53Runtime::Impl {
                 elapsed_nanoseconds(feedforward_started),
                 std::memory_order_relaxed);
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
         return result;
     }
 

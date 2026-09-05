@@ -73,7 +73,7 @@ block geometry before generation.
 
 ## Chat and server
 
-Two prefixes are **required** to reach the measured rates, not optional tuning:
+Two prefixes and one flag are **required** to reach the measured rates, not optional tuning:
 
 - `CUDA_DEVICE_ORDER=PCI_BUS_ID` — many shells export `FASTEST_FIRST`. Without
   this, `--devices 1,2` can silently select a different card than intended; on
@@ -83,19 +83,67 @@ Two prefixes are **required** to reach the measured rates, not optional tuning:
   placement lottery. Under the default policy the checkpoint lands 55.9/44.1
   across the two NUMA nodes in one run and 44.4/55.6 in the next, random in
   direction, which is a 6.7% spread on identical code (record 0218).
+- `--device-prefill` — worth **1.38x** on prompt processing and by far the larger of the
+  two prefill levers, almost entirely by moving KDA off the host: 15.69 s to 0.14 s at
+  619 tokens, 112x (record 0240). It defaults **off**, and it is unavailable above
+  `--context-size 2048`, because the device chain computes no indexer k-pool state and
+  `device_prefill_for_context()` refuses it for any context that can cross `kIndexTopK`.
+  `STRATA_GLM53_DEVICE_PREFILL=1` still sets it; the flag and the variable are OR-ed.
+- `--prefill-page-tokens 128` — worth a further **1.02x**, byte-identical. The compiled
+  default is 64 and the curve is flat from 128 upward, so 128 is the knee. Do not expect
+  more from it: weight bytes fall 4.7x between width 64 and 619 and prefill barely moves,
+  because the host expert path is **compute-bound** at these shapes, saturating near
+  77 GMAC/s — roughly 11% of this host's AVX2 FMA peak (records 0241, 0242).
+
+Together the two are **1.411x** at 619 tokens, byte-identical: 129.40 s to 91.71 s,
+medians of interleaved repetitions. Above `--context-size 2048` only the width half
+applies, and it is worth about 1.06x.
+
+A third improvement needs no flag at all. The routed page-MoE reduction used to
+dispatch one worker task per (row, column) -- about nine multiply-adds behind one
+contended atomic increment -- which cost a flat **16.4 s** of every prefill regardless
+of page width or prefill placement. Blocking that dispatch at 1024 takes the term to
+**0.19 s**, worth **1.194x** on total prefill on its own, byte-identical (record 0243).
+It is the default since `2d454be`; `STRATA_GLM53_EXPERT_REDUCTION_BLOCK=1` restores the
+old behaviour for A/B work.
+
+A prefill page also runs its routed experts on the device now, using the pinned
+expert tier that previously served decode only -- `feedforward_page`'s
+`allow_device_tiers` defaulted to false at both prefill call sites, so a page ran
+every routed expert on the host. Worth a further **1.09x**, byte-identical, on VRAM
+that was already allocated and idle during prefill (record 0244). Demand-staging
+the *non*-tier experts is implemented and exact but off by default
+(`STRATA_GLM53_DEVICE_PAGE_STAGING=1`): it moves 100% of routed experts to the GPU
+and still loses 2.3 s, because the 110.6 GB it uploads runs serially at 3.80 GB/s.
+
+At long prompts the routed experts are demand-staged to the device and every one
+of them executes there, on **both** cards rather than only the one that owns the
+layer. At 1,925 tokens prefill falls **248.60 s to 148.95 s, 7.743 to 12.924
+tok/s (1.67x)**, byte-identical, on defaults with no environment overrides:
+staging (1.27x), an O(n) counting sort replacing a quadratic one (1.09x), a
+grouped kernel launch (1.03x), expert parallelism across devices (1.13x), and a
+staging reserve without which none of it engages (1.66x on its own, because the
+static tier otherwise fills the device cache at load and leaves demand staging
+no room). Records 0244 and 0245.
+
+**Current best at 619 tokens: 129.40 s to 70.07 s, 4.784 to 8.834 tok/s, 1.847x**, with
+no kernel rewrite and no precision change. In the long-context
+regime (`--context-size 4096`, where device prefill is unavailable) the same three
+changes give **147.04 s to 125.89 s, 1.168x**; the reduction fix carries there in full
+absolute terms and attention, at 28.6% of the phase, becomes the next target.
 
 ```bash
 env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-chat \
   --model models/glm53f-mxfp4 --model-type glm53 \
   --devices 1,2 --context-size 2048 --max-new 256 \
-  --vram-fraction 0.85
+  --device-prefill --prefill-page-tokens 128 --vram-fraction 0.85
 
 env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
   ./build-release/strata-server \
   --model models/glm53f-mxfp4 --model-type glm53 --model-id glm53f-mxfp4 \
   --devices 1,2 --context-size 2048 --max-new 256 \
-  --vram-fraction 0.85 --port 8080
+  --device-prefill --prefill-page-tokens 128 --vram-fraction 0.85 --port 8080
 ```
 
 ### Reasoning
@@ -160,7 +208,8 @@ twice and read the second run: the static expert tier uploads about 9.5 GiB at
 startup, so a cold first process understates by up to 1.8x.
 
 ```bash
-env CUDA_DEVICE_ORDER=PCI_BUS_ID numactl --interleave=all \
+env CUDA_DEVICE_ORDER=PCI_BUS_ID STRATA_GLM53_DEVICE_PREFILL=1 \
+  numactl --interleave=all \
   ./build-release/strata-chat \
   --model models/glm53f-mxfp4 --model-type glm53 \
   --prompt 'Write the natural numbers in order, one per line, starting at 1. Continue until you reach 1000.' \

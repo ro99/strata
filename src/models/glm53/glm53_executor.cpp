@@ -18,6 +18,10 @@ public:
         concrete.sampling_seed = config.sampling.seed;
         concrete.verbose = config.verbose;
         concrete.load_progress = config.load_progress;
+        if (config.prefill_page_tokens != 0U) {
+            concrete.prefill_page_tokens = config.prefill_page_tokens;
+        }
+        concrete.device_prefill = config.device_prefill;
         return runtime_.initialize(model_directory, concrete);
     }
 

@@ -47,5 +47,6 @@ namespace strata {
 #include "detail/backend_absorbed_attention.inc.cuh"
 #include "detail/backend_matmul.inc.cuh"
 #include "detail/backend_moe.inc.cuh"
+#include "detail/backend_regfed_nvfp4.inc.cuh"
 
 }  // namespace strata

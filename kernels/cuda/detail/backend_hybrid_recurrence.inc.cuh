@@ -3003,8 +3003,68 @@ namespace {
 // experts plus the shared one. Duplicate descriptors are intentional: they
 // let a cohort apply one resident matrix to several independent activations
 // without introducing a completion per request.
-constexpr std::size_t kGlm53MaxDeviceExperts = 32U * 9U;
+constexpr std::size_t kGlm53MaxDeviceExperts =
+    CudaBackend::kMaximumGlm53DeviceExperts;
+// Rows of the same expert folded into one launch. The kernel keeps a
+// float[Batch][8] register accumulator.
+//
+// Do not widen this without fixing the kernel first. Instantiating the
+// template at 8 and 16 is measurably faster -- 79.75 s to 68.05 s of kernel at
+// 1,925 tokens, 230 to 269 GMAC/s -- and it CHANGES THE OUTPUT: stdout
+// SHA-256 moves from 70fa50481ecc to 5410f72d64f0. The template is correct
+// only at the widths it was validated at, so the win is not available until
+// that is understood and fixed. Record 0245.
 constexpr std::size_t kGlm53ExpertKernelBatch = 4U;
+
+// One launch per command instead of one per <=4 rows. Default on; the variable
+// selects the previous path so both arms run one binary.
+[[nodiscard]] inline bool glm53_grouped_expert_launch_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_GROUPED_EXPERT_LAUNCH");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+// Device and pinned-host room for `slices` grouped expert descriptors. Grown
+// on demand and never shrunk, so a command that widens between layers does not
+// reallocate inside a timed step.
+template <typename DeviceState>
+[[nodiscard]] inline ValidationResult glm53_reserve_expert_slices(
+    DeviceState& state, std::uint32_t slices) {
+    if (state.glm53_expert_slice_capacity >= slices) return {};
+    if (state.glm53_expert_slices != nullptr) {
+        static_cast<void>(cudaFree(state.glm53_expert_slices));
+        state.glm53_expert_slices = nullptr;
+    }
+    if (state.glm53_expert_slices_host != nullptr) {
+        static_cast<void>(cudaFreeHost(state.glm53_expert_slices_host));
+        state.glm53_expert_slices_host = nullptr;
+    }
+    state.glm53_expert_slice_capacity = 0U;
+    void* device_memory = nullptr;
+    if (auto status = cudaMalloc(&device_memory,
+                                 slices * sizeof(Glm53ExpertSlice));
+        status != cudaSuccess) {
+        return cuda_error(status, "allocate GLM-5.3 grouped expert slices");
+    }
+    void* host_memory = nullptr;
+    if (auto status = cudaMallocHost(&host_memory,
+                                     slices * sizeof(Glm53ExpertSlice));
+        status != cudaSuccess) {
+        static_cast<void>(cudaFree(device_memory));
+        return cuda_error(status,
+                          "allocate GLM-5.3 grouped expert slice staging");
+    }
+    state.glm53_expert_slices = static_cast<Glm53ExpertSlice*>(device_memory);
+    state.glm53_expert_slices_host =
+        static_cast<Glm53ExpertSlice*>(host_memory);
+    state.glm53_expert_slice_capacity = slices;
+    return {};
+}
 
 [[nodiscard]] bool same_glm53_expert(const CudaGlm53Expert& left,
                                      const CudaGlm53Expert& right) noexcept {
@@ -3025,6 +3085,36 @@ constexpr std::size_t kGlm53ExpertKernelBatch = 4U;
 
 }  // namespace
 
+// THE LAYOUT GUARD for the register-fed NVFP4 path (experiment 0247).
+//
+// `prepack_fragment` replaces canonical order in place, one-copy, and GLM's
+// expert CudaWeights are shared between the pinned static tier that serves
+// decode through the scalar kernels below and the demand-staged experts that
+// serve prefill. A prepacked expert reaching a scalar kernel would be read as
+// though it were canonical: no error, no NaN, just a permuted dot product on
+// every token. This turns that into a refusal at the boundary.
+//
+// It is deliberately a hard error rather than a silent reroute. A caller that
+// prepacked a tier-pinned expert has made a routing mistake that a fallback
+// would hide, and the whole point of the fragment_prepacked query is that the
+// caller decides which experts go where.
+[[nodiscard]] inline ValidationResult glm53_scalar_expert_layout_ok(
+    std::span<const CudaGlm53Expert> experts) {
+    for (const auto& expert : experts) {
+        const CudaWeight* projections[3] = {expert.gate, expert.up,
+                                            expert.down};
+        for (const auto* weight : projections) {
+            if (weight != nullptr && CudaBackend::fragment_prepacked(*weight)) {
+                return {{"GLM-5.3 scalar expert kernel refuses a "
+                         "fragment-prepacked weight: this expert belongs on the "
+                         "register-fed path, and reading it canonically would "
+                         "silently permute every token"}};
+            }
+        }
+    }
+    return {};
+}
+
 ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     int device, std::span<const CudaGlm53Expert> experts,
     std::span<const float> input) {
@@ -3039,6 +3129,9 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     }
     if (experts.empty() || experts.size() > kGlm53MaxDeviceExperts) {
         return {{"GLM-5.3 expert batch has an invalid width"}};
+    }
+    if (auto layout = glm53_scalar_expert_layout_ok(experts); !layout.ok()) {
+        return layout;
     }
     const auto hidden = experts.front().hidden;
     const auto intermediate = experts.front().intermediate;
@@ -3142,7 +3235,71 @@ ValidationResult CudaBackend::enqueue_glm53_expert_gate_up(
     constexpr std::uint32_t threads = 256U;
     const std::uint32_t blocks = (intermediate * 8U + threads - 1U) / threads;
     const auto scale_columns = hidden / 128U;
-    for (std::size_t index = 0U; index < experts.size();) {
+    // Grouped path: one launch for the whole command. The ungrouped grid is 64
+    // blocks, which cannot fill this device, and a wide prefill page issues
+    // hundreds of thousands of such launches. Only NVFP4 with per-expert input
+    // is grouped here; every other encoding keeps the loop below.
+    const bool grouped =
+        glm53_grouped_expert_launch_enabled() && per_expert_input &&
+        experts.front().encoding ==
+            CudaGlm53ExpertEncoding::Nvfp4Group16E4m3 &&
+        std::all_of(experts.begin(), experts.end(), [](const auto& expert) {
+            return expert.encoding ==
+                   CudaGlm53ExpertEncoding::Nvfp4Group16E4m3;
+        });
+    if (grouped) {
+        if (auto status = glm53_reserve_expert_slices(
+                state, static_cast<std::uint32_t>(experts.size()) * 2U);
+            !status.ok()) {
+            return status;
+        }
+        const auto weight_data = [](const CudaBuffer* buffer,
+                                    const CudaWeight* weight) {
+            return weight != nullptr ? weight->impl_->weights
+                                     : buffer->impl_->data;
+        };
+        const auto scale_data = [](const CudaBuffer* buffer,
+                                   const CudaWeight* weight) {
+            return weight != nullptr ? weight->impl_->scales
+                                     : (buffer == nullptr ? nullptr
+                                                          : buffer->impl_->data);
+        };
+        auto* host_slices = state.glm53_expert_slices_host;
+        const auto count = experts.size();
+        for (std::size_t index = 0U; index < count; ++index) {
+            const auto& expert = experts[index];
+            const auto* expert_input =
+                state.glm53_shared_input + index * hidden;
+            host_slices[index] = Glm53ExpertSlice{
+                static_cast<const unsigned char*>(
+                    weight_data(expert.gate_weights, expert.gate)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.gate_scales, expert.gate)),
+                expert_input, state.glm53_shared_gate + index * intermediate,
+                expert.gate_global_scale};
+            host_slices[count + index] = Glm53ExpertSlice{
+                static_cast<const unsigned char*>(
+                    weight_data(expert.up_weights, expert.up)),
+                static_cast<const unsigned char*>(
+                    scale_data(expert.up_scales, expert.up)),
+                expert_input, state.glm53_shared_up + index * intermediate,
+                expert.up_global_scale};
+        }
+        if (auto status = cudaMemcpyAsync(
+                state.glm53_expert_slices, host_slices,
+                2U * count * sizeof(Glm53ExpertSlice), cudaMemcpyHostToDevice,
+                state.stream);
+            status != cudaSuccess) {
+            return cuda_error(status, "upload GLM-5.3 grouped expert slices");
+        }
+        launch_glm53_shared_expert_nvfp4_dot_grouped(
+            dim3(blocks, static_cast<unsigned>(2U * count)), dim3(threads),
+            state.stream, state.glm53_expert_slices, intermediate, hidden);
+        if (auto status = cudaGetLastError(); status != cudaSuccess) {
+            return cuda_error(status, "launch GLM-5.3 grouped expert gate/up");
+        }
+    }
+    for (std::size_t index = 0U; !grouped && index < experts.size();) {
         const auto& expert = experts[index];
         std::size_t batch = 1U;
         while (per_expert_input &&
@@ -3322,6 +3479,9 @@ ValidationResult CudaBackend::enqueue_glm53_expert_down(
     }
     if (experts.empty() || experts.size() != state.glm53_shared_batch) {
         return {{"GLM-5.3 expert batch down does not match its gate and up"}};
+    }
+    if (auto layout = glm53_scalar_expert_layout_ok(experts); !layout.ok()) {
+        return layout;
     }
     const auto hidden = state.glm53_shared_hidden;
     const auto intermediate = state.glm53_shared_intermediate;

@@ -112,6 +112,14 @@ struct Glm53RuntimeConfig {
     // Upper bound for a prefill scheduler page. The default preserves the
     // production path; experiments may override it to measure weight reuse.
     std::uint32_t prefill_page_tokens{64U};
+    // Build prompt MLA and KDA state on the device and back-fill the host
+    // cache from it, instead of prefilling on the host. Worth about 1.38x at
+    // 619 tokens, almost entirely by moving KDA off the host (records 0240,
+    // 0242). It is silently unavailable above kIndexTopK: the device chain
+    // computes no indexer k-pool state, so a sequence that can cross that
+    // threshold must prefill on the host. `STRATA_GLM53_DEVICE_PREFILL` also
+    // sets it, and the two are OR-ed at initialization.
+    bool device_prefill{};
     bool verbose{};
     bool load_progress{};
     // Opt-in request attribution. CUDA event timing is enabled only when this

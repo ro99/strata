@@ -3273,11 +3273,15 @@ struct Glm53Runtime::Impl {
         std::size_t count{};
         std::uint8_t slot{};
         std::uint32_t rows_per_expert{};
+        // Where this chunk's rows landed in the gathered input buffer.
+        std::size_t gathered{};
     };
     std::vector<RegfedCommand> page_regfed_commands;
     // One chunk = one expert contributing `rows_per_expert` contiguous rows.
     std::vector<RegfedCommand> page_regfed_chunks;
     std::vector<CudaGlm53Expert> page_regfed_experts;
+    std::vector<CudaGlm53Expert> page_regfed_sorted_experts;
+    std::vector<float> page_regfed_inputs;
     // Which device each device-expert entry's weights live on. The tier pins
     // an expert to one device and the shared expert has its own, so this is
     // tracked rather than derived from the layer.
@@ -4925,80 +4929,24 @@ struct Glm53Runtime::Impl {
         // never reached the second one -- admission caps it at 32 sequences,
         // which is exactly the limit -- but a prefill page puts every
         // (row, route) pair on the device and passes it on the first layer.
-        // Register-fed commands. Assignments are already expert-major and
-        // row-major within an expert after the sort, so one expert's rows are
-        // contiguous. Cut each prepacked run into chunks of at most
-        // kGlm53RegfedMaxRowsPerExpert; the entry point takes a single
-        // rows_per_expert for the whole call, so consecutive chunks of equal
-        // width merge into one command and their inputs stay one contiguous
-        // span. `regfed_experts` holds one DISTINCT descriptor per chunk --
-        // the per-assignment repeats in `device_experts` are not what the
-        // entry point wants.
-        auto& regfed_experts = page_regfed_experts;
-        auto& regfed_chunks = page_regfed_chunks;
-        auto& regfed_commands = page_regfed_commands;
-        regfed_experts.clear();
-        regfed_chunks.clear();
-        regfed_commands.clear();
-        if (device_regfed_experts_enabled()) {
-            for (std::size_t begin = 0U; begin < device_count;) {
-                const auto slot = device_entry_slots[begin];
-                const auto key = device_key(device_output_slots[begin]);
-                auto end = begin;
-                while (end < device_count &&
-                       device_entry_slots[end] == slot &&
-                       device_key(device_output_slots[end]) == key) {
-                    ++end;
-                }
-                if (!CudaBackend::glm53_regfed_expert_prepacked(
-                        device_experts[begin])) {
-                    begin = end;
-                    continue;
-                }
-                for (auto cursor = begin; cursor < end;) {
-                    const auto rows = std::min<std::size_t>(
-                        CudaBackend::kGlm53RegfedMaxRowsPerExpert,
-                        end - cursor);
-                    regfed_experts.push_back(device_experts[cursor]);
-                    regfed_chunks.push_back(
-                        {cursor, rows, slot,
-                         static_cast<std::uint32_t>(rows)});
-                    cursor += rows;
-                }
-                begin = end;
-            }
-            // Merge consecutive chunks that share a device and a width.
-            for (std::size_t first = 0U; first < regfed_chunks.size();) {
-                auto last = first + 1U;
-                while (last < regfed_chunks.size() &&
-                       regfed_chunks[last].slot == regfed_chunks[first].slot &&
-                       regfed_chunks[last].rows_per_expert ==
-                           regfed_chunks[first].rows_per_expert &&
-                       regfed_chunks[last].begin ==
-                           regfed_chunks[last - 1U].begin +
-                               regfed_chunks[last - 1U].count) {
-                    ++last;
-                }
-                regfed_commands.push_back(
-                    {first, last - first, regfed_chunks[first].slot,
-                     regfed_chunks[first].rows_per_expert});
-                first = last;
-            }
-        }
-        if (!regfed_commands.empty()) {
-            // The partition above is built and gated, but the register-fed
-            // enqueue/collect dispatch is not wired yet. Refuse rather than
-            // fall through to the scalar path, which would recompute these
-            // assignments from weights that are no longer in canonical order.
-            return {{"GLM-5.3 register-fed expert dispatch is not wired"}};
-        }
         auto& device_commands = page_device_commands;
         device_commands.clear();
         for (std::size_t begin = 0U; begin < device_count;) {
+            // Prepacked experts belong to the register-fed commands above and
+            // sort ahead of canonical ones on each device. Skip them: their
+            // weights are no longer in canonical order, and the scalar enqueue
+            // refuses them rather than reading a permutation.
+            if (CudaBackend::glm53_regfed_expert_prepacked(
+                    device_experts[begin])) {
+                ++begin;
+                continue;
+            }
             auto end = begin + 1U;
             while (end < device_count &&
                    end - begin < CudaBackend::kMaximumGlm53DeviceExperts &&
                    device_entry_slots[end] == device_entry_slots[begin] &&
+                   !CudaBackend::glm53_regfed_expert_prepacked(
+                       device_experts[end]) &&
                    device_experts[end].encoding ==
                        device_experts[begin].encoding) {
                 ++end;
@@ -5129,6 +5077,213 @@ struct Glm53Runtime::Impl {
         auto& expert_outputs = page_expert_outputs;
         if (expert_outputs.size() < output_slots * kHidden) {
             return {{"GLM-5.3 host page output scratch is too small"}};
+        }
+        // Register-fed commands. Assignments are already expert-major and
+        // row-major within an expert after the sort, so one expert's rows are
+        // contiguous. Cut each prepacked run into chunks of at most
+        // kGlm53RegfedMaxRowsPerExpert; the entry point takes a single
+        // rows_per_expert for the whole call, so consecutive chunks of equal
+        // width merge into one command and their inputs stay one contiguous
+        // span. `regfed_experts` holds one DISTINCT descriptor per chunk --
+        // the per-assignment repeats in `device_experts` are not what the
+        // entry point wants.
+        auto& regfed_experts = page_regfed_experts;
+        auto& regfed_chunks = page_regfed_chunks;
+        auto& regfed_commands = page_regfed_commands;
+        regfed_experts.clear();
+        regfed_chunks.clear();
+        regfed_commands.clear();
+        if (device_regfed_experts_enabled()) {
+            for (std::size_t begin = 0U; begin < device_count;) {
+                const auto slot = device_entry_slots[begin];
+                const auto key = device_key(device_output_slots[begin]);
+                auto end = begin;
+                while (end < device_count &&
+                       device_entry_slots[end] == slot &&
+                       device_key(device_output_slots[end]) == key) {
+                    ++end;
+                }
+                if (!CudaBackend::glm53_regfed_expert_prepacked(
+                        device_experts[begin])) {
+                    begin = end;
+                    continue;
+                }
+                for (auto cursor = begin; cursor < end;) {
+                    const auto rows = std::min<std::size_t>(
+                        CudaBackend::kGlm53RegfedMaxRowsPerExpert,
+                        end - cursor);
+                    regfed_experts.push_back(device_experts[cursor]);
+                    regfed_chunks.push_back(
+                        {cursor, rows, slot,
+                         static_cast<std::uint32_t>(rows)});
+                    cursor += rows;
+                }
+                begin = end;
+            }
+            // Group by (device, width) rather than merging only adjacent
+            // chunks. One command takes a single rows_per_expert, and every
+            // expert carries a full-width run followed by one short remainder,
+            // so adjacency-only merging left two commands per expert -- about
+            // ten thousand commands and twenty thousand syncs per prefill,
+            // which cost more than the kernel saved. Sorting by width first
+            // collapses that to one command per distinct width per device.
+            //
+            // The inputs are no longer contiguous once reordered, so they are
+            // gathered into their own buffer. device_inputs is itself a gather
+            // from quantized_input, so this replaces one copy with another
+            // rather than adding a pass.
+            std::stable_sort(
+                regfed_chunks.begin(), regfed_chunks.end(),
+                [](const RegfedCommand& left, const RegfedCommand& right) {
+                    if (left.slot != right.slot) return left.slot < right.slot;
+                    return left.rows_per_expert > right.rows_per_expert;
+                });
+            auto& regfed_inputs = page_regfed_inputs;
+            regfed_inputs.resize(device_count * kHidden);
+            auto& sorted_experts = page_regfed_sorted_experts;
+            sorted_experts.resize(regfed_chunks.size());
+            std::size_t cursor = 0U;
+            for (std::size_t index = 0U; index < regfed_chunks.size();
+                 ++index) {
+                auto& chunk = regfed_chunks[index];
+                sorted_experts[index] = device_experts[chunk.begin];
+                std::copy_n(device_inputs.begin() +
+                                static_cast<std::ptrdiff_t>(chunk.begin *
+                                                            kHidden),
+                            chunk.count * kHidden,
+                            regfed_inputs.begin() +
+                                static_cast<std::ptrdiff_t>(cursor * kHidden));
+                chunk.gathered = cursor;
+                cursor += chunk.count;
+            }
+            regfed_experts.swap(sorted_experts);
+            for (std::size_t first = 0U; first < regfed_chunks.size();) {
+                auto last = first + 1U;
+                while (last < regfed_chunks.size() &&
+                       last - first < CudaBackend::kMaximumGlm53DeviceExperts &&
+                       regfed_chunks[last].slot == regfed_chunks[first].slot &&
+                       regfed_chunks[last].rows_per_expert ==
+                           regfed_chunks[first].rows_per_expert) {
+                    ++last;
+                }
+                regfed_commands.push_back(
+                    {first, last - first, regfed_chunks[first].slot,
+                     regfed_chunks[first].rows_per_expert});
+                first = last;
+            }
+        }
+        // Register-fed dispatch. Same enqueue/collect shape and the same host
+        // SwiGLU at the same BF16 boundary as the scalar path below, so the
+        // only difference is which kernel produced the raw dots.
+        const auto regfed_begin =
+            [&](const RegfedCommand& command) -> ValidationResult {
+            const auto rows = command.rows_per_expert;
+            const auto assignments = command.count * rows;
+            const auto row_begin = regfed_chunks[command.begin].gathered;
+            const auto experts = std::span<const CudaGlm53Expert>(
+                regfed_experts).subspan(command.begin, command.count);
+            return cuda.enqueue_glm53_regfed_expert_gate_up(
+                expert_devices[command.slot], experts,
+                std::span<const float>(page_regfed_inputs)
+                    .subspan(row_begin * kHidden, assignments * kHidden),
+                rows);
+        };
+        const auto regfed_finish =
+            [&](const RegfedCommand& command) -> ValidationResult {
+            const auto rows = command.rows_per_expert;
+            const auto assignments = command.count * rows;
+            // Gathered order, not assignment order: the chunks were sorted by
+            // width, so a command's rows are contiguous here and scattered in
+            // device_output_slots.
+            const auto row_begin = regfed_chunks[command.begin].gathered;
+            const auto experts = std::span<const CudaGlm53Expert>(
+                regfed_experts).subspan(command.begin, command.count);
+            auto gate = std::span<float>(shared_expert_gate)
+                .subspan(row_begin * intermediate, assignments * intermediate);
+            auto up = std::span<float>(shared_expert_up)
+                .subspan(row_begin * intermediate, assignments * intermediate);
+            auto status = cuda.collect_glm53_regfed_expert_gate_up(
+                expert_devices[command.slot], gate, up);
+            if (!status.ok()) return status;
+            for (std::size_t index = 0U; index < gate.size(); ++index) {
+                auto gate_value = bf16_round_f32(gate[index]);
+                auto up_value = bf16_round_f32(up[index]);
+                gate_value = std::min(gate_value, 10.0F);
+                up_value = std::clamp(up_value, -10.0F, 10.0F);
+                gate[index] = bf16_round_f32(
+                    gate_value * sigmoid(gate_value) * up_value);
+            }
+            if (fp8_expert_checkpoint()) {
+                for (std::size_t row = 0U; row < assignments; ++row) {
+                    glm53_quantize_activation(
+                        gate.subspan(row * intermediate, intermediate));
+                }
+            }
+            status = cuda.enqueue_glm53_regfed_expert_down(
+                expert_devices[command.slot], experts,
+                std::span<const float>(gate), rows);
+            if (!status.ok()) return status;
+            auto device_output = std::span<float>(shared_expert_output)
+                .subspan(row_begin * kHidden, assignments * kHidden);
+            status = cuda.collect_glm53_regfed_expert_down(
+                expert_devices[command.slot], device_output);
+            if (!status.ok()) return status;
+            for (std::size_t offset = 0U; offset < assignments; ++offset) {
+                const auto source =
+                    device_output.subspan(offset * kHidden, kHidden);
+                // Map back through the chunk this row came from.
+                const auto& chunk = regfed_chunks[command.begin + offset / rows];
+                const auto assignment = chunk.begin + (offset % rows);
+                auto destination = std::span<float>(expert_outputs).subspan(
+                    device_output_slots[assignment] * kHidden, kHidden);
+                for (std::size_t column = 0U; column < kHidden; ++column) {
+                    // Same BF16 boundary every device expert output crosses
+                    // before the routed reduction.
+                    destination[column] = bf16_round_f32(source[column]);
+                }
+            }
+            return {};
+        };
+        // Interleave across devices, as the scalar path below does. Run
+        // strictly serially this loop gave up both the cross-device overlap
+        // and the host/device overlap, and cost more than the kernel saved.
+        {
+            std::vector<std::size_t> next(expert_devices.size(), 0U);
+            std::vector<std::size_t> remaining(expert_devices.size(), 0U);
+            for (std::size_t index = 0U; index < regfed_commands.size();
+                 ++index) {
+                const auto slot = regfed_commands[index].slot;
+                if (remaining[slot] == 0U) next[slot] = index;
+                ++remaining[slot];
+            }
+            for (;;) {
+                bool progressed = false;
+                // Issue one command's gate/up on every device that still has
+                // work, so the cards compute concurrently, then drain them.
+                for (std::size_t slot = 0U; slot < expert_devices.size();
+                     ++slot) {
+                    if (remaining[slot] == 0U) continue;
+                    progressed = true;
+                    result = regfed_begin(regfed_commands[next[slot]]);
+                    if (!result.ok()) return result;
+                }
+                for (std::size_t slot = 0U; slot < expert_devices.size();
+                     ++slot) {
+                    if (remaining[slot] == 0U) continue;
+                    result = regfed_finish(regfed_commands[next[slot]]);
+                    if (!result.ok()) return result;
+                    --remaining[slot];
+                    for (auto index = next[slot] + 1U;
+                         remaining[slot] != 0U && index < regfed_commands.size();
+                         ++index) {
+                        if (regfed_commands[index].slot == slot) {
+                            next[slot] = index;
+                            break;
+                        }
+                    }
+                }
+                if (!progressed) break;
+            }
         }
         const auto down_started = std::chrono::steady_clock::now();
         result = host_moe_workers->parallel_for_blocked(

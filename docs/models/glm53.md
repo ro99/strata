@@ -95,6 +95,8 @@ Two prefixes and one flag are **required** to reach the measured rates, not opti
   because the host expert path is **compute-bound** at these shapes, saturating near
   77 GMAC/s — roughly 11% of this host's AVX2 FMA peak (records 0241, 0242).
 
+- `STRATA_GLM53_REGFED_EXPERTS=1` — the register-fed NVFP4 tensor-core expert path. It prepacks the pinned expert tier into m16n8k16 fragment order at load and routes both prefill pages and decode through the tensor kernel. It is **off by default and should stay off**: measured 0.999x on prefill and 0.993x on decode, both inside their own run-to-run range, because the device expert kernel is 2% of prefill wall time and fully overlapped in decode. The kernel itself is not the disappointment — it is 1.82x on prefill's expert kernel and 2.33x on decode's, deterministically — it simply is not the bottleneck (record 0248). Enabling it also **changes generated text**: the path is a reassociation held to 5.960e-07 rather than to an output hash, and in a greedy loop that eventually flips an argmax, measured at token 7 of a 32-token generation. Use it only to measure the kernel, never to serve.
+
 Together the two are **1.411x** at 619 tokens, byte-identical: 129.40 s to 91.71 s,
 medians of interleaved repetitions. Above `--context-size 2048` only the width half
 applies, and it is worth about 1.06x.

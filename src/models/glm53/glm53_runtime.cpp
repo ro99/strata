@@ -3155,6 +3155,9 @@ struct Glm53Runtime::Impl {
     // slot and down every output slot -- so reuse without clearing is exact,
     // and the byte-identical output gate is what verifies that.
     std::vector<float> host_moe_quantized_input;
+    // Expert-major replication of the decode activation row, for the
+    // register-fed enqueue's contract. Sized once at admission.
+    std::vector<float> host_moe_regfed_input;
     std::vector<float> host_moe_activations;
     std::vector<float> host_moe_expert_outputs;
     // All 42 shared experts, resident on the GPU that owns their layer.
@@ -4315,6 +4318,7 @@ struct Glm53Runtime::Impl {
         // layer can dispatch the eight routed experts plus its shared expert
         // together, and glm53_grow must therefore remain a no-op in decode.
         shared_expert_gate.resize(9U * 2048U);
+        host_moe_regfed_input.resize(8U * kHidden);
         shared_expert_up.resize(9U * 2048U);
         shared_expert_output.resize(9U * kHidden);
         std::cerr << "[glm53-static-tier] profile="
@@ -4327,6 +4331,58 @@ struct Glm53Runtime::Impl {
                       << static_experts.bytes_by_slot[slot];
         }
         std::cerr << '\n';
+        // Permute the pinned tier into m16n8k16 fragment order, once, here.
+        //
+        // This is the configuration the register-fed kernel was always for. A
+        // demand-staged expert pays its prepack on the page that stages it and
+        // is evicted before another page can reuse the layout, so the prepack
+        // is charged against a single use and the integration measured a net
+        // loss. A pinned expert pays once for the life of the process and is
+        // then read by every prefill page and every decode step.
+        //
+        // It needs the owner's tolerance ruling extended from prefill to
+        // decode, and that is not a formality: the permutation is in place and
+        // global to the weight, so once the tier is packed, decode reads it
+        // through the register-fed kernel too and its output moves by the same
+        // 5.960e-07 the prefill kernel was gated at. That is why this sits
+        // behind the same flag as the rest of the register-fed path and is off
+        // by default.
+        if (device_regfed_experts_enabled()) {
+            std::uint64_t packed_experts = 0U;
+            std::uint64_t inadmissible = 0U;
+            for (std::uint32_t layer = 0U; layer < kLayers; ++layer) {
+                if (!glm53_moe_layer(layer)) continue;
+                for (std::uint32_t expert = 0U; expert < 288U; ++expert) {
+                    if (static_experts.active[layer][expert] == 0U) continue;
+                    const auto& descriptor =
+                        static_experts.experts[layer][expert];
+                    // A non-NVFP4 or odd-shaped expert stays canonical and
+                    // keeps the scalar kernel. Both dispatch sites route per
+                    // descriptor, so a mixed tier is a supported state rather
+                    // than a failure.
+                    const std::size_t slot =
+                        static_experts.slot[layer][expert];
+                    // Both dispatch sites run a tier expert on the layer's own
+                    // device, so an expert that spilled onto an auxiliary
+                    // expert device is not reachable by the register-fed
+                    // command they build. Leave it canonical rather than
+                    // permute a weight nothing will read in fragment order.
+                    if (slot >= devices.size() ||
+                        !CudaBackend::glm53_regfed_expert_admissible(
+                            descriptor)) {
+                        ++inadmissible;
+                        continue;
+                    }
+                    auto status = cuda.prepack_glm53_regfed_expert(
+                        expert_devices[slot], descriptor);
+                    if (!status.ok()) return status;
+                    ++packed_experts;
+                }
+            }
+            std::cerr << "[glm53-static-tier] regfed_prepacked="
+                      << packed_experts << " regfed_inadmissible="
+                      << inadmissible << '\n';
+        }
         return {};
     }
 
@@ -4358,14 +4414,19 @@ struct Glm53Runtime::Impl {
         std::array<CudaGlm53Expert, 9U> device_experts{};
         std::size_t host_count = 0U;
         std::size_t device_count = 0U;
+        // Resident routes are collected before they are placed, because the
+        // placement is not route order: a prepacked expert cannot share a
+        // command with a canonical one, and the scalar enqueue refuses a
+        // prepacked expert rather than reading a permutation.
+        std::array<std::uint32_t, 8U> resident_routes{};
+        std::size_t resident_count = 0U;
         for (std::size_t route = 0U; route < route_limit; ++route) {
             const auto expert = static_cast<std::uint32_t>(routed[route].expert);
             const bool resident = static_experts.active_tier &&
                 static_experts.active[layer][expert] != 0U;
             if (resident) {
-                device_index[route] = device_count;
-                device_experts[device_count++] =
-                    static_experts.experts[layer][expert];
+                resident_routes[resident_count++] =
+                    static_cast<std::uint32_t>(route);
                 static_experts.route_hits.fetch_add(
                     1U, std::memory_order_relaxed);
             } else {
@@ -4375,6 +4436,28 @@ struct Glm53Runtime::Impl {
                     static_experts.route_misses.fetch_add(
                         1U, std::memory_order_relaxed);
                 }
+            }
+        }
+        // Prepacked first, canonical second, each keeping route order within
+        // its group, so both dispatches cover one contiguous range of the
+        // output. The shared expert is appended after both: it is BF16 or FP8
+        // in every release, never NVFP4, so it is never admissible here and
+        // belongs to the canonical range by construction.
+        std::size_t regfed_count = 0U;
+        for (int pass = 0; pass < 2; ++pass) {
+            const bool want_packed = pass == 0;
+            for (std::size_t index = 0U; index < resident_count; ++index) {
+                const auto route = resident_routes[index];
+                const auto expert =
+                    static_cast<std::uint32_t>(routed[route].expert);
+                const auto& descriptor = static_experts.experts[layer][expert];
+                if (CudaBackend::glm53_regfed_expert_prepacked(descriptor) !=
+                    want_packed) {
+                    continue;
+                }
+                device_index[route] = device_count;
+                device_experts[device_count++] = descriptor;
+                if (want_packed) ++regfed_count;
             }
         }
         if (include_shared) {
@@ -4448,9 +4531,31 @@ struct Glm53Runtime::Impl {
         }
         const auto device_expert_span =
             std::span<const CudaGlm53Expert>(device_experts).first(device_count);
-        if (device_count != 0U) {
+        const auto regfed_span = device_expert_span.first(regfed_count);
+        const auto scalar_span = device_expert_span.subspan(regfed_count);
+        // The scalar enqueue broadcasts one activation row to every expert;
+        // the register-fed one reads an expert-major block, so the same row is
+        // replicated. At one row per expert that is 8 x 4 KiB of copy against
+        // a 14 MB weight read per expert, and it keeps both kernels on their
+        // own contract rather than teaching either about the other.
+        if (regfed_count != 0U) {
+            auto& regfed_input = host_moe_regfed_input;
+            if (glm53_grow(regfed_input, regfed_count * kHidden)) ++allocations;
+            for (std::size_t index = 0U; index < regfed_count; ++index) {
+                std::copy_n(quantized_input.begin(), kHidden,
+                            regfed_input.begin() +
+                                static_cast<std::ptrdiff_t>(index * kHidden));
+            }
+            result = cuda.enqueue_glm53_regfed_expert_gate_up(
+                layer_device, regfed_span,
+                std::span<const float>(regfed_input)
+                    .first(regfed_count * kHidden),
+                1U);
+            if (!result.ok()) return result;
+        }
+        if (!scalar_span.empty()) {
             result = cuda.enqueue_glm53_expert_gate_up(
-                layer_device, device_expert_span,
+                layer_device, scalar_span,
                 std::span<const float>(quantized_input).first(kHidden));
             if (!result.ok()) return result;
         }
@@ -4496,11 +4601,23 @@ struct Glm53Runtime::Impl {
             const auto device_floats = device_count * intermediate;
             if (glm53_grow(shared_expert_gate, device_floats)) ++allocations;
             if (glm53_grow(shared_expert_up, device_floats)) ++allocations;
-            result = cuda.collect_glm53_expert_gate_up(
-                layer_device,
-                std::span<float>(shared_expert_gate).first(device_floats),
-                std::span<float>(shared_expert_up).first(device_floats));
-            if (!result.ok()) return result;
+            const auto regfed_floats = regfed_count * intermediate;
+            if (regfed_count != 0U) {
+                result = cuda.collect_glm53_regfed_expert_gate_up(
+                    layer_device,
+                    std::span<float>(shared_expert_gate).first(regfed_floats),
+                    std::span<float>(shared_expert_up).first(regfed_floats));
+                if (!result.ok()) return result;
+            }
+            if (regfed_count != device_count) {
+                result = cuda.collect_glm53_expert_gate_up(
+                    layer_device,
+                    std::span<float>(shared_expert_gate)
+                        .subspan(regfed_floats, device_floats - regfed_floats),
+                    std::span<float>(shared_expert_up)
+                        .subspan(regfed_floats, device_floats - regfed_floats));
+                if (!result.ok()) return result;
+            }
             for (std::size_t index = 0U; index < device_floats; ++index) {
                 auto gate = bf16_round_f32(shared_expert_gate[index]);
                 auto up = bf16_round_f32(shared_expert_up[index]);
@@ -4516,11 +4633,21 @@ struct Glm53Runtime::Impl {
                             expert * intermediate, intermediate));
                 }
             }
-            result = cuda.enqueue_glm53_expert_down(
-                layer_device, device_expert_span,
-                std::span<const float>(shared_expert_gate).first(
-                    device_floats));
-            if (!result.ok()) return result;
+            if (regfed_count != 0U) {
+                result = cuda.enqueue_glm53_regfed_expert_down(
+                    layer_device, regfed_span,
+                    std::span<const float>(shared_expert_gate)
+                        .first(regfed_floats),
+                    1U);
+                if (!result.ok()) return result;
+            }
+            if (regfed_count != device_count) {
+                result = cuda.enqueue_glm53_expert_down(
+                    layer_device, scalar_span,
+                    std::span<const float>(shared_expert_gate)
+                        .subspan(regfed_floats, device_floats - regfed_floats));
+                if (!result.ok()) return result;
+            }
         }
         if (config.phase_profile) {
             host_moe_activation_nanoseconds.fetch_add(
@@ -4560,10 +4687,21 @@ struct Glm53Runtime::Impl {
         if (device_count != 0U) {
             const auto device_floats = device_count * kHidden;
             if (glm53_grow(shared_expert_output, device_floats)) ++allocations;
-            result = cuda.collect_glm53_expert_down(
-                layer_device,
-                std::span<float>(shared_expert_output).first(device_floats));
-            if (!result.ok()) return result;
+            const auto regfed_floats = regfed_count * kHidden;
+            if (regfed_count != 0U) {
+                result = cuda.collect_glm53_regfed_expert_down(
+                    layer_device,
+                    std::span<float>(shared_expert_output)
+                        .first(regfed_floats));
+                if (!result.ok()) return result;
+            }
+            if (regfed_count != device_count) {
+                result = cuda.collect_glm53_expert_down(
+                    layer_device,
+                    std::span<float>(shared_expert_output)
+                        .subspan(regfed_floats, device_floats - regfed_floats));
+                if (!result.ok()) return result;
+            }
         }
         const auto term = [&](std::size_t position, std::size_t column) {
             if (host_index[position] != missing) {

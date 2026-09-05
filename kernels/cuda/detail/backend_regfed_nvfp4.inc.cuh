@@ -1,5 +1,9 @@
-// GLM-5.3 register-fed NVFP4 routed experts — the public entry point for the
-// kernel experiment 0247 gated.
+// Register-fed NVFP4 routed experts -- the public entry point for the kernel
+// experiment 0247 gated.
+//
+// Named for the encoding rather than the model, like every other file in
+// this tier: NVFP4 group-16/E4M3 is a checkpoint format, and check_layers
+// rejects a model-named file in strata_device.
 //
 // WHAT THIS IS. `regfed_nvfp4_grouped_matmul_kernel<kColBlocks, 3>` reproduces
 // `glm53_shared_expert_nvfp4_dot_kernel` to 5.960e-07 worst case over 60 real

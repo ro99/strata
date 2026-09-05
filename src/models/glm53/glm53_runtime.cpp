@@ -422,6 +422,21 @@ constexpr std::uint64_t kDevicePageStagingReserveBytes = 2ULL << 30U;
     return devices;
 }
 
+// Route demand-staged NVFP4 experts through the register-fed tensor kernel
+// gated by experiment 0247: 5.960e-07 worst case against the scalar kernel
+// over 60 real fixtures, inside 0157's 7.53e-07, and 4.8x to 17.0x depending
+// on rows per expert. Tier-pinned experts stay canonical because decode reads
+// them through the scalar path.
+[[nodiscard]] bool device_regfed_experts_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_REGFED_EXPERTS");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool device_expert_parallel_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_EXPERT_PARALLEL");
@@ -3253,6 +3268,16 @@ struct Glm53Runtime::Impl {
         std::uint8_t slot{};
     };
     std::vector<DeviceCommand> page_device_commands;
+    struct RegfedCommand {
+        std::size_t begin{};
+        std::size_t count{};
+        std::uint8_t slot{};
+        std::uint32_t rows_per_expert{};
+    };
+    std::vector<RegfedCommand> page_regfed_commands;
+    // One chunk = one expert contributing `rows_per_expert` contiguous rows.
+    std::vector<RegfedCommand> page_regfed_chunks;
+    std::vector<CudaGlm53Expert> page_regfed_experts;
     // Which device each device-expert entry's weights live on. The tier pins
     // an expert to one device and the shared expert has its own, so this is
     // tracked rather than derived from the layer.
@@ -4684,6 +4709,19 @@ struct Glm53Runtime::Impl {
                             target, layer, expert, staged_descriptor, staged);
                         if (!status.ok()) return status;
                         if (staged) {
+                            // Permute into m16n8k16 fragment order so this
+                            // expert can take the register-fed tensor path.
+                            // ONLY a demand-staged expert may be prepacked:
+                            // the prepack replaces canonical order in place,
+                            // and a tier-pinned expert is what decode reads
+                            // through the scalar kernel.
+                            if (device_regfed_experts_enabled() &&
+                                CudaBackend::glm53_regfed_expert_admissible(
+                                    staged_descriptor)) {
+                                auto packed = cuda.prepack_glm53_regfed_expert(
+                                    expert_devices[target], staged_descriptor);
+                                if (!packed.ok()) return packed;
+                            }
                             staging.descriptor[expert] = staged_descriptor;
                             staging.slot_for_expert[expert] =
                                 static_cast<std::uint8_t>(target);
@@ -4763,12 +4801,19 @@ struct Glm53Runtime::Impl {
             // layer-owning ones, so the bucket table must too. Sizing it from
             // devices.size() let an auxiliary-slot entry write past the end.
             const auto slot_count = expert_devices.size();
+            // Prepacked experts sort ahead of canonical ones within a
+            // device, so the register-fed and scalar ranges are contiguous and
+            // a command of either kind can never straddle the two layouts.
             const auto bucket_of = [&](std::size_t index) {
-                return static_cast<std::size_t>(device_entry_slots[index]) *
-                           290U + device_key(device_output_slots[index]);
+                const std::size_t packed =
+                    CudaBackend::glm53_regfed_expert_prepacked(
+                        device_experts[index]) ? 0U : 1U;
+                return ((static_cast<std::size_t>(device_entry_slots[index]) *
+                             2U + packed) * 290U) +
+                       device_key(device_output_slots[index]);
             };
             auto& counts = page_device_sort_counts;
-            counts.assign(slot_count * 290U + 1U, 0U);
+            counts.assign(slot_count * 2U * 290U + 1U, 0U);
             for (std::size_t index = 0U; index < count; ++index) {
                 ++counts[bucket_of(index) + 1U];
             }
@@ -4880,6 +4925,73 @@ struct Glm53Runtime::Impl {
         // never reached the second one -- admission caps it at 32 sequences,
         // which is exactly the limit -- but a prefill page puts every
         // (row, route) pair on the device and passes it on the first layer.
+        // Register-fed commands. Assignments are already expert-major and
+        // row-major within an expert after the sort, so one expert's rows are
+        // contiguous. Cut each prepacked run into chunks of at most
+        // kGlm53RegfedMaxRowsPerExpert; the entry point takes a single
+        // rows_per_expert for the whole call, so consecutive chunks of equal
+        // width merge into one command and their inputs stay one contiguous
+        // span. `regfed_experts` holds one DISTINCT descriptor per chunk --
+        // the per-assignment repeats in `device_experts` are not what the
+        // entry point wants.
+        auto& regfed_experts = page_regfed_experts;
+        auto& regfed_chunks = page_regfed_chunks;
+        auto& regfed_commands = page_regfed_commands;
+        regfed_experts.clear();
+        regfed_chunks.clear();
+        regfed_commands.clear();
+        if (device_regfed_experts_enabled()) {
+            for (std::size_t begin = 0U; begin < device_count;) {
+                const auto slot = device_entry_slots[begin];
+                const auto key = device_key(device_output_slots[begin]);
+                auto end = begin;
+                while (end < device_count &&
+                       device_entry_slots[end] == slot &&
+                       device_key(device_output_slots[end]) == key) {
+                    ++end;
+                }
+                if (!CudaBackend::glm53_regfed_expert_prepacked(
+                        device_experts[begin])) {
+                    begin = end;
+                    continue;
+                }
+                for (auto cursor = begin; cursor < end;) {
+                    const auto rows = std::min<std::size_t>(
+                        CudaBackend::kGlm53RegfedMaxRowsPerExpert,
+                        end - cursor);
+                    regfed_experts.push_back(device_experts[cursor]);
+                    regfed_chunks.push_back(
+                        {cursor, rows, slot,
+                         static_cast<std::uint32_t>(rows)});
+                    cursor += rows;
+                }
+                begin = end;
+            }
+            // Merge consecutive chunks that share a device and a width.
+            for (std::size_t first = 0U; first < regfed_chunks.size();) {
+                auto last = first + 1U;
+                while (last < regfed_chunks.size() &&
+                       regfed_chunks[last].slot == regfed_chunks[first].slot &&
+                       regfed_chunks[last].rows_per_expert ==
+                           regfed_chunks[first].rows_per_expert &&
+                       regfed_chunks[last].begin ==
+                           regfed_chunks[last - 1U].begin +
+                               regfed_chunks[last - 1U].count) {
+                    ++last;
+                }
+                regfed_commands.push_back(
+                    {first, last - first, regfed_chunks[first].slot,
+                     regfed_chunks[first].rows_per_expert});
+                first = last;
+            }
+        }
+        if (!regfed_commands.empty()) {
+            // The partition above is built and gated, but the register-fed
+            // enqueue/collect dispatch is not wired yet. Refuse rather than
+            // fall through to the scalar path, which would recompute these
+            // assignments from weights that are no longer in canonical order.
+            return {{"GLM-5.3 register-fed expert dispatch is not wired"}};
+        }
         auto& device_commands = page_device_commands;
         device_commands.clear();
         for (std::size_t begin = 0U; begin < device_count;) {

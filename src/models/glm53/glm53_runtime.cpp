@@ -1495,20 +1495,25 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // KDA layers through the device page primitive while the 11 MLA layers keep
 // the existing host fallback inside forward_layer_page_device. Opt-in and
 // off by default; the dense device-prefill contract above is unchanged.
-// Expand a layer-page's whole selection union once and slice each group out
-// of it, instead of re-running kv_b_proj per group. Above the point where a
-// page stops fitting in one group this is most of the sparse attention cost:
-// at 8,192 tokens layers 19 and 23 shatter one page into 86 and 75 groups that
-// each re-expand close to the 4,096-row cap to serve 24-27 query rows (record
-// 0268). Exact by construction -- a group's rows are the same floats the
-// per-group GEMM produced, copied rather than recomputed -- but landed OFF
-// because it has not been measured end to end. Record 0269 has the arithmetic.
+// Expand a layer-page's whole selection union once and index each group in
+// place out of it, instead of re-running kv_b_proj per group. Above the point
+// where a page stops fitting in one group this is most of the sparse attention
+// cost: at 8,192 tokens layers 19 and 23 shatter one page into 86 and 75 groups
+// that each re-expand close to the 4,096-row cap to serve 24-27 query rows
+// (record 0268). Exact by construction -- the old per-group buffer was a memcpy
+// of page_expanded rows, so indexing the page directly reads the same floats in
+// the same within-row order. Default ON since fix (1b) removed the slicing memcpy
+// (record 0270): bench at layer 19 / history 4,096 goes 48.3 s -> 22.5 s at the
+// calibrated 87-group shape and 184.8 s -> 68.9 s at the 755-group worst case,
+// identical checksums, with the hash gate green on a 2,591-token arm.
+// STRATA_GLM53_PAGE_EXPAND=0 restores the per-group GEMM path for A/B work.
 [[nodiscard]] bool page_expand_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_PAGE_EXPAND");
-        return value != nullptr && std::string_view(value) != "0" &&
-               std::string_view(value) != "false" &&
-               std::string_view(value) != "off";
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
     }();
     return enabled;
 }
@@ -7538,19 +7543,37 @@ struct Glm53Runtime::Impl {
                 static_cast<std::uint32_t>(group_union.size());
             ++call_groups;
             call_expanded_rows += expanded_rows;
-            static_cast<void>(glm53_grow(
-                mla_expanded_scratch,
-                static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
-                    kMlaHead));
-            const auto expanded = std::span<float>(mla_expanded_scratch)
-                .first(static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
-                       kMlaHead);
+            // Fix (1b): index in place into the page expansion. When the page
+            // union is live and the device stages are off, the host QK/AV loops
+            // below read through mla_page_pos into page_expanded directly and
+            // this per-group materialization (a GEMM-sized memcpy) is skipped.
+            // Grouping still tiles ROWS, so each row's softmax reduction stays
+            // whole and the output is bit-identical: the old buffer was a
+            // memcpy of page_expanded rows, so indexing the page directly reads
+            // the same floats in the same within-row order. The device path
+            // keeps the compact per-group buffer it uploads, so in-place
+            // engages only on the host path.
+            const bool page_index_in_place =
+                use_page_expansion && !device_attend_enabled();
+            std::span<float> expanded;
+            std::span<const float> active_expanded;
             const auto expand_started = config.phase_profile
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
             // Empty unless this group ran its own GEMM; the invariance probe
             // below needs that input and is skipped on the sliced path.
             std::span<const float> gathered;
+            if (page_index_in_place) {
+                active_expanded = page_expanded;
+            } else {
+            static_cast<void>(glm53_grow(
+                mla_expanded_scratch,
+                static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                    kMlaHead));
+            expanded = std::span<float>(mla_expanded_scratch)
+                .first(static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                       kMlaHead);
+            active_expanded = std::span<const float>(expanded);
             if (use_page_expansion) {
                 constexpr auto expanded_stride =
                     static_cast<std::size_t>(kHeads) * 2U * kMlaHead;
@@ -7599,6 +7622,7 @@ struct Glm53Runtime::Impl {
                     elapsed_nanoseconds(expand_started),
                     std::memory_order_relaxed);
             }
+            }  // end non-in-place per-group materialization
             // Batch-invariance probe (record 0269): expand the same union
             // as two half-batches and compare bit for bit against the
             // single-batch expansion above. Probe outputs are discarded;
@@ -7661,10 +7685,17 @@ struct Glm53Runtime::Impl {
                  ++position) {
                 const auto& chosen = selection[group_begin + position];
                 for (const auto pick : chosen) {
+                    if (page_index_in_place) {
+                        // Direct page position: page_expanded[mla_page_pos[pick]]
+                        // is the same floats the old copy staged into the group
+                        // buffer, so the host dots below read identical inputs.
+                        flat_local.push_back(mla_page_pos[pick]);
+                    } else {
                     flat_local.push_back(static_cast<std::uint32_t>(
                         std::lower_bound(group_union.begin(),
                                          group_union.end(), pick) -
                         group_union.begin()));
+                    }
                 }
                 row_offsets.push_back(
                     static_cast<std::uint32_t>(flat_local.size()));
@@ -7690,7 +7721,7 @@ struct Glm53Runtime::Impl {
                 scores_request.query = std::span<const float>(query).subspan(
                     static_cast<std::size_t>(group_begin) * kMlaWidth,
                     static_cast<std::size_t>(group_rows) * kMlaWidth);
-                scores_request.expanded = expanded;
+                scores_request.expanded = active_expanded;
                 scores_request.local_indices = flat_local;
                 scores_request.row_offsets = row_offsets;
                 scores_request.rows = group_rows;
@@ -7746,7 +7777,7 @@ struct Glm53Runtime::Impl {
                         }
                     } else {
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
-                        const auto* kv = expanded.data() +
+                        const auto* kv = active_expanded.data() +
                             (static_cast<std::size_t>(local[token]) * kHeads +
                              head) * (2U * kMlaHead);
                         float score = 0.0F;
@@ -7789,7 +7820,7 @@ struct Glm53Runtime::Impl {
                         // to BF16 before it ever multiplies a value.
                         const auto coefficient =
                             bf16_round_f32(scores[token] / total);
-                        const auto* value = expanded.data() +
+                        const auto* value = active_expanded.data() +
                             (static_cast<std::size_t>(local[token]) * kHeads +
                              head) * (2U * kMlaHead) + kMlaHead;
                         for (std::uint32_t column = 0U; column < kMlaHead; ++column) {

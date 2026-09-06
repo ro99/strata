@@ -547,21 +547,26 @@ Two fixes follow, in order:
    from host memory costs roughly 65 ms per layer-page against about 930 ms to
    recompute it, so the transfer is not the obstacle.
 
-   **Measured, and incomplete.** On the bench at layer 19, history 4,096, 2,048
-   rows -- a page that shatters into 755 groups under synthetic selections --
-   fix (1) is exact (identical checksums, `0x2f70b47448139dde`) and worth
-   1.27x on the layer-page: 194.8 s to 153.6 s. But the expansion term only
-   falls from 99.6 s to 82.9 s where the arithmetic says one 6,144-row GEMM
-   should cost about 0.2 s. The gap is the slicing itself: each group still
-   materializes a contiguous `expanded` buffer, copying 3,690 rows x 32,768
-   floats -- 484 MB per group, about 365 GB over the page. Fix (1) as landed
-   trades a GEMM for a memcpy of the same order. The remaining win needs the
-   attend core to index into the page expansion in place through `mla_page_pos`
-   rather than gathering each group's rows, which is a change to the QK and AV
-   loops and was not attempted. Note the bench over-fragments (755 groups where
-   a real layer-page gives 86), so the copy penalty is overstated relative to
-   production and the 1.27x is a lower bound on a synthetic worst case, not a
-   production figure.
+   **Measured, then completed (record 0270).** On the bench at layer 19, history
+   4,096, 2,048 rows -- a page that shatters into 755 groups under synthetic
+   selections -- fix (1) is exact (identical checksums, `0x2f70b47448139dde`) and was
+   worth 1.27x on the layer-page: 194.8 s to 153.6 s. But the expansion term only
+   fell from 99.6 s to 82.9 s where the arithmetic says one 6,144-row GEMM
+   should cost about 0.2 s. The gap was the slicing itself: each group still
+   materialized a contiguous `expanded` buffer, copying 3,690 rows x 32,768
+   floats -- 484 MB per group, about 365 GB over the page. Fix (1) as first landed
+   traded a GEMM for a memcpy of the same order. Fix (1b) removes it: the host QK
+   and AV loops now index into the page expansion in place through `mla_page_pos`,
+   engaging whenever the page union is live and the device stages are off (the device
+   path keeps the compact per-group buffer it uploads). At the calibrated 87-group
+   shape (smoothing 0.975, matching the real 86-group page) the layer-page goes
+   48.3 s -> 22.5 s with expansion 15.3 s -> 0.2 s, identical checksums; at the
+   755-group worst case 184.8 s -> 68.9 s with expansion 110 s -> 0.3 s, identical
+   checksums. The hash gate is green on a 2,591-token arm (11 MLA + KDA hashes and
+   stdout identical), so fix (1b) is default ON; `STRATA_GLM53_PAGE_EXPAND=0`
+   restores the per-group path for A/B work. Note the bench over-fragments (755 groups
+   where a real layer-page gives 86), so the worst-case figure overstates production
+   and the calibrated 2.15x is the quotable one.
 
    **Precondition, and it holds.** This is only legal if a row's expanded bits
    do not depend on the batch size it was expanded in; a split-K GEMM that
@@ -574,10 +579,10 @@ Two fixes follow, in order:
    where the cache lives and how the prefill loop is ordered, not whether the
    arithmetic permits it.
 
-Fix (1) is built and landed off by default behind `STRATA_GLM53_PAGE_EXPAND`;
+Fix (1b) is built, hash-gated, and default ON (`STRATA_GLM53_PAGE_EXPAND=0` opts out);
 fix (2) is not built, and its one blocking precondition is now answered. The
 campaign is closed here with the measurements, the instrument, the
-exact-but-currently-neutral device stages and fix (1) landed, and this is the
+exact-but-currently-neutral device stages and fix (1b) landed, and this is the
 state to resume from.
 
 Correction to earlier figures in this campaign: the fragmentation totals at

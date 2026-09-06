@@ -358,6 +358,33 @@ struct CudaGlm53IndexSelectRequest {
     float head_scale{};
 };
 
+// GLM-5.3 sparse-page attention scores (stage 3 of the device-attention
+// build). One QK dot per (row, head, attended token) against the group's
+// expanded KV, which the host uploads once per group.
+//
+// Exact by construction, not by luck: a single thread owns one dot and walks
+// its 256 channels in index order with `__fmul_rn`/`__fadd_rn`, reproducing
+// the host's DOUBLE rounding -- the host translation unit builds without FMA,
+// so its `score += q[c] * kv[c]` is mulss+addss and a fused multiply-add would
+// mismatch. The `* score_scale` that follows is the host's separate multiply.
+//
+// Scores for row r, head h, token t live at
+// `row_offsets[r] * heads + h * count(r) + t`, where
+// `count(r) = row_offsets[r + 1] - row_offsets[r]`. The softmax stays on the
+// host: host libm and device trig differ in the last ulp, and it is 0.89% of
+// the attend core (record 0264), so there is nothing to gain by moving it.
+struct CudaGlm53SparseScoresRequest {
+    std::span<const float> query;  // rows * heads * head_dim
+    std::span<const float> expanded;  // union_rows * heads * 2 * head_dim
+    std::span<const std::uint32_t> local_indices;  // row_offsets[rows] entries
+    std::span<const std::uint32_t> row_offsets;  // rows + 1 entries
+    std::uint32_t rows{};
+    std::uint32_t union_rows{};
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    float score_scale{};
+};
+
 struct CudaLightningIndexRequest {
     // Queries are post-projection/RoPE BF16 values. CUDA applies normalized
     // Hadamard rotation and FP4 E2M1/per-32 E8M0 simulation before scoring.
@@ -1539,6 +1566,9 @@ public:
     [[nodiscard]] ValidationResult lightning_index(
         int device, const CudaLightningIndexRequest& request,
         std::span<std::uint32_t> output);
+    [[nodiscard]] ValidationResult glm53_sparse_scores(
+        int device, const CudaGlm53SparseScoresRequest& request,
+        std::span<float> scores);
     [[nodiscard]] ValidationResult glm53_index_select(
         int device, const CudaGlm53IndexSelectRequest& request,
         std::span<std::uint32_t> selected,  // rows * 512 pool ids

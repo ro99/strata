@@ -5991,3 +5991,53 @@ __global__ void glm53_index_select_kernel(
         out_counts[row] = 512U;
     }
 }
+
+// GLM-5.3 sparse-page attention scores (stage 3). One thread owns one
+// (row, head, attended token) dot and walks its channels in index order with
+// the host's double rounding, so the scores are bit-identical to the host
+// attend core's and the softmax that follows on the host sees the same inputs.
+// Threads are independent, so nothing here depends on how they are scheduled.
+__global__ void glm53_sparse_scores_kernel(
+    const float* __restrict__ query,  // [rows][head_dim][heads]
+    const float* __restrict__ keys,  // [union][head_dim][heads]
+    const std::uint32_t* __restrict__ local_indices,
+    const std::uint32_t* __restrict__ row_offsets,
+    std::uint32_t heads, std::uint32_t head_dim, float score_scale,
+    float* __restrict__ scores) {
+    const std::uint32_t row = static_cast<std::uint32_t>(blockIdx.y);
+    const std::uint32_t begin = row_offsets[row];
+    const std::uint32_t count = row_offsets[row + 1U] - begin;
+    if (count == 0U) return;
+    const std::uint64_t total = static_cast<std::uint64_t>(heads) * count;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t index =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < total; index += stride) {
+        // HEAD IS THE FAST AXIS, and both operands are stored head-minor.
+        // A warp therefore covers 32 consecutive heads of the same token and
+        // reads 32 contiguous floats per column -- one 128-byte transaction.
+        // The first shape of this kernel put the token on the fast axis with
+        // head-major operands, so a warp touched 32 rows 64 KiB apart and used
+        // 4 bytes of every 128-byte transaction: 1/32 of the bus, and the
+        // kernel cost 12 s where the transfers cost under 2.
+        const std::uint32_t token = static_cast<std::uint32_t>(index / heads);
+        const std::uint32_t head = static_cast<std::uint32_t>(index % heads);
+        const std::uint32_t local = local_indices[begin + token];
+        const float* q = query +
+            static_cast<std::uint64_t>(row) * head_dim * heads + head;
+        const float* k = keys +
+            static_cast<std::uint64_t>(local) * head_dim * heads + head;
+        // The reduction itself stays strictly sequential over channels with
+        // the host's double rounding; only the memory layout changed.
+        float score = 0.0F;
+        for (std::uint32_t column = 0U; column < head_dim; ++column) {
+            score = __fadd_rn(
+                score, __fmul_rn(q[static_cast<std::uint64_t>(column) * heads],
+                                 k[static_cast<std::uint64_t>(column) * heads]));
+        }
+        scores[static_cast<std::uint64_t>(begin) * heads +
+               static_cast<std::uint64_t>(head) * count + token] =
+            __fmul_rn(score, score_scale);
+    }
+}

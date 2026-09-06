@@ -1470,6 +1470,16 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // KDA layers through the device page primitive while the 11 MLA layers keep
 // the existing host fallback inside forward_layer_page_device. Opt-in and
 // off by default; the dense device-prefill contract above is unchanged.
+[[nodiscard]] bool device_attend_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_DEVICE_ATTEND");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool index_check_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_INDEX_CHECK");
@@ -3398,6 +3408,11 @@ struct Glm53Runtime::Impl {
     // device-attention build can actually move: the expansion GEMM and the
     // QK/AV dots go to the device, but the softmax stays on the host because
     // host libm and device trig differ in the last ulp. Profile-gated.
+    std::vector<std::uint32_t> mla_flat_local;
+    std::vector<std::uint32_t> mla_row_offsets;
+    std::vector<float> mla_device_scores;
+    std::atomic<std::uint64_t> mla_index_nanoseconds{};
+    std::atomic<std::uint64_t> mla_device_nanoseconds{};
     std::atomic<std::uint64_t> mla_expand_nanoseconds{};
     std::atomic<std::uint64_t> mla_qk_nanoseconds{};
     std::atomic<std::uint64_t> mla_softmax_nanoseconds{};
@@ -7405,26 +7420,82 @@ struct Glm53Runtime::Impl {
                     std::memory_order_relaxed);
             }
 
+            // The group's union is sorted and so is each selection, so the
+            // mapped positions stay ascending and the accumulation order is
+            // the dense path's. Built once for the whole group here rather
+            // than per row, because the device scores command needs them all
+            // and the host path is happy to read the same flat array.
+            const auto group_rows = group_end - group_begin;
+            const auto index_started = config.phase_profile
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            auto& flat_local = mla_flat_local;
+            auto& row_offsets = mla_row_offsets;
+            flat_local.clear();
+            row_offsets.assign(1U, 0U);
+            for (std::uint32_t position = 0U; position < group_rows;
+                 ++position) {
+                const auto& chosen = selection[group_begin + position];
+                for (const auto pick : chosen) {
+                    flat_local.push_back(static_cast<std::uint32_t>(
+                        std::lower_bound(group_union.begin(),
+                                         group_union.end(), pick) -
+                        group_union.begin()));
+                }
+                row_offsets.push_back(
+                    static_cast<std::uint32_t>(flat_local.size()));
+            }
+            if (config.phase_profile) {
+                mla_index_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(index_started),
+                    std::memory_order_relaxed);
+            }
+            // Device QK, host softmax and AV. The dots are 62.7% of the attend
+            // core (record 0264) and each is an independent 256-channel
+            // reduction, so they move without touching any accumulation order;
+            // the softmax stays host-side because host libm and device trig
+            // differ in the last ulp and it is 0.89% of the term.
+            auto& device_scores = mla_device_scores;
+            const bool attend_on_device =
+                device_attend_enabled() && !flat_local.empty();
+            if (attend_on_device) {
+                device_scores.resize(
+                    static_cast<std::size_t>(flat_local.size()) * kHeads);
+                CudaGlm53SparseScoresRequest scores_request;
+                scores_request.query = std::span<const float>(query).subspan(
+                    static_cast<std::size_t>(group_begin) * kMlaWidth,
+                    static_cast<std::size_t>(group_rows) * kMlaWidth);
+                scores_request.expanded = expanded;
+                scores_request.local_indices = flat_local;
+                scores_request.row_offsets = row_offsets;
+                scores_request.rows = group_rows;
+                scores_request.union_rows = expanded_rows;
+                scores_request.heads = kHeads;
+                scores_request.head_dim = kMlaHead;
+                scores_request.score_scale = score_scale;
+                const auto device_started = config.phase_profile
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                result = cuda.glm53_sparse_scores(device_for(layer),
+                                                  scores_request,
+                                                  device_scores);
+                if (!result.ok()) return result;
+                if (config.phase_profile) {
+                    mla_device_nanoseconds.fetch_add(
+                        elapsed_nanoseconds(device_started),
+                        std::memory_order_relaxed);
+                }
+            }
             // Row-parallel within the group: rows share the read-only group
             // expansion and each writes its own attended slice. Scores become
             // per-row storage instead of the reused shared vector; every
             // within-row order is untouched, so the output is bit-identical.
             result = parallel_page_rows(
-                group_end - group_begin, [&](std::uint32_t position) {
+                group_rows, [&](std::uint32_t position) {
                 const auto row = group_begin + position;
-                // The group's union is sorted and so is each selection, so the
-                // mapped positions stay ascending and the accumulation order is
-                // the dense path's.
-                const auto& chosen = selection[row];
-                const auto attended_rows =
-                    static_cast<std::uint32_t>(chosen.size());
-                std::vector<std::uint32_t> local(attended_rows);
-                for (std::uint32_t index = 0U; index < attended_rows; ++index) {
-                    local[index] = static_cast<std::uint32_t>(
-                        std::lower_bound(group_union.begin(), group_union.end(),
-                                         chosen[index]) -
-                        group_union.begin());
-                }
+                const auto begin = row_offsets[position];
+                const auto attended_rows = row_offsets[position + 1U] - begin;
+                const std::uint32_t* local = flat_local.data() + begin;
                 std::vector<float> scores(attended_rows, 0.0F);
                 const bool profile = config.phase_profile;
                 std::uint64_t qk_ns = 0U;
@@ -7439,6 +7510,16 @@ struct Glm53Runtime::Impl {
                     const auto* q = query.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     float highest = -std::numeric_limits<float>::infinity();
+                    if (attend_on_device) {
+                        const auto* row_scores = device_scores.data() +
+                            static_cast<std::size_t>(begin) * kHeads +
+                            static_cast<std::size_t>(head) * attended_rows;
+                        for (std::uint32_t token = 0U;
+                             token < attended_rows; ++token) {
+                            scores[token] = row_scores[token];
+                            highest = std::max(highest, scores[token]);
+                        }
+                    } else {
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
                         const auto* kv = expanded.data() +
                             (static_cast<std::size_t>(local[token]) * kHeads +
@@ -7449,6 +7530,7 @@ struct Glm53Runtime::Impl {
                         }
                         scores[token] = score * score_scale;
                         highest = std::max(highest, scores[token]);
+                    }
                     }
                     const auto head_softmax_started = stamp();
                     float total = 0.0F;
@@ -9618,6 +9700,12 @@ struct Glm53Runtime::Impl {
                           << " softmax_s="
                           << (static_cast<double>(softmax_ns) / 1.0e9)
                           << " av_s=" << (static_cast<double>(av_ns) / 1.0e9)
+                          << " index_s="
+                          << (static_cast<double>(mla_index_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << " devicecall_s="
+                          << (static_cast<double>(mla_device_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
                           << '\n';
             }
         }

@@ -155,6 +155,10 @@ struct CudaBackend::Impl {
         std::uint32_t glm53_regfed_intermediate{};
         bool glm53_regfed_gate_up_in_flight{};
         bool glm53_regfed_down_in_flight{};
+        void* glm53_scores_workspace{};
+        std::uint64_t glm53_scores_workspace_bytes{};
+        void* glm53_scores_staging{};
+        std::uint64_t glm53_scores_staging_bytes{};
         std::byte* matmul_host_input{};
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};

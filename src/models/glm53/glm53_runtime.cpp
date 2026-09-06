@@ -7348,7 +7348,10 @@ struct Glm53Runtime::Impl {
                                       static_cast<std::uint64_t>(kIndexHeadDim) *
                                           kHidden);
                 if (!wk.ok()) return {std::move(wk.errors)};
-                for (std::uint32_t row = 0U; row < rows; ++row) {
+                // Row-parallel like the MHC glue (record 0250): each row is
+                // an independent serial dot, so scheduling is the only
+                // change and the output is bit-identical.
+                result = parallel_page_rows(rows, [&](std::uint32_t row) {
                     glm53_indexer_gate(
                         std::span<float>(page_keys).subspan(
                             static_cast<std::size_t>(row) * kIndexHeadDim,
@@ -7356,14 +7359,16 @@ struct Glm53Runtime::Impl {
                         input.subspan(static_cast<std::size_t>(row) * kHidden,
                                       kHidden),
                         *wk.value);
-                }
+                    return ValidationResult{};
+                });
+                if (!result.ok()) return result;
             }
             {
                 auto gate = host_tensor(page_indexer_bases[1],
                                         static_cast<std::uint64_t>(kIndexHeadDim) *
                                             kHidden);
                 if (!gate.ok()) return {std::move(gate.errors)};
-                for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = parallel_page_rows(rows, [&](std::uint32_t row) {
                     glm53_indexer_gate(
                         std::span<float>(page_gates).subspan(
                             static_cast<std::size_t>(row) * kIndexHeadDim,
@@ -7371,7 +7376,9 @@ struct Glm53Runtime::Impl {
                         input.subspan(static_cast<std::size_t>(row) * kHidden,
                                       kHidden),
                         *gate.value);
-                }
+                    return ValidationResult{};
+                });
+                if (!result.ok()) return result;
             }
             auto norm_weight =
                 host_tensor(attention + "indexer.k_norm.weight", kIndexHeadDim);
@@ -7381,7 +7388,7 @@ struct Glm53Runtime::Impl {
             if (!norm_bias.ok()) return {std::move(norm_bias.errors)};
             std::vector<float> packed(
                 static_cast<std::size_t>(rows) * 2U * kIndexHeadDim);
-            for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = parallel_page_rows(rows, [&](std::uint32_t row) {
                 auto key = std::span<float>(page_keys).subspan(
                     static_cast<std::size_t>(row) * kIndexHeadDim,
                     kIndexHeadDim);
@@ -7394,7 +7401,9 @@ struct Glm53Runtime::Impl {
                 std::copy_n(page_gates.data() +
                                 static_cast<std::size_t>(row) * kIndexHeadDim,
                             kIndexHeadDim, destination + kIndexHeadDim);
-            }
+                return ValidationResult{};
+            });
+            if (!result.ok()) return result;
             result = index_cache.append_rows(packed, rows);
             if (!result.ok()) return result;
         }

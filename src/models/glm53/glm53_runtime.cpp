@@ -9461,32 +9461,67 @@ struct Glm53Runtime::Impl {
         request->prefill_cursor = reused;
         // Sparse-KDA mode (record 0253) joins the dense device-prefill gate:
         // admit the device sequence so KDA layers run their device pages,
-        // with MLA layers on the host fallback. Fail closed without the
-        // resident path, exactly like the dense gate.
+        // with MLA layers on the host fallback.
+        const bool dense_prefill = device_prefill_for_context(
+            config.device_prefill, config.maximum_context_tokens);
         const bool sparse_kda_prefill = sparse_device_kda_enabled() &&
             sparse_indexer_active(config.maximum_context_tokens);
-        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens) ||
-            sparse_kda_prefill) {
+        if (dense_prefill || sparse_kda_prefill) {
+            // The 4118 rule, applied to prefill admission: an explicit
+            // device-prefill request that cannot be honored is an error,
+            // but sparse-KDA mode declines and leaves the host path intact.
+            // Only admission (resident path, sequence prepare, slot reserve)
+            // declines; mid-flight failures stay hard errors, and the
+            // downstream sites key off device_sequence.ready, so a declined
+            // request takes the host path in advance_prefill and skips the
+            // sync-back in finish_prefill automatically.
+            const bool may_decline = sparse_kda_prefill && !dense_prefill;
+            const auto decline_to_host = [&](const std::string& reason) {
+                std::cerr << "[glm53-sparse-kda] device KDA prefill "
+                             "declined ("
+                          << reason << "); continuing on host path\n";
+                if (request->device_sequence.ready) {
+                    sequence_slots_live.fetch_sub(
+                        1U, std::memory_order_relaxed);
+                }
+                request->device_sequence = DeviceSequenceState{};
+            };
             if (!resident_execution_active) {
-                request->result.errors.emplace_back(
-                    "GLM-5.3 device prefill requires the resident exact path");
-                complete_request(request);
-                return false;
-            }
-            auto prepared = prepare_device_sequence(
-                request->sequence, request->device_sequence);
-            if (!prepared.ok()) {
-                request->result.errors = std::move(prepared.errors);
-                complete_request(request);
-                return false;
-            }
-            for (const auto device : devices) {
-                prepared = cuda.dsv4_mhc_reserve_slots(
-                    device, config.prefill_page_tokens);
-                if (!prepared.ok()) {
+                if (!may_decline) {
+                    request->result.errors.emplace_back(
+                        "GLM-5.3 device prefill requires the resident exact path");
+                    complete_request(request);
+                    return false;
+                }
+                decline_to_host("resident path unavailable");
+            } else {
+                auto prepared = prepare_device_sequence(
+                    request->sequence, request->device_sequence);
+                if (!prepared.ok() && !may_decline) {
                     request->result.errors = std::move(prepared.errors);
                     complete_request(request);
                     return false;
+                }
+                if (!prepared.ok()) {
+                    decline_to_host(prepared.errors.empty()
+                                        ? "sequence admission failed"
+                                        : prepared.errors.front());
+                } else {
+                    for (const auto device : devices) {
+                        prepared = cuda.dsv4_mhc_reserve_slots(
+                            device, config.prefill_page_tokens);
+                        if (!prepared.ok()) break;
+                    }
+                    if (!prepared.ok() && !may_decline) {
+                        request->result.errors = std::move(prepared.errors);
+                        complete_request(request);
+                        return false;
+                    }
+                    if (!prepared.ok()) {
+                        decline_to_host(prepared.errors.empty()
+                                            ? "slot reserve failed"
+                                            : prepared.errors.front());
+                    }
                 }
             }
         }
@@ -9838,11 +9873,14 @@ struct Glm53Runtime::Impl {
         // Sparse-KDA mode joins here too: the device advanced KDA state, so
         // the host sequence must be refreshed before hashes, decode, and the
         // prefix cache read it. MLA layers ran on the host and take the
-        // existing host-history admission branch below.
+        // existing host-history admission branch below. The ready check is
+        // what makes a declined admission take the host path: prepare is
+        // the only place that sets it before prefill runs.
         const bool sparse_kda_prefill = sparse_device_kda_enabled() &&
             sparse_indexer_active(config.maximum_context_tokens);
-        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens) ||
-            sparse_kda_prefill) {
+        if ((device_prefill_for_context(config.device_prefill, config.maximum_context_tokens) ||
+             sparse_kda_prefill) &&
+            request->device_sequence.ready) {
             auto synchronized = synchronize_kda_sequence_from_device(
                 request->sequence, request->device_sequence);
             if (!synchronized.ok()) {
@@ -9947,12 +9985,12 @@ struct Glm53Runtime::Impl {
         }
         const auto count = std::min(
             maximum_rows, request->prompt.size() - request->prefill_cursor);
-        const bool use_device_pages = device_prefill_for_context(
-                                          config.device_prefill,
-                                          config.maximum_context_tokens) ||
-                                      (sparse_device_kda_enabled() &&
-                                       sparse_indexer_active(
-                                           config.maximum_context_tokens));
+        const bool use_device_pages =
+            (device_prefill_for_context(config.device_prefill,
+                                        config.maximum_context_tokens) ||
+             (sparse_device_kda_enabled() &&
+              sparse_indexer_active(config.maximum_context_tokens))) &&
+            request->device_sequence.ready;
         auto prefill = forward_prompt(
             std::span<const std::uint32_t>(request->prompt).subspan(
                 request->prefill_cursor, count),

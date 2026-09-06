@@ -390,6 +390,24 @@ constexpr std::size_t kExpertReductionBlock = 1024U;
 constexpr std::uint32_t kDevicePageStagingMinimumRows = 1536U;
 constexpr std::uint64_t kDevicePageStagingReserveBytes = 2ULL << 30U;
 
+// VRAM held back from the pinned tier for demand staging, in GiB. The compiled
+// default is the 2 GiB above, which admits about 140 experts at 14.2 MB each --
+// against roughly 250 distinct experts a 2,048-row page touches per layer. The
+// overflow is not queued, it falls to the host path, and that fallback is where
+// 136.6 s of a 250 s prefill goes while the device serves 87.5% of the routes
+// in 34.2 s. Raising this trades pinned-tier residency, which serves decode,
+// for staging capacity, which serves prefill.
+[[nodiscard]] std::uint64_t device_page_staging_reserve_bytes() noexcept {
+    static const std::uint64_t bytes = [] {
+        const char* value = std::getenv("STRATA_GLM53_STAGING_RESERVE_GIB");
+        if (value == nullptr) return kDevicePageStagingReserveBytes;
+        const std::uint64_t parsed = std::strtoull(value, nullptr, 10);
+        return parsed == 0U ? kDevicePageStagingReserveBytes
+                            : static_cast<std::uint64_t>(parsed << 30U);
+    }();
+    return bytes;
+}
+
 [[nodiscard]] int device_page_staging_override() noexcept {
     static const int setting = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_PAGE_STAGING");
@@ -3757,7 +3775,7 @@ struct Glm53Runtime::Impl {
         if (!device_page_staging_enabled(config.prefill_page_tokens)) {
             return 0U;
         }
-        return kDevicePageStagingReserveBytes;
+        return device_page_staging_reserve_bytes();
     }
 
     [[nodiscard]] std::size_t slot_for(std::uint32_t layer) const noexcept {

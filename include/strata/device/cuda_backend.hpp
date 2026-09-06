@@ -336,6 +336,28 @@ struct CudaLightningIndexSegment {
     std::uint32_t rows{};
 };
 
+// GLM-5.3 k-pool index selection for one prefill page: per-row pool
+// scoring + top-k + tail markers over host-provided keys, mirroring
+// glm53_sparse_index_select. One thread owns one row end to end and
+// accumulates in strict index order (scalar fmaf chains, sequential head
+// sum, (score desc, pool asc) tie order), so identical inputs select
+// identical sets by construction; the caller gates the sets
+// element-for-element against the host path. Synchronous: downloads the
+// selected pools. Identity rows (visible <= 2048) report count 0 and the
+// caller fills the dense range, exactly like the host branch.
+struct CudaGlm53IndexSelectRequest {
+    std::span<const float> index_query;  // rows * 32 * 128
+    std::span<const float> head_weights;  // rows * 32
+    std::span<const float> pool_keys;  // pools * 128, contiguous
+    std::uint32_t rows{};
+    std::uint32_t pools{};
+    std::uint32_t history_begin{};
+    // Host-computed 1/sqrtf constants, passed in so no device sqrt or
+    // division can drift from the host's correctly-rounded values.
+    float score_scale{};
+    float head_scale{};
+};
+
 struct CudaLightningIndexRequest {
     // Queries are post-projection/RoPE BF16 values. CUDA applies normalized
     // Hadamard rotation and FP4 E2M1/per-32 E8M0 simulation before scoring.
@@ -1517,6 +1539,10 @@ public:
     [[nodiscard]] ValidationResult lightning_index(
         int device, const CudaLightningIndexRequest& request,
         std::span<std::uint32_t> output);
+    [[nodiscard]] ValidationResult glm53_index_select(
+        int device, const CudaGlm53IndexSelectRequest& request,
+        std::span<std::uint32_t> selected,  // rows * 512 pool ids
+        std::span<std::uint32_t> counts);   // rows; 0 = identity row
     // Exact bounded-workspace Lightning Indexer over physical-format E4M3
     // learned-index pages. Selection is a parallel radix select over a
     // composite (score, position) key rather than the serial insertion merge

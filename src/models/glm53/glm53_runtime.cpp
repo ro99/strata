@@ -1227,6 +1227,28 @@ void glm53_index_pool_key(std::span<float> pool_key, std::uint32_t pool,
 }
 
 // `pool_key_at(pool)` returns that complete pool's cached 128-wide key.
+// Shared tail of pool selection, used by the host ranking below and by the
+// device-selection gate in the sparse prefill page: sort chosen pools
+// ascending, expand members, append the always-selected tail. Integer-only,
+// so both callers agree bit for bit by construction.
+[[nodiscard]] std::size_t expand_pool_selection(
+    std::span<const std::uint32_t> chosen, std::uint32_t pools,
+    std::uint32_t tail_count, std::span<std::uint32_t> selected) {
+    std::vector<std::uint32_t> ordered(chosen.begin(), chosen.end());
+    std::sort(ordered.begin(), ordered.end());
+    std::size_t count = 0U;
+    for (const auto pool : ordered) {
+        for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
+            selected[count++] = pool * kIndexPool + member;
+        }
+    }
+    // Always-selected tail: the current incomplete pool, as raw positions.
+    for (std::uint32_t offset = 0U; offset < tail_count; ++offset) {
+        selected[count++] = pools * kIndexPool + offset;
+    }
+    return count;
+}
+
 template <typename PoolKeyAt>
 [[nodiscard]] std::size_t glm53_sparse_index_select(
     std::span<std::uint32_t> selected, std::span<const float> indexer_query,
@@ -1292,19 +1314,7 @@ template <typename PoolKeyAt>
     for (std::size_t index = 0U; index < keep; ++index) {
         chosen.push_back(ranked[index].second);
     }
-    std::sort(chosen.begin(), chosen.end());
-
-    std::size_t count = 0U;
-    for (const auto pool : chosen) {
-        for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
-            selected[count++] = pool * kIndexPool + member;
-        }
-    }
-    // Always-selected tail: the current incomplete pool, as raw positions.
-    for (std::uint32_t offset = 0U; offset < tail_count; ++offset) {
-        selected[count++] = pools * kIndexPool + offset;
-    }
-    return count;
+    return expand_pool_selection(chosen, pools, tail_count, selected);
 }
 
 constexpr std::uint64_t kKdaWorkspaceFloats =
@@ -1460,6 +1470,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // KDA layers through the device page primitive while the 11 MLA layers keep
 // the existing host fallback inside forward_layer_page_device. Opt-in and
 // off by default; the dense device-prefill contract above is unchanged.
+[[nodiscard]] bool index_check_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_INDEX_CHECK");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool sparse_device_kda_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_SPARSE_DEVICE_KDA");
@@ -7237,6 +7258,85 @@ struct Glm53Runtime::Impl {
                 selection[row].assign(selected.begin(),
                                       selected.begin() +
                                           static_cast<std::ptrdiff_t>(count));
+            }
+        }
+
+        // Device selection (stage 2, record 0262) with an element gate
+        // against the host sets above. Always on (fail closed): a divergence
+        // errors the request rather than flowing downstream, so an
+        // intermittent ranking flip can never ship silently.
+        // STRATA_GLM53_INDEX_CHECK=0 restores pure host selection.
+        // Downstream consumes the device sets once the gate passes, so the
+        // device path is what's validated end to end.
+        if (index_check_enabled()) {
+            const auto pool_count = pool_cache.rows();
+            std::vector<float> flat_pool_keys(
+                static_cast<std::size_t>(pool_count) * kIndexHeadDim);
+            for (std::uint32_t pool = 0U; pool < pool_count; ++pool) {
+                const auto prow = pool_cache.row(pool);
+                std::copy(prow.begin(), prow.end(),
+                          flat_pool_keys.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  static_cast<std::size_t>(pool) *
+                                  kIndexHeadDim));
+            }
+            std::vector<std::uint32_t> device_sets(
+                static_cast<std::size_t>(rows) * 512U);
+            std::vector<std::uint32_t> device_counts(rows);
+            CudaGlm53IndexSelectRequest select_request;
+            select_request.index_query = index_query;
+            select_request.head_weights = head_weights;
+            select_request.pool_keys = flat_pool_keys;
+            select_request.rows = rows;
+            select_request.pools = pool_count;
+            select_request.history_begin = history_begin;
+            select_request.score_scale =
+                1.0F / std::sqrt(static_cast<float>(kIndexHeadDim));
+            select_request.head_scale =
+                1.0F / std::sqrt(static_cast<float>(kIndexHeads));
+            result = cuda.glm53_index_select(device_for(layer),
+                                             select_request, device_sets,
+                                             device_counts);
+            if (!result.ok()) return result;
+            std::vector<std::uint32_t> device_selected(kIndexSelectionWidth);
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto visible = history_begin + row + 1U;
+                std::size_t device_count = 0U;
+                if (device_counts[row] == 0U) {
+                    for (std::uint32_t token = 0U; token < visible; ++token) {
+                        device_selected[token] = token;
+                    }
+                    device_count = visible;
+                } else {
+                    std::vector<std::uint32_t> device_pools(
+                        device_sets.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                static_cast<std::size_t>(row) * 512U),
+                        device_sets.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                static_cast<std::size_t>(row) * 512U +
+                                device_counts[row]));
+                    const auto row_pools = visible / kIndexPool;
+                    const auto row_tail = visible - row_pools * kIndexPool;
+                    device_count = expand_pool_selection(
+                        device_pools, row_pools, row_tail, device_selected);
+                }
+                const auto& expected = selection[row];
+                if (device_count != expected.size() ||
+                    !std::equal(device_selected.begin(),
+                                device_selected.begin() +
+                                    static_cast<std::ptrdiff_t>(device_count),
+                                expected.begin())) {
+                    result.errors.emplace_back(
+                        "GLM-5.3 device index selection diverges from host at layer " +
+                        std::to_string(layer) + " row " +
+                        std::to_string(row));
+                    return result;
+                }
+                selection[row].assign(
+                    device_selected.begin(),
+                    device_selected.begin() +
+                        static_cast<std::ptrdiff_t>(device_count));
             }
         }
 

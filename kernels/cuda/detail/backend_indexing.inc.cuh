@@ -1411,3 +1411,138 @@ ValidationResult CudaBackend::dsv4_physical_lightning_index(
     }
     return result;
 }
+
+ValidationResult CudaBackend::glm53_index_select(
+    int device, const CudaGlm53IndexSelectRequest& request,
+    std::span<std::uint32_t> selected, std::span<std::uint32_t> counts) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "GLM-5.3 index selection targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    constexpr std::uint64_t kHeads = 32U;
+    constexpr std::uint64_t kHeadDim = 128U;
+    constexpr std::uint64_t kKeep = 512U;
+    constexpr std::uint64_t kStride = 512U;
+    if (request.rows == 0U || request.pools == 0U ||
+        request.index_query.size() !=
+            static_cast<std::size_t>(request.rows) * kHeads * kHeadDim ||
+        request.head_weights.size() !=
+            static_cast<std::size_t>(request.rows) * kHeads ||
+        request.pool_keys.size() !=
+            static_cast<std::size_t>(request.pools) * kHeadDim ||
+        selected.size() !=
+            static_cast<std::size_t>(request.rows) * kStride ||
+        counts.size() != request.rows || !std::isfinite(request.score_scale) ||
+        !std::isfinite(request.head_scale) || request.score_scale <= 0.0F ||
+        request.head_scale <= 0.0F) {
+        result.errors.emplace_back(
+            "GLM-5.3 index selection shapes are incompatible");
+        return result;
+    }
+    const auto query_bytes =
+        static_cast<std::uint64_t>(request.rows) * kHeads * kHeadDim *
+        sizeof(float);
+    const auto weights_bytes =
+        static_cast<std::uint64_t>(request.rows) * kHeads * sizeof(float);
+    const auto keys_bytes = static_cast<std::uint64_t>(request.pools) *
+                            kHeadDim * sizeof(float);
+    const auto sets_bytes =
+        static_cast<std::uint64_t>(request.rows) * kKeep * sizeof(std::uint32_t);
+    const auto counts_bytes =
+        static_cast<std::uint64_t>(request.rows) * sizeof(std::uint32_t);
+    const auto required =
+        query_bytes + weights_bytes + keys_bytes + sets_bytes + counts_bytes;
+    if (state.glm53_index_workspace_bytes < required) {
+        if (state.glm53_index_workspace != nullptr) {
+            static_cast<void>(cudaFree(state.glm53_index_workspace));
+            state.glm53_index_workspace = nullptr;
+            state.glm53_index_workspace_bytes = 0U;
+        }
+        if (auto status = cudaMalloc(&state.glm53_index_workspace,
+                                     static_cast<std::size_t>(required));
+            status != cudaSuccess) {
+            return cuda_error(status, "allocate GLM-5.3 index workspace");
+        }
+        state.glm53_index_workspace_bytes = required;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for GLM-5.3 selection");
+    }
+    auto* base = static_cast<std::byte*>(state.glm53_index_workspace);
+    auto* device_query = reinterpret_cast<float*>(base);
+    auto* device_weights =
+        reinterpret_cast<float*>(base + query_bytes);
+    auto* device_keys = reinterpret_cast<float*>(base + query_bytes +
+                                                 weights_bytes);
+    auto* device_sets = reinterpret_cast<std::uint32_t*>(
+        base + query_bytes + weights_bytes + keys_bytes);
+    auto* device_counts = reinterpret_cast<std::uint32_t*>(
+        base + query_bytes + weights_bytes + keys_bytes + sets_bytes);
+    const auto copy = [&](void* destination, const void* source,
+                          std::uint64_t bytes, cudaMemcpyKind kind,
+                          const char* what) {
+        const auto status = cudaMemcpyAsync(
+            destination, source, static_cast<std::size_t>(bytes), kind,
+            state.stream);
+        if (status != cudaSuccess) result = cuda_error(status, what);
+        return status == cudaSuccess;
+    };
+    if (!copy(device_query, request.index_query.data(), query_bytes,
+              cudaMemcpyHostToDevice, "upload GLM-5.3 index queries") ||
+        !copy(device_weights, request.head_weights.data(), weights_bytes,
+              cudaMemcpyHostToDevice, "upload GLM-5.3 index head weights") ||
+        !copy(device_keys, request.pool_keys.data(), keys_bytes,
+              cudaMemcpyHostToDevice, "upload GLM-5.3 index pool keys")) {
+        return result;
+    }
+    // One block per row: the scoring parallelises across pools while each
+    // pool's own reduction stays serial in one thread, and the shared block
+    // holds the scores plus the top-512 ranking arrays. Sized from `pools`
+    // rather than the per-row bound because the block is launched before the
+    // row's bound is known.
+    constexpr std::uint32_t kThreads = 256U;
+    const auto shared_bytes =
+        static_cast<std::uint64_t>(request.pools) * sizeof(float) +
+        kKeep * sizeof(float) + kKeep * sizeof(std::uint32_t);
+    int shared_limit = 0;
+    if (auto status = cudaDeviceGetAttribute(
+            &shared_limit, cudaDevAttrMaxSharedMemoryPerBlock, device);
+        status != cudaSuccess) {
+        return cuda_error(status, "query GLM-5.3 index selection shared limit");
+    }
+    if (shared_bytes > static_cast<std::uint64_t>(shared_limit)) {
+        // Fail closed rather than silently ranking on a truncated pool set.
+        // The caller still holds the host selection, so this is recoverable
+        // upstream; it is not recoverable by guessing here.
+        result.errors.emplace_back(
+            "GLM-5.3 index selection needs more shared memory than this "
+            "device offers");
+        return result;
+    }
+    glm53_index_select_kernel<<<request.rows, kThreads,
+                                static_cast<std::size_t>(shared_bytes),
+                                state.stream>>>(
+        device_query, device_weights, device_keys, request.rows,
+        request.pools, request.history_begin, request.score_scale,
+        request.head_scale, device_sets, device_counts);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch GLM-5.3 index selection");
+    }
+    if (!copy(selected.data(), device_sets,
+              static_cast<std::uint64_t>(request.rows) * kKeep *
+                  sizeof(std::uint32_t),
+              cudaMemcpyDeviceToHost, "download GLM-5.3 index selection") ||
+        !copy(counts.data(), device_counts, counts_bytes,
+              cudaMemcpyDeviceToHost, "download GLM-5.3 index counts")) {
+        return result;
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize GLM-5.3 index selection");
+    }
+    return result;
+}

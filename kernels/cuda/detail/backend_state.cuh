@@ -237,6 +237,11 @@ struct CudaBackend::Impl {
         // cosines and sines. Grown once and reused, never on a timed path.
         std::byte* dsv4_index_query_workspace{};
         std::uint64_t dsv4_index_query_workspace_bytes{};
+        // GLM-5.3 k-pool page selection (stage 2): index queries, head
+        // weights, pool keys, and output sets for one page. Grown
+        // geometrically and reused across layers; freed with the device.
+        std::byte* glm53_index_workspace{};
+        std::uint64_t glm53_index_workspace_bytes{};
         std::byte* dsv4_attention_workspace{};
         std::byte* dsv4_attention_host_upload{};
         std::byte* dsv4_attention_host_download{};
@@ -442,6 +447,9 @@ struct CudaBackend::Impl {
             }
             if (state.dsv4_index_query_workspace != nullptr) {
                 static_cast<void>(cudaFree(state.dsv4_index_query_workspace));
+            }
+            if (state.glm53_index_workspace != nullptr) {
+                static_cast<void>(cudaFree(state.glm53_index_workspace));
             }
             if (state.dsv4_attention_prepare_workspace != nullptr) {
                 static_cast<void>(

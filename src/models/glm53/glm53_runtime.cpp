@@ -7154,7 +7154,10 @@ struct Glm53Runtime::Impl {
             auto wp = host_tensor(bases[2],
                                   static_cast<std::uint64_t>(kIndexHeads) * kHidden);
             if (!wp.ok()) return {std::move(wp.errors)};
-            for (std::uint32_t row = 0U; row < rows; ++row) {
+            // Row-parallel (record 0250 pattern): each row is two independent
+            // serial dots over read-only weights, so scheduling is the only
+            // change and the output is bit-identical.
+            result = parallel_page_rows(rows, [&](std::uint32_t row) {
                 glm53_indexer_gate(
                     std::span<float>(index_query).subspan(
                         static_cast<std::size_t>(row) * kIndexHeads * kIndexHeadDim,
@@ -7167,7 +7170,9 @@ struct Glm53Runtime::Impl {
                         static_cast<std::size_t>(row) * kIndexHeads, kIndexHeads),
                     input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
                     *wp.value);
-            }
+                return ValidationResult{};
+            });
+            if (!result.ok()) return result;
         }
 
         // Every row's selection first, so the group boundaries can be chosen
@@ -7200,7 +7205,6 @@ struct Glm53Runtime::Impl {
         std::vector<float> attended(
             static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
         std::vector<std::uint32_t> group_union, merged;
-        std::vector<float> scores;
         for (std::uint32_t group_begin = 0U; group_begin < rows;) {
             group_union.clear();
             auto group_end = group_begin;
@@ -7244,7 +7248,13 @@ struct Glm53Runtime::Impl {
             result = linear_batch(expand, layer);
             if (!result.ok()) return result;
 
-            for (auto row = group_begin; row < group_end; ++row) {
+            // Row-parallel within the group: rows share the read-only group
+            // expansion and each writes its own attended slice. Scores become
+            // per-row storage instead of the reused shared vector; every
+            // within-row order is untouched, so the output is bit-identical.
+            result = parallel_page_rows(
+                group_end - group_begin, [&](std::uint32_t position) {
+                const auto row = group_begin + position;
                 // The group's union is sorted and so is each selection, so the
                 // mapped positions stay ascending and the accumulation order is
                 // the dense path's.
@@ -7258,7 +7268,7 @@ struct Glm53Runtime::Impl {
                                          chosen[index]) -
                         group_union.begin());
                 }
-                scores.assign(attended_rows, 0.0F);
+                std::vector<float> scores(attended_rows, 0.0F);
                 for (std::uint32_t head = 0U; head < kHeads; ++head) {
                     const auto* q = query.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
@@ -7295,7 +7305,9 @@ struct Glm53Runtime::Impl {
                         }
                     }
                 }
-            }
+                return ValidationResult{};
+            });
+            if (!result.ok()) return result;
             group_begin = group_end;
         }
         round_bf16(attended);

@@ -1447,6 +1447,21 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     return requested && !sparse_indexer_active(maximum_context_tokens);
 }
 
+// Sparse-context device KDA prefill (record 0253): run the 34 indexer-free
+// KDA layers through the device page primitive while the 11 MLA layers keep
+// the existing host fallback inside forward_layer_page_device. Opt-in and
+// off by default; the dense device-prefill contract above is unchanged.
+[[nodiscard]] bool sparse_device_kda_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_SPARSE_DEVICE_KDA");
+        return value != nullptr &&
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool device_page_mla_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_PAGE_MLA");
@@ -8096,8 +8111,14 @@ struct Glm53Runtime::Impl {
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
         const auto attention = prefix + "self_attn.";
+        // At sparse contexts the device MLA page would attend densely without
+        // the k-pool selection the host applies, which is wrong past topK.
+        // Sparse-KDA mode therefore forces MLA layers onto the existing host
+        // fallback (per-row download); only KDA layers run device pages.
+        // Dense contexts are unaffected: the indexer is inactive there.
         const bool device_mla = !glm53_kda_layer(layer) &&
             device_page_mla_enabled() &&
+            !sparse_indexer_active(config.maximum_context_tokens) &&
             weights->mla_kv_b_is_bf16(attention);
         std::vector<float> normalized(
             static_cast<std::size_t>(rows) * kHidden);
@@ -9381,7 +9402,14 @@ struct Glm53Runtime::Impl {
             request->base_hidden);
         request->result.metrics.reused_prompt_tokens = reused;
         request->prefill_cursor = reused;
-        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)) {
+        // Sparse-KDA mode (record 0253) joins the dense device-prefill gate:
+        // admit the device sequence so KDA layers run their device pages,
+        // with MLA layers on the host fallback. Fail closed without the
+        // resident path, exactly like the dense gate.
+        const bool sparse_kda_prefill = sparse_device_kda_enabled() &&
+            sparse_indexer_active(config.maximum_context_tokens);
+        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens) ||
+            sparse_kda_prefill) {
             if (!resident_execution_active) {
                 request->result.errors.emplace_back(
                     "GLM-5.3 device prefill requires the resident exact path");
@@ -9750,7 +9778,14 @@ struct Glm53Runtime::Impl {
     }
 
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
-        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)) {
+        // Sparse-KDA mode joins here too: the device advanced KDA state, so
+        // the host sequence must be refreshed before hashes, decode, and the
+        // prefix cache read it. MLA layers ran on the host and take the
+        // existing host-history admission branch below.
+        const bool sparse_kda_prefill = sparse_device_kda_enabled() &&
+            sparse_indexer_active(config.maximum_context_tokens);
+        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens) ||
+            sparse_kda_prefill) {
             auto synchronized = synchronize_kda_sequence_from_device(
                 request->sequence, request->device_sequence);
             if (!synchronized.ok()) {
@@ -9855,12 +9890,17 @@ struct Glm53Runtime::Impl {
         }
         const auto count = std::min(
             maximum_rows, request->prompt.size() - request->prefill_cursor);
+        const bool use_device_pages = device_prefill_for_context(
+                                          config.device_prefill,
+                                          config.maximum_context_tokens) ||
+                                      (sparse_device_kda_enabled() &&
+                                       sparse_indexer_active(
+                                           config.maximum_context_tokens));
         auto prefill = forward_prompt(
             std::span<const std::uint32_t>(request->prompt).subspan(
                 request->prefill_cursor, count),
             request->logits, request->sequence, &request->base_hidden, false,
-            device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)
-                ? &request->device_sequence : nullptr);
+            use_device_pages ? &request->device_sequence : nullptr);
         if (!prefill.ok()) {
             request->result.errors = std::move(prefill.errors);
             complete_request(request);

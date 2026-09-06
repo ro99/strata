@@ -6186,14 +6186,20 @@ struct Glm53Runtime::Impl {
         }
         auto weight = host_tensor(weight_name, columns);
         if (!weight.ok()) return {std::move(weight.errors)};
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        // Row-parallel (record 0250 pattern): each row is an independent
+        // rmsnorm plus round over disjoint spans, so scheduling is the only
+        // change and the output is bit-identical. Shared by every caller;
+        // single-row callers keep the sequential path via the pool guard.
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto begin = static_cast<std::size_t>(row) * columns;
-            auto normalized = kimi_rms_norm(
+            ValidationResult normalized = kimi_rms_norm(
                 output.subspan(begin, columns), input.subspan(begin, columns),
                 *weight.value, 1.0e-5F);
             if (!normalized.ok()) return normalized;
             round_bf16(output.subspan(begin, columns));
-        }
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
         return result;
     }
 
@@ -7540,10 +7546,33 @@ struct Glm53Runtime::Impl {
              {bases[1], inner, kHidden, input, rows, up, true}}};
         result = linear_batch(projections, layer);
         if (!result.ok()) return result;
-        for (std::size_t index = 0U; index < gate.size(); ++index) {
-            const auto g = std::min(gate[index], 10.0F);
-            const auto u = std::clamp(up[index], -10.0F, 10.0F);
-            activated[index] = g * sigmoid(g) * u;
+        // Worker-chunked, not per-element dispatched: 95M std::function
+        // calls would cost more than the arithmetic. Each worker takes one
+        // contiguous range, so every element keeps its exact scalar order
+        // and the output is bit-identical. Sequential below 4,096 elements.
+        const auto activate_count = gate.size();
+        if (host_moe_workers != nullptr && host_moe_active &&
+            host_moe_workers->size() > 1U && activate_count > 4096U) {
+            const std::size_t lanes = host_moe_workers->size();
+            result = host_moe_workers->parallel_for(
+                lanes, [&](std::size_t lane) {
+                    const auto begin =
+                        lane * activate_count / lanes;
+                    const auto end =
+                        (lane + 1U) * activate_count / lanes;
+                    for (std::size_t index = begin; index < end; ++index) {
+                        const auto g = std::min(gate[index], 10.0F);
+                        const auto u = std::clamp(up[index], -10.0F, 10.0F);
+                        activated[index] = g * sigmoid(g) * u;
+                    }
+                });
+            if (!result.ok()) return result;
+        } else {
+            for (std::size_t index = 0U; index < activate_count; ++index) {
+                const auto g = std::min(gate[index], 10.0F);
+                const auto u = std::clamp(up[index], -10.0F, 10.0F);
+                activated[index] = g * sigmoid(g) * u;
+            }
         }
         round_bf16(activated);
         return linear(prefix + "down_proj", activated, rows, inner,
@@ -7634,14 +7663,21 @@ struct Glm53Runtime::Impl {
             prefix + "mlp.gate.e_score_correction_bias", 288U);
         if (!bias.ok()) return {std::move(bias.errors)};
         std::vector<std::array<KimiRoutedExpert, 8U>> selected_rows(rows);
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            auto& selected = selected_rows[row];
-            result = kimi_route_topk(
-                selected,
+        // Top-k first, row-parallel: each row selects from its own logits
+        // over read-only bias, so scheduling is the only change and the
+        // selection is bit-identical. Observation stays sequential below:
+        // the census and predictor own shared mutable state that rows must
+        // not touch concurrently.
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return kimi_route_topk(
+                selected_rows[row],
                 std::span<const float>(logits).subspan(
                     static_cast<std::size_t>(row) * 288U, 288U),
                 *bias.value, 2.5F);
-            if (!result.ok()) return result;
+        });
+        if (!result.ok()) return result;
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            auto& selected = selected_rows[row];
             if (!route_requests.empty()) {
                 // Prompt pages and independent decode cohorts both have
                 // `rows > 1`; only the caller knows which one this is. Using

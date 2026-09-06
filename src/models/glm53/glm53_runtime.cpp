@@ -148,6 +148,8 @@ namespace {
         after.calls - before.calls,
         after.rows - before.rows,
         after.group_windows - before.group_windows,
+        after.dispatch_nanoseconds - before.dispatch_nanoseconds,
+        after.staging_nanoseconds - before.staging_nanoseconds,
         after.gate_up_weight_bytes - before.gate_up_weight_bytes,
         after.down_weight_bytes - before.down_weight_bytes,
         after.view_resolution_nanoseconds - before.view_resolution_nanoseconds,
@@ -262,6 +264,10 @@ void print_phase_metrics(std::ostream& output,
            << phase.host_experts.down_weight_bytes
            << ",\"view_resolution_nanoseconds\":"
            << phase.host_experts.view_resolution_nanoseconds
+           << ",\"dispatch_nanoseconds\":"
+           << phase.host_experts.dispatch_nanoseconds
+           << ",\"staging_nanoseconds\":"
+           << phase.host_experts.staging_nanoseconds
            << ",\"input_quantization_nanoseconds\":"
            << phase.host_experts.input_quantization_nanoseconds
            << ",\"gate_up_nanoseconds\":"
@@ -3349,6 +3355,8 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> host_moe_gate_up_weight_bytes{};
     std::atomic<std::uint64_t> host_moe_down_weight_bytes{};
     std::atomic<std::uint64_t> host_moe_view_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_dispatch_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_staging_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_input_quantization_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_gate_up_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_activation_nanoseconds{};
@@ -3444,6 +3452,8 @@ struct Glm53Runtime::Impl {
             host_moe_calls.load(std::memory_order_relaxed),
             host_moe_rows.load(std::memory_order_relaxed),
             host_moe_group_windows.load(std::memory_order_relaxed),
+            host_moe_dispatch_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_staging_nanoseconds.load(std::memory_order_relaxed),
             host_moe_gate_up_weight_bytes.load(std::memory_order_relaxed),
             host_moe_down_weight_bytes.load(std::memory_order_relaxed),
             host_moe_view_nanoseconds.load(std::memory_order_relaxed),
@@ -4781,7 +4791,6 @@ struct Glm53Runtime::Impl {
             return {{"GLM-5.3 host page MoE command has an invalid shape"}};
         }
         const auto started = std::chrono::steady_clock::now();
-        const auto view_started = started;
         const int layer_device = device_for(layer);
         const auto layer_device_slot = slot_for(layer);
         const int shared_device = allow_device_tiers &&
@@ -4836,6 +4845,14 @@ struct Glm53Runtime::Impl {
         staging.parallel =
             staging.enabled && device_expert_parallel_enabled() &&
             staging.slot_count > 1U;
+        // Dispatch region (record 0256): route classification, group
+        // formation, sort and assignments. INCLUDES the staging calls below
+        // (timed separately as a subset); use dispatch - staging for the
+        // pure classification cost. view_resolution now measures ONLY the
+        // expert_views loop further down -- previously it aliased this whole
+        // region via view_started = started and wore 22.7 s of
+        // dispatch+staging at 2,591 tokens.
+        const auto dispatch_started = std::chrono::steady_clock::now();
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto expert = routes[row][route].expert;
@@ -4876,8 +4893,18 @@ struct Glm53Runtime::Impl {
                             ? static_cast<std::size_t>(expert) %
                                   staging.slot_count
                             : layer_device_slot;
+                        // Staging subset timer: mutex, eviction loop, checkpoint
+                        // load and the backend upload with its ring-syncs. Part
+                        // of dispatch above by construction.
+                        const auto staging_started =
+                            std::chrono::steady_clock::now();
                         auto status = weights->stage_expert(
                             target, layer, expert, staged_descriptor, staged);
+                        if (config.phase_profile) {
+                            host_moe_staging_nanoseconds.fetch_add(
+                                elapsed_nanoseconds(staging_started),
+                                std::memory_order_relaxed);
+                        }
                         if (!status.ok()) return status;
                         if (staged) {
                             // Permute into m16n8k16 fragment order so this
@@ -5038,6 +5065,12 @@ struct Glm53Runtime::Impl {
             }
         }
 
+        if (config.phase_profile) {
+            host_moe_dispatch_nanoseconds.fetch_add(
+                elapsed_nanoseconds(dispatch_started),
+                std::memory_order_relaxed);
+        }
+        const auto view_started = std::chrono::steady_clock::now();
         for (auto& group : groups) {
             const auto slot = group.shared ? kExpertSlots - 1U : group.expert;
             Glm53ExpertViews views;
@@ -5047,6 +5080,8 @@ struct Glm53Runtime::Impl {
         }
 
         if (config.phase_profile) {
+            host_moe_view_nanoseconds.fetch_add(
+                elapsed_nanoseconds(view_started), std::memory_order_relaxed);
             std::uint64_t gate_up_bytes = 0U;
             std::uint64_t down_bytes = 0U;
             for (const auto& group : groups) {
@@ -5063,8 +5098,6 @@ struct Glm53Runtime::Impl {
                 gate_up_bytes, std::memory_order_relaxed);
             host_moe_down_weight_bytes.fetch_add(
                 down_bytes, std::memory_order_relaxed);
-            host_moe_view_nanoseconds.fetch_add(
-                elapsed_nanoseconds(view_started), std::memory_order_relaxed);
         }
 
         const auto input_quantization_started =

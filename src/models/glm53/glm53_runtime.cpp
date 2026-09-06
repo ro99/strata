@@ -3394,6 +3394,14 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> graph_attention_block_nanoseconds{};
     std::atomic<std::uint64_t> graph_kda_nanoseconds{};
     std::atomic<std::uint64_t> graph_mla_nanoseconds{};
+    // Sparse attend-core split (record 0264). Sizes what stage 4 of the
+    // device-attention build can actually move: the expansion GEMM and the
+    // QK/AV dots go to the device, but the softmax stays on the host because
+    // host libm and device trig differ in the last ulp. Profile-gated.
+    std::atomic<std::uint64_t> mla_expand_nanoseconds{};
+    std::atomic<std::uint64_t> mla_qk_nanoseconds{};
+    std::atomic<std::uint64_t> mla_softmax_nanoseconds{};
+    std::atomic<std::uint64_t> mla_av_nanoseconds{};
     std::atomic<std::uint64_t> graph_feedforward_block_nanoseconds{};
     std::atomic<std::uint64_t> graph_output_head_nanoseconds{};
     std::atomic<std::uint64_t> graph_sampling_nanoseconds{};
@@ -7386,8 +7394,16 @@ struct Glm53Runtime::Impl {
             const std::array<Glm53WeightCache::LinearRequest, 1U> expand{
                 {{bases[3], kHeads * 2U * kMlaHead, kKvRank,
                   gathered, expanded_rows, expanded, true}}};
+            const auto expand_started = config.phase_profile
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
             result = linear_batch(expand, layer);
             if (!result.ok()) return result;
+            if (config.phase_profile) {
+                mla_expand_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(expand_started),
+                    std::memory_order_relaxed);
+            }
 
             // Row-parallel within the group: rows share the read-only group
             // expansion and each writes its own attended slice. Scores become
@@ -7410,7 +7426,16 @@ struct Glm53Runtime::Impl {
                         group_union.begin());
                 }
                 std::vector<float> scores(attended_rows, 0.0F);
+                const bool profile = config.phase_profile;
+                std::uint64_t qk_ns = 0U;
+                std::uint64_t softmax_ns = 0U;
+                std::uint64_t av_ns = 0U;
+                const auto stamp = [&] {
+                    return profile ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+                };
                 for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                    const auto head_qk_started = stamp();
                     const auto* q = query.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     float highest = -std::numeric_limits<float>::infinity();
@@ -7425,11 +7450,13 @@ struct Glm53Runtime::Impl {
                         scores[token] = score * score_scale;
                         highest = std::max(highest, scores[token]);
                     }
+                    const auto head_softmax_started = stamp();
                     float total = 0.0F;
                     for (auto& score : scores) {
                         score = std::exp(score - highest);
                         total += score;
                     }
+                    const auto head_av_started = stamp();
                     auto* out = attended.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
@@ -7445,6 +7472,27 @@ struct Glm53Runtime::Impl {
                             out[column] += coefficient * value[column];
                         }
                     }
+                    if (profile) {
+                        const auto head_finished =
+                            std::chrono::steady_clock::now();
+                        qk_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                head_softmax_started - head_qk_started).count());
+                        softmax_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                head_av_started - head_softmax_started).count());
+                        av_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                head_finished - head_av_started).count());
+                    }
+                }
+                if (profile) {
+                    mla_qk_nanoseconds.fetch_add(qk_ns,
+                                                 std::memory_order_relaxed);
+                    mla_softmax_nanoseconds.fetch_add(
+                        softmax_ns, std::memory_order_relaxed);
+                    mla_av_nanoseconds.fetch_add(av_ns,
+                                                 std::memory_order_relaxed);
                 }
                 return ValidationResult{};
             });
@@ -9544,6 +9592,32 @@ struct Glm53Runtime::Impl {
                           << (routes == 0U ? 0.0
                                           : static_cast<double>(hits) /
                                                 static_cast<double>(routes))
+                          << '\n';
+            }
+        }
+        // Sparse attend-core split, once per request. Reported as a line
+        // rather than folded into the phase-profile JSON because it exists to
+        // size stage 4 of the device-attention build, not to be consumed by a
+        // tool: expansion and the QK/AV dots are what can move to the device,
+        // while softmax stays on the host for exactness (host libm and device
+        // trig differ in the last ulp -- record 0214's callback exists for
+        // exactly that).
+        if (config.phase_profile) {
+            const auto expand_ns =
+                mla_expand_nanoseconds.load(std::memory_order_relaxed);
+            const auto qk_ns =
+                mla_qk_nanoseconds.load(std::memory_order_relaxed);
+            const auto softmax_ns =
+                mla_softmax_nanoseconds.load(std::memory_order_relaxed);
+            const auto av_ns =
+                mla_av_nanoseconds.load(std::memory_order_relaxed);
+            if (expand_ns + qk_ns + softmax_ns + av_ns != 0U) {
+                std::cerr << "[glm53-mla-split] expand_s="
+                          << (static_cast<double>(expand_ns) / 1.0e9)
+                          << " qk_s=" << (static_cast<double>(qk_ns) / 1.0e9)
+                          << " softmax_s="
+                          << (static_cast<double>(softmax_ns) / 1.0e9)
+                          << " av_s=" << (static_cast<double>(av_ns) / 1.0e9)
                           << '\n';
             }
         }

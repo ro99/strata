@@ -547,11 +547,41 @@ Two fixes follow, in order:
    from host memory costs roughly 65 ms per layer-page against about 930 ms to
    recompute it, so the transfer is not the obstacle.
 
-   **Precondition:** this is only legal if a row's expanded bits do not depend
-   on the batch size it was expanded in. A split-K GEMM that tiles the K
-   dimension as a function of M would break it. Expand 4,096 rows as one call
-   and as two calls of 2,048 and compare bit for bit before building anything.
+   **Measured, and incomplete.** On the bench at layer 19, history 4,096, 2,048
+   rows -- a page that shatters into 755 groups under synthetic selections --
+   fix (1) is exact (identical checksums, `0x2f70b47448139dde`) and worth
+   1.27x on the layer-page: 194.8 s to 153.6 s. But the expansion term only
+   falls from 99.6 s to 82.9 s where the arithmetic says one 6,144-row GEMM
+   should cost about 0.2 s. The gap is the slicing itself: each group still
+   materializes a contiguous `expanded` buffer, copying 3,690 rows x 32,768
+   floats -- 484 MB per group, about 365 GB over the page. Fix (1) as landed
+   trades a GEMM for a memcpy of the same order. The remaining win needs the
+   attend core to index into the page expansion in place through `mla_page_pos`
+   rather than gathering each group's rows, which is a change to the QK and AV
+   loops and was not attempted. Note the bench over-fragments (755 groups where
+   a real layer-page gives 86), so the copy penalty is overstated relative to
+   production and the 1.27x is a lower bound on a synthetic worst case, not a
+   production figure.
 
-Neither was built. The campaign is being closed with the measurements, the
-instrument and the exact-but-currently-neutral device stages landed, and this
-is the state to resume from.
+   **Precondition, and it holds.** This is only legal if a row's expanded bits
+   do not depend on the batch size it was expanded in; a split-K GEMM that
+   tiled the K dimension as a function of M would break it. Measured with
+   `STRATA_GLM53_EXPAND_INVARIANCE_CHECK=1` on layer 19: a 3,071-row union
+   expanded as one call and as two half-batches is **bit-identical**
+   (`[glm53-expand-invariance] union_rows=3071 exact=1`). The probe is
+   default-off, discards its own outputs and cannot move the hash. So nothing
+   in the GEMM blocks the per-token cache, and the remaining questions are
+   where the cache lives and how the prefill loop is ordered, not whether the
+   arithmetic permits it.
+
+Fix (1) is built and landed off by default behind `STRATA_GLM53_PAGE_EXPAND`;
+fix (2) is not built, and its one blocking precondition is now answered. The
+campaign is closed here with the measurements, the instrument, the
+exact-but-currently-neutral device stages and fix (1) landed, and this is the
+state to resume from.
+
+Correction to earlier figures in this campaign: the fragmentation totals at
+8,192 tokens are 904 groups and 3.60M row-expansions -- 126x the expansions for
+3.16x the tokens -- at an effective 446 GMAC/s, which supersedes an earlier
+estimate of ~900k expansions at ~111 GMAC/s. Fix (1) takes that to 225k rows,
+about 135 s of expansion becoming about 8.5 s.

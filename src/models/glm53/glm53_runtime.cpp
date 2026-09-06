@@ -150,6 +150,7 @@ namespace {
         after.group_windows - before.group_windows,
         after.dispatch_nanoseconds - before.dispatch_nanoseconds,
         after.staging_nanoseconds - before.staging_nanoseconds,
+        after.staging_upload_nanoseconds - before.staging_upload_nanoseconds,
         after.gate_up_weight_bytes - before.gate_up_weight_bytes,
         after.down_weight_bytes - before.down_weight_bytes,
         after.view_resolution_nanoseconds - before.view_resolution_nanoseconds,
@@ -268,6 +269,8 @@ void print_phase_metrics(std::ostream& output,
            << phase.host_experts.dispatch_nanoseconds
            << ",\"staging_nanoseconds\":"
            << phase.host_experts.staging_nanoseconds
+           << ",\"staging_upload_nanoseconds\":"
+           << phase.host_experts.staging_upload_nanoseconds
            << ",\"input_quantization_nanoseconds\":"
            << phase.host_experts.input_quantization_nanoseconds
            << ",\"gate_up_nanoseconds\":"
@@ -3454,6 +3457,7 @@ struct Glm53Runtime::Impl {
             host_moe_group_windows.load(std::memory_order_relaxed),
             host_moe_dispatch_nanoseconds.load(std::memory_order_relaxed),
             host_moe_staging_nanoseconds.load(std::memory_order_relaxed),
+            checkpoint->load_upload_nanoseconds(),
             host_moe_gate_up_weight_bytes.load(std::memory_order_relaxed),
             host_moe_down_weight_bytes.load(std::memory_order_relaxed),
             host_moe_view_nanoseconds.load(std::memory_order_relaxed),

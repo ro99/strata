@@ -142,6 +142,11 @@ struct Glm53HostExpertMetrics {
     std::uint64_t group_windows{};
     std::uint64_t dispatch_nanoseconds{};
     std::uint64_t staging_nanoseconds{};
+    // backend.upload() time inside load_cuda_linear, phased by delta. In
+    // prefill this is the staging transfer path (memcpy + enqueue + ring
+    // waits + arena alloc); staging_nanoseconds minus this is host-side
+    // bookkeeping (validation, maps, eviction, describe, leases).
+    std::uint64_t staging_upload_nanoseconds{};
     std::uint64_t gate_up_weight_bytes{};
     std::uint64_t down_weight_bytes{};
     std::uint64_t view_resolution_nanoseconds{};

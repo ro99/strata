@@ -4,6 +4,7 @@
 #include "strata/models/glm53/glm53_manifest.hpp"
 #include "strata/platform/checkpoint_io.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -71,6 +72,13 @@ public:
         std::uint64_t columns, int device, CudaBackend& backend,
         CudaWeight& output, bool concurrent_prefetch = false,
         bool canonical_layout = false) const;
+    // Nanoseconds spent inside backend.upload() across load_cuda_linear
+    // calls: memcpy to the pinned ring, H2D enqueue, ring waits, arena
+    // alloc. Read by the runtime phase snapshot; lets the prefill profile
+    // split staging into transfer (here) vs host bookkeeping (the rest).
+    [[nodiscard]] std::uint64_t load_upload_nanoseconds() const noexcept {
+        return load_upload_nanoseconds_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] ValidationResult load_cuda_linear_slice(
         std::string_view base_name, std::uint64_t total_rows,
         std::uint64_t columns, std::uint64_t row_begin,
@@ -101,6 +109,7 @@ private:
     };
     mutable std::mutex mapping_mutex_;
     mutable std::unordered_map<std::string, ShardMapping> mappings_;
+    mutable std::atomic<std::uint64_t> load_upload_nanoseconds_{0};
 };
 
 }  // namespace strata

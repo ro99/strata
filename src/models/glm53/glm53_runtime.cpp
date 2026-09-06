@@ -7402,6 +7402,11 @@ struct Glm53Runtime::Impl {
         std::vector<float> attended(
             static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
         std::vector<std::uint32_t> group_union, merged;
+        // Group-fragmentation diagnostic (record 0267): how many groups the
+        // page shattered into and how much each group re-expands. Emitted
+        // per layer-page below; exactness-neutral, it only counts.
+        std::uint64_t call_groups = 0U;
+        std::uint64_t call_expanded_rows = 0U;
         for (std::uint32_t group_begin = 0U; group_begin < rows;) {
             group_union.clear();
             auto group_end = group_begin;
@@ -7420,6 +7425,8 @@ struct Glm53Runtime::Impl {
             }
             const auto expanded_rows =
                 static_cast<std::uint32_t>(group_union.size());
+            ++call_groups;
+            call_expanded_rows += expanded_rows;
             static_cast<void>(glm53_grow(
                 mla_gathered_scratch,
                 static_cast<std::size_t>(expanded_rows) * kKvRank));
@@ -7659,6 +7666,21 @@ struct Glm53Runtime::Impl {
             mla_groups_nanoseconds.fetch_add(
                 elapsed_nanoseconds(groups_started),
                 std::memory_order_relaxed);
+            std::cerr << "[glm53-sparse-groups] layer=" << layer
+                      << " page_rows=" << rows
+                      << " history_begin=" << history_begin
+                      << " groups=" << call_groups
+                      << " mean_group_rows="
+                      << (call_groups == 0U
+                              ? 0.0
+                              : static_cast<double>(rows) /
+                                    static_cast<double>(call_groups))
+                      << " mean_expanded_rows="
+                      << (call_groups == 0U
+                              ? 0.0
+                              : static_cast<double>(call_expanded_rows) /
+                                    static_cast<double>(call_groups))
+                      << '\n';
         }
         round_bf16(attended);
         return linear(attention + "o_proj", attended, rows, kMlaWidth,

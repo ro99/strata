@@ -1592,8 +1592,13 @@ ValidationResult CudaBackend::glm53_sparse_scores(
     const auto index_bytes = request.local_indices.size_bytes();
     const auto offset_bytes = request.row_offsets.size_bytes();
     const auto score_bytes = scores.size_bytes();
-    const std::uint64_t required = query_bytes + expanded_bytes + index_bytes +
-                                   offset_bytes + score_bytes;
+    // The value half and the AV output live in the same workspace so stage 4
+    // can consume them without the group's expansion crossing a second time.
+    const auto value_bytes = expanded_bytes;
+    const auto attended_bytes = query_bytes;
+    const std::uint64_t required = query_bytes + expanded_bytes + value_bytes +
+                                   index_bytes + offset_bytes + score_bytes +
+                                   score_bytes + attended_bytes;
     if (state.glm53_scores_workspace_bytes < required) {
         if (state.glm53_scores_workspace != nullptr) {
             static_cast<void>(cudaFree(state.glm53_scores_workspace));
@@ -1614,11 +1619,23 @@ ValidationResult CudaBackend::glm53_sparse_scores(
     auto* device_query = reinterpret_cast<float*>(base);
     auto* device_expanded = reinterpret_cast<float*>(base + query_bytes);
     auto* device_indices = reinterpret_cast<std::uint32_t*>(
-        base + query_bytes + expanded_bytes);
+        base + query_bytes + expanded_bytes + value_bytes);
     auto* device_offsets = reinterpret_cast<std::uint32_t*>(
-        base + query_bytes + expanded_bytes + index_bytes);
+        base + query_bytes + expanded_bytes + value_bytes + index_bytes);
+    auto* device_values = reinterpret_cast<float*>(
+        base + query_bytes + expanded_bytes);
     auto* device_scores = reinterpret_cast<float*>(
-        base + query_bytes + expanded_bytes + index_bytes + offset_bytes);
+        base + query_bytes + expanded_bytes + value_bytes + index_bytes +
+        offset_bytes);
+    state.glm53_scores_heads = request.heads;
+    state.glm53_scores_head_dim = request.head_dim;
+    state.glm53_scores_rows = request.rows;
+    state.glm53_scores_entries = static_cast<std::uint32_t>(entries);
+    state.glm53_scores_query_bytes = query_bytes;
+    state.glm53_scores_expanded_bytes = expanded_bytes;
+    state.glm53_scores_index_bytes = index_bytes;
+    state.glm53_scores_offset_bytes = offset_bytes;
+    state.glm53_scores_score_bytes = score_bytes;
     const auto copy = [&](void* destination, const void* source,
                           std::uint64_t bytes, cudaMemcpyKind kind,
                           const char* what) {
@@ -1699,16 +1716,38 @@ ValidationResult CudaBackend::glm53_sparse_scores(
                 }
             }
         }
-        const auto status = cudaMemcpyAsync(
+        auto status = cudaMemcpyAsync(
             device_expanded, staging, static_cast<std::size_t>(expanded_bytes),
             cudaMemcpyHostToDevice, state.stream);
         if (status != cudaSuccess) {
             result = cuda_error(status, "upload GLM-5.3 sparse expansion keys");
             return false;
         }
-        const auto sync = cudaStreamSynchronize(state.stream);
+        auto sync = cudaStreamSynchronize(state.stream);
         if (sync != cudaSuccess) {
             result = cuda_error(sync, "stage GLM-5.3 sparse expansion keys");
+            return false;
+        }
+        // The value half stays HEAD-MAJOR -- [union][head][column] -- because
+        // the AV kernel varies the column across a warp, the opposite of the
+        // score kernel. Each layout is the coalesced one for its own consumer.
+        for (std::size_t u = 0U; u < request.union_rows; ++u) {
+            for (std::size_t h = 0U; h < heads; ++h) {
+                std::memcpy(destination + (u * heads + h) * columns,
+                            source + (u * heads + h) * 2U * columns + columns,
+                            static_cast<std::size_t>(key_row_bytes));
+            }
+        }
+        status = cudaMemcpyAsync(
+            device_values, staging, static_cast<std::size_t>(value_bytes),
+            cudaMemcpyHostToDevice, state.stream);
+        if (status != cudaSuccess) {
+            result = cuda_error(status, "upload GLM-5.3 sparse expansion values");
+            return false;
+        }
+        sync = cudaStreamSynchronize(state.stream);
+        if (sync != cudaSuccess) {
+            result = cuda_error(sync, "stage GLM-5.3 sparse expansion values");
             return false;
         }
         return true;
@@ -1740,5 +1779,85 @@ ValidationResult CudaBackend::glm53_sparse_scores(
     }
     std::memcpy(scores.data(), staging,
                 static_cast<std::size_t>(score_bytes));
+    return result;
+}
+
+
+ValidationResult CudaBackend::glm53_sparse_attend(
+    int device, std::span<const float> coefficients,
+    std::span<float> attended) {
+    ValidationResult result;
+    const auto found = impl_->devices.find(device);
+    if (found == impl_->devices.end()) {
+        result.errors.emplace_back(
+            "GLM-5.3 sparse attend targets an uninitialized CUDA device");
+        return result;
+    }
+    auto& state = found->second;
+    // Fail closed rather than reading a stale workspace: this call is only
+    // meaningful immediately after glm53_sparse_scores on the same device and
+    // the same group, and a shape disagreement is how that would go wrong.
+    if (state.glm53_scores_workspace == nullptr ||
+        state.glm53_scores_entries == 0U ||
+        coefficients.size() != static_cast<std::size_t>(
+                                   state.glm53_scores_entries) *
+                                   state.glm53_scores_heads ||
+        attended.size() != static_cast<std::size_t>(state.glm53_scores_rows) *
+                               state.glm53_scores_heads *
+                               state.glm53_scores_head_dim) {
+        result.errors.emplace_back(
+            "GLM-5.3 sparse attend does not match the resident score batch");
+        return result;
+    }
+    if (auto status = cudaSetDevice(device); status != cudaSuccess) {
+        return cuda_error(status, "select CUDA device for GLM-5.3 attend");
+    }
+    auto* base = static_cast<std::byte*>(state.glm53_scores_workspace);
+    auto* device_values = reinterpret_cast<float*>(
+        base + state.glm53_scores_query_bytes +
+        state.glm53_scores_expanded_bytes);
+    auto* device_indices = reinterpret_cast<std::uint32_t*>(
+        base + state.glm53_scores_query_bytes +
+        state.glm53_scores_expanded_bytes + state.glm53_scores_expanded_bytes);
+    auto* device_offsets = reinterpret_cast<std::uint32_t*>(
+        reinterpret_cast<std::byte*>(device_indices) +
+        state.glm53_scores_index_bytes);
+    auto* device_scores = reinterpret_cast<float*>(
+        reinterpret_cast<std::byte*>(device_offsets) +
+        state.glm53_scores_offset_bytes);
+    auto* device_coefficients = reinterpret_cast<float*>(
+        reinterpret_cast<std::byte*>(device_scores) +
+        state.glm53_scores_score_bytes);
+    auto* device_attended = reinterpret_cast<float*>(
+        reinterpret_cast<std::byte*>(device_coefficients) +
+        state.glm53_scores_score_bytes);
+    auto* staging = static_cast<std::byte*>(state.glm53_scores_staging);
+    std::memcpy(staging, coefficients.data(), coefficients.size_bytes());
+    if (auto status = cudaMemcpyAsync(
+            device_coefficients, staging, coefficients.size_bytes(),
+            cudaMemcpyHostToDevice, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "upload GLM-5.3 sparse coefficients");
+    }
+    const dim3 blocks(state.glm53_scores_rows, state.glm53_scores_heads, 1U);
+    glm53_sparse_attend_kernel<<<blocks, state.glm53_scores_head_dim, 0U,
+                                 state.stream>>>(
+        device_values, device_coefficients, device_indices, device_offsets,
+        state.glm53_scores_heads, state.glm53_scores_head_dim,
+        device_attended);
+    if (auto status = cudaGetLastError(); status != cudaSuccess) {
+        return cuda_error(status, "launch GLM-5.3 sparse attend");
+    }
+    if (auto status = cudaMemcpyAsync(
+            staging, device_attended, attended.size_bytes(),
+            cudaMemcpyDeviceToHost, state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "download GLM-5.3 sparse attended");
+    }
+    if (auto status = cudaStreamSynchronize(state.stream);
+        status != cudaSuccess) {
+        return cuda_error(status, "synchronize GLM-5.3 sparse attend");
+    }
+    std::memcpy(attended.data(), staging, attended.size_bytes());
     return result;
 }

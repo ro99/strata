@@ -6041,3 +6041,48 @@ __global__ void glm53_sparse_scores_kernel(
             __fmul_rn(score, score_scale);
     }
 }
+
+// GLM-5.3 sparse-page AV accumulation (stage 4). One block per (row, head),
+// one thread per output column. The coefficient is uniform across the block so
+// it broadcasts, and both the value read and the output write are contiguous
+// across the warp -- the opposite layout choice from the score kernel, and the
+// right one here because the column is what varies across threads.
+//
+// Each thread accumulates over the attended tokens in index order with the
+// host's double rounding (`out[column] += coefficient * value[column]` is
+// mulss+addss in a translation unit built without FMA), so the result is
+// bit-identical to the host attend core.
+__global__ void glm53_sparse_attend_kernel(
+    const float* __restrict__ values,  // [union][heads][head_dim]
+    const float* __restrict__ coefficients,
+    const std::uint32_t* __restrict__ local_indices,
+    const std::uint32_t* __restrict__ row_offsets,
+    std::uint32_t heads, std::uint32_t head_dim,
+    float* __restrict__ attended) {  // [rows][heads][head_dim]
+    const std::uint32_t row = static_cast<std::uint32_t>(blockIdx.x);
+    const std::uint32_t head = static_cast<std::uint32_t>(blockIdx.y);
+    const std::uint32_t column = threadIdx.x;
+    if (column >= head_dim) return;
+    const std::uint32_t begin = row_offsets[row];
+    const std::uint32_t count = row_offsets[row + 1U] - begin;
+    float* out = attended +
+        (static_cast<std::uint64_t>(row) * heads + head) * head_dim + column;
+    if (count == 0U) {
+        *out = 0.0F;
+        return;
+    }
+    const float* coefficient = coefficients +
+        static_cast<std::uint64_t>(begin) * heads +
+        static_cast<std::uint64_t>(head) * count;
+    float accumulated = 0.0F;
+    for (std::uint32_t token = 0U; token < count; ++token) {
+        const std::uint32_t local = local_indices[begin + token];
+        const float value =
+            values[(static_cast<std::uint64_t>(local) * heads + head) *
+                       head_dim +
+                   column];
+        accumulated =
+            __fadd_rn(accumulated, __fmul_rn(coefficient[token], value));
+    }
+    *out = accumulated;
+}

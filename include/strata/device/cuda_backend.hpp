@@ -1566,6 +1566,13 @@ public:
     [[nodiscard]] ValidationResult lightning_index(
         int device, const CudaLightningIndexRequest& request,
         std::span<std::uint32_t> output);
+    // Stage 4. Consumes the expansion, indices and offsets left resident by
+    // the immediately preceding glm53_sparse_scores call on this device, so
+    // the group's values never cross twice; `coefficients` shares the scores'
+    // layout and `attended` is rows * heads * head_dim.
+    [[nodiscard]] ValidationResult glm53_sparse_attend(
+        int device, std::span<const float> coefficients,
+        std::span<float> attended);
     [[nodiscard]] ValidationResult glm53_sparse_scores(
         int device, const CudaGlm53SparseScoresRequest& request,
         std::span<float> scores);

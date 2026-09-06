@@ -3411,6 +3411,10 @@ struct Glm53Runtime::Impl {
     std::vector<std::uint32_t> mla_flat_local;
     std::vector<std::uint32_t> mla_row_offsets;
     std::vector<float> mla_device_scores;
+    std::vector<float> mla_device_coefficients;
+    std::vector<float> mla_device_attended;
+    std::atomic<std::uint64_t> mla_prelude_nanoseconds{};
+    std::atomic<std::uint64_t> mla_groups_nanoseconds{};
     std::atomic<std::uint64_t> mla_index_nanoseconds{};
     std::atomic<std::uint64_t> mla_device_nanoseconds{};
     std::atomic<std::uint64_t> mla_expand_nanoseconds{};
@@ -7215,6 +7219,9 @@ struct Glm53Runtime::Impl {
         // expansion at the context lengths it could still serve, and at least
         // twice the widest single selection so a row can never fail to fit.
         constexpr std::uint32_t kMaxExpandedRows = kSparseExpansionRows;
+        const auto prelude_started = config.phase_profile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         ValidationResult result = complete_index_pools(sequence, layer,
                                                        attention);
         if (!result.ok()) return result;
@@ -7260,6 +7267,14 @@ struct Glm53Runtime::Impl {
             if (!result.ok()) return result;
         }
 
+        if (config.phase_profile) {
+            mla_prelude_nanoseconds.fetch_add(
+                elapsed_nanoseconds(prelude_started),
+                std::memory_order_relaxed);
+        }
+        const auto groups_started = config.phase_profile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         // Every row's selection first, so the group boundaries can be chosen
         // from the unions they actually produce rather than guessed.
         std::vector<std::vector<std::uint32_t>> selection(rows);
@@ -7461,6 +7476,7 @@ struct Glm53Runtime::Impl {
             if (attend_on_device) {
                 device_scores.resize(
                     static_cast<std::size_t>(flat_local.size()) * kHeads);
+                mla_device_coefficients.resize(device_scores.size());
                 CudaGlm53SparseScoresRequest scores_request;
                 scores_request.query = std::span<const float>(query).subspan(
                     static_cast<std::size_t>(group_begin) * kMlaWidth,
@@ -7539,6 +7555,23 @@ struct Glm53Runtime::Impl {
                         total += score;
                     }
                     const auto head_av_started = stamp();
+                    if (attend_on_device) {
+                        // Stage 4: publish the coefficients and let the device
+                        // accumulate. The coefficient is still rounded to BF16
+                        // here, on the host, before it ever multiplies a value
+                        // -- that rounding belongs to the accepted softmax
+                        // arithmetic, not to the accumulation, so it happens
+                        // exactly once and on the same side of the boundary it
+                        // always did.
+                        auto* published = mla_device_coefficients.data() +
+                            static_cast<std::size_t>(begin) * kHeads +
+                            static_cast<std::size_t>(head) * attended_rows;
+                        for (std::uint32_t token = 0U;
+                             token < attended_rows; ++token) {
+                            published[token] =
+                                bf16_round_f32(scores[token] / total);
+                        }
+                    } else {
                     auto* out = attended.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
@@ -7553,6 +7586,7 @@ struct Glm53Runtime::Impl {
                         for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
                             out[column] += coefficient * value[column];
                         }
+                    }
                     }
                     if (profile) {
                         const auto head_finished =
@@ -7578,8 +7612,35 @@ struct Glm53Runtime::Impl {
                 }
                 return ValidationResult{};
             });
+            if (result.ok() && attend_on_device) {
+                const auto attend_started = config.phase_profile
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                auto& group_attended = mla_device_attended;
+                group_attended.resize(
+                    static_cast<std::size_t>(group_rows) * kMlaWidth);
+                result = cuda.glm53_sparse_attend(
+                    device_for(layer), mla_device_coefficients,
+                    group_attended);
+                if (!result.ok()) return result;
+                std::copy(group_attended.begin(), group_attended.end(),
+                          attended.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  static_cast<std::size_t>(group_begin) *
+                                  kMlaWidth));
+                if (config.phase_profile) {
+                    mla_device_nanoseconds.fetch_add(
+                        elapsed_nanoseconds(attend_started),
+                        std::memory_order_relaxed);
+                }
+            }
             if (!result.ok()) return result;
             group_begin = group_end;
+        }
+        if (config.phase_profile) {
+            mla_groups_nanoseconds.fetch_add(
+                elapsed_nanoseconds(groups_started),
+                std::memory_order_relaxed);
         }
         round_bf16(attended);
         return linear(attention + "o_proj", attended, rows, kMlaWidth,
@@ -9705,6 +9766,12 @@ struct Glm53Runtime::Impl {
                                   std::memory_order_relaxed)) / 1.0e9)
                           << " devicecall_s="
                           << (static_cast<double>(mla_device_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << " prelude_s="
+                          << (static_cast<double>(mla_prelude_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << " groups_s="
+                          << (static_cast<double>(mla_groups_nanoseconds.load(
                                   std::memory_order_relaxed)) / 1.0e9)
                           << '\n';
             }

@@ -159,6 +159,15 @@ struct CudaBackend::Impl {
         std::uint64_t glm53_scores_workspace_bytes{};
         void* glm53_scores_staging{};
         std::uint64_t glm53_scores_staging_bytes{};
+        std::uint32_t glm53_scores_heads{};
+        std::uint32_t glm53_scores_head_dim{};
+        std::uint32_t glm53_scores_rows{};
+        std::uint32_t glm53_scores_entries{};
+        std::uint64_t glm53_scores_query_bytes{};
+        std::uint64_t glm53_scores_expanded_bytes{};
+        std::uint64_t glm53_scores_index_bytes{};
+        std::uint64_t glm53_scores_offset_bytes{};
+        std::uint64_t glm53_scores_score_bytes{};
         std::byte* matmul_host_input{};
         std::byte* matmul_host_output{};
         std::uint64_t matmul_host_input_bytes{};

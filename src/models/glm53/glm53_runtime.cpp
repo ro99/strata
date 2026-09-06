@@ -1488,6 +1488,17 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // KDA layers through the device page primitive while the 11 MLA layers keep
 // the existing host fallback inside forward_layer_page_device. Opt-in and
 // off by default; the dense device-prefill contract above is unchanged.
+[[nodiscard]] bool expand_invariance_check_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value =
+            std::getenv("STRATA_GLM53_EXPAND_INVARIANCE_CHECK");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
 [[nodiscard]] bool device_attend_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_DEVICE_ATTEND");
@@ -3431,6 +3442,9 @@ struct Glm53Runtime::Impl {
     std::vector<float> mla_device_scores;
     std::vector<float> mla_device_coefficients;
     std::vector<float> mla_device_attended;
+    // Batch-invariance probe (record 0268): claimed once per process by the
+    // first sparse layer-page that takes the page-expansion path.
+    std::atomic<bool> mla_invariance_probed{false};
     std::atomic<std::uint64_t> mla_prelude_nanoseconds{};
     std::atomic<std::uint64_t> mla_groups_nanoseconds{};
     std::atomic<std::uint64_t> mla_index_nanoseconds{};
@@ -7458,6 +7472,49 @@ struct Glm53Runtime::Impl {
                 mla_expand_nanoseconds.fetch_add(
                     elapsed_nanoseconds(expand_started),
                     std::memory_order_relaxed);
+            }
+            // Batch-invariance probe (record 0269): expand the same union
+            // as two half-batches and compare bit for bit against the
+            // single-batch expansion above. Probe outputs are discarded;
+            // the request continues on the single-batch expansion, so the
+            // hash cannot move whatever the answer is. Env-gated, default
+            // off, first sparse group per process only. A probe GEMM error
+            // fails the request, fail-closed like the selection gate.
+            if (expand_invariance_check_enabled() && expanded_rows >= 2U &&
+                !mla_invariance_probed.exchange(true,
+                                                 std::memory_order_relaxed)) {
+                const auto half = expanded_rows / 2U;
+                std::vector<float> probe_out(
+                    static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                    kMlaHead);
+                for (std::uint32_t half_index = 0U; half_index < 2U;
+                     ++half_index) {
+                    const auto half_begin = half_index == 0U ? 0U : half;
+                    const auto half_rows = half_index == 0U
+                        ? half
+                        : expanded_rows - half;
+                    const auto half_in =
+                        std::span<const float>(gathered).subspan(
+                            static_cast<std::size_t>(half_begin) * kKvRank,
+                            static_cast<std::size_t>(half_rows) * kKvRank);
+                    const auto half_out =
+                        std::span<float>(probe_out).subspan(
+                            static_cast<std::size_t>(half_begin) * kHeads *
+                                2U * kMlaHead,
+                            static_cast<std::size_t>(half_rows) * kHeads * 2U *
+                                kMlaHead);
+                    const std::array<Glm53WeightCache::LinearRequest, 1U>
+                        probe{{{bases[3], kHeads * 2U * kMlaHead, kKvRank,
+                               half_in, half_rows, half_out, true}}};
+                    result = linear_batch(probe, layer);
+                    if (!result.ok()) return result;
+                }
+                const bool probe_exact = std::equal(
+                    probe_out.begin(), probe_out.end(), expanded.begin(),
+                    expanded.end());
+                std::cerr << "[glm53-expand-invariance] layer=" << layer
+                          << " union_rows=" << expanded_rows
+                          << " exact=" << (probe_exact ? 1 : 0) << '\n';
             }
 
             // The group's union is sorted and so is each selection, so the

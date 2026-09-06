@@ -7189,32 +7189,30 @@ struct Glm53Runtime::Impl {
             {{bases[0], kMlaWidth, kQueryRank, q_rank, rows, query, true}}};
         result = linear_batch(projections, layer);
         if (!result.ok()) return result;
+        // Stage 1 (record 0261): the two indexer projections as batched
+        // device GEMMs through the same linear_batch the q_b projection
+        // above already uses on this path -- same shape of thing, same
+        // machinery. bf16_output is FALSE: the host serial path produces raw
+        // floats with no rounding, and matching its contract exactly is what
+        // the hash gate judges. The results download for the host-side
+        // selection below (~34 MB per layer-page); stage 2 keeps them
+        // resident and deletes this round-trip.
+        // NOTE: LinearRequest::base is a string_view, so the module names
+        // live in a stored array -- temporaries here dangle and surface
+        // later as a corrupted tensor name (same warning as the decode
+        // selection site).
+        const std::array<std::string, 2U> index_projection_bases{
+            attention + "indexer.wq_b", attention + "indexer.weights_proj"};
         {
-            auto wq = host_tensor(bases[1],
-                                  static_cast<std::uint64_t>(kIndexHeads) *
-                                      kIndexHeadDim * kQueryRank);
-            if (!wq.ok()) return {std::move(wq.errors)};
-            auto wp = host_tensor(bases[2],
-                                  static_cast<std::uint64_t>(kIndexHeads) * kHidden);
-            if (!wp.ok()) return {std::move(wp.errors)};
-            // Row-parallel (record 0250 pattern): each row is two independent
-            // serial dots over read-only weights, so scheduling is the only
-            // change and the output is bit-identical.
-            result = parallel_page_rows(rows, [&](std::uint32_t row) {
-                glm53_indexer_gate(
-                    std::span<float>(index_query).subspan(
-                        static_cast<std::size_t>(row) * kIndexHeads * kIndexHeadDim,
-                        static_cast<std::size_t>(kIndexHeads) * kIndexHeadDim),
-                    q_rank.subspan(static_cast<std::size_t>(row) * kQueryRank,
-                                   kQueryRank),
-                    *wq.value);
-                glm53_indexer_gate(
-                    std::span<float>(head_weights).subspan(
-                        static_cast<std::size_t>(row) * kIndexHeads, kIndexHeads),
-                    input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
-                    *wp.value);
-                return ValidationResult{};
-            });
+            const std::array<Glm53WeightCache::LinearRequest, 2U>
+                index_projections{{
+                    {index_projection_bases[0],
+                     static_cast<std::uint64_t>(kIndexHeads) * kIndexHeadDim,
+                     kQueryRank, q_rank, rows, index_query, false},
+                    {index_projection_bases[1],
+                     static_cast<std::uint64_t>(kIndexHeads),
+                     kHidden, input, rows, head_weights, false}}};
+            result = linear_batch(index_projections, layer);
             if (!result.ok()) return result;
         }
 

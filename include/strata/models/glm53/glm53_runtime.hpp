@@ -139,6 +139,14 @@ struct Glm53CacheMetrics {
 struct Glm53HostExpertMetrics {
     std::uint64_t calls{};
     std::uint64_t rows{};
+    std::uint64_t group_windows{};
+    std::uint64_t dispatch_nanoseconds{};
+    std::uint64_t staging_nanoseconds{};
+    // backend.upload() time inside load_cuda_linear, phased by delta. In
+    // prefill this is the staging transfer path (memcpy + enqueue + ring
+    // waits + arena alloc); staging_nanoseconds minus this is host-side
+    // bookkeeping (validation, maps, eviction, describe, leases).
+    std::uint64_t staging_upload_nanoseconds{};
     std::uint64_t gate_up_weight_bytes{};
     std::uint64_t down_weight_bytes{};
     std::uint64_t view_resolution_nanoseconds{};
@@ -218,6 +226,58 @@ struct Glm53GenerationResult {
     [[nodiscard]] bool ok() const noexcept { return errors.empty(); }
 };
 
+// One layer-page of sparse MLA attention at an arbitrary history, on
+// fabricated cache state (record 0269). A full 8,192-token prefill is twenty
+// minutes and 32,768 is hours, so the regime this campaign exists to improve
+// has never once been measured directly -- every arm read the shape it could
+// afford rather than the shape the objective names. This reaches any history
+// in seconds because it synthesizes the latent and indexer caches instead of
+// computing them. The weights and the control flow are the production ones,
+// so the timing split and the group structure are real; the activations are
+// LCG noise, so the attention OUTPUT is meaningless and `checksum` is only a
+// same-input/same-output gate between two builds of the same shape.
+//
+// Selection content is data-dependent, and noise selects more uniformly than
+// a trained indexer does -- real fragmentation is layer-dependent (0268:
+// layers 3/7/11 never split, 19/23 shatter). So the bench brackets the
+// fragmented case rather than reproducing a given layer's, and its group
+// counts must be calibrated against a real run at a shape both can reach
+// before its numbers at 32,768 are believed.
+struct Glm53AttentionBenchRequest {
+    std::uint32_t layer{};
+    // Tokens already resident when the page runs; `history_begin` in the
+    // attention path. history + rows must exceed the indexer threshold or
+    // the dense path runs instead and the bench measures nothing.
+    std::uint32_t history{};
+    std::uint32_t rows{};
+    // Passes over the same fabricated state. The FIRST pass also builds the
+    // layer's k-pool keys, which every later pass then finds cached, so a
+    // repeated run reports a mean over one cold pass and n-1 warm ones. Use 1
+    // to measure a page as production sees it mid-prompt.
+    std::uint32_t repeats{1U};
+    std::uint64_t seed{0x9E3779B97F4A7C15ULL};
+    // How strongly a token's fabricated indexer key follows the previous
+    // token's, in [0, 1]. 0 is independent noise, which fragments far worse
+    // than any real layer; raise it until the reported group count matches a
+    // shape a real arm has measured, and only then read the sweep.
+    float smoothing{};
+};
+
+// Per-pass means. The names match the `[glm53-mla-split]` fields so a bench
+// line and an arm line can be read side by side.
+struct Glm53AttentionBenchResult {
+    std::uint64_t wall_nanoseconds{};
+    std::uint64_t prelude_nanoseconds{};
+    std::uint64_t groups_nanoseconds{};
+    std::uint64_t index_nanoseconds{};
+    std::uint64_t device_nanoseconds{};
+    std::uint64_t expand_nanoseconds{};
+    std::uint64_t qk_nanoseconds{};
+    std::uint64_t softmax_nanoseconds{};
+    std::uint64_t av_nanoseconds{};
+    std::uint64_t checksum{};
+};
+
 class Glm53Runtime {
 public:
     Glm53Runtime();
@@ -236,6 +296,11 @@ public:
     // the most verbose setting under a name that asked for the least. There is
     // no value that turns reasoning off: GLM-5.3's template opens a <think>
     // block unconditionally and ships no enable_thinking toggle.
+    // See `Glm53AttentionBenchRequest`. Requires an initialized runtime; it
+    // builds its own sequence state and leaves the runtime's alone.
+    [[nodiscard]] ValidationResult attention_bench(
+        const Glm53AttentionBenchRequest& request,
+        Glm53AttentionBenchResult& result);
     [[nodiscard]] Glm53GenerationResult generate_chat_stream(
         std::span<const ChatMessage> messages,
         std::uint32_t maximum_new_tokens, const SamplingOptions& sampling,

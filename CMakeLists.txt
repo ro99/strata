@@ -236,6 +236,11 @@ target_link_libraries(strata-chat PRIVATE strata_core)
 add_executable(strata-server apps/strata_server.cpp)
 target_link_libraries(strata-server PRIVATE strata_core)
 
+# One layer-page of GLM-5.3 sparse attention at any history, in seconds rather
+# than the hours a full prefill at that shape costs (record 0269).
+add_executable(strata-glm53-attnbench apps/strata_glm53_attnbench.cpp)
+target_link_libraries(strata-glm53-attnbench PRIVATE strata_core)
+
 if(STRATA_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(strata_device PUBLIC CUDA::cublas)

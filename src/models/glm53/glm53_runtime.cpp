@@ -147,6 +147,10 @@ namespace {
     return {
         after.calls - before.calls,
         after.rows - before.rows,
+        after.group_windows - before.group_windows,
+        after.dispatch_nanoseconds - before.dispatch_nanoseconds,
+        after.staging_nanoseconds - before.staging_nanoseconds,
+        after.staging_upload_nanoseconds - before.staging_upload_nanoseconds,
         after.gate_up_weight_bytes - before.gate_up_weight_bytes,
         after.down_weight_bytes - before.down_weight_bytes,
         after.view_resolution_nanoseconds - before.view_resolution_nanoseconds,
@@ -254,12 +258,19 @@ void print_phase_metrics(std::ostream& output,
            << "},\"host_experts\":{\"calls\":"
            << phase.host_experts.calls
            << ",\"rows\":" << phase.host_experts.rows
+           << ",\"group_windows\":" << phase.host_experts.group_windows
            << ",\"gate_up_weight_bytes\":"
            << phase.host_experts.gate_up_weight_bytes
            << ",\"down_weight_bytes\":"
            << phase.host_experts.down_weight_bytes
            << ",\"view_resolution_nanoseconds\":"
            << phase.host_experts.view_resolution_nanoseconds
+           << ",\"dispatch_nanoseconds\":"
+           << phase.host_experts.dispatch_nanoseconds
+           << ",\"staging_nanoseconds\":"
+           << phase.host_experts.staging_nanoseconds
+           << ",\"staging_upload_nanoseconds\":"
+           << phase.host_experts.staging_upload_nanoseconds
            << ",\"input_quantization_nanoseconds\":"
            << phase.host_experts.input_quantization_nanoseconds
            << ",\"gate_up_nanoseconds\":"
@@ -378,6 +389,24 @@ constexpr std::size_t kExpertReductionBlock = 1024U;
 // width; an explicit 0/1 forces it either way.
 constexpr std::uint32_t kDevicePageStagingMinimumRows = 1536U;
 constexpr std::uint64_t kDevicePageStagingReserveBytes = 2ULL << 30U;
+
+// VRAM held back from the pinned tier for demand staging, in GiB. The compiled
+// default is the 2 GiB above, which admits about 140 experts at 14.2 MB each --
+// against roughly 250 distinct experts a 2,048-row page touches per layer. The
+// overflow is not queued, it falls to the host path, and that fallback is where
+// 136.6 s of a 250 s prefill goes while the device serves 87.5% of the routes
+// in 34.2 s. Raising this trades pinned-tier residency, which serves decode,
+// for staging capacity, which serves prefill.
+[[nodiscard]] std::uint64_t device_page_staging_reserve_bytes() noexcept {
+    static const std::uint64_t bytes = [] {
+        const char* value = std::getenv("STRATA_GLM53_STAGING_RESERVE_GIB");
+        if (value == nullptr) return kDevicePageStagingReserveBytes;
+        const std::uint64_t parsed = std::strtoull(value, nullptr, 10);
+        return parsed == 0U ? kDevicePageStagingReserveBytes
+                            : static_cast<std::uint64_t>(parsed << 30U);
+    }();
+    return bytes;
+}
 
 [[nodiscard]] int device_page_staging_override() noexcept {
     static const int setting = [] {
@@ -1065,6 +1094,13 @@ constexpr std::uint32_t kIndexArenaRows =
 // what keeps that workspace flat rather than growing to `context x 32,768 x 4 B`.
 constexpr std::uint32_t kSparseExpansionRows = 4096U;
 static_assert(kSparseExpansionRows >= kIndexSelectionWidth);
+// Budget for the once-per-layer-page expansion (record 0269, fix 1). One
+// expanded row is kHeads*2*kMlaHead floats -- 128 KiB -- so expanding a whole
+// page union costs |U| x 128 KiB: about 1 GiB at 8,192 visible rows and 4.3 GB
+// at 32,768. Above this the page falls back to the per-group expansion below.
+// This only caps the working set; the change that removes the budget entirely
+// is expanding each latent row once when it enters the cache.
+constexpr std::uint32_t kPageExpansionBudgetRows = 8192U;
 
 // Whether a sequence runs the k-pool indexer at all. Only the host attention
 // path implements it, so this decides where a sequence's MLA attention lives.
@@ -1216,6 +1252,28 @@ void glm53_index_pool_key(std::span<float> pool_key, std::uint32_t pool,
 }
 
 // `pool_key_at(pool)` returns that complete pool's cached 128-wide key.
+// Shared tail of pool selection, used by the host ranking below and by the
+// device-selection gate in the sparse prefill page: sort chosen pools
+// ascending, expand members, append the always-selected tail. Integer-only,
+// so both callers agree bit for bit by construction.
+[[nodiscard]] std::size_t expand_pool_selection(
+    std::span<const std::uint32_t> chosen, std::uint32_t pools,
+    std::uint32_t tail_count, std::span<std::uint32_t> selected) {
+    std::vector<std::uint32_t> ordered(chosen.begin(), chosen.end());
+    std::sort(ordered.begin(), ordered.end());
+    std::size_t count = 0U;
+    for (const auto pool : ordered) {
+        for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
+            selected[count++] = pool * kIndexPool + member;
+        }
+    }
+    // Always-selected tail: the current incomplete pool, as raw positions.
+    for (std::uint32_t offset = 0U; offset < tail_count; ++offset) {
+        selected[count++] = pools * kIndexPool + offset;
+    }
+    return count;
+}
+
 template <typename PoolKeyAt>
 [[nodiscard]] std::size_t glm53_sparse_index_select(
     std::span<std::uint32_t> selected, std::span<const float> indexer_query,
@@ -1281,19 +1339,7 @@ template <typename PoolKeyAt>
     for (std::size_t index = 0U; index < keep; ++index) {
         chosen.push_back(ranked[index].second);
     }
-    std::sort(chosen.begin(), chosen.end());
-
-    std::size_t count = 0U;
-    for (const auto pool : chosen) {
-        for (std::uint32_t member = 0U; member < kIndexPool; ++member) {
-            selected[count++] = pool * kIndexPool + member;
-        }
-    }
-    // Always-selected tail: the current incomplete pool, as raw positions.
-    for (std::uint32_t offset = 0U; offset < tail_count; ++offset) {
-        selected[count++] = pools * kIndexPool + offset;
-    }
-    return count;
+    return expand_pool_selection(chosen, pools, tail_count, selected);
 }
 
 constexpr std::uint64_t kKdaWorkspaceFloats =
@@ -1443,6 +1489,71 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 [[nodiscard]] bool device_prefill_for_context(
     bool requested, std::uint32_t maximum_context_tokens) noexcept {
     return requested && !sparse_indexer_active(maximum_context_tokens);
+}
+
+// Sparse-context device KDA prefill (record 0253): run the 34 indexer-free
+// KDA layers through the device page primitive while the 11 MLA layers keep
+// the existing host fallback inside forward_layer_page_device. Opt-in and
+// off by default; the dense device-prefill contract above is unchanged.
+// Expand a layer-page's whole selection union once and slice each group out
+// of it, instead of re-running kv_b_proj per group. Above the point where a
+// page stops fitting in one group this is most of the sparse attention cost:
+// at 8,192 tokens layers 19 and 23 shatter one page into 86 and 75 groups that
+// each re-expand close to the 4,096-row cap to serve 24-27 query rows (record
+// 0268). Exact by construction -- a group's rows are the same floats the
+// per-group GEMM produced, copied rather than recomputed -- but landed OFF
+// because it has not been measured end to end. Record 0269 has the arithmetic.
+[[nodiscard]] bool page_expand_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_PAGE_EXPAND");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool expand_invariance_check_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value =
+            std::getenv("STRATA_GLM53_EXPAND_INVARIANCE_CHECK");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool device_attend_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_DEVICE_ATTEND");
+        return value != nullptr && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" &&
+               std::string_view(value) != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool index_check_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_INDEX_CHECK");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool sparse_device_kda_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_SPARSE_DEVICE_KDA");
+        return value != nullptr &&
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
 }
 
 [[nodiscard]] bool device_page_mla_enabled() noexcept {
@@ -3244,6 +3355,10 @@ struct Glm53Runtime::Impl {
     // roughly ten times what the link costs. Decode, dense prefill and sparse
     // prefill never run concurrently, so one set serves all three.
     std::vector<float> mla_expanded_scratch;
+    // Page-wide expansion and the map from a latent row index to its slot in
+    // it. Only allocated when page expansion is enabled and within budget.
+    std::vector<float> mla_page_expanded_scratch;
+    std::vector<std::uint32_t> mla_page_pos;
     std::vector<float> mla_gathered_scratch;
     std::vector<float> mla_head_score_scratch;
     std::vector<float> shared_expert_gate;
@@ -3327,10 +3442,13 @@ struct Glm53Runtime::Impl {
     bool host_moe_active{};
     std::atomic<std::uint64_t> host_moe_calls{};
     std::atomic<std::uint64_t> host_moe_rows{};
+    std::atomic<std::uint64_t> host_moe_group_windows{};
     std::atomic<std::uint64_t> host_moe_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_gate_up_weight_bytes{};
     std::atomic<std::uint64_t> host_moe_down_weight_bytes{};
     std::atomic<std::uint64_t> host_moe_view_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_dispatch_nanoseconds{};
+    std::atomic<std::uint64_t> host_moe_staging_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_input_quantization_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_gate_up_nanoseconds{};
     std::atomic<std::uint64_t> host_moe_activation_nanoseconds{};
@@ -3344,6 +3462,26 @@ struct Glm53Runtime::Impl {
     std::atomic<std::uint64_t> graph_attention_block_nanoseconds{};
     std::atomic<std::uint64_t> graph_kda_nanoseconds{};
     std::atomic<std::uint64_t> graph_mla_nanoseconds{};
+    // Sparse attend-core split (record 0264). Sizes what stage 4 of the
+    // device-attention build can actually move: the expansion GEMM and the
+    // QK/AV dots go to the device, but the softmax stays on the host because
+    // host libm and device trig differ in the last ulp. Profile-gated.
+    std::vector<std::uint32_t> mla_flat_local;
+    std::vector<std::uint32_t> mla_row_offsets;
+    std::vector<float> mla_device_scores;
+    std::vector<float> mla_device_coefficients;
+    std::vector<float> mla_device_attended;
+    // Batch-invariance probe (record 0268): claimed once per process by the
+    // first sparse layer-page that takes the page-expansion path.
+    std::atomic<bool> mla_invariance_probed{false};
+    std::atomic<std::uint64_t> mla_prelude_nanoseconds{};
+    std::atomic<std::uint64_t> mla_groups_nanoseconds{};
+    std::atomic<std::uint64_t> mla_index_nanoseconds{};
+    std::atomic<std::uint64_t> mla_device_nanoseconds{};
+    std::atomic<std::uint64_t> mla_expand_nanoseconds{};
+    std::atomic<std::uint64_t> mla_qk_nanoseconds{};
+    std::atomic<std::uint64_t> mla_softmax_nanoseconds{};
+    std::atomic<std::uint64_t> mla_av_nanoseconds{};
     std::atomic<std::uint64_t> graph_feedforward_block_nanoseconds{};
     std::atomic<std::uint64_t> graph_output_head_nanoseconds{};
     std::atomic<std::uint64_t> graph_sampling_nanoseconds{};
@@ -3425,6 +3563,10 @@ struct Glm53Runtime::Impl {
         return {
             host_moe_calls.load(std::memory_order_relaxed),
             host_moe_rows.load(std::memory_order_relaxed),
+            host_moe_group_windows.load(std::memory_order_relaxed),
+            host_moe_dispatch_nanoseconds.load(std::memory_order_relaxed),
+            host_moe_staging_nanoseconds.load(std::memory_order_relaxed),
+            checkpoint->load_upload_nanoseconds(),
             host_moe_gate_up_weight_bytes.load(std::memory_order_relaxed),
             host_moe_down_weight_bytes.load(std::memory_order_relaxed),
             host_moe_view_nanoseconds.load(std::memory_order_relaxed),
@@ -3676,7 +3818,7 @@ struct Glm53Runtime::Impl {
         if (!device_page_staging_enabled(config.prefill_page_tokens)) {
             return 0U;
         }
-        return kDevicePageStagingReserveBytes;
+        return device_page_staging_reserve_bytes();
     }
 
     [[nodiscard]] std::size_t slot_for(std::uint32_t layer) const noexcept {
@@ -4762,7 +4904,6 @@ struct Glm53Runtime::Impl {
             return {{"GLM-5.3 host page MoE command has an invalid shape"}};
         }
         const auto started = std::chrono::steady_clock::now();
-        const auto view_started = started;
         const int layer_device = device_for(layer);
         const auto layer_device_slot = slot_for(layer);
         const int shared_device = allow_device_tiers &&
@@ -4817,6 +4958,14 @@ struct Glm53Runtime::Impl {
         staging.parallel =
             staging.enabled && device_expert_parallel_enabled() &&
             staging.slot_count > 1U;
+        // Dispatch region (record 0256): route classification, group
+        // formation, sort and assignments. INCLUDES the staging calls below
+        // (timed separately as a subset); use dispatch - staging for the
+        // pure classification cost. view_resolution now measures ONLY the
+        // expert_views loop further down -- previously it aliased this whole
+        // region via view_started = started and wore 22.7 s of
+        // dispatch+staging at 2,591 tokens.
+        const auto dispatch_started = std::chrono::steady_clock::now();
         for (std::size_t row = 0U; row < rows; ++row) {
             for (std::size_t route = 0U; route < routes_per_row; ++route) {
                 const auto expert = routes[row][route].expert;
@@ -4857,8 +5006,18 @@ struct Glm53Runtime::Impl {
                             ? static_cast<std::size_t>(expert) %
                                   staging.slot_count
                             : layer_device_slot;
+                        // Staging subset timer: mutex, eviction loop, checkpoint
+                        // load and the backend upload with its ring-syncs. Part
+                        // of dispatch above by construction.
+                        const auto staging_started =
+                            std::chrono::steady_clock::now();
                         auto status = weights->stage_expert(
                             target, layer, expert, staged_descriptor, staged);
+                        if (config.phase_profile) {
+                            host_moe_staging_nanoseconds.fetch_add(
+                                elapsed_nanoseconds(staging_started),
+                                std::memory_order_relaxed);
+                        }
                         if (!status.ok()) return status;
                         if (staged) {
                             // Permute into m16n8k16 fragment order so this
@@ -5019,6 +5178,12 @@ struct Glm53Runtime::Impl {
             }
         }
 
+        if (config.phase_profile) {
+            host_moe_dispatch_nanoseconds.fetch_add(
+                elapsed_nanoseconds(dispatch_started),
+                std::memory_order_relaxed);
+        }
+        const auto view_started = std::chrono::steady_clock::now();
         for (auto& group : groups) {
             const auto slot = group.shared ? kExpertSlots - 1U : group.expert;
             Glm53ExpertViews views;
@@ -5028,6 +5193,8 @@ struct Glm53Runtime::Impl {
         }
 
         if (config.phase_profile) {
+            host_moe_view_nanoseconds.fetch_add(
+                elapsed_nanoseconds(view_started), std::memory_order_relaxed);
             std::uint64_t gate_up_bytes = 0U;
             std::uint64_t down_bytes = 0U;
             for (const auto& group : groups) {
@@ -5044,8 +5211,6 @@ struct Glm53Runtime::Impl {
                 gate_up_bytes, std::memory_order_relaxed);
             host_moe_down_weight_bytes.fetch_add(
                 down_bytes, std::memory_order_relaxed);
-            host_moe_view_nanoseconds.fetch_add(
-                elapsed_nanoseconds(view_started), std::memory_order_relaxed);
         }
 
         const auto input_quantization_started =
@@ -5135,6 +5300,12 @@ struct Glm53Runtime::Impl {
             return {{"GLM-5.3 host page activation scratch is too small"}};
         }
         const auto gate_up_started = std::chrono::steady_clock::now();
+        // Diagnostic for the item-2 investigation (record 0250): sum of
+        // expert groups per gate_up dispatch. tasks = group_windows * 2048,
+        // mean assignments/group = rows * 8 / group_windows. Zero behavior
+        // change: one relaxed increment per MoE call.
+        host_moe_group_windows.fetch_add(groups.size(),
+                                         std::memory_order_relaxed);
         result = host_moe_workers->parallel_for_blocked(
             groups.size() * intermediate, expert_dispatch_block(),
             [&](std::size_t task) {
@@ -6161,20 +6332,36 @@ struct Glm53Runtime::Impl {
         }
         auto weight = host_tensor(weight_name, columns);
         if (!weight.ok()) return {std::move(weight.errors)};
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        // Row-parallel (record 0250 pattern): each row is an independent
+        // rmsnorm plus round over disjoint spans, so scheduling is the only
+        // change and the output is bit-identical. Shared by every caller;
+        // single-row callers keep the sequential path via the pool guard.
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto begin = static_cast<std::size_t>(row) * columns;
-            auto normalized = kimi_rms_norm(
+            ValidationResult normalized = kimi_rms_norm(
                 output.subspan(begin, columns), input.subspan(begin, columns),
                 *weight.value, 1.0e-5F);
             if (!normalized.ok()) return normalized;
             round_bf16(output.subspan(begin, columns));
-        }
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
         return result;
     }
 
-    [[nodiscard]] ValidationResult mhc_pre(
-        std::span<float> collapsed, Dsv4MhcMix& mix,
-        std::span<const float> streams, const std::string& prefix) {
+    // Prefetched mHC projection weights for one (layer, block) pair. Fetching
+    // them once per page instead of once per row removes tens of thousands of
+    // string concatenations and cache lookups from a prefill (record 0250).
+    // The pointed-to vectors are immutable after load, so sharing them across
+    // row workers is exact.
+    struct MhcPreWeights {
+        std::shared_ptr<const std::vector<float>> projection;
+        std::shared_ptr<const std::vector<float>> base;
+        std::shared_ptr<const std::vector<float>> scale;
+    };
+
+    [[nodiscard]] ValidationResult mhc_pre_weights(
+        MhcPreWeights& weights, const std::string& prefix) {
         ValidationResult result;
         auto projection = host_tensor(prefix + "_fn", 24U * 16384U);
         auto base = host_tensor(prefix + "_base", 24U);
@@ -6185,6 +6372,16 @@ struct Glm53Runtime::Impl {
             append(result.errors, std::move(scale.errors));
             return result;
         }
+        weights.projection = projection.value;
+        weights.base = base.value;
+        weights.scale = scale.value;
+        return result;
+    }
+
+    [[nodiscard]] ValidationResult mhc_pre_with_weights(
+        std::span<float> collapsed, Dsv4MhcMix& mix,
+        std::span<const float> streams, const MhcPreWeights& weights) {
+        ValidationResult result;
         double square_sum = 0.0;
         for (const auto value : streams) square_sum += static_cast<double>(value) * value;
         const auto reciprocal = 1.0F / std::sqrt(
@@ -6194,13 +6391,13 @@ struct Glm53Runtime::Impl {
         for (std::size_t row = 0U; row < projected.size(); ++row) {
             double sum = 0.0;
             for (std::size_t column = 0U; column < streams.size(); ++column) {
-                sum += static_cast<double>((*projection.value)[row * streams.size() + column]) *
+                sum += static_cast<double>((*weights.projection)[row * streams.size() + column]) *
                        streams[column];
             }
             projected[row] = static_cast<float>(sum) * reciprocal;
         }
         auto split = dsv4_mhc_split_sinkhorn_f32(
-            projected, *scale.value, *base.value, kMhc, 20U, 1.0e-6F);
+            projected, *weights.scale, *weights.base, kMhc, 20U, 1.0e-6F);
         if (!split.ok()) return {std::move(split.errors)};
         mix = std::move(split.value);
         round_bf16(mix.post);
@@ -6214,6 +6411,53 @@ struct Glm53Runtime::Impl {
         }
         round_bf16(collapsed);
         return result;
+    }
+
+    [[nodiscard]] ValidationResult mhc_pre(
+        std::span<float> collapsed, Dsv4MhcMix& mix,
+        std::span<const float> streams, const std::string& prefix) {
+        MhcPreWeights weights;
+        ValidationResult result = mhc_pre_weights(weights, prefix);
+        if (!result.ok()) return result;
+        return mhc_pre_with_weights(collapsed, mix, streams, weights);
+    }
+
+    // Row-parallel driver for per-row page glue (record 0250). Every row of a
+    // prefill page computes the same function of disjoint spans -- one MHC
+    // projection, one post-mix, one norm -- so running rows on the MoE worker
+    // pool changes scheduling only: each row keeps its exact scalar-double
+    // operation order and the output is bit-for-bit the sequential one. Falls
+    // back to sequential when the pool is unavailable, so single-row callers
+    // (decode) pay no dispatch cost.
+    [[nodiscard]] ValidationResult parallel_page_rows(
+        std::uint32_t rows,
+        const std::function<ValidationResult(std::uint32_t)>& row_fn) {
+        if (rows == 0U) return {};
+        if (host_moe_workers == nullptr || !host_moe_active ||
+            host_moe_workers->size() <= 1U || rows == 1U) {
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                ValidationResult step = row_fn(row);
+                if (!step.ok()) return step;
+            }
+            return {};
+        }
+        const std::size_t workers = host_moe_workers->size();
+        const std::size_t block = std::max<std::size_t>(
+            1U, (static_cast<std::size_t>(rows) + workers * 4U - 1U) /
+                      (workers * 4U));
+        std::mutex error_mutex;
+        ValidationResult first_error;
+        ValidationResult dispatch = host_moe_workers->parallel_for_blocked(
+            rows, block, [&](std::size_t task) {
+                ValidationResult step =
+                    row_fn(static_cast<std::uint32_t>(task));
+                if (!step.ok()) {
+                    std::scoped_lock lock(error_mutex);
+                    if (first_error.ok()) first_error = std::move(step);
+                }
+            });
+        if (!dispatch.ok()) return dispatch;
+        return first_error;
     }
 
     [[nodiscard]] ValidationResult attention_kda(
@@ -7036,6 +7280,9 @@ struct Glm53Runtime::Impl {
         // expansion at the context lengths it could still serve, and at least
         // twice the widest single selection so a row can never fail to fit.
         constexpr std::uint32_t kMaxExpandedRows = kSparseExpansionRows;
+        const auto prelude_started = config.phase_profile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         ValidationResult result = complete_index_pools(sequence, layer,
                                                        attention);
         if (!result.ok()) return result;
@@ -7054,30 +7301,41 @@ struct Glm53Runtime::Impl {
             {{bases[0], kMlaWidth, kQueryRank, q_rank, rows, query, true}}};
         result = linear_batch(projections, layer);
         if (!result.ok()) return result;
+        // Stage 1 (record 0261): the two indexer projections as batched
+        // device GEMMs through the same linear_batch the q_b projection
+        // above already uses on this path -- same shape of thing, same
+        // machinery. bf16_output is FALSE: the host serial path produces raw
+        // floats with no rounding, and matching its contract exactly is what
+        // the hash gate judges. The results download for the host-side
+        // selection below (~34 MB per layer-page); stage 2 keeps them
+        // resident and deletes this round-trip.
+        // NOTE: LinearRequest::base is a string_view, so the module names
+        // live in a stored array -- temporaries here dangle and surface
+        // later as a corrupted tensor name (same warning as the decode
+        // selection site).
+        const std::array<std::string, 2U> index_projection_bases{
+            attention + "indexer.wq_b", attention + "indexer.weights_proj"};
         {
-            auto wq = host_tensor(bases[1],
-                                  static_cast<std::uint64_t>(kIndexHeads) *
-                                      kIndexHeadDim * kQueryRank);
-            if (!wq.ok()) return {std::move(wq.errors)};
-            auto wp = host_tensor(bases[2],
-                                  static_cast<std::uint64_t>(kIndexHeads) * kHidden);
-            if (!wp.ok()) return {std::move(wp.errors)};
-            for (std::uint32_t row = 0U; row < rows; ++row) {
-                glm53_indexer_gate(
-                    std::span<float>(index_query).subspan(
-                        static_cast<std::size_t>(row) * kIndexHeads * kIndexHeadDim,
-                        static_cast<std::size_t>(kIndexHeads) * kIndexHeadDim),
-                    q_rank.subspan(static_cast<std::size_t>(row) * kQueryRank,
-                                   kQueryRank),
-                    *wq.value);
-                glm53_indexer_gate(
-                    std::span<float>(head_weights).subspan(
-                        static_cast<std::size_t>(row) * kIndexHeads, kIndexHeads),
-                    input.subspan(static_cast<std::size_t>(row) * kHidden, kHidden),
-                    *wp.value);
-            }
+            const std::array<Glm53WeightCache::LinearRequest, 2U>
+                index_projections{{
+                    {index_projection_bases[0],
+                     static_cast<std::uint64_t>(kIndexHeads) * kIndexHeadDim,
+                     kQueryRank, q_rank, rows, index_query, false},
+                    {index_projection_bases[1],
+                     static_cast<std::uint64_t>(kIndexHeads),
+                     kHidden, input, rows, head_weights, false}}};
+            result = linear_batch(index_projections, layer);
+            if (!result.ok()) return result;
         }
 
+        if (config.phase_profile) {
+            mla_prelude_nanoseconds.fetch_add(
+                elapsed_nanoseconds(prelude_started),
+                std::memory_order_relaxed);
+        }
+        const auto groups_started = config.phase_profile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         // Every row's selection first, so the group boundaries can be chosen
         // from the unions they actually produce rather than guessed.
         std::vector<std::vector<std::uint32_t>> selection(rows);
@@ -7102,13 +7360,164 @@ struct Glm53Runtime::Impl {
             }
         }
 
+        // Device selection (stage 2, record 0262) with an element gate
+        // against the host sets above. Always on (fail closed): a divergence
+        // errors the request rather than flowing downstream, so an
+        // intermittent ranking flip can never ship silently.
+        // STRATA_GLM53_INDEX_CHECK=0 restores pure host selection.
+        // Downstream consumes the device sets once the gate passes, so the
+        // device path is what's validated end to end.
+        if (index_check_enabled()) {
+            const auto pool_count = pool_cache.rows();
+            std::vector<float> flat_pool_keys(
+                static_cast<std::size_t>(pool_count) * kIndexHeadDim);
+            for (std::uint32_t pool = 0U; pool < pool_count; ++pool) {
+                const auto prow = pool_cache.row(pool);
+                std::copy(prow.begin(), prow.end(),
+                          flat_pool_keys.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  static_cast<std::size_t>(pool) *
+                                  kIndexHeadDim));
+            }
+            std::vector<std::uint32_t> device_sets(
+                static_cast<std::size_t>(rows) * 512U);
+            std::vector<std::uint32_t> device_counts(rows);
+            CudaGlm53IndexSelectRequest select_request;
+            select_request.index_query = index_query;
+            select_request.head_weights = head_weights;
+            select_request.pool_keys = flat_pool_keys;
+            select_request.rows = rows;
+            select_request.pools = pool_count;
+            select_request.history_begin = history_begin;
+            select_request.score_scale =
+                1.0F / std::sqrt(static_cast<float>(kIndexHeadDim));
+            select_request.head_scale =
+                1.0F / std::sqrt(static_cast<float>(kIndexHeads));
+            result = cuda.glm53_index_select(device_for(layer),
+                                             select_request, device_sets,
+                                             device_counts);
+            if (!result.ok()) return result;
+            std::vector<std::uint32_t> device_selected(kIndexSelectionWidth);
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto visible = history_begin + row + 1U;
+                std::size_t device_count = 0U;
+                if (device_counts[row] == 0U) {
+                    for (std::uint32_t token = 0U; token < visible; ++token) {
+                        device_selected[token] = token;
+                    }
+                    device_count = visible;
+                } else {
+                    std::vector<std::uint32_t> device_pools(
+                        device_sets.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                static_cast<std::size_t>(row) * 512U),
+                        device_sets.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                static_cast<std::size_t>(row) * 512U +
+                                device_counts[row]));
+                    const auto row_pools = visible / kIndexPool;
+                    const auto row_tail = visible - row_pools * kIndexPool;
+                    device_count = expand_pool_selection(
+                        device_pools, row_pools, row_tail, device_selected);
+                }
+                const auto& expected = selection[row];
+                if (device_count != expected.size() ||
+                    !std::equal(device_selected.begin(),
+                                device_selected.begin() +
+                                    static_cast<std::ptrdiff_t>(device_count),
+                                expected.begin())) {
+                    result.errors.emplace_back(
+                        "GLM-5.3 device index selection diverges from host at layer " +
+                        std::to_string(layer) + " row " +
+                        std::to_string(row));
+                    return result;
+                }
+                selection[row].assign(
+                    device_selected.begin(),
+                    device_selected.begin() +
+                        static_cast<std::ptrdiff_t>(device_count));
+            }
+        }
+
         const auto score_scale = 1.0F / std::sqrt(static_cast<float>(kMlaHead));
         // One row of `attended` per prompt row, so `o_proj` runs once for the
         // page exactly as it does on the dense path.
         std::vector<float> attended(
             static_cast<std::size_t>(rows) * kMlaWidth, 0.0F);
         std::vector<std::uint32_t> group_union, merged;
-        std::vector<float> scores;
+        // Group-fragmentation diagnostic (record 0267): how many groups the
+        // page shattered into and how much each group re-expands. Emitted
+        // per layer-page below; exactness-neutral, it only counts.
+        std::uint64_t call_groups = 0U;
+        std::uint64_t call_expanded_rows = 0U;
+        // Fix (1), record 0269: the page union, expanded once. Grouping below
+        // is unchanged and still tiles ROWS for the attend core -- a row's
+        // softmax reduction must stay whole (record 0262) -- but each group's
+        // `expanded` is sliced out of this instead of re-running kv_b_proj.
+        // Grouping only decides which rows share an expansion, never any
+        // within-row order, so the hash gate applies unchanged.
+        std::vector<std::uint32_t> page_union;
+        std::span<const float> page_expanded;
+        bool use_page_expansion = false;
+        if (page_expand_enabled()) {
+            std::vector<std::uint32_t> page_merged;
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+                page_merged.clear();
+                std::set_union(page_union.begin(), page_union.end(),
+                               selection[row].begin(), selection[row].end(),
+                               std::back_inserter(page_merged));
+                page_union.swap(page_merged);
+                if (page_union.size() > kPageExpansionBudgetRows) break;
+            }
+            if (!page_union.empty() &&
+                page_union.size() <= kPageExpansionBudgetRows) {
+                const auto page_size =
+                    static_cast<std::uint32_t>(page_union.size());
+                static_cast<void>(glm53_grow(
+                    mla_gathered_scratch,
+                    static_cast<std::size_t>(page_size) * kKvRank));
+                const auto page_gathered =
+                    std::span<float>(mla_gathered_scratch)
+                        .first(static_cast<std::size_t>(page_size) * kKvRank);
+                for (std::uint32_t index = 0U; index < page_size; ++index) {
+                    const auto source = latent_rows.row(page_union[index]);
+                    std::copy(source.begin(), source.end(),
+                              page_gathered.begin() +
+                                  static_cast<std::ptrdiff_t>(
+                                      static_cast<std::size_t>(index) *
+                                      kKvRank));
+                }
+                static_cast<void>(glm53_grow(
+                    mla_page_expanded_scratch,
+                    static_cast<std::size_t>(page_size) * kHeads * 2U *
+                        kMlaHead));
+                const auto page_out =
+                    std::span<float>(mla_page_expanded_scratch)
+                        .first(static_cast<std::size_t>(page_size) * kHeads *
+                               2U * kMlaHead);
+                const std::array<Glm53WeightCache::LinearRequest, 1U>
+                    page_expand{{{bases[3], kHeads * 2U * kMlaHead, kKvRank,
+                                  page_gathered, page_size, page_out, true}}};
+                const auto page_expand_started = config.phase_profile
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                result = linear_batch(page_expand, layer);
+                if (!result.ok()) return result;
+                if (config.phase_profile) {
+                    mla_expand_nanoseconds.fetch_add(
+                        elapsed_nanoseconds(page_expand_started),
+                        std::memory_order_relaxed);
+                }
+                page_expanded = std::span<const float>(page_out);
+                mla_page_pos.assign(
+                    static_cast<std::size_t>(history_begin) + rows,
+                    std::numeric_limits<std::uint32_t>::max());
+                for (std::uint32_t index = 0U; index < page_size; ++index) {
+                    mla_page_pos[page_union[index]] = index;
+                }
+                use_page_expansion = true;
+            }
+        }
         for (std::uint32_t group_begin = 0U; group_begin < rows;) {
             group_union.clear();
             auto group_end = group_begin;
@@ -7127,18 +7536,8 @@ struct Glm53Runtime::Impl {
             }
             const auto expanded_rows =
                 static_cast<std::uint32_t>(group_union.size());
-            static_cast<void>(glm53_grow(
-                mla_gathered_scratch,
-                static_cast<std::size_t>(expanded_rows) * kKvRank));
-            const auto gathered = std::span<float>(mla_gathered_scratch)
-                .first(static_cast<std::size_t>(expanded_rows) * kKvRank);
-            for (std::uint32_t index = 0U; index < expanded_rows; ++index) {
-                const auto source = latent_rows.row(group_union[index]);
-                std::copy(source.begin(), source.end(),
-                          gathered.begin() +
-                              static_cast<std::ptrdiff_t>(
-                                  static_cast<std::size_t>(index) * kKvRank));
-            }
+            ++call_groups;
+            call_expanded_rows += expanded_rows;
             static_cast<void>(glm53_grow(
                 mla_expanded_scratch,
                 static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
@@ -7146,31 +7545,206 @@ struct Glm53Runtime::Impl {
             const auto expanded = std::span<float>(mla_expanded_scratch)
                 .first(static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
                        kMlaHead);
-            const std::array<Glm53WeightCache::LinearRequest, 1U> expand{
-                {{bases[3], kHeads * 2U * kMlaHead, kKvRank,
-                  gathered, expanded_rows, expanded, true}}};
-            result = linear_batch(expand, layer);
-            if (!result.ok()) return result;
-
-            for (auto row = group_begin; row < group_end; ++row) {
-                // The group's union is sorted and so is each selection, so the
-                // mapped positions stay ascending and the accumulation order is
-                // the dense path's.
-                const auto& chosen = selection[row];
-                const auto attended_rows =
-                    static_cast<std::uint32_t>(chosen.size());
-                std::vector<std::uint32_t> local(attended_rows);
-                for (std::uint32_t index = 0U; index < attended_rows; ++index) {
-                    local[index] = static_cast<std::uint32_t>(
-                        std::lower_bound(group_union.begin(), group_union.end(),
-                                         chosen[index]) -
-                        group_union.begin());
+            const auto expand_started = config.phase_profile
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            // Empty unless this group ran its own GEMM; the invariance probe
+            // below needs that input and is skipped on the sliced path.
+            std::span<const float> gathered;
+            if (use_page_expansion) {
+                constexpr auto expanded_stride =
+                    static_cast<std::size_t>(kHeads) * 2U * kMlaHead;
+                for (std::uint32_t index = 0U; index < expanded_rows;
+                     ++index) {
+                    const auto page_index = mla_page_pos[group_union[index]];
+                    std::copy(page_expanded.begin() +
+                                  static_cast<std::ptrdiff_t>(
+                                      static_cast<std::size_t>(page_index) *
+                                      expanded_stride),
+                              page_expanded.begin() +
+                                  static_cast<std::ptrdiff_t>(
+                                      (static_cast<std::size_t>(page_index) +
+                                       1U) * expanded_stride),
+                              expanded.begin() +
+                                  static_cast<std::ptrdiff_t>(
+                                      static_cast<std::size_t>(index) *
+                                      expanded_stride));
                 }
-                scores.assign(attended_rows, 0.0F);
+            } else {
+                static_cast<void>(glm53_grow(
+                    mla_gathered_scratch,
+                    static_cast<std::size_t>(expanded_rows) * kKvRank));
+                const auto group_gathered =
+                    std::span<float>(mla_gathered_scratch)
+                        .first(static_cast<std::size_t>(expanded_rows) *
+                               kKvRank);
+                for (std::uint32_t index = 0U; index < expanded_rows;
+                     ++index) {
+                    const auto source = latent_rows.row(group_union[index]);
+                    std::copy(source.begin(), source.end(),
+                              group_gathered.begin() +
+                                  static_cast<std::ptrdiff_t>(
+                                      static_cast<std::size_t>(index) *
+                                      kKvRank));
+                }
+                const std::array<Glm53WeightCache::LinearRequest, 1U> expand{
+                    {{bases[3], kHeads * 2U * kMlaHead, kKvRank,
+                      group_gathered, expanded_rows, expanded, true}}};
+                result = linear_batch(expand, layer);
+                if (!result.ok()) return result;
+                gathered = std::span<const float>(group_gathered);
+            }
+            if (config.phase_profile) {
+                mla_expand_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(expand_started),
+                    std::memory_order_relaxed);
+            }
+            // Batch-invariance probe (record 0269): expand the same union
+            // as two half-batches and compare bit for bit against the
+            // single-batch expansion above. Probe outputs are discarded;
+            // the request continues on the single-batch expansion, so the
+            // hash cannot move whatever the answer is. Env-gated, default
+            // off, first sparse group per process only. A probe GEMM error
+            // fails the request, fail-closed like the selection gate.
+            if (expand_invariance_check_enabled() && !gathered.empty() &&
+                expanded_rows >= 2U &&
+                !mla_invariance_probed.exchange(true,
+                                                 std::memory_order_relaxed)) {
+                const auto half = expanded_rows / 2U;
+                std::vector<float> probe_out(
+                    static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                    kMlaHead);
+                for (std::uint32_t half_index = 0U; half_index < 2U;
+                     ++half_index) {
+                    const auto half_begin = half_index == 0U ? 0U : half;
+                    const auto half_rows = half_index == 0U
+                        ? half
+                        : expanded_rows - half;
+                    const auto half_in =
+                        std::span<const float>(gathered).subspan(
+                            static_cast<std::size_t>(half_begin) * kKvRank,
+                            static_cast<std::size_t>(half_rows) * kKvRank);
+                    const auto half_out =
+                        std::span<float>(probe_out).subspan(
+                            static_cast<std::size_t>(half_begin) * kHeads *
+                                2U * kMlaHead,
+                            static_cast<std::size_t>(half_rows) * kHeads * 2U *
+                                kMlaHead);
+                    const std::array<Glm53WeightCache::LinearRequest, 1U>
+                        probe{{{bases[3], kHeads * 2U * kMlaHead, kKvRank,
+                               half_in, half_rows, half_out, true}}};
+                    result = linear_batch(probe, layer);
+                    if (!result.ok()) return result;
+                }
+                const bool probe_exact = std::equal(
+                    probe_out.begin(), probe_out.end(), expanded.begin(),
+                    expanded.end());
+                std::cerr << "[glm53-expand-invariance] layer=" << layer
+                          << " union_rows=" << expanded_rows
+                          << " exact=" << (probe_exact ? 1 : 0) << '\n';
+            }
+
+            // The group's union is sorted and so is each selection, so the
+            // mapped positions stay ascending and the accumulation order is
+            // the dense path's. Built once for the whole group here rather
+            // than per row, because the device scores command needs them all
+            // and the host path is happy to read the same flat array.
+            const auto group_rows = group_end - group_begin;
+            const auto index_started = config.phase_profile
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            auto& flat_local = mla_flat_local;
+            auto& row_offsets = mla_row_offsets;
+            flat_local.clear();
+            row_offsets.assign(1U, 0U);
+            for (std::uint32_t position = 0U; position < group_rows;
+                 ++position) {
+                const auto& chosen = selection[group_begin + position];
+                for (const auto pick : chosen) {
+                    flat_local.push_back(static_cast<std::uint32_t>(
+                        std::lower_bound(group_union.begin(),
+                                         group_union.end(), pick) -
+                        group_union.begin()));
+                }
+                row_offsets.push_back(
+                    static_cast<std::uint32_t>(flat_local.size()));
+            }
+            if (config.phase_profile) {
+                mla_index_nanoseconds.fetch_add(
+                    elapsed_nanoseconds(index_started),
+                    std::memory_order_relaxed);
+            }
+            // Device QK, host softmax and AV. The dots are 62.7% of the attend
+            // core (record 0264) and each is an independent 256-channel
+            // reduction, so they move without touching any accumulation order;
+            // the softmax stays host-side because host libm and device trig
+            // differ in the last ulp and it is 0.89% of the term.
+            auto& device_scores = mla_device_scores;
+            const bool attend_on_device =
+                device_attend_enabled() && !flat_local.empty();
+            if (attend_on_device) {
+                device_scores.resize(
+                    static_cast<std::size_t>(flat_local.size()) * kHeads);
+                mla_device_coefficients.resize(device_scores.size());
+                CudaGlm53SparseScoresRequest scores_request;
+                scores_request.query = std::span<const float>(query).subspan(
+                    static_cast<std::size_t>(group_begin) * kMlaWidth,
+                    static_cast<std::size_t>(group_rows) * kMlaWidth);
+                scores_request.expanded = expanded;
+                scores_request.local_indices = flat_local;
+                scores_request.row_offsets = row_offsets;
+                scores_request.rows = group_rows;
+                scores_request.union_rows = expanded_rows;
+                scores_request.heads = kHeads;
+                scores_request.head_dim = kMlaHead;
+                scores_request.score_scale = score_scale;
+                const auto device_started = config.phase_profile
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                result = cuda.glm53_sparse_scores(device_for(layer),
+                                                  scores_request,
+                                                  device_scores);
+                if (!result.ok()) return result;
+                if (config.phase_profile) {
+                    mla_device_nanoseconds.fetch_add(
+                        elapsed_nanoseconds(device_started),
+                        std::memory_order_relaxed);
+                }
+            }
+            // Row-parallel within the group: rows share the read-only group
+            // expansion and each writes its own attended slice. Scores become
+            // per-row storage instead of the reused shared vector; every
+            // within-row order is untouched, so the output is bit-identical.
+            result = parallel_page_rows(
+                group_rows, [&](std::uint32_t position) {
+                const auto row = group_begin + position;
+                const auto begin = row_offsets[position];
+                const auto attended_rows = row_offsets[position + 1U] - begin;
+                const std::uint32_t* local = flat_local.data() + begin;
+                std::vector<float> scores(attended_rows, 0.0F);
+                const bool profile = config.phase_profile;
+                std::uint64_t qk_ns = 0U;
+                std::uint64_t softmax_ns = 0U;
+                std::uint64_t av_ns = 0U;
+                const auto stamp = [&] {
+                    return profile ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+                };
                 for (std::uint32_t head = 0U; head < kHeads; ++head) {
+                    const auto head_qk_started = stamp();
                     const auto* q = query.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     float highest = -std::numeric_limits<float>::infinity();
+                    if (attend_on_device) {
+                        const auto* row_scores = device_scores.data() +
+                            static_cast<std::size_t>(begin) * kHeads +
+                            static_cast<std::size_t>(head) * attended_rows;
+                        for (std::uint32_t token = 0U;
+                             token < attended_rows; ++token) {
+                            scores[token] = row_scores[token];
+                            highest = std::max(highest, scores[token]);
+                        }
+                    } else {
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
                         const auto* kv = expanded.data() +
                             (static_cast<std::size_t>(local[token]) * kHeads +
@@ -7182,11 +7756,31 @@ struct Glm53Runtime::Impl {
                         scores[token] = score * score_scale;
                         highest = std::max(highest, scores[token]);
                     }
+                    }
+                    const auto head_softmax_started = stamp();
                     float total = 0.0F;
                     for (auto& score : scores) {
                         score = std::exp(score - highest);
                         total += score;
                     }
+                    const auto head_av_started = stamp();
+                    if (attend_on_device) {
+                        // Stage 4: publish the coefficients and let the device
+                        // accumulate. The coefficient is still rounded to BF16
+                        // here, on the host, before it ever multiplies a value
+                        // -- that rounding belongs to the accepted softmax
+                        // arithmetic, not to the accumulation, so it happens
+                        // exactly once and on the same side of the boundary it
+                        // always did.
+                        auto* published = mla_device_coefficients.data() +
+                            static_cast<std::size_t>(begin) * kHeads +
+                            static_cast<std::size_t>(head) * attended_rows;
+                        for (std::uint32_t token = 0U;
+                             token < attended_rows; ++token) {
+                            published[token] =
+                                bf16_round_f32(scores[token] / total);
+                        }
+                    } else {
                     auto* out = attended.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
@@ -7202,9 +7796,75 @@ struct Glm53Runtime::Impl {
                             out[column] += coefficient * value[column];
                         }
                     }
+                    }
+                    if (profile) {
+                        const auto head_finished =
+                            std::chrono::steady_clock::now();
+                        qk_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                head_softmax_started - head_qk_started).count());
+                        softmax_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                head_av_started - head_softmax_started).count());
+                        av_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                head_finished - head_av_started).count());
+                    }
+                }
+                if (profile) {
+                    mla_qk_nanoseconds.fetch_add(qk_ns,
+                                                 std::memory_order_relaxed);
+                    mla_softmax_nanoseconds.fetch_add(
+                        softmax_ns, std::memory_order_relaxed);
+                    mla_av_nanoseconds.fetch_add(av_ns,
+                                                 std::memory_order_relaxed);
+                }
+                return ValidationResult{};
+            });
+            if (result.ok() && attend_on_device) {
+                const auto attend_started = config.phase_profile
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                auto& group_attended = mla_device_attended;
+                group_attended.resize(
+                    static_cast<std::size_t>(group_rows) * kMlaWidth);
+                result = cuda.glm53_sparse_attend(
+                    device_for(layer), mla_device_coefficients,
+                    group_attended);
+                if (!result.ok()) return result;
+                std::copy(group_attended.begin(), group_attended.end(),
+                          attended.begin() +
+                              static_cast<std::ptrdiff_t>(
+                                  static_cast<std::size_t>(group_begin) *
+                                  kMlaWidth));
+                if (config.phase_profile) {
+                    mla_device_nanoseconds.fetch_add(
+                        elapsed_nanoseconds(attend_started),
+                        std::memory_order_relaxed);
                 }
             }
+            if (!result.ok()) return result;
             group_begin = group_end;
+        }
+        if (config.phase_profile) {
+            mla_groups_nanoseconds.fetch_add(
+                elapsed_nanoseconds(groups_started),
+                std::memory_order_relaxed);
+            std::cerr << "[glm53-sparse-groups] layer=" << layer
+                      << " page_rows=" << rows
+                      << " history_begin=" << history_begin
+                      << " groups=" << call_groups
+                      << " mean_group_rows="
+                      << (call_groups == 0U
+                              ? 0.0
+                              : static_cast<double>(rows) /
+                                    static_cast<double>(call_groups))
+                      << " mean_expanded_rows="
+                      << (call_groups == 0U
+                              ? 0.0
+                              : static_cast<double>(call_expanded_rows) /
+                                    static_cast<double>(call_groups))
+                      << '\n';
         }
         round_bf16(attended);
         return linear(attention + "o_proj", attended, rows, kMlaWidth,
@@ -7256,7 +7916,10 @@ struct Glm53Runtime::Impl {
                                       static_cast<std::uint64_t>(kIndexHeadDim) *
                                           kHidden);
                 if (!wk.ok()) return {std::move(wk.errors)};
-                for (std::uint32_t row = 0U; row < rows; ++row) {
+                // Row-parallel like the MHC glue (record 0250): each row is
+                // an independent serial dot, so scheduling is the only
+                // change and the output is bit-identical.
+                result = parallel_page_rows(rows, [&](std::uint32_t row) {
                     glm53_indexer_gate(
                         std::span<float>(page_keys).subspan(
                             static_cast<std::size_t>(row) * kIndexHeadDim,
@@ -7264,14 +7927,16 @@ struct Glm53Runtime::Impl {
                         input.subspan(static_cast<std::size_t>(row) * kHidden,
                                       kHidden),
                         *wk.value);
-                }
+                    return ValidationResult{};
+                });
+                if (!result.ok()) return result;
             }
             {
                 auto gate = host_tensor(page_indexer_bases[1],
                                         static_cast<std::uint64_t>(kIndexHeadDim) *
                                             kHidden);
                 if (!gate.ok()) return {std::move(gate.errors)};
-                for (std::uint32_t row = 0U; row < rows; ++row) {
+                result = parallel_page_rows(rows, [&](std::uint32_t row) {
                     glm53_indexer_gate(
                         std::span<float>(page_gates).subspan(
                             static_cast<std::size_t>(row) * kIndexHeadDim,
@@ -7279,7 +7944,9 @@ struct Glm53Runtime::Impl {
                         input.subspan(static_cast<std::size_t>(row) * kHidden,
                                       kHidden),
                         *gate.value);
-                }
+                    return ValidationResult{};
+                });
+                if (!result.ok()) return result;
             }
             auto norm_weight =
                 host_tensor(attention + "indexer.k_norm.weight", kIndexHeadDim);
@@ -7289,7 +7956,7 @@ struct Glm53Runtime::Impl {
             if (!norm_bias.ok()) return {std::move(norm_bias.errors)};
             std::vector<float> packed(
                 static_cast<std::size_t>(rows) * 2U * kIndexHeadDim);
-            for (std::uint32_t row = 0U; row < rows; ++row) {
+            result = parallel_page_rows(rows, [&](std::uint32_t row) {
                 auto key = std::span<float>(page_keys).subspan(
                     static_cast<std::size_t>(row) * kIndexHeadDim,
                     kIndexHeadDim);
@@ -7302,7 +7969,9 @@ struct Glm53Runtime::Impl {
                 std::copy_n(page_gates.data() +
                                 static_cast<std::size_t>(row) * kIndexHeadDim,
                             kIndexHeadDim, destination + kIndexHeadDim);
-            }
+                return ValidationResult{};
+            });
+            if (!result.ok()) return result;
             result = index_cache.append_rows(packed, rows);
             if (!result.ok()) return result;
         }
@@ -7427,10 +8096,33 @@ struct Glm53Runtime::Impl {
              {bases[1], inner, kHidden, input, rows, up, true}}};
         result = linear_batch(projections, layer);
         if (!result.ok()) return result;
-        for (std::size_t index = 0U; index < gate.size(); ++index) {
-            const auto g = std::min(gate[index], 10.0F);
-            const auto u = std::clamp(up[index], -10.0F, 10.0F);
-            activated[index] = g * sigmoid(g) * u;
+        // Worker-chunked, not per-element dispatched: 95M std::function
+        // calls would cost more than the arithmetic. Each worker takes one
+        // contiguous range, so every element keeps its exact scalar order
+        // and the output is bit-identical. Sequential below 4,096 elements.
+        const auto activate_count = gate.size();
+        if (host_moe_workers != nullptr && host_moe_active &&
+            host_moe_workers->size() > 1U && activate_count > 4096U) {
+            const std::size_t lanes = host_moe_workers->size();
+            result = host_moe_workers->parallel_for(
+                lanes, [&](std::size_t lane) {
+                    const auto begin =
+                        lane * activate_count / lanes;
+                    const auto end =
+                        (lane + 1U) * activate_count / lanes;
+                    for (std::size_t index = begin; index < end; ++index) {
+                        const auto g = std::min(gate[index], 10.0F);
+                        const auto u = std::clamp(up[index], -10.0F, 10.0F);
+                        activated[index] = g * sigmoid(g) * u;
+                    }
+                });
+            if (!result.ok()) return result;
+        } else {
+            for (std::size_t index = 0U; index < activate_count; ++index) {
+                const auto g = std::min(gate[index], 10.0F);
+                const auto u = std::clamp(up[index], -10.0F, 10.0F);
+                activated[index] = g * sigmoid(g) * u;
+            }
         }
         round_bf16(activated);
         return linear(prefix + "down_proj", activated, rows, inner,
@@ -7521,14 +8213,21 @@ struct Glm53Runtime::Impl {
             prefix + "mlp.gate.e_score_correction_bias", 288U);
         if (!bias.ok()) return {std::move(bias.errors)};
         std::vector<std::array<KimiRoutedExpert, 8U>> selected_rows(rows);
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            auto& selected = selected_rows[row];
-            result = kimi_route_topk(
-                selected,
+        // Top-k first, row-parallel: each row selects from its own logits
+        // over read-only bias, so scheduling is the only change and the
+        // selection is bit-identical. Observation stays sequential below:
+        // the census and predictor own shared mutable state that rows must
+        // not touch concurrently.
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return kimi_route_topk(
+                selected_rows[row],
                 std::span<const float>(logits).subspan(
                     static_cast<std::size_t>(row) * 288U, 288U),
                 *bias.value, 2.5F);
-            if (!result.ok()) return result;
+        });
+        if (!result.ok()) return result;
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+            auto& selected = selected_rows[row];
             if (!route_requests.empty()) {
                 // Prompt pages and independent decode cohorts both have
                 // `rows > 1`; only the caller knows which one this is. Using
@@ -8019,8 +8718,14 @@ struct Glm53Runtime::Impl {
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
         const auto attention = prefix + "self_attn.";
+        // At sparse contexts the device MLA page would attend densely without
+        // the k-pool selection the host applies, which is wrong past topK.
+        // Sparse-KDA mode therefore forces MLA layers onto the existing host
+        // fallback (per-row download); only KDA layers run device pages.
+        // Dense contexts are unaffected: the indexer is inactive there.
         const bool device_mla = !glm53_kda_layer(layer) &&
             device_page_mla_enabled() &&
+            !sparse_indexer_active(config.maximum_context_tokens) &&
             weights->mla_kv_b_is_bf16(attention);
         std::vector<float> normalized(
             static_cast<std::size_t>(rows) * kHidden);
@@ -8193,17 +8898,20 @@ struct Glm53Runtime::Impl {
         std::vector<Dsv4MhcMix> mixes(rows);
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+        MhcPreWeights attn_pre_weights;
+        result = mhc_pre_weights(attn_pre_weights, prefix + "hc_attn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_attn");
-            if (!result.ok()) return result;
-        }
+                attn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
@@ -8227,33 +8935,38 @@ struct Glm53Runtime::Impl {
                                                 std::memory_order_relaxed);
             }
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
+        MhcPreWeights ffn_pre_weights;
+        result = mhc_pre_weights(ffn_pre_weights, prefix + "hc_ffn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_ffn");
-            if (!result.ok()) return result;
-        }
+                ffn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
@@ -8275,22 +8988,24 @@ struct Glm53Runtime::Impl {
                 elapsed_nanoseconds(feedforward_started),
                 std::memory_order_relaxed);
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
         return result;
     }
 
@@ -8593,17 +9308,20 @@ struct Glm53Runtime::Impl {
         std::vector<Dsv4MhcMix> mixes(rows);
         const auto prefix = "model.language_model.layers." +
                             std::to_string(layer) + ".";
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+        MhcPreWeights attn_pre_weights;
+        result = mhc_pre_weights(attn_pre_weights, prefix + "hc_attn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_attn");
-            if (!result.ok()) return result;
-        }
+                attn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "input_layernorm.weight");
         if (!result.ok()) return result;
@@ -8636,33 +9354,38 @@ struct Glm53Runtime::Impl {
                                                 std::memory_order_relaxed);
             }
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
-            result = mhc_pre(
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
+        MhcPreWeights ffn_pre_weights;
+        result = mhc_pre_weights(ffn_pre_weights, prefix + "hc_ffn");
+        if (!result.ok()) return result;
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
+            return mhc_pre_with_weights(
                 std::span<float>(collapsed).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 mixes[row],
                 std::span<const float>(streams).subspan(
                     static_cast<std::size_t>(row) * stream_columns,
                     stream_columns),
-                prefix + "hc_ffn");
-            if (!result.ok()) return result;
-        }
+                ffn_pre_weights);
+        });
+        if (!result.ok()) return result;
         result = norm_rows(normalized, collapsed, rows, kHidden,
                            prefix + "post_attention_layernorm.weight");
         if (!result.ok()) return result;
@@ -8680,22 +9403,24 @@ struct Glm53Runtime::Impl {
                 elapsed_nanoseconds(feedforward_started),
                 std::memory_order_relaxed);
         }
-        for (std::uint32_t row = 0U; row < rows; ++row) {
+        result = parallel_page_rows(rows, [&](std::uint32_t row) {
             const auto stream_begin =
                 static_cast<std::size_t>(row) * stream_columns;
             std::vector<float> transitioned(stream_columns);
-            result = dsv4_mhc_post_f32(
+            ValidationResult step = dsv4_mhc_post_f32(
                 transitioned,
                 std::span<const float>(branch).subspan(
                     static_cast<std::size_t>(row) * kHidden, kHidden),
                 std::span<const float>(streams).subspan(
                     stream_begin, stream_columns),
                 mixes[row], kMhc);
-            if (!result.ok()) return result;
+            if (!step.ok()) return step;
             round_bf16(transitioned);
             std::copy(transitioned.begin(), transitioned.end(),
                       streams.begin() + static_cast<std::ptrdiff_t>(stream_begin));
-        }
+            return ValidationResult{};
+        });
+        if (!result.ok()) return result;
         return result;
     }
 
@@ -9237,6 +9962,44 @@ struct Glm53Runtime::Impl {
                           << '\n';
             }
         }
+        // Sparse attend-core split, once per request. Reported as a line
+        // rather than folded into the phase-profile JSON because it exists to
+        // size stage 4 of the device-attention build, not to be consumed by a
+        // tool: expansion and the QK/AV dots are what can move to the device,
+        // while softmax stays on the host for exactness (host libm and device
+        // trig differ in the last ulp -- record 0214's callback exists for
+        // exactly that).
+        if (config.phase_profile) {
+            const auto expand_ns =
+                mla_expand_nanoseconds.load(std::memory_order_relaxed);
+            const auto qk_ns =
+                mla_qk_nanoseconds.load(std::memory_order_relaxed);
+            const auto softmax_ns =
+                mla_softmax_nanoseconds.load(std::memory_order_relaxed);
+            const auto av_ns =
+                mla_av_nanoseconds.load(std::memory_order_relaxed);
+            if (expand_ns + qk_ns + softmax_ns + av_ns != 0U) {
+                std::cerr << "[glm53-mla-split] expand_s="
+                          << (static_cast<double>(expand_ns) / 1.0e9)
+                          << " qk_s=" << (static_cast<double>(qk_ns) / 1.0e9)
+                          << " softmax_s="
+                          << (static_cast<double>(softmax_ns) / 1.0e9)
+                          << " av_s=" << (static_cast<double>(av_ns) / 1.0e9)
+                          << " index_s="
+                          << (static_cast<double>(mla_index_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << " devicecall_s="
+                          << (static_cast<double>(mla_device_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << " prelude_s="
+                          << (static_cast<double>(mla_prelude_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << " groups_s="
+                          << (static_cast<double>(mla_groups_nanoseconds.load(
+                                  std::memory_order_relaxed)) / 1.0e9)
+                          << '\n';
+            }
+        }
         if (config.phase_profile && request->prepared) {
             const auto profile_after_decode = profile_snapshot();
             request->result.metrics.decode = phase_delta(
@@ -9284,27 +10047,69 @@ struct Glm53Runtime::Impl {
             request->base_hidden);
         request->result.metrics.reused_prompt_tokens = reused;
         request->prefill_cursor = reused;
-        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)) {
+        // Sparse-KDA mode (record 0253) joins the dense device-prefill gate:
+        // admit the device sequence so KDA layers run their device pages,
+        // with MLA layers on the host fallback.
+        const bool dense_prefill = device_prefill_for_context(
+            config.device_prefill, config.maximum_context_tokens);
+        const bool sparse_kda_prefill = sparse_device_kda_enabled() &&
+            sparse_indexer_active(config.maximum_context_tokens);
+        if (dense_prefill || sparse_kda_prefill) {
+            // The 4118 rule, applied to prefill admission: an explicit
+            // device-prefill request that cannot be honored is an error,
+            // but sparse-KDA mode declines and leaves the host path intact.
+            // Only admission (resident path, sequence prepare, slot reserve)
+            // declines; mid-flight failures stay hard errors, and the
+            // downstream sites key off device_sequence.ready, so a declined
+            // request takes the host path in advance_prefill and skips the
+            // sync-back in finish_prefill automatically.
+            const bool may_decline = sparse_kda_prefill && !dense_prefill;
+            const auto decline_to_host = [&](const std::string& reason) {
+                std::cerr << "[glm53-sparse-kda] device KDA prefill "
+                             "declined ("
+                          << reason << "); continuing on host path\n";
+                if (request->device_sequence.ready) {
+                    sequence_slots_live.fetch_sub(
+                        1U, std::memory_order_relaxed);
+                }
+                request->device_sequence = DeviceSequenceState{};
+            };
             if (!resident_execution_active) {
-                request->result.errors.emplace_back(
-                    "GLM-5.3 device prefill requires the resident exact path");
-                complete_request(request);
-                return false;
-            }
-            auto prepared = prepare_device_sequence(
-                request->sequence, request->device_sequence);
-            if (!prepared.ok()) {
-                request->result.errors = std::move(prepared.errors);
-                complete_request(request);
-                return false;
-            }
-            for (const auto device : devices) {
-                prepared = cuda.dsv4_mhc_reserve_slots(
-                    device, config.prefill_page_tokens);
-                if (!prepared.ok()) {
+                if (!may_decline) {
+                    request->result.errors.emplace_back(
+                        "GLM-5.3 device prefill requires the resident exact path");
+                    complete_request(request);
+                    return false;
+                }
+                decline_to_host("resident path unavailable");
+            } else {
+                auto prepared = prepare_device_sequence(
+                    request->sequence, request->device_sequence);
+                if (!prepared.ok() && !may_decline) {
                     request->result.errors = std::move(prepared.errors);
                     complete_request(request);
                     return false;
+                }
+                if (!prepared.ok()) {
+                    decline_to_host(prepared.errors.empty()
+                                        ? "sequence admission failed"
+                                        : prepared.errors.front());
+                } else {
+                    for (const auto device : devices) {
+                        prepared = cuda.dsv4_mhc_reserve_slots(
+                            device, config.prefill_page_tokens);
+                        if (!prepared.ok()) break;
+                    }
+                    if (!prepared.ok() && !may_decline) {
+                        request->result.errors = std::move(prepared.errors);
+                        complete_request(request);
+                        return false;
+                    }
+                    if (!prepared.ok()) {
+                        decline_to_host(prepared.errors.empty()
+                                            ? "slot reserve failed"
+                                            : prepared.errors.front());
+                    }
                 }
             }
         }
@@ -9653,7 +10458,17 @@ struct Glm53Runtime::Impl {
     }
 
     void finish_prefill(const std::shared_ptr<ScheduledRequest>& request) {
-        if (device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)) {
+        // Sparse-KDA mode joins here too: the device advanced KDA state, so
+        // the host sequence must be refreshed before hashes, decode, and the
+        // prefix cache read it. MLA layers ran on the host and take the
+        // existing host-history admission branch below. The ready check is
+        // what makes a declined admission take the host path: prepare is
+        // the only place that sets it before prefill runs.
+        const bool sparse_kda_prefill = sparse_device_kda_enabled() &&
+            sparse_indexer_active(config.maximum_context_tokens);
+        if ((device_prefill_for_context(config.device_prefill, config.maximum_context_tokens) ||
+             sparse_kda_prefill) &&
+            request->device_sequence.ready) {
             auto synchronized = synchronize_kda_sequence_from_device(
                 request->sequence, request->device_sequence);
             if (!synchronized.ok()) {
@@ -9758,12 +10573,17 @@ struct Glm53Runtime::Impl {
         }
         const auto count = std::min(
             maximum_rows, request->prompt.size() - request->prefill_cursor);
+        const bool use_device_pages =
+            (device_prefill_for_context(config.device_prefill,
+                                        config.maximum_context_tokens) ||
+             (sparse_device_kda_enabled() &&
+              sparse_indexer_active(config.maximum_context_tokens))) &&
+            request->device_sequence.ready;
         auto prefill = forward_prompt(
             std::span<const std::uint32_t>(request->prompt).subspan(
                 request->prefill_cursor, count),
             request->logits, request->sequence, &request->base_hidden, false,
-            device_prefill_for_context(config.device_prefill, config.maximum_context_tokens)
-                ? &request->device_sequence : nullptr);
+            use_device_pages ? &request->device_sequence : nullptr);
         if (!prefill.ok()) {
             request->result.errors = std::move(prefill.errors);
             complete_request(request);
@@ -10167,6 +10987,182 @@ struct Glm53Runtime::Impl {
         std::unique_lock lock(request->completion_mutex);
         request->completion.wait(lock, [&] { return request->done; });
         return std::move(request->result);
+    }
+
+    // Sparse-attention micro-bench (record 0269). Rationale and the
+    // fabricated-state caveat are on `Glm53AttentionBenchRequest`.
+    [[nodiscard]] ValidationResult attention_bench(
+        const Glm53AttentionBenchRequest& request,
+        Glm53AttentionBenchResult& out) {
+        ValidationResult result;
+        if (!ready) {
+            result.errors.emplace_back(
+                "GLM-5.3 attention bench requires an initialized runtime");
+            return result;
+        }
+        if (request.layer >= kLayers || glm53_kda_layer(request.layer)) {
+            result.errors.emplace_back(
+                "GLM-5.3 attention bench layer " +
+                std::to_string(request.layer) + " is not an MLA layer");
+            return result;
+        }
+        if (request.rows == 0U) {
+            result.errors.emplace_back(
+                "GLM-5.3 attention bench needs at least one page row");
+            return result;
+        }
+        const std::uint64_t total =
+            static_cast<std::uint64_t>(request.history) + request.rows;
+        if (total > config.maximum_context_tokens) {
+            result.errors.push_back(
+                "GLM-5.3 attention bench history+rows " +
+                std::to_string(total) + " exceeds the admitted context " +
+                std::to_string(config.maximum_context_tokens));
+            return result;
+        }
+        // Below the threshold `attention_mla_page_sparse` is never reached,
+        // so a bench that asked for it would silently time the dense path.
+        if (total <= kIndexTopK ||
+            !sparse_indexer_active(config.maximum_context_tokens)) {
+            result.errors.push_back(
+                "GLM-5.3 attention bench needs history+rows above " +
+                std::to_string(kIndexTopK) +
+                " on a sparse-admitted context; the dense path runs instead");
+            return result;
+        }
+
+        Glm53SequenceState sequence;
+        result = sequence.reset(config.maximum_context_tokens, 64U);
+        if (!result.ok()) return result;
+        // Knuth MMIX, the same generator the indexer oracle fixture uses, so
+        // a bench shape is reproducible from its seed alone.
+        std::uint64_t lcg = request.seed;
+        const auto next = [&lcg]() noexcept {
+            lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+            return static_cast<float>(
+                static_cast<double>(lcg >> 40U) / 8388608.0 - 1.0);
+        };
+        auto& latents = sequence.mla(request.layer);
+        auto& index_cache = sequence.indexer(request.layer);
+        std::vector<float> latent_row(kKvRank);
+        std::vector<float> index_row(2U * kIndexHeadDim);
+        // Independent noise per token is the wrong shape of input for this
+        // measurement, and the first calibration proved it: at layer 19,
+        // history 4,096, iid keys gave 755 groups of 2.7 rows where the real
+        // run gave 86 of 24-27 (record 0268). A trained indexer makes
+        // neighbouring queries select overlapping history, so their unions
+        // merge; iid keys make them select disjointly, so every union hits
+        // the cap almost at once. `smoothing` is a first-order walk over
+        // position that restores that overlap -- it is a calibration dial,
+        // not a model: raise it until the group count matches a measured
+        // shape, then read the sweep.
+        const float smoothing =
+            request.smoothing < 0.0F
+                ? 0.0F
+                : (request.smoothing > 1.0F ? 1.0F : request.smoothing);
+        const float fresh = 1.0F - smoothing;
+        for (std::uint64_t token = 0U; token < total; ++token) {
+            for (auto& value : latent_row) value = next();
+            result = latents.append(latent_row);
+            if (!result.ok()) return result;
+            if (token == 0U) {
+                for (auto& value : index_row) value = next();
+            } else {
+                for (auto& value : index_row) {
+                    value = smoothing * value + fresh * next();
+                }
+            }
+            result = index_cache.append(index_row);
+            if (!result.ok()) return result;
+        }
+        sequence.set_token_count(static_cast<std::uint32_t>(total));
+
+        // The queries matter more than the keys. Group merging is driven by
+        // NEIGHBOURING ROWS selecting overlapping history, which happens when
+        // their hidden states are similar; smoothing only the keys leaves each
+        // row's ranking independent and changes nothing (measured: 755 groups
+        // at smoothing 0, 758 at 0.9). So the same walk runs down the rows of
+        // both activations that feed the selection.
+        const auto fill_smoothed = [&](std::span<float> values,
+                                       std::uint32_t width) {
+            for (std::uint32_t row = 0U; row < request.rows; ++row) {
+                for (std::uint32_t column = 0U; column < width; ++column) {
+                    const auto index =
+                        static_cast<std::size_t>(row) * width + column;
+                    values[index] =
+                        row == 0U
+                            ? next()
+                            : smoothing * values[index - width] +
+                                  fresh * next();
+                }
+            }
+        };
+        std::vector<float> input(
+            static_cast<std::size_t>(request.rows) * kHidden);
+        fill_smoothed(input, kHidden);
+        std::vector<float> q_rank(
+            static_cast<std::size_t>(request.rows) * kQueryRank);
+        fill_smoothed(q_rank, kQueryRank);
+        // o_proj closes the block back to the residual width, so this is
+        // kHidden and not the kMlaWidth the attended rows carry.
+        std::vector<float> output(
+            static_cast<std::size_t>(request.rows) * kHidden);
+        const auto attention = "model.language_model.layers." +
+                               std::to_string(request.layer) + ".self_attn.";
+
+        mla_prelude_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_groups_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_index_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_device_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_expand_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_qk_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_softmax_nanoseconds.store(0U, std::memory_order_relaxed);
+        mla_av_nanoseconds.store(0U, std::memory_order_relaxed);
+
+        const auto repeats = request.repeats == 0U ? 1U : request.repeats;
+        const auto started = std::chrono::steady_clock::now();
+        for (std::uint32_t pass = 0U; pass < repeats; ++pass) {
+            result = attention_mla_page_sparse(
+                output, input, request.rows, request.layer, attention,
+                sequence, q_rank, latents, request.history);
+            if (!result.ok()) return result;
+        }
+        const auto elapsed = elapsed_nanoseconds(started);
+
+        const auto mean = [repeats](std::uint64_t value) {
+            return value / repeats;
+        };
+        out.wall_nanoseconds = mean(elapsed);
+        out.prelude_nanoseconds =
+            mean(mla_prelude_nanoseconds.load(std::memory_order_relaxed));
+        out.groups_nanoseconds =
+            mean(mla_groups_nanoseconds.load(std::memory_order_relaxed));
+        out.index_nanoseconds =
+            mean(mla_index_nanoseconds.load(std::memory_order_relaxed));
+        out.device_nanoseconds =
+            mean(mla_device_nanoseconds.load(std::memory_order_relaxed));
+        out.expand_nanoseconds =
+            mean(mla_expand_nanoseconds.load(std::memory_order_relaxed));
+        out.qk_nanoseconds =
+            mean(mla_qk_nanoseconds.load(std::memory_order_relaxed));
+        out.softmax_nanoseconds =
+            mean(mla_softmax_nanoseconds.load(std::memory_order_relaxed));
+        out.av_nanoseconds =
+            mean(mla_av_nanoseconds.load(std::memory_order_relaxed));
+        // FNV-1a over the output bits. Two builds fed the same seed and shape
+        // must agree here; it is a change detector, not an exactness proof
+        // against the reference (the inputs are noise).
+        std::uint64_t checksum = 1469598103934665603ULL;
+        for (const auto value : output) {
+            std::uint32_t bits = 0U;
+            std::memcpy(&bits, &value, sizeof(bits));
+            for (std::uint32_t byte = 0U; byte < 4U; ++byte) {
+                checksum ^= (bits >> (byte * 8U)) & 0xFFU;
+                checksum *= 1099511628211ULL;
+            }
+        }
+        out.checksum = checksum;
+        return result;
     }
 };
 
@@ -10630,6 +11626,12 @@ ValidationResult Glm53Runtime::initialize(
             std::string(error.what()));
     }
     return result;
+}
+
+ValidationResult Glm53Runtime::attention_bench(
+    const Glm53AttentionBenchRequest& request,
+    Glm53AttentionBenchResult& result) {
+    return impl_->attention_bench(request, result);
 }
 
 Glm53GenerationResult Glm53Runtime::generate_chat_stream(

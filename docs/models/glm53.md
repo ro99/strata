@@ -442,3 +442,146 @@ exact production latency path leaves it disabled. Resident absorbed MLA is on
 by default after its isolated exactness gate closed; all 45 layers now use the
 same device mHC path. `STRATA_GLM53_RESIDENT_MLA=0` exists as a diagnostic
 control, not as the recommended production route.
+
+## Long-context prefill: measured state and the open lever
+
+This section closes the `exp/glm53-prefill-campaign` work. It records what was
+measured, what landed, and the one change that was identified but deliberately
+not made, so the next attempt starts from evidence rather than from scratch.
+
+### The regime split, and why early results misled
+
+Prefill has two regimes divided by `index_topk` (2,048). Below it the k-pool
+indexer's selection is the identity and the dense page path runs; above it the
+sparse path runs and the cost structure is completely different. Most of this
+campaign's early arms were measured at 619 and 2,591 tokens because an arm at
+8,192 tokens is about twenty minutes and one at 32,768 is hours. Two accepted
+conclusions turned out to be artifacts of that choice, and both were withdrawn:
+a 2% decode "regression" that was the phase profiler charging per device
+command, and a decomposition that mis-sized the attend core by dividing a
+parallel CPU total by a wall time.
+
+The shares invert with length. At 2,591 tokens attention is 26% of prefill and
+the feed-forward term 58%; at 8,192 tokens attention is 64% and feed-forward
+26%. Per-token, attention goes 67.2 to 124.9 ms and is still accelerating,
+while feed-forward goes 83.8 to 30.8 ms and saturates, because a page's set of
+distinct experts stops growing and the upload amortizes. **Any prefill decision
+taken below 2,048 tokens says nothing about the regime users run.**
+
+### What the sparse path actually spends
+
+The sparse attend core expands a group's union of selected latent rows through
+`kv_b_proj`, then scores and accumulates. Rows are grouped until their combined
+selection would exceed `kSparseExpansionRows` (4,096). Below about 4,000 tokens
+of history one group covers a whole page. Above it the page shatters: at 8,192
+tokens, layers 19 and 23 split one page into 86 and 75 groups of 24-27 rows,
+and each group re-expands close to the full 4,096-row cap. Fragmentation is
+layer-dependent -- layers 3, 7 and 11 never split at that length.
+
+That is a 154:1 ratio of expanded rows to query rows served, and it is the
+mechanism behind the upward bend: total row-expansions grow about 31x for 3.16x
+the tokens. Each group also pays its own serial `linear_batch` round trip,
+which accounts for most of a roughly 400 s gap between the group loop's wall
+time and the parallel work inside it.
+
+### Landed here
+
+Stages 1-4 move the indexer projections, k-pool selection, sparse QK and sparse
+AV to the device. All four are bit-identical to the host path and all are
+**off by default** behind `STRATA_GLM53_DEVICE_ATTEND`; the k-pool selection
+runs with an always-on element gate against the host sets and fails the request
+on divergence. At 8,192 tokens they are a wash (1229.10 s to 1239.04 s): they
+remove about 6,522 s of host CPU, but that CPU was spread over roughly 21
+effective threads, so it was only about 311 s of wall, and it is replaced by
+320.5 s of *serial* device time issued per group on one stream. Parallel host
+work trades evenly against serial device work at this thread count, and the
+trade gets worse as the page fragments further.
+
+They are kept because they are exact and because they become worthwhile once
+the group loop stops fragmenting -- not because they pay today.
+
+### The bench
+
+`strata-glm53-attnbench` runs one layer-page of the production sparse
+attention path at an arbitrary history, over a fabricated cache, in seconds:
+
+    strata-glm53-attnbench --model models/glm53f-nvfp4 --devices 1,2 \
+        --context 32768 --layer 19 --rows 2048 --smoothing 0.9 \
+        --sweep 4096,8192,16384,30720
+
+It exists because the arm harness cannot reach the shape this work targets. The
+weights and control flow are the production ones, so the timing split and group
+structure are real; the activations are LCG noise, so the attention output is
+meaningless and `checksum` is only a same-input/same-output change detector.
+
+**Calibrate it before quoting it.** Independent noise makes neighbouring
+queries select disjoint history, so unions hit the cap almost immediately: at
+layer 19 and history 4,096 it reports 755 groups of 2.7 rows where the real run
+gives 86 of 24-27. `--smoothing` is a first-order walk over position that
+restores the overlap a trained indexer produces. Raise it until the group count
+matches a shape a real arm has measured, then read the sweep.
+
+### The open lever, and why it was not taken
+
+`kv_b_proj(latent[i])` is a pure function of token `i`. It is identical on
+every page and in every group, and the current design recomputes it every time.
+Two fixes follow, in order:
+
+1. **Expand once per layer-page** rather than once per group, with a memory
+   budget and a fall-back to the present grouping above it, tiling *rows* and
+   never the union (a row's softmax reduction must stay whole). Arithmetic:
+   one expanded row is 512 x 32,768 = 16.8 MMAC; the measured 900k expansions
+   at 8,192 tokens imply about 111 GMAC/s, and expanding once per layer-page
+   would be 225k rows instead -- roughly 135 s down to 34 s, plus the collapse
+   of 86 serial round trips into one. Estimated 1.25-1.5x overall.
+
+2. **Cache the expanded rows per token.** Fix (1) still leaves expansion at
+   O(visible history) per layer-page, so summed over pages it stays quadratic:
+   about 3.06M expansions at 32,768 tokens. Expanding each latent row once when
+   it enters the cache makes it linear -- about 360k expansions for an entire
+   32,768-token prefill, 8.5x fewer -- and removes the term that bends the
+   curve upward. An expanded row is 128 KB in F32 and 64 KB in BF16, so a
+   32,768-token context is 4.3 GB or 2.1 GB per layer; keeping all eleven
+   sparse layers resident at once does not fit, which is why this needs either
+   a layer-outer prefill loop or a host-resident cache. Gathering the union
+   from host memory costs roughly 65 ms per layer-page against about 930 ms to
+   recompute it, so the transfer is not the obstacle.
+
+   **Measured, and incomplete.** On the bench at layer 19, history 4,096, 2,048
+   rows -- a page that shatters into 755 groups under synthetic selections --
+   fix (1) is exact (identical checksums, `0x2f70b47448139dde`) and worth
+   1.27x on the layer-page: 194.8 s to 153.6 s. But the expansion term only
+   falls from 99.6 s to 82.9 s where the arithmetic says one 6,144-row GEMM
+   should cost about 0.2 s. The gap is the slicing itself: each group still
+   materializes a contiguous `expanded` buffer, copying 3,690 rows x 32,768
+   floats -- 484 MB per group, about 365 GB over the page. Fix (1) as landed
+   trades a GEMM for a memcpy of the same order. The remaining win needs the
+   attend core to index into the page expansion in place through `mla_page_pos`
+   rather than gathering each group's rows, which is a change to the QK and AV
+   loops and was not attempted. Note the bench over-fragments (755 groups where
+   a real layer-page gives 86), so the copy penalty is overstated relative to
+   production and the 1.27x is a lower bound on a synthetic worst case, not a
+   production figure.
+
+   **Precondition, and it holds.** This is only legal if a row's expanded bits
+   do not depend on the batch size it was expanded in; a split-K GEMM that
+   tiled the K dimension as a function of M would break it. Measured with
+   `STRATA_GLM53_EXPAND_INVARIANCE_CHECK=1` on layer 19: a 3,071-row union
+   expanded as one call and as two half-batches is **bit-identical**
+   (`[glm53-expand-invariance] union_rows=3071 exact=1`). The probe is
+   default-off, discards its own outputs and cannot move the hash. So nothing
+   in the GEMM blocks the per-token cache, and the remaining questions are
+   where the cache lives and how the prefill loop is ordered, not whether the
+   arithmetic permits it.
+
+Fix (1) is built and landed off by default behind `STRATA_GLM53_PAGE_EXPAND`;
+fix (2) is not built, and its one blocking precondition is now answered. The
+campaign is closed here with the measurements, the instrument, the
+exact-but-currently-neutral device stages and fix (1) landed, and this is the
+state to resume from.
+
+Correction to earlier figures in this campaign: the fragmentation totals at
+8,192 tokens are 904 groups and 3.60M row-expansions -- 126x the expansions for
+3.16x the tokens -- at an effective 446 GMAC/s, which supersedes an earlier
+estimate of ~900k expansions at ~111 GMAC/s. Fix (1) takes that to 225k rows,
+about 135 s of expansion becoming about 8.5 s.

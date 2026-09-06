@@ -3,6 +3,7 @@
 #include "../common/checkpoint_common.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <cerrno>
 #include <cstdlib>
@@ -480,11 +481,19 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
         }
         // Both mapped views outlive every upload, so the copy stream may retain
         // them until its device-side completion event without a heap copy.
-        return backend.upload(device, descriptor, weights.value, scales, output,
-                              concurrent_prefetch
-                                  ? CudaBackend::UploadCompletion::DeferredConcurrent
-                                  : CudaBackend::UploadCompletion::Deferred,
-                              fragment_layout);
+        const auto upload_started = std::chrono::steady_clock::now();
+        auto uploaded = backend.upload(device, descriptor, weights.value, scales, output,
+                                       concurrent_prefetch
+                                           ? CudaBackend::UploadCompletion::DeferredConcurrent
+                                           : CudaBackend::UploadCompletion::Deferred,
+                                       fragment_layout);
+        load_upload_nanoseconds_.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - upload_started)
+                    .count()),
+            std::memory_order_relaxed);
+        return uploaded;
     }
 
     // Same-binary control route for performance campaigns. This is the former
@@ -503,9 +512,17 @@ ValidationResult Glm53CheckpointReader::load_cuda_linear(
         if (!loaded_scales.ok()) return {std::move(loaded_scales.errors)};
         scales = std::move(loaded_scales.value);
     }
-    return backend.upload(device, descriptor, weights.value, scales, output,
-                          CudaBackend::UploadCompletion::Synchronous,
-                          fragment_layout);
+    const auto upload_started = std::chrono::steady_clock::now();
+    auto uploaded = backend.upload(device, descriptor, weights.value, scales, output,
+                                   CudaBackend::UploadCompletion::Synchronous,
+                                   fragment_layout);
+    load_upload_nanoseconds_.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - upload_started)
+                .count()),
+        std::memory_order_relaxed);
+    return uploaded;
 }
 
 ValidationResult Glm53CheckpointReader::load_cuda_linear_slice(

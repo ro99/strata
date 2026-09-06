@@ -336,6 +336,55 @@ struct CudaLightningIndexSegment {
     std::uint32_t rows{};
 };
 
+// GLM-5.3 k-pool index selection for one prefill page: per-row pool
+// scoring + top-k + tail markers over host-provided keys, mirroring
+// glm53_sparse_index_select. One thread owns one row end to end and
+// accumulates in strict index order (scalar fmaf chains, sequential head
+// sum, (score desc, pool asc) tie order), so identical inputs select
+// identical sets by construction; the caller gates the sets
+// element-for-element against the host path. Synchronous: downloads the
+// selected pools. Identity rows (visible <= 2048) report count 0 and the
+// caller fills the dense range, exactly like the host branch.
+struct CudaGlm53IndexSelectRequest {
+    std::span<const float> index_query;  // rows * 32 * 128
+    std::span<const float> head_weights;  // rows * 32
+    std::span<const float> pool_keys;  // pools * 128, contiguous
+    std::uint32_t rows{};
+    std::uint32_t pools{};
+    std::uint32_t history_begin{};
+    // Host-computed 1/sqrtf constants, passed in so no device sqrt or
+    // division can drift from the host's correctly-rounded values.
+    float score_scale{};
+    float head_scale{};
+};
+
+// GLM-5.3 sparse-page attention scores (stage 3 of the device-attention
+// build). One QK dot per (row, head, attended token) against the group's
+// expanded KV, which the host uploads once per group.
+//
+// Exact by construction, not by luck: a single thread owns one dot and walks
+// its 256 channels in index order with `__fmul_rn`/`__fadd_rn`, reproducing
+// the host's DOUBLE rounding -- the host translation unit builds without FMA,
+// so its `score += q[c] * kv[c]` is mulss+addss and a fused multiply-add would
+// mismatch. The `* score_scale` that follows is the host's separate multiply.
+//
+// Scores for row r, head h, token t live at
+// `row_offsets[r] * heads + h * count(r) + t`, where
+// `count(r) = row_offsets[r + 1] - row_offsets[r]`. The softmax stays on the
+// host: host libm and device trig differ in the last ulp, and it is 0.89% of
+// the attend core (record 0264), so there is nothing to gain by moving it.
+struct CudaGlm53SparseScoresRequest {
+    std::span<const float> query;  // rows * heads * head_dim
+    std::span<const float> expanded;  // union_rows * heads * 2 * head_dim
+    std::span<const std::uint32_t> local_indices;  // row_offsets[rows] entries
+    std::span<const std::uint32_t> row_offsets;  // rows + 1 entries
+    std::uint32_t rows{};
+    std::uint32_t union_rows{};
+    std::uint32_t heads{};
+    std::uint32_t head_dim{};
+    float score_scale{};
+};
+
 struct CudaLightningIndexRequest {
     // Queries are post-projection/RoPE BF16 values. CUDA applies normalized
     // Hadamard rotation and FP4 E2M1/per-32 E8M0 simulation before scoring.
@@ -1517,6 +1566,20 @@ public:
     [[nodiscard]] ValidationResult lightning_index(
         int device, const CudaLightningIndexRequest& request,
         std::span<std::uint32_t> output);
+    // Stage 4. Consumes the expansion, indices and offsets left resident by
+    // the immediately preceding glm53_sparse_scores call on this device, so
+    // the group's values never cross twice; `coefficients` shares the scores'
+    // layout and `attended` is rows * heads * head_dim.
+    [[nodiscard]] ValidationResult glm53_sparse_attend(
+        int device, std::span<const float> coefficients,
+        std::span<float> attended);
+    [[nodiscard]] ValidationResult glm53_sparse_scores(
+        int device, const CudaGlm53SparseScoresRequest& request,
+        std::span<float> scores);
+    [[nodiscard]] ValidationResult glm53_index_select(
+        int device, const CudaGlm53IndexSelectRequest& request,
+        std::span<std::uint32_t> selected,  // rows * 512 pool ids
+        std::span<std::uint32_t> counts);   // rows; 0 = identity row
     // Exact bounded-workspace Lightning Indexer over physical-format E4M3
     // learned-index pages. Selection is a parallel radix select over a
     // composite (score, position) key rather than the serial insertion merge

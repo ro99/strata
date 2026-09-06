@@ -5881,3 +5881,208 @@ cudaError_t regfed_grow(void*& pointer, std::uint64_t& capacity,
     return cudaMemsetAsync(pointer, 0, static_cast<std::size_t>(required),
                            stream);
 }
+
+// GLM-5.3 k-pool prefill selection, one BLOCK per prompt row (stage 2 of the
+// device-attention build). Scoring mirrors glm53_sparse_index_select exactly:
+// scalar chains over channels in index order, sequential accumulation over the
+// 32 heads, then insertion-kept top-512 with (score desc, pool asc) tie order
+// matching the host partial_sort comparator. Identical inputs therefore select
+// identical sets by construction; the runtime gates the sets
+// element-for-element against the host path. Rows with visible <= 2048 report
+// count 0 and the caller fills the dense range, exactly like the host branch.
+//
+// One thread per POOL, not one per row. Each pool's score is still computed
+// end to end by a single thread in strict index order, so distributing pools
+// across threads changes no reduction order -- but the first shape ran one
+// thread per row with 4 KiB of per-thread top-k arrays, which spill to local
+// memory, and it cost 7 s against a host path that costs 0.1 s. Scores and the
+// top-k live in shared memory here, and the serial ranking reads them there.
+__global__ void glm53_index_select_kernel(
+    const float* __restrict__ index_query,  // [rows][32][128]
+    const float* __restrict__ head_weights,  // [rows][32]
+    const float* __restrict__ pool_keys,  // [pools][128]
+    std::uint32_t rows, std::uint32_t pools, std::uint32_t history_begin,
+    float score_scale, float head_scale,
+    std::uint32_t* __restrict__ out_sets,  // [rows][512]
+    std::uint32_t* __restrict__ out_counts) {
+    const std::uint32_t row = static_cast<std::uint32_t>(blockIdx.x);
+    if (row >= rows) return;
+    const std::uint32_t visible = history_begin + row + 1U;
+    if (visible <= 2048U) {
+        if (threadIdx.x == 0U) out_counts[row] = 0U;
+        return;
+    }
+    // The host scores pools [0, visible/4): complete pools only, exactly as
+    // glm53_sparse_index_select derives them from the same visible.
+    const std::uint32_t row_pools = visible / 4U;
+    const std::uint32_t bound = row_pools < pools ? row_pools : pools;
+    // Keeping every pool is the identity selection: the host's partial_sort
+    // ranks them but expand_pool_selection then sorts the chosen set ascending,
+    // so when keep == bound the result is {0..bound-1} whatever the scores are.
+    // Skipping the scoring here is therefore exact, not an approximation, and
+    // it covers roughly half the active rows at a 2,591-token prompt.
+    if (bound <= 512U) {
+        for (std::uint32_t pool = threadIdx.x; pool < bound;
+             pool += blockDim.x) {
+            out_sets[static_cast<std::uint64_t>(row) * 512U + pool] = pool;
+        }
+        if (threadIdx.x == 0U) out_counts[row] = bound;
+        return;
+    }
+    extern __shared__ float glm53_index_shared[];
+    float* scores = glm53_index_shared;
+    float* top_score = scores + pools;
+    std::uint32_t* top_pool =
+        reinterpret_cast<std::uint32_t*>(top_score + 512U);
+    for (std::uint32_t pool = threadIdx.x; pool < bound; pool += blockDim.x) {
+        const float* key =
+            pool_keys + static_cast<std::uint64_t>(pool) * 128U;
+        float score = 0.0F;
+        for (std::uint32_t head = 0U; head < 32U; ++head) {
+            const float* q = index_query +
+                (static_cast<std::uint64_t>(row) * 32U + head) * 128U;
+            float dot = 0.0F;
+            for (std::uint32_t channel = 0U; channel < 128U; ++channel) {
+                // Double rounding, exactly like the host: the host TU builds
+                // without FMA, so its plain += is SSE2 mulss+addss (two
+                // roundings), not a contraction. Single-rounding fmaf here
+                // mismatches essentially every dot. __fmul_rn/__fadd_rn pin
+                // the two roundings explicitly so neither compiler may fuse.
+                dot = __fadd_rn(dot, __fmul_rn(q[channel], key[channel]));
+            }
+            const float term = __fmul_rn(
+                __fmul_rn(head_weights[static_cast<std::uint64_t>(row) *
+                                        32U +
+                                        head],
+                          head_scale),
+                fmaxf(0.0F, __fmul_rn(dot, score_scale)));
+            score = __fadd_rn(score, term);
+        }
+        scores[pool] = score;
+    }
+    __syncthreads();
+    // The ranking stays serial: it is the host's comparator and its result
+    // depends on insertion order, so it cannot be parallelised without
+    // changing which of two equal scores wins. Shared memory is what makes
+    // that affordable.
+    if (threadIdx.x == 0U) {
+        std::uint32_t filled = 0U;
+        for (std::uint32_t pool = 0U; pool < bound; ++pool) {
+            const float score = scores[pool];
+            std::uint32_t pos = 0U;
+            while (pos < filled &&
+                   (top_score[pos] > score ||
+                    (top_score[pos] == score && top_pool[pos] < pool))) {
+                ++pos;
+            }
+            if (pos >= 512U) continue;
+            const std::uint32_t limit = filled < 512U ? filled : 511U;
+            for (std::uint32_t i = limit; i > pos; --i) {
+                top_score[i] = top_score[i - 1U];
+                top_pool[i] = top_pool[i - 1U];
+            }
+            top_score[pos] = score;
+            top_pool[pos] = pool;
+            if (filled < 512U) ++filled;
+        }
+        for (std::uint32_t i = 0U; i < 512U; ++i) {
+            out_sets[static_cast<std::uint64_t>(row) * 512U + i] = top_pool[i];
+        }
+        out_counts[row] = 512U;
+    }
+}
+
+// GLM-5.3 sparse-page attention scores (stage 3). One thread owns one
+// (row, head, attended token) dot and walks its channels in index order with
+// the host's double rounding, so the scores are bit-identical to the host
+// attend core's and the softmax that follows on the host sees the same inputs.
+// Threads are independent, so nothing here depends on how they are scheduled.
+__global__ void glm53_sparse_scores_kernel(
+    const float* __restrict__ query,  // [rows][head_dim][heads]
+    const float* __restrict__ keys,  // [union][head_dim][heads]
+    const std::uint32_t* __restrict__ local_indices,
+    const std::uint32_t* __restrict__ row_offsets,
+    std::uint32_t heads, std::uint32_t head_dim, float score_scale,
+    float* __restrict__ scores) {
+    const std::uint32_t row = static_cast<std::uint32_t>(blockIdx.y);
+    const std::uint32_t begin = row_offsets[row];
+    const std::uint32_t count = row_offsets[row + 1U] - begin;
+    if (count == 0U) return;
+    const std::uint64_t total = static_cast<std::uint64_t>(heads) * count;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t index =
+             static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < total; index += stride) {
+        // HEAD IS THE FAST AXIS, and both operands are stored head-minor.
+        // A warp therefore covers 32 consecutive heads of the same token and
+        // reads 32 contiguous floats per column -- one 128-byte transaction.
+        // The first shape of this kernel put the token on the fast axis with
+        // head-major operands, so a warp touched 32 rows 64 KiB apart and used
+        // 4 bytes of every 128-byte transaction: 1/32 of the bus, and the
+        // kernel cost 12 s where the transfers cost under 2.
+        const std::uint32_t token = static_cast<std::uint32_t>(index / heads);
+        const std::uint32_t head = static_cast<std::uint32_t>(index % heads);
+        const std::uint32_t local = local_indices[begin + token];
+        const float* q = query +
+            static_cast<std::uint64_t>(row) * head_dim * heads + head;
+        const float* k = keys +
+            static_cast<std::uint64_t>(local) * head_dim * heads + head;
+        // The reduction itself stays strictly sequential over channels with
+        // the host's double rounding; only the memory layout changed.
+        float score = 0.0F;
+        for (std::uint32_t column = 0U; column < head_dim; ++column) {
+            score = __fadd_rn(
+                score, __fmul_rn(q[static_cast<std::uint64_t>(column) * heads],
+                                 k[static_cast<std::uint64_t>(column) * heads]));
+        }
+        scores[static_cast<std::uint64_t>(begin) * heads +
+               static_cast<std::uint64_t>(head) * count + token] =
+            __fmul_rn(score, score_scale);
+    }
+}
+
+// GLM-5.3 sparse-page AV accumulation (stage 4). One block per (row, head),
+// one thread per output column. The coefficient is uniform across the block so
+// it broadcasts, and both the value read and the output write are contiguous
+// across the warp -- the opposite layout choice from the score kernel, and the
+// right one here because the column is what varies across threads.
+//
+// Each thread accumulates over the attended tokens in index order with the
+// host's double rounding (`out[column] += coefficient * value[column]` is
+// mulss+addss in a translation unit built without FMA), so the result is
+// bit-identical to the host attend core.
+__global__ void glm53_sparse_attend_kernel(
+    const float* __restrict__ values,  // [union][heads][head_dim]
+    const float* __restrict__ coefficients,
+    const std::uint32_t* __restrict__ local_indices,
+    const std::uint32_t* __restrict__ row_offsets,
+    std::uint32_t heads, std::uint32_t head_dim,
+    float* __restrict__ attended) {  // [rows][heads][head_dim]
+    const std::uint32_t row = static_cast<std::uint32_t>(blockIdx.x);
+    const std::uint32_t head = static_cast<std::uint32_t>(blockIdx.y);
+    const std::uint32_t column = threadIdx.x;
+    if (column >= head_dim) return;
+    const std::uint32_t begin = row_offsets[row];
+    const std::uint32_t count = row_offsets[row + 1U] - begin;
+    float* out = attended +
+        (static_cast<std::uint64_t>(row) * heads + head) * head_dim + column;
+    if (count == 0U) {
+        *out = 0.0F;
+        return;
+    }
+    const float* coefficient = coefficients +
+        static_cast<std::uint64_t>(begin) * heads +
+        static_cast<std::uint64_t>(head) * count;
+    float accumulated = 0.0F;
+    for (std::uint32_t token = 0U; token < count; ++token) {
+        const std::uint32_t local = local_indices[begin + token];
+        const float value =
+            values[(static_cast<std::uint64_t>(local) * heads + head) *
+                       head_dim +
+                   column];
+        accumulated =
+            __fadd_rn(accumulated, __fmul_rn(coefficient[token], value));
+    }
+    *out = accumulated;
+}

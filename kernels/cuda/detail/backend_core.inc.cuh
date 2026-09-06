@@ -566,6 +566,12 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
         if (cudaStreamSynchronize(upload_stream) != cudaSuccess) {
             state.quarantined_weights.push_back(std::move(target));
         }
+        // The stream is drained, so every tracked slice is complete: recycle
+        // their events rather than leaking them on the error path.
+        for (const auto& slice : state.weight_host_staging_inflight) {
+            state.weight_host_staging_free_events.push_back(slice.event);
+        }
+        state.weight_host_staging_inflight.clear();
         return cuda_error(status, operation);
     };
     // cudaMemcpyAsync from an mmap-backed checkpoint is only superficially
@@ -596,9 +602,58 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
     const bool pinned_stage_ready =
         stage_pageable && state.weight_host_staging != nullptr &&
         payload_bytes <= state.weight_host_staging_bytes;
+    // Per-slice waits (record 0257): wait only on in-flight slices the new
+    // reservation actually overlaps. Wrap-around makes non-front overlap
+    // possible, so scan explicitly rather than assuming FIFO order.
+    const auto wait_staging_slice = [&](std::uint64_t begin,
+                                        std::uint64_t end) -> cudaError_t {
+        auto& inflight = state.weight_host_staging_inflight;
+        for (std::size_t index = 0U; index < inflight.size();) {
+            const auto& slice = inflight[index];
+            if (begin < slice.end && slice.begin < end) {
+                if (auto status = cudaEventSynchronize(slice.event);
+                    status != cudaSuccess) {
+                    return status;
+                }
+                state.weight_host_staging_free_events.push_back(slice.event);
+                inflight[index] = inflight.back();
+                inflight.pop_back();
+            } else {
+                ++index;
+            }
+        }
+        // Invariant guard: the ring bounds in-flight slices by construction.
+        // If bookkeeping ever leaks, drain once instead of growing forever.
+        if (inflight.size() > 1024U) {
+            if (auto status = cudaStreamSynchronize(upload_stream);
+                status != cudaSuccess) {
+                return status;
+            }
+            for (const auto& slice : inflight) {
+                state.weight_host_staging_free_events.push_back(slice.event);
+            }
+            inflight.clear();
+        }
+        return cudaSuccess;
+    };
+    const auto take_staging_event = [&](cudaEvent_t& event) -> cudaError_t {
+        if (!state.weight_host_staging_free_events.empty()) {
+            event = state.weight_host_staging_free_events.back();
+            state.weight_host_staging_free_events.pop_back();
+            return cudaSuccess;
+        }
+        return cudaEventCreateWithFlags(
+            &event, cudaEventDisableTiming | cudaEventBlockingSync);
+    };
     const auto reserve_staging = [&](std::uint64_t bytes,
                                      const std::byte*& source,
-                                     const std::byte* original) -> cudaError_t {
+                                     const std::byte* original,
+                                     std::uint64_t& slice_begin,
+                                     std::uint64_t& slice_end,
+                                     bool& staged) -> cudaError_t {
+        slice_begin = 0U;
+        slice_end = 0U;
+        staged = false;
         if (!pinned_stage_ready || bytes == 0U) {
             source = original;
             return cudaSuccess;
@@ -608,21 +663,46 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
                       ~(alignment - 1U);
         if (cursor > state.weight_host_staging_bytes ||
             bytes > state.weight_host_staging_bytes - cursor) {
-            // Every earlier slice is consumed by this one upload stream.  Wait
-            // only when the ring wraps, then recycle the whole arena at once.
-            const auto drained = cudaStreamSynchronize(upload_stream);
-            if (drained != cudaSuccess) return drained;
             cursor = 0U;
+        }
+        if (auto status = wait_staging_slice(cursor, cursor + bytes);
+            status != cudaSuccess) {
+            return status;
         }
         auto* destination = state.weight_host_staging + cursor;
         std::memcpy(destination, original, static_cast<std::size_t>(bytes));
         state.weight_host_staging_cursor = cursor + bytes;
         source = destination;
+        slice_begin = cursor;
+        slice_end = cursor + bytes;
+        staged = true;
+        return cudaSuccess;
+    };
+    // Record one staged slice's completion on the upload stream, right after
+    // its H2D enqueue, so a later reuse waits exactly on it. No-op when the
+    // payload bypassed the ring.
+    const auto track_staging_slice = [&](bool staged, std::uint64_t begin,
+                                         std::uint64_t end) -> cudaError_t {
+        if (!staged) return cudaSuccess;
+        cudaEvent_t event{};
+        if (auto status = take_staging_event(event);
+            status != cudaSuccess) {
+            return status;
+        }
+        if (auto status = cudaEventRecord(event, upload_stream);
+            status != cudaSuccess) {
+            state.weight_host_staging_free_events.push_back(event);
+            return status;
+        }
+        state.weight_host_staging_inflight.push_back({event, begin, end});
         return cudaSuccess;
     };
     const std::byte* weight_source = weights.data();
+    std::uint64_t weight_slice_begin = 0U, weight_slice_end = 0U;
+    bool weight_staged = false;
     if (auto status = reserve_staging(weights.size(), weight_source,
-                                      weights.data());
+                                      weights.data(), weight_slice_begin,
+                                      weight_slice_end, weight_staged);
         status != cudaSuccess) {
         return upload_error(status, "recycle pinned CUDA weight staging");
     }
@@ -631,6 +711,11 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
                                       cudaMemcpyHostToDevice, upload_stream);
         status != cudaSuccess) {
         return upload_error(status, "upload CUDA weights");
+    }
+    if (auto status = track_staging_slice(weight_staged, weight_slice_begin,
+                                          weight_slice_end);
+        status != cudaSuccess) {
+        return upload_error(status, "track pinned CUDA weight staging");
     }
     copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     if (expected_scales != 0U) {
@@ -646,8 +731,11 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
                 elapsed_nanoseconds_since(scale_allocation_started);
         }
         const std::byte* scale_source = scales.data();
+        std::uint64_t scale_slice_begin = 0U, scale_slice_end = 0U;
+        bool scale_staged = false;
         if (auto status = reserve_staging(scales.size(), scale_source,
-                                          scales.data());
+                                          scales.data(), scale_slice_begin,
+                                          scale_slice_end, scale_staged);
             status != cudaSuccess) {
             return upload_error(status, "recycle pinned CUDA scale staging");
         }
@@ -656,6 +744,11 @@ ValidationResult CudaBackend::upload(int device, const CudaWeightDescriptor& des
                                           cudaMemcpyHostToDevice, upload_stream);
             status != cudaSuccess) {
             return upload_error(status, "upload CUDA scales");
+        }
+        if (auto status = track_staging_slice(scale_staged, scale_slice_begin,
+                                              scale_slice_end);
+            status != cudaSuccess) {
+            return upload_error(status, "track pinned CUDA scale staging");
         }
         copy_nanoseconds += elapsed_nanoseconds_since(copy_started);
     }

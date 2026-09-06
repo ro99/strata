@@ -181,6 +181,19 @@ struct CudaBackend::Impl {
         std::byte* weight_host_staging{};
         std::uint64_t weight_host_staging_bytes{};
         std::uint64_t weight_host_staging_cursor{};
+        // Per-slice completion for the staging ring (record 0257): each
+        // upload records an event over the slice it consumed, and reuse
+        // waits only on slices it actually overlaps instead of draining the
+        // whole copy stream on every wrap. Same copies, finer waits, zero
+        // extra pinned memory. Events recycle through the free list; the
+        // in-flight list is bounded by the safety valve in upload().
+        struct StagingSlice {
+            cudaEvent_t event{};
+            std::uint64_t begin{};
+            std::uint64_t end{};
+        };
+        std::vector<StagingSlice> weight_host_staging_inflight;
+        std::vector<cudaEvent_t> weight_host_staging_free_events;
         // Register-fed fused MoE workspaces: split-K partials for gate, up and
         // down, plus the two B-fragment activation buffers. Grown geometrically
         // and kept, so a decode step that repeats the same shapes allocates
@@ -468,6 +481,15 @@ struct CudaBackend::Impl {
                 static_cast<void>(cudaFree(state.upload_prepack_scratch));
             }
             if (state.weight_host_staging != nullptr) {
+                for (const auto& slice : state.weight_host_staging_inflight) {
+                    static_cast<void>(cudaEventSynchronize(slice.event));
+                    static_cast<void>(cudaEventDestroy(slice.event));
+                }
+                state.weight_host_staging_inflight.clear();
+                for (auto event : state.weight_host_staging_free_events) {
+                    static_cast<void>(cudaEventDestroy(event));
+                }
+                state.weight_host_staging_free_events.clear();
                 static_cast<void>(cudaFreeHost(state.weight_host_staging));
             }
             for (void* pointer : {state.moe_regfed.activation,
@@ -662,6 +684,15 @@ struct CudaBackend::Impl {
             }
             if (state.upload_stream != nullptr) {
                 static_cast<void>(cudaStreamSynchronize(state.upload_stream));
+                for (const auto& slice : state.weight_host_staging_inflight) {
+                    state.weight_host_staging_free_events.push_back(
+                        slice.event);
+                }
+                state.weight_host_staging_inflight.clear();
+                for (auto event : state.weight_host_staging_free_events) {
+                    static_cast<void>(cudaEventDestroy(event));
+                }
+                state.weight_host_staging_free_events.clear();
                 static_cast<void>(cudaStreamDestroy(state.upload_stream));
             }
             if (state.moe_shared_stream != nullptr) {

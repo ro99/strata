@@ -585,6 +585,68 @@ campaign is closed here with the measurements, the instrument, the
 exact-but-currently-neutral device stages and fix (1b) landed, and this is the
 state to resume from.
 
+### The page union is dense, and what that costs fix (1)
+
+Measured on the bench at layer 19, 2,048 rows, smoothing 0.975, pinned to NUMA
+node 1 (the 3090s' socket), with `page_expand=`/`page_union=` added to the
+`[glm53-sparse-groups]` line so a run says which path it took:
+
+| history | visible positions | page union | budget needed |
+| --- | --- | --- | --- |
+| 4,096 | 6,144 | 6,135 (99.85%) | 6,144 |
+| 8,192 | 10,240 | 10,234 (99.94%) | 10,240 |
+| 16,384 | 18,432 | >12,288 | ~18,432 |
+
+**The union of a page's selections is every visible position.** The k-pool
+indexer is sparse per row and dense per page: 2,048 rows selecting ~2,051
+positions each cover the whole history. Three consequences.
+
+First, `kPageExpansionBudgetRows` must equal `context + page_rows` for fix (1)
+to engage at all, so no constant fixes it -- at the shipped 8,192 the path
+disengages from history 8,192 onward, which is every shape this campaign
+targets. `STRATA_GLM53_PAGE_EXPAND_ROWS` makes it tunable for that sweep;
+raising it to 12,288 re-engages history 8,192 and is worth 1.35x on the
+layer-page (199.59 s -> 147.37 s, expansion 27.98 s -> 0.38 s, checksum
+`0x710ba7ddaefe367a` in both arms). Keep it as breathing room, not as a fix.
+
+Second, fix (2)'s per-token cache stores the same set the page union already
+does, so it is the correct form of fix (1) rather than an alternative -- but an
+expanded row is 64x its latent row (32,768 values against 512), so at 262,144
+tokens one layer's cache is 17.2 GB at BF16 and eleven are 189 GB. Neither
+residence proposed for it survives that: all eleven layers do not fit host
+memory beside the mmap'd checkpoint, and one layer does not fit a 24 GiB card
+beside the expert arena. The BF16 storage itself is free and worth taking --
+the expansion already passes `bf16_output = true`, so those values are BF16
+precision in F32 containers -- but it buys one doubling, not an order.
+
+Third, QK and AV are **flat in history**: 91.85/91.91/91.61 s and
+63.93/64.04/63.98 s across 8,192, 16,384 and 30,720. Every context-dependent
+term in sparse MLA is expansion or per-group overhead. QK runs 68.8 GMAC in
+91.6 s -- 0.75 GMAC/s, against 460 GMAC/s measured for the expansion GEMM on
+the same box -- so that loop is bound by streaming 64 KiB of expanded K per
+(row, position) pair, not by arithmetic.
+
+That is the case for absorption. `CudaBackend::glm_absorbed_attention` already
+implements it exactly for GLM-5.2's dense window, and it composes with per-row
+sparse selection: fold `kv_b_proj` into the query, dot against the stored
+latent, accumulate AV in latent space, project out once per row. It never
+materializes expanded K/V, so the grouping, the expansion budget, fix (1) and
+fix (2) all become unnecessary rather than optimized. It roughly doubles the
+QK/AV MACs and cuts their memory traffic 32-64x, which is the right side of the
+trade on a loop measured at 0.75 GMAC/s. GLM-5.3's sparse path is the one path
+that excludes itself from it (`glm53_runtime.cpp`, "Sparse contexts have their
+own independent device entry point below and never share the <=2,048 resident
+MLA kernels").
+
+Caveats. These are synthetic activations calibrated to match a real arm's group
+count; union coverage is a different statistic than group count and should be
+confirmed against one real arm before anyone acts on it. The split is read from
+one profile at one layer -- layer 19 is among the two worst-fragmenting -- and
+must not be scaled to a full-prefill figure. Absorption reassociates the
+arithmetic and so will not be bit-identical to the current path; that is a
+linear-algebra-exact change, not a routing approximation, but it needs the same
+owner ruling and re-baseline the resident-MLA landing took.
+
 Correction to earlier figures in this campaign: the fragmentation totals at
 8,192 tokens are 904 groups and 3.60M row-expansions -- 126x the expansions for
 3.16x the tokens -- at an effective 446 GMAC/s, which supersedes an earlier

@@ -1101,6 +1101,24 @@ static_assert(kSparseExpansionRows >= kIndexSelectionWidth);
 // This only caps the working set; the change that removes the budget entirely
 // is expanding each latent row once when it enters the cache.
 constexpr std::uint32_t kPageExpansionBudgetRows = 8192U;
+// The budget above is a working-set cap, not a correctness bound, so it is
+// worth sweeping: measured at layer 19 the page union is 6,135 rows at history
+// 4,096 (path engages, expansion 0.22 s) and crosses the cap by four rows at
+// history 8,192 (path disengages, expansion 27.98 s). The ceiling is the MLA
+// activation workspace -- one expanded row is 128 KiB, against a 2 GiB reserve
+// -- so this cannot simply go to the context length without chunking the
+// expansion, which §7's batch-invariance result makes exact.
+[[nodiscard]] std::uint32_t page_expansion_budget_rows() noexcept {
+    static const std::uint32_t rows = [] {
+        const char* value = std::getenv("STRATA_GLM53_PAGE_EXPAND_ROWS");
+        if (value == nullptr) return kPageExpansionBudgetRows;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        if (end == value || parsed == 0UL) return kPageExpansionBudgetRows;
+        return static_cast<std::uint32_t>(parsed);
+    }();
+    return rows;
+}
 
 // Whether a sequence runs the k-pool indexer at all. Only the host attention
 // path implements it, so this decides where a sequence's MLA attention lives.
@@ -7472,10 +7490,10 @@ struct Glm53Runtime::Impl {
                                selection[row].begin(), selection[row].end(),
                                std::back_inserter(page_merged));
                 page_union.swap(page_merged);
-                if (page_union.size() > kPageExpansionBudgetRows) break;
+                if (page_union.size() > page_expansion_budget_rows()) break;
             }
             if (!page_union.empty() &&
-                page_union.size() <= kPageExpansionBudgetRows) {
+                page_union.size() <= page_expansion_budget_rows()) {
                 const auto page_size =
                     static_cast<std::uint32_t>(page_union.size());
                 static_cast<void>(glm53_grow(
@@ -7885,6 +7903,14 @@ struct Glm53Runtime::Impl {
                       << " page_rows=" << rows
                       << " history_begin=" << history_begin
                       << " groups=" << call_groups
+                      // Whether fix (1)'s page union engaged, and how wide it
+                      // was. It disengages silently above
+                      // kPageExpansionBudgetRows, falling back to the per-group
+                      // GEMMs, and that cliff is a function of history -- so a
+                      // run that does not say which path it took cannot be
+                      // compared against one that took the other.
+                      << " page_expand=" << (use_page_expansion ? 1 : 0)
+                      << " page_union=" << page_union.size()
                       << " mean_group_rows="
                       << (call_groups == 0U
                               ? 0.0

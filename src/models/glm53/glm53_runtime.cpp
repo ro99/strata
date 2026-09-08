@@ -677,6 +677,42 @@ __attribute__((target("avx2,fma")))
     return glm53_host_fp8_dot_scalar(weights, scales, input);
 }
 
+// 256-wide F32 dot for the MLA attend core (G2 experiment, default OFF via
+// STRATA_GLM53_AVX2_ATTEND). Eight FMA accumulators broken out exactly as in
+// glm53_host_fp8_dot_avx2, minus the FP8 decode: plain loads instead. FMA
+// fuses and the 8-way split reassociates, so this is NOT bit-identical to the
+// scalar loop -- same change class as absorption, separately gated.
+#if STRATA_GLM53_HOST_AVX2
+__attribute__((target("avx2,fma")))
+[[nodiscard]] float glm53_mla_dot256_avx2(const float* q,
+                                          const float* kv) noexcept {
+    __m256 accumulators[8]{
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (std::uint32_t base = 0U; base < 256U; base += 64U) {
+        for (std::uint32_t group = 0U; group < 8U; ++group) {
+            const auto offset = base + group * 8U;
+            accumulators[group] = _mm256_fmadd_ps(
+                _mm256_loadu_ps(q + offset), _mm256_loadu_ps(kv + offset),
+                accumulators[group]);
+        }
+    }
+    for (std::uint32_t width = 4U; width != 0U; width >>= 1U) {
+        for (std::uint32_t index = 0U; index < width; ++index) {
+            accumulators[index] = _mm256_add_ps(
+                accumulators[index], accumulators[index + width]);
+        }
+    }
+    const __m128 low = _mm256_castps256_ps128(accumulators[0]);
+    const __m128 high = _mm256_extractf128_ps(accumulators[0], 1);
+    __m128 total = _mm_add_ps(low, high);
+    total = _mm_hadd_ps(total, total);
+    total = _mm_hadd_ps(total, total);
+    return _mm_cvtss_f32(total);
+}
+#endif
+
 // E8M0 is a bare binary exponent biased by 127, so the whole format is 255
 // powers of two plus one NaN code. Decoding it through a table keeps the inner
 // loop free of ldexp and lets the AVX2 path broadcast a plain float.
@@ -1066,6 +1102,60 @@ constexpr std::uint32_t kVocabulary = 154880U;
 // tokens is roughly 8.8 GiB, which this host holds comfortably. The checkpoint
 // itself declares 1,048,576; that is not offered until it has been measured.
 constexpr std::uint32_t kMaximumSupportedContext = 262144U;
+// One head's AV accumulation over its selected tokens with register-resident
+// FMA accumulators (G2 experiment, same flag/contract as the dot above).
+// 32 accumulators cover the 256-wide row in 8-float lanes and are stored
+// once at the end, so ~2,051 read-modify-writes per output row become one
+// write. Lives here (not with the dot helper) because it reads kHeads and
+// kMlaHead. Callees without a target attribute (bf16_round_f32) inline INTO
+// AVX2 code without issue; only the reverse direction is forbidden.
+#if STRATA_GLM53_HOST_AVX2
+__attribute__((target("avx2,fma")))
+inline void glm53_mla_av_head_avx2(float* out, const float* scores,
+                                   float total, const float* expanded,
+                                   const std::uint32_t* local,
+                                   std::uint32_t attended_rows,
+                                   std::uint32_t head,
+                                   bool raw_coeff) noexcept {
+    __m256 vacc[32];
+    for (std::uint32_t vacc_init = 0U; vacc_init < 32U; ++vacc_init) {
+        vacc[vacc_init] = _mm256_setzero_ps();
+    }
+    for (std::uint32_t token = 0U; token < attended_rows; ++token) {
+        const float coefficient = raw_coeff ? scores[token] / total
+                                            : bf16_round_f32(scores[token] /
+                                                              total);
+        const float* const value = expanded +
+            (static_cast<std::size_t>(local[token]) * kHeads + head) *
+                (2U * kMlaHead) + kMlaHead;
+        const __m256 coeff_vec = _mm256_set1_ps(coefficient);
+        for (std::uint32_t vacc_col = 0U; vacc_col < 32U; ++vacc_col) {
+            vacc[vacc_col] = _mm256_fmadd_ps(
+                _mm256_loadu_ps(value + vacc_col * 8U), coeff_vec,
+                vacc[vacc_col]);
+        }
+    }
+    for (std::uint32_t vacc_col = 0U; vacc_col < 32U; ++vacc_col) {
+        _mm256_storeu_ps(out + vacc_col * 8U, vacc[vacc_col]);
+    }
+}
+
+// One token-head AV step over the streaming layout (G2 experiment, same
+// flag/contract as above): FMA one token's contiguous V half, scaled by its
+// coefficient, into the head's 256-wide accumulator row. Called per
+// (token, head) from unattributed code -- the call crossing is the point,
+// since always_inline intrinsics cannot live in the caller.
+__attribute__((target("avx2,fma")))
+inline void glm53_mla_av_token_avx2(float* acc_row, const float* v_half,
+                                    float coeff) noexcept {
+    const __m256 c = _mm256_set1_ps(coeff);
+    for (std::uint32_t k = 0U; k < 32U; ++k) {
+        __m256 acc = _mm256_loadu_ps(acc_row + k * 8U);
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(v_half + k * 8U), c, acc);
+        _mm256_storeu_ps(acc_row + k * 8U, acc);
+    }
+}
+#endif
 // GLM-5.3 k-pool sparse indexer (record 0237). The checkpoint ships 84 indexer
 // tensors that this adapter loaded and validated but never used, attending
 // densely instead. That is exact only while history <= kIndexTopK, because
@@ -1101,6 +1191,24 @@ static_assert(kSparseExpansionRows >= kIndexSelectionWidth);
 // This only caps the working set; the change that removes the budget entirely
 // is expanding each latent row once when it enters the cache.
 constexpr std::uint32_t kPageExpansionBudgetRows = 8192U;
+// The budget above is a working-set cap, not a correctness bound, so it is
+// worth sweeping: measured at layer 19 the page union is 6,135 rows at history
+// 4,096 (path engages, expansion 0.22 s) and crosses the cap by four rows at
+// history 8,192 (path disengages, expansion 27.98 s). The ceiling is the MLA
+// activation workspace -- one expanded row is 128 KiB, against a 2 GiB reserve
+// -- so this cannot simply go to the context length without chunking the
+// expansion, which §7's batch-invariance result makes exact.
+[[nodiscard]] std::uint32_t page_expansion_budget_rows() noexcept {
+    static const std::uint32_t rows = [] {
+        const char* value = std::getenv("STRATA_GLM53_PAGE_EXPAND_ROWS");
+        if (value == nullptr) return kPageExpansionBudgetRows;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        if (end == value || parsed == 0UL) return kPageExpansionBudgetRows;
+        return static_cast<std::uint32_t>(parsed);
+    }();
+    return rows;
+}
 
 // Whether a sequence runs the k-pool indexer at all. Only the host attention
 // path implements it, so this decides where a sequence's MLA attention lives.
@@ -1495,20 +1603,25 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
 // KDA layers through the device page primitive while the 11 MLA layers keep
 // the existing host fallback inside forward_layer_page_device. Opt-in and
 // off by default; the dense device-prefill contract above is unchanged.
-// Expand a layer-page's whole selection union once and slice each group out
-// of it, instead of re-running kv_b_proj per group. Above the point where a
-// page stops fitting in one group this is most of the sparse attention cost:
-// at 8,192 tokens layers 19 and 23 shatter one page into 86 and 75 groups that
-// each re-expand close to the 4,096-row cap to serve 24-27 query rows (record
-// 0268). Exact by construction -- a group's rows are the same floats the
-// per-group GEMM produced, copied rather than recomputed -- but landed OFF
-// because it has not been measured end to end. Record 0269 has the arithmetic.
+// Expand a layer-page's whole selection union once and index each group in
+// place out of it, instead of re-running kv_b_proj per group. Above the point
+// where a page stops fitting in one group this is most of the sparse attention
+// cost: at 8,192 tokens layers 19 and 23 shatter one page into 86 and 75 groups
+// that each re-expand close to the 4,096-row cap to serve 24-27 query rows
+// (record 0268). Exact by construction -- the old per-group buffer was a memcpy
+// of page_expanded rows, so indexing the page directly reads the same floats in
+// the same within-row order. Default ON since fix (1b) removed the slicing memcpy
+// (record 0270): bench at layer 19 / history 4,096 goes 48.3 s -> 22.5 s at the
+// calibrated 87-group shape and 184.8 s -> 68.9 s at the 755-group worst case,
+// identical checksums, with the hash gate green on a 2,591-token arm.
+// STRATA_GLM53_PAGE_EXPAND=0 restores the per-group GEMM path for A/B work.
 [[nodiscard]] bool page_expand_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GLM53_PAGE_EXPAND");
-        return value != nullptr && std::string_view(value) != "0" &&
-               std::string_view(value) != "false" &&
-               std::string_view(value) != "off";
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
     }();
     return enabled;
 }
@@ -1533,6 +1646,50 @@ constexpr std::uint64_t kMinimumDeviceBudget = 2ULL << 30U;
     }();
     return enabled;
 }
+
+// G2: AVX2+FMA versions of the sparse attend core's host QK dot and AV
+// accumulate, following the glm53_host_fp8_dot_avx2 pattern. Default ON:
+// FMA fuses and the 8/32-way splits reassociate, so the last bits move --
+// the owner ruled this acceptable on 2026-09-07 (accuracy, not
+// bit-reproducibility, is the standard). STRATA_GLM53_AVX2_ATTEND=0 restores
+// the scalar path as the A/B control.
+// G2: token-outer/head-inner traversal of the sparse host QK/AV. One token's
+// contiguous 128 KiB row serves all 64 heads in order instead of each head
+// striding 128 KiB between its tokens. Default ON: bit-identical by
+// construction (same dots, same softmax, same accumulation order -- bench
+// checksum unchanged, full-arm hash gate green), so no owner ruling is needed.
+// STRATA_GLM53_INTERCHANGE=0 restores the head-outer order for A/B work.
+[[nodiscard]] bool interchange_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_INTERCHANGE");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool avx2_attend_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GLM53_AVX2_ATTEND");
+        return value == nullptr ||
+               (std::string_view(value) != "0" &&
+                std::string_view(value) != "false" &&
+                std::string_view(value) != "off");
+    }();
+    return enabled;
+}
+
+#if STRATA_GLM53_HOST_AVX2
+[[nodiscard]] bool glm53_cpu_has_avx2_fma() noexcept {
+    static const bool ok =
+        __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return ok;
+}
+#else
+[[nodiscard]] bool glm53_cpu_has_avx2_fma() noexcept { return false; }
+#endif
 
 [[nodiscard]] bool index_check_enabled() noexcept {
     static const bool enabled = [] {
@@ -7467,10 +7624,10 @@ struct Glm53Runtime::Impl {
                                selection[row].begin(), selection[row].end(),
                                std::back_inserter(page_merged));
                 page_union.swap(page_merged);
-                if (page_union.size() > kPageExpansionBudgetRows) break;
+                if (page_union.size() > page_expansion_budget_rows()) break;
             }
             if (!page_union.empty() &&
-                page_union.size() <= kPageExpansionBudgetRows) {
+                page_union.size() <= page_expansion_budget_rows()) {
                 const auto page_size =
                     static_cast<std::uint32_t>(page_union.size());
                 static_cast<void>(glm53_grow(
@@ -7497,7 +7654,8 @@ struct Glm53Runtime::Impl {
                                2U * kMlaHead);
                 const std::array<Glm53WeightCache::LinearRequest, 1U>
                     page_expand{{{bases[3], kHeads * 2U * kMlaHead, kKvRank,
-                                  page_gathered, page_size, page_out, true}}};
+                                  page_gathered, page_size, page_out,
+                                  true}}};
                 const auto page_expand_started = config.phase_profile
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
@@ -7538,19 +7696,37 @@ struct Glm53Runtime::Impl {
                 static_cast<std::uint32_t>(group_union.size());
             ++call_groups;
             call_expanded_rows += expanded_rows;
-            static_cast<void>(glm53_grow(
-                mla_expanded_scratch,
-                static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
-                    kMlaHead));
-            const auto expanded = std::span<float>(mla_expanded_scratch)
-                .first(static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
-                       kMlaHead);
+            // Fix (1b): index in place into the page expansion. When the page
+            // union is live and the device stages are off, the host QK/AV loops
+            // below read through mla_page_pos into page_expanded directly and
+            // this per-group materialization (a GEMM-sized memcpy) is skipped.
+            // Grouping still tiles ROWS, so each row's softmax reduction stays
+            // whole and the output is bit-identical: the old buffer was a
+            // memcpy of page_expanded rows, so indexing the page directly reads
+            // the same floats in the same within-row order. The device path
+            // keeps the compact per-group buffer it uploads, so in-place
+            // engages only on the host path.
+            const bool page_index_in_place =
+                use_page_expansion && !device_attend_enabled();
+            std::span<float> expanded;
+            std::span<const float> active_expanded;
             const auto expand_started = config.phase_profile
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
             // Empty unless this group ran its own GEMM; the invariance probe
             // below needs that input and is skipped on the sliced path.
             std::span<const float> gathered;
+            if (page_index_in_place) {
+                active_expanded = page_expanded;
+            } else {
+            static_cast<void>(glm53_grow(
+                mla_expanded_scratch,
+                static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                    kMlaHead));
+            expanded = std::span<float>(mla_expanded_scratch)
+                .first(static_cast<std::size_t>(expanded_rows) * kHeads * 2U *
+                       kMlaHead);
+            active_expanded = std::span<const float>(expanded);
             if (use_page_expansion) {
                 constexpr auto expanded_stride =
                     static_cast<std::size_t>(kHeads) * 2U * kMlaHead;
@@ -7589,7 +7765,8 @@ struct Glm53Runtime::Impl {
                 }
                 const std::array<Glm53WeightCache::LinearRequest, 1U> expand{
                     {{bases[3], kHeads * 2U * kMlaHead, kKvRank,
-                      group_gathered, expanded_rows, expanded, true}}};
+                      group_gathered, expanded_rows, expanded,
+                      true}}};
                 result = linear_batch(expand, layer);
                 if (!result.ok()) return result;
                 gathered = std::span<const float>(group_gathered);
@@ -7599,6 +7776,7 @@ struct Glm53Runtime::Impl {
                     elapsed_nanoseconds(expand_started),
                     std::memory_order_relaxed);
             }
+            }  // end non-in-place per-group materialization
             // Batch-invariance probe (record 0269): expand the same union
             // as two half-batches and compare bit for bit against the
             // single-batch expansion above. Probe outputs are discarded;
@@ -7661,10 +7839,17 @@ struct Glm53Runtime::Impl {
                  ++position) {
                 const auto& chosen = selection[group_begin + position];
                 for (const auto pick : chosen) {
+                    if (page_index_in_place) {
+                        // Direct page position: page_expanded[mla_page_pos[pick]]
+                        // is the same floats the old copy staged into the group
+                        // buffer, so the host dots below read identical inputs.
+                        flat_local.push_back(mla_page_pos[pick]);
+                    } else {
                     flat_local.push_back(static_cast<std::uint32_t>(
                         std::lower_bound(group_union.begin(),
                                          group_union.end(), pick) -
                         group_union.begin()));
+                    }
                 }
                 row_offsets.push_back(
                     static_cast<std::uint32_t>(flat_local.size()));
@@ -7682,6 +7867,10 @@ struct Glm53Runtime::Impl {
             auto& device_scores = mla_device_scores;
             const bool attend_on_device =
                 device_attend_enabled() && !flat_local.empty();
+            // G2 experiment: vectorised host dots when asked and supported;
+            // the device and scalar paths below are untouched.
+            const bool use_avx2 =
+                avx2_attend_enabled() && glm53_cpu_has_avx2_fma();
             if (attend_on_device) {
                 device_scores.resize(
                     static_cast<std::size_t>(flat_local.size()) * kHeads);
@@ -7690,7 +7879,7 @@ struct Glm53Runtime::Impl {
                 scores_request.query = std::span<const float>(query).subspan(
                     static_cast<std::size_t>(group_begin) * kMlaWidth,
                     static_cast<std::size_t>(group_rows) * kMlaWidth);
-                scores_request.expanded = expanded;
+                scores_request.expanded = active_expanded;
                 scores_request.local_indices = flat_local;
                 scores_request.row_offsets = row_offsets;
                 scores_request.rows = group_rows;
@@ -7730,6 +7919,111 @@ struct Glm53Runtime::Impl {
                     return profile ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
                 };
+                if (interchange_enabled() && !attend_on_device) {
+                    // G2 experiment: token-outer, head-inner. Each token's
+                    // contiguous row is read once and dotted against all 64
+                    // heads, then read once more while accumulating into 64
+                    // cache-resident rows. Same dots, same softmax, same
+                    // per-(head,column) accumulation order: bit-identical.
+                    const bool iavx2 = use_avx2;
+                    std::vector<float> iscores(
+                        static_cast<std::size_t>(kHeads) * attended_rows, 0.0F);
+                    std::vector<float> ihigh(static_cast<std::size_t>(kHeads),
+                        -std::numeric_limits<float>::infinity());
+                    const auto iqk_stamp = stamp();
+                    for (std::uint32_t itok = 0U; itok < attended_rows; ++itok) {
+                        const std::uint32_t gtok = local[itok];
+                        for (std::uint32_t ihead = 0U; ihead < kHeads; ++ihead) {
+                            const float* const iq = query.data() +
+                                (static_cast<std::size_t>(row) * kHeads +
+                                 ihead) * kMlaHead;
+                            const float* const ikv = active_expanded.data() +
+                                (static_cast<std::size_t>(gtok) * kHeads +
+                                 ihead) * (2U * kMlaHead);
+                            float iscore = 0.0F;
+#if STRATA_GLM53_HOST_AVX2
+                            if (iavx2) {
+                                iscore = glm53_mla_dot256_avx2(iq, ikv);
+                            } else
+#endif
+                            {
+                                for (std::uint32_t ic = 0U; ic < kMlaHead;
+                                     ++ic) {
+                                    iscore += iq[ic] * ikv[ic];
+                                }
+                            }
+                            const std::size_t islot =
+                                static_cast<std::size_t>(ihead) * attended_rows +
+                                itok;
+                            iscores[islot] = iscore * score_scale;
+                            ihigh[ihead] =
+                                std::max(ihigh[ihead], iscores[islot]);
+                        }
+                    }
+                    const auto ism_stamp = stamp();
+                    std::vector<float> itotal(static_cast<std::size_t>(kHeads),
+                                              0.0F);
+                    for (std::uint32_t ihead = 0U; ihead < kHeads; ++ihead) {
+                        float* const irow_scores = iscores.data() +
+                            static_cast<std::size_t>(ihead) * attended_rows;
+                        float itot = 0.0F;
+                        for (std::uint32_t itok = 0U; itok < attended_rows;
+                             ++itok) {
+                            irow_scores[itok] =
+                                std::exp(irow_scores[itok] - ihigh[ihead]);
+                            itot += irow_scores[itok];
+                        }
+                        itotal[ihead] = itot;
+                    }
+                    const auto iav_stamp = stamp();
+                    std::vector<float> iacc(
+                        static_cast<std::size_t>(kHeads) * kMlaHead, 0.0F);
+                    for (std::uint32_t itok = 0U; itok < attended_rows; ++itok) {
+                        const std::uint32_t gtok = local[itok];
+                        for (std::uint32_t ihead = 0U; ihead < kHeads; ++ihead) {
+                            const float icoeff = bf16_round_f32(
+                                iscores[static_cast<std::size_t>(ihead) *
+                                            attended_rows + itok] /
+                                itotal[ihead]);
+                            const float* const ival = active_expanded.data() +
+                                (static_cast<std::size_t>(gtok) * kHeads +
+                                 ihead) * (2U * kMlaHead) + kMlaHead;
+                            float* const iaccrow = iacc.data() +
+                                static_cast<std::size_t>(ihead) * kMlaHead;
+#if STRATA_GLM53_HOST_AVX2
+                            if (iavx2) {
+                                glm53_mla_av_token_avx2(iaccrow, ival, icoeff);
+                            } else
+#endif
+                            {
+                                for (std::uint32_t ic = 0U; ic < kMlaHead; ++ic) {
+                                    iaccrow[ic] += icoeff * ival[ic];
+                                }
+                            }
+                        }
+                    }
+                    float* const iout = attended.data() +
+                        static_cast<std::size_t>(row) * kMlaWidth;
+                    std::copy(iacc.begin(), iacc.end(), iout);
+                    if (profile) {
+                        const auto ihead_done =
+                            std::chrono::steady_clock::now();
+                        qk_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(ism_stamp -
+                                                         iqk_stamp)
+                                .count());
+                        softmax_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(iav_stamp - ism_stamp)
+                                .count());
+                        av_ns += static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<
+                                std::chrono::nanoseconds>(ihead_done -
+                                                         iav_stamp)
+                                .count());
+                    }
+                } else {
                 for (std::uint32_t head = 0U; head < kHeads; ++head) {
                     const auto head_qk_started = stamp();
                     const auto* q = query.data() +
@@ -7744,9 +8038,33 @@ struct Glm53Runtime::Impl {
                             scores[token] = row_scores[token];
                             highest = std::max(highest, scores[token]);
                         }
+                    } else if (use_avx2) {
+#if STRATA_GLM53_HOST_AVX2
+                    // G2 experiment: 8-way FMA dot. Not bit-identical.
+                    for (std::uint32_t token = 0U; token < attended_rows; ++token) {
+                        const auto* kv = active_expanded.data() +
+                            (static_cast<std::size_t>(local[token]) * kHeads +
+                             head) * (2U * kMlaHead);
+                        scores[token] =
+                            glm53_mla_dot256_avx2(q, kv) * score_scale;
+                        highest = std::max(highest, scores[token]);
+                    }
+#else
+                    for (std::uint32_t token = 0U; token < attended_rows; ++token) {
+                        const auto* kv = active_expanded.data() +
+                            (static_cast<std::size_t>(local[token]) * kHeads +
+                             head) * (2U * kMlaHead);
+                        float score = 0.0F;
+                        for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
+                            score += q[column] * kv[column];
+                        }
+                        scores[token] = score * score_scale;
+                        highest = std::max(highest, scores[token]);
+                    }
+#endif
                     } else {
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
-                        const auto* kv = expanded.data() +
+                        const auto* kv = active_expanded.data() +
                             (static_cast<std::size_t>(local[token]) * kHeads +
                              head) * (2U * kMlaHead);
                         float score = 0.0F;
@@ -7780,7 +8098,20 @@ struct Glm53Runtime::Impl {
                             published[token] =
                                 bf16_round_f32(scores[token] / total);
                         }
-                    } else {
+                    } else if (use_avx2) {
+#if STRATA_GLM53_HOST_AVX2
+                    // G2 experiment: 16 register-resident FMA accumulators
+                    // across the token loop (see glm53_mla_av_head_avx2).
+                    // Not bit-identical: FMA fusion + reassociation.
+                    glm53_mla_av_head_avx2(
+                        attended.data() +
+                            (static_cast<std::size_t>(row) * kHeads + head) *
+                                kMlaHead,
+                        scores.data(), total, active_expanded.data(), local,
+                        attended_rows, head, false);
+#endif
+                    }
+                    if (!use_avx2) {
                     auto* out = attended.data() +
                         (static_cast<std::size_t>(row) * kHeads + head) * kMlaHead;
                     for (std::uint32_t token = 0U; token < attended_rows; ++token) {
@@ -7789,7 +8120,7 @@ struct Glm53Runtime::Impl {
                         // to BF16 before it ever multiplies a value.
                         const auto coefficient =
                             bf16_round_f32(scores[token] / total);
-                        const auto* value = expanded.data() +
+                        const auto* value = active_expanded.data() +
                             (static_cast<std::size_t>(local[token]) * kHeads +
                              head) * (2U * kMlaHead) + kMlaHead;
                         for (std::uint32_t column = 0U; column < kMlaHead; ++column) {
@@ -7810,6 +8141,7 @@ struct Glm53Runtime::Impl {
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 head_finished - head_av_started).count());
                     }
+                }
                 }
                 if (profile) {
                     mla_qk_nanoseconds.fetch_add(qk_ns,
@@ -7854,6 +8186,14 @@ struct Glm53Runtime::Impl {
                       << " page_rows=" << rows
                       << " history_begin=" << history_begin
                       << " groups=" << call_groups
+                      // Whether fix (1)'s page union engaged, and how wide it
+                      // was. It disengages silently above
+                      // kPageExpansionBudgetRows, falling back to the per-group
+                      // GEMMs, and that cliff is a function of history -- so a
+                      // run that does not say which path it took cannot be
+                      // compared against one that took the other.
+                      << " page_expand=" << (use_page_expansion ? 1 : 0)
+                      << " page_union=" << page_union.size()
                       << " mean_group_rows="
                       << (call_groups == 0U
                               ? 0.0

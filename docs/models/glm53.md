@@ -547,21 +547,26 @@ Two fixes follow, in order:
    from host memory costs roughly 65 ms per layer-page against about 930 ms to
    recompute it, so the transfer is not the obstacle.
 
-   **Measured, and incomplete.** On the bench at layer 19, history 4,096, 2,048
-   rows -- a page that shatters into 755 groups under synthetic selections --
-   fix (1) is exact (identical checksums, `0x2f70b47448139dde`) and worth
-   1.27x on the layer-page: 194.8 s to 153.6 s. But the expansion term only
-   falls from 99.6 s to 82.9 s where the arithmetic says one 6,144-row GEMM
-   should cost about 0.2 s. The gap is the slicing itself: each group still
-   materializes a contiguous `expanded` buffer, copying 3,690 rows x 32,768
-   floats -- 484 MB per group, about 365 GB over the page. Fix (1) as landed
-   trades a GEMM for a memcpy of the same order. The remaining win needs the
-   attend core to index into the page expansion in place through `mla_page_pos`
-   rather than gathering each group's rows, which is a change to the QK and AV
-   loops and was not attempted. Note the bench over-fragments (755 groups where
-   a real layer-page gives 86), so the copy penalty is overstated relative to
-   production and the 1.27x is a lower bound on a synthetic worst case, not a
-   production figure.
+   **Measured, then completed (record 0270).** On the bench at layer 19, history
+   4,096, 2,048 rows -- a page that shatters into 755 groups under synthetic
+   selections -- fix (1) is exact (identical checksums, `0x2f70b47448139dde`) and was
+   worth 1.27x on the layer-page: 194.8 s to 153.6 s. But the expansion term only
+   fell from 99.6 s to 82.9 s where the arithmetic says one 6,144-row GEMM
+   should cost about 0.2 s. The gap was the slicing itself: each group still
+   materialized a contiguous `expanded` buffer, copying 3,690 rows x 32,768
+   floats -- 484 MB per group, about 365 GB over the page. Fix (1) as first landed
+   traded a GEMM for a memcpy of the same order. Fix (1b) removes it: the host QK
+   and AV loops now index into the page expansion in place through `mla_page_pos`,
+   engaging whenever the page union is live and the device stages are off (the device
+   path keeps the compact per-group buffer it uploads). At the calibrated 87-group
+   shape (smoothing 0.975, matching the real 86-group page) the layer-page goes
+   48.3 s -> 22.5 s with expansion 15.3 s -> 0.2 s, identical checksums; at the
+   755-group worst case 184.8 s -> 68.9 s with expansion 110 s -> 0.3 s, identical
+   checksums. The hash gate is green on a 2,591-token arm (11 MLA + KDA hashes and
+   stdout identical), so fix (1b) is default ON; `STRATA_GLM53_PAGE_EXPAND=0`
+   restores the per-group path for A/B work. Note the bench over-fragments (755 groups
+   where a real layer-page gives 86), so the worst-case figure overstates production
+   and the calibrated 2.15x is the quotable one.
 
    **Precondition, and it holds.** This is only legal if a row's expanded bits
    do not depend on the batch size it was expanded in; a split-K GEMM that
@@ -574,11 +579,73 @@ Two fixes follow, in order:
    where the cache lives and how the prefill loop is ordered, not whether the
    arithmetic permits it.
 
-Fix (1) is built and landed off by default behind `STRATA_GLM53_PAGE_EXPAND`;
+Fix (1b) is built, hash-gated, and default ON (`STRATA_GLM53_PAGE_EXPAND=0` opts out);
 fix (2) is not built, and its one blocking precondition is now answered. The
 campaign is closed here with the measurements, the instrument, the
-exact-but-currently-neutral device stages and fix (1) landed, and this is the
+exact-but-currently-neutral device stages and fix (1b) landed, and this is the
 state to resume from.
+
+### The page union is dense, and what that costs fix (1)
+
+Measured on the bench at layer 19, 2,048 rows, smoothing 0.975, pinned to NUMA
+node 1 (the 3090s' socket), with `page_expand=`/`page_union=` added to the
+`[glm53-sparse-groups]` line so a run says which path it took:
+
+| history | visible positions | page union | budget needed |
+| --- | --- | --- | --- |
+| 4,096 | 6,144 | 6,135 (99.85%) | 6,144 |
+| 8,192 | 10,240 | 10,234 (99.94%) | 10,240 |
+| 16,384 | 18,432 | >12,288 | ~18,432 |
+
+**The union of a page's selections is every visible position.** The k-pool
+indexer is sparse per row and dense per page: 2,048 rows selecting ~2,051
+positions each cover the whole history. Three consequences.
+
+First, `kPageExpansionBudgetRows` must equal `context + page_rows` for fix (1)
+to engage at all, so no constant fixes it -- at the shipped 8,192 the path
+disengages from history 8,192 onward, which is every shape this campaign
+targets. `STRATA_GLM53_PAGE_EXPAND_ROWS` makes it tunable for that sweep;
+raising it to 12,288 re-engages history 8,192 and is worth 1.35x on the
+layer-page (199.59 s -> 147.37 s, expansion 27.98 s -> 0.38 s, checksum
+`0x710ba7ddaefe367a` in both arms). Keep it as breathing room, not as a fix.
+
+Second, fix (2)'s per-token cache stores the same set the page union already
+does, so it is the correct form of fix (1) rather than an alternative -- but an
+expanded row is 64x its latent row (32,768 values against 512), so at 262,144
+tokens one layer's cache is 17.2 GB at BF16 and eleven are 189 GB. Neither
+residence proposed for it survives that: all eleven layers do not fit host
+memory beside the mmap'd checkpoint, and one layer does not fit a 24 GiB card
+beside the expert arena. The BF16 storage itself is free and worth taking --
+the expansion already passes `bf16_output = true`, so those values are BF16
+precision in F32 containers -- but it buys one doubling, not an order.
+
+Third, QK and AV are **flat in history**: 91.85/91.91/91.61 s and
+63.93/64.04/63.98 s across 8,192, 16,384 and 30,720. Every context-dependent
+term in sparse MLA is expansion or per-group overhead. QK runs 68.8 GMAC in
+91.6 s -- 0.75 GMAC/s, against 460 GMAC/s measured for the expansion GEMM on
+the same box -- so that loop is bound by streaming 64 KiB of expanded K per
+(row, position) pair, not by arithmetic.
+
+That is the case for absorption. `CudaBackend::glm_absorbed_attention` already
+implements it exactly for GLM-5.2's dense window, and it composes with per-row
+sparse selection: fold `kv_b_proj` into the query, dot against the stored
+latent, accumulate AV in latent space, project out once per row. It never
+materializes expanded K/V, so the grouping, the expansion budget, fix (1) and
+fix (2) all become unnecessary rather than optimized. It roughly doubles the
+QK/AV MACs and cuts their memory traffic 32-64x, which is the right side of the
+trade on a loop measured at 0.75 GMAC/s. GLM-5.3's sparse path is the one path
+that excludes itself from it (`glm53_runtime.cpp`, "Sparse contexts have their
+own independent device entry point below and never share the <=2,048 resident
+MLA kernels").
+
+Caveats. These are synthetic activations calibrated to match a real arm's group
+count; union coverage is a different statistic than group count and should be
+confirmed against one real arm before anyone acts on it. The split is read from
+one profile at one layer -- layer 19 is among the two worst-fragmenting -- and
+must not be scaled to a full-prefill figure. Absorption reassociates the
+arithmetic and so will not be bit-identical to the current path; that is a
+linear-algebra-exact change, not a routing approximation, but it needs the same
+owner ruling and re-baseline the resident-MLA landing took.
 
 Correction to earlier figures in this campaign: the fragmentation totals at
 8,192 tokens are 904 groups and 3.60M row-expansions -- 126x the expansions for
